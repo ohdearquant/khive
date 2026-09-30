@@ -249,12 +249,15 @@ to pooled routing for its next ordinary query.
 ### Reader diagnostics
 
 The verb's existing root fields describe main. Its additive `databases` array has one entry
-per canonical file (or distinct in-memory pool) already opened by the serving host. Each
-entry has all alias `backend_names`, canonical `path`, and either the same per-file
+per canonical file (or distinct in-memory pool) opened by this serving runtime and its
+pack handles, including events sidecars opened through runtime accessors after host
+composition. Each entry has all alias
+`backend_names`, canonical `path`, and either the same per-file
 `diagnostics` field set or an `error` for that file. A
 failed inspection does not suppress the other entries. This collector does not open any
 unopened database path. Process checkpoint and audit counters are shared across entries;
-reader and writer counters belong to each entry's pool.
+reader and writer counters belong to each entry's representative pool. Diagnostics
+holds late-opened pools only while collecting the report.
 
 `db_diagnostics.reader_contention` is pool-scoped and resets only when the
 `ConnectionPool` is reconstructed. It reports:
