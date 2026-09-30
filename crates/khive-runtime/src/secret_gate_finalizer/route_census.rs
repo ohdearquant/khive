@@ -261,6 +261,14 @@ fn macro_strings(tokens: TokenStream, strings: &mut Vec<String>) {
 
 type SqlBindings = BTreeMap<String, Option<String>>;
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ModuleId {
+    root: String,
+    segments: Vec<String>,
+}
+
+type ModuleBindings = BTreeMap<ModuleId, SqlBindings>;
+
 fn use_tree_imports(
     tree: &UseTree,
     prefix: &mut Vec<String>,
@@ -297,6 +305,8 @@ fn import_target(
     known: &SqlBindings,
     parents: &[SqlBindings],
     current_module: Option<&SqlBindings>,
+    module_id: &ModuleId,
+    modules: &ModuleBindings,
 ) -> Option<String> {
     let (original, prefix) = path.split_last()?;
     if NOTE_PROPERTY_SQL_CONSTANTS.contains(&original.as_str()) {
@@ -318,29 +328,63 @@ fn import_target(
             .checked_sub(prefix.len())
             .and_then(|index| parents.get(index))
             .and_then(&lookup),
-        _ => None,
+        _ => qualified_target(path, module_id, modules),
     }
 }
 
-fn use_bindings<'a>(
-    uses: impl Iterator<Item = &'a ItemUse>,
+fn qualified_target(
+    path: &[String],
+    current: &ModuleId,
+    modules: &ModuleBindings,
+) -> Option<String> {
+    let (name, prefix) = path.split_last()?;
+    let (mut module, consumed) = match prefix.first()?.as_str() {
+        "crate" => (
+            ModuleId {
+                root: current.root.clone(),
+                segments: Vec::new(),
+            },
+            1,
+        ),
+        "self" => (current.clone(), 1),
+        "super" => {
+            let depth = prefix
+                .iter()
+                .take_while(|part| part.as_str() == "super")
+                .count();
+            let keep = current.segments.len().checked_sub(depth)?;
+            let mut parent = current.clone();
+            parent.segments.truncate(keep);
+            (parent, depth)
+        }
+        _ => return None,
+    };
+    for part in &prefix[consumed..] {
+        if matches!(part.as_str(), "crate" | "self" | "super") {
+            return None;
+        }
+        module.segments.push(part.clone());
+    }
+    modules.get(&module)?.get(name).cloned().flatten()
+}
+
+fn resolve_imports(
+    imports: &[(String, Vec<String>)],
     parents: &[SqlBindings],
     current_module: Option<&SqlBindings>,
+    module_id: &ModuleId,
+    modules: &ModuleBindings,
 ) -> SqlBindings {
-    let mut imports = Vec::new();
-    for item in uses {
-        use_tree_imports(&item.tree, &mut Vec::new(), &mut imports);
-    }
     let mut bindings = imports
         .iter()
         .map(|(name, _)| (name.clone(), None))
         .collect::<SqlBindings>();
     for _ in 0..imports.len() {
         let known = bindings.clone();
-        for (name, path) in &imports {
+        for (name, path) in imports {
             bindings.insert(
                 name.clone(),
-                import_target(path, &known, parents, current_module),
+                import_target(path, &known, parents, current_module, module_id, modules),
             );
         }
         if known == bindings {
@@ -348,6 +392,20 @@ fn use_bindings<'a>(
         }
     }
     bindings
+}
+
+fn use_bindings<'a>(
+    uses: impl Iterator<Item = &'a ItemUse>,
+    parents: &[SqlBindings],
+    current_module: Option<&SqlBindings>,
+    module_id: &ModuleId,
+    modules: &ModuleBindings,
+) -> SqlBindings {
+    let mut imports = Vec::new();
+    for item in uses {
+        use_tree_imports(&item.tree, &mut Vec::new(), &mut imports);
+    }
+    resolve_imports(&imports, parents, current_module, module_id, modules)
 }
 
 #[derive(Default)]
@@ -370,16 +428,18 @@ fn shadow_bindings<'a>(
     names.0.into_iter().map(|name| (name, None)).collect()
 }
 
-struct SourceCollector {
+struct SourceCollector<'modules> {
     path: String,
     scope: Vec<String>,
     sites: BTreeMap<String, Site>,
     all_calls: BTreeMap<String, BTreeSet<String>>,
     bindings: Vec<SqlBindings>,
     parent_module_bindings: Vec<SqlBindings>,
+    module_id: ModuleId,
+    modules: &'modules ModuleBindings,
 }
 
-impl SourceCollector {
+impl<'modules> SourceCollector<'modules> {
     fn key(&self) -> String {
         format!("{}::{}", self.path, self.scope.join("::"))
     }
@@ -431,13 +491,15 @@ impl SourceCollector {
     }
 }
 
-impl<'ast> Visit<'ast> for SourceCollector {
+impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
     fn visit_item_mod(&mut self, item: &'ast ItemMod) {
         if test_only(&item.attrs) {
             return;
         }
         let mut parents = self.parent_module_bindings.clone();
         parents.push(self.bindings.first().cloned().unwrap_or_default());
+        let mut child_module = self.module_id.clone();
+        child_module.segments.push(item.ident.to_string());
         let module_bindings = item
             .content
             .as_ref()
@@ -449,9 +511,12 @@ impl<'ast> Visit<'ast> for SourceCollector {
                     }),
                     &parents,
                     None,
+                    &child_module,
+                    self.modules,
                 )
             });
         let outer_bindings = std::mem::replace(&mut self.bindings, vec![module_bindings]);
+        let outer_module = std::mem::replace(&mut self.module_id, child_module);
         self.parent_module_bindings
             .push(outer_bindings.first().cloned().unwrap_or_default());
         self.scope.push(item.ident.to_string());
@@ -459,6 +524,7 @@ impl<'ast> Visit<'ast> for SourceCollector {
         self.scope.pop();
         self.parent_module_bindings.pop();
         self.bindings = outer_bindings;
+        self.module_id = outer_module;
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
@@ -518,6 +584,8 @@ impl<'ast> Visit<'ast> for SourceCollector {
             }),
             &self.parent_module_bindings,
             self.bindings.first(),
+            &self.module_id,
+            self.modules,
         );
         self.bindings.push(block_bindings);
         syn::visit::visit_block(self, block);
@@ -635,7 +703,11 @@ impl<'ast> Visit<'ast> for SourceCollector {
                 } else if NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str()) {
                     Some(name.clone())
                 } else {
-                    None
+                    let path = segments
+                        .iter()
+                        .map(|part| part.ident.to_string())
+                        .collect::<Vec<_>>();
+                    qualified_target(&path, &self.module_id, self.modules)
                 };
                 if let Some(constant) = constant {
                     self.record(
@@ -678,22 +750,47 @@ impl<'ast> Visit<'ast> for SourceCollector {
     }
 }
 
-fn scan_source(path: &str, source: &str) -> Result<Vec<Site>, syn::Error> {
+fn module_parents(module_id: &ModuleId, modules: &ModuleBindings) -> Vec<SqlBindings> {
+    (0..module_id.segments.len())
+        .map(|depth| {
+            modules
+                .get(&ModuleId {
+                    root: module_id.root.clone(),
+                    segments: module_id.segments[..depth].to_vec(),
+                })
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn scan_source(
+    path: &str,
+    source: &str,
+    module_id: ModuleId,
+    modules: &ModuleBindings,
+) -> Result<Vec<Site>, syn::Error> {
     let file = syn::parse_file(source)?;
+    let parents = module_parents(&module_id, modules);
+    let bindings = use_bindings(
+        file.items.iter().filter_map(|item| match item {
+            syn::Item::Use(item) => Some(item),
+            _ => None,
+        }),
+        &parents,
+        None,
+        &module_id,
+        modules,
+    );
     let mut collector = SourceCollector {
         path: path.to_owned(),
         scope: Vec::new(),
         sites: BTreeMap::new(),
         all_calls: BTreeMap::new(),
-        bindings: vec![use_bindings(
-            file.items.iter().filter_map(|item| match item {
-                syn::Item::Use(item) => Some(item),
-                _ => None,
-            }),
-            &[],
-            None,
-        )],
-        parent_module_bindings: Vec::new(),
+        bindings: vec![bindings],
+        parent_module_bindings: parents,
+        module_id,
+        modules,
     };
     collector.visit_file(&file);
     Ok(collector.sites.into_values().collect())
@@ -812,6 +909,51 @@ fn source_path(path: &Path) -> Option<String> {
     Some(segments.join("/"))
 }
 
+fn module_source_paths(
+    parent: &str,
+    inline_dirs: &[String],
+    module: &ItemMod,
+    sources: &BTreeSet<String>,
+) -> Vec<String> {
+    let parent_path = Path::new(parent);
+    let parent_dir = parent_path.parent().unwrap_or_else(|| Path::new(""));
+    let override_path = module
+        .attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("path"));
+    let candidates = if let Some(attr) = override_path {
+        let syn::Meta::NameValue(value) = &attr.meta else {
+            return Vec::new();
+        };
+        let Some(name) = literal_string(&value.value) else {
+            return Vec::new();
+        };
+        let mut base = parent_dir.to_path_buf();
+        for segment in inline_dirs {
+            base.push(segment);
+        }
+        vec![base.join(name)]
+    } else {
+        let mut base = parent_dir.to_path_buf();
+        let filename = parent_path.file_name().and_then(|name| name.to_str());
+        if !matches!(filename, Some("lib.rs" | "main.rs" | "mod.rs")) {
+            if let Some(stem) = parent_path.file_stem() {
+                base.push(stem);
+            }
+        }
+        for segment in inline_dirs {
+            base.push(segment);
+        }
+        let module_base = base.join(module.ident.to_string());
+        vec![module_base.with_extension("rs"), module_base.join("mod.rs")]
+    };
+    candidates
+        .into_iter()
+        .filter_map(|candidate| source_path(&candidate))
+        .filter(|child| sources.contains(child))
+        .collect()
+}
+
 fn source_inclusions(
     parent: &str,
     items: &[syn::Item],
@@ -842,47 +984,12 @@ fn source_inclusions(
                     continue;
                 }
 
-                let override_path = module
-                    .attrs
-                    .iter()
-                    .find(|attr| attr.path().is_ident("path"));
-                let candidates = if let Some(attr) = override_path {
-                    let syn::Meta::NameValue(value) = &attr.meta else {
-                        continue;
-                    };
-                    let Some(name) = literal_string(&value.value) else {
-                        continue;
-                    };
-                    let mut base = parent_dir.to_path_buf();
-                    for segment in inline_dirs.iter() {
-                        base.push(segment);
-                    }
-                    vec![base.join(name)]
-                } else {
-                    let mut base = parent_dir.to_path_buf();
-                    let filename = parent_path.file_name().and_then(|name| name.to_str());
-                    if !matches!(filename, Some("lib.rs" | "main.rs" | "mod.rs")) {
-                        if let Some(stem) = parent_path.file_stem() {
-                            base.push(stem);
-                        }
-                    }
-                    for segment in inline_dirs.iter() {
-                        base.push(segment);
-                    }
-                    let module_base = base.join(module.ident.to_string());
-                    vec![module_base.with_extension("rs"), module_base.join("mod.rs")]
-                };
-                for candidate in candidates {
-                    let Some(child) = source_path(&candidate) else {
-                        continue;
-                    };
-                    if sources.contains(&child) {
-                        incoming.insert(child.clone());
-                        edges
-                            .entry(parent.to_owned())
-                            .or_default()
-                            .push((child, only_test));
-                    }
+                for child in module_source_paths(parent, inline_dirs, module, sources) {
+                    incoming.insert(child.clone());
+                    edges
+                        .entry(parent.to_owned())
+                        .or_default()
+                        .push((child, only_test));
                 }
             }
             syn::Item::Macro(item) if item.mac.path.is_ident("include") => {
@@ -905,7 +1012,9 @@ fn source_inclusions(
     }
 }
 
-fn test_module_files(sources: &[(String, String)]) -> Result<BTreeSet<String>, syn::Error> {
+fn test_module_files(
+    sources: &[(String, String)],
+) -> Result<(BTreeSet<String>, BTreeSet<String>), syn::Error> {
     let paths = sources
         .iter()
         .map(|(path, _)| path.clone())
@@ -925,14 +1034,28 @@ fn test_module_files(sources: &[(String, String)]) -> Result<BTreeSet<String>, s
         );
     }
 
-    let mut production = paths
+    let mut roots = paths
         .difference(&incoming)
         .cloned()
         .collect::<BTreeSet<_>>();
     for path in &paths {
         if path.split_once("/src/").is_some_and(|(_, source)| {
-            source == "lib.rs" || source == "main.rs" || source.starts_with("bin/")
+            source == "lib.rs"
+                || source == "main.rs"
+                || source.strip_prefix("bin/").is_some_and(|binary| {
+                    !binary.contains('/')
+                        || (binary.ends_with("/main.rs") && binary.matches('/').count() == 1)
+                })
         }) {
+            roots.insert(path.clone());
+        }
+    }
+    let mut production = roots.clone();
+    for path in &paths {
+        if path
+            .split_once("/src/")
+            .is_some_and(|(_, source)| source.starts_with("bin/"))
+        {
             production.insert(path.clone());
         }
     }
@@ -946,17 +1069,181 @@ fn test_module_files(sources: &[(String, String)]) -> Result<BTreeSet<String>, s
             }
         }
     }
-    Ok(incoming.difference(&production).cloned().collect())
+    Ok((incoming.difference(&production).cloned().collect(), roots))
+}
+
+struct ModuleImportTraversal<'a> {
+    parsed: &'a BTreeMap<String, syn::File>,
+    paths: &'a BTreeSet<String>,
+    imports: BTreeMap<ModuleId, Vec<(String, Vec<String>)>>,
+    file_modules: BTreeMap<String, ModuleId>,
+    visited: BTreeSet<(String, ModuleId)>,
+}
+
+fn collect_module_imports(
+    path: &str,
+    items: &[syn::Item],
+    module_id: &ModuleId,
+    inline_dirs: &mut Vec<String>,
+    traversal: &mut ModuleImportTraversal<'_>,
+) {
+    if !traversal
+        .visited
+        .insert((path.to_owned(), module_id.clone()))
+    {
+        return;
+    }
+    traversal
+        .file_modules
+        .entry(path.to_owned())
+        .or_insert_with(|| module_id.clone());
+    let module_imports = traversal.imports.entry(module_id.clone()).or_default();
+    for item in items {
+        if let syn::Item::Use(item) = item {
+            use_tree_imports(&item.tree, &mut Vec::new(), module_imports);
+        }
+    }
+    let parsed = traversal.parsed;
+    let paths = traversal.paths;
+    let parent_dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+    for item in items {
+        match item {
+            syn::Item::Mod(module) if !test_only(&module.attrs) => {
+                let mut child_module = module_id.clone();
+                child_module.segments.push(module.ident.to_string());
+                if let Some((_, nested)) = &module.content {
+                    inline_dirs.push(module.ident.to_string());
+                    collect_module_imports(path, nested, &child_module, inline_dirs, traversal);
+                    inline_dirs.pop();
+                } else {
+                    for child in module_source_paths(path, inline_dirs, module, paths) {
+                        if let Some(file) = parsed.get(&child) {
+                            collect_module_imports(
+                                &child,
+                                &file.items,
+                                &child_module,
+                                &mut Vec::new(),
+                                traversal,
+                            );
+                        }
+                    }
+                }
+            }
+            syn::Item::Macro(item)
+                if item.mac.path.is_ident("include") && !test_only(&item.attrs) =>
+            {
+                let Ok(name) = syn::parse2::<syn::LitStr>(item.mac.tokens.clone()) else {
+                    continue;
+                };
+                let Some(child) = source_path(&parent_dir.join(name.value())) else {
+                    continue;
+                };
+                if let Some(file) = parsed.get(&child) {
+                    collect_module_imports(
+                        &child,
+                        &file.items,
+                        module_id,
+                        &mut Vec::new(),
+                        traversal,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn index_module_bindings(
+    sources: &[(String, String)],
+    skipped: &BTreeSet<String>,
+    roots: &BTreeSet<String>,
+) -> Result<(ModuleBindings, BTreeMap<String, ModuleId>), String> {
+    let mut parsed = BTreeMap::new();
+    for (path, source) in sources {
+        if skipped.contains(path) || path.contains("/tests/") || path.contains("/benches/") {
+            continue;
+        }
+        parsed.insert(
+            path.clone(),
+            syn::parse_file(source).map_err(|error| format!("{path}: {error}"))?,
+        );
+    }
+    let paths = parsed.keys().cloned().collect::<BTreeSet<_>>();
+    let mut traversal = ModuleImportTraversal {
+        parsed: &parsed,
+        paths: &paths,
+        imports: BTreeMap::new(),
+        file_modules: BTreeMap::new(),
+        visited: BTreeSet::new(),
+    };
+    for root in roots {
+        if let Some(file) = parsed.get(root) {
+            let module_id = ModuleId {
+                root: root.clone(),
+                segments: Vec::new(),
+            };
+            collect_module_imports(
+                root,
+                &file.items,
+                &module_id,
+                &mut Vec::new(),
+                &mut traversal,
+            );
+        }
+    }
+    for (path, file) in &parsed {
+        if !traversal.file_modules.contains_key(path) {
+            let module_id = ModuleId {
+                root: path.clone(),
+                segments: Vec::new(),
+            };
+            collect_module_imports(
+                path,
+                &file.items,
+                &module_id,
+                &mut Vec::new(),
+                &mut traversal,
+            );
+        }
+    }
+    let mut modules = traversal
+        .imports
+        .keys()
+        .map(|module_id| (module_id.clone(), SqlBindings::new()))
+        .collect::<ModuleBindings>();
+    let rounds = traversal.imports.values().map(Vec::len).sum::<usize>() + 1;
+    for _ in 0..rounds {
+        let previous = modules.clone();
+        for (module_id, module_imports) in &traversal.imports {
+            let parents = module_parents(module_id, &previous);
+            modules.insert(
+                module_id.clone(),
+                resolve_imports(module_imports, &parents, None, module_id, &previous),
+            );
+        }
+        if modules == previous {
+            break;
+        }
+    }
+    Ok((modules, traversal.file_modules))
 }
 
 fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
-    let skipped = test_module_files(sources).map_err(|error| error.to_string())?;
+    let (skipped, roots) = test_module_files(sources).map_err(|error| error.to_string())?;
+    let (modules, file_modules) = index_module_bindings(sources, &skipped, &roots)?;
     let mut all = Vec::new();
     for (path, source) in sources {
         if skipped.contains(path) || path.contains("/tests/") || path.contains("/benches/") {
             continue;
         }
-        all.extend(scan_source(path, source).map_err(|error| format!("{path}: {error}"))?);
+        let module_id = file_modules
+            .get(path)
+            .cloned()
+            .expect("indexed production source");
+        all.extend(
+            scan_source(path, source, module_id, &modules)
+                .map_err(|error| format!("{path}: {error}"))?,
+        );
     }
     all.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(all)
@@ -1369,6 +1656,67 @@ fn aliased_note_sql_constants_respect_lexical_shadows() {
     assert!(scan_sources(&[(path.into(), unused.into())])
         .unwrap()
         .is_empty());
+}
+
+fn qualified_reexport_sources(guarded: bool) -> Vec<(String, String)> {
+    let writer = if guarded {
+        "use crate::sql_alias::MERGE_SQL as SQL;
+         fn merge_note_sql(conn: &Connection) {
+             reject_reserved_secret_gate_property(merged_props);
+             conn.prepare_cached(SQL);
+         }"
+    } else {
+        "use crate::sql_alias::MERGE_SQL as SQL;
+         fn merge_note_sql(conn: &Connection) { conn.prepare_cached(SQL); }"
+    };
+    vec![
+        (
+            "sample/src/lib.rs".into(),
+            "mod sql_alias; mod writer;".into(),
+        ),
+        (
+            "sample/src/sql_alias.rs".into(),
+            "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;".into(),
+        ),
+        ("sample/src/writer.rs".into(), writer.into()),
+    ]
+}
+
+fn qualified_reexport_route() -> RouteInventoryEntry {
+    RouteInventoryEntry {
+        site: "sample/src/writer.rs::merge_note_sql",
+        ..*ROUTE_INVENTORY
+            .iter()
+            .find(|route| route.id == "curation.merge.note")
+            .expect("note merge route is declared")
+    }
+}
+
+#[test]
+fn qualified_reexport_without_reservation_is_reported() {
+    let sites = scan_sources(&qualified_reexport_sources(false)).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].key, "sample/src/writer.rs::merge_note_sql");
+    assert_eq!(sites[0].target, Substrate::Note);
+    assert_eq!(sites[0].class, DetectedClass::WholeObject);
+    assert!(sites[0].evidence.contains("SQL constant NOTE_UPSERT_SQL"));
+    assert!(check_inventory(&sites, &[], 0)
+        .unwrap_err()
+        .contains("unmapped sample/src/writer.rs::merge_note_sql"));
+    assert!(check_inventory(&sites, &[qualified_reexport_route()], 0)
+        .unwrap_err()
+        .contains("whole-object write lacks its named check/callee"));
+}
+
+#[test]
+fn qualified_reexport_with_reservation_passes_inventory() {
+    let sites = scan_sources(&qualified_reexport_sources(true)).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].key, "sample/src/writer.rs::merge_note_sql");
+    assert_eq!(sites[0].target, Substrate::Note);
+    assert_eq!(sites[0].class, DetectedClass::WholeObject);
+    assert!(sites[0].evidence.contains("SQL constant NOTE_UPSERT_SQL"));
+    assert!(check_inventory(&sites, &[qualified_reexport_route()], 0).is_ok());
 }
 
 #[test]
