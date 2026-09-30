@@ -151,6 +151,8 @@ function ModuleButton({
     <button
       type="button"
       className={styles.moduleButton}
+      data-keyboard-row
+      aria-keyshortcuts="J K Enter"
       data-module-id={module.id}
       aria-label={moduleInspectLabel(moduleById, module)}
       aria-controls="repository-module-inspector"
@@ -221,6 +223,7 @@ export function RepositoryTriage({
       className={styles.root}
       aria-label="Repository triage"
       data-repository-triage
+      data-keyboard-scope
     >
       <header className={styles.header}>
         <div className={styles.heading}>
@@ -295,6 +298,7 @@ export function RepositoryTriage({
               ? (
                 <div
                   className={styles.searchResults}
+                  data-keyboard-list
                   aria-label={`${moduleLabel} search results`}
                 >
                   <div className={styles.resultHeading}>
@@ -351,7 +355,7 @@ export function RepositoryTriage({
                 </div>
               )
               : (
-                <div className={styles.startList}>
+                <div className={styles.startList} data-keyboard-list>
                   {brief.startHere.length
                     ? (
                       <>
@@ -425,7 +429,7 @@ export function RepositoryTriage({
               </div>
               <Eye aria-hidden="true" />
             </div>
-            <div className={styles.signalGrid}>
+            <div className={styles.signalGrid} data-keyboard-list>
               {brief.attentionSignals.length
                 ? (
                   <>
@@ -470,6 +474,8 @@ export function RepositoryTriage({
                       {inspectionTarget && (
                         <button
                           type="button"
+                          data-keyboard-row
+                          aria-keyshortcuts="J K Enter"
                           aria-label={moduleInspectLabel(moduleById, inspectionTarget)}
                           onClick={() => selectSignal(signal)}
                         >
@@ -478,6 +484,8 @@ export function RepositoryTriage({
                       )}
                       <button
                         type="button"
+                        data-keyboard-row
+                        aria-keyshortcuts="J K Enter"
                         aria-controls="repository-analysis-dashboard"
                         aria-label={`Open full analysis: ${
                           bundle.capability.views[signal.targetView].label
@@ -634,6 +642,8 @@ export function RepositoryTriage({
                               <li key={module.id}>
                                 <button
                                   type="button"
+                                  data-keyboard-row
+                                  aria-keyshortcuts="J K Enter"
                                   aria-label={moduleInspectLabel(moduleById, module)}
                                   onClick={() => onInspectModule(module.id)}
                                 >
@@ -665,6 +675,8 @@ export function RepositoryTriage({
                                 <li key={module.id}>
                                   <button
                                     type="button"
+                                    data-keyboard-row
+                                    aria-keyshortcuts="J K Enter"
                                     aria-label={moduleInspectLabel(moduleById, module)}
                                     onClick={() => onInspectModule(module.id)}
                                   >
@@ -697,6 +709,8 @@ export function RepositoryTriage({
                               <span key={module.id}>
                                 <button
                                   type="button"
+                                  data-keyboard-row
+                                  aria-keyshortcuts="J K Enter"
                                   aria-label={moduleInspectLabel(moduleById, module)}
                                   onClick={() => onInspectModule(module.id)}
                                 >
@@ -736,6 +750,8 @@ export function RepositoryTriage({
                           <li key={coupling.module.id}>
                             <button
                               type="button"
+                              data-keyboard-row
+                              aria-keyshortcuts="J K Enter"
                               aria-label={moduleInspectLabel(moduleById, coupling.module)}
                               onClick={() => onInspectModule(coupling.module.id)}
                             >

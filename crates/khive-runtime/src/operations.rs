@@ -1065,6 +1065,11 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     // depends_on); the endpoint pair is intentionally narrow (document only,
     // no service/concept targets — see ADR-191 D2/F10).
     ("document", EdgeRelation::LinksTo, "document"),
+    // ADR-002 amendment (ADR-196): location — the source occupies, or is
+    // manifested in, the target without being a constituent of it. The base
+    // contract is one row; packs and Subjects narrow it with typed endpoint
+    // rules for their own subtypes.
+    ("concept", EdgeRelation::LocatedIn, "concept"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -5170,9 +5175,11 @@ impl KhiveRuntime {
         // match `note_kind` are dropped post-fetch — they're a small set
         // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
+        let search_pool = self.backend().pool_arc();
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
+                search_pool.record_note_candidate_hydration_row();
                 if note.deleted_at.is_some() {
                     continue;
                 }
@@ -19984,6 +19991,71 @@ mod tests {
                 .to_string()
                 .contains("base endpoint allowlist"),
             "concept->document links_to must be refused with the \
+             endpoint-contract error; got {concept_to_doc}"
+        );
+    }
+
+    // ── Location endpoint pair (ADR-196) ─────────────────────────────────────
+    // The base contract is one row, concept->concept; other base kinds are left
+    // to the first pack that emits them.
+
+    #[tokio::test]
+    async fn link_concept_located_in_concept_allowed_other_base_kinds_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let pneumonia = rt
+            .create_entity(&tok, "concept", None, "Pneumonia", None, None, vec![])
+            .await
+            .unwrap();
+        let lung = rt
+            .create_entity(&tok, "concept", None, "Lung", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(
+                &tok,
+                pneumonia.id,
+                lung.id,
+                EdgeRelation::LocatedIn,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "concept->concept located_in must be allowed by the ADR-196 \
+             endpoint amendment; got {result:?}"
+        );
+        let edge = result.unwrap();
+        assert_eq!(edge.relation, EdgeRelation::LocatedIn);
+        assert!(
+            edge.metadata.is_none(),
+            "located_in carries no governed metadata and infers none; got {:?}",
+            edge.metadata
+        );
+
+        let page = rt
+            .create_entity(&tok, "document", None, "Atlas page", None, None, vec![])
+            .await
+            .unwrap();
+        let concept_to_doc = rt
+            .link(
+                &tok,
+                pneumonia.id,
+                page.id,
+                EdgeRelation::LocatedIn,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            concept_to_doc
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "concept->document located_in must be refused with the \
              endpoint-contract error; got {concept_to_doc}"
         );
     }

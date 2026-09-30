@@ -3,7 +3,8 @@
 //! `code.ingest` never writes to the shared production graph: it defaults to
 //! a dedicated map database colocated with the ingested path, and rejects an
 //! explicit `db` that resolves to any production store known to this process,
-//! including declared backends, event stores and SQLite companions.
+//! including declared backends, event stores and SQLite companions. This is a
+//! path-level courtesy preflight; it cannot prove which handles SQLite later opens.
 
 use std::path::{Path, PathBuf};
 
@@ -216,9 +217,10 @@ pub(crate) fn validate_explicit_db_path(db: &str) -> Result<(), String> {
 /// default anchor, the calling runtime's configured database (or `KHIVE_DB`
 /// if unresolved), and every declared backend. Each store's event database
 /// and SQLite companions are protected as well.
-/// An explicit target must already be a regular file. This prevents typo-driven
-/// creation before runtime construction; it does not pin identity or protect
-/// against concurrent unlink/replacement between this check and SQLite open.
+/// An explicit target must already be a regular file. The final component of
+/// either target may not be a symlink. This prevents typo-driven creation and
+/// ordinary link traversal before runtime construction; it does not pin
+/// identity or protect against a swap between this check and SQLite open.
 pub(crate) fn resolve_target_db(
     db_param: Option<&str>,
     ingest_path: &Path,
@@ -268,19 +270,40 @@ pub(crate) fn resolve_target_db(
             }
         }
     }
-    if db_param.is_some() {
-        let metadata = std::fs::metadata(&candidate).map_err(|error| {
-            format!(
-                "code.ingest explicit db {candidate:?} must be an existing regular file: {error}; \
-                 omit db to create the workspace-local default"
-            )
-        })?;
-        if !metadata.is_file() {
+    // Do not follow the final component here. The earlier production identity
+    // census retains its more specific protected-store refusal for links to a
+    // known production member; this check also refuses links to dedicated maps.
+    let metadata = match std::fs::symlink_metadata(&candidate) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && db_param.is_none() => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(format!(
-                "code.ingest explicit db {candidate:?} must be an existing regular file; \
+                "code.ingest explicit db {candidate:?} must be an existing regular file: {error}; \
                  omit db to create the workspace-local default"
             ));
         }
+        Err(error) => {
+            return Err(format!(
+                "code.ingest cannot establish target database identity for {}: {error}",
+                candidate.display()
+            ));
+        }
+    };
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(format!(
+            "code.ingest refuses final-component symlink target {}; \
+             select a regular dedicated map database",
+            candidate.display()
+        ));
+    }
+    if db_param.is_some() && !metadata.as_ref().is_some_and(std::fs::Metadata::is_file) {
+        return Err(format!(
+            "code.ingest explicit db {candidate:?} must be an existing regular file; \
+             omit db to create the workspace-local default"
+        ));
     }
     Ok(candidate)
 }
@@ -345,6 +368,80 @@ mod tests {
         )
         .expect("dedicated path accepted");
         assert_eq!(db, target);
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn final_component_symlinks_refuse_while_an_independent_copy_is_admitted() {
+        fn link_file(target: &Path, link: &Path) {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, link).expect("create file symlink");
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(target, link).expect(
+                "Windows CI needs Developer Mode or symlink privilege; do not skip this witness",
+            );
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let protected = tmp.path().join("protected.db");
+        let dedicated = tmp.path().join("dedicated.db");
+        std::fs::write(&protected, b"protected bytes").unwrap();
+        std::fs::write(&dedicated, b"dedicated bytes").unwrap();
+
+        let explicit_link = tmp.path().join("explicit-link.db");
+        link_file(&dedicated, &explicit_link);
+        let error = resolve_target_db(
+            Some(explicit_link.to_str().unwrap()),
+            tmp.path(),
+            Some(&protected),
+            &[],
+        )
+        .expect_err("an explicit final-component symlink must refuse");
+        assert!(error.contains("final-component symlink"), "{error}");
+
+        let ingest = tmp.path().join("source");
+        let default_dir = ingest.join(".khive");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_link = default_dir.join("code-map.db");
+        link_file(&dedicated, &default_link);
+        let error = resolve_target_db(None, &ingest, Some(&protected), &[])
+            .expect_err("an existing default final-component symlink must refuse");
+        assert!(error.contains("final-component symlink"), "{error}");
+
+        let protected_link = tmp.path().join("protected-link.db");
+        link_file(&protected, &protected_link);
+        assert!(
+            resolve_target_db(
+                Some(protected_link.to_str().unwrap()),
+                tmp.path(),
+                Some(&protected),
+                &[],
+            )
+            .is_err(),
+            "a symlink to production must also refuse"
+        );
+
+        let independent_copy = tmp.path().join("independent-copy.db");
+        std::fs::copy(&protected, &independent_copy).unwrap();
+        assert_eq!(
+            resolve_target_db(
+                Some(independent_copy.to_str().unwrap()),
+                tmp.path(),
+                Some(&protected),
+                &[],
+            ),
+            Ok(independent_copy)
+        );
+        assert_eq!(std::fs::read(&protected).unwrap(), b"protected bytes");
+        assert_eq!(std::fs::read(&dedicated).unwrap(), b"dedicated bytes");
+        assert!(std::fs::symlink_metadata(&explicit_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&default_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

@@ -410,6 +410,52 @@ fn fts5_candidate_terms(raw_query: &str) -> Vec<String> {
     }
 }
 
+// The #3514 experiment substitutes only the FTS access path. The ordinary
+// production build always uses `fts_knowledge`; the feature-gated test scopes
+// two temporary index shapes around the same real knowledge.search dispatch.
+#[cfg(all(test, feature = "namespace-trigram-proto"))]
+#[derive(Clone)]
+enum NamespaceTrigramExperiment {
+    SlotTable { key: String },
+    Prefixed { key: String },
+}
+
+#[cfg(all(test, feature = "namespace-trigram-proto"))]
+tokio::task_local! {
+    static NAMESPACE_TRIGRAM_EXPERIMENT: NamespaceTrigramExperiment;
+}
+
+#[cfg(all(test, feature = "namespace-trigram-proto"))]
+fn prototype_fts_target(term: &str) -> Option<(&'static str, String)> {
+    NAMESPACE_TRIGRAM_EXPERIMENT
+        .try_with(Clone::clone)
+        .ok()
+        .map(|experiment| match experiment {
+            NamespaceTrigramExperiment::SlotTable { key } => (
+                "fts_knowledge",
+                format!(
+                    "namespace_key : {} AND {{slug name content}} : {term}",
+                    quote_fts5_phrase(&key)
+                ),
+            ),
+            NamespaceTrigramExperiment::Prefixed { key } => {
+                // Every input term came from quote_fts5_phrase above. Decode
+                // that single phrase before letting the prototype helper
+                // quote the trusted namespace envelope and the raw text.
+                let raw = term
+                    .strip_prefix('"')
+                    .and_then(|term| term.strip_suffix('"'))
+                    .expect("candidate terms are quoted FTS5 phrases")
+                    .replace("\"\"", "\"");
+                (
+                    "fts_knowledge_namespace_proto",
+                    khive_db::namespace_trigram_proto::scoped_match(&key, &raw)
+                        .expect("the fixture uses a valid namespace key"),
+                )
+            }
+        })
+}
+
 /// SQL eligibility predicate for the public atom/domain kind filter.
 ///
 /// Domain mirrors are atoms carrying the exact `type:domain` tag. Applying
@@ -477,6 +523,17 @@ impl FtsTermBudget {
 }
 
 fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
+    #[cfg(all(test, feature = "namespace-trigram-proto"))]
+    if let Some((table, scoped_term)) = prototype_fts_target(term) {
+        return SqlStatement {
+            sql: format!(
+                "SELECT rowid FROM {table} WHERE {table} MATCH ?1 \
+                 ORDER BY rowid LIMIT ?2"
+            ),
+            params: vec![SqlValue::Text(scoped_term), SqlValue::Integer(limit as i64)],
+            label: Some("knowledge.fts_rowids".into()),
+        };
+    }
     SqlStatement {
         sql: "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
               ORDER BY rowid LIMIT ?2"
@@ -487,6 +544,22 @@ fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
 }
 
 fn term_frequency_statement(term: &str) -> SqlStatement {
+    #[cfg(all(test, feature = "namespace-trigram-proto"))]
+    if let Some((table, scoped_term)) = prototype_fts_target(term) {
+        return SqlStatement {
+            sql: format!(
+                "SELECT count(*) AS frequency FROM ( \
+                     SELECT rowid FROM {table} WHERE {table} MATCH ?1 \
+                     ORDER BY rowid LIMIT ?2 \
+                 )"
+            ),
+            params: vec![
+                SqlValue::Text(scoped_term),
+                SqlValue::Integer((FTS_TERM_LIMIT + 1) as i64),
+            ],
+            label: Some("knowledge.fts_term_frequency".into()),
+        };
+    }
     SqlStatement {
         sql: "SELECT count(*) AS frequency FROM ( \
                   SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
@@ -907,6 +980,50 @@ async fn fetch_fts_candidates(
     #[cfg(test)]
     let reader = tests::record_term_probes(reader);
     let mut reader = reader;
+    #[cfg(all(test, feature = "namespace-trigram-proto"))]
+    if let Ok(experiment) = NAMESPACE_TRIGRAM_EXPERIMENT.try_with(Clone::clone) {
+        // The slot-table baseline resolves its namespace slot once per
+        // lexical pass. Both paired arms retain that indexed lookup, so their
+        // timings include the same key-read cost.
+        let key_row = match stage
+            .read(
+                LexicalPhase::ReaderOpen,
+                reader.query_row(SqlStatement {
+                    sql: "SELECT namespace_key FROM knowledge_fts_namespace_tokens \
+                          WHERE namespace = ?1"
+                        .into(),
+                    params: vec![SqlValue::Text(ns.into())],
+                    label: Some("knowledge.fts_namespace_key".into()),
+                }),
+            )
+            .await
+        {
+            Ok(row) => row,
+            Err(e) if is_timeout(&e) => {
+                return Ok(FtsFetchOutcome {
+                    atoms: Vec::new(),
+                    timeout: stage.timeout,
+                    state: LexicalCandidateState::TimedOut,
+                });
+            }
+            Err(e) => return Err(sql_err("search fts namespace key", e)),
+        };
+        let found = key_row
+            .as_ref()
+            .and_then(|row| row_str(row, "namespace_key"))
+            .ok_or_else(|| {
+                RuntimeError::Internal(format!("missing knowledge FTS namespace key for {ns:?}"))
+            })?;
+        let expected = match experiment {
+            NamespaceTrigramExperiment::SlotTable { key }
+            | NamespaceTrigramExperiment::Prefixed { key } => key,
+        };
+        if found != expected {
+            return Err(RuntimeError::Internal(
+                "prototype namespace key differs from slot-table baseline".into(),
+            ));
+        }
+    }
     let type_clause = type_eligibility_sql(type_filter, "a");
     let per_term_limit = if terms.len() == 1 {
         fetch_limit
@@ -1079,8 +1196,26 @@ async fn fetch_fts_candidates(
                      ORDER BY fts_knowledge.rowid \
                      LIMIT ?3"
                 );
+                let scoped_term = term.clone();
+                #[cfg(all(test, feature = "namespace-trigram-proto"))]
+                let (scoped_sql, scoped_term) =
+                    if let Some((table, match_expression)) = prototype_fts_target(term) {
+                        (
+                            format!(
+                                "SELECT a.* FROM {table} \
+                                 CROSS JOIN knowledge_atoms AS a ON a.rowid = {table}.rowid \
+                                 WHERE {table} MATCH ?1 \
+                                   AND +a.namespace = ?2 \
+                                   AND a.deleted_at IS NULL{scoped_status_clause}{type_clause} \
+                                 ORDER BY {table}.rowid LIMIT ?3"
+                            ),
+                            match_expression,
+                        )
+                    } else {
+                        (scoped_sql, scoped_term)
+                    };
                 let mut scoped_params = vec![
-                    SqlValue::Text(term.clone()),
+                    SqlValue::Text(scoped_term),
                     SqlValue::Text(ns.to_owned()),
                     SqlValue::Integer(per_term_limit as i64),
                 ];
@@ -1219,17 +1354,35 @@ async fn fetch_fts_candidates(
     // terms before exposing no_match, within the same lexical deadline.
     if !namespace_has_match {
         for term in unexhausted_terms {
+            let statement = SqlStatement {
+                sql: "SELECT 1 AS present FROM fts_knowledge \
+                      CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
+                      WHERE fts_knowledge MATCH ?1 AND +a.namespace = ?2 LIMIT 1"
+                    .into(),
+                params: vec![SqlValue::Text(term.clone()), SqlValue::Text(ns.to_owned())],
+                label: None,
+            };
+            #[cfg(all(test, feature = "namespace-trigram-proto"))]
+            let statement = if let Some((table, match_expression)) = prototype_fts_target(&term) {
+                SqlStatement {
+                    sql: format!(
+                        "SELECT 1 AS present FROM {table} \
+                         CROSS JOIN knowledge_atoms AS a ON a.rowid = {table}.rowid \
+                         WHERE {table} MATCH ?1 AND +a.namespace = ?2 LIMIT 1"
+                    ),
+                    params: vec![
+                        SqlValue::Text(match_expression),
+                        SqlValue::Text(ns.to_owned()),
+                    ],
+                    label: None,
+                }
+            } else {
+                statement
+            };
             let row = match stage
                 .read(
                     LexicalPhase::NamespaceExistence,
-                    reader.query_row(SqlStatement {
-                        sql: "SELECT 1 AS present FROM fts_knowledge \
-                              CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
-                              WHERE fts_knowledge MATCH ?1 AND +a.namespace = ?2 LIMIT 1"
-                            .into(),
-                        params: vec![SqlValue::Text(term), SqlValue::Text(ns.to_owned())],
-                        label: None,
-                    }),
+                    reader.query_row(statement),
                 )
                 .await
             {
@@ -4510,11 +4663,117 @@ pub(crate) async fn seed_low_overlap_corpus(runtime: &KhiveRuntime, n: u32, voca
 #[path = "lexical_timeout_tests.rs"]
 mod lexical_timeout_tests;
 
+#[cfg(all(test, feature = "namespace-trigram-proto"))]
+#[path = "namespace_trigram_proto_tests.rs"]
+mod namespace_trigram_proto_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use khive_storage::types::{SqlRow, StorageResult};
     use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "namespace-trigram-proto")]
+    pub(super) type PrototypePhaseTimes = Arc<Mutex<HashMap<&'static str, (u128, u64)>>>;
+
+    #[cfg(feature = "namespace-trigram-proto")]
+    tokio::task_local! {
+        static PROTOTYPE_PHASE_TIMES: PrototypePhaseTimes;
+    }
+
+    #[cfg(feature = "namespace-trigram-proto")]
+    pub(super) async fn with_prototype_phase_times<F: std::future::Future>(
+        timings: PrototypePhaseTimes,
+        future: F,
+    ) -> F::Output {
+        PROTOTYPE_PHASE_TIMES.scope(timings, future).await
+    }
+
+    #[cfg(feature = "namespace-trigram-proto")]
+    fn prototype_phase(sql: &str) -> &'static str {
+        let prefixed = sql.contains("fts_knowledge_namespace_proto");
+        if sql.starts_with("SELECT namespace_key FROM knowledge_fts_namespace_tokens") {
+            "namespace_key"
+        } else if sql.starts_with("SELECT count(*) AS frequency") {
+            if prefixed {
+                "term_frequency_prefixed"
+            } else {
+                "term_frequency_slot_table"
+            }
+        } else if sql.starts_with("SELECT rowid FROM") {
+            if prefixed {
+                "phase_a_rowids_prefixed"
+            } else {
+                "phase_a_rowids_slot_table"
+            }
+        } else if sql.starts_with("SELECT a.* FROM fts_") {
+            if prefixed {
+                "eligibility_fallback_prefixed"
+            } else {
+                "eligibility_fallback_slot_table"
+            }
+        } else if sql.starts_with("SELECT a.*, a.rowid AS rowid") {
+            "phase_b_hydration"
+        } else if sql.starts_with("SELECT 1 AS present FROM fts_") {
+            if prefixed {
+                "namespace_existence_prefixed"
+            } else {
+                "namespace_existence_slot_table"
+            }
+        } else if sql.starts_with("SELECT 1 AS present FROM knowledge_atoms") {
+            "namespace_membership"
+        } else {
+            "other_lexical_read"
+        }
+    }
+
+    #[cfg(feature = "namespace-trigram-proto")]
+    struct PrototypeTimingReader {
+        inner: Box<dyn khive_storage::SqlReader>,
+        timings: PrototypePhaseTimes,
+    }
+
+    #[cfg(feature = "namespace-trigram-proto")]
+    impl PrototypeTimingReader {
+        fn record(&self, sql: &str, elapsed: std::time::Duration) {
+            let mut timings = self.timings.lock().expect("prototype phase timings");
+            let sample = timings.entry(prototype_phase(sql)).or_default();
+            sample.0 += elapsed.as_nanos();
+            sample.1 += 1;
+        }
+    }
+
+    #[cfg(feature = "namespace-trigram-proto")]
+    #[async_trait::async_trait]
+    impl khive_storage::SqlReader for PrototypeTimingReader {
+        async fn query_row(&mut self, statement: SqlStatement) -> StorageResult<Option<SqlRow>> {
+            let started = std::time::Instant::now();
+            let result = self.inner.query_row(statement.clone()).await;
+            self.record(&statement.sql, started.elapsed());
+            result
+        }
+
+        async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            let started = std::time::Instant::now();
+            let result = self.inner.query_all(statement.clone()).await;
+            self.record(&statement.sql, started.elapsed());
+            result
+        }
+
+        async fn query_scalar(
+            &mut self,
+            statement: SqlStatement,
+        ) -> StorageResult<Option<SqlValue>> {
+            let started = std::time::Instant::now();
+            let result = self.inner.query_scalar(statement.clone()).await;
+            self.record(&statement.sql, started.elapsed());
+            result
+        }
+
+        async fn explain(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            self.inner.explain(statement).await
+        }
+    }
 
     tokio::task_local! {
         static TERM_PROBES: Arc<Mutex<Vec<SqlStatement>>>;
@@ -4564,10 +4823,15 @@ mod tests {
     pub(super) fn record_term_probes(
         inner: Box<dyn khive_storage::SqlReader>,
     ) -> Box<dyn khive_storage::SqlReader> {
-        match TERM_PROBES.try_with(Arc::clone) {
+        let inner: Box<dyn khive_storage::SqlReader> = match TERM_PROBES.try_with(Arc::clone) {
             Ok(probes) => Box::new(TermRecordingReader { inner, probes }),
             Err(_) => inner,
+        };
+        #[cfg(feature = "namespace-trigram-proto")]
+        if let Ok(timings) = PROTOTYPE_PHASE_TIMES.try_with(Arc::clone) {
+            return Box::new(PrototypeTimingReader { inner, timings });
         }
+        inner
     }
 
     fn distinct_term_query(count: usize) -> String {

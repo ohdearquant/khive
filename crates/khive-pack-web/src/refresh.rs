@@ -199,7 +199,7 @@ fn vary_is_replayable(vary: &Value, headers: &[(String, String)]) -> bool {
 }
 
 /// A 304's new Vary describes the request that actually reached the origin.
-/// The client fixes gzip on that wire request even for a legacy body whose
+/// The client fixes identity on that wire request even for a legacy body whose
 /// stored map predates the encoding field. The cached-body gate above still
 /// requires an explicit stored selector before sending a later validator.
 fn vary_is_represented_on_wire(vary: &Value, headers: &[(String, String)]) -> bool {
@@ -215,12 +215,27 @@ fn vary_is_represented_on_wire(vary: &Value, headers: &[(String, String)]) -> bo
     vary_is_replayable(vary, &effective)
 }
 
+fn stored_legacy_gzip_body(properties: &Value) -> bool {
+    properties
+        .pointer("/request_headers/accept-encoding")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values.len() == 1 && values[0].as_str() == Some(crate::fetch::LEGACY_ACCEPT_ENCODING)
+        })
+}
+
 fn conditional_headers_for_hop(
     properties: &Value,
     original_url: &Url,
     current_url: &Url,
     first_hop: bool,
 ) -> Vec<(String, String)> {
+    // A legacy gzip-negotiated body may have passed through the old decoder.
+    // Replaying its selector as identity does not make its cached bytes an
+    // identity representation. Fetch a body under identity before validating.
+    if stored_legacy_gzip_body(properties) {
+        return Vec::new();
+    }
     let Ok(negotiation) = crate::fetch::stored_negotiation_headers(properties) else {
         return Vec::new();
     };
@@ -267,6 +282,7 @@ async fn run_refresh(
     resolver: &dyn Resolver,
     cfg: &khive_runtime::engine_config::WebSectionConfig,
     params: RefreshParams,
+    clients: &egress::PinnedClients,
 ) -> Result<Value, RuntimeError> {
     let entities = runtime.entities(token)?;
     let entity = entities.get_entity(params.id).await?.ok_or_else(|| {
@@ -317,35 +333,37 @@ async fn run_refresh(
     let original_url = url.clone();
     let mut first_hop = true;
     let mut first_observed_hop = true;
-    let (outcome, redirect_hops, terminal_request_snapshot) = crate::fetch::run_hop_chain_observed(
-        resolver,
-        cfg,
-        url,
-        reqwest::Method::GET,
-        max_bytes,
-        deadline,
-        |current_url| {
-            let initial = std::mem::take(&mut first_hop);
-            refresh_headers_for_hop(&properties, &original_url, current_url, initial)
-        },
-        |current_url| {
-            let initial = std::mem::take(&mut first_observed_hop);
-            async move {
-                // The original row was already read before the first request.
-                // Only redirected hops need a separate terminal-row snapshot.
-                if initial {
-                    return Ok(None);
+    let (outcome, redirect_hops, terminal_request_snapshot) =
+        crate::fetch::run_hop_chain_with_clients_observed(
+            clients,
+            resolver,
+            cfg,
+            url,
+            reqwest::Method::GET,
+            max_bytes,
+            deadline,
+            |current_url| {
+                let initial = std::mem::take(&mut first_hop);
+                refresh_headers_for_hop(&properties, &original_url, current_url, initial)
+            },
+            |current_url| {
+                let initial = std::mem::take(&mut first_observed_hop);
+                async move {
+                    // The original row was already read before the first request.
+                    // Only redirected hops need a separate terminal-row snapshot.
+                    if initial {
+                        return Ok(None);
+                    }
+                    let document_id = document_id_for_url(&current_url);
+                    let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
+                    if let Some(entity) = &snapshot {
+                        crate::entities::require_entity_namespace(token, entity)?;
+                    }
+                    Ok(snapshot)
                 }
-                let document_id = document_id_for_url(&current_url);
-                let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
-                if let Some(entity) = &snapshot {
-                    crate::entities::require_entity_namespace(token, entity)?;
-                }
-                Ok(snapshot)
-            }
-        },
-    )
-    .await?;
+            },
+        )
+        .await?;
 
     settle_refresh_from_snapshot(
         runtime,
@@ -819,8 +837,18 @@ async fn settle_refresh_from_snapshot(
                 &response_content_ref,
                 outcome.status,
                 &outcome.headers,
-                (!redirect_hops.is_empty() && final_id != id && body_present)
-                    .then_some(request_headers),
+                ((!redirect_hops.is_empty() && final_id != id && body_present)
+                    || (redirect_hops.is_empty()
+                        && outcome.status == 200
+                        && body_present
+                        && source_snapshot
+                            .properties
+                            .as_ref()
+                            .is_some_and(|properties| {
+                                stored_legacy_gzip_body(properties)
+                                    && crate::fetch::stored_negotiation_headers(properties).is_ok()
+                            })))
+                .then_some(request_headers),
             )
             .await?
         }
@@ -940,6 +968,7 @@ impl WebPack {
             &SystemResolver,
             &self.runtime.config().web,
             params,
+            &egress::PinnedClients::default(),
         )
         .await
     }
@@ -1388,8 +1417,9 @@ mod tests {
             let cfg = Default::default();
             // Arm the watchdog after the stored-entity read completes and DNS
             // begins, so paused time cannot race the database's blocking task.
+            let clients = egress::PinnedClients::default();
             let error = tokio::select! {
-                result = run_refresh(&runtime, &token, &resolver, &cfg, params) => result.unwrap_err(),
+                result = run_refresh(&runtime, &token, &resolver, &cfg, params, &clients) => result.unwrap_err(),
                 () = async {
                     resolver.pending_started.notified().await;
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1429,7 +1459,7 @@ mod tests {
                 "status": 200,
                 "vary": [],
                 "content_language": null,
-                "request_headers": {"accept-encoding": ["gzip"]}
+                "request_headers": {"accept-encoding": ["identity"]}
             }),
         )
         .await

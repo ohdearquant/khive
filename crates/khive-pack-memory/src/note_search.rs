@@ -161,10 +161,12 @@ impl NoteSearchAnnProvider for MemoryNoteSearchAnnProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_pack_kg::KgPack;
     use khive_runtime::pack::PackRuntime;
-    use khive_runtime::{BackendId, Namespace, RuntimeConfig};
+    use khive_runtime::{BackendId, Namespace, RuntimeConfig, VerbRegistryBuilder};
     use khive_storage::types::VectorSearchRequest;
     use khive_types::SubstrateKind;
+    use serde_json::json;
     use serial_test::serial;
     use std::sync::Arc;
 
@@ -410,6 +412,78 @@ mod tests {
     #[tokio::test]
     #[serial(note_search_ann)]
     #[serial_test::serial(config_ledger)]
+    async fn db_diagnostics_handler_reports_note_search_route_totals() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(&dir.path().join("route-diagnostics.db"), "main", true);
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        let pack = MemoryPack::new(rt.clone());
+        let ann = pack.ann.clone();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+        let id = seed(&rt, &token, "route diagnostics note")
+            .await
+            .to_string();
+        let search = json!({"kind": "note", "query": "route diagnostics note"});
+
+        let (_, fallback_before) = khive_runtime::note_search_ann::route_totals();
+        let cold = registry
+            .dispatch("search", search.clone())
+            .await
+            .expect("cold note search");
+        assert!(cold.as_array().is_some_and(|hits| hits
+            .iter()
+            .any(|hit| hit["id"].as_str() == Some(id.as_str())
+                && hit["signals"]["vector_similarity"].is_number())));
+        let (ann_after_cold, fallback_after_cold) = khive_runtime::note_search_ann::route_totals();
+        assert!(fallback_after_cold > fallback_before);
+
+        registry.call_register_note_search_ann_providers(&rt);
+        ann::ensure_ann_for_model(&rt, &token, &ann, MODEL)
+            .await
+            .expect("warm note-search graph");
+        assert!(ann::read_note_search_watermark(&rt, MODEL)
+            .await
+            .expect("consumer watermark")
+            .is_some_and(|watermark| watermark >= 0));
+        let hot = registry
+            .dispatch("search", search)
+            .await
+            .expect("warm note search");
+        assert!(hot.as_array().is_some_and(|hits| hits
+            .iter()
+            .any(|hit| hit["id"].as_str() == Some(id.as_str())
+                && hit["signals"]["vector_similarity"].is_number())));
+        let (ann_after_hot, fallback_after_hot) = khive_runtime::note_search_ann::route_totals();
+        assert!(ann_after_hot > ann_after_cold);
+
+        let report = registry
+            .dispatch("db_diagnostics", json!({}))
+            .await
+            .expect("public db_diagnostics handler");
+        let reported_ann = report["note_search_ann_route_total"]
+            .as_u64()
+            .expect("ANN route total");
+        let reported_fallback = report["note_search_fallback_route_total"]
+            .as_u64()
+            .expect("fallback route total");
+        assert!(reported_ann >= ann_after_hot);
+        assert!(reported_fallback >= fallback_after_hot);
+        assert!(report["databases"][0]["error"].is_null());
+        assert_eq!(
+            report["databases"][0]["diagnostics"]["note_search_ann_route_total"],
+            reported_ann
+        );
+        assert_eq!(
+            report["databases"][0]["diagnostics"]["note_search_fallback_route_total"],
+            reported_fallback
+        );
+    }
+
+    #[tokio::test]
+    #[serial(note_search_ann)]
+    #[serial_test::serial(config_ledger)]
     async fn note_search_old_memory_graph_waits_for_its_own_full_checkpoint() {
         let dir = tempfile::tempdir().expect("tempdir");
         let rt = runtime(&dir.path().join("old-graph.db"), "main", true);
@@ -491,6 +565,59 @@ mod tests {
         assert_eq!(
             fallback_after, fallback_before,
             "warm suite cannot silently scan"
+        );
+    }
+
+    /// ADR-166 G5: count rows at the runtime's post-fusion hydration seam,
+    /// including the note-search ANN consumer's fresh-tail candidate.
+    #[tokio::test]
+    #[serial(note_search_ann)]
+    #[serial_test::serial(config_ledger)]
+    async fn hot_path_guard_g5_note_search_hydration_stays_within_candidate_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let rt = runtime(&dir.path().join("g5.db"), "main", true);
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        let pack = MemoryPack::new(rt.clone());
+        pack.register_note_search_ann_provider(&rt);
+        for index in 0..40 {
+            seed(&rt, &token, &format!("g5 candidate note {index}")).await;
+        }
+        warm(&rt, &token, &pack).await;
+        seed(&rt, &token, "g5 candidate note fresh tail").await;
+        let query = rt.embed_query("g5 candidate note").await.expect("query");
+        let before = rt
+            .db_diagnostics()
+            .await
+            .expect("diagnostics before search");
+
+        let limit = 3;
+        let hits = rt
+            .search_notes(
+                &token,
+                "g5 candidate note",
+                Some(query),
+                limit,
+                None,
+                false,
+                &[],
+                None,
+            )
+            .await
+            .expect("warm note search");
+
+        let after = rt.db_diagnostics().await.expect("diagnostics after search");
+        let hydrated = after.search_mechanism.note_candidate_hydration_rows
+            - before.search_mechanism.note_candidate_hydration_rows;
+        assert_eq!(hits.len(), limit as usize);
+        assert!(
+            hydrated >= hits.len() as u64,
+            "returned notes must have been hydrated: {hydrated}"
+        );
+        let per_arm = u64::from(limit) * 4;
+        let fresh_tail = 1;
+        assert!(
+            hydrated <= per_arm * 2 + fresh_tail,
+            "post-fusion hydration exceeded two bounded arms plus fresh tail: {hydrated}"
         );
     }
 

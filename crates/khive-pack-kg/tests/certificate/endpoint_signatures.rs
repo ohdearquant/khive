@@ -61,6 +61,16 @@ fn signatures(triples: &[(String, String, String)]) -> Vec<(String, Vec<(String,
 /// SYSTEM_ROLE_EXCEPTIONS entry with a FailsEliminator disposition (coverage.rs).
 const D3_RATIFIED_COLLISIONS: &[(&str, &str)] = &[("refutes", "supports")];
 
+/// Signature collisions resolved by a passing Er fixture in the later relation's
+/// certificate (CERTIFIED_RELATIONS in coverage.rs), rather than by system role.
+///
+/// This list is CLOSED and separate from `D3_RATIFIED_COLLISIONS`.  `located_in` (ADR-196)
+/// and `extends` both carry the single base pair `concept -> concept`; the `located_in`
+/// certificate defeats Er with a fixture in which an organ occupies a space it does not
+/// constitute.  A new collision must not be silenced by appending here without a passing Er
+/// fixture for one of the two relations.
+const CERTIFIED_ER_COLLISIONS: &[(&str, &str)] = &[("extends", "located_in")];
+
 /// Endpoint-signature collision tripwire (supplementary Er signal, ADR-076 §D2).
 ///
 /// Flags any pair of distinct relations that share an identical (source, target)
@@ -71,7 +81,8 @@ const D3_RATIFIED_COLLISIONS: &[(&str, &str)] = &[("refutes", "supports")];
 ///
 /// Uses the real live rules from khive-runtime and khive-pack-kg — not copies.
 #[test]
-fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_d3_ratified_collisions() {
+fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_ratified_and_certified_collisions(
+) {
     // Collect live base entity endpoint rules from khive-runtime.
     let mut all_triples: Vec<(String, String, String)> = base_entity_endpoint_rules()
         .iter()
@@ -98,7 +109,9 @@ fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_d3_ratified_co
                 let mut pair = [rel_a.as_str(), rel_b.as_str()];
                 pair.sort_unstable();
                 let normalised = (pair[0], pair[1]);
-                if !D3_RATIFIED_COLLISIONS.contains(&normalised) {
+                if !D3_RATIFIED_COLLISIONS.contains(&normalised)
+                    && !CERTIFIED_ER_COLLISIONS.contains(&normalised)
+                {
                     collisions.push((rel_a.clone(), rel_b.clone()));
                 }
             }
@@ -132,6 +145,55 @@ fn d3_ratified_collisions_is_exactly_refutes_supports() {
          (\"refutes\", \"supports\"); silencing a new collision by appending here bypasses \
          the Er-eliminator analysis gate — resolve via the certificate admission path or a \
          FailsEliminator disposition in SYSTEM_ROLE_EXCEPTIONS instead"
+    );
+}
+
+/// Guard: `CERTIFIED_ER_COLLISIONS` is a closed list containing exactly the one certified case.
+///
+/// Appending to it to suppress a new collision must update this equality, which forces
+/// reviewer attention; the entry needs a passing Er fixture in coverage.rs's certificate for
+/// `located_in` (or the relation that replaces it).
+#[test]
+fn certified_er_collisions_is_exactly_extends_located_in() {
+    assert_eq!(
+        CERTIFIED_ER_COLLISIONS,
+        &[("extends", "located_in")],
+        "CERTIFIED_ER_COLLISIONS must contain exactly the one ADR-196 case \
+         (\"extends\", \"located_in\"); a new collision is resolved by a passing Er fixture \
+         in the relation's certificate, then recorded here deliberately"
+    );
+}
+
+/// The `extends`/`located_in` collision is present and resolved by the `located_in` Er fixture.
+///
+/// Asserts the collision is real, so a rule change that removes it (or adds a base row for
+/// `located_in` beyond `concept -> concept`) fails here for investigation rather than leaving
+/// a stale exemption behind.
+#[test]
+fn extends_and_located_in_share_the_concept_to_concept_signature_adr196() {
+    let base_triples: Vec<(String, String, String)> = base_entity_endpoint_rules()
+        .iter()
+        .map(|(src, rel, tgt)| (src.to_string(), rel.as_str().to_string(), tgt.to_string()))
+        .collect();
+    let base_sigs = signatures(&base_triples);
+    let pairs_of = |name: &str| {
+        base_sigs
+            .iter()
+            .find(|(r, _)| r == name)
+            .map(|(_, p)| p.clone())
+            .unwrap_or_else(|| panic!("{name} must appear in base rules"))
+    };
+    let located_in = pairs_of("located_in");
+    assert_eq!(
+        located_in,
+        vec![("concept".to_string(), "concept".to_string())],
+        "located_in's base contract is exactly one row, `concept -> concept` (ADR-196 D1)"
+    );
+    assert_eq!(
+        pairs_of("extends"),
+        located_in,
+        "extends and located_in are expected to share the concept -> concept signature; \
+         if this fails, revisit CERTIFIED_ER_COLLISIONS"
     );
 }
 
