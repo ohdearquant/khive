@@ -839,18 +839,19 @@ fn error_with_disposition(error: Value, disposition: DomainDisposition) -> Value
 ///
 /// When `khive_cfg` is supplied and contains a non-empty `[[backends]]`
 /// declaration, the backend topology (sorted backend list, explicit read-only
-/// modes, served-substrate declarations, and pack→backend assignments) is
-/// folded into the fingerprint so that two configs differing only in routing
-/// or access mode produce different ids (ADR-049 / B-SHOULD-FIX-4).
-/// Delimiter-free topologies retain their legacy
-/// spelling; a topology containing reserved delimiter text uses an injective,
-/// escaped v2 encoding so path data can never impersonate access mode.
+/// modes, effective WAL ceilings, served-substrate declarations, and
+/// pack→backend assignments) is
+/// folded into the fingerprint so that two configs differing only in routing,
+/// access mode, or effective ceiling produce different ids (ADR-049 / B-SHOULD-FIX-4).
+/// Delimiter-free topologies retain their legacy field encoding; a topology
+/// containing reserved delimiter text uses an injective, escaped v2 encoding
+/// so path data can never impersonate access mode.
 ///
-/// When `khive_cfg` is `None` or its `backends` list is empty, a writable
-/// target remains byte-identical to what it would have been before this
-/// parameter was added. An existing path with no filesystem write bits gains
-/// the read-only backend marker before the runtime opens it, so forwarding and
-/// server fingerprints converge.
+/// When `khive_cfg` is `None` or its `backends` list is empty, the implicit
+/// main backend's effective WAL ceiling is folded into the `backend` field.
+/// An existing path with no filesystem write bits gains the read-only backend
+/// marker before the runtime opens it, so forwarding and server fingerprints
+/// converge.
 ///
 /// `config.db_path` and each declared backend path are canonicalized against
 /// the process's current working directory before entering the fingerprint. A
@@ -913,11 +914,10 @@ fn configured_storage_read_only(
 /// source but cannot safely share a warm daemon with it: the writable daemon
 /// would omit the audit advisory and could retain a write-capable file handle.
 /// Fold the effective main-backend mode into the existing `backend` component
-/// so the mismatch remains parseable as a structured backend mismatch without
-/// changing the legacy fingerprint for writable runtimes. Pre-open callers
-/// that have already applied a storage override (for example, multi-backend
-/// `--db :memory:`) must use this form rather than re-reading the superseded
-/// declaration through [`compute_config_id`].
+/// so the mismatch remains parseable as a structured backend mismatch.
+/// Pre-open callers that have already applied a storage override (for example,
+/// multi-backend `--db :memory:`) must use this form rather than re-reading
+/// the superseded declaration through [`compute_config_id`].
 pub fn compute_config_id_with_storage_mode(
     config: &RuntimeConfig,
     khive_cfg: Option<&khive_runtime::KhiveConfig>,
@@ -1001,10 +1001,33 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     );
     let telemetry = format!("{:x}", telemetry_hasher.finalize());
 
-    let backend = if storage_read_only {
-        format!("{:?}:read_only", config.backend_id)
+    // The daemon compatibility parser compares this existing `backend` field.
+    // For a declared topology, main uses the same effective value as its row
+    // below; without one, RuntimeConfig already holds the resolved implicit
+    // main value. Read-only storage has no writer ceiling even when a value
+    // was configured for a writable deployment.
+    let main_wal_ceiling_bytes = if storage_read_only {
+        0
     } else {
-        format!("{:?}", config.backend_id)
+        khive_cfg
+            .and_then(|cfg| {
+                cfg.backends
+                    .iter()
+                    .find(|backend| backend.name == khive_runtime::BackendId::MAIN)
+            })
+            .map(|backend| effective_named_wal_ceiling_bytes(config, backend))
+            .unwrap_or(config.wal_ceiling_bytes)
+    };
+    let backend = if storage_read_only {
+        format!(
+            "{:?}:read_only:wal_ceiling_bytes={main_wal_ceiling_bytes}",
+            config.backend_id
+        )
+    } else {
+        format!(
+            "{:?}:wal_ceiling_bytes={main_wal_ceiling_bytes}",
+            config.backend_id
+        )
     };
     // `display_timezone` is part of daemon identity, not merely of rendering
     // (ADR-169). `gtd.assign` anchors a date-only `due` through
@@ -1053,11 +1076,11 @@ pub(crate) fn compute_config_id_with_runtime_policies(
 
     // Fold backend topology when non-empty so two configs differing only in
     // pack→backend routing produce different config_ids (ADR-049).
-    // When backends is empty this branch is skipped, preserving byte-identity
-    // with the pre-change fingerprint.
+    // When backends is empty this branch is skipped; the implicit main ceiling
+    // is already included in the `backend` component above.
     let topology = khive_cfg
         .filter(|cfg| !cfg.backends.is_empty())
-        .map(encode_backend_topology)
+        .map(|cfg| encode_backend_topology(cfg, config))
         .unwrap_or_default();
 
     format!("{base}{topology}")
@@ -1066,7 +1089,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
 /// Reserved syntax in the legacy topology spelling.
 ///
 /// Keeping the legacy representation when every caller-controlled component
-/// excludes these bytes preserves existing warm-daemon identities without
+/// excludes these bytes avoids needless changes to topology encoding without
 /// retaining its ambiguity. The v2 marker itself contains `|`, so a safe
 /// legacy value can never equal a v2 value.
 fn legacy_topology_component_is_safe(value: &str) -> bool {
@@ -1103,9 +1126,25 @@ fn format_served_kinds_suffix(served_kinds: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
+/// Only the ceiling enforced by a writable SQLite backend participates in
+/// daemon identity. The configured value and its source remain operator
+/// diagnostics; a read-only or in-memory backend enforces no writer policy.
+fn effective_named_wal_ceiling_bytes(
+    config: &RuntimeConfig,
+    backend: &khive_runtime::BackendConfig,
+) -> u64 {
+    if backend.read_only || backend.kind != khive_runtime::BackendKind::Sqlite {
+        0
+    } else {
+        backend
+            .wal_ceiling_bytes
+            .unwrap_or(config.wal_ceiling_configured_bytes)
+    }
+}
+
+fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig, config: &RuntimeConfig) -> String {
     let mut legacy_safe = true;
-    let mut backend_rows: Vec<(String, String, String, bool, Option<String>)> = cfg
+    let mut backend_rows: Vec<(String, String, String, bool, Option<String>, u64)> = cfg
         .backends
         .iter()
         .map(|backend| {
@@ -1134,6 +1173,7 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
                 path,
                 backend.read_only,
                 served_kinds,
+                effective_named_wal_ceiling_bytes(config, backend),
             )
         })
         .collect();
@@ -1157,10 +1197,12 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     let (backends, pack_backends) = if legacy_safe {
         let backends = backend_rows
             .iter()
-            .map(|(name, kind, path, is_read_only, served_kinds)| {
+            .map(|(name, kind, path, is_read_only, served_kinds, wal_ceiling_bytes)| {
                 let read_only = if *is_read_only { ":read_only" } else { "" };
                 let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
-                format!("{name}:{kind}:{path}{read_only}{served_kinds}")
+                format!(
+                    "{name}:{kind}:{path}{read_only}{served_kinds}:wal_ceiling_bytes={wal_ceiling_bytes}"
+                )
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -1179,16 +1221,18 @@ fn encode_backend_topology(cfg: &khive_runtime::KhiveConfig) -> String {
     } else {
         let backends = backend_rows
             .iter()
-            .map(|(name, kind, path, read_only, served_kinds)| {
-                let mode = if *read_only { "r" } else { "w" };
-                let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
-                format!(
-                    "{}:{}:{}:{mode}{served_kinds}",
-                    escape_topology_component(name),
-                    escape_topology_component(kind),
-                    escape_topology_component(path),
-                )
-            })
+            .map(
+                |(name, kind, path, read_only, served_kinds, wal_ceiling_bytes)| {
+                    let mode = if *read_only { "r" } else { "w" };
+                    let served_kinds = format_served_kinds_suffix(served_kinds.as_deref());
+                    format!(
+                        "{}:{}:{}:{mode}{served_kinds}:wal_ceiling_bytes={wal_ceiling_bytes}",
+                        escape_topology_component(name),
+                        escape_topology_component(kind),
+                        escape_topology_component(path),
+                    )
+                },
+            )
             .collect::<Vec<_>>()
             .join(",");
         let pack_backends = pack_rows
@@ -11377,6 +11421,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("./data/main.db")),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -11431,6 +11476,7 @@ mod tests {
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -11440,6 +11486,7 @@ mod tests {
                     path: Some(path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -11465,9 +11512,8 @@ mod tests {
     }
 
     /// The collision fix is deliberately conditional: ordinary topology
-    /// components that contain no reserved syntax keep their existing daemon
-    /// identity, avoiding an unnecessary one-time fallback/restart for the
-    /// overwhelmingly common configuration shape.
+    /// components that contain no reserved syntax keep the legacy spelling
+    /// of the path and mode fields.
     #[test]
     #[serial_test::serial(config_ledger)]
     fn config_id_preserves_legacy_topology_spelling_when_delimiter_free() {
@@ -11488,6 +11534,7 @@ mod tests {
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -11502,14 +11549,137 @@ mod tests {
         };
 
         let expected_suffix = format!(
-            ";backends=[main:Sqlite:{}];pack_backends=[kg=main]",
+            ";backends=[main:Sqlite:{}:wal_ceiling_bytes=0];pack_backends=[kg=main]",
             canonical_fingerprint_path(&main_path)
         );
         let config_id = compute_config_id(&runtime, Some(&topology));
         assert!(
             config_id.ends_with(&expected_suffix),
-            "delimiter-free topologies must retain their legacy fingerprint spelling; got {config_id}"
+            "delimiter-free topologies must retain the legacy field encoding; got {config_id}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn config_id_folds_effective_wal_ceiling_bytes() {
+        use khive_runtime::{BackendConfig, BackendKind, KhiveConfig, WalCeilingSource};
+
+        let dir = tempfile::tempdir().expect("WAL ceiling fingerprint tempdir");
+        let main_path = dir.path().join("main.db");
+        let archive_path = dir.path().join("archive.db");
+        let default_runtime = RuntimeConfig {
+            db_path: Some(main_path.clone()),
+            packs: vec!["kg".to_string()],
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_env_raw: None,
+            wal_ceiling_source: WalCeilingSource::Default,
+            ..RuntimeConfig::no_embeddings()
+        };
+        let env_runtime = RuntimeConfig {
+            wal_ceiling_bytes: 8192,
+            wal_ceiling_configured_bytes: 8192,
+            wal_ceiling_env_raw: Some("8192".to_string()),
+            wal_ceiling_source: WalCeilingSource::Environment,
+            ..default_runtime.clone()
+        };
+        let explicit_zero_runtime = RuntimeConfig {
+            wal_ceiling_env_raw: Some("0".to_string()),
+            wal_ceiling_source: WalCeilingSource::Environment,
+            ..default_runtime.clone()
+        };
+
+        let implicit_zero = compute_config_id(&default_runtime, None);
+        let implicit_nonzero = compute_config_id(&env_runtime, None);
+        assert_eq!(
+            implicit_zero,
+            compute_config_id(&explicit_zero_runtime, None)
+        );
+        assert_ne!(implicit_zero, implicit_nonzero);
+        assert!(implicit_zero.contains(&format!(
+            "backend={:?}:wal_ceiling_bytes=0",
+            default_runtime.backend_id
+        )));
+        assert!(implicit_nonzero.contains(&format!(
+            "backend={:?}:wal_ceiling_bytes=8192",
+            default_runtime.backend_id
+        )));
+        assert!(!khive_runtime::daemon::config_ids_compatible(
+            &implicit_zero,
+            &implicit_nonzero
+        ));
+
+        let backend = |name: &str, path: std::path::PathBuf, wal_ceiling_bytes| BackendConfig {
+            name: name.to_string(),
+            kind: BackendKind::Sqlite,
+            path: Some(path),
+            cache_mb: None,
+            journal_mode: None,
+            wal_ceiling_bytes,
+            served_kinds: None,
+            read_only: false,
+        };
+        let env_topology = KhiveConfig {
+            backends: vec![
+                backend("archive", archive_path.clone(), None),
+                backend("main", main_path.clone(), None),
+            ],
+            ..KhiveConfig::default()
+        };
+        let mut field_topology = env_topology.clone();
+        for backend in &mut field_topology.backends {
+            backend.wal_ceiling_bytes = Some(8192);
+        }
+        let from_env = compute_config_id(&env_runtime, Some(&env_topology));
+        let from_fields = compute_config_id(&default_runtime, Some(&field_topology));
+        assert_eq!(
+            from_env, from_fields,
+            "only effective values define identity"
+        );
+        assert!(from_fields.contains(&format!(
+            "backend={:?}:wal_ceiling_bytes=8192",
+            default_runtime.backend_id
+        )));
+        assert!(from_fields.contains("archive:Sqlite:"));
+        assert!(from_fields.contains(":wal_ceiling_bytes=8192"));
+
+        let mut reversed = field_topology.clone();
+        reversed.backends.reverse();
+        assert_eq!(
+            from_fields,
+            compute_config_id(&default_runtime, Some(&reversed))
+        );
+
+        let mut changed = field_topology.clone();
+        changed.backends[0].wal_ceiling_bytes = Some(8193);
+        let changed_id = compute_config_id(&default_runtime, Some(&changed));
+        assert_ne!(from_fields, changed_id);
+        assert!(!khive_runtime::daemon::config_ids_compatible(
+            &from_fields,
+            &changed_id
+        ));
+
+        let mut explicit_zero_topology = env_topology.clone();
+        for backend in &mut explicit_zero_topology.backends {
+            backend.wal_ceiling_bytes = Some(0);
+        }
+        assert_eq!(
+            compute_config_id(&default_runtime, Some(&env_topology)),
+            compute_config_id(&default_runtime, Some(&explicit_zero_topology))
+        );
+
+        let mut read_only = explicit_zero_topology.clone();
+        read_only.backends[1].read_only = true;
+        let read_only_zero = compute_config_id(&default_runtime, Some(&read_only));
+        read_only.backends[1].wal_ceiling_bytes = Some(8192);
+        let read_only_configured = compute_config_id(&default_runtime, Some(&read_only));
+        assert_eq!(read_only_zero, read_only_configured);
+        assert!(read_only_configured.contains(&format!(
+            "backend={:?}:read_only:wal_ceiling_bytes=0",
+            default_runtime.backend_id
+        )));
+        assert!(read_only_configured.contains("main:Sqlite:"));
+        assert!(read_only_configured.contains(":read_only:wal_ceiling_bytes=0"));
     }
 
     #[test]
@@ -11530,6 +11700,7 @@ mod tests {
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds,
                 read_only: false,
             }],
@@ -11567,6 +11738,7 @@ mod tests {
             path: None,
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: served_kinds.clone(),
             read_only: false,
         };
@@ -11585,8 +11757,9 @@ mod tests {
             ..KhiveConfig::default()
         };
 
-        let legacy_encoded = encode_backend_topology(&legacy_topology);
-        let escaped_encoded = encode_backend_topology(&escaped_topology);
+        let runtime = RuntimeConfig::no_embeddings();
+        let legacy_encoded = encode_backend_topology(&legacy_topology, &runtime);
+        let escaped_encoded = encode_backend_topology(&escaped_topology, &runtime);
 
         // `BTreeSet<SubstrateKind>` iterates in discriminant order (Note=0,
         // Entity=1), so the joined suffix is "note+entity", not input order.
@@ -11627,6 +11800,7 @@ mod tests {
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -11691,6 +11865,7 @@ mod tests {
                 path: runtime.db_path.clone(),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],

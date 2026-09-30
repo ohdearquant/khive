@@ -57,7 +57,7 @@ use khive_mcp::serve::{
     apply_env_output_format, build_server_multi_backend_with_db_anchor,
     build_single_backend_runtime, config_discovery_db_anchor, enforce_strict_actor_mode,
     normalize_redundant_db_override_with_source, reject_conflicting_db_override_with_source,
-    validate_declared_backend_access_modes, RuntimeConfigInputs,
+    validate_declared_backend_access_modes, validate_wal_ceiling_topology, RuntimeConfigInputs,
 };
 use khive_mcp::server::KhiveMcpServer;
 #[cfg(unix)]
@@ -2136,6 +2136,8 @@ fn disclose_resolved_database(cfg: &RuntimeConfig, khive_cfg: &KhiveConfig) {
     let line =
         khive_mcp::serve::resolved_database_disclosure(cfg.db_path.as_deref(), &khive_cfg.backends);
     let _ = writeln!(std::io::stderr(), "{line}");
+    let wal_line = khive_mcp::serve::resolved_wal_ceiling_disclosure(cfg, &khive_cfg.backends);
+    let _ = writeln!(std::io::stderr(), "{wal_line}");
 }
 
 fn disclose_resolved_actor(cfg: &RuntimeConfig) {
@@ -2392,6 +2394,7 @@ async fn run_exec_inline_with_forward(
     if !force_memory {
         validate_declared_backend_access_modes(&khive_cfg.backends)?;
     }
+    validate_wal_ceiling_topology(&cfg, &khive_cfg.backends, force_memory)?;
 
     disclose_resolved_database(&cfg, &khive_cfg);
     disclose_resolved_actor(&cfg);
@@ -4138,6 +4141,7 @@ id = "lambda:fallback"
                     journal_mode: None,
                     served_kinds: None,
                     read_only: false,
+                    wal_ceiling_bytes: None,
                 },
                 BackendConfig {
                     name: "sessions".to_string(),
@@ -4147,6 +4151,7 @@ id = "lambda:fallback"
                     journal_mode: None,
                     served_kinds: None,
                     read_only: false,
+                    wal_ceiling_bytes: None,
                 },
             ],
             packs: {
@@ -4261,6 +4266,7 @@ id = "lambda:fallback"
                     journal_mode: None,
                     served_kinds: None,
                     read_only: false,
+                    wal_ceiling_bytes: None,
                 },
                 BackendConfig {
                     name: "secondary".to_string(),
@@ -4270,6 +4276,7 @@ id = "lambda:fallback"
                     journal_mode: None,
                     served_kinds: None,
                     read_only: false,
+                    wal_ceiling_bytes: None,
                 },
             ],
             packs: {
@@ -4411,6 +4418,7 @@ id = "lambda:fallback"
                 journal_mode: None,
                 served_kinds: None,
                 read_only: false,
+                wal_ceiling_bytes: None,
             }],
             ..KhiveConfig::default()
         };

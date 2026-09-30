@@ -2304,6 +2304,62 @@ pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> any
     Ok(())
 }
 
+fn wal_ceiling_policy_for_backend(
+    config: &RuntimeConfig,
+    backend: &BackendConfig,
+) -> anyhow::Result<khive_db::WalCeilingPolicy> {
+    let wal_mode = backend
+        .journal_mode
+        .as_deref()
+        .is_none_or(|mode| mode.eq_ignore_ascii_case("wal"));
+    let resolved = khive_runtime::resolve_wal_ceiling(
+        backend.wal_ceiling_bytes,
+        config.wal_ceiling_env_raw.as_deref(),
+        &backend.name,
+        backend.kind.clone(),
+        wal_mode,
+        backend.read_only,
+    )?;
+    Ok(khive_db::WalCeilingPolicy {
+        bytes: resolved.configured_bytes,
+        source: resolved.source,
+    })
+}
+
+/// Validate ceiling policy for every effective backend before daemon forwarding
+/// or opening any configured database. Aliases of one SQLite file must agree
+/// on the writer policy actually enforced by their shared pool.
+pub fn validate_wal_ceiling_topology(
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<()> {
+    let effective = effective_backend_configs(backends, force_memory);
+    let mut by_path: HashMap<PathBuf, (&str, u64)> = HashMap::new();
+    for backend in &effective {
+        let policy = wal_ceiling_policy_for_backend(config, backend)?;
+        let effective_bytes = policy.effective_bytes(backend.read_only);
+        let Some(path) = canonical_backend_path(backend)? else {
+            continue;
+        };
+        if let Some((first_name, first_bytes)) = by_path.get(&path) {
+            if *first_bytes != effective_bytes {
+                return Err(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                    first_backend: (*first_name).to_string(),
+                    second_backend: backend.name.clone(),
+                    path,
+                    first_bytes: *first_bytes,
+                    second_bytes: effective_bytes,
+                }
+                .into());
+            }
+        } else {
+            by_path.insert(path, (&backend.name, effective_bytes));
+        }
+    }
+    Ok(())
+}
+
 fn plan_configured_storage_targets(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
@@ -2426,13 +2482,15 @@ pub async fn migrate_configured_storage_topology(
             cli_db_override,
             &khive_cfg.backends,
         )?;
+        validate_wal_ceiling_topology(&base_config, &plan.effective_backends, false)?;
         let selected = plan
             .effective_backends
             .iter()
             .find(|backend| backend.name == target)
             .expect("the planner validated the selected backend")
             .clone();
-        let backend = Arc::new(open_backend(&selected, None)?);
+        let policy = wal_ceiling_policy_for_backend(&base_config, &selected)?;
+        let backend = Arc::new(open_backend_with_wal_ceiling(&selected, None, policy)?);
         prepare_core_schema_for_boot(Arc::clone(&backend), format!("backend {}", selected.name))
             .await?;
         crate::attachment_cutover::require_secondary_attachment_empty(
@@ -2938,6 +2996,7 @@ async fn prepare_configured_storage_topology(
     // read-only/read-write alias topology without creating a partial set of
     // database files.
     validate_effective_backend_alias_modes(&effective_backends)?;
+    validate_wal_ceiling_topology(&base_config, &effective_backends, false)?;
 
     // ADR-170: the events split must anchor beside the store that actually
     // holds this deployment's data. The resolver derived it from
@@ -2991,7 +3050,8 @@ async fn prepare_configured_storage_topology(
                 continue;
             }
         }
-        let backend = open_backend(backend_cfg, max_readers)?;
+        let policy = wal_ceiling_policy_for_backend(&base_config, backend_cfg)?;
+        let backend = open_backend_with_wal_ceiling(backend_cfg, max_readers, policy)?;
         let arc = Arc::new(backend);
         if let Some(canon) = canonical {
             path_to_backend.insert(canon, arc.clone());
@@ -3619,6 +3679,7 @@ async fn build_server_inner(
     // backends slice keeps the line truthful in multi-backend mode, where the
     // config-declared backend paths — not `config.db_path` — receive writes.
     tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
+    tracing::info!(target: "khive.boot", "{}", resolved_wal_ceiling_disclosure(&config, &khive_cfg.backends));
 
     if khive_cfg.backends.is_empty() {
         let runtime =
@@ -4125,6 +4186,23 @@ fn open_single_backend(
     config: &RuntimeConfig,
     max_readers: Option<usize>,
 ) -> anyhow::Result<StorageBackend> {
+    let kind = if config.db_path.is_some() {
+        BackendKind::Sqlite
+    } else {
+        BackendKind::Memory
+    };
+    let resolved = khive_runtime::resolve_wal_ceiling(
+        Some(config.wal_ceiling_configured_bytes),
+        None,
+        BackendId::MAIN,
+        kind,
+        true,
+        false,
+    )?;
+    let wal_ceiling = khive_db::WalCeilingPolicy {
+        bytes: resolved.configured_bytes,
+        source: config.wal_ceiling_source,
+    };
     let backend = match &config.db_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -4135,8 +4213,11 @@ fn open_single_backend(
                     )
                 })?;
             }
-            StorageBackend::sqlite_with_max_readers(path, max_readers)
-                .map_err(|error| anyhow::anyhow!("open single SQLite backend: {error}"))?
+            StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, max_readers, wal_ceiling)
+                .map_err(|error| {
+                    let context = format!("open single SQLite backend: {error}");
+                    anyhow::Error::new(error).context(context)
+                })?
         }
         None => StorageBackend::memory()
             .map_err(|error| anyhow::anyhow!("open single in-memory backend: {error}"))?,
@@ -4276,7 +4357,16 @@ fn build_pack_runtime(
 }
 
 /// Open a `StorageBackend` from a `BackendConfig`.
+#[cfg(test)]
 fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Result<StorageBackend> {
+    open_backend_with_wal_ceiling(cfg, max_readers, khive_db::WalCeilingPolicy::default())
+}
+
+fn open_backend_with_wal_ceiling(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    wal_ceiling: khive_db::WalCeilingPolicy,
+) -> anyhow::Result<StorageBackend> {
     match cfg.kind {
         BackendKind::Memory => StorageBackend::memory()
             .map_err(|e| anyhow::anyhow!("backend {}: memory open: {e}", cfg.name)),
@@ -4300,12 +4390,25 @@ fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Resu
                 }
             }
             if cfg.read_only {
-                StorageBackend::sqlite_read_only_with_max_readers(&expanded, max_readers).map_err(
-                    |e| anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name),
+                StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
+                    &expanded,
+                    max_readers,
+                    wal_ceiling,
                 )
+                .map_err(|error| {
+                    let context = format!("backend {}: sqlite read-only open: {error}", cfg.name);
+                    anyhow::Error::new(error).context(context)
+                })
             } else {
-                let backend = StorageBackend::sqlite_with_max_readers(&expanded, max_readers)
-                    .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))?;
+                let backend = StorageBackend::sqlite_with_max_readers_and_wal_ceiling(
+                    &expanded,
+                    max_readers,
+                    wal_ceiling,
+                )
+                .map_err(|error| {
+                    let context = format!("backend {}: sqlite open: {error}", cfg.name);
+                    anyhow::Error::new(error).context(context)
+                })?;
                 if backend.is_read_only() {
                     anyhow::bail!(
                         "backend {}: path {} has no filesystem write bits; declare \
@@ -4388,6 +4491,80 @@ pub fn resolved_database_disclosure(
         }
         Some(path) => format!("database: {} (resolved)", path.display()),
     }
+}
+
+/// Report the resolved WAL policy for every storage target at startup. This
+/// uses the same configuration snapshot as daemon identity and backend open.
+pub fn resolved_wal_ceiling_disclosure(
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+) -> String {
+    fn source_name(source: khive_runtime::WalCeilingSource) -> &'static str {
+        match source {
+            khive_runtime::WalCeilingSource::BackendField => "backend_field",
+            khive_runtime::WalCeilingSource::Environment => "environment",
+            khive_runtime::WalCeilingSource::Default => "default",
+        }
+    }
+
+    fn row(name: &str, configured: u64, effective: u64, source: &str, read_only: bool) -> String {
+        let status = if read_only && configured > 0 {
+            "read_only_not_enforced"
+        } else if effective > 0 {
+            "enforced"
+        } else {
+            "disabled"
+        };
+        format!(
+            "{name}: configured_bytes={configured} effective_bytes={effective} source={source} enabled={} status={status}",
+            effective > 0
+        )
+    }
+
+    if backends.is_empty() {
+        let read_only = config.db_path.as_deref().is_some_and(|path| {
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().readonly())
+        });
+        let effective = if config.db_path.is_none() || read_only {
+            0
+        } else {
+            config.wal_ceiling_bytes
+        };
+        return format!(
+            "wal_ceiling: {}",
+            row(
+                BackendId::MAIN,
+                config.wal_ceiling_configured_bytes,
+                effective,
+                source_name(config.wal_ceiling_source),
+                read_only,
+            )
+        );
+    }
+
+    let forced_memory = config.db_path.is_none();
+    let mut rows = Vec::with_capacity(backends.len());
+    for backend in backends {
+        let (configured, source) = match backend.wal_ceiling_bytes {
+            Some(bytes) => (bytes, khive_runtime::WalCeilingSource::BackendField),
+            None => (
+                config.wal_ceiling_configured_bytes,
+                config.wal_ceiling_source,
+            ),
+        };
+        let memory = forced_memory || backend.kind == BackendKind::Memory;
+        let read_only = backend.read_only;
+        let effective = if memory || read_only { 0 } else { configured };
+        rows.push(row(
+            &backend.name,
+            configured,
+            effective,
+            source_name(source),
+            read_only,
+        ));
+    }
+    rows.sort();
+    format!("wal_ceiling: {}", rows.join("; "))
 }
 
 /// One-line, stdout-safe disclosure of the actor selected by the resolved
@@ -4717,17 +4894,77 @@ fn resolve_config(
                 );
             }
 
-            Ok(runtime_config_from_khive_config(&khive_cfg, base))
+            let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends)?;
+            Ok(resolved)
         }
         None => {
             let env_cfg = config_from_env();
-            if env_cfg.engines.is_empty() {
-                Ok(base)
+            let mut resolved = if env_cfg.engines.is_empty() {
+                base
             } else {
-                Ok(runtime_config_from_khive_config(&env_cfg, base))
-            }
+                runtime_config_from_khive_config(&env_cfg, base)
+            };
+            resolve_runtime_wal_ceiling(&mut resolved, &[])?;
+            Ok(resolved)
         }
     }
+}
+
+/// Capture one policy snapshot before a forwarding client computes its daemon
+/// identity. Backend field overrides are resolved from this same snapshot at
+/// the named-backend opener, so a later environment change cannot split the
+/// client fingerprint from the opened pool.
+fn resolve_runtime_wal_ceiling(
+    config: &mut RuntimeConfig,
+    backends: &[BackendConfig],
+) -> anyhow::Result<()> {
+    let env_raw = std::env::var_os("KHIVE_SQLITE_WAL_CEILING_BYTES")
+        .map(|value| value.to_string_lossy().into_owned());
+    let needs_fallback = backends.is_empty()
+        || backends
+            .iter()
+            .any(|backend| backend.wal_ceiling_bytes.is_none());
+    let fallback = if needs_fallback {
+        khive_runtime::resolve_wal_ceiling(
+            None,
+            env_raw.as_deref(),
+            BackendId::MAIN,
+            BackendKind::Sqlite,
+            true,
+            false,
+        )?
+    } else {
+        khive_runtime::ResolvedWalCeiling {
+            configured_bytes: 0,
+            effective_bytes: 0,
+            source: khive_runtime::WalCeilingSource::Default,
+        }
+    };
+    config.wal_ceiling_env_raw = env_raw;
+    config.wal_ceiling_configured_bytes = fallback.configured_bytes;
+    config.wal_ceiling_bytes = fallback.effective_bytes;
+    config.wal_ceiling_source = fallback.source;
+
+    if backends.is_empty() {
+        let kind = if config.db_path.is_some() {
+            BackendKind::Sqlite
+        } else {
+            BackendKind::Memory
+        };
+        let main = khive_runtime::resolve_wal_ceiling(
+            None,
+            config.wal_ceiling_env_raw.as_deref(),
+            BackendId::MAIN,
+            kind,
+            true,
+            false,
+        )?;
+        config.wal_ceiling_bytes = main.effective_bytes;
+    } else {
+        validate_wal_ceiling_topology(config, backends, false)?;
+    }
+    Ok(())
 }
 
 /// Resolve configuration without enabling embedding engines (no-embed path).
@@ -4747,14 +4984,19 @@ fn resolve_actor_from_config(
     {
         Some(khive_cfg) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
-            let resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends)?;
             Ok(RuntimeConfig {
                 embedding_model: None,
                 additional_embedding_models: vec![],
                 ..resolved
             })
         }
-        None => Ok(base),
+        None => {
+            let mut resolved = base;
+            resolve_runtime_wal_ceiling(&mut resolved, &[])?;
+            Ok(resolved)
+        }
     }
 }
 
@@ -4922,6 +5164,33 @@ mod tests {
     }
 
     #[test]
+    fn wal_ceiling_disclosure_names_disabled_default_and_read_only_policy() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(
+            resolved_wal_ceiling_disclosure(&config, &[]),
+            "wal_ceiling: main: configured_bytes=0 effective_bytes=0 source=default enabled=false status=disabled"
+        );
+
+        let backend = BackendConfig {
+            name: "archive".into(),
+            kind: BackendKind::Sqlite,
+            path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+            cache_mb: None,
+            journal_mode: None,
+            wal_ceiling_bytes: Some(8192),
+            served_kinds: None,
+            read_only: true,
+        };
+        assert_eq!(
+            resolved_wal_ceiling_disclosure(&config, &[backend]),
+            "wal_ceiling: archive: configured_bytes=8192 effective_bytes=0 source=backend_field enabled=false status=read_only_not_enforced"
+        );
+    }
+
+    #[test]
     fn resolved_actor_disclosure_names_attributed_actor() {
         let line = resolved_actor_disclosure(Some("lambda:worker"));
         assert_eq!(line, "actor: \"lambda:worker\" (resolved; attributed)");
@@ -4948,6 +5217,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("/data/main.db")),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             },
@@ -4959,6 +5229,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("/data/ignored-stray.db")),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             },
@@ -4990,6 +5261,7 @@ mod tests {
             path: Some(std::path::PathBuf::from("/data/main.db")),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         }];
@@ -6158,6 +6430,7 @@ id = "lambda:project-actor"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6167,6 +6440,7 @@ id = "lambda:project-actor"
                     path: Some(second_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6245,6 +6519,7 @@ id = "lambda:project-actor"
             path: Some(path.clone()),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         };
@@ -6351,6 +6626,7 @@ id = "lambda:project-actor"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6360,6 +6636,7 @@ id = "lambda:project-actor"
                     path: Some(secondary_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6410,6 +6687,7 @@ id = "lambda:project-actor"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6419,6 +6697,7 @@ id = "lambda:project-actor"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6521,6 +6800,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -6663,6 +6943,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -6779,6 +7060,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -6862,6 +7144,7 @@ id = "lambda:project-actor"
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -6896,6 +7179,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -6997,6 +7281,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7276,6 +7561,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7320,6 +7606,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7531,6 +7818,7 @@ region = "us-east-1"
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: true,
             }],
@@ -7597,6 +7885,7 @@ region = "us-east-1"
                 path: Some(main_path),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: true,
             }],
@@ -7653,6 +7942,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7662,6 +7952,7 @@ region = "us-east-1"
                     path: Some(archive_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -7718,6 +8009,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -7727,6 +8019,7 @@ region = "us-east-1"
                     path: Some(blob_db),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7785,6 +8078,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7794,6 +8088,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7870,6 +8165,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7879,6 +8175,7 @@ region = "us-east-1"
                     path: Some(real_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7888,6 +8185,7 @@ region = "us-east-1"
                     path: Some(alias_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7972,6 +8270,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7981,6 +8280,7 @@ region = "us-east-1"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8032,6 +8332,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8041,6 +8342,7 @@ region = "us-east-1"
                     path: Some(secondary_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8081,6 +8383,7 @@ region = "us-east-1"
             path: None,
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         });
@@ -8580,6 +8883,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8589,6 +8893,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8664,6 +8969,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8673,6 +8979,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8765,6 +9072,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -8807,6 +9115,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -8868,6 +9177,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -8953,6 +9263,7 @@ region = "us-east-1"
             path: Some(db_path.clone()),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: true,
         };
@@ -9000,6 +9311,7 @@ region = "us-east-1"
             path: Some(db_path),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         };
@@ -9029,6 +9341,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -9038,6 +9351,7 @@ region = "us-east-1"
                     path: Some(comm_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -9145,6 +9459,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: main_read_only,
                 },
@@ -9154,6 +9469,7 @@ region = "us-east-1"
                     path: Some(comm_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: comm_read_only,
                 },
@@ -9273,6 +9589,7 @@ region = "us-east-1"
                     path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9282,6 +9599,7 @@ region = "us-east-1"
                     path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9301,6 +9619,29 @@ region = "us-east-1"
         }
     }
 
+    #[test]
+    fn wal_ceiling_aliases_reject_unequal_effective_limits_before_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("not-created.db");
+        let mut topology = duplicate_sqlite_path_config(&path);
+        topology.backends[0].wal_ceiling_bytes = Some(8192);
+        topology.backends[1].wal_ceiling_bytes = Some(16384);
+        let runtime = RuntimeConfig::default();
+
+        let error = validate_wal_ceiling_topology(&runtime, &topology.backends, false)
+            .expect_err("one physical writer cannot have two limits");
+        assert!(matches!(
+            error.downcast_ref::<khive_runtime::ConfigError>(),
+            Some(khive_runtime::ConfigError::WalCeilingAliasConflict { .. })
+        ));
+        assert!(!path.exists(), "static validation must not open a database");
+
+        topology.backends[0].read_only = true;
+        topology.backends[1].read_only = true;
+        validate_wal_ceiling_topology(&runtime, &topology.backends, false)
+            .expect("read-only aliases both enforce zero");
+    }
+
     #[tokio::test]
     async fn targeted_secondary_rejects_conflicting_physical_alias_modes_before_open() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -9313,6 +9654,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9322,6 +9664,7 @@ region = "us-east-1"
                     path: Some(aliased.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -9331,6 +9674,7 @@ region = "us-east-1"
                     path: Some(aliased.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9366,6 +9710,7 @@ region = "us-east-1"
                     path: Some(main.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9375,6 +9720,7 @@ region = "us-east-1"
                     path: Some(main),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9384,6 +9730,7 @@ region = "us-east-1"
                     path: Some(secondary),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9430,6 +9777,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9647,6 +9995,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9656,6 +10005,7 @@ region = "us-east-1"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9716,6 +10066,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9725,6 +10076,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9825,6 +10177,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9834,6 +10187,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9896,6 +10250,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9905,6 +10260,7 @@ region = "us-east-1"
                     path: Some(second_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -12602,6 +12958,7 @@ backend = "kg-backend"
                         path: Some(main_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -12611,6 +12968,7 @@ backend = "kg-backend"
                         path: Some(kg_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -12743,6 +13101,7 @@ backend = "kg-backend"
                         path: Some(dir.path().join("main.db")),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -12752,6 +13111,7 @@ backend = "kg-backend"
                         path: Some(dir.path().join("comm.db")),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -12856,6 +13216,7 @@ backend = "kg-backend"
                         path: Some(main_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -12865,6 +13226,7 @@ backend = "kg-backend"
                         path: Some(comm_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -16032,6 +16394,7 @@ backend = "kg-backend"
                     path: Some(main_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -16041,6 +16404,7 @@ backend = "kg-backend"
                     path: Some(tool_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: tool_read_only,
                 },

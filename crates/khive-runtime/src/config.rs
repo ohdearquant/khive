@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use khive_db::StorageBackend;
+pub use khive_db::WalCeilingSource;
 use khive_gate::{ActorRef, AllowAllGate, GateRef};
 use khive_types::Namespace;
 use lattice_embed::EmbeddingModel;
@@ -323,6 +324,18 @@ pub struct RuntimeConfig {
     /// builders, which coordinate V21 before constructing runtimes. Tests and
     /// already-current single-backend callers may still use it directly.
     pub db_path: Option<std::path::PathBuf>,
+    /// The WAL ceiling applied to this runtime's implicit main backend.
+    /// Zero means disabled, including for a read-only backend that retains a
+    /// nonzero configured value only for operator reporting.
+    pub wal_ceiling_bytes: u64,
+    /// The configured value before read-only writer-policy suppression.
+    pub wal_ceiling_configured_bytes: u64,
+    /// Where the configured ceiling came from.
+    pub wal_ceiling_source: WalCeilingSource,
+    /// Construction-time snapshot of the environment fallback. The host uses
+    /// this same value to resolve every named backend before forwarding or
+    /// opening it, without rereading mutable process environment.
+    pub wal_ceiling_env_raw: Option<String>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
     /// Local embedding model. `None` alone does not disable embedding: setting
@@ -505,6 +518,10 @@ impl Default for RuntimeConfig {
             .filter(|s| !s.trim().is_empty());
         Self {
             db_path,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             default_namespace: Namespace::local(),
             embedding_model,
             additional_embedding_models,

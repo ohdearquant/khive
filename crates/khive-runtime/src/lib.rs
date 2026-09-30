@@ -94,7 +94,7 @@ pub use blob::{
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
-pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env};
+pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env, WalCeilingSource};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_compared_values,
@@ -115,17 +115,19 @@ pub use daemon::{
 pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
-    config_from_env, BackendConfig, BackendKind, BlobConfig, BrainSectionConfig, ConfigError,
-    EngineConfig, GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
-    PackConfig, StorageSectionConfig,
+    config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
+    BrainSectionConfig, ConfigError, EngineConfig, GateSectionConfig, GitWriteEntryConfig,
+    GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling, StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
     ChannelIngestFailureClass, DenialAuditOutcome, DenialReceipt, DispatchError, DomainDisposition,
     GuardedWriteFailure, ReceiptRefusal, RefusalEventContext, RefusalEventRecording,
     RefusalRecordingErrorClass, RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext,
-    WriterTaskFailureContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
-    WRITER_QUEUE_SATURATED_STAGE, WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
+    WriterTaskFailureContext, SQLITE_WAL_CAPACITY_REFUSED_STAGE,
+    SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE, WRITER_ADMISSION_SCOPE,
+    WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
+    WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
 pub use error_projection::runtime_error_value;
 pub use event_store_guard::EventAttribution;
