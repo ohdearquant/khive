@@ -488,7 +488,7 @@ collection.
 
 ## Amendment 11 (2026-09-29): timeout residual for detached descendants
 
-Status: Proposed for sign-off as a statement of current behavior; the containment target in
+Status: Accepted (2026-09-30) as a statement of current behavior; the containment target in
 acceptance 6 is **not met** for a descendant that leaves the initial process group (for example,
 by calling `setsid`). The follow-up design issue is #3631. This amendment does not change the
 Seatbelt profile and leaves acceptance 6's lifetime target intact. The receipt-visible changes it
