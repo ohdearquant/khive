@@ -1523,6 +1523,52 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
+    async fn graft_cannot_hide_acknowledged_ancestor_from_reconciliation() {
+        let fixture = Fixture::new().await;
+        let grafts = fixture.repo.path().join(".git/info/grafts");
+        std::fs::write(&grafts, format!("{}\n", fixture.second_sha)).unwrap();
+
+        assert_eq!(
+            git(
+                fixture.repo.path(),
+                &["rev-parse", "--is-shallow-repository"]
+            ),
+            "false"
+        );
+        let grafted_walk = git_command(fixture.repo.path(), &["log", "--format=%H", "HEAD"])
+            .env_remove("GIT_GRAFT_FILE")
+            .output()
+            .expect("grafted walk");
+        assert!(grafted_walk.status.success());
+        assert_eq!(
+            String::from_utf8(grafted_walk.stdout).unwrap().trim(),
+            fixture.second_sha
+        );
+
+        let preview = fixture.run(None).await;
+        assert!(preview.complete_coverage, "{preview:?}");
+        assert_eq!(preview.counts.acknowledged_shas_examined, 2);
+        assert_eq!(preview.counts.repairable_missing_links, 1);
+        let applied = fixture.run(Some(preview.preview_id)).await;
+        assert!(applied.success, "{applied:?}");
+        assert!(fixture.edge_bytes(fixture.first_note).await.is_some());
+
+        let restored_walk = git_command(fixture.repo.path(), &["log", "--format=%H", "HEAD"])
+            .output()
+            .expect("ungrafted walk");
+        assert!(restored_walk.status.success());
+        assert!(restored_walk.stderr.is_empty());
+        assert_eq!(
+            String::from_utf8(restored_walk.stdout)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![fixture.second_sha.as_str(), fixture.first_sha.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn prior_walk_and_unavailable_or_diverged_tip_are_incomplete() {
         let fixture = Fixture::new().await;
         fixture
