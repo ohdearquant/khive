@@ -21,6 +21,38 @@ fn default_production_db_path() -> Option<PathBuf> {
     khive_runtime::config::resolve_db_anchor(None)
 }
 
+pub(crate) fn configured_production_bases(
+    runtime_db_path: Option<&Path>,
+    declared_backend_db_paths: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let mut bases = Vec::new();
+    if let Some(prod) = default_production_db_path() {
+        bases.push(prod);
+    }
+    match runtime_db_path {
+        Some(runtime_db) => bases.push(runtime_db.to_path_buf()),
+        None => {
+            if let Ok(env_db) = std::env::var("KHIVE_DB") {
+                if !env_db.is_empty() {
+                    bases.push(PathBuf::from(env_db));
+                }
+            }
+        }
+    }
+    bases.extend_from_slice(declared_backend_db_paths);
+    let cwd = std::env::current_dir().map_err(|error| {
+        format!("code.ingest cannot resolve configured production paths: {error}")
+    })?;
+    for base in &mut bases {
+        if !base.is_absolute() {
+            *base = cwd.join(&base);
+        }
+    }
+    bases.sort();
+    bases.dedup();
+    Ok(bases)
+}
+
 /// Normalize `path` to its deepest *existing* canonical ancestor plus the
 /// still-not-yet-created suffix appended back on. This lets two lexically
 /// different paths that alias the same file — a symlinked parent directory,
@@ -232,30 +264,19 @@ pub(crate) fn resolve_target_db(
             validate_explicit_db_path(p)?;
             PathBuf::from(p)
         }
-        None => ingest_path.join(".khive").join("code-map.db"),
+        None => ingest_path
+            .canonicalize()
+            .map_err(|error| {
+                format!(
+                    "code.ingest cannot pin omitted-db workspace parent {}: {error}",
+                    ingest_path.display()
+                )
+            })?
+            .join(".khive")
+            .join("code-map.db"),
     };
 
-    let mut forbidden: Vec<PathBuf> = Vec::new();
-    if let Some(prod) = default_production_db_path() {
-        forbidden.push(prod);
-    }
-    match runtime_db_path {
-        Some(runtime_db) => forbidden.push(runtime_db.to_path_buf()),
-        // `config().db_path` is unresolved (not reachable by the production
-        // daemon today, which always populates it at startup) — fall back to
-        // `KHIVE_DB` directly so the fence is total rather than
-        // total-in-practice: an operator running with an env-only override
-        // and no resolved config path is still covered (#1042).
-        None => {
-            if let Ok(env_db) = std::env::var("KHIVE_DB") {
-                if !env_db.is_empty() {
-                    forbidden.push(PathBuf::from(env_db));
-                }
-            }
-        }
-    }
-
-    forbidden.extend_from_slice(declared_backend_db_paths);
+    let forbidden = configured_production_bases(runtime_db_path, declared_backend_db_paths)?;
     let candidate_spellings = target_spellings(&candidate)?;
     for base in &forbidden {
         for forbidden_path in protected_store_members(base)? {
@@ -336,8 +357,10 @@ mod tests {
 
     #[test]
     fn default_target_is_workspace_local() {
-        let path = Path::new("/tmp/some-repo");
-        let db = resolve_target_db(None, path, None, &[]).expect("default resolves");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().canonicalize().unwrap().join("some-repo");
+        std::fs::create_dir(&path).expect("create ingest workspace");
+        let db = resolve_target_db(None, &path, None, &[]).expect("default resolves");
         assert_eq!(db, path.join(".khive").join("code-map.db"));
     }
 
