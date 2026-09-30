@@ -1196,7 +1196,9 @@ fn build_note_filter_where(
 
 /// SQL form of the row-level mailbox rule for `message` rows. Every other kind
 /// passes. JSON `null`, a missing key and a missing `properties` blob all read
-/// as "absent", and a non-text routing field never equals the actor id.
+/// as "absent", and a non-text routing field never equals the actor id: the
+/// row-level rule reads routing fields as strings, while `json_extract` renders
+/// an array or object as its JSON text, which an actor id can spell.
 fn mailbox_condition(
     scope: &khive_storage::note::NoteMailboxScope,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
@@ -1209,8 +1211,15 @@ fn mailbox_condition(
     };
     let not_text = |path: &str| format!("ifnull({}, '') != 'text'", json_type_expr(path));
     let direction = json_extract_expr("$.direction");
-    let to = json_extract_expr("$.to_actor");
-    let from = json_extract_expr("$.from_actor");
+    let text_is_actor = |path: &str| {
+        format!(
+            "({} = 'text' AND {} = {actor})",
+            json_type_expr(path),
+            json_extract_expr(path)
+        )
+    };
+    let to = text_is_actor("$.to_actor");
+    let from = text_is_actor("$.from_actor");
     let (inbound_legacy, outbound_legacy, unrouted) = if scope.legacy_local {
         (
             format!(" OR {}", absent("$.to_actor")),
@@ -1226,8 +1235,8 @@ fn mailbox_condition(
         Default::default()
     };
     format!(
-        "(kind != 'message' OR ({direction} = 'inbound' AND ({to} = {actor}{inbound_legacy})) \
-         OR ({direction} = 'outbound' AND ({from} = {actor}{outbound_legacy})){unrouted})"
+        "(kind != 'message' OR ({direction} = 'inbound' AND ({to}{inbound_legacy})) \
+         OR ({direction} = 'outbound' AND ({from}{outbound_legacy})){unrouted})"
     )
 }
 

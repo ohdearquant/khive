@@ -1005,6 +1005,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_thread_scope_matches_a_routing_field_only_as_text() {
+        use khive_runtime::{KhiveRuntime, Namespace};
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let namespace = Namespace::parse("scope-one").expect("valid namespace");
+        let token = runtime.authorize(namespace).expect("authorized namespace");
+        for (thread, to_actor) in [
+            (
+                "aaaaaaaa-bbbb-4ccc-8ddd-000000000001",
+                serde_json::json!("x"),
+            ),
+            (
+                "aaaaaaaa-bbbb-4ccc-8ddd-000000000002",
+                serde_json::json!(["x"]),
+            ),
+        ] {
+            runtime
+                .create_note(
+                    &token,
+                    "message",
+                    None,
+                    "routed message",
+                    None,
+                    Some(serde_json::json!({
+                        "thread_id": thread,
+                        "direction": "inbound",
+                        "to_actor": to_actor,
+                    })),
+                    vec![],
+                )
+                .await
+                .expect("create message note");
+        }
+        // An array routing field renders as `["x"]` under json_extract; an
+        // actor id spelling that text must not be admitted to the thread.
+        for (actor, expected) in [
+            ("x", vec!["aaaaaaaa-bbbb-4ccc-8ddd-000000000001"]),
+            (r#"["x"]"#, vec![]),
+        ] {
+            let mut reader = runtime.sql().reader().await.expect("SQL reader");
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: sql!("message_threads_list").to_string(),
+                    params: vec![
+                        SqlValue::Text(r#"["scope-one"]"#.into()),
+                        SqlValue::Text(actor.into()),
+                        SqlValue::Integer(0),
+                    ],
+                    label: Some("test.message_threads_list".into()),
+                })
+                .await
+                .expect("message thread scope query");
+            let threads: Vec<String> = rows
+                .iter()
+                .map(|row| match row.get("thread_id") {
+                    Some(SqlValue::Text(thread)) => thread.clone(),
+                    other => panic!("thread_id column: {other:?}"),
+                })
+                .collect();
+            assert_eq!(threads, expected, "actor {actor}");
+        }
+    }
+
+    #[tokio::test]
     async fn message_thread_namespace_json_scope_handles_empty_single_and_past_bind_limit() {
         use khive_runtime::{KhiveRuntime, Namespace};
         use khive_storage::types::{SqlStatement, SqlValue};

@@ -166,6 +166,11 @@ async fn store_mailbox_scope_matches_row_level_rule() {
         Some(json!({"direction": 5})),
         Some(json!({"from_actor": 5})),
         Some(json!({"to_actor": "a", "from_actor": "a"})),
+        // `json_extract` renders an array or object as JSON text, which an
+        // actor id below spells; the row-level rule reads only strings.
+        Some(json!({"direction": "inbound", "to_actor": ["x"]})),
+        Some(json!({"direction": "outbound", "from_actor": ["x"]})),
+        Some(json!({"direction": "inbound", "to_actor": {"k": "v"}})),
     ];
     let mut notes = Vec::new();
     for (i, shape) in shapes.into_iter().enumerate() {
@@ -181,7 +186,15 @@ async fn store_mailbox_scope_matches_row_level_rule() {
         .await
         .expect("upsert shapes");
 
-    for (actor_id, delegated) in [("local", false), ("local", true), ("a", false), ("a", true)] {
+    for (actor_id, delegated) in [
+        ("local", false),
+        ("local", true),
+        ("a", false),
+        ("a", true),
+        (r#"["x"]"#, false),
+        (r#"["x"]"#, true),
+        (r#"{"k":"v"}"#, true),
+    ] {
         let view = MailboxView {
             actor_id: actor_id.to_string(),
             delegated,
