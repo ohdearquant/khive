@@ -5118,6 +5118,58 @@ async fn list_rejects_unknown_kwarg() -> anyhow::Result<()> {
 
 // ── MCP-wide ISO-8601 timestamps ──────────────────────────────────────────
 
+fn assert_agent_created_at_pair(
+    agent_row: &Value,
+    canonical_row: &Value,
+    request_started: chrono::DateTime<chrono::Utc>,
+    response_received: chrono::DateTime<chrono::Utc>,
+) {
+    let canonical = canonical_row["created_at"]
+        .as_str()
+        .expect("Verbose row must carry created_at");
+    let instant = chrono::DateTime::parse_from_rfc3339(canonical)
+        .expect("canonical created_at must parse")
+        .with_timezone(&chrono::Utc);
+    assert!(canonical.ends_with('Z'), "the fixture producer emits UTC Z");
+    assert_eq!(
+        agent_row["created_at"], canonical_row["created_at"],
+        "Agent row must retain the exact canonical instant and fraction"
+    );
+    assert!(
+        canonical_row.get("created_at_relative").is_none(),
+        "the relative sibling must be added by Agent presentation"
+    );
+
+    let relative = agent_row["created_at_relative"]
+        .as_str()
+        .expect("Agent list row must carry created_at_relative");
+    let token = relative
+        .strip_suffix(" ago")
+        .expect("relative timestamp must end with ' ago'");
+    let (digits, unit) = token.split_at(token.len() - 1);
+    let count: u64 = digits.parse().expect("relative count must be decimal");
+    let seconds_per_unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => panic!("unexpected relative unit: {relative}"),
+    };
+    let age_at_start = (request_started.timestamp() - instant.timestamp()).max(0) as u64;
+    let age_at_end = (response_received.timestamp() - instant.timestamp()).max(0) as u64;
+    // Integer-second sampling can cross a boundary around a microsecond fixture.
+    assert!(
+        count.saturating_mul(seconds_per_unit) <= age_at_end.saturating_add(1)
+            && count.saturating_add(1).saturating_mul(seconds_per_unit)
+                > age_at_start.saturating_sub(1),
+        "{relative} must describe the row age during the MCP call ({age_at_start}..={age_at_end}s)"
+    );
+    if age_at_end.saturating_add(1) < 60 {
+        assert_eq!(unit, "s", "fresh rows use the seconds band");
+    }
+    assert!(agent_row.get("updated_at_relative").is_none());
+}
+
 /// `remember` must return ISO-8601 `created_at` (not a raw microsecond i64).
 #[tokio::test]
 async fn remember_returns_iso8601_timestamp() -> anyhow::Result<()> {
@@ -5164,6 +5216,67 @@ async fn recall_returns_iso8601_timestamps() -> anyhow::Result<()> {
         "recall hit created_at must be ISO-8601 string, got: {:?}",
         hits[0]["created_at"]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_note_list_created_at_has_exact_and_relative_forms() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let protected = "2026-09-29T19:18:25.132811+03:00";
+    let created = ok_one(
+        &client,
+        &format!(
+            "create(kind=\"observation\", content=\"am9 note list timestamp\", properties={{\"source_at\":{}}})",
+            json!(protected)
+        ),
+    )
+    .await?;
+
+    let request_started = chrono::Utc::now();
+    let agent = agent_one(&client, r#"list(kind="note", limit=1)"#).await?;
+    let response_received = chrono::Utc::now();
+    let canonical = ok_one(&client, r#"list(kind="note", limit=1)"#).await?;
+    let agent_row = &agent["items"][0];
+    let canonical_row = &canonical["items"][0];
+    assert_eq!(canonical_row["id"], created["id"]);
+    assert_agent_created_at_pair(agent_row, canonical_row, request_started, response_received);
+    assert_eq!(agent_row["updated_at"], canonical_row["updated_at"]);
+    assert_eq!(agent_row["properties"]["source_at"], protected);
+    assert_eq!(
+        agent_row["properties"]["source_at"],
+        canonical_row["properties"]["source_at"]
+    );
+
+    let root = agent_one(&client, &format!("get(id={})", json!(created["id"]))).await?;
+    assert_eq!(root["created_at"], canonical_row["created_at"]);
+    assert!(root.get("created_at_relative").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_memory_recall_created_at_has_exact_and_relative_forms() -> anyhow::Result<()> {
+    let client = connect_full().await?;
+    let ops = r#"memory.recall(query="am9 memory timestamp witness", limit=1, fusion_strategy="keyword_only", min_score=0.0)"#;
+    ok_one(
+        &client,
+        r#"memory.remember(content="am9 memory timestamp witness")"#,
+    )
+    .await?;
+
+    let request_started = chrono::Utc::now();
+    let agent = agent_one(&client, ops).await?;
+    let response_received = chrono::Utc::now();
+    let canonical = ok_one(&client, ops).await?;
+    let agent_row = agent
+        .as_array()
+        .and_then(|rows| rows.first())
+        .expect("Agent recall must return the seeded memory");
+    let canonical_row = canonical
+        .as_array()
+        .and_then(|rows| rows.first())
+        .expect("Verbose recall must return the seeded memory");
+    assert_eq!(agent_row["full_id"], canonical_row["full_id"]);
+    assert_agent_created_at_pair(agent_row, canonical_row, request_started, response_received);
     Ok(())
 }
 
@@ -5265,6 +5378,33 @@ async fn send_returns_iso8601_timestamps() -> anyhow::Result<()> {
         "message note created_at must be ISO-8601 string, got: {:?}",
         items[0]["created_at"]
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn agent_comm_inbox_created_at_has_exact_and_relative_forms() -> anyhow::Result<()> {
+    let client = connect_comm_only().await?;
+    ok_one(
+        &client,
+        r#"comm.send(to="commtest", content="am9 sent mailbox timestamp witness")"#,
+    )
+    .await?;
+
+    let ops = r#"comm.inbox(box="sent", limit=1)"#;
+    let request_started = chrono::Utc::now();
+    let agent = agent_one(&client, ops).await?;
+    let response_received = chrono::Utc::now();
+    let canonical = ok_one(&client, ops).await?;
+    let agent_row = &agent["messages"][0];
+    let canonical_row = &canonical["messages"][0];
+    assert_eq!(agent_row["full_id"], canonical_row["full_id"]);
+    assert_agent_created_at_pair(agent_row, canonical_row, request_started, response_received);
+    assert_eq!(agent_row["updated_at"], canonical_row["updated_at"]);
+    assert_eq!(
+        agent_row["properties"]["sent_at"],
+        canonical_row["properties"]["sent_at"]
+    );
+    assert!(agent_row["properties"]["sent_at"].is_string());
     Ok(())
 }
 
@@ -6942,11 +7082,10 @@ async fn issue_2537_agent_write_receipts_with_compact_metadata() -> anyhow::Resu
             let row = &listed["items"][0];
             assert_eq!(row["id"], receipt["id"]);
             assert_eq!(row["version"], stored["version"]);
-            assert_ne!(
+            assert_eq!(
                 row["updated_at"], stored["updated_at"],
-                "read metadata must stay compact"
+                "Amendment 9 renders read metadata as exact UTC"
             );
-            assert!(!row["updated_at"].as_str().unwrap().contains('.'));
             pairs.push((
                 format!("write atomic={atomic} expected={expected:?}"),
                 receipt["updated_at"].clone(),

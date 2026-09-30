@@ -81,7 +81,8 @@ const CERTIFIED_ER_COLLISIONS: &[(&str, &str)] = &[("extends", "located_in")];
 ///
 /// Uses the real live rules from khive-runtime and khive-pack-kg — not copies.
 #[test]
-fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_d3_ratified_collisions() {
+fn base_and_pack_endpoint_signatures_are_pairwise_distinct_except_ratified_and_certified_collisions(
+) {
     // Collect live base entity endpoint rules from khive-runtime.
     let mut all_triples: Vec<(String, String, String)> = base_entity_endpoint_rules()
         .iter()

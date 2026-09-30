@@ -747,7 +747,6 @@ mod tests {
     fn bare_client() -> reqwest::Client {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .gzip(true)
             .build()
             .expect("bare client builds")
     }
