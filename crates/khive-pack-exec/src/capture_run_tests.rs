@@ -191,3 +191,52 @@ fn run_capture_refuses_fifo_in_run_directory_without_blocking() {
         "{receipt}"
     );
 }
+
+#[tokio::test]
+async fn run_that_removes_its_run_directory_reports_degraded_capture() {
+    let fixture = Fixture::new();
+    let tree = fixture.ready_tree().await;
+
+    let complete = fixture
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree,
+                "tool": "sh",
+                "args": ["-c", "printf inside > output"],
+                "actor": "local"
+            }),
+        )
+        .await;
+    let receipt = &complete["receipt"];
+    assert_eq!(receipt["success"], true, "{receipt}");
+    assert_eq!(receipt["tree_capture"], "complete", "{receipt}");
+    assert!(receipt["tree_capture_detail"].is_null(), "{receipt}");
+
+    let result = fixture
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree,
+                "tool": "sh",
+                "args": ["-c", "d=$PWD; cd / && rm -rf \"$d\" && test ! -e \"$d\""],
+                "actor": "local"
+            }),
+        )
+        .await;
+    let receipt = &result["receipt"];
+    // The tool's own exit is recorded unchanged; capture's verdict is separate.
+    assert_eq!(receipt["exit_code"], 0, "{receipt}");
+    assert_eq!(receipt["timed_out"], false, "{receipt}");
+    assert_eq!(receipt["tree_capture"], "degraded", "{receipt}");
+    let detail = receipt["tree_capture_detail"].as_str().unwrap_or_default();
+    assert!(detail.starts_with("root_missing: F_GETPATH"), "{receipt}");
+    assert_eq!(receipt["success"], false, "{receipt}");
+    assert!(receipt["tree_out"].is_null(), "{receipt}");
+    assert_eq!(receipt["changed"], json!([]), "{receipt}");
+    let reason = receipt["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("capture degraded: root_missing"),
+        "{receipt}"
+    );
+}

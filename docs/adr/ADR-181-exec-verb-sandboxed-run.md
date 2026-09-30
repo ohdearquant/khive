@@ -491,7 +491,9 @@ collection.
 Status: Proposed for sign-off as a statement of current behavior; the containment target in
 acceptance 6 is **not met** for a descendant that leaves the initial process group (for example,
 by calling `setsid`). The follow-up design issue is #3631. This amendment does not change the
-Seatbelt profile or timeout algorithm, and leaves acceptance 6's lifetime target intact.
+Seatbelt profile and leaves acceptance 6's lifetime target intact. The receipt-visible changes it
+makes, output collection setting `timed_out`, a capture path cap and a `tree_capture` status, are
+stated below.
 
 Acceptance 4 now names the operations the Seatbelt profile actually refuses: outbound connect and
 bind/listen on a network port, each with an unsandboxed control. Its earlier "opens a socket"
@@ -516,3 +518,28 @@ lifetime target.
 
 Until #3631 resolves the design, consumers must treat `timed_out: true` as a deadline outcome and
 must not infer whole-process-tree termination from it.
+
+`timed_out: true` is also set when output collection reaches the run deadline after the directly
+waited child has exited, so a receipt can carry `exit_code: 0` beside `timed_out: true`. The flag
+reports the run deadline, not how the child ended.
+
+Capture lists the run directory from the descriptor opened before launch and reopens each
+directory from that root one component at a time. A path longer than 1024 bytes relative to the
+run directory is a capture error, which bounds the reopen work for each directory; the earlier
+path-based walk stopped near the platform path limit.
+
+After the walk, capture asks the kernel for the pinned run directory's current path (`F_GETPATH` on
+macOS) and checks with `lstat` that the path still names that directory. A run directory the tool
+removed, or removed and recreated at the same path, lists as empty through the pinned descriptor,
+and on macOS its `st_nlink` does not reach zero, so without this check the receipt would read as a
+run that wrote nothing. When the path is gone or names another file, the receipt's `tree_capture`
+is `degraded` and `tree_capture_detail` starts with `root_missing` and names the detector. When the
+path cannot be queried or read, for example because the tool moved the directory to a path longer
+than the platform limit, `tree_capture` is also `degraded` and the detail starts with
+`root_unverified`. In both cases `success` is false, no `tree_out` or `changed` entries are
+published, and `exit_code` keeps the tool's own status. A renamed run directory is still the pinned
+directory and is captured through it, including when the tool then creates a new directory at the
+old path: the receipt describes the renamed tree, and files written to the new directory are not
+captured. Otherwise `tree_capture` is
+`complete`, `failed` for a capture error, or `none` when the run did not reach capture. A removal
+after the check is not detected, and a platform with no descriptor-to-path query runs no such check.

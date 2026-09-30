@@ -379,6 +379,10 @@ struct Receipt {
     stderr_retained: u64,
     stdout_capture: &'static str,
     stderr_capture: &'static str,
+    // "none" before capture runs, then "complete", "failed", or "degraded"
+    // when the run directory no longer resolves to the pinned descriptor.
+    tree_capture: &'static str,
+    tree_capture_detail: Option<String>,
     changed: Vec<Change>,
     undeclared: Vec<String>,
     skipped: Vec<String>,
@@ -424,6 +428,8 @@ impl Receipt {
             "stderr_retained_bytes": self.stderr_retained,
             "stdout_capture": self.stdout_capture,
             "stderr_capture": self.stderr_capture,
+            "tree_capture": self.tree_capture,
+            "tree_capture_detail": self.tree_capture_detail,
             "changed": self.changed.iter().map(Change::to_json).collect::<Vec<_>>(),
             "undeclared_changes": self.undeclared,
             "skipped": self.skipped,
@@ -851,6 +857,8 @@ pub async fn run(
         stderr_retained: 0,
         stdout_capture: "none",
         stderr_capture: "none",
+        tree_capture: "none",
+        tree_capture_detail: None,
         changed: vec![],
         undeclared: vec![],
         skipped: vec![],
@@ -1641,10 +1649,29 @@ async fn execute(
 
     // Capture errors describe a completed, unsuccessful run. Finalize its
     // receipt rather than propagating past receipt insertion in `run`.
+    let mut root_unconfirmed: Option<String> = None;
     let captured: Result<(), RuntimeError> = async {
         let (found, skipped) =
             walk(&capture_root)
                 .map_err(|e| RuntimeError::Unconfigured(format!("capture tree: {e}")))?;
+        // A run directory the tool removed, or removed and recreated, lists as
+        // empty through the pinned descriptor. That is not evidence the tool
+        // wrote nothing, so the walk result is withheld rather than published
+        // as its output; so is one whose current path cannot be confirmed.
+        match capture_root.missing_root() {
+            Ok(None) => {}
+            Ok(Some(detail)) => {
+                root_unconfirmed = Some(detail);
+                return Ok(());
+            }
+            // No descriptor-to-path query on this platform (ADR-181 Amendment 11).
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(error) => {
+                return Err(RuntimeError::Unconfigured(format!(
+                    "capture root check: {error}"
+                )))
+            }
+        }
         receipt.skipped = skipped;
         let input: BTreeMap<&str, &TreeEntry> =
             ready.entries.iter().map(|e| (e.path.as_str(), e)).collect();
@@ -1768,6 +1795,7 @@ async fn execute(
     }
     .await;
     if let Err(error) = captured {
+        receipt.tree_capture = "failed";
         append_failure_reason(receipt, error.to_string());
         receipt.tree_out = None;
         receipt.changed.clear();
@@ -1777,7 +1805,20 @@ async fn execute(
         finish_cleanup(receipt, &run_dir, &profile_path, false);
         return Ok(());
     }
+    if let Some(detail) = root_unconfirmed {
+        // The tool's own exit status stays as recorded; only capture's verdict
+        // changes, and no output tree is claimed for the run.
+        receipt.tree_capture = "degraded";
+        append_failure_reason(receipt, format!("capture degraded: {detail}"));
+        receipt.tree_capture_detail = Some(detail);
+        receipt.tree_out = None;
+        receipt.changed.clear();
+        receipt.undeclared.clear();
+        finish_cleanup(receipt, &run_dir, &profile_path, false);
+        return Ok(());
+    }
 
+    receipt.tree_capture = "complete";
     finish_cleanup(receipt, &run_dir, &profile_path, cfg.keep);
     Ok(())
 }
