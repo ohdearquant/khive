@@ -106,6 +106,17 @@ impl AuxiliarySidecarReader {
 }
 
 impl CheckpointDirectory {
+    /// Pin the non-symlink/non-reparse directory resolved from the configured
+    /// path at its first final-component open. The parent chain is trusted on
+    /// both platforms. Unix's descriptor walk follows only ownership/mode-
+    /// qualified ancestor symlinks; Windows rejects ancestor links by path
+    /// before its canonical component walk and rejects reparse-point handles.
+    /// An ordinary directory replacement before the first open is out of
+    /// scope because a path input supplies no earlier identity to authenticate.
+    /// Unix binds the walked handle to an independent `O_NOFOLLOW` reopen by
+    /// device/inode; Windows binds the walked and retained handles by volume/
+    /// file ID and final path. A final symlink or reparse point is refused, and
+    /// subsequent checkpoint operations use the retained directory handle.
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         {

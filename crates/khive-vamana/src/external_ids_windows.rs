@@ -44,6 +44,15 @@ pub(super) fn write_via_dir_handle(dir: &Path, buf: &[u8]) -> Result<(), Externa
 
 /// The checkpoint writer shares the sidecar's verified directory-handle
 /// boundary. All later operations are relative to this pinned handle.
+///
+/// The configured path establishes the directory identity at the first
+/// handle-relative open of its canonical location. The returned handle must
+/// identify that same non-reparse directory: the walked and retained handles
+/// are compared by volume/file ID and final path. The parent chain is trusted;
+/// `ensure_portable_ancestors_not_symlinks` rejects ancestor links by path,
+/// and each walked handle and the retained final handle reject reparse points.
+/// An ordinary directory replacement before the first open is outside this
+/// boundary: a path input carries no earlier directory identity to authenticate.
 pub(crate) fn open_checkpoint_directory(dir: &Path) -> std::io::Result<std::fs::File> {
     open_checkpoint_directory_with_access(dir, FILE_READ_ATTRIBUTES)
 }
