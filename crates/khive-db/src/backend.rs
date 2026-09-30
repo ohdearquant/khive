@@ -230,7 +230,9 @@ impl StorageBackend {
     /// whose mode is read-only is opened with the same locked-down pool
     /// configuration as [`Self::sqlite_read_only`]. The writable pool provides
     /// 1 writer + N readers in WAL mode for concurrent access.
-    /// No schema is applied — call `apply_schema()` for each service.
+    /// No service schema is applied — call `apply_schema()` for each service.
+    /// The pool may create its internal `_khive_database_identity` singleton
+    /// table on a writable open before service migrations run.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         Self::sqlite_with_pool_config(path, PoolConfig::default(), None)
     }
