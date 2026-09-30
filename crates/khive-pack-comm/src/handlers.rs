@@ -2239,11 +2239,21 @@ async fn repair_duplicate_quarantine(
     let stored_ref = duplicate
         .properties
         .as_ref()
-        .and_then(|properties| properties.get("quarantine_content_ref"))
-        .and_then(Value::as_str);
-    if stored_ref != Some(attachment.content_ref.as_str()) {
+        .and_then(|properties| properties.get("quarantine_content_ref"));
+    let needs_ref_backfill = stored_ref.is_none();
+    if stored_ref.is_some_and(|value| value.as_str() != Some(attachment.content_ref.as_str())) {
         return Err(RuntimeError::InvalidInput(
             "ingest: duplicate quarantine external_id holds different original bytes".to_string(),
+        ));
+    }
+    if needs_ref_backfill
+        && !duplicate.properties.as_ref().is_some_and(|properties| {
+            matches!(properties.get("quarantined"), Some(Value::Bool(true)))
+                || properties.get("quarantined").and_then(Value::as_str) == Some("true")
+        })
+    {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: duplicate without an original reference is not quarantined".to_string(),
         ));
     }
     let stored_channel_kind = duplicate
@@ -2261,6 +2271,12 @@ async fn repair_duplicate_quarantine(
     {
         return Err(RuntimeError::InvalidInput(
             "ingest: duplicate quarantine channel identity disagrees with replay".to_string(),
+        ));
+    }
+    if needs_ref_backfill && (stored_channel_kind.is_none() || channel_slug.is_none()) {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: duplicate quarantine needs channel identity to attach original bytes"
+                .to_string(),
         ));
     }
     // Compute the replay grace before installing the owner, so an
@@ -2337,50 +2353,52 @@ async fn repair_duplicate_quarantine(
             }
         }
     }
-    if let (Some(channel_kind), Some(channel_slug), Some(deadline)) =
-        (stored_channel_kind, channel_slug, replay_deadline)
-    {
-        // The duplicate lookup has already matched the exact
-        // channel kind and slug. This guarded write installs or
-        // extends its retention deadline; a concurrent identity
-        // change cannot redirect cleanup to another channel.
-        // Later deadlines are retained.
-        let sql = runtime.sql();
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let repaired = writer
-            .execute(SqlStatement {
-                sql: "UPDATE notes SET \
-                      properties = json_set(properties, '$.channel_slug', ?5), \
-                      expires_at = CASE WHEN expires_at IS NULL OR expires_at < ?6 \
+    if let (Some(channel_kind), Some(channel_slug)) = (stored_channel_kind, channel_slug) {
+        if needs_ref_backfill || replay_deadline.is_some() {
+            // The duplicate lookup has already matched the exact channel kind
+            // and slug. Repair a pre-attachment quarantine's ContentRef before
+            // acknowledging it, and extend retention only for a current-key
+            // replay. A concurrent identity change cannot redirect cleanup.
+            let sql = runtime.sql();
+            let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+            let repaired = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET \
+                      properties = json_set(properties, '$.channel_slug', ?5, \
+                                            '$.quarantine_content_ref', ?3), \
+                      expires_at = CASE WHEN ?6 IS NULL THEN expires_at \
+                        WHEN expires_at IS NULL OR expires_at < ?6 \
                         THEN ?6 ELSE expires_at END, \
                       updated_at = MAX(updated_at, ?7) \
                       WHERE id = ?1 AND namespace = ?2 AND kind = 'message' \
                         AND deleted_at IS NULL \
-                        AND json_extract(properties, '$.quarantine_content_ref') = ?3 \
+                        AND (json_type(properties, '$.quarantine_content_ref') IS NULL \
+                             OR json_extract(properties, '$.quarantine_content_ref') = ?3) \
                         AND json_extract(properties, '$.channel_kind') = ?4 \
                         AND (json_type(properties, '$.channel_slug') IS NULL \
                              OR (json_type(properties, '$.channel_slug') = 'text' \
                                  AND json_extract(properties, '$.channel_slug') = ?5)) \
                         AND (json_extract(properties, '$.quarantined') = 'true' \
                              OR json_type(properties, '$.quarantined') = 'true')"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(duplicate.id.as_hyphenated().to_string()),
-                    SqlValue::Text(ns.to_string()),
-                    SqlValue::Text(attachment.content_ref.to_string()),
-                    SqlValue::Text(channel_kind.to_string()),
-                    SqlValue::Text(channel_slug.to_string()),
-                    SqlValue::Integer(deadline),
-                    SqlValue::Integer(Utc::now().timestamp_micros()),
-                ],
-                label: Some("comm_quarantine_duplicate_retention_repair".into()),
-            })
-            .await
-            .map_err(RuntimeError::Storage)?;
-        if repaired != 1 {
-            return Err(RuntimeError::InvalidInput(
-                "ingest: duplicate quarantine changed during retention repair".to_string(),
-            ));
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(duplicate.id.as_hyphenated().to_string()),
+                        SqlValue::Text(ns.to_string()),
+                        SqlValue::Text(attachment.content_ref.to_string()),
+                        SqlValue::Text(channel_kind.to_string()),
+                        SqlValue::Text(channel_slug.to_string()),
+                        replay_deadline.map_or(SqlValue::Null, SqlValue::Integer),
+                        SqlValue::Integer(Utc::now().timestamp_micros()),
+                    ],
+                    label: Some("comm_quarantine_duplicate_retention_repair".into()),
+                })
+                .await
+                .map_err(RuntimeError::Storage)?;
+            if repaired != 1 {
+                return Err(RuntimeError::InvalidInput(
+                    "ingest: duplicate quarantine changed during retention repair".to_string(),
+                ));
+            }
         }
     }
     Ok(())

@@ -5789,6 +5789,86 @@ async fn imap_legacy_key_repairs_duplicate_quarantine_before_ack() {
     assert_eq!(old_note.properties.unwrap()["external_id"], old_id);
 }
 
+#[tokio::test]
+async fn imap_legacy_key_backfills_original_on_note_only_quarantine() {
+    use khive_storage::BlobStore as _;
+
+    let (registry, runtime) = build_registry_for_ns("local");
+    let blob_root = tempfile::tempdir().expect("blob root");
+    let blob_store = Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+            .expect("blob store"),
+    );
+    let original_ref = blob_store
+        .put(b"byte-exact legacy quarantine original".to_vec())
+        .await
+        .expect("publish original");
+    runtime
+        .install_blob_store(blob_store)
+        .expect("install blob store");
+    let old_id = "imap:mail.example.com:17:note-only";
+    let new_id = "imap:mail.example.com:a@example.com:17:note-only";
+    let old = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "old note-only quarantine", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": old_id,
+                "metadata": {"quarantined": "true", "quarantine_reason": "off-allowlist"},
+            }),
+        )
+        .await
+        .expect("seed note-only quarantine");
+    let replay = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "replayed quarantine", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": new_id,
+                "legacy_external_id": old_id,
+                "metadata": {
+                    "quarantined": "true",
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("same-mailbox old key must repair before duplicate acknowledgement");
+    assert_eq!(replay["deduplicated"], true);
+    assert_eq!(replay["thread_id"], old["thread_id"]);
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let notes = runtime.notes(&token).expect("note store");
+    assert_eq!(
+        notes.count_notes("local", Some("message")).await.unwrap(),
+        1
+    );
+    let note_id = old["full_id"]
+        .as_str()
+        .expect("old note id")
+        .parse()
+        .expect("canonical UUID");
+    let note = notes
+        .get_note(note_id)
+        .await
+        .unwrap()
+        .expect("old row retained");
+    let props = note.properties.expect("old row properties");
+    assert_eq!(props["external_id"], old_id);
+    assert_eq!(props["quarantine_content_ref"], original_ref.to_string());
+    let owner = runtime
+        .core()
+        .attachments()
+        .expect("attachment store")
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("attachment lookup")
+        .expect("legacy note roots its original");
+    assert_eq!(owner.content_ref, original_ref);
+}
+
 /// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must echo the literal stored value — not fabricate the duplicate's note UUID (which would route a caller into a DIFFERENT thread on a later send).
 #[tokio::test]
 async fn ingest_dedup_echoes_stored_non_uuid_thread_label() {

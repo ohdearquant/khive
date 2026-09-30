@@ -955,6 +955,7 @@ async fn channel_poll_loop(
     default_inbound_actor: String,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    use base64::Engine as _;
     use chrono::{DateTime, Utc};
     use khive_channel_email::{is_backoff_eligible, ImapBackoff};
     use serde_json::json;
@@ -1143,6 +1144,56 @@ async fn channel_poll_loop(
                         .collect();
                     let mut page_fully_ingested = true;
                     for env in page.envelopes {
+                        let mut metadata = env.metadata.clone();
+                        if kind == "email"
+                            && metadata.get("quarantined").map(String::as_str) == Some("true")
+                        {
+                            let Some(replay) = env.quarantine_replay.as_ref() else {
+                                tracing::warn!(
+                                    channel = kind,
+                                    external_id = env.external_id.as_deref(),
+                                    "quarantined email has no original-byte replay; holding channel progress"
+                                );
+                                page_fully_ingested = false;
+                                continue;
+                            };
+                            let put = registry
+                                .dispatch(
+                                    "blob.put",
+                                    json!({
+                                        "bytes": base64::engine::general_purpose::STANDARD
+                                            .encode(&replay.bytes)
+                                    }),
+                                )
+                                .await;
+                            let content_ref = match put {
+                                Ok(result) => {
+                                    match result.get("content_ref").and_then(|v| v.as_str()) {
+                                        Some(content_ref) => content_ref.to_string(),
+                                        None => {
+                                            tracing::warn!(
+                                            channel = kind,
+                                            external_id = env.external_id.as_deref(),
+                                            "blob.put returned no quarantine content reference; holding channel progress"
+                                        );
+                                            page_fully_ingested = false;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        channel = kind,
+                                        external_id = env.external_id.as_deref(),
+                                        %error,
+                                        "failed to publish quarantined email original; holding channel progress"
+                                    );
+                                    page_fully_ingested = false;
+                                    continue;
+                                }
+                            };
+                            metadata.insert("quarantine_content_ref".to_string(), content_ref);
+                        }
                         let params = json!({
                             "namespace": ingest_namespace,
                             "from": env.from.clone(),
@@ -1158,7 +1209,7 @@ async fn channel_poll_loop(
                             "default_inbound_actor": default_inbound_actor,
                             "wire_message_id": env.wire_message_id.clone(),
                             "wire_references": env.wire_references.clone(),
-                            "metadata": env.metadata.clone(),
+                            "metadata": metadata,
                         });
                         if let Err(error) = registry.dispatch("comm.ingest", params).await {
                             let handled = handle_channel_ingest_failure(
@@ -13862,12 +13913,12 @@ backend = "kg-backend"
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
-        struct ContentRefusalOnceChannel {
+        struct EmailOnceChannel {
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
         #[async_trait]
-        impl Channel for ContentRefusalOnceChannel {
+        impl Channel for EmailOnceChannel {
             fn kind(&self) -> &'static str {
                 "email"
             }
@@ -14074,6 +14125,130 @@ backend = "kg-backend"
         }
 
         #[tokio::test(start_paused = true)]
+        async fn first_time_email_quarantine_roots_exact_original_before_cursor_commit() {
+            const ORIGINAL_BYTES: &[u8] = b"From: forged@example.com\r\n\
+                To: maintainer@example.com\r\n\
+                X-Original: \xff\x00\r\n\
+                \r\n\
+                untrusted body\r\n";
+            const EXTERNAL_ID: &str = "imap:h:account:11:8";
+            let mut envelope = ChannelEnvelope::new(
+                "email:quarantine",
+                "email:maintainer@example.com",
+                "untrusted body",
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_legacy_external_id("imap:h:11:8")
+            .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
+            envelope
+                .metadata
+                .insert("quarantined".to_string(), "true".to_string());
+            envelope
+                .metadata
+                .insert("quarantine_reason".to_string(), "off-allowlist".to_string());
+            envelope.metadata.insert(
+                "quarantine_claimed_from".to_string(),
+                "forged@example.com".to_string(),
+            );
+
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(EmailOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first-time quarantine must attach its original and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let notes = inbox["items"].as_array().expect("message items");
+            assert_eq!(notes.len(), 1, "one first-time quarantine note");
+            let quarantined = &notes[0];
+            let props = &quarantined["properties"];
+            assert_eq!(props["external_id"], EXTERNAL_ID);
+            assert_eq!(props["from_actor"], "email:quarantine");
+            assert_eq!(props["quarantined"], "true");
+            assert_eq!(props["quarantine_reason"], "off-allowlist");
+            assert_eq!(props["quarantine_claimed_from"], "forged@example.com");
+            assert!(props.get("quarantine_classification").is_none());
+            let content_ref = props["quarantine_content_ref"]
+                .as_str()
+                .expect("first-time quarantine original reference");
+            let note_id = quarantined["id"]
+                .as_str()
+                .expect("quarantine note id")
+                .parse::<uuid::Uuid>()
+                .expect("quarantine note UUID");
+            let owner = runtime
+                .attachments()
+                .expect("main attachment store")
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .expect("original must be rooted before cursor commit");
+            assert_eq!(owner.substrate, khive_storage::AttachmentSubstrate::Note);
+            assert_eq!(owner.content_ref.as_str(), content_ref);
+            let fetched = registry
+                .dispatch("blob.get", json!({"content_ref": content_ref}))
+                .await
+                .expect("quarantine original must be retrievable");
+            let original = BASE64
+                .decode(fetched["bytes"].as_str().expect("base64 original bytes"))
+                .expect("valid base64 original bytes");
+            assert_eq!(original, ORIGINAL_BYTES);
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn content_refusal_stores_exact_replay_and_ingests_body_free_quarantine() {
             const EXTERNAL_ID: &str = "imap:h:11:7";
             const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
@@ -14092,7 +14267,7 @@ backend = "kg-backend"
             .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
 
             let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(ContentRefusalOnceChannel {
+            ch_registry.register(Arc::new(EmailOnceChannel {
                 envelope: Mutex::new(Some(envelope)),
             }));
 
@@ -14353,7 +14528,7 @@ backend = "kg-backend"
             ));
 
             let mut channels = ChannelRegistry::new();
-            channels.register(Arc::new(ContentRefusalOnceChannel {
+            channels.register(Arc::new(EmailOnceChannel {
                 envelope: Mutex::new(Some(envelope)),
             }));
             let task = tokio::spawn(channel_poll_loop(
