@@ -357,6 +357,46 @@ fn byte_copy_of_production_is_not_an_identity_alias() {
 }
 
 #[cfg(unix)]
+fn has_moved(conn: &Connection) -> (std::ffi::c_int, std::ffi::c_int) {
+    let mut moved: std::ffi::c_int = -1;
+    // SAFETY: conn is live for the call; the schema name and out-parameter
+    // outlive it.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::ffi::c_int).cast(),
+        )
+    };
+    (result, moved)
+}
+
+#[cfg(unix)]
+#[test]
+fn opened_main_reports_when_its_path_names_another_file() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let target = dir.path().join("code-map.db");
+    let backend = StorageBackend::sqlite_code_map(&target, &[], &[]).expect("first guarded open");
+    let writer = backend.pool().writer().expect("guarded writer");
+    assert_eq!(has_moved(writer.conn()), (rusqlite::ffi::SQLITE_OK, 0));
+
+    let moved = dir.path().join("moved.db");
+    std::fs::rename(&target, &moved).expect("move the opened main");
+    assert_eq!(has_moved(writer.conn()), (rusqlite::ffi::SQLITE_OK, 1));
+
+    std::fs::copy(&moved, &target).expect("equal bytes at the old path");
+    assert_eq!(has_moved(writer.conn()), (rusqlite::ffi::SQLITE_OK, 1));
+
+    std::fs::remove_file(&target).expect("drop the copy");
+    std::fs::rename(&moved, &target).expect("restore the opened main");
+    assert_eq!(has_moved(writer.conn()), (rusqlite::ffi::SQLITE_OK, 0));
+}
+
+#[cfg(unix)]
 #[test]
 fn main_hardlink_swap_is_quarantined_without_poisoning_production() {
     if let Some(path) = std::env::var_os(PRODUCTION_LOCK_PROBE) {

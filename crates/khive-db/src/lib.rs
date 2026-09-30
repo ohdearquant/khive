@@ -16,6 +16,9 @@ pub mod diagnostics;
 pub mod error;
 /// SQLite extension registration (sqlite-vec auto-extension).
 pub mod extension;
+/// Physical file identity shared by pool admission and backend alias routing.
+#[cfg(any(unix, windows))]
+pub mod file_identity;
 mod fts_maintenance;
 /// Schema migration system (versioned migrations).
 pub mod migrations;

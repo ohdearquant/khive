@@ -49,6 +49,22 @@ fn identity(stat: &libc::stat) -> Identity {
     }
 }
 
+/// Whether `path` still names the file with `opened`, the question SQLite's
+/// Unix VFS answers for SQLITE_FCNTL_HAS_MOVED. The path is not followed, as
+/// the guard never admits a symlinked member.
+pub(super) fn path_names(path: &Path, opened: Identity) -> bool {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: path is NUL-terminated and the output buffer is valid for lstat.
+    if unsafe { libc::lstat(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: lstat initialized the entire stat structure on success.
+    identity(&unsafe { stat.assume_init() }) == opened
+}
+
 fn regular_observation(stat: &libc::stat) -> io::Result<Observed> {
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(io::Error::new(

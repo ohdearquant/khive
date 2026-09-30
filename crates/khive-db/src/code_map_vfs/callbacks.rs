@@ -444,6 +444,20 @@ unsafe extern "C" fn file_control(
             }
         }
     }
+    #[cfg(unix)]
+    {
+        if op == ffi::SQLITE_FCNTL_HAS_MOVED && opened.handle.role == Role::Main {
+            if arg.is_null() {
+                return ffi::SQLITE_IOERR;
+            }
+            // Callers verify that the opened main is still the file at its
+            // path; answering NOTFOUND would leave that question unanswerable.
+            let moved = !os::path_names(&opened.guard.path(Role::Main), opened.handle.identity);
+            // SAFETY: SQLITE_FCNTL_HAS_MOVED carries a writable int pointer.
+            unsafe { *arg.cast::<c_int>() = c_int::from(moved) };
+            return ffi::SQLITE_OK;
+        }
+    }
     ffi::SQLITE_NOTFOUND
 }
 

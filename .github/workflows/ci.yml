@@ -1197,6 +1197,16 @@ jobs:
           # Floor 1 detects empty selection without pinning the suite size.
           cargo test -p khive-db --lib bounded_verified_get_accepts_exact_and_portable_maximum_limits 2>&1 | tee "$RUNNER_TEMP/bounded_verified_get_accepts_exact_and_portable_maximum_limits.log"
           ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/bounded_verified_get_accepts_exact_and_portable_maximum_limits.log" 1
+      - name: khive-mcp Windows database alias identity
+        shell: bash
+        run: |
+          cargo test -p khive-mcp --lib windows_backend_alias_snapshot_rejects_same_path_replacement 2>&1 | tee "$RUNNER_TEMP/windows-backend-alias-identity.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/windows-backend-alias-identity.log" 1
+      - name: khive-db Windows legacy reader file identity
+        shell: bash
+        run: |
+          cargo test -p khive-db --lib windows_read_only_legacy_reader_rejects_different_opened_file_identity 2>&1 | tee "$RUNNER_TEMP/windows-legacy-reader-identity.log"
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/windows-legacy-reader-identity.log" 1
       # #2149: exercise real Windows sharing/reparse semantics and Git's
       # consumption of the pinned path; a compile check cannot prove either.
       - name: khive-pack-git Windows cache slot pins
