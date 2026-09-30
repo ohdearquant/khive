@@ -93,6 +93,8 @@ impl KhiveRuntime {
     /// at 98,304 bytes by the protocol request limit. No blob store is involved.
     /// A failure commits nothing and returns no recipient disposition. Retryable
     /// storage errors must not be converted into quarantine by the caller.
+    /// A SecretDetected refusal is deterministic: redelivering the same payload
+    /// is refused again.
     pub(crate) async fn ingest_verified_recipient(
         &self,
         token: &NamespaceToken,
@@ -218,7 +220,7 @@ impl KhiveRuntime {
                 reason,
                 parsed_plaintext,
             } => {
-                // ADR-105's credential fence also applies to retained plaintext.
+                // Retained plaintext passes the same write-time secret gate as a stored message.
                 // Refuse before the quarantine/replay/ack transaction can write.
                 if let Some(plaintext) = &parsed_plaintext {
                     crate::secret_gate::check_json_at(plaintext, "quarantine", "parsed_plaintext")?;
