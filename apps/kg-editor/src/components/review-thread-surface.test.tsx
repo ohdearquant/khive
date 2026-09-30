@@ -2,7 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import { ReviewThreadSurface, VALUE_TOO_DEEP } from "@/components/review-thread-surface";
+import { ReviewThreadSurface } from "@/components/review-thread-surface";
 import { demoReviewFixture } from "@/lib/fixtures/demo-review";
 import type { ReviewReport } from "@/lib/review-bundle";
 import { buildReviewThreadModel, reviewUnitKey, type ReviewAnnotation } from "@/lib/review-thread";
@@ -115,6 +115,7 @@ describe("review list and thread surface", () => {
   });
 
   it("renders an imported value nested past the stringify recursion limit without throwing", async () => {
+    const VALUE_TOO_DEEP = "Value is nested too deeply to display.";
     const deep: Record<string, unknown> = {};
     let cursor = deep;
     for (let level = 0; level < 8000; level += 1) {

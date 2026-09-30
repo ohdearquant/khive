@@ -185,7 +185,7 @@ function ThreadEvent({ event }: { event: ReviewThreadEvent }) {
 
 type UnitField = NonNullable<ReviewThreadUnit["change"]>["fields"][number];
 
-export const VALUE_TOO_DEEP = "Value is nested too deeply to display.";
+const VALUE_TOO_DEEP = "Value is nested too deeply to display.";
 
 function formatValue(value: unknown): string {
   if (typeof value === "string") return value;
