@@ -267,13 +267,11 @@ enum Binding {
     /// the module namespace.
     Local,
     /// An import that is neither a note SQL constant nor a scanned module.
-    /// `type_like` is set when the imported name is UpperCamelCase, the
-    /// type-namespace convention. Only such an import hides a module or crate
-    /// of the same name at the head of a path: a function or constant lives
-    /// in the value namespace and hides nothing there, and an import whose
-    /// namespace is unknown keeps the lookup going, so it can add a reported
-    /// site but never drop one.
-    Other { type_like: bool },
+    /// Its name cannot tell a type from a function or constant, so it never
+    /// hides a module or crate of the same name at the head of a path: the
+    /// census may report a path that Rust resolves through the import, but
+    /// never drops one that reaches a note SQL constant.
+    Other,
     /// A note properties SQL constant, by its declared name.
     Constant(String),
     /// A scanned module, so a path through this name resolves inside it.
@@ -331,16 +329,6 @@ fn use_tree_imports(
             imports.push((rename.rename.to_string(), path));
         }
         UseTree::Glob(_) => imports.push((GLOB_IMPORT.to_owned(), prefix.clone())),
-    }
-}
-
-/// The binding for an import of `path` that the census does not follow.
-fn other_import(path: &[String]) -> Binding {
-    Binding::Other {
-        type_like: path.last().is_some_and(|name| {
-            name.starts_with(|c: char| c.is_ascii_uppercase())
-                && name.chars().any(|c| c.is_ascii_lowercase())
-        }),
     }
 }
 
@@ -429,7 +417,7 @@ fn crate_root(name: &str, modules: &ModuleBindings) -> Option<ModuleId> {
 /// The scanned module a path prefix names, or `None` when the prefix leaves
 /// the scanned sources. A leading plain name resolves as Rust resolves it:
 /// through an import in scope, then a child module, then a workspace crate.
-/// A name the scope binds to anything but a module ends the lookup there.
+/// A name the scope binds to anything but a module keeps the lookup going.
 /// Each later segment follows a child module or a re-exported module alias.
 fn resolve_module(
     prefix: &[String],
@@ -462,10 +450,6 @@ fn resolve_module(
         name => (
             match in_scope(name) {
                 Some(Binding::Module(module)) => module,
-                // A type imported under this name hides child modules and
-                // workspace crates of the same name. A value import does not,
-                // since a path head resolves in the type namespace.
-                Some(Binding::Other { type_like: true }) => return None,
                 _ => child_module(current, name, modules).or_else(|| crate_root(name, modules))?,
             },
             rest,
@@ -542,7 +526,7 @@ fn resolve_imports(
     let mut bindings = imports
         .iter()
         .filter(|(name, _)| name != GLOB_IMPORT)
-        .map(|(name, path)| (name.clone(), other_import(path)))
+        .map(|(name, _)| (name.clone(), Binding::Other))
         .collect::<SqlBindings>();
     for _ in 0..=imports.len() {
         let known = bindings.clone();
@@ -553,7 +537,7 @@ fn resolve_imports(
             bindings.insert(
                 name.clone(),
                 import_target(path, &known, parents, current_module, module_id, modules)
-                    .unwrap_or_else(|| other_import(path)),
+                    .unwrap_or(Binding::Other),
             );
         }
         // Every explicit name is already bound, and explicit imports shadow
@@ -1960,7 +1944,7 @@ fn module_paths_to_reexported_note_sql_are_reported() {
     )];
     // (description, writer source, extra sample files)
     type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
-    let cases: [Case; 14] = [
+    let cases: [Case; 16] = [
         (
             "renamed module import",
             "use crate::sql_alias as db;
@@ -2046,6 +2030,21 @@ fn module_paths_to_reexported_note_sql_are_reported() {
              fn write(conn: &Connection) { conn.prepare_cached(merge); }",
             &other_crate,
         ),
+        // The census cannot tell a type import from a value import by its
+        // name, so a type import under a crate's name still reports the crate.
+        (
+            "workspace crate behind a type import of the same name",
+            "use std::collections::HashMap as dbx;
+             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
+            &other_crate,
+        ),
+        (
+            "import path through a type import of the same name",
+            "use std::collections::HashMap as dbx;
+             use dbx::MERGE_SQL as merge;
+             fn write(conn: &Connection) { conn.prepare_cached(merge); }",
+            &other_crate,
+        ),
     ];
     for (form, writer, extra) in cases {
         let sites = scan_sources(&module_path_sources(writer, extra)).unwrap();
@@ -2110,32 +2109,6 @@ fn module_paths_to_unrelated_names_are_not_reported() {
     ] {
         let sites = scan_sources(&module_path_sources(writer, &[])).unwrap();
         assert!(sites.is_empty(), "{form}: {sites:?}");
-    }
-
-    // A name imported from outside the scanned sources hides a workspace crate
-    // of the same name, in an expression path and in an import path alike.
-    let other_crate = [(
-        "dbx/src/lib.rs",
-        "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;",
-    )];
-    for (form, writer) in [
-        (
-            "expression path",
-            "use std::collections::HashMap as dbx;
-             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
-        ),
-        (
-            "import path",
-            "use std::collections::HashMap as dbx;
-             use dbx::MERGE_SQL as merge;
-             fn write(conn: &Connection) { conn.prepare_cached(merge); }",
-        ),
-    ] {
-        let sites = scan_sources(&module_path_sources(writer, &other_crate)).unwrap();
-        assert!(
-            sites.is_empty(),
-            "import hides a workspace crate, {form}: {sites:?}"
-        );
     }
 }
 
