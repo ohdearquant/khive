@@ -912,7 +912,9 @@ form that parser accepts.
 | five-field cron           | The next match after the previous trigger, evaluated in UTC                                 |
 
 Any other value is rejected at creation with an error that names the rejected value and
-the accepted forms. A legacy row whose stored `repeat` the parser does not accept still
+the accepted forms. Creation also rejects a parsed recurrence that has no representable
+occurrence after its requested `at`, naming the rejected value. A legacy row whose stored
+`repeat` the parser does not accept still
 fails closed before invocation; the fail-closed rule is unchanged, only the accepted
 grammar widened. The write boundary and the executor cannot disagree about what a
 recurrence means because there is exactly one definition of it; that property, not any
@@ -1002,6 +1004,12 @@ implementation and gives no reason for the drift. This amendment decides the que
 5. **The other forms are unchanged.** `daily`, `weekly` and `every:` are fixed durations with nothing
    to clamp, and cron occurrences are absolute positions of the pattern. None of them reads or writes
    `repeat_anchor`.
+6. **Invalid stored anchors fail visibly.** If a stored `repeat_anchor` is not a timestamp or is
+   later than the row's current `trigger_at`, the executor fails the row without advancing it.
+   It records the calendar error in `recurrence_error` beside any action delivery or dispatch
+   error. An already durable action receipt keeps its known outcome; calendar failure does not
+   classify that invocation as indeterminate. A missed occurrence still records its missed
+   receipt without dispatching. The failed row is counted once after finalization commits.
 
 Acceptance, stated before any implementation runs:
 

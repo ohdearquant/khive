@@ -115,7 +115,13 @@ pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> V
     Value::Object(out)
 }
 
-pub(crate) const FIXED_ACCEPT_ENCODING: &str = "gzip";
+/// The fetch path never offers a content coding and never decodes one: every
+/// body it hands on is the identity representation or the request is refused.
+pub(crate) const FIXED_ACCEPT_ENCODING: &str = "identity";
+/// The value earlier versions recorded when the client offered gzip. A stored
+/// request map carrying it is valid for negotiation replay, but its body must
+/// be replaced by an unconditional identity GET before validators can be sent.
+pub(crate) const LEGACY_ACCEPT_ENCODING: &str = "gzip";
 const NEGOTIATION_HEADERS: &[&str] = &["accept", "accept-language", "accept-encoding"];
 
 /// Keep only representation negotiation, never credentials or conditional
@@ -131,10 +137,9 @@ pub(crate) fn negotiation_headers(headers: &[(String, String)]) -> BTreeMap<Stri
     selected
 }
 
-/// Both HTTP clients enable reqwest gzip, which sends this header when the
-/// caller has not supplied one. The egress allowlist does not permit callers
-/// to set Accept-Encoding. Record that fixed client choice alongside the
-/// fields passed explicitly to `run_one_hop`.
+/// `run_one_hop` sends this header on every hop. The egress allowlist does not
+/// permit callers to set Accept-Encoding. Record that fixed client choice
+/// alongside the fields passed explicitly to `run_one_hop`.
 pub(crate) fn recorded_negotiation_headers(
     headers: &[(String, String)],
 ) -> BTreeMap<String, Vec<String>> {
@@ -181,12 +186,16 @@ pub(crate) fn stored_negotiation_headers(
                     "stored {name} negotiation has no valid header value"
                 )));
             }
-            if *name == "accept-encoding"
-                && (values.len() != 1 || values[0] != FIXED_ACCEPT_ENCODING)
-            {
-                return Err(RuntimeError::InvalidInput(
-                    "stored accept-encoding differs from the fixed client value".to_string(),
-                ));
+            if *name == "accept-encoding" {
+                if values.len() != 1
+                    || (values[0] != FIXED_ACCEPT_ENCODING && values[0] != LEGACY_ACCEPT_ENCODING)
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "stored accept-encoding differs from the fixed client value".to_string(),
+                    ));
+                }
+                headers.push(((*name).to_string(), FIXED_ACCEPT_ENCODING.to_string()));
+                continue;
             }
             headers.extend(values.into_iter().map(|value| ((*name).to_string(), value)));
         }
@@ -343,9 +352,8 @@ pub(crate) async fn run_one_hop(
         .into());
     }
     let want_body = method == reqwest::Method::GET;
-    // The encoded representation is fixed for every hop, including HEAD and
-    // redirects. Supplying it explicitly also keeps the wire value stable if
-    // a future internal client builder changes its reqwest defaults.
+    // The requested representation is fixed for every hop, including HEAD and
+    // redirects: identity, sent explicitly so no origin is invited to compress.
     let mut request = client
         .request(method, url.clone())
         .header(reqwest::header::ACCEPT_ENCODING, FIXED_ACCEPT_ENCODING);
@@ -379,6 +387,13 @@ pub(crate) async fn run_one_hop(
         };
         let body =
             if want_body && redirect_to.is_none() {
+                // No client decodes a content coding, so a body that names one
+                // would reach the byte cap as undecoded bytes. Refuse it
+                // before any body byte is read. A 204 or 304 has no content
+                // to mislabel.
+                if !matches!(status, 204 | 304) {
+                    refuse_content_encoding(&response_headers)?;
+                }
                 let mut response = response;
                 let mut buffer: Vec<u8> = Vec::new();
                 let mut truncated = false;
@@ -413,6 +428,30 @@ pub(crate) async fn run_one_hop(
         Ok(result) => result,
         Err(_) => Err(Refusal::new("response_too_slow", "response exceeded the time bound").into()),
     }
+}
+
+/// Refuse any `Content-Encoding` other than `identity`. Every listed coding
+/// must be identity; an unreadable value is refused as well.
+fn refuse_content_encoding(headers: &reqwest::header::HeaderMap) -> Result<(), RuntimeError> {
+    for value in headers.get_all(reqwest::header::CONTENT_ENCODING) {
+        let text = value.to_str().ok();
+        let coding = text.unwrap_or("<non-text value>");
+        let identity_only = text.is_some_and(|text| {
+            text.split(',')
+                .map(str::trim)
+                .all(|token| token.is_empty() || token.eq_ignore_ascii_case("identity"))
+        });
+        if !identity_only {
+            return Err(Refusal::new(
+                "unsupported_content_encoding",
+                format!(
+                    "the response declares content-encoding {coding:?}; only identity is accepted"
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 struct CredentialAttachment {
@@ -637,37 +676,7 @@ where
 /// belongs to the terminal request, including when that request followed a
 /// redirect; callers can use it as an optimistic-write guard at settlement.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_hop_chain_observed<F, O, Fut, T>(
-    resolver: &dyn Resolver,
-    cfg: &WebSectionConfig,
-    url: Url,
-    method: reqwest::Method,
-    max_bytes: u64,
-    deadline: Instant,
-    headers_for_hop: F,
-    before_request: O,
-) -> Result<(HopOutcome, Vec<RedirectHop>, T), RuntimeError>
-where
-    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
-    O: FnMut(Url) -> Fut,
-    Fut: Future<Output = Result<T, RuntimeError>>,
-{
-    run_hop_chain_with_clients_observed(
-        &egress::PinnedClients::default(),
-        resolver,
-        cfg,
-        url,
-        method,
-        max_bytes,
-        deadline,
-        headers_for_hop,
-        before_request,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_hop_chain_with_clients_observed<F, O, Fut, T>(
+pub(crate) async fn run_hop_chain_with_clients_observed<F, O, Fut, T>(
     clients: &egress::PinnedClients,
     resolver: &dyn Resolver,
     cfg: &WebSectionConfig,
@@ -1532,7 +1541,6 @@ mod tests {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
-            .gzip(true)
             .build()
             .expect("plain client builds")
     }
@@ -2177,10 +2185,10 @@ mod tests {
         assert_eq!(after.properties.unwrap(), head_properties);
     }
 
-    // arm 19: a gzip response whose decompressed size exceeds the byte
-    // bound stores truncated at exactly the bound.
+    // arm 19: a gzip response is refused by name; the compressed bytes never
+    // reach the caller, whatever the byte bound.
     #[tokio::test]
-    async fn arm19_gzip_response_truncates_after_decompression_to_the_bound() {
+    async fn arm19_gzip_response_is_refused_not_passed_through() {
         let plaintext = vec![b'z'; 10_000];
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         {
@@ -2193,7 +2201,6 @@ mod tests {
             "fixture must actually compress"
         );
 
-        let max_bytes = 100u64;
         let response = http_response(
             200,
             "OK",
@@ -2203,53 +2210,20 @@ mod tests {
         let (port, _hits) = spawn_once(response).await;
         let url = local_url(port, "/gz");
         let client = plain_client(Duration::from_secs(5));
-        let outcome = run_one_hop(
+        let error = run_one_hop(
             &client,
             &url,
             reqwest::Method::GET,
             &[],
-            max_bytes,
+            100,
             Instant::now() + Duration::from_secs(5),
         )
         .await
-        .expect("hop succeeds");
-        let (buffer, truncated) = outcome.body.clone().expect("GET body");
+        .expect_err("a content-encoded response must be refused");
         assert!(
-            truncated,
-            "decompressed body exceeds max_bytes and must truncate"
+            error.to_string().contains("unsupported_content_encoding"),
+            "{error}"
         );
-        assert_eq!(buffer.len() as u64, max_bytes);
-        assert!(buffer.iter().all(|&b| b == b'z'));
-
-        let (runtime, token, _dir) = test_runtime().await;
-        let reply = settle(
-            &runtime,
-            &token,
-            "GET",
-            &outcome.final_url,
-            outcome.status,
-            &outcome.headers,
-            Some((buffer.clone(), truncated)),
-            &[],
-            true,
-        )
-        .await
-        .expect("settle stores the truncated decompressed prefix");
-        assert_eq!(reply["truncated"], true);
-        assert_eq!(reply["bytes"], max_bytes);
-        let content_ref = reply["content_ref"].as_str().unwrap().to_string();
-        let store = crate::blob_store(&runtime).unwrap();
-        let content_ref_parsed = ContentRef::from_hex(&content_ref).unwrap();
-        let size = store
-            .size(&content_ref_parsed)
-            .await
-            .unwrap()
-            .expect("object exists");
-        assert!(
-            size <= max_bytes,
-            "stored object must be no larger than the bound"
-        );
-        assert_eq!(size, max_bytes);
     }
 
     // arm 21: a redirect whose second hop is outside the credential's host
@@ -2661,7 +2635,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let captured = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..6 {
                 let (mut stream, _) = listener.accept().await.expect("accept");
                 let mut bytes = Vec::new();
                 while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
@@ -2699,21 +2673,39 @@ mod tests {
                 reqwest::Method::HEAD,
             ),
         ] {
+            // The built client alone offers no content coding ...
             client
-                .request(method, url)
+                .request(method.clone(), url.clone())
                 .send()
                 .await
                 .expect("built client sends request");
+            // ... and the hop sends the fixed identity value, once.
+            run_one_hop(
+                client,
+                &url,
+                method,
+                &[],
+                1_000,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("hop succeeds");
         }
-        for request in captured.await.expect("captured requests") {
+        for (index, request) in captured
+            .await
+            .expect("captured requests")
+            .iter()
+            .enumerate()
+        {
+            let offered: Vec<&str> = request
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("accept-encoding:"))
+                .map(|line| line.split_once(':').unwrap().1.trim())
+                .collect();
+            let expected: &[&str] = if index % 2 == 0 { &[] } else { &["identity"] };
             assert_eq!(
-                request
-                    .lines()
-                    .filter(|line| line.to_ascii_lowercase().starts_with("accept-encoding:"))
-                    .map(|line| line.split_once(':').unwrap().1.trim())
-                    .collect::<Vec<_>>(),
-                vec!["gzip"],
-                "the built client must send one fixed encoding: {request}"
+                offered, expected,
+                "request {index} must offer no compression: {request}"
             );
         }
     }

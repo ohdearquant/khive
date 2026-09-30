@@ -3,7 +3,7 @@
 //! Embeddings are excluded (regenerable from text + model). Edges are collected by
 //! querying all entity IDs in the namespace first, then fetching incident edges.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -275,30 +275,65 @@ impl KhiveRuntime {
         let store = self.entities(token)?;
         let mut entities_imported = 0usize;
         let mut embedding_truncation = crate::retrieval::EmbeddingTruncationReport::default();
-        for ee in &archive.entities {
-            let created_micros = ee.created_at.timestamp_micros();
-            let updated_micros = ee.updated_at.timestamp_micros();
-            let entity = khive_storage::entity::Entity {
-                id: ee.id,
-                namespace: ns.clone(),
-                kind: ee.kind.clone(),
-                entity_type: ee.entity_type.clone(),
-                name: ee.name.clone(),
-                description: ee.description.clone(),
-                properties: ee.properties.clone(),
-                tags: ee.tags.clone(),
-                created_at: created_micros,
-                updated_at: updated_micros,
-                deleted_at: None,
-                merged_into: None,
-                merge_event_id: None,
-                version: 1,
-                content_ref: None,
-            };
-            store.upsert_entity(entity.clone()).await?;
-            // Reindex so imported entities are searchable via hybrid_search immediately.
-            embedding_truncation.merge(self.reindex_entity(token, &entity).await?);
-            entities_imported += 1;
+        for page in archive
+            .entities
+            .chunks(crate::retrieval::EMBEDDING_BATCH_PAGE_SIZE)
+        {
+            let entities: Vec<khive_storage::entity::Entity> = page
+                .iter()
+                .map(|ee| khive_storage::entity::Entity {
+                    id: ee.id,
+                    namespace: ns.clone(),
+                    kind: ee.kind.clone(),
+                    entity_type: ee.entity_type.clone(),
+                    name: ee.name.clone(),
+                    description: ee.description.clone(),
+                    properties: ee.properties.clone(),
+                    tags: ee.tags.clone(),
+                    created_at: ee.created_at.timestamp_micros(),
+                    updated_at: ee.updated_at.timestamp_micros(),
+                    deleted_at: None,
+                    merged_into: None,
+                    merge_event_id: None,
+                    version: 1,
+                    content_ref: None,
+                })
+                .collect();
+            let texts: Vec<String> = entities
+                .iter()
+                .map(crate::curation::entity_embedding_text)
+                .collect();
+            let mut embeddings: Vec<HashMap<String, crate::retrieval::DocumentEmbeddingOutcome>> =
+                (0..entities.len()).map(|_| HashMap::new()).collect();
+            for model_name in self.registered_embedding_model_names() {
+                match self
+                    .embed_document_batch_with_model_outcomes_for_token(token, &model_name, &texts)
+                    .await
+                {
+                    Ok(outcomes) => {
+                        for (slot, outcome) in embeddings.iter_mut().zip(outcomes) {
+                            slot.insert(model_name.clone(), outcome);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            model = %model_name,
+                            error = %error,
+                            "import_kg: batch embed failed; retrying records individually"
+                        );
+                    }
+                }
+            }
+            for (entity, outcomes) in entities.into_iter().zip(embeddings) {
+                store.upsert_entity(entity.clone()).await?;
+                // Publish each record through the same guarded FTS/vector writer
+                // as an ordinary reindex, including its best-effort model failures.
+                embedding_truncation.merge(
+                    self.reindex_entity_with_precomputed(token, &entity, outcomes)
+                        .await?,
+                );
+                entities_imported += 1;
+            }
         }
 
         // Untrusted archives may reference entities absent from the target namespace;
@@ -346,7 +381,7 @@ impl KhiveRuntime {
                 .validate_edge_relation_endpoints(token, ee.source, ee.target, ee.relation)
                 .await
             {
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(e @ (RuntimeError::InvalidInput(_) | RuntimeError::NotFound(_))) => {
                     tracing::warn!(
                         source = %ee.source,
@@ -403,6 +438,7 @@ impl KhiveRuntime {
 // helpers that would otherwise need to be made pub to test from tests/.
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use super::*;
@@ -413,6 +449,96 @@ mod tests {
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
 
     const IMPORT_TEST_MODEL: &str = "all-minilm-l6-v2";
+    const IMPORT_BATCH_MODEL: &str = "import-batch-model";
+    const IMPORT_BATCH_MODEL_TWO: &str = "import-batch-model-two";
+
+    struct CountingImportService {
+        calls: Arc<AtomicUsize>,
+        reject_poison: bool,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for CountingImportService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_poison
+                && (texts.len() > 1 || texts.iter().any(|text| text.contains("poison")))
+            {
+                return Err(EmbedError::InferenceFailed("poison input".into()));
+            }
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    vec![
+                        text.len() as f32,
+                        text.bytes().map(u32::from).sum::<u32>() as f32,
+                        text.as_bytes().first().copied().unwrap_or_default() as f32,
+                        text.as_bytes().last().copied().unwrap_or_default() as f32,
+                    ]
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "import-batch-counting-service"
+        }
+    }
+
+    struct CountingImportProvider {
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+        reject_poison: bool,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for CountingImportProvider {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(&self) -> std::result::Result<Arc<dyn EmbeddingService>, RuntimeError> {
+            Ok(Arc::new(CountingImportService {
+                calls: Arc::clone(&self.calls),
+                reject_poison: self.reject_poison,
+            }))
+        }
+    }
+
+    fn batch_archive(names: impl IntoIterator<Item = String>) -> KgArchive {
+        KgArchive {
+            format: "khive-kg".to_string(),
+            version: "0.1".to_string(),
+            namespace: "local".to_string(),
+            exported_at: Utc::now(),
+            entities: names
+                .into_iter()
+                .map(|name| ExportedEntity {
+                    id: Uuid::new_v4(),
+                    kind: "concept".to_string(),
+                    entity_type: None,
+                    name,
+                    description: Some("batch body".to_string()),
+                    properties: None,
+                    tags: vec![],
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                })
+                .collect(),
+            edges: vec![],
+        }
+    }
 
     struct ImportEmbeddingService;
 
@@ -461,6 +587,151 @@ mod tests {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         runtime.register_embedder(ImportEmbeddingProvider);
         runtime
+    }
+
+    #[tokio::test]
+    async fn import_batches_provider_calls_and_matches_per_record_reindex_vectors() {
+        let token = NamespaceToken::local();
+        let archive = batch_archive((0..257).map(|index| format!("Batch entity {index}")));
+        let ids: Vec<Uuid> = archive.entities.iter().map(|entity| entity.id).collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = KhiveRuntime::memory().unwrap();
+        runtime.register_embedder(CountingImportProvider {
+            name: IMPORT_BATCH_MODEL,
+            calls: Arc::clone(&calls),
+            reject_poison: false,
+        });
+        let usage = crate::usage::UsageContext::new();
+        let summary = crate::usage::scope(usage.clone(), runtime.import_kg(&archive, &token))
+            .await
+            .unwrap();
+        assert_eq!(summary.entities_imported, ids.len());
+        assert_eq!(usage.snapshot()["embed_calls"], ids.len() as u64);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "257 records need two provider batches"
+        );
+
+        let singles = KhiveRuntime::memory().unwrap();
+        let singleton_calls = Arc::new(AtomicUsize::new(0));
+        singles.register_embedder(CountingImportProvider {
+            name: IMPORT_BATCH_MODEL,
+            calls: Arc::clone(&singleton_calls),
+            reject_poison: false,
+        });
+        for id in &ids {
+            let entity = runtime.get_entity(&token, *id).await.unwrap();
+            singles
+                .entities(&token)
+                .unwrap()
+                .upsert_entity(entity.clone())
+                .await
+                .unwrap();
+            singles.reindex_entity(&token, &entity).await.unwrap();
+        }
+        assert_eq!(singleton_calls.load(Ordering::SeqCst), ids.len());
+        let batched_vectors = runtime
+            .vectors_for_model(&token, IMPORT_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&ids, "local", "entity.body")
+            .await
+            .unwrap();
+        let singleton_vectors = singles
+            .vectors_for_model(&token, IMPORT_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&ids, "local", "entity.body")
+            .await
+            .unwrap();
+        assert_eq!(batched_vectors.len(), ids.len());
+        assert_eq!(batched_vectors, singleton_vectors);
+    }
+
+    #[tokio::test]
+    async fn import_batches_each_registered_model_once_per_page() {
+        let token = NamespaceToken::local();
+        let archive = batch_archive(["alpha", "beta", "gamma"].map(str::to_string));
+        let calls_a = Arc::new(AtomicUsize::new(0));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let runtime = KhiveRuntime::memory().unwrap();
+        for (name, calls) in [
+            (IMPORT_BATCH_MODEL, Arc::clone(&calls_a)),
+            (IMPORT_BATCH_MODEL_TWO, Arc::clone(&calls_b)),
+        ] {
+            runtime.register_embedder(CountingImportProvider {
+                name,
+                calls,
+                reject_poison: false,
+            });
+        }
+        runtime.import_kg(&archive, &token).await.unwrap();
+        assert_eq!(calls_a.load(Ordering::SeqCst), 1);
+        assert_eq!(calls_b.load(Ordering::SeqCst), 1);
+        let ids: Vec<Uuid> = archive.entities.iter().map(|entity| entity.id).collect();
+        for model in [IMPORT_BATCH_MODEL, IMPORT_BATCH_MODEL_TWO] {
+            assert_eq!(
+                runtime
+                    .vectors_for_model(&token, model)
+                    .unwrap()
+                    .get_vectors(&ids, "local", "entity.body")
+                    .await
+                    .unwrap()
+                    .len(),
+                ids.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn import_failed_batch_isolates_poison_without_duplicate_vector_writes() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let token = NamespaceToken::local();
+        let archive = batch_archive(["good one", "poison", "good two"].map(str::to_string));
+        let ids: Vec<Uuid> = archive.entities.iter().map(|entity| entity.id).collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let runtime = KhiveRuntime::memory().unwrap();
+        runtime.register_embedder(CountingImportProvider {
+            name: IMPORT_BATCH_MODEL,
+            calls: Arc::clone(&calls),
+            reject_poison: true,
+        });
+        let summary = runtime.import_kg(&archive, &token).await.unwrap();
+        assert_eq!(summary.entities_imported, 3);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "one failed page plus three singleton retries"
+        );
+        let vectors = runtime
+            .vectors_for_model(&token, IMPORT_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&ids, "local", "entity.body")
+            .await
+            .unwrap();
+        assert_eq!(vectors.len(), 2);
+        assert!(!vectors.contains_key(&ids[1]));
+        let mut reader = runtime.sql().reader().await.unwrap();
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log WHERE embedding_model = ?1 AND op = 'upsert'".into(),
+                params: vec![SqlValue::Text(IMPORT_BATCH_MODEL.into())],
+                label: Some("import-batch-upsert-count".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(&rows[0].columns[0].value, SqlValue::Integer(2)));
+        let provenance = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM vector_provenance WHERE model_key = ?1".into(),
+                params: vec![SqlValue::Text(crate::config::sanitize_key(
+                    IMPORT_BATCH_MODEL,
+                ))],
+                label: Some("import-batch-provenance-count".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(provenance, Some(SqlValue::Integer(0))));
     }
 
     #[tokio::test]

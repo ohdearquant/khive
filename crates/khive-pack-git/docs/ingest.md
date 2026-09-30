@@ -144,6 +144,16 @@ silently skipped forever because the cursor moved past it. Records that do
 succeed after a stall are still written; they are idempotent via the `sha`
 natural key, so a retried pass never double-creates them.
 
+New commit notes use a note key derived from the SHA. Keyed create prepares
+embedding and `annotates` edges before publishing the note in one transaction,
+so another pass cannot checkpoint a provisional note that later rolls back.
+Concurrent first passes may both read an absent SHA; the key admits one note,
+and the losing pass reuses that committed note, adds its missing project
+annotations, then advances its own checkpoint. Historical unkeyed notes remain
+readable. If multiple live historical notes share one SHA, ingest refuses the
+ambiguous lookup before advancing rather than choosing an arbitrary note; an
+operator must reconcile those duplicates separately.
+
 `local_sha_to_id` maps parent SHA to note id for commits created earlier in
 the same pass. Combined with `find_commit_by_sha`'s database lookup, it
 resolves `precedes` parent edges regardless of which pass the parent

@@ -10,6 +10,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::error::ResolutionFacts;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -54,11 +55,28 @@ fn duplicate_anchor_warning(selected: Uuid, duplicates: &[Uuid]) -> Option<Strin
     })
 }
 
-fn log_duplicate_anchor_warning(error: RuntimeError, warning: Option<&str>) -> RuntimeError {
+fn attach_resolution_facts(
+    error: RuntimeError,
+    resolution: &ProjectResolution,
+    warning: Option<&str>,
+) -> RuntimeError {
     if let Some(warning) = warning {
         tracing::warn!("{warning}");
     }
-    error
+    error.with_resolution(ResolutionFacts {
+        project_id: resolution.id,
+        duplicate_anchor_ids: resolution.slug_duplicates.clone(),
+        slug_backfilled: resolution.slug_backfilled,
+        project_created: resolution.created,
+        orphaned_project_id: resolution
+            .orphan
+            .as_ref()
+            .map(|orphan| orphan.dead_project_id),
+        orphaned_note_count: resolution
+            .orphan
+            .as_ref()
+            .map_or(0, |orphan| orphan.annotated_note_count),
+    })
 }
 
 fn remote_cache_error(remote: &str, stage: &str, error: CacheError) -> RuntimeError {
@@ -254,6 +272,7 @@ impl GitPack {
                 ProjectResolution {
                     id,
                     created: false,
+                    slug_backfilled: false,
                     orphan: None,
                     slug_duplicates: Vec::new(),
                 }
@@ -295,8 +314,9 @@ impl GitPack {
             }
         }
         .map_err(|error| {
-            log_duplicate_anchor_warning(
+            attach_resolution_facts(
                 digest_failure_to_runtime(error),
+                &resolution,
                 duplicate_warning.as_deref(),
             )
         })?;
@@ -357,6 +377,7 @@ fn parse_include(v: &Value) -> Result<IngestInclude, RuntimeError> {
 pub(crate) struct ProjectResolution {
     pub(crate) id: Uuid,
     pub(crate) created: bool,
+    pub(crate) slug_backfilled: bool,
     /// `Some` when `created` is `true` AND a soft-deleted anchor for this
     /// repo identity was found with a live corpus still annotating it
     /// (issue #1173) — surfaced via `IngestReport`, never silent.
@@ -420,6 +441,7 @@ async fn resolve_or_create_project(
         return Ok(ProjectResolution {
             id: selected,
             created: false,
+            slug_backfilled: false,
             orphan: None,
             slug_duplicates,
         });
@@ -460,6 +482,7 @@ async fn resolve_or_create_project(
         return Ok(ProjectResolution {
             id,
             created: false,
+            slug_backfilled: true,
             orphan: None,
             slug_duplicates,
         });
@@ -492,6 +515,7 @@ async fn resolve_or_create_project(
         return Ok(ProjectResolution {
             id: selected,
             created: false,
+            slug_backfilled: true,
             orphan: None,
             slug_duplicates: duplicates.iter().map(|(id, _)| *id).collect(),
         });
@@ -525,6 +549,7 @@ async fn resolve_or_create_project(
     Ok(ProjectResolution {
         id,
         created: true,
+        slug_backfilled: false,
         orphan,
         slug_duplicates: Vec::new(),
     })
@@ -1259,11 +1284,32 @@ mod tests {
             )
             .await
             .expect_err("zero-commit repository has no HEAD to ingest");
-        let message = match error {
+        let message = match error.refusal_source() {
             RuntimeError::InvalidInput(message) => message,
             other => panic!("ingest error kind must be preserved: {other:?}"),
         };
         assert_eq!(message, "could not resolve commit snapshot HEAD");
+        let projected =
+            khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
+        assert_eq!(
+            projected["message"],
+            "invalid input: could not resolve commit snapshot HEAD"
+        );
+        assert_eq!(
+            projected["details"]["resolution"]["project_id"],
+            ids[0].to_string()
+        );
+        assert_eq!(
+            projected["details"]["resolution"]["duplicate_anchor_ids"],
+            json!([ids[1]])
+        );
+        assert_eq!(projected["details"]["resolution"]["slug_backfilled"], true);
+        assert_eq!(projected["details"]["resolution"]["project_created"], false);
+        assert_eq!(
+            projected["details"]["resolution"]["orphaned_project_id"],
+            Value::Null
+        );
+        assert_eq!(projected["details"]["resolution"]["orphaned_note_count"], 0);
         let warning = duplicate_anchor_warning(ids[0], &ids[1..]).expect("warning");
         {
             let captured = warnings.lock().expect("warning capture lock");
@@ -1292,6 +1338,45 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(config_ledger)]
+    async fn ingest_failure_reports_created_anchor() {
+        let (rt, token, registry) = fixture().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .expect("spawn git init");
+        assert!(init.success());
+
+        let error = registry
+            .dispatch(
+                "git.digest",
+                json!({ "source": dir.path().to_string_lossy(), "include": ["commits"] }),
+            )
+            .await
+            .expect_err("zero-commit repository has no HEAD to ingest");
+        assert!(matches!(
+            error.refusal_source(),
+            RuntimeError::InvalidInput(_)
+        ));
+        let projected =
+            khive_runtime::runtime_error_value(error, khive_runtime::DomainDisposition::Unknown);
+        let resolution = &projected["details"]["resolution"];
+        assert_eq!(resolution["project_created"], true);
+        assert_eq!(resolution["slug_backfilled"], false);
+        assert_eq!(resolution["duplicate_anchor_ids"], json!([]));
+        assert_eq!(resolution["orphaned_project_id"], Value::Null);
+        assert_eq!(resolution["orphaned_note_count"], 0);
+        let id = Uuid::parse_str(resolution["project_id"].as_str().expect("project id"))
+            .expect("project UUID");
+        rt.get_entity(&token, id)
+            .await
+            .expect("created anchor survives failed ingest");
+    }
+
     #[test]
     fn duplicate_warning_keeps_storage_error_subtype_and_retryability() {
         let selected = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
@@ -1308,9 +1393,31 @@ mod tests {
             pool_identity: Some("test-pool".into()),
         });
         let original_message = original.to_string();
-        let returned = log_duplicate_anchor_warning(original, Some(&warning));
+        let resolution = ProjectResolution {
+            id: selected,
+            created: false,
+            slug_backfilled: true,
+            orphan: None,
+            slug_duplicates: vec![duplicate],
+        };
+        let returned = attach_resolution_facts(original, &resolution, Some(&warning));
         assert_eq!(returned.to_string(), original_message);
-        match returned {
+        let RuntimeError::WithResolution { context } = &returned else {
+            panic!("expected resolution context");
+        };
+        assert!(matches!(
+            std::error::Error::source(context)
+                .and_then(|source| source.downcast_ref::<RuntimeError>()),
+            Some(RuntimeError::Storage(_))
+        ));
+        let retry = returned
+            .retryable_failure_context()
+            .expect("retryable context");
+        assert_eq!(
+            retry.stage,
+            khive_runtime::error::STORAGE_ADMISSION_TIMEOUT_STAGE
+        );
+        match returned.refusal_source() {
             RuntimeError::Storage(source) => {
                 assert!(source.is_retryable());
                 let khive_storage::StorageError::AdmissionTimeout {
@@ -1322,11 +1429,25 @@ mod tests {
                     panic!("storage subtype changed");
                 };
                 assert_eq!(operation.as_ref(), "git digest read");
-                assert_eq!(timeout_ms, 42);
+                assert_eq!(*timeout_ms, 42);
                 assert_eq!(pool_identity.as_deref(), Some("test-pool"));
             }
             other => panic!("storage subtype changed: {other:?}"),
         }
+        let projected =
+            khive_runtime::runtime_error_value(returned, khive_runtime::DomainDisposition::Unknown);
+        assert_eq!(projected["kind"], "unavailable");
+        assert_eq!(projected["retryable"], true);
+        assert_eq!(projected["message"], original_message);
+        assert_eq!(
+            projected["details"]["resolution"]["project_id"],
+            selected.to_string()
+        );
+        assert_eq!(
+            projected["details"]["resolution"]["duplicate_anchor_ids"],
+            json!([duplicate])
+        );
+        assert_eq!(projected["details"]["resolution"]["slug_backfilled"], true);
         let captured = warnings.lock().expect("warning capture lock");
         assert_eq!(captured.as_slice(), &[warning]);
     }

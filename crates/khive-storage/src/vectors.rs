@@ -1,6 +1,6 @@
 //! Vector embedding storage and similarity search capability.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use async_trait::async_trait;
@@ -94,6 +94,7 @@ pub trait VectorStore: Send + Sync + 'static {
             supports_update: false,
             supports_orphan_sweep: false,
             supports_multi_field: false,
+            supports_vector_read: false,
             // Backend-neutral baseline: unknown dimension ceiling and no
             // advertised index kind. Backends with a concrete limit (e.g.
             // SqliteVecStore) must override capabilities().
@@ -192,6 +193,23 @@ pub trait VectorStore: Send + Sync + 'static {
             capability: StorageCapability::Vectors,
             operation: "batch_exists".into(),
             message: "this backend does not support batch existence checks".into(),
+        })
+    }
+
+    /// Read the stored embeddings of `ids` under `field` in `namespace`, for this
+    /// store's embedding model. Absent IDs are absent from the map; the result
+    /// has no ordering.
+    async fn get_vectors(
+        &self,
+        ids: &[Uuid],
+        namespace: &str,
+        field: &str,
+    ) -> StorageResult<HashMap<Uuid, Vec<f32>>> {
+        let _ = (ids, namespace, field);
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Vectors,
+            operation: "get_vectors".into(),
+            message: "this backend does not support stored vector reads".into(),
         })
     }
 
