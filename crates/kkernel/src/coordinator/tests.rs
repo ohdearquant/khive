@@ -387,6 +387,70 @@ async fn fan_out_search_uses_served_kind_metadata_before_dispatch() {
     assert!(per_backend[0].error.is_none());
 }
 
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn hot_path_guard_g4_excluded_backend_note_dispatch_count_stays_flat() {
+    let notes = memory_runtime();
+    let entities_only = memory_runtime();
+    let mut registry = BackendRegistry::new();
+    registry
+        .register_with_served_kinds(
+            backend_id("notes"),
+            Arc::clone(&notes),
+            Some(BTreeSet::from([SubstrateKind::Note])),
+        )
+        .expect("note-serving backend");
+    registry
+        .register_with_served_kinds(
+            backend_id("entities-only"),
+            Arc::clone(&entities_only),
+            Some(BTreeSet::from([SubstrateKind::Entity])),
+        )
+        .expect("entity-only backend");
+    let coordinator = SubstrateCoordinator::new(registry);
+    let request = validated_kg_search(serde_json::json!({
+        "kind": "note",
+        "query": "g4-dispatch-counter",
+        "limit": 3,
+    }));
+    let count = |report: &khive_db::diagnostics::DbDiagnostics, backend: &str| {
+        report
+            .search_mechanism
+            .dispatches_by_backend_and_kind
+            .get(backend)
+            .and_then(|kinds| kinds.get("note"))
+            .copied()
+            .unwrap_or(0)
+    };
+    let notes_before = notes.db_diagnostics().await.expect("notes diagnostics");
+    let excluded_before = entities_only
+        .db_diagnostics()
+        .await
+        .expect("excluded diagnostics");
+
+    let (_entities, _notes, per_backend) = coordinator
+        .fan_out_search(&request, &Namespace::local())
+        .await;
+    assert_eq!(per_backend.len(), 1);
+    assert_eq!(per_backend[0].backend_id.as_str(), "notes");
+
+    let notes_after = notes.db_diagnostics().await.expect("notes diagnostics");
+    let excluded_after = entities_only
+        .db_diagnostics()
+        .await
+        .expect("excluded diagnostics");
+    assert_eq!(
+        count(&notes_after, "notes") - count(&notes_before, "notes"),
+        1,
+        "the eligible backend must receive one note-search dispatch"
+    );
+    assert_eq!(
+        count(&excluded_after, "entities-only") - count(&excluded_before, "entities-only"),
+        0,
+        "a backend declaring only entities must receive no note-search dispatch"
+    );
+}
+
 #[test]
 fn registry_primary_is_first_registered() {
     let mut reg = BackendRegistry::new();

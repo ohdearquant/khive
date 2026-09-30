@@ -1361,4 +1361,51 @@ describe("repository showcase", () => {
       expect(center + halfWidth).toBeLessThanOrEqual(stageWidth);
     }
   });
+
+  it("moves through history rows with j/k and opens the focused module with Enter", async () => {
+    const bundle = golden();
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.history_structure_navigation.label,
+    }));
+
+    const rows = Array.from(container.querySelectorAll<HTMLButtonElement>(
+      "[data-history-modules] [data-keyboard-row]",
+    ));
+    expect(rows.length).toBeGreaterThan(1);
+    rows[0].focus();
+    await user.keyboard("j");
+    expect(rows[1]).toHaveFocus();
+    await user.keyboard("k");
+    expect(rows[0]).toHaveFocus();
+    await user.keyboard("j{Enter}");
+    expect(rows[1]).toHaveAttribute("aria-pressed", "true");
+    expect(container.querySelector("[data-module-inspector] h3"))
+      .toHaveTextContent(bundle.graph.modules.items[1].source_path);
+  });
+
+  it("traverses the commit timeline and opens a focused commit", async () => {
+    const bundle = golden();
+    const moduleIds = new Set(bundle.graph.modules.items.slice(0, 100).map((item) => item.id));
+    const withCommits = bundle.graph.history_navigation.by_module.items.find(
+      (item) => moduleIds.has(item.module_id) && item.commits.items.length >= 2,
+    )!;
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(screen.getByRole("button", {
+      name: bundle.capability.views.history_structure_navigation.label,
+    }));
+    await user.click(container.querySelector<HTMLButtonElement>(
+      `[data-history-modules] [data-module-id="${withCommits.module_id}"]`,
+    )!);
+
+    const commits = Array.from(container.querySelectorAll<HTMLButtonElement>(
+      "[data-history-commits] [data-keyboard-row]",
+    ));
+    expect(commits.length).toBeGreaterThan(1);
+    commits[0].focus();
+    await user.keyboard("j{Enter}");
+    expect(commits[1]).toHaveAttribute("aria-pressed", "true");
+  });
 });

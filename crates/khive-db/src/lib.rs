@@ -23,6 +23,9 @@ pub mod namespace_move;
 /// A store fixture reproducing the namespace split, for the move's own arms.
 #[cfg(any(test, feature = "test-support"))]
 pub mod namespace_move_fixture;
+/// Feature-gated namespace-bounded FTS5 trigram prototype.
+#[cfg(feature = "namespace-trigram-proto")]
+pub mod namespace_trigram_proto;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
 mod read_cancellation;
@@ -64,7 +67,10 @@ pub use migrations::{
     run_migrations, EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration,
     MIGRATIONS,
 };
-pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, ReaderRow, WriterGuard};
+pub use pool::{
+    CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,
+    WriterGuard,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use read_cancellation::scope_test_read_progress;
 pub use read_cancellation::{sqlite_interrupt_grace_from_env, DEFAULT_SQLITE_INTERRUPT_GRACE_MS};

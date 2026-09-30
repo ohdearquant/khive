@@ -45,7 +45,7 @@ pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
     ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload, ProposalWithdrawnPayload,
-    RerankExecutedPayload,
+    RerankExecutedPayload, ToolCheckDecidedPayload,
 };
 #[cfg(feature = "serde")]
 pub use event::{

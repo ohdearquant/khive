@@ -829,7 +829,7 @@ async fn pathless_incremental_tail_does_not_hold_shared_writer_after_read() {
     let writer = rt
         .backend()
         .pool()
-        .try_writer_nowait()
+        .try_checkpoint_nowait()
         .unwrap_or_else(|error| {
             panic!(
                 "PATHLESS_TAIL_WRITER_RELEASE: expected the shared writer to be available while incremental tail maintenance is paused; got {error}"

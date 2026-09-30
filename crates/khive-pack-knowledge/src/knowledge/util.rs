@@ -311,14 +311,19 @@ pub(super) fn status_multiplier(status: Option<&str>) -> f32 {
 // ─── embed text helper ────────────────────────────────────────────────────────
 
 pub(super) fn atom_embed_text(atom: &Atom) -> String {
+    atom_embed_text_fields(&atom.name, &atom.content, &atom.tags)
+}
+
+/// Render search fallbacks from the same stored fields as index-time atoms.
+pub(super) fn atom_embed_text_fields(name: &str, content: &str, tags: &str) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(3);
-    if !atom.name.is_empty() {
-        parts.push(atom.name.clone());
+    if !name.is_empty() {
+        parts.push(name.to_owned());
     }
-    if !atom.content.is_empty() {
-        parts.push(atom.content.clone());
+    if !content.is_empty() {
+        parts.push(content.to_owned());
     }
-    if let Ok(tags) = serde_json::from_str::<Vec<String>>(&atom.tags) {
+    if let Ok(tags) = serde_json::from_str::<Vec<String>>(tags) {
         let meaningful: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
         if !meaningful.is_empty() {
             parts.push(format!("Tags: {}", meaningful.join(", ")));

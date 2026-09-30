@@ -18,6 +18,9 @@ use khive_storage::ContentRef;
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
+/// Bounds provider input and per-page outcome memory while amortizing model setup.
+pub(crate) const EMBEDDING_BATCH_PAGE_SIZE: usize = 256;
+
 // Fault-injection flag for backfill reader errors (test / `fault-injection` builds only).
 #[cfg(any(test, feature = "fault-injection"))]
 std::thread_local! {
@@ -1110,10 +1113,51 @@ impl KhiveRuntime {
         Ok(hits)
     }
 
+    async fn embed_backfill_page(
+        &self,
+        token: &NamespaceToken,
+        model_name: &str,
+        inputs: &[(Uuid, String)],
+    ) -> Vec<Option<DocumentEmbeddingOutcome>> {
+        let texts: Vec<String> = inputs.iter().map(|(_, text)| text.clone()).collect();
+        match self
+            .embed_document_batch_with_model_outcomes_for_token(token, model_name, &texts)
+            .await
+        {
+            Ok(outcomes) => outcomes.into_iter().map(Some).collect(),
+            Err(error) => {
+                tracing::warn!(
+                    model = %model_name,
+                    error = %error,
+                    "backfill_missing_embeddings: batch embed failed; retrying records individually"
+                );
+                let mut outcomes = Vec::with_capacity(inputs.len());
+                for (id, text) in inputs {
+                    match self
+                        .embed_document_with_model_outcome_for_token(token, model_name, text)
+                        .await
+                    {
+                        Ok(outcome) => outcomes.push(Some(outcome)),
+                        Err(error) => {
+                            tracing::warn!(
+                                id = %id,
+                                model = %model_name,
+                                error = %error,
+                                "backfill_missing_embeddings: record embed failed"
+                            );
+                            outcomes.push(None);
+                        }
+                    }
+                }
+                outcomes
+            }
+        }
+    }
+
     /// Backfill vector and FTS index entries for entities and notes that are missing them.
     ///
     /// Intended to run once at startup as a background task (warm-up sequence steps 2–4).
-    /// Queries the SQL substrate for entity descriptions and note contents that have no
+    /// Queries the SQL substrate for entity bodies and note contents that have no
     /// corresponding entry in an eligible embedding model's vector store, then
     /// embeds and inserts them. FTS entries missing for notes are also repopulated.
     ///
@@ -1138,27 +1182,37 @@ impl KhiveRuntime {
 
         for model_name in &model_names {
             let mut model_truncation = EmbeddingTruncationReport::default();
+            match self.vectors_for_model(token, model_name) {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(model = %model_name, error = %error,
+                        "backfill_missing_embeddings: vector store unavailable");
+                    continue;
+                }
+            };
             // Must match vec_model_key's naming logic.
             let vec_table = format!("vec_{}", sanitize_key(model_name));
 
-            // --- Entities: embed description where no vector entry exists ---
-            // Each inserted row satisfies the NOT IN (SELECT subject_id FROM vec_table ...)
-            // clause going forward, so no OFFSET is needed between pages.
-            const PAGE_SIZE: usize = 500;
+            // --- Entities: embed the canonical body where no vector exists ---
+            // Keyset pagination advances past failed or ineligible records too;
+            // they must not keep the first page full forever.
+            const PAGE_SIZE: usize = EMBEDDING_BATCH_PAGE_SIZE;
             let mut entity_total = 0usize;
+            let mut entity_cursor = String::new();
             loop {
                 let entity_sql = SqlStatement {
                     sql: format!(
-                        "SELECT id, name, description FROM entities \
-                         WHERE namespace = ?1 AND deleted_at IS NULL \
+                        "SELECT id FROM entities \
+                         WHERE namespace = ?1 AND deleted_at IS NULL AND id > ?3 \
                          AND id NOT IN (\
                              SELECT subject_id FROM {vec_table} \
                              WHERE namespace = ?1 AND embedding_model = ?2 \
-                         ) LIMIT {PAGE_SIZE}"
+                         ) ORDER BY id LIMIT {PAGE_SIZE}"
                     ),
                     params: vec![
                         SqlValue::Text(ns.clone()),
                         SqlValue::Text(model_name.clone()),
+                        SqlValue::Text(entity_cursor.clone()),
                     ],
                     label: Some("backfill_entities".into()),
                 };
@@ -1185,72 +1239,61 @@ impl KhiveRuntime {
 
                 let batch_len = entity_rows.len();
                 entity_total += batch_len;
+                if batch_len == 0 {
+                    break;
+                }
+                entity_cursor = match entity_rows.last().and_then(|row| row.columns.first()) {
+                    Some(column) => match &column.value {
+                        SqlValue::Text(id) => id.clone(),
+                        _ => {
+                            return Err(RuntimeError::Internal(
+                                "backfill entity ID is not text".into(),
+                            ))
+                        }
+                    },
+                    None => {
+                        return Err(RuntimeError::Internal(
+                            "backfill entity page is empty".into(),
+                        ))
+                    }
+                };
 
+                let entity_store = self.entities(token)?;
+                let mut entities = Vec::with_capacity(batch_len);
+                let mut inputs = Vec::with_capacity(batch_len);
                 for row in &entity_rows {
-                    let id_str = row.columns.first().and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    });
-                    let description = row.columns.get(2).and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value {
-                            Some(s.clone())
-                        } else if let SqlValue::Null = &c.value {
-                            None
-                        } else {
-                            None
-                        }
-                    });
-
-                    let (Some(id_str), Some(desc)) = (id_str, description) else {
+                    let Some(SqlValue::Text(id)) = row.columns.first().map(|column| &column.value)
+                    else {
                         continue;
                     };
-                    let Ok(id) = id_str.parse::<Uuid>() else {
+                    let Ok(id) = id.parse::<Uuid>() else { continue };
+                    let Some(entity) = entity_store.get_entity(id).await? else {
                         continue;
                     };
-                    if desc.trim().is_empty() {
+                    if entity.namespace != ns || entity.deleted_at.is_some() {
                         continue;
                     }
-
+                    let text = crate::curation::entity_embedding_text(&entity);
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    inputs.push((id, text));
+                    entities.push(entity);
+                }
+                let outcomes = self.embed_backfill_page(token, model_name, &inputs).await;
+                for (entity, outcome) in entities.into_iter().zip(outcomes) {
+                    let Some(outcome) = outcome else { continue };
+                    model_truncation.observe(&outcome);
                     match self
-                        .embed_document_with_model_outcome_for_token(token, model_name, &desc)
+                        .publish_entity_vector_revision(token, &entity, model_name, &outcome.vector)
                         .await
                     {
-                        Ok(outcome) => {
-                            model_truncation.observe(&outcome);
-                            if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                                match vs
-                                    .insert(
-                                        id,
-                                        SubstrateKind::Entity,
-                                        &ns,
-                                        "entity.description",
-                                        vec![outcome.vector],
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        total_backfilled += 1;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            id = %id, model = %model_name,
-                                            error = %e,
-                                            "backfill_missing_embeddings: entity vector insert failed"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                id = %id, model = %model_name,
-                                error = %e,
-                                "backfill_missing_embeddings: entity embed failed"
-                            );
-                        }
+                        Ok(true) => total_backfilled += 1,
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            id = %entity.id, model = %model_name, error = %error,
+                            "backfill_missing_embeddings: entity vector insert failed"
+                        ),
                     }
                 }
 
@@ -1308,17 +1351,25 @@ impl KhiveRuntime {
 
                 let batch_len = note_rows.len();
                 note_total += batch_len;
-
-                if let Some(last_id) = note_rows.last().and_then(|row| row.columns.first()) {
-                    if let SqlValue::Text(id) = &last_id.value {
-                        note_cursor.clone_from(id);
-                    } else {
-                        return Err(RuntimeError::Internal(
-                            "backfill note cursor is not text".into(),
-                        ));
-                    }
+                if batch_len == 0 {
+                    break;
                 }
+                note_cursor = match note_rows.last().and_then(|row| row.columns.first()) {
+                    Some(column) => match &column.value {
+                        SqlValue::Text(id) => id.clone(),
+                        _ => {
+                            return Err(RuntimeError::Internal(
+                                "backfill note ID is not text".into(),
+                            ))
+                        }
+                    },
+                    None => {
+                        return Err(RuntimeError::Internal("backfill note page is empty".into()))
+                    }
+                };
 
+                let mut notes_for_batch = Vec::with_capacity(batch_len);
+                let mut inputs = Vec::with_capacity(batch_len);
                 for row in &note_rows {
                     let id_str = row.columns.first().and_then(|c| {
                         if let SqlValue::Text(s) = &c.value {
@@ -1365,44 +1416,24 @@ impl KhiveRuntime {
                         continue;
                     }
 
-                    let content = note.content.clone();
+                    inputs.push((id, note.content.clone()));
+                    notes_for_batch.push(note);
+                }
+
+                let outcomes = self.embed_backfill_page(token, model_name, &inputs).await;
+                for (note, outcome) in notes_for_batch.into_iter().zip(outcomes) {
+                    let Some(outcome) = outcome else { continue };
+                    model_truncation.observe(&outcome);
                     match self
-                        .embed_document_with_model_outcome_for_token(token, model_name, &content)
+                        .publish_note_vector_revision(token, &note, model_name, &outcome.vector)
                         .await
                     {
-                        Ok(outcome) => {
-                            model_truncation.observe(&outcome);
-                            if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                                match vs
-                                    .insert(
-                                        id,
-                                        SubstrateKind::Note,
-                                        &ns,
-                                        "note.content",
-                                        vec![outcome.vector],
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        total_backfilled += 1;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            id = %id, model = %model_name,
-                                            error = %e,
-                                            "backfill_missing_embeddings: note vector insert failed"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                id = %id, model = %model_name,
-                                error = %e,
-                                "backfill_missing_embeddings: note embed failed"
-                            );
-                        }
+                        Ok(true) => total_backfilled += 1,
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            id = %note.id, model = %model_name, error = %error,
+                            "backfill_missing_embeddings: note vector insert failed"
+                        ),
                     }
                 }
 
@@ -1648,6 +1679,7 @@ fn rrf_fuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use crate::runtime::{KhiveRuntime, NamespaceToken, RuntimeConfig};
@@ -3179,7 +3211,7 @@ mod tests {
         use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec};
         use khive_storage::note::Note;
 
-        const PAGE: u128 = 500;
+        const PAGE: u128 = EMBEDDING_BATCH_PAGE_SIZE as u128;
         let primary = EmbeddingModel::AllMiniLmL6V2;
         let primary_name = primary.to_string();
         let secondary_name = "zz-backfill-secondary";
@@ -3243,6 +3275,241 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "the first-model pass must still repopulate FTS"
+        );
+    }
+
+    const BACKFILL_BATCH_MODEL: &str = "backfill-batch-model";
+
+    struct CountingBackfillService {
+        calls: Arc<AtomicUsize>,
+        reject_poison: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for CountingBackfillService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_poison
+                && (texts.len() > 1 || texts.iter().any(|text| text.contains("poison")))
+            {
+                return Err(EmbedError::InferenceFailed("poison input".into()));
+            }
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    vec![
+                        text.len() as f32,
+                        text.bytes().map(u32::from).sum::<u32>() as f32,
+                        text.as_bytes().first().copied().unwrap_or_default() as f32,
+                        text.as_bytes().last().copied().unwrap_or_default() as f32,
+                    ]
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "backfill-batch-counting-service"
+        }
+    }
+
+    struct CountingBackfillProvider {
+        calls: Arc<AtomicUsize>,
+        reject_poison: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for CountingBackfillProvider {
+        fn name(&self) -> &str {
+            BACKFILL_BATCH_MODEL
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(CountingBackfillService {
+                calls: Arc::clone(&self.calls),
+                reject_poison: self.reject_poison,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_batches_provider_calls_and_matches_single_record_vectors() {
+        let token = NamespaceToken::local();
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut entity_ids = Vec::new();
+        for index in 0..257 {
+            let entity = runtime
+                .create_entity(
+                    &token,
+                    "concept",
+                    None,
+                    &format!("Backfill entity {index}"),
+                    (index != 0).then_some("body"),
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap();
+            entity_ids.push(entity.id);
+        }
+        let mut note_ids = Vec::new();
+        for index in 0..3 {
+            let note = runtime
+                .create_note(
+                    &token,
+                    "observation",
+                    None,
+                    &format!("Backfill note {index}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap();
+            note_ids.push(note.id);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        runtime.register_embedder(CountingBackfillProvider {
+            calls: Arc::clone(&calls),
+            reject_poison: false,
+        });
+        let usage = crate::usage::UsageContext::new();
+        let backfilled =
+            crate::usage::scope(usage.clone(), runtime.backfill_missing_embeddings(&token))
+                .await
+                .unwrap();
+        assert_eq!(backfilled, 260);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two entity pages and one note page"
+        );
+        assert_eq!(
+            usage.snapshot()["embed_calls"],
+            260,
+            "ADR-103 counts texts, not provider calls"
+        );
+
+        let singles = KhiveRuntime::memory().unwrap();
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        singles.register_embedder(CountingBackfillProvider {
+            calls: Arc::clone(&single_calls),
+            reject_poison: false,
+        });
+        for id in &entity_ids {
+            let entity = runtime.get_entity(&token, *id).await.unwrap();
+            singles
+                .entities(&token)
+                .unwrap()
+                .upsert_entity(entity.clone())
+                .await
+                .unwrap();
+            singles.reindex_entity(&token, &entity).await.unwrap();
+        }
+        for id in &note_ids {
+            let note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(*id)
+                .await
+                .unwrap()
+                .unwrap();
+            singles
+                .notes(&token)
+                .unwrap()
+                .upsert_note(note.clone())
+                .await
+                .unwrap();
+            singles.reindex_note(&token, &note).await.unwrap();
+        }
+        assert_eq!(single_calls.load(Ordering::SeqCst), 260);
+        let batched_entities = runtime
+            .vectors_for_model(&token, BACKFILL_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&entity_ids, "local", "entity.body")
+            .await
+            .unwrap();
+        let single_entities = singles
+            .vectors_for_model(&token, BACKFILL_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&entity_ids, "local", "entity.body")
+            .await
+            .unwrap();
+        assert_eq!(batched_entities.len(), 257);
+        assert_eq!(batched_entities, single_entities);
+        let batched_notes = runtime
+            .vectors_for_model(&token, BACKFILL_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&note_ids, "local", "note.content")
+            .await
+            .unwrap();
+        let single_notes = singles
+            .vectors_for_model(&token, BACKFILL_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&note_ids, "local", "note.content")
+            .await
+            .unwrap();
+        assert_eq!(batched_notes.len(), 3);
+        assert_eq!(batched_notes, single_notes);
+    }
+
+    #[tokio::test]
+    async fn backfill_failed_pages_retry_singly_without_duplicate_index_rows() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let token = NamespaceToken::local();
+        let runtime = KhiveRuntime::memory().unwrap();
+        for name in ["good one", "poison", "good two"] {
+            runtime
+                .create_entity(&token, "concept", None, name, Some("body"), None, vec![])
+                .await
+                .unwrap();
+            runtime
+                .create_note(&token, "observation", None, name, None, None, vec![])
+                .await
+                .unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        runtime.register_embedder(CountingBackfillProvider {
+            calls: Arc::clone(&calls),
+            reject_poison: true,
+        });
+        let backfilled = runtime.backfill_missing_embeddings(&token).await.unwrap();
+        assert_eq!(backfilled, 4);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            8,
+            "two failed pages plus six singleton retries"
+        );
+        let mut reader = runtime.sql().reader().await.unwrap();
+        for (table, expected) in [("ann_write_log", 4), ("vector_provenance", 0)] {
+            let count = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT COUNT(*) FROM {table} WHERE namespace = ?1"),
+                    params: vec![SqlValue::Text("local".into())],
+                    label: Some("backfill-batch-no-duplicate-rows".into()),
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(count, Some(SqlValue::Integer(value)) if value == expected),
+                "{table} must match the guarded per-record writer"
+            );
+        }
+        assert_eq!(
+            runtime.backfill_missing_embeddings(&token).await.unwrap(),
+            0
         );
     }
 }

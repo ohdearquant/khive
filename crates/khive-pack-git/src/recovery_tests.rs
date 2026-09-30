@@ -433,9 +433,24 @@ async fn public_digest_recovery_cache_failures_keep_remote_type_and_stage() {
         std::env::remove_var("KHIVE_TEST_GIT_FAIL_REFETCH_UNTIL");
 
         let error = result.expect_err("cache repair must fail");
-        let khive_runtime::RuntimeError::RemoteFetchError { remote, message } = error else {
+        let khive_runtime::RuntimeError::WithResolution { context } = &error else {
+            panic!("recovery cache failure must carry anchor facts: {error:?}");
+        };
+        assert_eq!(context.resolution.project_id, project);
+        assert!(context.resolution.duplicate_anchor_ids.is_empty());
+        assert!(!context.resolution.slug_backfilled);
+        assert!(!context.resolution.project_created);
+        let khive_runtime::RuntimeError::RemoteFetchError { remote, message } =
+            error.refusal_source()
+        else {
             panic!("recovery cache failure must remain typed: {error:?}");
         };
+        assert!(std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<khive_runtime::RuntimeError>())
+            .is_some_and(|source| matches!(
+                source,
+                khive_runtime::RuntimeError::RemoteFetchError { .. }
+            )));
         assert_eq!(remote, "https://github.com/khive-fixture/recovery-type");
         assert!(
             !message.contains("tok3n") && !message.contains("SECRET"),

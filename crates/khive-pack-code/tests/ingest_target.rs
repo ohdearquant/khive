@@ -38,6 +38,11 @@ impl Fixture {
     }
 
     async fn assert_refused_without_creating(&self, target: &Path) {
+        self.assert_refused_without_creating_with_reason(target, "existing regular file")
+            .await;
+    }
+
+    async fn assert_refused_without_creating_with_reason(&self, target: &Path, reason: &str) {
         let before = directory_listing(self.root.path());
         let error = self
             .ingest(Some(target))
@@ -45,7 +50,7 @@ impl Fixture {
             .expect_err("explicit target preflight must refuse");
         assert!(
             matches!(&error, RuntimeError::InvalidInput(message)
-                if message.contains("existing regular file") && message.contains(&target.display().to_string())),
+                if message.contains(reason) && message.contains(&target.display().to_string())),
             "typed target refusal must name the path: {error:?}"
         );
         assert_eq!(
@@ -200,7 +205,9 @@ async fn explicit_dangling_symlink_refuses_without_creating_its_target() {
     let missing = fixture.root.path().join("missing.db");
     let link = fixture.root.path().join("map-link.db");
     std::os::unix::fs::symlink(&missing, &link).unwrap();
-    fixture.assert_refused_without_creating(&link).await;
+    fixture
+        .assert_refused_without_creating_with_reason(&link, "final-component symlink")
+        .await;
     assert!(!missing.exists());
     assert_eq!(std::fs::read_link(link).unwrap(), missing);
 }
@@ -243,18 +250,18 @@ async fn omitted_target_creates_workspace_default() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn explicit_symlink_to_existing_dedicated_file_remains_accepted() {
+async fn explicit_symlink_to_existing_dedicated_file_refuses_without_mutation() {
     let fixture = Fixture::new();
     let target = fixture.root.path().join("dedicated.db");
     let link = fixture.root.path().join("dedicated-link.db");
     std::fs::File::create(&target).unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    let response = fixture
-        .ingest(Some(&link))
-        .await
-        .expect("regular-file symlink preserves compatibility");
-    assert_eq!(response["db_path"], json!(link));
-    assert!(std::fs::metadata(target).unwrap().len() > 0);
+    let before = file_snapshot(&target);
+    fixture
+        .assert_refused_without_creating_with_reason(&link, "final-component symlink")
+        .await;
+    assert_eq!(file_snapshot(&target), before, "refusal mutated the map");
+    assert_eq!(std::fs::read_link(&link).unwrap(), target);
 }
 
 #[tokio::test]

@@ -194,7 +194,7 @@ request(ops="session.list(provider=\"claude_code\", limit=5)")
 ## Auditing the surface
 
 The wire contract is discoverable without relying on implementation paths:
-`request(ops="verbs(pack=\"session\")")` lists five public verbs. Search
+`request(ops="verbs(pack=\"session\")")` lists seven public verbs. Search
 remains unavailable until transcript deletion and resume/export continuity
 support are available. The [API reference](api-reference.md) records their
 parameters and response shapes. The source links
