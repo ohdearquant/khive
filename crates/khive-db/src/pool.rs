@@ -763,6 +763,10 @@ pub struct ConnectionPool {
     /// derivation) use this, the same canonical value the identity was
     /// minted from, via [`Self::canonical_path`].
     identity_path: Option<PathBuf>,
+    /// Device and inode proven against SQLite's opened main file at pool
+    /// construction. Unlike the path, this remains stable if the name moves.
+    #[cfg(unix)]
+    opened_file_identity: Option<(u64, u64)>,
     /// Registered only after every connection opens successfully. RAII removes
     /// the path when the last pool for it drops, including failed construction.
     identity_registration: Option<PoolIdentityRegistration>,
@@ -1597,6 +1601,8 @@ impl ConnectionPool {
         let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
         let writer = open_writer_connection(&config, read_only_open_target.as_deref())?;
         let wal_enabled = configure_writer_connection(&writer, &config)?;
+        #[cfg(unix)]
+        let opened_file_identity = opened_main_file_identity(&writer, identity_path.as_deref())?;
         let max_readers = effective_reader_count(&config, wal_enabled);
 
         let readers = ArrayQueue::new(max_readers.max(1));
@@ -1620,6 +1626,8 @@ impl ConnectionPool {
             writer_task_join_stored: AtomicBool::new(false),
             origin,
             identity_path,
+            #[cfg(unix)]
+            opened_file_identity,
             identity_registration: None,
             #[cfg(test)]
             writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2131,6 +2139,19 @@ impl ConnectionPool {
         self.identity_path.as_deref()
     }
 
+    /// Identity of the database SQLite opened, if this is a Unix file pool.
+    /// `None` is deliberately incomparable: in-memory pools are distinct.
+    pub fn opened_file_identity(&self) -> Option<(u64, u64)> {
+        #[cfg(unix)]
+        {
+            self.opened_file_identity
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     /// Whether the write queue is effectively enabled for this pool: the
     /// resolved `write_queue_enabled` flag AND file-backed.
     ///
@@ -2590,6 +2611,54 @@ impl ConnectionPool {
 /// Linux/macOS `ELOOP`, commonly 40 hops) rather than looping forever on a
 /// cycle.
 const MAX_SYMLINK_DEPTH: u32 = 40;
+
+#[cfg(unix)]
+fn opened_main_file_identity(
+    conn: &Connection,
+    path: Option<&Path>,
+) -> Result<Option<(u64, u64)>, SqliteError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    // The schema read forces SQLite to open main before checking its retained
+    // file handle. HAS_MOVED detects a path that no longer names that handle.
+    let _: i64 = conn.query_row("SELECT count(*) FROM main.sqlite_master", [], |row| {
+        row.get(0)
+    })?;
+    let still_at_path = || -> Result<bool, SqliteError> {
+        let mut moved: std::ffi::c_int = 0;
+        // SAFETY: conn remains alive; the C string and output pointer remain
+        // valid for this call. SQLite's Unix VFS checks its opened file.
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                conn.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+                (&mut moved as *mut std::ffi::c_int).cast(),
+            )
+        };
+        if status != rusqlite::ffi::SQLITE_OK {
+            return Err(SqliteError::InvalidData(format!(
+                "cannot verify opened database file identity (SQLite file control {status})"
+            )));
+        }
+        Ok(moved == 0)
+    };
+    if !still_at_path()? {
+        return Err(SqliteError::InvalidData(
+            "database path changed while opening the pool".into(),
+        ));
+    }
+    let metadata = fs::metadata(path)?;
+    if !still_at_path()? {
+        return Err(SqliteError::InvalidData(
+            "database path changed while identifying the opened pool".into(),
+        ));
+    }
+    Ok(Some((metadata.dev(), metadata.ino())))
+}
 
 /// Mint the canonical [`DbIdentity`] for a configured database path.
 ///

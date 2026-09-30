@@ -6508,6 +6508,69 @@ id = "lambda:project-actor"
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    #[serial(config_ledger)]
+    async fn message_filter_accepts_distinct_backend_names_for_one_open_store() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let db_path = dir.path().join("shared.db");
+        let khive_cfg = KhiveConfig {
+            backends: [BackendId::MAIN, "comm-alias"]
+                .into_iter()
+                .map(|name| BackendConfig {
+                    name: name.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(db_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                })
+                .collect(),
+            packs: HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "comm-alias".to_string(),
+                    no_embed: false,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+        let multi = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &khive_cfg,
+            None,
+        )
+        .await
+        .expect("aliased backend registry");
+        assert_ne!(
+            multi.default_runtime.backend_id(),
+            multi.per_pack_runtimes["comm"].backend_id()
+        );
+        assert!(multi
+            .default_runtime
+            .shares_backend_storage_with(&multi.per_pack_runtimes["comm"]));
+
+        let registry = multi.registry;
+        registry
+            .dispatch(
+                "comm.send",
+                serde_json::json!({"to": "email:recipient@example.com", "content": "alias witness"}),
+            )
+            .await
+            .expect("comm writes outbound row");
+        let listed = registry
+            .dispatch(
+                "list",
+                serde_json::json!({"kind": "note", "direction": "outbound", "limit": 1}),
+            )
+            .await
+            .expect("message filter accepts the shared physical store");
+        assert_eq!(listed["items"][0]["content"], "alias witness", "{listed}");
+    }
+
     /// ADR-124 note-write identity guard: the pack-owned note kind set must
     /// be installed on the multi-backend boot path, not only on
     /// `KhiveMcpServer::with_packs` (single-backend). Routes `kg` and `comm`
@@ -12852,10 +12915,8 @@ backend = "kg-backend"
         }
 
         /// Two-backend regression for the comm split topology: comm assigned
-        /// its own backend while kg stays on main. The delivery loop's
-        /// non-wire scan/claim/mark must all land on the comm backend; the
-        /// generic wire `list` (kg/main-routed) cannot see the outbox at all,
-        /// which is exactly why the loop must not use it.
+        /// its own backend while kg stays on main. Explicit message lists and
+        /// the delivery loop's scan/claim/mark must use the comm backend.
         #[tokio::test]
         #[serial]
         #[serial(config_ledger)]
@@ -12924,8 +12985,6 @@ backend = "kg-backend"
                 .expect("comm.send returns full_id")
                 .to_string();
 
-            // The generic wire `list` runs on kg/main and must NOT see the
-            // outbox row — pinning the routing gap the non-wire scan closes.
             let wire_list = registry
                 .dispatch(
                     "list",
@@ -12937,15 +12996,17 @@ backend = "kg-backend"
                     }),
                 )
                 .await
-                .expect("generic list must succeed on main");
+                .expect("explicit message list must succeed on comm");
             let wire_items = wire_list
                 .get("items")
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
             assert!(
-                wire_items.is_empty(),
-                "main-routed wire list must not see comm's outbox: {wire_list}"
+                wire_items
+                    .iter()
+                    .any(|item| item["id"].as_str() == Some(note_id.as_str())),
+                "explicit message list must see comm's outbox: {wire_list}"
             );
 
             let channel = RecordingChannel::default();
@@ -13586,6 +13647,31 @@ backend = "kg-backend"
 
         const SOURCE: &str = "imap+tls:h:993:m:INBOX";
 
+        /// The poll loop stores inbound rows under its landing actor, so the
+        /// stored mailbox is read through that owner. `None` reads as the
+        /// anonymous caller.
+        async fn list_messages_as(
+            registry: &khive_runtime::VerbRegistry,
+            namespace: &str,
+            actor_id: Option<&str>,
+        ) -> Vec<serde_json::Value> {
+            registry
+                .dispatch_with_identity(
+                    "list",
+                    json!({"namespace": namespace, "kind": "message", "limit": 50}),
+                    Some(khive_runtime::RequestIdentity {
+                        namespace: namespace.to_string(),
+                        actor_id: actor_id.map(str::to_string),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("list must succeed")["items"]
+                .as_array()
+                .expect("list returns an items envelope")
+                .clone()
+        }
+
         /// First `poll_page` call returns one message that ingests cleanly
         /// and one that permanently fails `comm.ingest` validation (empty
         /// content) -- simulating a partial-page ingest failure. Every
@@ -13756,17 +13842,13 @@ backend = "kg-backend"
                  {calls:?}"
             );
 
-            let inbox = registry
-                .dispatch(
-                    "list",
-                    json!({"namespace": "local", "kind": "message", "limit": 50}),
-                )
-                .await
-                .expect("list must succeed");
-            let notes = inbox["items"]
-                .as_array()
-                .expect("list returns an items envelope")
-                .clone();
+            let notes = list_messages_as(&registry, "local", Some("actor:test")).await;
+            for other in [None, Some("actor:other")] {
+                assert!(
+                    list_messages_as(&registry, "local", other).await.is_empty(),
+                    "a caller other than the landing actor must not list its mailbox: {other:?}"
+                );
+            }
             let matching: Vec<_> = notes
                 .iter()
                 .filter(|n| {
@@ -14054,17 +14136,7 @@ backend = "kg-backend"
                 );
             assert_eq!(restored.checkpoint.high_water, Some(1));
 
-            let inbox = registry
-                .dispatch(
-                    "list",
-                    json!({"namespace": "local", "kind": "message", "limit": 50}),
-                )
-                .await
-                .expect("list must succeed");
-            let notes = inbox["items"]
-                .as_array()
-                .expect("list returns an items envelope")
-                .clone();
+            let notes = list_messages_as(&registry, "local", Some("actor:test")).await;
             let quarantined = notes
                 .iter()
                 .find(|n| {
@@ -14208,16 +14280,7 @@ backend = "kg-backend"
             }
             task.abort();
 
-            let inbox = registry
-                .dispatch(
-                    "list",
-                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
-                )
-                .await
-                .expect("list must succeed");
-            let notes = inbox["items"]
-                .as_array()
-                .expect("list returns an items envelope");
+            let notes = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
             assert_eq!(notes.len(), 1, "only the quarantine notification is stored");
             let quarantined = &notes[0];
             assert_eq!(

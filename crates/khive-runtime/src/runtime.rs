@@ -725,6 +725,20 @@ impl KhiveRuntime {
         &self.config.backend_id
     }
 
+    /// Whether two runtime handles share one opened physical store. The host
+    /// deduplicates same-path aliases; separately opened hard-link aliases
+    /// compare the identity pinned when SQLite opened each file.
+    pub fn shares_backend_storage_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.backend, &other.backend)
+            || matches!(
+                (
+                    self.backend.pool().opened_file_identity(),
+                    other.backend.pool().opened_file_identity()
+                ),
+                (Some(left), Some(right)) if left == right
+            )
+    }
+
     /// Return the extra-visible namespaces assembled at config load.
     ///
     /// OSS dispatch uses this set to widen the default multi-record read scope
@@ -3305,6 +3319,36 @@ mod tests {
     fn backend_id_defaults_to_main() {
         let rt = KhiveRuntime::memory().unwrap();
         assert_eq!(rt.backend_id().as_str(), BackendId::MAIN);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_identity_accepts_hard_links_but_rejects_distinct_files() {
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let first_path = dir.path().join("first.db");
+        let alias_path = dir.path().join("alias.db");
+        let distinct_path = dir.path().join("distinct.db");
+        let open = |path: &std::path::Path| {
+            Arc::new(
+                StorageBackend::sqlite_for_test_with_journal_mode(
+                    path,
+                    false,
+                    std::time::Duration::from_secs(1),
+                )
+                .expect("test backend"),
+            )
+        };
+        let first = open(&first_path);
+        std::fs::hard_link(&first_path, &alias_path).expect("hard-link alias");
+        let alias = open(&alias_path);
+        let distinct = open(&distinct_path);
+        let first = KhiveRuntime::from_backend(first, RuntimeConfig::no_embeddings());
+        let alias = KhiveRuntime::from_backend(alias, RuntimeConfig::no_embeddings());
+        let distinct = KhiveRuntime::from_backend(distinct, RuntimeConfig::no_embeddings());
+
+        assert!(first.shares_backend_storage_with(&alias));
+        assert!(!first.shares_backend_storage_with(&distinct));
+        assert!(first.shares_backend_storage_with(&first.clone()));
     }
 
     #[test]

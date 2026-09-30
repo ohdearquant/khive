@@ -1,6 +1,6 @@
 //! Keyed note pagination is distinct from the ordinary insertion-sequence walk.
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, MailboxView, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, NoteFilter, NoteKeyCursor, PropertyFilter};
 use khive_storage::{PageRequest, SqlValue};
 use serde_json::Value;
@@ -95,6 +95,7 @@ fn decode_cursor(raw: &str) -> Result<Option<NoteKeyCursor>, RuntimeError> {
 pub(super) async fn list_keyed_notes(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    view: &MailboxView,
     p: &ListParams,
     filter: &NoteFilter,
     requested: u32,
@@ -163,7 +164,7 @@ pub(super) async fn list_keyed_notes(
         for note in page {
             scanned += 1;
             last_scanned = Some(NoteKeyCursor::from(&note));
-            if note_matches_list_filters(&note, p) {
+            if note_matches_list_filters(&note, p, token, view) {
                 if skip > 0 {
                     skip -= 1;
                 } else {

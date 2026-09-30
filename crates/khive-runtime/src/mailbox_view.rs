@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use khive_gate::{check_with_mailbox_policy, mailbox_read_owner};
+use khive_storage::note::Note;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -14,6 +15,52 @@ use crate::{
 pub struct MailboxView {
     pub actor_id: String,
     pub delegated: bool,
+}
+
+impl MailboxView {
+    /// The same actor partitions as Comm's inbox and sent views. Generic note
+    /// listing applies this before its own page limit, including for broad
+    /// kind=note reads that encounter a message row.
+    pub fn permits_message_note(&self, token: &NamespaceToken, note: &Note) -> bool {
+        if note.kind != "message" {
+            return true;
+        }
+        let properties = note.properties.as_ref();
+        let text = |key: &str| -> Option<&str> {
+            properties
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_str)
+        };
+        let legacy_local =
+            !self.delegated && token.actor().is_anonymous() && token.actor().id == "local";
+        match text("direction") {
+            Some("inbound") => {
+                text("to_actor") == Some(self.actor_id.as_str())
+                    || (legacy_local
+                        && properties
+                            .and_then(|p| p.get("to_actor"))
+                            .is_none_or(Value::is_null))
+            }
+            Some("outbound") => {
+                text("from_actor") == Some(self.actor_id.as_str())
+                    || (legacy_local
+                        && properties
+                            .and_then(|p| p.get("from_actor"))
+                            .is_none_or(Value::is_null))
+            }
+            // Pre-v1 local rows can lack all routing fields. Named callers
+            // never inherit that unattributed pool.
+            None => {
+                legacy_local
+                    && properties
+                        .and_then(|p| p.get("direction"))
+                        .is_none_or(Value::is_null)
+                    && text("from_actor").is_none()
+                    && text("to_actor").is_none()
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The same strict selector check is used before ordinary/intercepted dispatch
@@ -38,11 +85,15 @@ impl KhiveRuntime {
         args: &Value,
     ) -> RuntimeResult<MailboxView> {
         let selector_field = match verb {
-            "comm.inbox" | "comm.thread" => "mailbox_actor",
-            "comm.probe" => "actor",
+            "comm.inbox" | "comm.thread" => Some("mailbox_actor"),
+            "comm.probe" => Some("actor"),
+            // Generic message listing has no cross-actor selector. The caller
+            // still needs the ordinary list gate decision and a row-level
+            // mailbox filter before any message can be returned.
+            "list" => None,
             _ => {
                 return Err(RuntimeError::InvalidInput(
-                    "mailbox views are supported only by comm.inbox, comm.thread and comm.probe"
+                    "mailbox views are supported only by comm.inbox, comm.thread, comm.probe and list"
                         .into(),
                 ));
             }
@@ -54,10 +105,16 @@ impl KhiveRuntime {
             args.clone(),
         );
         validate_mailbox_request(&req)?;
-        if args.get(selector_field).and_then(Value::as_str) != selector {
-            return Err(RuntimeError::InvalidInput(format!(
-                "mailbox selector must match the original {selector_field} argument"
-            )));
+        if let Some(selector_field) = selector_field {
+            if args.get(selector_field).and_then(Value::as_str) != selector {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "mailbox selector must match the original {selector_field} argument"
+                )));
+            }
+        } else if selector.is_some() {
+            return Err(RuntimeError::InvalidInput(
+                "list has no cross-actor mailbox selector".into(),
+            ));
         }
         match check_with_mailbox_policy(self.config().gate.as_ref(), &req) {
             Ok(GateDecision::Allow { .. }) => {

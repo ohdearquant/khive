@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, MailboxView, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::Note;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
@@ -22,6 +22,8 @@ use crate::KgPack;
 const ENTITY_LIST_CAP: u32 = 500;
 const NOTE_LIST_CAP: u32 = 200;
 const EVENT_LIST_CAP: u32 = 1000;
+const MESSAGE_FILTER_FIELDS: &[&str] =
+    &["thread_id", "direction", "from", "to", "read", "delivered"];
 
 fn validate_list_filter_scope(
     fields: &[String],
@@ -154,6 +156,7 @@ fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
 async fn resolve_message_thread_filter(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    view: &MailboxView,
     raw: &str,
     primary_only: bool,
 ) -> Result<String, RuntimeError> {
@@ -194,7 +197,13 @@ async fn resolve_message_thread_filter(
     let rows = reader
         .query_all(SqlStatement {
             sql: sql!("message_threads_list").to_string(),
-            params: vec![SqlValue::Text(visible_json)],
+            params: vec![
+                SqlValue::Text(visible_json),
+                SqlValue::Text(view.actor_id.clone()),
+                SqlValue::Integer(i64::from(
+                    !view.delegated && token.actor().is_anonymous() && token.actor().id == "local",
+                )),
+            ],
             label: Some("list.resolve_message_thread_filter".to_string()),
         })
         .await
@@ -262,7 +271,15 @@ async fn resolve_message_thread_filter(
     )))
 }
 
-pub(super) fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
+pub(super) fn note_matches_list_filters(
+    note: &Note,
+    params: &ListParams,
+    token: &NamespaceToken,
+    view: &MailboxView,
+) -> bool {
+    if !view.permits_message_note(token, note) {
+        return false;
+    }
     let properties = note.properties.as_ref();
     if let Some(wanted) = params.tags.as_deref().filter(|tags| !tags.is_empty()) {
         let stored = properties
@@ -379,6 +396,7 @@ impl KgPack {
         // become accepted on an unrelated substrate or note kind.
         let has_schedule_filters =
             params.get("status").is_some() || params.get("created_by_actor").is_some();
+        let original_params = params.clone();
         let mut p: ListParams = deser(params)?;
         if p.after.is_some() && p.offset.is_some() {
             return Err(RuntimeError::InvalidInput(
@@ -524,20 +542,19 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
-                let message_filters = supplied_fields.iter().any(|field| {
-                    matches!(
-                        field.as_str(),
-                        "thread_id" | "direction" | "from" | "to" | "read" | "delivered"
-                    )
-                });
+                let message_filters = supplied_fields
+                    .iter()
+                    .any(|field| MESSAGE_FILTER_FIELDS.contains(&field.as_str()));
                 let runtime = kind_filter
                     .as_deref()
                     .map(|kind| registry.kg_note_read_runtime_for_kind(&self.runtime, kind))
                     .unwrap_or(&self.runtime);
+                let mailbox_view =
+                    runtime.authorize_mailbox_view(token, "list", None, &original_params)?;
                 if message_filters && kind_filter.as_deref() != Some("message") {
                     let message_runtime =
                         registry.kg_note_read_runtime_for_kind(&self.runtime, "message");
-                    if message_runtime.backend_id() != self.runtime.backend_id() {
+                    if !message_runtime.shares_backend_storage_with(&self.runtime) {
                         return Err(RuntimeError::Khive(khive_types::KhiveError::invalid_input(
                             format!(
                                 "list: message filters require kind=\"message\" when messages are stored on backend {:?}",
@@ -557,6 +574,7 @@ impl KgPack {
                         resolve_message_thread_filter(
                             runtime,
                             token,
+                            &mailbox_view,
                             &raw_thread_id,
                             p.key_prefix.is_some(),
                         )
@@ -568,17 +586,20 @@ impl KgPack {
                 let filter = super::note_list::note_filter(&p, kind_filter.as_deref())?;
                 if p.key_prefix.is_some() {
                     return super::note_list::list_keyed_notes(
-                        runtime, token, &p, &filter, requested, limit,
+                        runtime,
+                        token,
+                        &mailbox_view,
+                        &p,
+                        &filter,
+                        requested,
+                        limit,
                     )
                     .await;
                 }
                 let has_note_filter = p.tags.as_ref().is_some_and(|tags| !tags.is_empty())
-                    || p.thread_id.is_some()
-                    || p.direction.is_some()
-                    || p.from.is_some()
-                    || p.to.is_some()
-                    || p.read.is_some()
-                    || p.delivered.is_some();
+                    || message_filters
+                    || kind_filter.is_none()
+                    || kind_filter.as_deref() == Some("message");
                 const PAGE_SIZE: u32 = 200;
                 const MAX_SCAN_TOTAL: u32 = 10_000;
 
@@ -610,7 +631,7 @@ impl KgPack {
                             for note in page {
                                 scanned = scanned.saturating_add(1);
                                 last_scanned = Some(note.id);
-                                if note_matches_list_filters(&note, &p) {
+                                if note_matches_list_filters(&note, &p, token, &mailbox_view) {
                                     collected.push(note);
                                     if collected.len() >= target {
                                         break;
@@ -706,7 +727,7 @@ impl KgPack {
                             if note.deleted_at.is_some() {
                                 continue;
                             }
-                            if note_matches_list_filters(&note, &p) {
+                            if note_matches_list_filters(&note, &p, token, &mailbox_view) {
                                 collected.push(note);
                                 if collected.len() >= target_after_skip {
                                     break;
@@ -1013,7 +1034,11 @@ mod tests {
             let rows = reader
                 .query_all(SqlStatement {
                     sql: sql!("message_threads_list").to_string(),
-                    params: vec![SqlValue::Text(namespaces_json)],
+                    params: vec![
+                        SqlValue::Text(namespaces_json),
+                        SqlValue::Text("local".into()),
+                        SqlValue::Integer(1),
+                    ],
                     label: Some("test.message_threads_list".into()),
                 })
                 .await
