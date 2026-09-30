@@ -234,6 +234,23 @@ fn channel_loop_plan(server: &KhiveMcpServer, args: &Args) -> crate::server::Cha
     }
 }
 
+/// Name the reason inbound polling was refused when the comm runtime is
+/// writable but the blob pack's runtime is not. Comm's own read-only refusal is
+/// reported by the callers' skip line; this is the blob counterpart.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn log_inbound_refused_for_read_only_blob(
+    channel_kind: &str,
+    admission: crate::server::ChannelLoopAdmission,
+) {
+    if admission.inbound_blocked_by_read_only_blob {
+        tracing::error!(
+            channel = channel_kind,
+            "{channel_kind} inbound polling not started: the blob pack runtime is read-only, so \
+             quarantined originals cannot be stored; assign the blob pack a writable backend"
+        );
+    }
+}
+
 /// Handle for the ADR-091 Amendment 2 Plank A session sweep task. Dropping
 /// the sender alone is NOT a sufficient shutdown contract (minor, ADR-091
 /// Amendment 2): the sweep task's own clean-shutdown heartbeat
@@ -379,6 +396,7 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
         tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
         return;
     }
+    log_inbound_refused_for_read_only_blob("email", admission);
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
             "email channel loops: skipped (assigned comm runtime does not admit writes)"
@@ -442,12 +460,31 @@ fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRunti
     runtime.filter(|runtime| !runtime.is_read_only())
 }
 
+#[cfg(all(test, feature = "channel-email"))]
+thread_local! {
+    static EMAIL_POLL_TEST_CHANNEL: std::cell::RefCell<Option<std::sync::Arc<dyn khive_channel::Channel>>> =
+        const { std::cell::RefCell::new(None) };
+    static EMAIL_POLL_TEST_SHUTDOWN: std::cell::RefCell<Option<tokio_util::sync::CancellationToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "channel-email")]
+fn email_poll_shutdown_token(
+    process_shutdown: tokio_util::sync::CancellationToken,
+) -> tokio_util::sync::CancellationToken {
+    #[cfg(test)]
+    let process_shutdown = EMAIL_POLL_TEST_SHUTDOWN
+        .with(|token| token.borrow_mut().take())
+        .unwrap_or(process_shutdown);
+    process_shutdown
+}
+
+#[cfg(feature = "channel-email")]
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
 /// warning and returns on incomplete config. Only call this with the
 /// role-and-runtime admission returned by [`channel_loop_plan`] — use
 /// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
-#[cfg(feature = "channel-email")]
 fn spawn_email_channel_loops(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
@@ -461,13 +498,16 @@ fn spawn_email_channel_loops(
             let email_ch = Arc::new(email_ch);
             let mut ch_registry = ChannelRegistry::new();
             let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
+            #[cfg(test)]
+            let dyn_ch = EMAIL_POLL_TEST_CHANNEL
+                .with(|channel| channel.borrow_mut().take())
+                .unwrap_or(dyn_ch);
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
             let runtime = server.channel_outbox_runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             let mut allowlist = allowed_recipients_from_env();
             if allowlist.is_empty() {
                 allowlist.push(email_ch.maintainer_address().to_string());
@@ -485,6 +525,8 @@ fn spawn_email_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
+                    let poll_shutdown =
+                        email_poll_shutdown_token(khive_runtime::daemon_shutdown_token());
                     khive_runtime::track_named_background_task("email_channel_poll", async move {
                         if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
                         {
@@ -499,7 +541,7 @@ fn spawn_email_channel_loops(
                             verb_reg_poll,
                             ingest_ns_clone,
                             default_actor_clone,
-                            khive_runtime::daemon_shutdown_token(),
+                            poll_shutdown,
                         )
                         .await;
                     });
@@ -563,11 +605,17 @@ fn ingest_namespace_from_env() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
+/// Resolve the default inbound actor for fresh (uncorrelated) email messages.
+#[cfg(feature = "channel-email")]
+fn email_default_inbound_actor_from_env() -> String {
+    default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email")
+}
+
 /// Resolve the default inbound actor for fresh (uncorrelated) channel messages.
 ///
-/// Reads the supplied environment variable; falls back to the channel's
-/// recipient when it is unset or blank. Email defaults to `local`; Telegram's
-/// fallback is isolated from the anonymous `local` mailbox.
+/// Reads the supplied environment variable; falls back to the supplied channel
+/// actor when it is unset or blank. Both channel defaults are isolated
+/// from the anonymous `local` mailbox.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn default_inbound_actor_from_env(actor_variable: &str, fallback: &str) -> String {
     std::env::var(actor_variable)
@@ -733,6 +781,7 @@ async fn ensure_channel_quarantine_storage(
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
 async fn quarantine_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -741,6 +790,7 @@ async fn quarantine_channel_ingest_failure(
     default_inbound_actor: Option<&str>,
     envelope: &khive_channel::ChannelEnvelope,
     classification: khive_runtime::ChannelIngestFailureClass,
+    retention_limit: Option<usize>,
 ) -> Result<(), khive_runtime::RuntimeError> {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
@@ -757,17 +807,39 @@ async fn quarantine_channel_ingest_failure(
         .map(|replay| (replay.bytes.as_slice(), replay.notification_to.as_str()))
         .unwrap_or_else(|| (envelope.content.as_bytes(), envelope.to.as_str()));
 
-    let put = registry
-        .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
-        .await?;
-    let content_ref = put
-        .get("content_ref")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            khive_runtime::RuntimeError::Internal(
-                "blob.put returned no string content_ref for channel quarantine".to_string(),
-            )
-        })?;
+    // The same retention bound as the poller's own quarantine path: past it
+    // the message is still recorded, without its original bytes. An error
+    // reading the count holds progress through the caller.
+    let content_ref = if quarantine_original_may_be_retained(
+        registry,
+        ingest_namespace,
+        retention_limit,
+    )
+    .await?
+    {
+        let put = registry
+            .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
+            .await?;
+        Some(
+            put.get("content_ref")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    khive_runtime::RuntimeError::Internal(
+                        "blob.put returned no string content_ref for channel quarantine"
+                            .to_string(),
+                    )
+                })?
+                .to_string(),
+        )
+    } else {
+        tracing::warn!(
+            channel = channel_kind,
+            external_id,
+            limit = retention_limit,
+            "quarantine retention limit reached; recording the refused message without its original bytes"
+        );
+        None
+    };
 
     // Quarantine sender prefix invariant: the sender retains the originating
     // channel prefix because prefix-keyed consumers depend on it for alert
@@ -778,21 +850,33 @@ async fn quarantine_channel_ingest_failure(
         "quarantine sender prefix invariant: prefix-keyed consumers require the channel prefix"
     );
 
+    let mut metadata = json!({
+        "quarantined": "true",
+        "quarantine_classification": classification.name(),
+        "quarantine_reason": classification.reason(),
+        "quarantine_external_id": external_id,
+    });
+    let content = match &content_ref {
+        Some(content_ref) => {
+            metadata["quarantine_content_ref"] = json!(content_ref);
+            "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference."
+        }
+        None => {
+            metadata["quarantine_original_retained"] = json!("false");
+            metadata["quarantine_original_not_retained_reason"] = json!("retention-limit");
+            "Inbound channel message quarantined. Its original bytes were not stored because the quarantine retention limit was reached."
+        }
+    };
     let mut params = json!({
         "namespace": ingest_namespace,
         "from": quarantine_sender,
         "to": notification_to,
-        "content": "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference.",
+        "content": content,
         "channel_kind": channel_kind,
         "channel_slug": channel_slug,
         "external_id": external_id,
-        "metadata": {
-            "quarantined": "true",
-            "quarantine_classification": classification.name(),
-            "quarantine_reason": classification.reason(),
-            "quarantine_external_id": external_id,
-            "quarantine_content_ref": content_ref,
-        },
+        "correlation_external_id": envelope.correlation_external_id.clone(),
+        "metadata": metadata,
     });
     if let Some(actor) = default_inbound_actor {
         params["default_inbound_actor"] = json!(actor);
@@ -803,6 +887,7 @@ async fn quarantine_channel_ingest_failure(
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
 async fn handle_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -811,6 +896,7 @@ async fn handle_channel_ingest_failure(
     envelope: &khive_channel::ChannelEnvelope,
     error: &khive_runtime::RuntimeError,
     unknown_attempts: &mut std::collections::HashMap<String, u8>,
+    retention_limit: Option<usize>,
 ) -> bool {
     let (channel_kind, channel_slug) = channel;
     let classification = error.channel_ingest_failure_class();
@@ -841,6 +927,7 @@ async fn handle_channel_ingest_failure(
                 default_inbound_actor,
                 envelope,
                 classification,
+                retention_limit,
             )
             .await
             {
@@ -926,6 +1013,41 @@ async fn channel_cycle_wait(
     }
 }
 
+/// Whether one more quarantined original may be stored before it is published.
+///
+/// The bound is the number of live quarantine records in the ingest namespace
+/// (`comm.health`'s `quarantined_count`), so it survives restarts and shrinks
+/// as expired records are cleaned up. Records stored without an original count
+/// too, which keeps the bound conservative. `None` applies no bound.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn quarantine_original_may_be_retained(
+    registry: &khive_runtime::VerbRegistry,
+    ingest_namespace: &str,
+    limit: Option<usize>,
+) -> Result<bool, khive_runtime::RuntimeError> {
+    let Some(limit) = limit else {
+        return Ok(true);
+    };
+    if limit == 0 {
+        return Ok(false);
+    }
+    let health = registry
+        .dispatch(
+            "comm.health",
+            serde_json::json!({"namespace": ingest_namespace}),
+        )
+        .await?;
+    let live = health
+        .get("quarantined_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            khive_runtime::RuntimeError::Internal(
+                "comm.health returned no numeric quarantined_count".to_string(),
+            )
+        })?;
+    Ok(live < limit as u64)
+}
+
 /// Background task that polls all registered channels every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
@@ -949,6 +1071,7 @@ async fn channel_poll_loop(
     default_inbound_actor: String,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    use base64::Engine as _;
     use chrono::{DateTime, Utc};
     use khive_channel_email::{is_backoff_eligible, ImapBackoff};
     use serde_json::json;
@@ -1137,6 +1260,92 @@ async fn channel_poll_loop(
                         .collect();
                     let mut page_fully_ingested = true;
                     for env in page.envelopes {
+                        let mut metadata = env.metadata.clone();
+                        if kind == "email"
+                            && metadata.get("quarantined").map(String::as_str) == Some("true")
+                        {
+                            let Some(replay) = env.quarantine_replay.as_ref() else {
+                                tracing::warn!(
+                                    channel = kind,
+                                    external_id = env.external_id.as_deref(),
+                                    "quarantined email has no original-byte replay; holding channel progress"
+                                );
+                                page_fully_ingested = false;
+                                continue;
+                            };
+                            let retain_original = match quarantine_original_may_be_retained(
+                                &registry,
+                                &ingest_namespace,
+                                channel.quarantine_retention_limit(),
+                            )
+                            .await
+                            {
+                                Ok(retain) => retain,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        channel = kind,
+                                        external_id = env.external_id.as_deref(),
+                                        %error,
+                                        "could not read the retained quarantine count; holding channel progress"
+                                    );
+                                    page_fully_ingested = false;
+                                    continue;
+                                }
+                            };
+                            if !retain_original {
+                                tracing::warn!(
+                                    channel = kind,
+                                    external_id = env.external_id.as_deref(),
+                                    limit = channel.quarantine_retention_limit(),
+                                    "quarantine retention limit reached; recording the message without its original bytes"
+                                );
+                                metadata.insert(
+                                    "quarantine_original_retained".to_string(),
+                                    "false".to_string(),
+                                );
+                                metadata.insert(
+                                    "quarantine_original_not_retained_reason".to_string(),
+                                    "retention-limit".to_string(),
+                                );
+                            } else {
+                                let put = registry
+                                    .dispatch(
+                                        "blob.put",
+                                        json!({
+                                            "bytes": base64::engine::general_purpose::STANDARD
+                                                .encode(&replay.bytes)
+                                        }),
+                                    )
+                                    .await;
+                                let content_ref = match put {
+                                    Ok(result) => {
+                                        match result.get("content_ref").and_then(|v| v.as_str()) {
+                                            Some(content_ref) => content_ref.to_string(),
+                                            None => {
+                                                tracing::warn!(
+                                            channel = kind,
+                                            external_id = env.external_id.as_deref(),
+                                            "blob.put returned no quarantine content reference; holding channel progress"
+                                        );
+                                                page_fully_ingested = false;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            channel = kind,
+                                            external_id = env.external_id.as_deref(),
+                                            %error,
+                                            "failed to publish quarantined email original; holding channel progress"
+                                        );
+                                        page_fully_ingested = false;
+                                        continue;
+                                    }
+                                };
+                                metadata.insert("quarantine_content_ref".to_string(), content_ref);
+                            }
+                        }
                         let params = json!({
                             "namespace": ingest_namespace,
                             "from": env.from.clone(),
@@ -1152,7 +1361,7 @@ async fn channel_poll_loop(
                             "default_inbound_actor": default_inbound_actor,
                             "wire_message_id": env.wire_message_id.clone(),
                             "wire_references": env.wire_references.clone(),
-                            "metadata": env.metadata.clone(),
+                            "metadata": metadata,
                         });
                         if let Err(error) = registry.dispatch("comm.ingest", params).await {
                             let handled = handle_channel_ingest_failure(
@@ -1163,6 +1372,7 @@ async fn channel_poll_loop(
                                 &env,
                                 &error,
                                 &mut unknown_ingest_attempts,
+                                channel.quarantine_retention_limit(),
                             )
                             .await;
                             if !handled {
@@ -1739,6 +1949,7 @@ fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) 
         tracing::info!("telegram channel loops: skipped (client role; daemon owns channel loops)");
         return;
     }
+    log_inbound_refused_for_read_only_blob("telegram", admission);
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
             "telegram channel loops: skipped (assigned comm runtime does not admit writes)"
@@ -1975,6 +2186,8 @@ async fn telegram_poll_loop(
                             &env,
                             &error,
                             &mut unknown_ingest_attempts,
+                            // The Telegram adapter declares no retention bound.
+                            None,
                         )
                         .await;
                         if !handled {
@@ -2246,14 +2459,224 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BackendAliasIdentity {
+    /// An existing file can have several distinct canonical hard-link paths.
+    #[cfg(any(unix, windows))]
+    File(FileIdentity),
+    /// A not-yet-created file has only a resolved path to compare.
+    Path(PathBuf),
+}
+
+fn backend_alias_identity(
+    backend_name: &str,
+    canonical: &std::path::Path,
+) -> anyhow::Result<BackendAliasIdentity> {
+    #[cfg(any(unix, windows))]
+    {
+        match khive_db::file_identity::database_file_identity(canonical) {
+            Ok(identity) => Ok(BackendAliasIdentity::File(identity)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+            }
+            Err(error) => anyhow::bail!(
+                "backend {backend_name}: cannot inspect database identity at {}: {error}",
+                canonical.display()
+            ),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = backend_name;
+        Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+    }
+}
+
+/// Read the identity that SQLite's pool pinned during open. A second pathname
+/// stat alone can agree with the pre-open stat after an A→B→A replacement,
+/// while SQLite actually holds B.
+fn opened_backend_alias_identity(
+    backend: &StorageBackend,
+    canonical: &std::path::Path,
+) -> anyhow::Result<BackendAliasIdentity> {
+    #[cfg(any(unix, windows))]
+    {
+        let identity = backend
+            .pool()
+            .opened_file_identity_record()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "file-backed backend {} has no opened SQLite file identity",
+                    canonical.display()
+                )
+            })?;
+        Ok(BackendAliasIdentity::File(identity))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = backend;
+        Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+    }
+}
+
+fn snapshot_matches_opened_backend(
+    snapshot: &BackendAliasIdentity,
+    opened: &BackendAliasIdentity,
+) -> bool {
+    #[cfg(any(unix, windows))]
+    {
+        // An absent first-open path has no file identity to compare yet.
+        matches!(snapshot, BackendAliasIdentity::Path(_)) || snapshot == opened
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        snapshot == opened
+    }
+}
+
+/// Bind a configured file identity to the database actually opened by SQLite.
+/// The opener is injectable only so the path-replacement window can be tested
+/// deterministically; production passes `open_backend` unchanged.
+fn open_backend_bound_to_alias_identity_with<F>(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    snapshot: &BackendAliasIdentity,
+    canonical: &std::path::Path,
+    opener: F,
+) -> anyhow::Result<(StorageBackend, BackendAliasIdentity)>
+where
+    F: FnOnce(&BackendConfig, Option<usize>) -> anyhow::Result<StorageBackend>,
+{
+    let backend = opener(cfg, max_readers)?;
+    let opened = opened_backend_alias_identity(&backend, canonical)?;
+    let at_path = backend_alias_identity(&cfg.name, canonical)?;
+    let configured_now = canonical_backend_path(cfg)?
+        .map(|path| backend_alias_identity(&cfg.name, &path))
+        .transpose()?;
+    if opened != at_path
+        || configured_now.as_ref() != Some(&opened)
+        || !snapshot_matches_opened_backend(snapshot, &opened)
+    {
+        anyhow::bail!(
+            "backend {}: database identity changed between topology snapshot and SQLite open \
+             at {}: snapshot={snapshot:?}, opened={opened:?}, path_now={at_path:?}, \
+             configured_now={configured_now:?}",
+            cfg.name,
+            canonical.display()
+        );
+    }
+    Ok((backend, opened))
+}
+
+fn verify_reused_backend_alias_identity(
+    cfg: &BackendConfig,
+    snapshot: &BackendAliasIdentity,
+    canonical: &std::path::Path,
+    existing: &StorageBackend,
+) -> anyhow::Result<()> {
+    let opened = opened_backend_alias_identity(existing, canonical)?;
+    let at_path = backend_alias_identity(&cfg.name, canonical)?;
+    let configured_now = canonical_backend_path(cfg)?
+        .map(|path| backend_alias_identity(&cfg.name, &path))
+        .transpose()?;
+    if at_path != opened
+        || configured_now.as_ref() != Some(&opened)
+        || !snapshot_matches_opened_backend(snapshot, &at_path)
+    {
+        anyhow::bail!(
+            "backend {}: alias identity changed before cached backend reuse at {}: \
+             snapshot={snapshot:?}, opened={opened:?}, path_now={at_path:?}, \
+             configured_now={configured_now:?}",
+            cfg.name,
+            canonical.display()
+        );
+    }
+    Ok(())
+}
+
+/// Open the entire declared topology against one pre-open snapshot. The
+/// injectable opener makes the snapshot→SQLite-open race executable without a
+/// scheduler or global hook; production passes `open_backend` directly.
+fn open_effective_backends_with<F>(
+    effective_backends: &[BackendConfig],
+    max_readers: Option<usize>,
+    mut opener: F,
+) -> anyhow::Result<HashMap<String, Arc<StorageBackend>>>
+where
+    F: FnMut(&BackendConfig, Option<usize>) -> anyhow::Result<StorageBackend>,
+{
+    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
+    let identities = effective_backends
+        .iter()
+        .map(|cfg| {
+            canonical_backend_path(cfg)?.map_or(Ok(None), |canonical| {
+                backend_alias_identity(&cfg.name, &canonical)
+                    .map(|identity| Some((identity, canonical)))
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut identity_to_backend: HashMap<BackendAliasIdentity, Arc<StorageBackend>> =
+        HashMap::new();
+    for (backend_cfg, identity) in effective_backends.iter().zip(identities) {
+        if let Some((ref key, ref canon)) = identity {
+            if let Some(existing) = identity_to_backend.get(key) {
+                verify_reused_backend_alias_identity(backend_cfg, key, canon, existing)?;
+                if existing.is_read_only() != backend_cfg.read_only {
+                    anyhow::bail!(
+                        "backend {} aliases {} but declares read_only={} while the same \
+                         physical database was already opened with read_only={}; every alias \
+                         of one database must use the same access mode",
+                        backend_cfg.name,
+                        canon.display(),
+                        backend_cfg.read_only,
+                        existing.is_read_only(),
+                    );
+                }
+                backends.insert(backend_cfg.name.clone(), existing.clone());
+                continue;
+            }
+        }
+        let (backend, opened_key) = if let Some((ref key, ref canon)) = identity {
+            let (backend, opened) = open_backend_bound_to_alias_identity_with(
+                backend_cfg,
+                max_readers,
+                key,
+                canon,
+                &mut opener,
+            )?;
+            (backend, Some(opened))
+        } else {
+            (opener(backend_cfg, max_readers)?, None)
+        };
+        let arc = Arc::new(backend);
+        if let (Some((snapshot, _)), Some(opened)) = (identity, opened_key) {
+            if identity_to_backend.contains_key(&opened) {
+                anyhow::bail!(
+                    "backend {}: opened database identity was already cached under another \
+                     configured path; refusing duplicate pool after topology changed",
+                    backend_cfg.name
+                );
+            }
+            identity_to_backend.insert(opened, arc.clone());
+            if matches!(&snapshot, BackendAliasIdentity::Path(_)) {
+                identity_to_backend.insert(snapshot, arc.clone());
+            }
+        }
+        backends.insert(backend_cfg.name.clone(), arc);
+    }
+    Ok(backends)
+}
+
 /// Reject conflicting access modes without opening any configured database.
 pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
-    let mut physical_sqlite: HashMap<std::path::PathBuf, (&str, bool)> = HashMap::new();
+    let mut physical_sqlite: HashMap<BackendAliasIdentity, (&str, bool)> = HashMap::new();
     for backend in backends {
         let Some(canonical) = canonical_backend_path(backend)? else {
             continue;
         };
-        if let Some((first_name, first_read_only)) = physical_sqlite.get(&canonical) {
+        let identity = backend_alias_identity(&backend.name, &canonical)?;
+
+        if let Some((first_name, first_read_only)) = physical_sqlite.get(&identity) {
             if *first_read_only != backend.read_only {
                 anyhow::bail!(
                     "backend {} aliases {} (already declared by backend {}) but declares \
@@ -2267,7 +2690,7 @@ pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> any
                 );
             }
         } else {
-            physical_sqlite.insert(canonical, (&backend.name, backend.read_only));
+            physical_sqlite.insert(identity, (&backend.name, backend.read_only));
         }
     }
     Ok(())
@@ -2563,29 +2986,20 @@ pub fn reject_conflicting_db_override_with_source(
 /// Filesystem identity of a reindex target, captured so a symlink retargeted
 /// or a file replaced in place between validation and open can be told apart
 /// from the declared file validation actually checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
+#[cfg(any(unix, windows))]
+type FileIdentity = khive_db::file_identity::DatabaseFileIdentity;
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity;
 
 fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let meta = std::fs::metadata(path).ok()?;
-        Some(FileIdentity {
-            device: meta.dev(),
-            inode: meta.ino(),
-        })
+        khive_db::file_identity::database_file_identity(path).ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        // The standard library exposes no stable file-identity accessor off
-        // unix (the Windows volume-serial and file-index accessors are
-        // unstable), so the pre-open re-check degrades to path-level
-        // validation there. This crate's non-unix lane is compile-checked
-        // only.
         let _ = path;
         None
     }
@@ -2623,7 +3037,7 @@ pub fn capture_existing_database_target(
         path.display()
     );
     let identity = file_identity(&path);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     anyhow::ensure!(
         identity.is_some(),
         "cannot capture database identity for {}",
@@ -2640,12 +3054,10 @@ pub fn capture_existing_database_target(
 /// to the same canonical (already symlink-free) path, so pinning the open to
 /// `target.path` defeats that redirect by construction; a declared file
 /// replaced in place (e.g. another database renamed over it) keeps the same
-/// path string but changes `(device, inode)`, which this call catches.
+/// path string but changes its physical file identity, which this call catches.
 ///
-/// The gap this does not close: a parent directory replaced in the sliver of
-/// time between this call returning and the underlying SQLite `open()`
-/// syscall. No API the sqlite binding used here exposes reaches an
-/// already-open file descriptor's identity, so that final window stays open.
+/// This pre-open check alone cannot close a replacement window between its
+/// return and the underlying SQLite `open()` syscall.
 pub fn reverify_reindex_target_identity(target: &ValidatedReindexTarget) -> anyhow::Result<()> {
     let observed = file_identity(&target.path);
     if observed != target.identity {
@@ -2935,38 +3347,12 @@ async fn prepare_configured_storage_topology(
         }
     }
 
-    // Open each declared backend, deduplicating SQLite backends by canonical
-    // path (ADR-028 §8). Schema preparation is deliberately deferred until
-    // after main is identified: every distinct secondary must be inventoried
-    // before main can atomically enable attachment-only GC at V21.
-    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
-    let mut path_to_backend: HashMap<std::path::PathBuf, Arc<StorageBackend>> = HashMap::new();
-    for backend_cfg in &effective_backends {
-        let canonical = canonical_backend_path(backend_cfg)?;
-        if let Some(ref canon) = canonical {
-            if let Some(existing) = path_to_backend.get(canon) {
-                if existing.is_read_only() != backend_cfg.read_only {
-                    anyhow::bail!(
-                        "backend {} aliases {} but declares read_only={} while the same \
-                         physical database was already opened with read_only={}; every alias \
-                         of one database must use the same access mode",
-                        backend_cfg.name,
-                        canon.display(),
-                        backend_cfg.read_only,
-                        existing.is_read_only(),
-                    );
-                }
-                backends.insert(backend_cfg.name.clone(), existing.clone());
-                continue;
-            }
-        }
-        let backend = open_backend(backend_cfg, max_readers)?;
-        let arc = Arc::new(backend);
-        if let Some(canon) = canonical {
-            path_to_backend.insert(canon, arc.clone());
-        }
-        backends.insert(backend_cfg.name.clone(), arc);
-    }
+    // Open each declared backend, deduplicating SQLite backends by physical
+    // file identity (or canonical path before creation; ADR-028 §8). Schema
+    // preparation is deferred until after main is identified: every distinct
+    // secondary must be inventoried before main can atomically enable
+    // attachment-only GC at V21.
+    let backends = open_effective_backends_with(&effective_backends, max_readers, open_backend)?;
 
     let main_backend = backends
         .get(BackendId::MAIN)
@@ -3286,6 +3672,10 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
     registry.call_register_note_mutation_hooks(&default_runtime);
+    registry.call_register_note_search_ann_providers(&default_runtime);
+    for rt in per_pack_runtimes_local.values() {
+        registry.call_register_note_search_ann_providers(rt);
+    }
     // Note-write identity: install the pack-owned kind set and the pack-owned
     // note-write validator so identity properties are derived at the write and
     // preserved through merge/update on every path, including the ones that
@@ -3300,8 +3690,11 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         .map(str::to_string)
         .collect();
     default_runtime.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    let note_embedding_policies = registry.all_note_embedding_policies();
+    default_runtime.install_note_embedding_policies(&note_embedding_policies);
     for rt in per_pack_runtimes_local.values() {
         rt.install_pack_owned_note_kinds(owned_note_kinds.clone());
+        rt.install_note_embedding_policies(&note_embedding_policies);
     }
     // The validator is installed on every runtime the kind list reaches, not
     // just the default: each per-pack runtime is built independently, so none
@@ -3854,6 +4247,7 @@ pub fn build_server_from_multi_backend_registry(
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let channel_loop_admission = crate::server::ChannelLoopAdmission::for_pack_runtimes(
         multi.per_pack_runtimes.get("comm").map(Arc::as_ref),
+        multi.per_pack_runtimes.get("blob").map(Arc::as_ref),
     );
     // The delivery loops scan, claim, and mark outbound `message` notes, so
     // they must hold the runtime that owns comm's rows — under a
@@ -4232,6 +4626,7 @@ fn build_pack_runtime(
     let rt = KhiveRuntime::from_backend(backend, rt_config)
         .with_declared_backend_db_paths(declared_backend_db_paths)
         .with_diagnostic_backends(diagnostic_backends)
+        .with_diagnostic_observer_from(main_runtime)
         .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
@@ -9205,6 +9600,89 @@ region = "us-east-1"
         );
     }
 
+    /// The server built from a multi-backend registry reads admission from the
+    /// blob pack's own runtime: comm on a writable backend and blob on a
+    /// read-only one must not poll, and must still deliver outbound mail.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[tokio::test]
+    #[serial]
+    #[serial(config_ledger)]
+    async fn mixed_topology_refuses_inbound_polling_when_the_blob_backend_is_read_only() {
+        use clap::Parser;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-blob-admission.db");
+        let blob_path = dir.path().join("blob-admission.db");
+        let blob_root = dir.path().join("blob-objects");
+        let config_for = |blob_read_only: bool| KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "blob-store".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(blob_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: blob_read_only,
+                },
+            ],
+            packs: HashMap::from([(
+                "blob".to_string(),
+                PackConfig {
+                    backend: "blob-store".to_string(),
+                    no_embed: false,
+                },
+            )]),
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.to_string_lossy().into_owned()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let base_config = || {
+            let mut config = base_runtime_config_for_multi_backend();
+            config.packs = vec!["kg".to_string(), "comm".to_string(), "blob".to_string()];
+            config
+        };
+
+        let seeded =
+            build_registry_for_multi_backend_inner(base_config(), &config_for(false), None)
+                .await
+                .expect("seed exact-current snapshots");
+        drop(seeded);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&blob_path);
+        let daemon = Args::parse_from(["mcp", "--daemon"]);
+
+        let snapshot =
+            build_registry_for_multi_backend_inner(base_config(), &config_for(true), None)
+                .await
+                .expect("writable comm plus read-only blob topology");
+        let server = build_server_from_multi_backend_registry(snapshot, &config_for(true), None);
+        let admission = channel_loop_plan(&server, &daemon);
+        assert!(
+            !admission.inbound_poll,
+            "quarantined originals are published through the read-only blob runtime"
+        );
+        assert!(admission.inbound_blocked_by_read_only_blob);
+        assert!(
+            admission.outbound_delivery,
+            "outbound delivery runs on the writable comm runtime and does not use blob"
+        );
+    }
+
     /// RAII guard: redirects `HOME` and restores the prior value on drop.
     struct HomeGuard {
         original: Option<std::ffi::OsString>,
@@ -9532,6 +10010,376 @@ region = "us-east-1"
         let message = error.to_string();
         assert!(message.contains("same physical database"), "{message}");
         assert!(message.contains("read_only"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_backend_aliases_must_agree_on_access_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("main.db");
+        let hard_link = dir.path().join("archive.db");
+        std::fs::write(&database, b"").unwrap();
+        std::fs::hard_link(&database, &hard_link).unwrap();
+
+        let mut config = duplicate_sqlite_path_config(&database);
+        config.backends[1].path = Some(hard_link);
+        config.backends[1].read_only = true;
+        let error = validate_effective_backend_alias_modes(&config.backends)
+            .expect_err("hard links to one database cannot have conflicting modes");
+        let message = error.to_string();
+        assert!(message.contains("same physical database"), "{message}");
+        assert!(message.contains("read_only"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn hard_linked_backend_aliases_share_one_open_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("main.db");
+        let hard_link = dir.path().join("archive.db");
+        rusqlite::Connection::open(&database).unwrap();
+        std::fs::hard_link(&database, &hard_link).unwrap();
+
+        let mut config = duplicate_sqlite_path_config(&database);
+        config.backends[1].path = Some(hard_link);
+        let topology = prepare_configured_storage_topology(
+            base_runtime_config_for_multi_backend(),
+            &config,
+            None,
+            StorageTopologyPurpose::Serving,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &topology.backends["main"],
+            &topology.backends["alias"]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_snapshot_to_open_aba_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for (path, marker) in [(&main, "original"), (&replacement, "replacement")] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch(&format!("CREATE TABLE {marker} (id INTEGER)"))
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let mut opened_alias = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                let staged_replacement = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged_replacement).unwrap();
+                std::fs::rename(&staged_replacement, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                opened_main = true;
+                assert_eq!(file_identity(&main), Some(replacement_identity));
+                let staged_original = dir.path().join("staged-original.db");
+                std::fs::hard_link(&alias, &staged_original).unwrap();
+                std::fs::rename(&staged_original, &main).unwrap();
+                Ok(backend)
+            } else {
+                opened_alias = true;
+                open_backend(cfg, max_readers)
+            }
+        })
+        .err()
+        .expect("the opened replacement must not be cached under the original inode");
+        assert!(opened_main);
+        assert!(
+            !opened_alias,
+            "reject before alias routing or schema preparation"
+        );
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        let message = error.to_string();
+        assert!(message.contains("identity changed"), "{message}");
+        assert!(message.contains("opened="), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_snapshot_to_open_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                let staged = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                assert_eq!(
+                    backend.pool().opened_file_identity_record(),
+                    Some(replacement_identity)
+                );
+                opened_main = true;
+                Ok(backend)
+            } else {
+                panic!("reject before looking up or opening the hard-link alias")
+            }
+        })
+        .err()
+        .expect("the opened replacement must not inherit the old topology snapshot");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backend_alias_snapshot_rejects_same_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                std::fs::remove_file(&main).unwrap();
+                std::fs::hard_link(&replacement, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                assert_eq!(
+                    backend.pool().opened_file_identity_record(),
+                    Some(replacement_identity)
+                );
+                opened_main = true;
+                Ok(backend)
+            } else {
+                panic!("reject before cached alias reuse")
+            }
+        })
+        .err()
+        .expect("a read-only legacy database replacement must fail before alias routing");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_path_swap_after_sqlite_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                assert_eq!(file_identity(&main), Some(original_identity));
+                assert_eq!(
+                    backend.pool().opened_file_identity_record(),
+                    Some(original_identity)
+                );
+                opened_main = true;
+                let staged = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &main).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("the path replacement after SQLite open must fail before alias reuse");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_hard_link_alias_rechecks_path_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                let staged = dir.path().join("staged-alias.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("changed alias must not reuse the cached original backend");
+        assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        assert!(error.to_string().contains("before cached backend reuse"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_symlink_alias_rechecks_configured_target_before_reuse() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        symlink(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&replacement, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("retargeted symlink must not reuse the cached original backend");
+        assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        let message = error.to_string();
+        assert!(message.contains("before cached backend reuse"), "{message}");
+        assert!(message.contains("configured_now="), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_rechecks_configured_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        symlink(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[0].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&replacement, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("retargeted configured path must fail before caching the opened backend");
+        assert_eq!(opened_count, 1, "reject before opening the next backend");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        let message = error.to_string();
+        assert!(
+            message.contains("between topology snapshot and SQLite open"),
+            "{message}"
+        );
+        assert!(message.contains("configured_now="), "{message}");
     }
 
     /// Regression for #720: changing `HOME` after runtime-config resolution but
@@ -10124,21 +10972,24 @@ region = "us-east-1"
 
         #[test]
         #[serial]
-        fn default_inbound_actor_defaults_to_local() {
+        fn default_inbound_actor_defaults_to_channel_email() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local"),
-                "local",
-                "an unset actor must resolve to the neutral namespace, not to any particular \
-                 deployment's identity"
-            );
+            let actor = email_default_inbound_actor_from_env();
+            assert_eq!(actor, "channel:email");
+            for caller in [None, Some("  ")] {
+                assert_ne!(
+                    actor,
+                    khive_runtime::resolve_actor(caller).id,
+                    "an unconfigured caller must never resolve to the email mailbox actor"
+                );
+            }
         }
 
         #[test]
         #[serial]
         fn default_inbound_actor_reads_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "lambda:mybot");
-            let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(actor, "lambda:mybot");
         }
@@ -10147,21 +10998,24 @@ region = "us-east-1"
         #[serial]
         fn default_inbound_actor_ignores_blank_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "  ");
-            let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(actor, "local", "blank env var must fall back to default");
+            assert_eq!(
+                actor, "channel:email",
+                "blank env var must use the channel actor"
+            );
         }
 
         #[tokio::test]
         #[serial]
-        async fn fresh_uncorrelated_email_defaults_to_local_inbox() {
+        async fn explicit_local_override_routes_fresh_email_to_local_inbox() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
             assert_eq!(default_actor, "local");
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let registry = email_test_registry(runtime);
-            ingest_fresh_email(&registry, "email-default-local", &default_actor).await;
+            ingest_fresh_email(&registry, "email-explicit-local", &default_actor).await;
 
             let inbox = registry
                 .dispatch("comm.inbox", serde_json::json!({}))
@@ -10179,12 +11033,11 @@ region = "us-east-1"
 
         #[tokio::test]
         #[serial]
-        async fn opt_in_email_mailbox_is_visible_only_to_a_configured_reader() {
-            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+        async fn fresh_uncorrelated_email_defaults_to_channel_mailbox() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let default_actor = email_default_inbound_actor_from_env();
             assert_eq!(default_actor, "channel:email");
+            assert_ne!(default_actor, khive_runtime::resolve_actor(None).id);
 
             let config: KhiveConfig = toml::from_str(&format!(
                 "[actor]\nid = 'channel:email'\nmailbox_readers = ['{EMAIL_READER}']\n"
@@ -10202,7 +11055,7 @@ region = "us-east-1"
             );
             let runtime = KhiveRuntime::new(runtime_config).expect("configured runtime");
             let registry = email_test_registry(runtime);
-            ingest_fresh_email(&registry, "email-opt-in-reader", &default_actor).await;
+            ingest_fresh_email(&registry, "email-default-channel", &default_actor).await;
 
             let inbox = dispatch_as(
                 &registry,
@@ -10215,6 +11068,18 @@ region = "us-east-1"
             let messages = inbox["messages"].as_array().expect("inbox messages");
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0]["content"], "fresh email");
+            assert_eq!(messages[0]["properties"]["to_actor"], "channel:email");
+
+            let local = dispatch_as(&registry, None, "comm.inbox", serde_json::json!({}))
+                .await
+                .expect("the anonymous local caller can read its own inbox");
+            assert!(
+                local["messages"]
+                    .as_array()
+                    .expect("inbox messages")
+                    .is_empty(),
+                "fresh email must not appear in the anonymous local inbox"
+            );
 
             let denied = dispatch_as(
                 &registry,
@@ -10237,9 +11102,9 @@ region = "us-east-1"
         #[tokio::test]
         #[serial]
         async fn email_sender_prefix_filters_fresh_ingest_from_local_sends() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let registry = email_test_registry(runtime);
             ingest_fresh_email(&registry, "email-prefix-filter", &default_actor).await;
@@ -12939,17 +13804,30 @@ backend = "kg-backend"
     #[cfg(feature = "channel-email")]
     mod spawn_email_channel_loops_tests {
         use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use std::sync::{Arc, Mutex};
 
-        const EMAIL_ENV_VARS: [&str; 9] = [
+        const EMAIL_ENV_VARS: &[&str] = &[
             "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_SMTP_PORT",
             "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_IMAP_PORT",
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
             "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAILBOX",
             "KHIVE_EMAIL_MAINTAINER_ADDRESS",
             "KHIVE_EMAIL_AUTHSERV_ID",
             "KHIVE_EMAIL_PASSWORD",
             "KHIVE_EMAIL_OAUTH_TENANT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
+            "KHIVE_EMAIL_QUARANTINE_STORE",
+            "KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS",
+            "KHIVE_EMAIL_INGEST_NAMESPACE",
+            "KHIVE_EMAIL_DEFAULT_ACTOR",
         ];
 
         /// RAII guard: snapshots each `KHIVE_EMAIL_*` var's current value, clears it,
@@ -12981,6 +13859,158 @@ backend = "kg-backend"
                     }
                 }
             }
+        }
+
+        struct OneMessageEmailChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for OneMessageEmailChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(self.envelope.lock().unwrap().take().into_iter().collect())
+            }
+        }
+
+        #[test]
+        fn email_poll_shutdown_override_survives_cancelled_process_token() {
+            let cancelled_process = tokio_util::sync::CancellationToken::new();
+            cancelled_process.cancel();
+            let isolated = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(isolated.clone());
+            });
+
+            let selected = email_poll_shutdown_token(cancelled_process);
+            assert!(!selected.is_cancelled());
+            selected.cancel();
+            assert!(isolated.is_cancelled());
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial]
+        async fn production_email_spawn_routes_unset_default_actor_to_channel_mailbox() {
+            let _env_guard = EmailEnvGuard::clear();
+            std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_USERNAME", "mailbox@example.com");
+            std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+            std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.example.com");
+            std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+            assert!(std::env::var_os("KHIVE_EMAIL_DEFAULT_ACTOR").is_none());
+            khive_channel_email::EmailChannel::from_env().expect("email config takes the Ok arm");
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let blob_dir = tempfile::tempdir().expect("blob directory");
+            runtime
+                .install_blob_store(Arc::new(
+                    khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                        .expect("blob store"),
+                ))
+                .expect("install quarantine blob store");
+            let server = KhiveMcpServer::with_packs(
+                runtime,
+                &["kg".to_string(), "comm".to_string(), "blob".to_string()],
+            )
+            .expect("server builds with comm and blob storage");
+            let registry = server.verb_registry_clone();
+            let mut admission = server.channel_loop_admission();
+            assert!(
+                admission.inbound_poll,
+                "writable comm runtime admits polling"
+            );
+            admission.outbound_delivery = false;
+
+            // Replace the transport and process-global shutdown token. The
+            // real spawn path still resolves the actor, starts
+            // channel_poll_loop, and dispatches comm.ingest.
+            let test_shutdown = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(test_shutdown.clone());
+            });
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Arc::new(OneMessageEmailChannel {
+                    envelope: Mutex::new(Some(
+                        ChannelEnvelope::new(
+                            "email:sender@example.com",
+                            "email:mailbox@example.com",
+                            "production actor wiring",
+                        )
+                        .with_external_id("email-production-default-actor"),
+                    )),
+                }));
+            });
+            spawn_email_channel_loops(&server, admission);
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed fake transport"
+                );
+            });
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed test-scoped shutdown token"
+                );
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let message = loop {
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                tokio::task::yield_now().await;
+                let channel_inbox = registry
+                    .dispatch_with_identity(
+                        "comm.inbox",
+                        serde_json::json!({"status": "all"}),
+                        Some(khive_runtime::RequestIdentity {
+                            namespace: "local".to_string(),
+                            actor_id: Some("channel:email".to_string()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .expect("channel actor reads its own inbox");
+                if let Some(message) = channel_inbox["messages"]
+                    .as_array()
+                    .expect("channel inbox messages")
+                    .iter()
+                    .find(|message| message["content"] == "production actor wiring")
+                {
+                    break message.clone();
+                }
+                let local_inbox = registry
+                    .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                    .await
+                    .expect("local actor reads its own inbox");
+                assert!(
+                    !local_inbox["messages"]
+                        .as_array()
+                        .expect("local inbox messages")
+                        .iter()
+                        .any(|message| message["content"] == "production actor wiring"),
+                    "the production poll must not pass local as comm.ingest's default actor"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "production polling did not ingest its test message within 30s"
+                );
+            };
+            assert_eq!(message["properties"]["to_actor"], "channel:email");
+            test_shutdown.cancel();
         }
 
         #[tokio::test]
@@ -13083,6 +14113,89 @@ backend = "kg-backend"
             let admitted = channel_loop_plan(&server, &client);
             assert!(!admitted.inbound_poll);
             assert!(!admitted.outbound_delivery);
+        }
+
+        /// Inbound polling publishes quarantined originals through `blob.put`, so
+        /// a writable comm runtime beside a read-only blob runtime must not poll:
+        /// every publish would fail, the cursor would hold, and the same message
+        /// would be retried forever.
+        #[test]
+        #[serial_test::serial(config_ledger)]
+        fn email_admission_refuses_inbound_polling_when_the_blob_runtime_is_read_only() {
+            use crate::server::ChannelLoopAdmission;
+            use std::sync::{Arc, Mutex};
+
+            #[derive(Clone, Default)]
+            struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for CapturedLog {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+                type Writer = CapturedLog;
+                fn make_writer(&'a self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("blob-read-only.db");
+            let config = RuntimeConfig {
+                db_path: Some(path),
+                packs: vec!["kg".to_string(), "blob".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+            KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            #[cfg(unix)]
+            freeze_snapshot_sidecars(config.db_path.as_ref().expect("db path"));
+            let read_only_blob =
+                KhiveRuntime::new_readonly(config).expect("read-only blob runtime");
+            assert!(read_only_blob.is_read_only());
+            let writable = KhiveRuntime::memory().expect("writable runtime");
+
+            let refused =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&writable), Some(&read_only_blob));
+            assert!(
+                !refused.inbound_poll,
+                "polling must not start against a read-only blob runtime"
+            );
+            assert!(refused.inbound_blocked_by_read_only_blob);
+            assert!(
+                refused.outbound_delivery,
+                "outbound delivery does not touch blob and stays admitted"
+            );
+
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                log_inbound_refused_for_read_only_blob("email", refused);
+            });
+            let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logged.contains("blob pack runtime is read-only"),
+                "the refusal must name the blob runtime: {logged}"
+            );
+
+            // Controls: a writable blob runtime, or no blob pack at all, leaves
+            // admission exactly as comm's own writability decides it.
+            let admitted =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&writable), Some(&writable));
+            assert!(admitted.inbound_poll && admitted.outbound_delivery);
+            assert!(!admitted.inbound_blocked_by_read_only_blob);
+            let no_blob = ChannelLoopAdmission::for_pack_runtimes(Some(&writable), None);
+            assert!(no_blob.inbound_poll && !no_blob.inbound_blocked_by_read_only_blob);
+            let comm_read_only =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&read_only_blob), Some(&writable));
+            assert!(!comm_read_only.inbound_poll && !comm_read_only.outbound_delivery);
         }
 
         #[tokio::test]
@@ -13519,6 +14632,18 @@ backend = "kg-backend"
 
         const SOURCE: &str = "imap+tls:h:993:m:INBOX";
 
+        /// The poller stores every quarantined email's original as one blob
+        /// before it commits the cursor, so the channel's accepted message
+        /// ceiling must fit one blob object. A larger ceiling admits a message
+        /// whose quarantine `blob.put` refuses on every poll.
+        #[test]
+        fn email_message_ceiling_fits_one_blob_object() {
+            assert_eq!(
+                khive_channel_email::config::MAX_IMAP_MESSAGE_BYTES as u64,
+                khive_storage::blob::MAX_BLOB_WHOLE_BYTES
+            );
+        }
+
         /// First `poll_page` call returns one message that ingests cleanly
         /// and one that permanently fails `comm.ingest` validation (empty
         /// content) -- simulating a partial-page ingest failure. Every
@@ -13835,12 +14960,12 @@ backend = "kg-backend"
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
-        struct ContentRefusalOnceChannel {
+        struct EmailOnceChannel {
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
         #[async_trait]
-        impl Channel for ContentRefusalOnceChannel {
+        impl Channel for EmailOnceChannel {
             fn kind(&self) -> &'static str {
                 "email"
             }
@@ -14047,6 +15172,448 @@ backend = "kg-backend"
         }
 
         #[tokio::test(start_paused = true)]
+        async fn first_time_email_quarantine_roots_exact_original_before_cursor_commit() {
+            const ORIGINAL_BYTES: &[u8] = b"From: forged@example.com\r\n\
+                To: maintainer@example.com\r\n\
+                X-Original: \xff\x00\r\n\
+                \r\n\
+                untrusted body\r\n";
+            const EXTERNAL_ID: &str = "imap:h:account:11:8";
+            let mut envelope = ChannelEnvelope::new(
+                "email:quarantine",
+                "email:maintainer@example.com",
+                "untrusted body",
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_legacy_external_id("imap:h:11:8")
+            .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
+            envelope
+                .metadata
+                .insert("quarantined".to_string(), "true".to_string());
+            envelope
+                .metadata
+                .insert("quarantine_reason".to_string(), "off-allowlist".to_string());
+            envelope.metadata.insert(
+                "quarantine_claimed_from".to_string(),
+                "forged@example.com".to_string(),
+            );
+
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(EmailOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first-time quarantine must attach its original and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let notes = inbox["items"].as_array().expect("message items");
+            assert_eq!(notes.len(), 1, "one first-time quarantine note");
+            let quarantined = &notes[0];
+            let props = &quarantined["properties"];
+            assert_eq!(props["external_id"], EXTERNAL_ID);
+            assert_eq!(props["from_actor"], "email:quarantine");
+            assert_eq!(props["quarantined"], "true");
+            assert_eq!(props["quarantine_reason"], "off-allowlist");
+            assert_eq!(props["quarantine_claimed_from"], "forged@example.com");
+            assert!(props.get("quarantine_classification").is_none());
+            let content_ref = props["quarantine_content_ref"]
+                .as_str()
+                .expect("first-time quarantine original reference");
+            let note_id = quarantined["id"]
+                .as_str()
+                .expect("quarantine note id")
+                .parse::<uuid::Uuid>()
+                .expect("quarantine note UUID");
+            let owner = runtime
+                .attachments()
+                .expect("main attachment store")
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .expect("original must be rooted before cursor commit");
+            assert_eq!(owner.substrate, khive_storage::AttachmentSubstrate::Note);
+            assert_eq!(owner.content_ref.as_str(), content_ref);
+            let fetched = registry
+                .dispatch("blob.get", json!({"content_ref": content_ref}))
+                .await
+                .expect("quarantine original must be retrievable");
+            let original = BASE64
+                .decode(fetched["bytes"].as_str().expect("base64 original bytes"))
+                .expect("valid base64 original bytes");
+            assert_eq!(original, ORIGINAL_BYTES);
+        }
+
+        /// One page of pre-built envelopes, delivered once, from a channel that
+        /// declares a quarantine retention limit.
+        struct EmailBatchChannel {
+            envelopes: Mutex<Vec<ChannelEnvelope>>,
+            limit: Option<usize>,
+        }
+
+        #[async_trait]
+        impl Channel for EmailBatchChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            fn quarantine_retention_limit(&self) -> Option<usize> {
+                self.limit
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                _since: DateTime<Utc>,
+                _checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                let envelopes = std::mem::take(&mut *self.envelopes.lock().unwrap());
+                let next_checkpoint = (!envelopes.is_empty()).then(|| ChannelCheckpoint {
+                    source: SOURCE.to_string(),
+                    generation: 11,
+                    high_water: Some(7),
+                });
+                Ok(ChannelPollPage {
+                    envelopes,
+                    next_checkpoint,
+                })
+            }
+        }
+
+        /// Published blob objects under `dir`: files named by a 64-hex digest.
+        fn count_files(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir)
+                .expect("read blob directory")
+                .map(|entry| entry.expect("directory entry").path())
+                .map(|path| {
+                    if path.is_dir() {
+                        return count_files(&path);
+                    }
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    usize::from(name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+                })
+                .sum()
+        }
+
+        /// Poll three distinct quarantined emails through the real poll loop
+        /// under `limit`. Returns each stored note's properties in external-id
+        /// order, plus the number of objects the blob store ended up holding.
+        async fn poll_three_quarantined_emails(
+            limit: Option<usize>,
+        ) -> (Vec<serde_json::Value>, usize) {
+            let envelopes = (1..=3)
+                .map(|n| {
+                    let mut envelope = ChannelEnvelope::new(
+                        "email:quarantine",
+                        "email:maintainer@example.com",
+                        format!("untrusted body {n}"),
+                    )
+                    .with_external_id(format!("imap:h:account:11:{n}"))
+                    .with_quarantine_replay(
+                        format!("raw original number {n}").into_bytes(),
+                        "email:maintainer@example.com",
+                    );
+                    envelope
+                        .metadata
+                        .insert("quarantined".to_string(), "true".to_string());
+                    envelope
+                        .metadata
+                        .insert("quarantine_reason".to_string(), "off-allowlist".to_string());
+                    envelope
+                })
+                .collect();
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(EmailBatchChannel {
+                envelopes: Mutex::new(envelopes),
+                limit,
+            }));
+
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "every quarantined message must be recorded and the cursor must advance"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let mut properties: Vec<serde_json::Value> = inbox["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .map(|note| note["properties"].clone())
+                .collect();
+            properties.sort_by_key(|props| props["external_id"].as_str().map(str::to_string));
+            (properties, count_files(blob_dir.path()))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn quarantine_originals_stop_at_the_retention_limit_but_every_record_is_kept() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(2)).await;
+            assert_eq!(notes.len(), 3, "every quarantined message is recorded");
+            for retained in &notes[..2] {
+                assert!(
+                    retained["quarantine_content_ref"].is_string(),
+                    "below the limit the original is retained: {retained}"
+                );
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            let omitted = &notes[2];
+            assert_eq!(omitted["quarantined"], "true");
+            assert_eq!(omitted["external_id"], "imap:h:account:11:3");
+            assert!(
+                omitted.get("quarantine_content_ref").is_none(),
+                "past the limit no original is published: {omitted}"
+            );
+            assert_eq!(omitted["quarantine_original_retained"], "false");
+            assert_eq!(
+                omitted["quarantine_original_not_retained_reason"],
+                "retention-limit"
+            );
+            assert_eq!(
+                stored_objects, 2,
+                "blob.put ran only for the two originals under the limit"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn quarantine_originals_are_all_retained_below_the_retention_limit() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(10)).await;
+            assert_eq!(notes.len(), 3);
+            for retained in &notes {
+                assert!(retained["quarantine_content_ref"].is_string());
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            assert_eq!(stored_objects, 3);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_zero_retention_limit_stores_no_originals() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(0)).await;
+            assert_eq!(notes.len(), 3);
+            for omitted in &notes {
+                assert!(omitted.get("quarantine_content_ref").is_none());
+                assert_eq!(omitted["quarantine_original_retained"], "false");
+            }
+            assert_eq!(stored_objects, 0);
+        }
+
+        /// Quarantine three messages that `comm.ingest` refused, through the
+        /// ingest-failure path, under `limit`. Returns the stored message
+        /// properties sorted by external id and the number of blob objects.
+        async fn quarantine_three_refused_messages(
+            limit: Option<usize>,
+        ) -> (Vec<serde_json::Value>, usize) {
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            for index in 1..=3u32 {
+                let envelope = ChannelEnvelope::new(
+                    "email:maintainer@example.com",
+                    "email:mailbox@example.com",
+                    "refused body",
+                )
+                .with_external_id(format!("imap:h:refused:11:{index}"))
+                .with_quarantine_replay(
+                    format!("original message {index}").into_bytes(),
+                    "email:maintainer@example.com",
+                );
+                quarantine_channel_ingest_failure(
+                    &registry,
+                    "test-ns",
+                    "email",
+                    "email",
+                    Some("actor:test"),
+                    &envelope,
+                    khive_runtime::ChannelIngestFailureClass::Permanent {
+                        reason: "SecretDetected",
+                    },
+                    limit,
+                )
+                .await
+                .expect("a refused message is always recorded");
+            }
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let mut properties: Vec<serde_json::Value> = inbox["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .map(|note| note["properties"].clone())
+                .collect();
+            properties.sort_by_key(|props| props["external_id"].as_str().map(str::to_string));
+            (properties, count_files(blob_dir.path()))
+        }
+
+        #[tokio::test]
+        async fn refused_message_originals_stop_at_the_retention_limit_but_every_record_is_kept() {
+            let (notes, stored_objects) = quarantine_three_refused_messages(Some(2)).await;
+            assert_eq!(notes.len(), 3, "every refused message is recorded");
+            for retained in &notes[..2] {
+                assert!(
+                    retained["quarantine_content_ref"].is_string(),
+                    "below the limit the original is retained: {retained}"
+                );
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            let omitted = &notes[2];
+            assert_eq!(omitted["quarantined"], "true");
+            assert_eq!(omitted["external_id"], "imap:h:refused:11:3");
+            assert!(
+                omitted.get("quarantine_content_ref").is_none(),
+                "past the limit no original is published: {omitted}"
+            );
+            assert_eq!(omitted["quarantine_original_retained"], "false");
+            assert_eq!(
+                omitted["quarantine_original_not_retained_reason"],
+                "retention-limit"
+            );
+            assert_eq!(
+                stored_objects, 2,
+                "blob.put ran only for the two originals under the limit"
+            );
+        }
+
+        #[tokio::test]
+        async fn refused_message_originals_are_unbounded_without_a_limit() {
+            let (notes, stored_objects) = quarantine_three_refused_messages(None).await;
+            assert_eq!(notes.len(), 3);
+            for retained in &notes {
+                assert!(retained["quarantine_content_ref"].is_string());
+            }
+            assert_eq!(stored_objects, 3);
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn content_refusal_stores_exact_replay_and_ingests_body_free_quarantine() {
             const EXTERNAL_ID: &str = "imap:h:11:7";
             const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
@@ -14065,7 +15632,7 @@ backend = "kg-backend"
             .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
 
             let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(ContentRefusalOnceChannel {
+            ch_registry.register(Arc::new(EmailOnceChannel {
                 envelope: Mutex::new(Some(envelope)),
             }));
 
@@ -14234,6 +15801,7 @@ backend = "kg-backend"
                 khive_runtime::ChannelIngestFailureClass::Permanent {
                     reason: "SecretDetected",
                 },
+                None,
             )
             .await
             .expect("duplicate quarantine repairs its missing blob owner");
@@ -14245,6 +15813,139 @@ backend = "kg-backend"
                 .unwrap()
                 .expect("retry restores the GC root");
             assert_eq!(repaired.content_ref.as_str(), content_ref);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn correlated_content_refusal_routes_quarantine_to_original_sender() {
+            const EXTERNAL_ID: &str = "imap:correlated-quarantine:11:7";
+            const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
+
+            let config = RuntimeConfig {
+                db_path: None,
+                actor_id: Some("lambda:original-sender".to_string()),
+                ..RuntimeConfig::no_embeddings()
+            };
+            let runtime = KhiveRuntime::new(config).expect("in-memory sender runtime");
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            builder.with_actor_id(runtime.config().actor_id.clone());
+            let registry = builder.build().expect("registry builds");
+            ensure_channel_quarantine_storage(&registry)
+                .await
+                .expect("quarantine storage preflight");
+
+            let sent = registry
+                .dispatch(
+                    "comm.send",
+                    json!({"to": "email:recipient@example.com", "content": "original outbound"}),
+                )
+                .await
+                .expect("original sender's outbound message");
+            assert_eq!(sent["from"], "lambda:original-sender");
+            let thread_id = sent["thread_id"]
+                .as_str()
+                .expect("outbound thread ID")
+                .to_string();
+            let envelope = ChannelEnvelope::new(
+                "email:recipient@example.com",
+                "email:mailbox@example.com",
+                REFUSED_BODY,
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_correlation(thread_id.clone())
+            .with_quarantine_replay(
+                REFUSED_BODY.as_bytes().to_vec(),
+                "email:recipient@example.com",
+            );
+
+            let refused = registry
+                .dispatch(
+                    "comm.ingest",
+                    json!({
+                        "namespace": "local",
+                        "from": envelope.from.clone(),
+                        "to": envelope.to.clone(),
+                        "content": envelope.content.clone(),
+                        "channel_kind": "email",
+                        "external_id": EXTERNAL_ID,
+                        "correlation_external_id": thread_id.clone(),
+                        "default_inbound_actor": "channel:email",
+                    }),
+                )
+                .await
+                .expect_err("the real content gate must refuse the reply");
+            assert!(matches!(
+                refused,
+                khive_runtime::RuntimeError::SecretDetected(_)
+            ));
+
+            let mut channels = ChannelRegistry::new();
+            channels.register(Arc::new(EmailOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(channels),
+                registry.clone(),
+                "local".to_string(),
+                "channel:email".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor lookup");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a refused correlated message must quarantine and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let listed = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "local", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list messages");
+            let quarantined: Vec<_> = listed["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .filter(|note| note["properties"]["external_id"] == EXTERNAL_ID)
+                .collect();
+            assert_eq!(quarantined.len(), 1, "one quarantine for the refused reply");
+            let props = &quarantined[0]["properties"];
+            assert_eq!(props["from_actor"], "email:quarantine");
+            assert_eq!(props["to_actor"], "lambda:original-sender");
+            assert_ne!(props["to_actor"], "channel:email");
+            assert_eq!(props["thread_id"], sent["thread_id"]);
+            assert_eq!(props["quarantine_reason"], "SecretDetected");
         }
 
         /// A real quarantine note plus GC-rooted original in one isolated
@@ -14312,6 +16013,37 @@ backend = "kg-backend"
                 .authorize(Namespace::parse("retention-ns").unwrap())
                 .unwrap();
             let notes = runtime.notes(&token).unwrap();
+            let annotator = runtime
+                .create_note(
+                    &token,
+                    "observation",
+                    None,
+                    "quarantine cleanup edge fixture",
+                    None,
+                    None,
+                    vec![note_id],
+                )
+                .await
+                .unwrap();
+            let incident_edge_query = || SqlStatement {
+                sql: "SELECT id FROM graph_edges \
+                      WHERE source_id = ?1 AND target_id = ?2 AND relation = 'annotates'"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(annotator.id.to_string()),
+                    SqlValue::Text(note_id.to_string()),
+                ],
+                label: Some("quarantine_retention_incident_edges".into()),
+            };
+            let edges_before = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(incident_edge_query())
+                .await
+                .unwrap();
+            assert_eq!(edges_before.len(), 1);
             let note = notes.get_note(note_id).await.unwrap().unwrap();
             let expires_at = note
                 .expires_at
@@ -14358,6 +16090,15 @@ backend = "kg-backend"
                 .expect("expired cleanup");
             assert_eq!(after["deleted"], 1);
             assert!(notes.get_note(note_id).await.unwrap().is_none());
+            let edges_after = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(incident_edge_query())
+                .await
+                .unwrap();
+            assert!(edges_after.is_empty());
             assert!(runtime
                 .attachments()
                 .unwrap()

@@ -2840,6 +2840,145 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn hot_path_guard_g1_recall_batches_served_targets_into_one_writer_acquisition() {
+        use khive_runtime::audit_batch::AuditBatchConfig;
+
+        async fn await_tracked_background_idle() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while khive_runtime::background_task_count() != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("tracked recall and audit tasks must drain");
+        }
+
+        const QUERY: &str = "violet orchard writer acquisition witness";
+        let rt = build_full_rt_with_brain();
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for _ in 0..8 {
+            rt.create_note(&token, "memory", None, QUERY, Some(0.8), None, vec![])
+                .await
+                .expect("seed a distinct matching memory");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        builder
+            .with_runtime_event_store(&rt)
+            .expect("use the runtime's real audit batch");
+        // One audit row per generation keeps the miss/hit fixed-cost control stable.
+        builder.with_audit_batch_config(AuditBatchConfig {
+            max_rows_per_generation: std::num::NonZeroUsize::new(1).unwrap(),
+            ..AuditBatchConfig::default()
+        });
+        let registry = builder.build().expect("registry");
+        assert!(registry.audit_batch_handle().is_some());
+        assert!(
+            rt.backend()
+                .pool()
+                .writer_task_handle()
+                .expect("writer task lookup")
+                .is_some(),
+            "this guard requires the file-backed writer task"
+        );
+
+        await_tracked_background_idle().await;
+        let warm = registry
+            .dispatch("memory.recall", json!({"query": QUERY, "limit": 8}))
+            .await
+            .expect("warm recall");
+        assert_eq!(warm.as_array().expect("warm hits").len(), 8);
+        await_tracked_background_idle().await;
+
+        let before = rt
+            .db_diagnostics()
+            .await
+            .expect("before diagnostics")
+            .writer_contention
+            .writer_task_acquisitions;
+        let miss = registry
+            .dispatch(
+                "memory.recall",
+                json!({"query": "unseeded hazelnut zephyr", "limit": 8}),
+            )
+            .await
+            .expect("no-hit fixed-cost control");
+        assert!(miss.as_array().expect("no-hit results").is_empty());
+        await_tracked_background_idle().await;
+        let after_miss = rt
+            .db_diagnostics()
+            .await
+            .expect("control diagnostics")
+            .writer_contention
+            .writer_task_acquisitions;
+
+        let hit = registry
+            .dispatch("memory.recall", json!({"query": QUERY, "limit": 8}))
+            .await
+            .expect("measured recall");
+        assert_eq!(hit.as_array().expect("measured hits").len(), 8);
+        await_tracked_background_idle().await;
+        let after_hit = rt
+            .db_diagnostics()
+            .await
+            .expect("after diagnostics")
+            .writer_contention
+            .writer_task_acquisitions;
+
+        let event_page = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![khive_types::EventKind::RecallExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("recall telemetry");
+        assert_eq!(event_page.items.len(), 3, "each recall emitted telemetry");
+        let mut reader = rt.sql().reader().await.expect("serve ledger reader");
+        let ledger_row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT COUNT(*) AS count FROM brain_serve_ledger WHERE query_raw = ?1".into(),
+                params: vec![khive_storage::types::SqlValue::Text(QUERY.into())],
+                label: None,
+            })
+            .await
+            .expect("serve ledger query")
+            .expect("count row");
+        assert!(
+            matches!(
+                ledger_row.get("count"),
+                Some(khive_storage::types::SqlValue::Integer(16))
+            ),
+            "warm and measured recalls each persisted eight served targets: {ledger_row:?}"
+        );
+
+        let miss_acquisitions = after_miss - before;
+        let hit_acquisitions = after_hit - after_miss;
+        assert_eq!(
+            hit_acquisitions,
+            miss_acquisitions + 1,
+            "eight served targets may add only one writer-task acquisition beyond the fixed audit and telemetry work"
+        );
+        drop(reader);
+        registry
+            .shutdown_audit_batch()
+            .await
+            .expect("audit batch drains before fixture teardown");
+    }
+
     // `#[serial(background_tasks)]`: see the note on
     // `recall_with_dollar_sign_query_does_not_error` above — this test
     // directly exercises the same `track_background_task`-driven ledger

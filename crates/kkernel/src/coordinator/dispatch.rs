@@ -588,6 +588,8 @@ impl SubstrateCoordinator {
                 &token,
                 source_id,
                 target_id,
+                src_located.kind,
+                tgt_located.kind,
                 relation,
                 weight,
                 metadata,
@@ -665,6 +667,13 @@ impl SubstrateCoordinator {
         let props_filter_owned = request.properties().cloned();
         let tags_owned = request.tags().to_vec();
         let kind_filter_owned = request.kind_filter().map(str::to_string);
+        let requested_kind = kind_filter_owned.clone().unwrap_or_else(|| {
+            if search_notes {
+                "note".to_string()
+            } else {
+                "entity".to_string()
+            }
+        });
         let entity_type_owned = request.entity_type().map(str::to_string);
         let include_superseded = request.include_superseded();
 
@@ -725,6 +734,10 @@ impl SubstrateCoordinator {
                         std::future::pending::<()>().await;
                         unreachable!("a pending future never resolves");
                     }
+                    runtime
+                        .backend()
+                        .pool_arc()
+                        .record_search_dispatch(backend_id.as_str(), &requested_kind);
                     runtime
                         .search_notes_outcome_with_text_mode(
                             &token,
@@ -799,6 +812,10 @@ impl SubstrateCoordinator {
                         std::future::pending::<()>().await;
                         unreachable!("a pending future never resolves");
                     }
+                    runtime
+                        .backend()
+                        .pool_arc()
+                        .record_search_dispatch(backend_id.as_str(), &requested_kind);
                     runtime
                         .hybrid_search_outcome_with_text_mode(
                             &token,
@@ -897,6 +914,7 @@ impl SubstrateCoordinator {
             let ns = ns.clone();
             let extra_visible_task = extra_visible_owned.clone();
             let kf = kind_filter_owned.clone();
+            let requested_kind = requested_kind.clone();
             let et = entity_type_owned.clone();
             let pf = props_filter_owned.clone();
             let tg = tags_owned.clone();
@@ -970,6 +988,10 @@ impl SubstrateCoordinator {
                         return (backend_id, Err(e), None, None);
                     }
                 };
+                runtime
+                    .backend()
+                    .pool_arc()
+                    .record_search_dispatch(backend_id.as_str(), &requested_kind);
                 if search_notes {
                     let result = runtime
                         .search_notes_outcome_with_text_mode(

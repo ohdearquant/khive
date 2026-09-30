@@ -87,12 +87,16 @@ fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
 
 /// Validates the recurrence against the one parser the executor advances
 /// with (`crate::repeat`). Accepting a recurrence that the drain cannot
-/// compute would silently consume it as a one-shot, so anything the parser
-/// refuses is rejected at this write boundary.
-fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
-    crate::repeat::parse_repeat(repeat)
-        .map(|_| ())
-        .map_err(RuntimeError::InvalidInput)
+/// compute would silently consume it as a one-shot, so a parsed expression
+/// must also have a representable occurrence after this row's first trigger.
+fn validate_repeat(repeat: &str, at: DateTime<Utc>) -> Result<(), RuntimeError> {
+    let parsed = crate::repeat::parse_repeat(repeat).map_err(RuntimeError::InvalidInput)?;
+    if parsed.next_after(at).is_none() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "invalid repeat expression {repeat:?}: no representable occurrence after at {at}"
+        )));
+    }
+    Ok(())
 }
 
 fn store_monthly_anchor(properties: &mut Value, repeat: Option<&str>, trigger_at: &str) {
@@ -717,10 +721,10 @@ pub(crate) async fn handle_remind(
     // submitted wall time and offset are round-tripped faithfully.
     // The UTC instant is used only for comparison/ordering.
     let trigger_at_original = p.at.trim().to_string();
-    let _trigger_utc = validate_at("remind", &trigger_at_original)?;
+    let trigger_utc = validate_at("remind", &trigger_at_original)?;
 
     if let Some(ref r) = p.repeat {
-        validate_repeat(r)?;
+        validate_repeat(r, trigger_utc)?;
     }
 
     let mut properties = json!({
@@ -792,10 +796,10 @@ pub(crate) async fn handle_schedule(
     // submitted wall time and offset are round-tripped faithfully.
     // The UTC instant is used only for comparison/ordering.
     let trigger_at_original = p.at.trim().to_string();
-    let _trigger_utc = validate_at("schedule", &trigger_at_original)?;
+    let trigger_utc = validate_at("schedule", &trigger_at_original)?;
 
     if let Some(ref r) = p.repeat {
-        validate_repeat(r)?;
+        validate_repeat(r, trigger_utc)?;
     }
 
     let mut properties = json!({

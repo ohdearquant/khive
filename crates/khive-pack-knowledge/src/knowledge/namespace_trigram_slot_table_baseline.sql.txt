@@ -1,0 +1,89 @@
+-- Design baseline: assign each knowledge namespace one exact trigram posting key.
+-- Three Private Use Area codepoints are unchanged by FTS5's case fold and
+-- tokenize as exactly one trigram. The persistent, unique slot map gives
+-- disjoint generated namespace-key matches; unlike a hex phrase, no shared leading
+-- trigram makes ordinary foreign namespaces part of the iterator's work.
+-- A slot is never reused. Exhausting the 6400^3 - 1 supported slots fails the
+-- atom write transaction instead of silently sharing a posting key.
+
+DROP TRIGGER IF EXISTS fts_knowledge_ai;
+DROP TRIGGER IF EXISTS fts_knowledge_ad;
+DROP TRIGGER IF EXISTS fts_knowledge_au;
+DROP TABLE IF EXISTS fts_knowledge;
+DROP VIEW IF EXISTS knowledge_atoms_fts_content;
+
+CREATE TABLE knowledge_fts_namespace_keys (
+    slot INTEGER PRIMARY KEY AUTOINCREMENT CHECK(slot BETWEEN 1 AND 262143999999),
+    namespace_value TEXT NOT NULL UNIQUE
+);
+
+INSERT INTO knowledge_fts_namespace_keys(namespace_value)
+SELECT DISTINCT namespace FROM knowledge_atoms ORDER BY namespace;
+
+CREATE VIEW knowledge_fts_namespace_tokens AS
+SELECT namespace_value AS namespace,
+       char(57344 + slot % 6400,
+            57344 + (slot / 6400) % 6400,
+            57344 + (slot / 40960000) % 6400) AS namespace_key
+FROM knowledge_fts_namespace_keys;
+
+CREATE VIEW knowledge_atoms_fts_content AS
+SELECT a.rowid, a.id, a.namespace, k.namespace_key,
+       a.slug, a.name, a.content
+FROM knowledge_atoms AS a
+JOIN knowledge_fts_namespace_tokens AS k ON k.namespace = a.namespace
+WHERE a.deleted_at IS NULL;
+
+CREATE VIRTUAL TABLE fts_knowledge USING fts5(
+    id            UNINDEXED,
+    namespace     UNINDEXED,
+    namespace_key,
+    slug,
+    name,
+    content,
+    content=knowledge_atoms_fts_content,
+    content_rowid=rowid,
+    tokenize='trigram case_sensitive 0'
+);
+
+CREATE TRIGGER fts_knowledge_ai
+AFTER INSERT ON knowledge_atoms WHEN new.deleted_at IS NULL BEGIN
+    INSERT INTO knowledge_fts_namespace_keys(namespace_value)
+        SELECT new.namespace WHERE NOT EXISTS (
+            SELECT 1 FROM knowledge_fts_namespace_keys WHERE namespace_value = new.namespace
+        ) ON CONFLICT(namespace_value) DO NOTHING;
+    INSERT INTO fts_knowledge(rowid, id, namespace, namespace_key, slug, name, content)
+        SELECT new.rowid, new.id, new.namespace, k.namespace_key,
+               new.slug, new.name, new.content
+        FROM knowledge_fts_namespace_tokens AS k WHERE k.namespace = new.namespace;
+END;
+
+CREATE TRIGGER fts_knowledge_ad
+AFTER DELETE ON knowledge_atoms WHEN old.deleted_at IS NULL BEGIN
+    INSERT INTO fts_knowledge(fts_knowledge, rowid, id, namespace, namespace_key,
+                              slug, name, content)
+        SELECT 'delete', old.rowid, old.id, old.namespace, k.namespace_key,
+               old.slug, old.name, old.content
+        FROM knowledge_fts_namespace_tokens AS k WHERE k.namespace = old.namespace;
+END;
+
+CREATE TRIGGER fts_knowledge_au
+AFTER UPDATE OF id, namespace, slug, name, content, deleted_at ON knowledge_atoms BEGIN
+    INSERT INTO fts_knowledge(fts_knowledge, rowid, id, namespace, namespace_key,
+                              slug, name, content)
+        SELECT 'delete', old.rowid, old.id, old.namespace, k.namespace_key,
+               old.slug, old.name, old.content
+        FROM knowledge_fts_namespace_tokens AS k
+        WHERE k.namespace = old.namespace AND old.deleted_at IS NULL;
+    INSERT INTO knowledge_fts_namespace_keys(namespace_value)
+        SELECT new.namespace WHERE new.deleted_at IS NULL AND NOT EXISTS (
+            SELECT 1 FROM knowledge_fts_namespace_keys WHERE namespace_value = new.namespace
+        ) ON CONFLICT(namespace_value) DO NOTHING;
+    INSERT INTO fts_knowledge(rowid, id, namespace, namespace_key, slug, name, content)
+        SELECT new.rowid, new.id, new.namespace, k.namespace_key,
+               new.slug, new.name, new.content
+        FROM knowledge_fts_namespace_tokens AS k
+        WHERE k.namespace = new.namespace AND new.deleted_at IS NULL;
+END;
+
+INSERT INTO fts_knowledge(fts_knowledge) VALUES ('rebuild');

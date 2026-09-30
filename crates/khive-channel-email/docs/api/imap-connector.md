@@ -30,6 +30,26 @@ Every UID that passed the size preflight must appear exactly once in `fetched_ra
   detect a body that grew after the size check. The first UID that would exceed the page
   budget is left for the next poll, and the checkpoint advances only through
   the processed prefix. Missing or duplicate size responses reject the page.
+- `KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES` is accepted up to 64 MiB, and a larger value refuses
+  at startup. A quarantined message's original bytes are stored as one blob before the
+  cursor advances past it, and a blob object holds at most 64 MiB, so a larger ceiling
+  would admit a message whose quarantine could never be stored.
+- Quarantine storage is bounded in aggregate as well as per message.
+  `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED` (default 256) caps how many live quarantine
+  records in the ingest namespace may hold a stored original; the poller counts them
+  before each `blob.put`, both for a message the adapter quarantined and for one it
+  quarantines because `comm.ingest` refused it (the `quarantined_count` that `comm.health` reports, so the
+  cap survives restarts and frees up as expired records are cleaned up). Once the cap
+  is reached, a quarantined message is still ingested and the cursor still advances,
+  but its bytes are not stored: the record has no `quarantine_content_ref` and carries
+  `quarantine_original_retained: "false"` with `quarantine_original_not_retained_reason:
+  "retention-limit"`. `0` stores no originals. If the count cannot be read the page is
+  held and retried; an original is never dropped silently. Records stored without an
+  original count toward the cap too, so it is conservative.
+- Inbound polling also needs the blob pack's runtime to accept writes. When comm is
+  writable but blob is read-only, the daemon does not start the poll and logs an error
+  naming the blob pack runtime, rather than failing every `blob.put` and retrying the
+  same message forever.
 - A fetch response for a UID **outside** `selected_uids` is unrequested (e.g. a stray server
   response) and is ignored with a `warn!`; it never affects page validity or the candidate
   high-water mark.

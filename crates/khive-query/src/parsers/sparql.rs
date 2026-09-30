@@ -796,6 +796,38 @@ mod tests {
     }
 
     #[test]
+    fn repeated_numeric_property_values_remain_conjunctive() {
+        let query = parse("SELECT ?a WHERE { ?a :score 1 . ?a :score 2 . ?a :extends ?b . }")
+            .expect("distinct numeric triples are valid conjuncts");
+        assert!(matches!(&query.where_clause, WhereExpr::And(_, _)));
+        let conditions: Vec<_> = query.where_clause.conditions().collect();
+        assert_eq!(
+            conditions.len(),
+            2,
+            "neither numeric triple may be discarded"
+        );
+        for (condition, value) in conditions.into_iter().zip([1.0, 2.0]) {
+            assert_eq!(condition.variable, "a");
+            assert_eq!(
+                condition.property,
+                PropertyRef::JsonPath(vec!["score".into()])
+            );
+            assert_eq!(condition.op, CompareOp::Eq);
+            assert_eq!(condition.value, ConditionValue::Number(value));
+        }
+        let compiled = crate::compile(&query, &crate::CompileOptions::default())
+            .expect("both conjuncts compile");
+        assert_eq!(
+            compiled
+                .sql
+                .matches("json_extract(n0.properties, '$.score') = ?")
+                .count(),
+            2,
+            "SQL must test the scalar JSON property against both values"
+        );
+    }
+
+    #[test]
     fn disconnected_triples_rejected() {
         let err = parse("SELECT ?a ?d WHERE { ?a :extends ?b . ?c :implements ?d . }").unwrap_err();
         assert!(

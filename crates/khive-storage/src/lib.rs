@@ -38,7 +38,7 @@ pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
 };
 pub use graph::GraphStore;
-pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
+pub use note::{FilterOp, Note, NoteFilter, NoteStore, NoteVisibility, SortDir};
 pub use request_context::{
     await_request_read_phase, capture_request_read_context, effective_request_read_deadline,
     ensure_request_read_active, inherit_request_read_cancellation, inherit_request_read_context,

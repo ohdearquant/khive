@@ -508,11 +508,11 @@ mod tests {
         );
     }
 
+    /// A repository whose HEAD carries a signature header and whose local
+    /// configuration points signature display and verification at a helper
+    /// that records its invocation. Returns the helper's marker path.
     #[cfg(unix)]
-    #[test]
-    fn signed_head_does_not_run_repo_configured_verifier() {
-        let fixture = tempfile::tempdir().unwrap();
-        let repo = fixture.path();
+    fn signed_head_with_marker_verifier(repo: &Path) -> PathBuf {
         let git = |args: &[&str]| {
             let output = Command::new("git")
                 .arg("-C")
@@ -573,6 +573,15 @@ mod tests {
         git(&["config", "log.showSignature", "true"]);
         git(&["config", "gpg.format", "openpgp"]);
         git(&["config", "gpg.program", verifier.to_str().unwrap()]);
+        marker
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signed_head_does_not_run_repo_configured_verifier() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        let marker = signed_head_with_marker_verifier(repo);
 
         let _ = Command::new("git")
             .arg("-C")
@@ -587,6 +596,33 @@ mod tests {
         fs::remove_file(&marker).unwrap();
 
         assert!(!head_committed_at(repo).unwrap().is_empty());
+        assert!(
+            !marker.exists(),
+            "showcase Git read must not run the verifier"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_signature_request_does_not_run_repo_configured_verifier() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path();
+        let marker = signed_head_with_marker_verifier(repo);
+        let args = ["log", "-1", "--show-signature", "--format=%cI", "HEAD"];
+
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            marker.exists(),
+            "fixture must execute the unguarded verifier"
+        );
+        fs::remove_file(&marker).unwrap();
+
+        assert!(!git_text(repo, &args).unwrap().is_empty());
         assert!(
             !marker.exists(),
             "showcase Git read must not run the verifier"

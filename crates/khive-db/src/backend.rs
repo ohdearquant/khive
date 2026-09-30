@@ -230,7 +230,9 @@ impl StorageBackend {
     /// whose mode is read-only is opened with the same locked-down pool
     /// configuration as [`Self::sqlite_read_only`]. The writable pool provides
     /// 1 writer + N readers in WAL mode for concurrent access.
-    /// No schema is applied — call `apply_schema()` for each service.
+    /// No service schema is applied — call `apply_schema()` for each service.
+    /// The pool may create its internal `_khive_database_identity` singleton
+    /// table on a writable open before service migrations run.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         Self::sqlite_with_pool_config(path, PoolConfig::default(), None)
     }
@@ -239,6 +241,25 @@ impl StorageBackend {
     #[cfg(any(test, feature = "test-support"))]
     pub fn sqlite_for_test(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         Self::sqlite_with_pool_config(path, PoolConfig::for_test(), None)
+    }
+
+    /// Open a private test database with an explicit journal mode and busy wait.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sqlite_for_test_with_journal_mode(
+        path: impl AsRef<Path>,
+        wal_mode: bool,
+        busy_timeout: std::time::Duration,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(
+            path,
+            PoolConfig {
+                wal_mode,
+                busy_timeout,
+                write_queue_enabled: Some(true),
+                ..PoolConfig::for_test()
+            },
+            None,
+        )
     }
 
     /// Open SQLite with a reader count selected before any connections are opened.

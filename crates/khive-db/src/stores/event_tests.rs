@@ -28,6 +28,16 @@ fn make_event(namespace: &str) -> Event {
     .with_payload(json!({ "result_kind": "note" }))
 }
 
+async fn observations_for(store: &SqlEventStore, event_id: Uuid) -> Vec<EventObservation> {
+    let pool = Arc::clone(&store.pool);
+    tokio::task::spawn_blocking(move || {
+        let guard = pool.reader().unwrap();
+        fetch_event_observations(guard.conn(), event_id).unwrap()
+    })
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
 async fn operation_attribution_round_trips_and_changes_idempotent_identity() {
     use khive_storage::operation_context::scope_operation_attribution;
@@ -84,6 +94,226 @@ async fn operation_attribution_rejects_unpaired_values_before_append() {
         assert!(store.append_event(event).await.is_err());
     }
     assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn profile_state_version_refuses_overflow_before_any_event_is_persisted() {
+    let store = setup_memory_store();
+    let candidate = Uuid::new_v4();
+    let mut valid = make_event("default").with_profile_state_version(i64::MAX as u64);
+    valid.payload = json!({
+        "result_kind": "note",
+        "candidates": [candidate.to_string()],
+    });
+    let overflow = make_event("default").with_profile_state_version(i64::MAX as u64 + 1);
+
+    assert_eq!(event_insert_statements(&valid).unwrap().len(), 2);
+    assert!(event_insert_statements(&overflow).is_err());
+    assert!(store.preflight_event(&overflow).is_err());
+    assert!(store.append_event(overflow.clone()).await.is_err());
+    assert!(store
+        .append_events(vec![valid.clone(), overflow.clone()])
+        .await
+        .is_err());
+    assert!(observations_for(&store, valid.id).await.is_empty());
+    assert!(store
+        .append_events_idempotent(vec![valid.clone(), overflow.clone()])
+        .await
+        .is_err());
+    assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 0);
+    assert!(observations_for(&store, valid.id).await.is_empty());
+
+    store.append_event(valid.clone()).await.unwrap();
+    assert_eq!(observations_for(&store, valid.id).await.len(), 1);
+    assert_eq!(
+        store.get_event(valid.id).await.unwrap(),
+        Some(valid.clone())
+    );
+    let mut invalid_retry = valid;
+    invalid_retry.profile_state_version = overflow.profile_state_version;
+    assert!(store
+        .append_events_idempotent(vec![invalid_retry])
+        .await
+        .is_err());
+    assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 1);
+    assert_eq!(
+        store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0
+                }
+            )
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn profile_state_version_builder_binds_input_value() {
+    let event = make_event("default").with_profile_state_version(41);
+    let statements = event_insert_statements(&event).unwrap();
+    assert_eq!(statements.len(), 1);
+    match statements[0].params.get(9) {
+        Some(SqlValue::Integer(value)) => assert_eq!(*value, 41),
+        other => panic!("expected bound profile_state_version 41, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn prepared_event_insert_stores_and_reads_i64_max_profile_state_version() {
+    let store = setup_memory_store();
+    let event = make_event("default").with_profile_state_version(i64::MAX as u64);
+    let statements = event_insert_statements(&event).expect("boundary value is representable");
+
+    {
+        let writer = store.pool.writer().unwrap();
+        let conn = writer.conn();
+        for statement in statements {
+            let mut prepared = conn.prepare(&statement.sql).unwrap();
+            crate::sql_bridge::bind_params(&mut prepared, &statement.params).unwrap();
+            assert_eq!(prepared.raw_execute().unwrap(), 1);
+        }
+        let stored: i64 = conn
+            .query_row(
+                "SELECT profile_state_version FROM events WHERE id = ?1",
+                [event.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, i64::MAX);
+    }
+
+    assert_eq!(store.get_event(event.id).await.unwrap(), Some(event));
+}
+
+#[tokio::test]
+async fn batch_failure_rolls_back_event_and_observation_rows() {
+    let store = setup_memory_store();
+    let candidate = Uuid::new_v4();
+    let mut first = make_event("default");
+    first.payload = json!({
+        "result_kind": "note",
+        "candidates": [candidate.to_string()],
+    });
+    assert_eq!(decode_event_observations(&first).unwrap().len(), 1);
+
+    let mut rejected = make_event("default");
+    rejected.payload = json!({"result_kind": "edge"});
+    assert!(store
+        .append_events(vec![first.clone(), rejected.clone()])
+        .await
+        .is_err());
+    assert_eq!(store.count_events(EventFilter::default()).await.unwrap(), 0);
+    assert!(observations_for(&store, first.id).await.is_empty());
+    assert!(observations_for(&store, rejected.id).await.is_empty());
+}
+
+#[tokio::test]
+async fn profile_state_version_audit_finds_preexisting_unreadable_rows() {
+    let store = setup_memory_store();
+    let valid_null = make_event("default");
+    let valid_max = make_event("default").with_profile_state_version(i64::MAX as u64);
+    let negative = make_event("default");
+    let text = make_event("default");
+    let real = make_event("default");
+    for event in [
+        valid_null.clone(),
+        valid_max.clone(),
+        negative.clone(),
+        text.clone(),
+        real.clone(),
+    ] {
+        store.append_event(event).await.unwrap();
+    }
+
+    // Simulate rows written before the profile-version guard existed.
+    {
+        let writer = store.pool.writer().unwrap();
+        let conn = writer.conn();
+        for (id, value) in [
+            (negative.id, rusqlite::types::Value::Integer(-1)),
+            (
+                text.id,
+                rusqlite::types::Value::Text("not-an-integer".into()),
+            ),
+            (real.id, rusqlite::types::Value::Real(1.5)),
+        ] {
+            assert_eq!(
+                conn.execute(
+                    "UPDATE events SET profile_state_version = ?1 WHERE id = ?2",
+                    rusqlite::params![value, id.to_string()],
+                )
+                .unwrap(),
+                1,
+            );
+        }
+    }
+
+    let rows: Vec<(String, String, String, String)> = {
+        let reader = store.pool.reader().unwrap();
+        let mut statement = reader
+            .conn()
+            .prepare(include_str!(
+                "../../docs/api/event-profile-state-version-audit.sql"
+            ))
+            .unwrap();
+        let found = statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        found
+    };
+    let mut expected = vec![
+        (
+            negative.id.to_string(),
+            "default".to_string(),
+            "integer".to_string(),
+            "-1".to_string(),
+        ),
+        (
+            text.id.to_string(),
+            "default".to_string(),
+            "text".to_string(),
+            "'not-an-integer'".to_string(),
+        ),
+        (
+            real.id.to_string(),
+            "default".to_string(),
+            "real".to_string(),
+            "1.5".to_string(),
+        ),
+    ];
+    expected.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(rows, expected);
+    assert_eq!(
+        store.get_event(valid_null.id).await.unwrap(),
+        Some(valid_null)
+    );
+    assert_eq!(
+        store.get_event(valid_max.id).await.unwrap(),
+        Some(valid_max)
+    );
+    for id in [negative.id, text.id, real.id] {
+        assert!(store.get_event(id).await.is_err());
+    }
+    assert!(store
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -267,21 +497,81 @@ async fn search_executed_rejects_unknown_result_kind() {
 }
 
 #[tokio::test]
-async fn search_executed_rejects_absent_result_kind() {
+async fn search_executed_absent_result_kind_projects_historical_note_rows() {
     let store = setup_memory_store();
     let mut event = make_event("default");
+    let note_id = Uuid::new_v4();
     event.payload = json!({
-        "candidates": [Uuid::new_v4().to_string()],
-        "selected": []
+        "candidates": [note_id.to_string()],
+        "selected": [note_id.to_string()]
     });
     let event_id = event.id;
-
-    let result = store.append_event(event).await;
-    assert!(result.is_err(), "absent result_kind must be rejected");
-    assert!(
-        store.get_event(event_id).await.unwrap().is_none(),
-        "invalid event and projection must roll back atomically"
+    store.preflight_event(&event).unwrap();
+    event_insert_statements(&event).unwrap();
+    store.append_event(event.clone()).await.unwrap();
+    let event_id_str = event_id.to_string();
+    let reader = store.pool.reader().unwrap();
+    let mut stmt = reader
+        .conn()
+        .prepare(
+            "SELECT entity_id, referent_kind, role FROM event_observations \
+             WHERE event_id = ?1 ORDER BY role, position",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([&event_id_str], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (note_id.to_string(), "note".into(), "candidate".into()),
+            (note_id.to_string(), "note".into(), "selected".into()),
+        ]
     );
+    drop(stmt);
+    drop(reader);
+    let replay = store.append_events_idempotent(vec![event]).await.unwrap();
+    assert_eq!(
+        replay.rows,
+        vec![EventAppendDisposition::AlreadyPresentIdentical]
+    );
+}
+
+#[tokio::test]
+async fn search_executed_rejects_non_object_payload_root() {
+    let store = setup_memory_store();
+    for payload in [json!("not an object"), json!([]), json!(null)] {
+        let mut event = make_event("default");
+        event.payload = payload;
+        let event_id = event.id;
+
+        assert!(store.preflight_event(&event).is_err());
+        assert!(event_insert_statements(&event).is_err());
+        assert!(store.append_event(event).await.is_err());
+        assert!(store.get_event(event_id).await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn search_executed_rejects_present_non_string_result_kind() {
+    let store = setup_memory_store();
+    for result_kind in [json!(null), json!(0), json!(["note"])] {
+        let mut event = make_event("default");
+        event.payload = json!({"result_kind": result_kind, "candidates": [], "selected": []});
+        let event_id = event.id;
+        assert!(store.preflight_event(&event).is_err());
+        assert!(event_insert_statements(&event).is_err());
+        assert!(store.append_event(event).await.is_err());
+        assert!(store.get_event(event_id).await.unwrap().is_none());
+    }
 }
 
 async fn selected_uuids_for(store: &SqlEventStore, event_id: Uuid) -> Vec<String> {
@@ -786,9 +1076,27 @@ async fn link_events_project_edge_referents_and_observed_matches_any_role() {
         "id": edge_id,
         "source_id": source_id,
         "target_id": target_id,
+        "source_kind": "entity",
+        "target_kind": "entity",
         "mutation": "created"
     }));
     let event_id = event.id;
+    let mut legacy = event.clone();
+    legacy
+        .payload
+        .as_object_mut()
+        .unwrap()
+        .remove("source_kind");
+    legacy
+        .payload
+        .as_object_mut()
+        .unwrap()
+        .remove("target_kind");
+    assert_eq!(
+        decode_link_observations(&event).unwrap(),
+        decode_link_observations(&legacy).unwrap(),
+        "explicit entity endpoints must preserve today's observation bytes"
+    );
     store.append_event(event).await.unwrap();
 
     for observed in [source_id, target_id, edge_id] {
@@ -809,29 +1117,126 @@ async fn link_events_project_edge_referents_and_observed_matches_any_role() {
         assert_eq!(page.items[0].id, event_id);
     }
 
-    let pool = Arc::clone(&store.pool);
-    let edge_id = edge_id.to_string();
-    let row = tokio::task::spawn_blocking(move || {
-        let guard = pool.reader().unwrap();
-        guard
-            .conn()
-            .query_row(
-                "SELECT referent_kind, role, position FROM event_observations \
-                 WHERE event_id = ?1 AND entity_id = ?2",
-                rusqlite::params![event_id.to_string(), edge_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                    ))
-                },
-            )
-            .unwrap()
-    })
-    .await
-    .unwrap();
-    assert_eq!(row, ("edge".to_string(), "target".to_string(), 2));
+    let rows = observations_for(&store, event_id).await;
+    assert_eq!(rows.len(), 3);
+    for (position, id, kind) in [
+        (0, source_id, ReferentKind::Entity),
+        (1, target_id, ReferentKind::Entity),
+        (2, edge_id, ReferentKind::Edge),
+    ] {
+        assert_eq!(rows[position].entity_id, id);
+        assert_eq!(rows[position].referent_kind, kind);
+        assert_eq!(rows[position].role, ObservationRole::Target);
+        assert_eq!(rows[position].position, position as u32);
+    }
+}
+
+#[tokio::test]
+async fn link_note_endpoints_project_note_referents() {
+    let store = setup_memory_store();
+    let source_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+    let edge_id = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "link",
+        EventKind::LinkCreated,
+        SubstrateKind::Entity,
+        "agent:test",
+    )
+    .with_target(edge_id)
+    .with_payload(json!({
+        "id": edge_id,
+        "source_id": source_id,
+        "target_id": target_id,
+        "source_kind": "note",
+        "target_kind": "note",
+        "relation": "supports"
+    }));
+    let event_id = event.id;
+    store.append_event(event).await.unwrap();
+
+    let rows = observations_for(&store, event_id).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].entity_id, source_id);
+    assert_eq!(rows[0].referent_kind, ReferentKind::Note);
+    assert_eq!(rows[1].entity_id, target_id);
+    assert_eq!(rows[1].referent_kind, ReferentKind::Note);
+    assert_eq!(rows[2].entity_id, edge_id);
+    assert_eq!(rows[2].referent_kind, ReferentKind::Edge);
+}
+
+#[tokio::test]
+async fn legacy_link_payload_replays_with_entity_endpoint_fallback() {
+    let store = setup_memory_store();
+    let source_id = Uuid::new_v4();
+    let target_id = Uuid::new_v4();
+    let edge_id = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "link",
+        EventKind::LinkCreated,
+        SubstrateKind::Entity,
+        "agent:test",
+    )
+    .with_target(edge_id)
+    .with_payload(json!({
+        "id": edge_id,
+        "source_id": source_id,
+        "target_id": target_id
+    }));
+    let first = store
+        .append_events_idempotent(vec![event.clone()])
+        .await
+        .unwrap();
+    assert_eq!(first.rows, vec![EventAppendDisposition::Inserted]);
+    let rows = observations_for(&store, event.id).await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].referent_kind, ReferentKind::Entity);
+    assert_eq!(rows[1].referent_kind, ReferentKind::Entity);
+    assert_eq!(rows[2].referent_kind, ReferentKind::Edge);
+
+    let retry = store.append_events_idempotent(vec![event]).await.unwrap();
+    assert_eq!(
+        retry.rows,
+        vec![EventAppendDisposition::AlreadyPresentIdentical]
+    );
+}
+
+#[tokio::test]
+async fn link_to_event_projects_edge_without_event_endpoint() {
+    let store = setup_memory_store();
+    let source_id = Uuid::new_v4();
+    let target_event_id = Uuid::new_v4();
+    let edge_id = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "link",
+        EventKind::LinkCreated,
+        SubstrateKind::Entity,
+        "agent:test",
+    )
+    .with_target(edge_id)
+    .with_payload(json!({
+        "id": edge_id,
+        "source_id": source_id,
+        "target_id": target_event_id,
+        "source_kind": "note",
+        "target_kind": "event",
+        "relation": "annotates"
+    }));
+    let event_id = event.id;
+    store.append_event(event).await.unwrap();
+
+    let rows = observations_for(&store, event_id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].entity_id, source_id);
+    assert_eq!(rows[0].referent_kind, ReferentKind::Note);
+    assert_eq!(rows[0].position, 0);
+    assert_eq!(rows[1].entity_id, edge_id);
+    assert_eq!(rows[1].referent_kind, ReferentKind::Edge);
+    assert_eq!(rows[1].position, 2);
+    assert!(rows.iter().all(|row| row.entity_id != target_event_id));
 }
 
 #[tokio::test]

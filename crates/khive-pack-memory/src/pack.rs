@@ -541,7 +541,7 @@ impl PackRuntime for MemoryPack {
     /// Generic KG mutation paths preserve the stale graph and schedule replacement. See
     /// `crates/khive-pack-memory/docs/api/pack-integration.md`.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {
-        let runtime = self.runtime.clone();
+        let runtime = self.runtime.detached_for_note_search_ann_provider();
         let ann = self.ann.clone();
         let hook: khive_runtime::NoteMutationHookFn = std::sync::Arc::new(move |kind, _id| {
             let runtime = runtime.clone();
@@ -561,6 +561,21 @@ impl PackRuntime for MemoryPack {
             })
         });
         self.runtime.install_note_mutation_hook(hook);
+    }
+
+    fn register_note_search_ann_provider(&self, runtime: &KhiveRuntime) {
+        if self.runtime.backend_id() != runtime.backend_id()
+            || !std::ptr::eq(self.runtime.backend(), runtime.backend())
+        {
+            return;
+        }
+        crate::ann::enable_note_search_consumer(&self.ann);
+        runtime.install_note_search_ann_provider(Arc::new(
+            crate::note_search::MemoryNoteSearchAnnProvider::new(
+                self.runtime.clone(),
+                self.ann.clone(),
+            ),
+        ));
     }
 
     async fn dispatch(

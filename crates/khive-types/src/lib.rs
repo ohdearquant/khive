@@ -45,7 +45,7 @@ pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
     ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload, ProposalWithdrawnPayload,
-    RerankExecutedPayload,
+    RerankExecutedPayload, ToolCheckDecidedPayload,
 };
 #[cfg(feature = "serde")]
 pub use event::{
@@ -63,9 +63,10 @@ pub use note::{Note, NoteStatus};
 #[allow(deprecated)]
 pub use pack::VerbDef;
 pub use pack::{
-    EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteKindSpec, NoteLifecycleSpec,
-    Pack, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
-    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
+    EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteEmbeddingPolicy,
+    NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec, Pack, PackColumnAddition,
+    PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};

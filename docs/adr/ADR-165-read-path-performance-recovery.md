@@ -236,6 +236,20 @@ Contract (both routes):
   distinctly named consumer of the note-vector graphs. It does not mean the memory
   consumer's contract changes, and it does not extend the graphs' corpus.
 
+### Slice 3 implementation note (2026-09-28)
+
+The note-substrate vector leg uses the memory pack's warm global note-content
+graph through a runtime-owned provider installed at pack boot on matching
+backends. Its independent ADR-118 consumer is `note_search`; an older graph
+cannot serve it until a full checkpoint activates its durable watermark.
+Warm searches always merge the exact fresh tail, including when the separate
+memory/knowledge fresh-tail policy is disabled, then overfetch and filter to
+live notes in the primary namespace. A model without an eligible installed
+graph uses the exact sqlite-vec route. Entity search remains on its existing
+shared-table path. Process-lifetime `db_diagnostics` counters
+`note_search_ann_route_total` and `note_search_fallback_route_total` expose
+the route selected for each note vector query.
+
 ### Slice 4 — coordinator fan-out filtered by declared backend kinds
 
 The coordinator registry today stores only a backend identifier and runtime — no

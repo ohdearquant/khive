@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### Edge Ontology (18 edge relations — closed set; 16 base incl. `links_to` via ADR-191 + 2 epistemic via ADR-055) (ADR-002)
+### Edge Ontology (19 edge relations — closed set; 17 base incl. `links_to` via ADR-191 and `located_in` via ADR-196 + 2 epistemic via ADR-055) (ADR-002)
 
 - The GTD pack does NOT add new edge relation variants; `depends_on` is already in the base set.
 - The pack additively extends the _endpoint contract_ to allow `depends_on` between two `task`

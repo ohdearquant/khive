@@ -101,6 +101,77 @@ pub(crate) struct AnnBridge {
     drop_probe: Option<Arc<()>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum AnnScoreRoute {
+    Memory,
+    NoteSearch,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FreshTailSearch<'a> {
+    query: &'a [f32],
+    k: usize,
+    route: AnnScoreRoute,
+}
+
+impl<'a> FreshTailSearch<'a> {
+    pub(crate) fn new(query: &'a [f32], k: usize, route: AnnScoreRoute) -> Self {
+        Self { query, k, route }
+    }
+}
+
+impl AnnScoreRoute {
+    fn graph_score(self, squared_l2_distance: f32) -> Result<f64, RuntimeError> {
+        match self {
+            Self::Memory => Ok(f64::from((1.0 - squared_l2_distance / 2.0).max(0.0))),
+            Self::NoteSearch => khive_score::try_cosine_score_with_f32_tolerance(
+                f64::from(squared_l2_distance) / 2.0,
+            )
+            .map(|score| score.to_f64())
+            .map_err(|error| {
+                RuntimeError::Internal(format!("note-search ANN cosine distance: {error}"))
+            }),
+        }
+    }
+
+    fn tail_score(self, query: &[f32], embedding: &[f32]) -> Result<f64, RuntimeError> {
+        let cosine = exact_cosine_unclamped(query, embedding);
+        match self {
+            Self::Memory => Ok(f64::from(cosine.max(0.0))),
+            Self::NoteSearch => {
+                khive_score::try_cosine_score_with_f32_tolerance(1.0 - f64::from(cosine))
+                    .map(|score| score.to_f64())
+                    .map_err(|error| {
+                        RuntimeError::Internal(format!(
+                            "note-search fresh-tail cosine distance: {error}"
+                        ))
+                    })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn note_search_score_carrier_preserves_non_cardinal_fixed_point_bits() {
+    let squared_l2_distance = 0.41_f32;
+    let canonical =
+        khive_score::try_cosine_score_with_f32_tolerance(f64::from(squared_l2_distance) / 2.0)
+            .expect("canonical cosine score");
+    let carried = AnnScoreRoute::NoteSearch
+        .graph_score(squared_l2_distance)
+        .expect("note-search score");
+    assert_eq!(
+        khive_score::DeterministicScore::from_f64(carried),
+        canonical
+    );
+    assert_ne!(
+        khive_score::DeterministicScore::from_f64(f64::from(carried as f32)),
+        canonical,
+        "fixture must detect a lossy f32 candidate-score roundtrip"
+    );
+}
+
 /// Shared model-index cache with single-flight and freshness coordination.
 pub(crate) struct AnnState {
     /// Whether this process may build the memory index from the full corpus and
@@ -111,6 +182,9 @@ pub(crate) struct AnnState {
     /// reindex path sets it unconditionally, because building is what it was
     /// invoked to do.
     pub(crate) builds_corpus_indexes: bool,
+    /// Set when the registered memory pack supplies this graph to note search.
+    /// Direct ANN fixtures without the provider retain the memory-only lifecycle.
+    note_search_consumer_enabled: AtomicBool,
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
     checkpoint_policy: std::sync::RwLock<CheckpointPolicy>,
     checkpoint_timers: std::sync::Mutex<HashSet<AnnKey>>,
@@ -193,6 +267,15 @@ pub(crate) struct AnnState {
 
 pub(crate) type SharedAnn = Arc<AnnState>;
 
+pub(crate) fn enable_note_search_consumer(ann: &SharedAnn) {
+    ann.note_search_consumer_enabled
+        .store(true, Ordering::Release);
+}
+
+fn note_search_consumer_enabled(ann: &SharedAnn) -> bool {
+    ann.note_search_consumer_enabled.load(Ordering::Acquire)
+}
+
 /// Shared ANN state for a process that builds corpus indexes. Test-only here:
 /// production reaches this through `MemoryPack::new_with_index_role`, which
 /// states the role rather than assuming it.
@@ -206,6 +289,7 @@ pub(crate) fn new_shared() -> SharedAnn {
 pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
     Arc::new(AnnState {
         builds_corpus_indexes,
+        note_search_consumer_enabled: AtomicBool::new(false),
         indexes: RwLock::new(HashMap::new()),
         checkpoint_policy: std::sync::RwLock::new(CheckpointPolicy::from_env()),
         checkpoint_timers: std::sync::Mutex::new(HashSet::new()),
@@ -551,24 +635,33 @@ impl AnnBridge {
         self
     }
 
-    pub(crate) fn search(&self, query: &[f32], k: usize) -> Result<Vec<(Uuid, f32)>, RuntimeError> {
+    pub(crate) fn search_with_route(
+        &self,
+        query: &[f32],
+        k: usize,
+        route: AnnScoreRoute,
+    ) -> Result<Vec<(Uuid, f64)>, RuntimeError> {
         let mut q = query.to_vec();
         l2_normalize(&mut q);
         let raw = self
             .index
             .search(&q, k)
             .map_err(|e| RuntimeError::Internal(format!("memory ANN search: {e}")))?;
-        let hits = raw
-            .into_iter()
-            .filter_map(|(idx, dist)| {
-                self.id_map.get(idx as usize).map(|uuid| {
-                    // L2² → cosine for unit vectors: cos(a,b) = 1 - ||a-b||²/2
-                    let cosine = (1.0 - dist / 2.0).max(0.0);
-                    (*uuid, cosine)
-                })
-            })
-            .collect();
+        let mut hits = Vec::with_capacity(raw.len());
+        for (idx, dist) in raw {
+            if let Some(uuid) = self.id_map.get(idx as usize) {
+                // The graph emits normalized-vector L2². For note search,
+                // L2²/2 is cosine distance and uses the same converter as the
+                // exact sqlite-vec route; memory recall retains its prior floor.
+                hits.push((*uuid, route.graph_score(dist)?));
+            }
+        }
         Ok(hits)
+    }
+
+    #[cfg(test)]
+    fn search(&self, query: &[f32], k: usize) -> Result<Vec<(Uuid, f64)>, RuntimeError> {
+        self.search_with_route(query, k, AnnScoreRoute::Memory)
     }
 
     /// Stamp the ann_write_log watermark this bridge's corpus state reflects
@@ -856,13 +949,34 @@ pub(crate) async fn search_loaded_with_seq(
     query: &[f32],
     k: usize,
 ) -> Result<Option<(Vec<(Uuid, f32)>, u64)>, RuntimeError> {
+    search_loaded_with_seq_route(ann, key, query, k, AnnScoreRoute::Memory)
+        .await
+        .map(|result| {
+            result.map(|(hits, seq)| {
+                (
+                    hits.into_iter()
+                        .map(|(id, score)| (id, score as f32))
+                        .collect(),
+                    seq,
+                )
+            })
+        })
+}
+
+pub(crate) async fn search_loaded_with_seq_route(
+    ann: &SharedAnn,
+    key: &AnnKey,
+    query: &[f32],
+    k: usize,
+    route: AnnScoreRoute,
+) -> Result<Option<(Vec<(Uuid, f64)>, u64)>, RuntimeError> {
     let guard = ann.indexes.read().await;
     match guard.get(key) {
         None => Ok(None),
         Some(bridge) => {
             #[cfg(test)]
             ann.warm_route_count.fetch_add(1, Ordering::SeqCst);
-            let hits = bridge.search(query, k)?;
+            let hits = bridge.search_with_route(query, k, route)?;
             // Keep the exact leg over unpublished deltas: incremental graph
             // insertion alone does not guarantee immediate reachability.
             let seq = if bridge.dirty_ops > 0 {
@@ -951,7 +1065,14 @@ pub(crate) async fn ensure_ann_background(
     let target_generation = current_generation(ann, &key).await;
 
     // Presence is insufficient: the installed generation must cover the caller's floor.
-    if installed_is_fresh(ann, &key, target_generation).await && !checkpoint_due(ann, &key).await {
+    // An installed memory bridge may predate this consumer's registration.
+    // Its graph is useful to recall, but note search cannot trust its tail
+    // until a full checkpoint activates the new watermark.
+    let note_search_pending = note_search_requires_full_rebuild(rt, ann, model).await;
+    if !note_search_pending
+        && installed_is_fresh(ann, &key, target_generation).await
+        && !checkpoint_due(ann, &key).await
+    {
         return false;
     }
 
@@ -1335,6 +1456,11 @@ pub(crate) async fn ensure_ann_for_model(
             )));
         }
     };
+    // A graph published before Slice 3 has no note_search protection. Its
+    // old tail may already have been compacted under the memory row, so only
+    // a new full scan may activate this second consumer. Keep the memory
+    // bridge available while that work runs.
+    force_full_rebuild |= note_search_requires_full_rebuild(rt, ann, model).await;
 
     // Read generation BEFORE any fast path or corpus snapshot to close the write race.
     let target_generation = current_generation(ann, &key).await;
@@ -1355,8 +1481,9 @@ pub(crate) async fn ensure_ann_for_model(
     // accepting its bridge; local presence alone cannot prove protection.
     match read_own_watermark(rt, model).await {
         Ok(Some(watermark)) if watermark >= 0 => {
-            force_full_rebuild = false;
-            if installed_is_fresh(ann, &key, target_generation).await
+            force_full_rebuild = note_search_requires_full_rebuild(rt, ann, model).await;
+            if !force_full_rebuild
+                && installed_is_fresh(ann, &key, target_generation).await
                 && !checkpoint_due(ann, &key).await
             {
                 return Ok(AnnEnsureStatus::AlreadyLoaded);
@@ -1380,6 +1507,7 @@ pub(crate) async fn ensure_ann_for_model(
             )));
         }
     }
+    force_full_rebuild |= note_search_requires_full_rebuild(rt, ann, model).await;
 
     let phase_start = std::time::Instant::now();
     // Process CPU is cumulative, so phase attribution requires entry and exit snapshots.
@@ -1899,6 +2027,9 @@ async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) 
 /// (ADR-079 Amendment 1, global-scope addendum): pack name plus the corpus
 /// predicate's field value.
 const ANN_CONSUMER: &str = "memory-notes:note.content";
+/// The same global note-content graph has a second ADR-118 consumer with its
+/// own durable protection; it never borrows the memory consumer's row.
+pub(crate) const NOTE_SEARCH_CONSUMER: &str = "note_search";
 
 /// Registry namespace for a global-scope consumer (one row per model spanning
 /// every namespace). `'*'` is not a valid `Namespace` value, so wildcard rows
@@ -1923,6 +2054,14 @@ fn ann_rebuild_threshold() -> f64 {
 /// every namespace but, unlike an active checkpoint at `S = 0`, can be retired
 /// with a visible warning if it never activates.
 async fn register_consumer(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
+    register_consumer_identity(rt, model, ANN_CONSUMER).await
+}
+
+async fn register_consumer_identity(
+    rt: &KhiveRuntime,
+    model: &str,
+    consumer: &str,
+) -> Result<(), String> {
     let sql = rt.sql();
     if ann_segment_dir(rt, model).is_none() {
         // Pooled in-memory writers can't hold a manual transaction across
@@ -1936,7 +2075,7 @@ async fn register_consumer(rt: &KhiveRuntime, model: &str) -> Result<(), String>
                       VALUES (?1, ?2, ?3, ?4)"
                     .into(),
                 params: vec![
-                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(consumer.into()),
                     SqlValue::Text(ANN_WILDCARD_NS.into()),
                     SqlValue::Text(model.to_owned()),
                     SqlValue::Integer(PENDING_WATERMARK),
@@ -1947,7 +2086,7 @@ async fn register_consumer(rt: &KhiveRuntime, model: &str) -> Result<(), String>
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
-    ann_registry::register_pending(sql.as_ref(), ANN_CONSUMER, ANN_WILDCARD_NS, model)
+    ann_registry::register_pending(sql.as_ref(), consumer, ANN_WILDCARD_NS, model)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1955,6 +2094,69 @@ async fn register_consumer(rt: &KhiveRuntime, model: &str) -> Result<(), String>
 /// Read this consumer's own wildcard registry watermark. `None` = no row
 /// (decision rule 4: Cold after re-registering as pending).
 async fn read_own_watermark(rt: &KhiveRuntime, model: &str) -> Result<Option<i64>, String> {
+    read_consumer_watermark(rt, model, ANN_CONSUMER).await
+}
+
+pub(crate) async fn read_note_search_watermark(
+    rt: &KhiveRuntime,
+    model: &str,
+) -> Result<Option<i64>, String> {
+    read_consumer_watermark(rt, model, NOTE_SEARCH_CONSUMER).await
+}
+
+async fn note_search_requires_full_rebuild(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    model: &str,
+) -> bool {
+    if !note_search_consumer_enabled(ann) {
+        return false;
+    }
+    match read_note_search_watermark(rt, model).await {
+        Ok(Some(watermark)) if watermark >= 0 => false,
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            if let Err(error) = register_consumer_identity(rt, model, NOTE_SEARCH_CONSUMER).await {
+                tracing::warn!(%error, model, "note-search ANN registration failed");
+            }
+            true
+        }
+        Err(error) => {
+            tracing::warn!(%error, model, "note-search ANN registry read failed");
+            false // Memory recall's existing consumer remains independently valid.
+        }
+    }
+}
+
+async fn advance_note_search_watermark(
+    rt: &KhiveRuntime,
+    ann: &SharedAnn,
+    model: &str,
+    s: u64,
+    authority: WatermarkAuthority,
+) {
+    if !note_search_consumer_enabled(ann) {
+        return;
+    }
+    // An incremental checkpoint cannot activate a pending consumer: only a
+    // full-corpus checkpoint under PendingOrActive may do that.
+    if authority == WatermarkAuthority::Active
+        && !matches!(read_note_search_watermark(rt, model).await, Ok(Some(n)) if n >= 0)
+    {
+        return;
+    }
+    if let Err(error) =
+        raise_consumer_watermark_with_authority(rt, model, NOTE_SEARCH_CONSUMER, s, authority).await
+    {
+        tracing::warn!(%error, model, "note-search ANN watermark remains unavailable");
+    }
+}
+
+async fn read_consumer_watermark(
+    rt: &KhiveRuntime,
+    model: &str,
+    consumer: &str,
+) -> Result<Option<i64>, String> {
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
@@ -1963,7 +2165,7 @@ async fn read_own_watermark(rt: &KhiveRuntime, model: &str) -> Result<Option<i64
                   WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
                 .into(),
             params: vec![
-                SqlValue::Text(ANN_CONSUMER.into()),
+                SqlValue::Text(consumer.into()),
                 SqlValue::Text(ANN_WILDCARD_NS.into()),
                 SqlValue::Text(model.to_owned()),
             ],
@@ -1989,6 +2191,16 @@ async fn raise_watermark_with_authority(
     s: u64,
     authority: WatermarkAuthority,
 ) -> Result<(), String> {
+    raise_consumer_watermark_with_authority(rt, model, ANN_CONSUMER, s, authority).await
+}
+
+async fn raise_consumer_watermark_with_authority(
+    rt: &KhiveRuntime,
+    model: &str,
+    consumer: &str,
+    s: u64,
+    authority: WatermarkAuthority,
+) -> Result<(), String> {
     let sql = rt.sql();
     let raised = if ann_segment_dir(rt, model).is_none() {
         let watermark = i64::try_from(s)
@@ -2009,7 +2221,7 @@ async fn raise_watermark_with_authority(
                        AND {predicate}"
                 ),
                 params: vec![
-                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(consumer.into()),
                     SqlValue::Text(ANN_WILDCARD_NS.into()),
                     SqlValue::Text(model.to_owned()),
                     SqlValue::Integer(watermark),
@@ -2020,20 +2232,13 @@ async fn raise_watermark_with_authority(
             .map_err(|e| e.to_string())?
             == 1
     } else {
-        ann_registry::raise_watermark(
-            sql.as_ref(),
-            ANN_CONSUMER,
-            ANN_WILDCARD_NS,
-            model,
-            s,
-            authority,
-        )
-        .await
-        .map_err(|e| e.to_string())?
+        ann_registry::raise_watermark(sql.as_ref(), consumer, ANN_WILDCARD_NS, model, s, authority)
+            .await
+            .map_err(|e| e.to_string())?
     };
     if !raised {
         return Err(format!(
-            "memory ANN watermark publication fence rejected {authority:?}"
+            "{consumer} ANN watermark publication fence rejected {authority:?}"
         ));
     }
     Ok(())
@@ -2481,6 +2686,37 @@ async fn registry_min_watermark_on(
     }))
 }
 
+/// Read the named consumer inside the same snapshot as the registry minimum
+/// and fresh-tail rows. An outside-the-snapshot precheck cannot protect a
+/// graph from concurrent consumer retirement and compaction.
+async fn consumer_watermark_on(
+    reader: &mut dyn khive_storage::SqlReader,
+    model: &str,
+    consumer: &str,
+) -> Result<Option<i64>, String> {
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT watermark FROM ann_consumer_watermark \
+                  WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
+                .into(),
+            params: vec![
+                SqlValue::Text(consumer.into()),
+                SqlValue::Text(ANN_WILDCARD_NS.into()),
+                SqlValue::Text(model.to_owned()),
+            ],
+            label: Some("note_search_ann_consumer_snapshot".into()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| match row.get("watermark") {
+            Some(SqlValue::Integer(value)) => Some(*value),
+            _ => None,
+        }))
+}
+
 /// Open an explicit read transaction so a reader keeps one connection across
 /// calls (ADR-118 §1). Load-bearing corpus hydration still uses one
 /// statement (see [`fetch_final_tail_on`]) since a pool-backed reader may
@@ -2518,15 +2754,49 @@ async fn end_read_snapshot(reader: &mut dyn khive_storage::SqlReader) {
 /// [`AnnBridge::search`]: both vectors normalized, dot product, clamped to a
 /// non-negative floor.
 pub(crate) fn exact_cosine(query: &[f32], embedding: &[f32]) -> f32 {
+    exact_cosine_unclamped(query, embedding).max(0.0)
+}
+
+fn exact_cosine_unclamped(query: &[f32], embedding: &[f32]) -> f32 {
     let mut q = query.to_vec();
     l2_normalize(&mut q);
     let mut e = embedding.to_vec();
     l2_normalize(&mut e);
-    q.iter()
-        .zip(e.iter())
-        .map(|(a, b)| a * b)
-        .sum::<f32>()
-        .max(0.0)
+    q.iter().zip(e.iter()).map(|(a, b)| a * b).sum::<f32>()
+}
+
+pub(crate) fn merge_fresh_tail_for_route(
+    best_raw: Vec<(Uuid, f64)>,
+    query: &[f32],
+    ops: Vec<(Uuid, Option<Vec<f32>>)>,
+    route: AnnScoreRoute,
+) -> Result<Vec<(Uuid, f64)>, RuntimeError> {
+    if ops.is_empty() {
+        return Ok(best_raw);
+    }
+    let mut deletes: HashSet<Uuid> = HashSet::new();
+    let mut upserts: HashMap<Uuid, f64> = HashMap::new();
+    for (uuid, op) in ops {
+        match op {
+            None => {
+                deletes.insert(uuid);
+            }
+            Some(embedding) => {
+                upserts.insert(uuid, route.tail_score(query, &embedding)?);
+            }
+        }
+    }
+    let mut merged: Vec<(Uuid, f64)> = best_raw
+        .into_iter()
+        .filter(|(uuid, _)| !deletes.contains(uuid) && !upserts.contains_key(uuid))
+        .collect();
+    merged.extend(upserts);
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(merged)
 }
 
 /// Keep the cheap wait probe and candidate-producing snapshot on the same
@@ -2787,7 +3057,13 @@ pub(crate) fn outcome_into_candidates(
 ) -> (Vec<(Uuid, f32)>, Option<String>) {
     match outcome {
         FreshTailOutcome::Ops(ops) => (merge_fresh_tail(prior, query, ops), None),
-        FreshTailOutcome::Replace(candidates, reason) => (candidates, reason.map(str::to_string)),
+        FreshTailOutcome::Replace(candidates, reason) => (
+            candidates
+                .into_iter()
+                .map(|(id, score)| (id, score as f32))
+                .collect(),
+            reason.map(str::to_string),
+        ),
         FreshTailOutcome::Skipped(reason) => (prior, Some(reason.to_string())),
     }
 }
@@ -2885,13 +3161,41 @@ pub(crate) enum FreshTailOutcome {
     /// `best_raw` outright (never merge them with the stale set). `Some(reason)`
     /// discloses when read-your-writes visibility was lost after
     /// re-resolution; `None` means the full pair was assembled.
-    Replace(Vec<(Uuid, f32)>, Option<&'static str>),
+    Replace(Vec<(Uuid, f64)>, Option<&'static str>),
     /// The leg sat out this query entirely; the caller's candidates are
     /// unaffected. The payload renders to a non-empty failure-site
     /// diagnostic: the label, followed by the error that caused the skip
     /// whenever the site was holding one. Callers may depend on its
     /// presence, not on its exact wording.
     Skipped(SkipReason),
+}
+
+fn replace_with_merged_tail(
+    candidates: Vec<(Uuid, f64)>,
+    query: &[f32],
+    ops: Vec<(Uuid, Option<Vec<f32>>)>,
+    route: AnnScoreRoute,
+) -> FreshTailOutcome {
+    if matches!(route, AnnScoreRoute::Memory) {
+        let candidates = candidates
+            .into_iter()
+            .map(|(id, score)| (id, score as f32))
+            .collect();
+        return FreshTailOutcome::Replace(
+            merge_fresh_tail(candidates, query, ops)
+                .into_iter()
+                .map(|(id, score)| (id, f64::from(score)))
+                .collect(),
+            None,
+        );
+    }
+    match merge_fresh_tail_for_route(candidates, query, ops, route) {
+        Ok(merged) => FreshTailOutcome::Replace(merged, None),
+        Err(error) => FreshTailOutcome::Skipped(SkipReason::with_error(
+            "fresh-tail: canonical score conversion failed",
+            error,
+        )),
+    }
 }
 
 /// The ADR-118 fresh-tail exact leg, giving read-your-writes visibility.
@@ -2968,7 +3272,18 @@ pub(crate) async fn fresh_tail_leg(
     }
 
     match s {
-        Some(s) => fresh_tail_serving(rt, ann, key, model, query, k, s).await,
+        Some(s) => {
+            fresh_tail_serving(
+                rt,
+                ann,
+                key,
+                model,
+                FreshTailSearch::new(query, k, AnnScoreRoute::Memory),
+                s,
+                None,
+            )
+            .await
+        }
         None => fresh_tail_capped(rt, model).await,
     }
 }
@@ -2976,14 +3291,14 @@ pub(crate) async fn fresh_tail_leg(
 /// Tier 1: a serving bridge exists at watermark `s`. The registry-minimum
 /// guard and tail statement share one read transaction (ADR-118 §1
 /// "Compaction linearization"; see `docs/ann.md`).
-async fn fresh_tail_serving(
+pub(crate) async fn fresh_tail_serving(
     rt: &KhiveRuntime,
     ann: &SharedAnn,
     key: &AnnKey,
     model: &str,
-    query: &[f32],
-    k: usize,
+    search: FreshTailSearch<'_>,
     s: u64,
+    consumer: Option<&str>,
 ) -> FreshTailOutcome {
     let mut reader = match rt.sql().reader().await {
         Ok(r) => r,
@@ -3001,6 +3316,15 @@ async fn fresh_tail_serving(
             "fresh-tail: snapshot begin failed",
             e,
         ));
+    }
+    if let Some(consumer) = consumer {
+        let own = consumer_watermark_on(reader.as_mut(), model, consumer).await;
+        if !matches!(own, Ok(Some(watermark)) if watermark >= 0) {
+            end_read_snapshot(reader.as_mut()).await;
+            return FreshTailOutcome::Skipped(SkipReason::bare(
+                "note-search ANN consumer is not active in tail snapshot",
+            ));
+        }
     }
 
     let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
@@ -3026,7 +3350,7 @@ async fn fresh_tail_serving(
                 // connection it needs to finish.
                 end_read_snapshot(reader.as_mut()).await;
                 drop(reader);
-                return fresh_tail_pathless_reresolve(rt, ann, key, model, query, k).await;
+                return fresh_tail_pathless_reresolve(rt, ann, key, model, search, consumer).await;
             }
 
             // Mismatch (ADR-118 §1): the log may no longer retain every row
@@ -3041,7 +3365,7 @@ async fn fresh_tail_serving(
                 Some(new_s) => {
                     end_read_snapshot(reader.as_mut()).await;
                     drop(reader);
-                    fresh_tail_reresolve(rt, ann, key, model, query, k, new_s).await
+                    fresh_tail_reresolve(rt, ann, key, model, search, new_s, consumer).await
                 }
                 None => {
                     // Re-resolution isn't possible: floor at the
@@ -3086,14 +3410,17 @@ async fn fresh_tail_pathless_reresolve(
     ann: &SharedAnn,
     key: &AnnKey,
     model: &str,
-    query: &[f32],
-    k: usize,
+    search: FreshTailSearch<'_>,
+    consumer: Option<&str>,
 ) -> FreshTailOutcome {
+    let FreshTailSearch { query, k, route } = search;
     let lock = model_warm_lock(ann, key).await;
     #[cfg(test)]
     ann.pathless_reresolve_wait_notify.notify_one();
     let _publication_guard = lock.lock().await;
-    let (candidates, resolved_s) = match search_loaded_with_seq(ann, key, query, k).await {
+    let (candidates, resolved_s) = match search_loaded_with_seq_route(ann, key, query, k, route)
+        .await
+    {
         Ok(Some(pair)) => pair,
         Ok(None) => {
             bump_generation(ann, key).await;
@@ -3129,6 +3456,15 @@ async fn fresh_tail_pathless_reresolve(
             Some("fresh-tail: pathless re-resolved snapshot begin failed; served re-resolved candidates without fresh-tail merge"),
         );
     }
+    if let Some(consumer) = consumer {
+        let own = consumer_watermark_on(reader.as_mut(), model, consumer).await;
+        if !matches!(own, Ok(Some(watermark)) if watermark >= 0) {
+            end_read_snapshot(reader.as_mut()).await;
+            return FreshTailOutcome::Skipped(SkipReason::bare(
+                "note-search ANN consumer is not active after pathless re-resolution",
+            ));
+        }
+    }
     let floor = registry_min_watermark_on(reader.as_mut(), model).await;
     let outcome = match floor {
         Ok(floor)
@@ -3137,9 +3473,7 @@ async fn fresh_tail_pathless_reresolve(
                 .is_none_or(|floor| floor <= resolved_s) =>
         {
             match fetch_final_tail_on(reader.as_mut(), model, resolved_s, None).await {
-                Ok((ops, _)) => {
-                    FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
-                }
+                Ok((ops, _)) => replace_with_merged_tail(candidates, query, ops, route),
                 Err(e) => {
                     tracing::warn!(error = %e, model, "fresh-tail: pathless re-resolved tail fetch failed; serving re-resolved candidates");
                     FreshTailOutcome::Replace(
@@ -3191,10 +3525,11 @@ async fn fresh_tail_reresolve(
     ann: &SharedAnn,
     key: &AnnKey,
     model: &str,
-    query: &[f32],
-    k: usize,
+    search: FreshTailSearch<'_>,
     new_s: u64,
+    consumer: Option<&str>,
 ) -> FreshTailOutcome {
+    let FreshTailSearch { query, k, route } = search;
     let mut expected_s = new_s;
     for round in 1..=FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
         let Some(dir) = ann_segment_dir(rt, model) else {
@@ -3215,7 +3550,7 @@ async fn fresh_tail_reresolve(
             }
         };
         let s_loaded = bridge.index.last_applied_seq().unwrap_or(expected_s);
-        let candidates = match bridge.search(query, k) {
+        let candidates = match bridge.search_with_route(query, k, route) {
             Ok(hits) => hits,
             Err(e) => {
                 tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; skipping exact leg");
@@ -3261,6 +3596,15 @@ async fn fresh_tail_reresolve(
                 Some("fresh-tail: re-resolved snapshot begin failed"),
             );
         }
+        if let Some(consumer) = consumer {
+            let own = consumer_watermark_on(reader.as_mut(), model, consumer).await;
+            if !matches!(own, Ok(Some(watermark)) if watermark >= 0) {
+                end_read_snapshot(reader.as_mut()).await;
+                return FreshTailOutcome::Skipped(SkipReason::bare(
+                    "note-search ANN consumer is not active after segment re-resolution",
+                ));
+            }
+        }
 
         let registry_min = match registry_min_watermark_on(reader.as_mut(), model).await {
             Ok(v) => v.and_then(|value| u64::try_from(value).ok()),
@@ -3285,9 +3629,7 @@ async fn fresh_tail_reresolve(
             let outcome = fetch_final_tail_on(reader.as_mut(), model, s_loaded, None).await;
             end_read_snapshot(reader.as_mut()).await;
             return match outcome {
-                Ok((ops, _)) => {
-                    FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
-                }
+                Ok((ops, _)) => replace_with_merged_tail(candidates, query, ops, route),
                 Err(e) => {
                     tracing::warn!(error = %e, model, "fresh-tail: re-resolved tail fetch failed; serving re-resolved candidates without further tail");
                     FreshTailOutcome::Replace(
@@ -3313,9 +3655,7 @@ async fn fresh_tail_reresolve(
             let outcome = fetch_final_tail_on(reader.as_mut(), model, m, None).await;
             end_read_snapshot(reader.as_mut()).await;
             return match outcome {
-                Ok((ops, _)) => {
-                    FreshTailOutcome::Replace(merge_fresh_tail(candidates, query, ops), None)
-                }
+                Ok((ops, _)) => replace_with_merged_tail(candidates, query, ops, route),
                 Err(e) => {
                     tracing::warn!(error = %e, model, "fresh-tail: floored-fallback tail fetch failed; serving re-resolved candidates without further tail");
                     FreshTailOutcome::Replace(
@@ -3418,6 +3758,7 @@ async fn checkpoint_raise_compact_readopt(
             evict_unprotected_index(ann, key).await;
             return false;
         }
+        advance_note_search_watermark(rt, ann, model, applied, authority).await;
         if let Err(e) = compact_log(rt, model).await {
             tracing::warn!(error = %e, "memory ann log compaction failed (retries next checkpoint)");
         }
@@ -3511,7 +3852,9 @@ async fn persist_file_checkpoint(
         // install them; the next ensure re-resolves durable state.
         tracing::warn!(error = %e, "memory ann watermark publication rejected; dropping candidate bridge");
         return Err(true);
-    } else if let Err(e) = compact_log(rt, model).await {
+    }
+    advance_note_search_watermark(rt, ann, model, applied, authority).await;
+    if let Err(e) = compact_log(rt, model).await {
         tracing::warn!(error = %e, "memory ann log compaction failed (retries next checkpoint)");
     }
     match load_segment(ann, dir) {
@@ -3941,7 +4284,7 @@ mod tests {
     fn outcome_into_candidates_replace_with_reason_discloses_degradation() {
         // A reasoned Replace must surface its failure-site reason, not report healthy.
         let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
-        let replaced = vec![(Uuid::from_u128(2), 0.8_f32)];
+        let replaced = vec![(Uuid::from_u128(2), 0.8_f64)];
         let (candidates, disclosure) = outcome_into_candidates(
             FreshTailOutcome::Replace(
                 replaced.clone(),
@@ -3950,7 +4293,11 @@ mod tests {
             prior,
             &[1.0, 0.0],
         );
-        assert_eq!(candidates, replaced, "Replace must swap the candidate set");
+        assert_eq!(
+            candidates,
+            vec![(Uuid::from_u128(2), 0.8_f64 as f32)],
+            "Replace must swap the candidate set"
+        );
         assert_eq!(
             disclosure.as_deref(),
             Some("fresh-tail: re-resolved tail fetch failed"),
@@ -3961,13 +4308,13 @@ mod tests {
     #[test]
     fn outcome_into_candidates_healthy_replace_and_ops_do_not_disclose() {
         let prior = vec![(Uuid::from_u128(1), 0.9_f32)];
-        let replaced = vec![(Uuid::from_u128(2), 0.8_f32)];
+        let replaced = vec![(Uuid::from_u128(2), 0.8_f64)];
         let (candidates, disclosure) = outcome_into_candidates(
             FreshTailOutcome::Replace(replaced.clone(), None),
             prior.clone(),
             &[1.0, 0.0],
         );
-        assert_eq!(candidates, replaced);
+        assert_eq!(candidates, vec![(Uuid::from_u128(2), 0.8_f64 as f32)]);
         assert!(
             disclosure.is_none(),
             "a fully assembled re-resolution is not degraded"
@@ -6987,7 +7334,15 @@ mod tests {
             "fresh note must exist only in the tail"
         );
 
-        let outcome = fresh_tail_pathless_reresolve(&rt, &ann, &key, MODEL, &query, 10).await;
+        let outcome = fresh_tail_pathless_reresolve(
+            &rt,
+            &ann,
+            &key,
+            MODEL,
+            FreshTailSearch::new(&query, 10, AnnScoreRoute::Memory),
+            None,
+        )
+        .await;
         let merged = match outcome {
             FreshTailOutcome::Replace(hits, _) => hits,
             _ => panic!("pathless re-resolution must replace stale candidates"),

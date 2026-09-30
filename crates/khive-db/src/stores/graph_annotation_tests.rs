@@ -192,6 +192,76 @@ async fn latest_annotation_filters_before_limit_and_keeps_edge_namespace_visibil
     );
 }
 
+#[tokio::test]
+async fn latest_annotation_property_filters_before_limit_in_both_query_branches() {
+    for extra_incident in [false, true] {
+        let (pool, store) = fixture();
+        let target = Uuid::from_u128(1);
+        let genuine = Uuid::from_u128(2);
+        let decoy = Uuid::from_u128(3);
+        {
+            let writer = pool.writer().unwrap();
+            let conn = writer.conn();
+            note(
+                conn,
+                genuine,
+                100,
+                "observation",
+                json!(["web.receipt"]),
+                false,
+            );
+            conn.execute(
+                "UPDATE notes SET properties = ?2 WHERE id = ?1",
+                rusqlite::params![
+                    genuine.to_string(),
+                    json!({
+                        "tags": ["web.receipt"],
+                        "khive:web_receipt": "v1",
+                    })
+                    .to_string(),
+                ],
+            )
+            .unwrap();
+            edge(conn, genuine, target, "visible", "annotates", false);
+            note(
+                conn,
+                decoy,
+                200,
+                "observation",
+                json!(["web.receipt"]),
+                false,
+            );
+            edge(conn, decoy, target, "visible", "annotates", false);
+            if extra_incident {
+                let third = Uuid::from_u128(4);
+                note(conn, third, 300, "question", json!([]), false);
+                edge(conn, third, target, "visible", "annotates", false);
+            }
+        }
+        assert_eq!(
+            store
+                .latest_annotating_note(target, "observation", "web.receipt")
+                .await
+                .unwrap(),
+            Some((decoy, 200)),
+        );
+        assert_eq!(
+            store
+                .latest_annotating_note_with_property(
+                    target,
+                    "observation",
+                    "web.receipt",
+                    "khive:web_receipt",
+                    "v1",
+                )
+                .await
+                .unwrap(),
+            Some((genuine, 100)),
+            "extra_incident={extra_incident}"
+        );
+    }
+}
+
 fn query_steps(conn: &Connection, target: Uuid) -> (Uuid, i32) {
     let mut stmt = conn.prepare(LATEST_ANNOTATING_NOTE_SQL).unwrap();
     let id: String = stmt

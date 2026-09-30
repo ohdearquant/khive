@@ -181,7 +181,62 @@ const SESSION_IDENTITY_MIGRATION_NAME: &str = "session_source_scoped_identity";
 const V41_UP: &str = include_str!("../sql/041-sender-transport.sql");
 const V42_UP: &str = include_str!("../sql/042-comm-external-id-channel-scope.sql");
 const V43_UP: &str = include_str!("../sql/043-vector-provenance.sql");
-const V45_UP: &str = include_str!("../sql/045-memory-visibility-receipts.sql");
+const V44_COLUMNS: &str = include_str!("../sql/044-comm-outbound-due-a-columns.sql");
+const V44_UP: &str = include_str!("../sql/044-comm-outbound-due-b-index.sql");
+
+/// V44 may follow a direct-store bootstrap, whose idempotent notes DDL
+/// already supplies the two columns. Backfill before building the index so
+/// existing future retries are excluded by its deadline range immediately.
+pub(crate) fn migrate_outbound_due_key(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let has_column = |name: &str| -> rusqlite::Result<bool> {
+        tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('notes') WHERE name = ?1)",
+            [name],
+            |row| row.get(0),
+        )
+    };
+    match (has_column("strict_due_key")?, has_column("due_source")?) {
+        (false, false) => tx.execute_batch(V44_COLUMNS)?,
+        (true, true) => {}
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    }
+
+    let mut after_id = String::new();
+    let mut first_page = true;
+    loop {
+        let rows: Vec<(String, String)> = {
+            let comparator = if first_page { ">=" } else { ">" };
+            let mut stmt = tx.prepare(&format!(
+                "SELECT id, json_extract(properties, '$.next_attempt_at') FROM notes \
+                 WHERE id {comparator} ?1 AND json_type(properties, '$.next_attempt_at') = 'text' \
+                 ORDER BY id LIMIT 500"
+            ))?;
+            let collected = stmt
+                .query_map([&after_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            collected
+        };
+        if rows.is_empty() {
+            break;
+        }
+        after_id = rows.last().expect("nonempty V44 page").0.clone();
+        first_page = false;
+        for (id, source) in rows {
+            if let Some(key) = crate::pool::strict_rfc3339_key(&source) {
+                tx.execute(
+                    "UPDATE notes SET strict_due_key = ?1, due_source = ?2 \
+                     WHERE id = ?3 AND (strict_due_key IS NOT ?1 OR due_source IS NOT ?2)",
+                    rusqlite::params![key, source, id],
+                )?;
+            }
+        }
+    }
+    tx.execute_batch(V44_UP)
+}
+
+const RECIPIENT_TRANSPORT_VERSION: u32 = 45;
+const V45_UP: &str = include_str!("../sql/045-recipient-transport.sql");
+const V46_UP: &str = include_str!("../sql/046-memory-visibility-receipts.sql");
 
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
@@ -458,9 +513,19 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         up: V43_UP,
     },
     VersionedMigration {
-        version: 45,
-        name: "memory_visibility_receipts",
+        version: 44,
+        name: "comm_outbound_due",
+        up: V44_UP,
+    },
+    VersionedMigration {
+        version: RECIPIENT_TRANSPORT_VERSION,
+        name: "recipient_transport",
         up: V45_UP,
+    },
+    VersionedMigration {
+        version: 46,
+        name: "memory_visibility_receipts",
+        up: V46_UP,
     },
 ];
 
@@ -1509,6 +1574,11 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                     version: migration.version,
                     error: e.to_string(),
                 }
+            })?;
+        } else if migration.version == 44 {
+            migrate_outbound_due_key(&tx).map_err(|error| SqliteError::Migration {
+                version: migration.version,
+                error: error.to_string(),
             })?;
         } else if migration.name == SESSION_IDENTITY_MIGRATION_NAME {
             tx.execute_batch(migration.up)

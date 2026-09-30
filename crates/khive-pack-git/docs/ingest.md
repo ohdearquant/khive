@@ -144,6 +144,16 @@ silently skipped forever because the cursor moved past it. Records that do
 succeed after a stall are still written; they are idempotent via the `sha`
 natural key, so a retried pass never double-creates them.
 
+New commit notes use a note key derived from the SHA. Keyed create prepares
+embedding and `annotates` edges before publishing the note in one transaction,
+so another pass cannot checkpoint a provisional note that later rolls back.
+Concurrent first passes may both read an absent SHA; the key admits one note,
+and the losing pass reuses that committed note, adds its missing project
+annotations, then advances its own checkpoint. Historical unkeyed notes remain
+readable. If multiple live historical notes share one SHA, ingest refuses the
+ambiguous lookup before advancing rather than choosing an arbitrary note; an
+operator must reconcile those duplicates separately.
+
 `local_sha_to_id` maps parent SHA to note id for commits created earlier in
 the same pass. Combined with `find_commit_by_sha`'s database lookup, it
 resolves `precedes` parent edges regardless of which pass the parent
@@ -153,3 +163,28 @@ refused/failed record — including past a later _existing_ record, whose
 natural-key lookup proves only its own landing, not the failed record's —
 would strand the failed commit behind the floor and skip it forever instead
 of retrying it on the next pass.
+
+### Historical shared-commit annotation repair (#3532)
+
+An already acknowledged SHA does not enter a later page, so a commit note
+shared by two project anchors can remain without the second project's
+`annotates` edge. `kkernel git-annotation-repair` previews one project against
+one local source and frozen tip, then applies only the missing project links
+when given the preview ID. It never changes the `commits` or
+`commits_checkpoint` cursor rows or the commit note. The preview counts live
+edges, tombstones, missing links, missing/deleted/ambiguous notes, and
+coverage errors. Existing edges, including their curated fields, and
+tombstones are left byte-for-byte unchanged.
+
+Under the [accepted ADR-088 Amendment 1 rider — historical shared-commit
+project annotations (#3532)](../../../docs/adr/ADR-088-amendment-1-git-digest.md#adr-088-amendment-1-rider--historical-shared-commit-project-annotations-3532),
+this implementation accepts only a surviving checkpoint with
+`base_cursor=null` as proof of the entire acknowledged reverse-topological
+prefix. A later checkpoint with a non-null base identifies only its current
+span; its SHA does not prove an earlier recorded merge-DAG walk. Such projects
+are reported as **coverage incomplete** with a reason and are not applied.
+Missing source objects,
+a divergent frozen tip, changed cursor rows, and an exceeded walk bound also
+stop application. A post-apply preview must show complete coverage and zero
+missing links before the command reports success. A partial write failure is
+retryable by taking a new preview and applying its new ID.

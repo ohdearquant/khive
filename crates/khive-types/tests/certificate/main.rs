@@ -18,5 +18,8 @@ mod harness;
 /// Certificate fixtures for the `cites` relation (proposed Tier-1, ADR-076).
 mod cites;
 
+/// Certificate fixtures for the `located_in` relation (ADR-196).
+mod located_in;
+
 /// Coverage gate: every EdgeRelation must have a cert entry or system-role exception.
 mod coverage;

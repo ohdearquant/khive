@@ -8,10 +8,13 @@ mod egress;
 mod entities;
 mod extract;
 mod fetch;
-mod identity;
+#[cfg(test)]
+mod fhcrc_probe_tests;
+pub mod identity;
 mod ingest;
 mod namespace;
 mod pack;
+pub mod producer;
 mod receipt;
 mod refresh;
 mod search;

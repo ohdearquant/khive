@@ -102,6 +102,7 @@ pub fn interpret(event: &Event) -> BrainSignal {
                     target_id: target,
                     event_kind,
                     served_by_profile_id: served_by,
+                    section_signals,
                     effective_weight,
                 }
             } else {
@@ -131,7 +132,7 @@ pub fn interpret(event: &Event) -> BrainSignal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use khive_brain_core::{entity_signal, is_recall_positive};
+    use khive_brain_core::{entity_signal, is_recall_positive, SectionPosteriorState};
     use khive_types::{EventKind, SubstrateKind};
     use uuid::Uuid;
 
@@ -430,6 +431,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn semantic_feedback_preserves_section_signals_for_replay() {
+        use khive_brain_core::SectionType;
+        let id = Uuid::new_v4();
+        let mut event = make_event("brain.feedback", EventOutcome::Success, Some(id));
+        event.payload = serde_json::json!({
+            "signal": "explicit_positive",
+            "section_signals": {"overview": "useful", "examples": "wrong"}
+        });
+        match interpret(&event) {
+            BrainSignal::SemanticFeedback {
+                section_signals: Some(signals),
+                ..
+            } => {
+                assert_eq!(signals[&SectionType::Overview], FeedbackSignal::Useful);
+                assert_eq!(signals[&SectionType::Examples], FeedbackSignal::Wrong);
+            }
+            other => panic!("semantic section signals were dropped: {other:?}"),
+        }
+    }
+
     // ── FeedbackEventKind unit tests (MAJ-001 coverage) ──────────────────────
 
     #[test]
@@ -492,14 +514,71 @@ mod tests {
                 target_id,
                 event_kind,
                 served_by_profile_id,
+                section_signals,
                 effective_weight,
             } => {
                 assert_eq!(target_id, id);
                 assert_eq!(event_kind, FeedbackEventKind::ExplicitPositive);
                 assert!(served_by_profile_id.is_none());
+                assert!(section_signals.is_none());
                 assert!((effective_weight - 1.5).abs() < 1e-12);
             }
             other => panic!("expected SemanticFeedback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn semantic_feedback_keeps_section_signals_for_every_scalar() {
+        for scalar in [
+            "explicit_positive",
+            "explicit_negative",
+            "implicit_positive",
+            "implicit_negative",
+            "correction",
+        ] {
+            let mut event = make_event(
+                "brain.feedback",
+                EventOutcome::Success,
+                Some(Uuid::new_v4()),
+            );
+            event.payload = serde_json::json!({
+                "signal": scalar,
+                "section_signals": {
+                    "overview": "useful",
+                    "formalism": "not_useful",
+                    "examples": "wrong"
+                }
+            });
+
+            let signal = interpret(&event);
+            let BrainSignal::SemanticFeedback {
+                section_signals: Some(sections),
+                ..
+            } = &signal
+            else {
+                panic!("{scalar} must retain section signals: {signal:?}");
+            };
+            assert_eq!(sections.len(), 3);
+            assert_eq!(sections[&SectionType::Overview], FeedbackSignal::Useful);
+            assert_eq!(sections[&SectionType::Formalism], FeedbackSignal::NotUseful);
+            assert_eq!(sections[&SectionType::Examples], FeedbackSignal::Wrong);
+
+            let mut state = SectionPosteriorState::new();
+            state.apply_signal(&signal);
+            assert_eq!(state.total_events, 1, "{scalar}");
+            let weight = FeedbackEventKind::from_signal_str(scalar)
+                .expect("known semantic scalar")
+                .update_weight();
+            assert!(
+                (state.posteriors[&SectionType::Overview].alpha() - 2.0 - weight).abs() < 1e-12
+            );
+            assert!(
+                (state.posteriors[&SectionType::Formalism].beta() - 4.0 - weight).abs() < 1e-12
+            );
+            assert!(
+                (state.posteriors[&SectionType::Examples].beta() - 2.0 - 2.0 * weight).abs()
+                    < 1e-12
+            );
         }
     }
 
@@ -543,6 +622,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::ExplicitPositive,
             served_by_profile_id: None,
+            section_signals: None,
             effective_weight: FeedbackEventKind::ExplicitPositive.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, true)));
@@ -555,6 +635,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::ImplicitNegative,
             served_by_profile_id: None,
+            section_signals: None,
             effective_weight: FeedbackEventKind::ImplicitNegative.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, false)));
@@ -567,6 +648,7 @@ mod tests {
             target_id: id,
             event_kind: FeedbackEventKind::Correction,
             served_by_profile_id: None,
+            section_signals: None,
             effective_weight: FeedbackEventKind::Correction.update_weight(),
         };
         assert_eq!(entity_signal(&sig), Some((id, false)));

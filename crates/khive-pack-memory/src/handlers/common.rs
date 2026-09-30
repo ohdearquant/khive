@@ -169,7 +169,7 @@ pub(super) fn recall_profile_enabled() -> bool {
     })
 }
 
-pub(super) fn ann_overfetch_max_rounds() -> usize {
+pub(crate) fn ann_overfetch_max_rounds() -> usize {
     static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ROUNDS.get_or_init(|| {
         let rounds = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")

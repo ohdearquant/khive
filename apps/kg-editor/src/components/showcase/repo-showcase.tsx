@@ -49,6 +49,7 @@ import {
   RelationMark,
 } from "@/components/ontology-mark";
 import { settleGraphLayout } from "@/lib/graph-layout";
+import { handleKeyboardRows } from "@/lib/keyboard-rows";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import { buildRepositoryBrief } from "@/lib/repository-brief";
 import { buildStructureCouplingLens } from "@/lib/structure-coupling-lens";
@@ -271,6 +272,8 @@ function ModuleInspectionControl({
     <button
       type="button"
       className={`repo-module-action ${className}`.trim()}
+      data-keyboard-row
+      aria-keyshortcuts="J K Enter"
       data-module-id={moduleId}
       aria-label={moduleInspectLabel(moduleById, moduleNode)}
       aria-controls="repository-module-inspector"
@@ -1127,6 +1130,8 @@ function StructureGraph({
                       <button
                         type="button"
                         className="repo-coupling-focus"
+                        data-keyboard-row
+                        aria-keyshortcuts="J K Enter"
                         aria-pressed={focusedPairKey === pair.key}
                         aria-label={`Focus coupling candidate between ${leftLabel} and ${rightLabel}`}
                         onClick={() => setFocusedPairKey(pair.key)}
@@ -1435,10 +1440,12 @@ function HistoryStructure({
             <h3>{labels.node_types.module}</h3>
             <p>{formatNumber(modules.length)}</p>
           </div>
-          <div className="repo-list">
+          <div className="repo-list" data-keyboard-list>
             {modules.map((module) => (
               <button
                 type="button"
+                data-keyboard-row
+                aria-keyshortcuts="J K Enter"
                 data-module-id={module.id}
                 aria-label={moduleInspectLabel(moduleById, module)}
                 aria-controls="repository-module-inspector"
@@ -1470,10 +1477,12 @@ function HistoryStructure({
             <h3>{labels.node_types.commit}</h3>
             <p>{formatNumber(commits.length)}</p>
           </div>
-          <div className="repo-list">
+          <div className="repo-list" data-keyboard-list>
             {commits.map((commit) => (
               <button
                 type="button"
+                data-keyboard-row
+                aria-keyshortcuts="J K Enter"
                 data-commit-id={commit.id}
                 aria-pressed={selectedCommitId === commit.id}
                 className={`repo-list-row ${selectedCommitId === commit.id ? "selected" : ""}`}
@@ -2302,27 +2311,62 @@ type CadenceSeriesId =
   | "pull_requests_opened"
   | "pull_requests_merged";
 
-function CadenceSeries({
-  id,
-  page,
-  label,
-  labels,
-  onExploreStructure,
-}: {
+type CadenceSeriesEntry = Readonly<{
   id: CadenceSeriesId;
   page: CadencePage;
   label: string;
+}>;
+
+type CadenceTimelineRow = Readonly<{
+  seriesId: CadenceSeriesId;
+  weekStart: string;
+  count: number;
+  label: string;
+}>;
+
+function cadenceTimelineRows(
+  series: readonly CadenceSeriesEntry[],
+): CadenceTimelineRow[] {
+  const order = new Map(
+    series.map(({ id }, index) => [id, index] as const),
+  );
+  // The wire date is YYYY-MM-DD, so lexical order is chronological.
+  return series
+    .flatMap(({ id, page, label }) =>
+      page.disclosure.status === "unavailable"
+        ? []
+        : page.items.slice(0, UI_ROW_LIMIT).map((point) => ({
+            seriesId: id,
+            weekStart: point.week_start,
+            count: point.count,
+            label,
+          })),
+    )
+    .sort(
+      (left, right) =>
+        left.weekStart.localeCompare(right.weekStart) ||
+        (order.get(left.seriesId) ?? 0) - (order.get(right.seriesId) ?? 0),
+    );
+}
+
+function CadenceSeriesStatus({
+  series,
+  labels,
+  onExploreStructure,
+}: {
+  series: CadenceSeriesEntry;
   labels: Labels;
   onExploreStructure: () => void;
 }) {
+  const { id, page, label } = series;
   const rows = page.items.slice(0, UI_ROW_LIMIT);
   const seriesStatus =
     page.disclosure.status === "complete" && isIncompleteRepoPage(page)
       ? "truncated"
       : page.disclosure.status;
   return (
-    <section
-      className="repo-card repo-table-wrap"
+    <div
+      className="repo-card"
       data-cadence-series={id}
       data-series-status={seriesStatus}
     >
@@ -2354,24 +2398,7 @@ function CadenceSeries({
             onClick: onExploreStructure,
           }}
         />
-      ) : (
-        <table className="repo-table">
-          <thead>
-            <tr>
-              <th>{labels.metrics.week}</th>
-              <th>{label}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((point) => (
-              <tr key={point.week_start}>
-                <td>{point.week_start}</td>
-                <td>{formatNumber(point.count)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
+      ) : null}
       <LocalSliceDisclosure
         shown={rows.length}
         total={page.items.length}
@@ -2379,37 +2406,103 @@ function CadenceSeries({
         labels={labels}
       />
       <BoundDisclosure page={page} labels={labels} />
-    </section>
+    </div>
   );
 }
 
 function CadenceView({ bundle, onExploreStructure }: ViewProps) {
   const analysis = bundle.aggregates.cadence_timeline;
   const labels = bundle.capability.labels;
-  const commitRows = analysis.commits.items.slice(0, UI_ROW_LIMIT);
-  const maxCommits = Math.max(1, ...commitRows.map((point) => point.count));
-  const width = Math.max(100, commitRows.length * 8 + 20);
+  const [activeSeries, setActiveSeries] = useState<CadenceSeriesId | "all">(
+    "all",
+  );
+  const series: CadenceSeriesEntry[] = [
+    { id: "commits", page: analysis.commits, label: labels.metrics.commits },
+    {
+      id: "issues_opened",
+      page: analysis.issues_opened,
+      label: labels.metrics.issues_opened,
+    },
+    {
+      id: "issues_closed",
+      page: analysis.issues_closed,
+      label: labels.metrics.issues_closed,
+    },
+    {
+      id: "pull_requests_opened",
+      page: analysis.pull_requests_opened,
+      label: labels.metrics.pull_requests_opened,
+    },
+    {
+      id: "pull_requests_merged",
+      page: analysis.pull_requests_merged,
+      label: labels.metrics.pull_requests_merged,
+    },
+  ];
+  const timelineRows = cadenceTimelineRows(series);
+  const visibleRows =
+    activeSeries === "all"
+      ? timelineRows
+      : timelineRows.filter((row) => row.seriesId === activeSeries);
+  const selectedSeries = series.find(({ id }) => id === activeSeries);
+  const chartSeries = selectedSeries ?? series[0];
+  const chartRows = chartSeries.page.items.slice(0, UI_ROW_LIMIT);
+  const maxCount = Math.max(1, ...chartRows.map((point) => point.count));
+  const width = Math.max(100, chartRows.length * 8 + 20);
   const plot = { left: 16, right: width - 4, top: 6, bottom: 58 };
-  const barStep = (plot.right - plot.left) / Math.max(1, commitRows.length);
+  const barStep = (plot.right - plot.left) / Math.max(1, chartRows.length);
   const barWidth = Math.max(2, Math.min(5, barStep * 0.64));
-  const yTicks = chartTicks(maxCommits);
-  const weekTickIndices = chartTickIndices(commitRows.length);
+  const yTicks = chartTicks(maxCount);
+  const weekTickIndices = chartTickIndices(chartRows.length);
   const releaseTags = analysis.release_tags.items.slice(0, UI_ROW_LIMIT);
-  // Same absence rule as the hotspot chart: with no measured commit weeks
-  // the y-axis domain fallback of 1 would invent a scale, so render the
-  // commit series' data state instead of an empty plot.
-  const chartState = analysis.commits.disclosure.status === "unavailable"
-    ? <DataState className="repo-empty" state="unavailable" title={`${labels.metrics.commits} ${labels.unavailable.toLocaleLowerCase()}`} message={analysis.commits.disclosure.reason ?? "This bundle does not claim commit cadence data."} />
-    : isKnownEmptyRepoPage(analysis.commits)
-      ? <DataState className="repo-empty" state="empty" title={`No ${labels.metrics.commits.toLocaleLowerCase()} cadence points`} message={`Captured weekly ${labels.metrics.commits.toLocaleLowerCase()} counts belong here.`} action={{ label: "Explore repository structure", onClick: onExploreStructure }} />
-      : null;
+  // Without measured weeks the y-axis fallback would invent a scale.
+  const chartState =
+    chartSeries.page.disclosure.status === "unavailable" ? (
+      <DataState
+        className="repo-empty"
+        state="unavailable"
+        title={`${chartSeries.label} ${labels.unavailable.toLocaleLowerCase()}`}
+        message={
+          chartSeries.page.disclosure.reason ??
+          "This bundle does not claim cadence data."
+        }
+      />
+    ) : isKnownEmptyRepoPage(chartSeries.page) ? (
+      <DataState
+        className="repo-empty"
+        state="empty"
+        title={`No ${chartSeries.label.toLocaleLowerCase()} cadence points`}
+        message={`Captured weekly ${chartSeries.label.toLocaleLowerCase()} counts belong here.`}
+        action={{
+          label: "Explore repository structure",
+          onClick: onExploreStructure,
+        }}
+      />
+    ) : chartRows.length === 0 && isIncompleteRepoPage(chartSeries.page) ? (
+      <DataState
+        className="repo-empty"
+        state="truncated"
+        title={`${chartSeries.label} ${labels.truncated.toLocaleLowerCase()}`}
+        shown={0}
+        bound={chartSeries.page.bound.max_items}
+        knownTotal={
+          chartSeries.page.total_count.status === "available"
+            ? chartSeries.page.total_count.value
+            : undefined
+        }
+        reason={
+          chartSeries.page.disclosure.reason ??
+          "No cadence points were captured within the declared bound."
+        }
+      />
+    ) : null;
   return (
     <div className="repo-view-body repo-grid">
       <div className="repo-chart">
         <div className="repo-legend">
           <span>
             <i className="green" />
-            {labels.metrics.commits}
+            {chartSeries.label}
           </span>
         </div>
         {chartState ?? (
@@ -2425,7 +2518,7 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
             <desc id="cadence-desc">{analysis.meta.inputs.join(", ")}</desc>
             {yTicks.map((tick) => {
               const y =
-                plot.bottom - (tick / maxCommits) * (plot.bottom - plot.top);
+                plot.bottom - (tick / maxCount) * (plot.bottom - plot.top);
               return (
                 <g key={`cadence-y-${tick}`}>
                   <line
@@ -2448,10 +2541,10 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
                 </g>
               );
             })}
-            {commitRows.map((point, index) => {
+            {chartRows.map((point, index) => {
               const x = plot.left + index * barStep + (barStep - barWidth) / 2;
               const height =
-                (point.count / maxCommits) * (plot.bottom - plot.top);
+                (point.count / maxCount) * (plot.bottom - plot.top);
               return (
                 <rect
                   className="repo-chart-bar"
@@ -2462,14 +2555,14 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
                   height={height}
                 >
                   <title>
-                    {point.week_start} · {labels.metrics.commits}:{" "}
+                    {point.week_start} · {chartSeries.label}:{" "}
                     {point.count}
                   </title>
                 </rect>
               );
             })}
             {weekTickIndices.map((index) => {
-              const point = commitRows[index];
+              const point = chartRows[index];
               const x = plot.left + index * barStep + barStep / 2;
               return (
                 <text
@@ -2500,53 +2593,141 @@ function CadenceView({ bundle, onExploreStructure }: ViewProps) {
               y="32"
               textAnchor="middle"
             >
-              {labels.metrics.commits}
+              {chartSeries.label}
             </text>
           </svg>
         )}
         <LocalSliceDisclosure
-          shown={commitRows.length}
-          total={analysis.commits.items.length}
-          label={labels.metrics.commits}
+          shown={chartRows.length}
+          total={chartSeries.page.items.length}
+          label={chartSeries.label}
           labels={labels}
         />
       </div>
-      <div className="repo-cadence-series">
-        <CadenceSeries
-          id="commits"
-          page={analysis.commits}
-          label={labels.metrics.commits}
-          labels={labels}
-          onExploreStructure={onExploreStructure}
-        />
-        <CadenceSeries
-          id="issues_opened"
-          page={analysis.issues_opened}
-          label={labels.metrics.issues_opened}
-          labels={labels}
-          onExploreStructure={onExploreStructure}
-        />
-        <CadenceSeries
-          id="issues_closed"
-          page={analysis.issues_closed}
-          label={labels.metrics.issues_closed}
-          labels={labels}
-          onExploreStructure={onExploreStructure}
-        />
-        <CadenceSeries
-          id="pull_requests_opened"
-          page={analysis.pull_requests_opened}
-          label={labels.metrics.pull_requests_opened}
-          labels={labels}
-          onExploreStructure={onExploreStructure}
-        />
-        <CadenceSeries
-          id="pull_requests_merged"
-          page={analysis.pull_requests_merged}
-          label={labels.metrics.pull_requests_merged}
-          labels={labels}
-          onExploreStructure={onExploreStructure}
-        />
+      <section
+        className="repo-card repo-table-wrap"
+        data-cadence-timeline
+        data-active-series={activeSeries}
+        data-total-rows={timelineRows.length}
+      >
+        <div className="repo-card-heading">
+          <h3>Weekly cadence</h3>
+          <p>
+            {formatNumber(visibleRows.length)} / {formatNumber(timelineRows.length)}
+          </p>
+        </div>
+        <div
+          className="repo-view-tags"
+          role="group"
+          aria-label="Filter weekly cadence by series"
+        >
+          <button
+            type="button"
+            className={`repo-view-tag${activeSeries === "all" ? " join" : ""}`}
+            data-cadence-facet="all"
+            aria-pressed={activeSeries === "all"}
+            aria-controls="cadence-weekly-timeline"
+            onClick={() => setActiveSeries("all")}
+          >
+            All series
+          </button>
+          {series.map(({ id, label }) => (
+            <button
+              type="button"
+              className={`repo-view-tag${activeSeries === id ? " join" : ""}`}
+              data-cadence-facet={id}
+              aria-pressed={activeSeries === id}
+              aria-controls="cadence-weekly-timeline"
+              onClick={() => setActiveSeries(id)}
+              key={id}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div id="cadence-weekly-timeline">
+          {visibleRows.length > 0 ? (
+            <table className="repo-table" aria-label="Weekly cadence timeline">
+              <thead>
+                <tr>
+                  <th>{labels.metrics.week}</th>
+                  <th>Series</th>
+                  <th>Count</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleRows.map((row) => (
+                  <tr
+                    data-cadence-row
+                    data-series={row.seriesId}
+                    data-week-start={row.weekStart}
+                    key={`${row.seriesId}-${row.weekStart}`}
+                  >
+                    <td>{row.weekStart}</td>
+                    <td>{row.label}</td>
+                    <td>{formatNumber(row.count)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : selectedSeries && selectedSeries.page.disclosure.status === "unavailable" ? (
+            <DataState
+              className="repo-empty compact"
+              state="unavailable"
+              title={`${selectedSeries.label} ${labels.unavailable.toLocaleLowerCase()}`}
+              message={
+                selectedSeries.page.disclosure.reason ??
+                "This bundle does not claim cadence data."
+              }
+            />
+          ) : selectedSeries && isIncompleteRepoPage(selectedSeries.page) ? (
+            <DataState
+              className="repo-empty compact"
+              state="truncated"
+              title={`${selectedSeries.label} ${labels.truncated.toLocaleLowerCase()}`}
+              shown={0}
+              bound={selectedSeries.page.bound.max_items}
+              knownTotal={
+                selectedSeries.page.total_count.status === "available"
+                  ? selectedSeries.page.total_count.value
+                  : undefined
+              }
+              reason={
+                selectedSeries.page.disclosure.reason ??
+                "No cadence points were captured within the declared bound."
+              }
+            />
+          ) : (
+            <DataState
+              className="repo-empty compact"
+              state="empty"
+              title={
+                selectedSeries
+                  ? `No ${selectedSeries.label.toLocaleLowerCase()} cadence points`
+                  : "No weekly cadence points"
+              }
+              message="Captured weekly counts belong here."
+              action={{
+                label: "Explore repository structure",
+                onClick: onExploreStructure,
+              }}
+            />
+          )}
+        </div>
+      </section>
+      <div
+        className="repo-cadence-series"
+        role="group"
+        aria-label="Cadence series availability and bounds"
+      >
+        {series.map((entry) => (
+          <CadenceSeriesStatus
+            key={entry.id}
+            series={entry}
+            labels={labels}
+            onExploreStructure={onExploreStructure}
+          />
+        ))}
       </div>
       <div className="repo-grid two">
         <section className="repo-card" style={{ padding: 14 }}>
@@ -3424,6 +3605,7 @@ export function RepoShowcase({
       className="repo-overview"
       data-head-sha={snapshot.head_sha}
       data-analysis-source={analysisSource}
+      onKeyDown={handleKeyboardRows}
     >
       <header className="repo-overview-heading">
         <div className="repo-identity">
@@ -3549,6 +3731,7 @@ export function RepoShowcase({
       <div
         className="repo-dashboard"
         data-repository-dashboard
+        data-keyboard-scope
         id="repository-analysis-dashboard"
         ref={dashboardRef}
         role="region"

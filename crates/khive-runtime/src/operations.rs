@@ -11,6 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
+use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, EdgeUpsertDisposition,
@@ -690,6 +691,18 @@ pub enum EdgeEndpointKind {
     Edge,
 }
 
+impl EdgeEndpointKind {
+    /// Wire name carried by a link lifecycle event for this endpoint.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Note => "note",
+            Self::Event => "event",
+            Self::Edge => "edge",
+        }
+    }
+}
+
 /// Map a resolved endpoint to its `(substrate, kind, entity_type)` triple, or
 /// `None` if the substrate is not a valid edge endpoint (events, edges).
 ///
@@ -1053,6 +1066,11 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     // depends_on); the endpoint pair is intentionally narrow (document only,
     // no service/concept targets — see ADR-191 D2/F10).
     ("document", EdgeRelation::LinksTo, "document"),
+    // ADR-002 amendment (ADR-196): location — the source occupies, or is
+    // manifested in, the target without being a constituent of it. The base
+    // contract is one row; packs and Subjects narrow it with typed endpoint
+    // rules for their own subtypes.
+    ("concept", EdgeRelation::LocatedIn, "concept"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -1153,6 +1171,20 @@ pub(crate) fn canonical_edge_endpoints(
         (target_id, source_id)
     } else {
         (source_id, target_id)
+    }
+}
+
+/// Keep endpoint substrates paired with their IDs when a symmetric link swaps direction.
+pub(crate) fn canonical_edge_endpoint_kinds(
+    requested_source_id: Uuid,
+    canonical_source_id: Uuid,
+    source_kind: EdgeEndpointKind,
+    target_kind: EdgeEndpointKind,
+) -> (EdgeEndpointKind, EdgeEndpointKind) {
+    if requested_source_id == canonical_source_id {
+        (source_kind, target_kind)
+    } else {
+        (target_kind, source_kind)
     }
 }
 
@@ -2560,8 +2592,8 @@ impl KhiveRuntime {
     /// - `supersedes` / `supports` / `refutes`: same-substrate only (note→note or entity→entity).
     /// - All other 13 relations: both endpoints MUST be entities.
     ///
-    /// Returns `Ok(())` when valid; otherwise `InvalidInput` or `NotFound` with
-    /// the same messages as the previous inline block (byte-identical behaviour).
+    /// Returns the validated endpoint substrates when valid; otherwise
+    /// `InvalidInput` or `NotFound` for an invalid endpoint pair.
     ///
     /// `pub(crate)`: the atomic prepare pass (`crate::atomic_prepare`) reuses
     /// this exact endpoint-type validation during its async prepare step,
@@ -2572,7 +2604,7 @@ impl KhiveRuntime {
         source_id: Uuid,
         target_id: Uuid,
         relation: EdgeRelation,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<(EdgeEndpointKind, EdgeEndpointKind)> {
         if source_id == target_id {
             return Err(RuntimeError::InvalidInput(
                 "self-loop edges are not allowed: source_id and target_id must be different".into(),
@@ -2602,11 +2634,26 @@ impl KhiveRuntime {
                 }
             }
             // Target may be any substrate (entity, note, event, or edge) — by-ID, unfiltered.
-            if !self.substrate_exists_by_id(token, target_id).await? {
-                return Err(RuntimeError::NotFound(format!(
-                    "link target {target_id} not found"
-                )));
-            }
+            let target_kind = match self.resolve_edge_endpoint(token, target_id).await? {
+                Some(Resolved::Entity(_)) => EdgeEndpointKind::Entity,
+                Some(Resolved::Note(_)) => EdgeEndpointKind::Note,
+                Some(Resolved::Event(_)) => EdgeEndpointKind::Event,
+                Some(Resolved::PackRecord { .. }) => {
+                    return Err(RuntimeError::InvalidInput(
+                        "pack-private record is not a valid edge endpoint for annotates".into(),
+                    ));
+                }
+                None => match self.get_edge(token, target_id).await {
+                    Ok(Some(_)) => EdgeEndpointKind::Edge,
+                    Ok(None) | Err(RuntimeError::NotFound(_)) => {
+                        return Err(RuntimeError::NotFound(format!(
+                            "link target {target_id} not found"
+                        )));
+                    }
+                    Err(error) => return Err(error),
+                },
+            };
+            return Ok((EdgeEndpointKind::Note, target_kind));
         } else if crate::pack::is_special_relation(relation) {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
@@ -2638,7 +2685,7 @@ impl KhiveRuntime {
                     )));
                 }
             };
-            match (&src, &tgt) {
+            return match (&src, &tgt) {
                 (Resolved::Entity(src_e), Resolved::Entity(tgt_e)) => {
                     if !base_entity_rule_allows(&src_e.kind, relation, &tgt_e.kind) {
                         let legal_relations = accepted_entity_relations_description(
@@ -2662,8 +2709,11 @@ impl KhiveRuntime {
                             src_e.kind, tgt_e.kind, src_e.kind, tgt_e.kind
                         )));
                     }
+                    Ok((EdgeEndpointKind::Entity, EdgeEndpointKind::Entity))
                 }
-                (Resolved::Note(_), Resolved::Note(_)) => {}
+                (Resolved::Note(_), Resolved::Note(_)) => {
+                    Ok((EdgeEndpointKind::Note, EdgeEndpointKind::Note))
+                }
                 (Resolved::Event(_), _) => {
                     return Err(RuntimeError::InvalidInput(format!(
                         "{rel_name} does not apply to events; source {source_id} is an event"
@@ -2691,7 +2741,7 @@ impl KhiveRuntime {
                         "pack-private record is not a valid edge endpoint for {rel_name}"
                     )));
                 }
-            }
+            };
         } else {
             // All remaining base relations require entity→entity with kind-level
             // restrictions (see base allowlist). Packs may extend the allowlist
@@ -2704,7 +2754,17 @@ impl KhiveRuntime {
             let pack_rules = self.pack_edge_rules();
 
             if pack_rule_allows(&pack_rules, relation, src_res.as_ref(), tgt_res.as_ref()) {
-                return Ok(());
+                let kind = |resolved: Option<&Resolved>| match resolved {
+                    Some(Resolved::Entity(_)) => Some(EdgeEndpointKind::Entity),
+                    Some(Resolved::Note(_)) => Some(EdgeEndpointKind::Note),
+                    _ => None,
+                };
+                return match (kind(src_res.as_ref()), kind(tgt_res.as_ref())) {
+                    (Some(source_kind), Some(target_kind)) => Ok((source_kind, target_kind)),
+                    _ => Err(RuntimeError::Internal(
+                        "pack endpoint rule admitted an unsupported substrate".into(),
+                    )),
+                };
             }
 
             // Substrate check: both endpoints must be entities.
@@ -2765,7 +2825,7 @@ impl KhiveRuntime {
                 )));
             }
         }
-        Ok(())
+        Ok((EdgeEndpointKind::Entity, EdgeEndpointKind::Entity))
     }
 
     /// Public delegator for cross-backend link validation.
@@ -2781,6 +2841,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<()> {
         self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await
+            .map(|_| ())
     }
 
     /// Validate an edge relation using pre-fetched endpoint records.
@@ -3042,9 +3103,14 @@ impl KhiveRuntime {
     ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
         validate_edge_metadata(relation, metadata.as_ref())?;
-        self.validate_edge_relation_endpoints(token, source_id, target_id, relation)
+        let (source_kind, target_kind) = self
+            .validate_edge_relation_endpoints(token, source_id, target_id, relation)
             .await?;
-        let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
+        let (canonical_source, canonical_target) =
+            canonical_edge_endpoints(relation, source_id, target_id);
+        let (source_kind, target_kind) =
+            canonical_edge_endpoint_kinds(source_id, canonical_source, source_kind, target_kind);
+        let (source_id, target_id) = (canonical_source, canonical_target);
         let metadata = if relation == EdgeRelation::DependsOn {
             // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
             // above. The visible-set-scoped `resolve` would silently drop the
@@ -3107,7 +3173,8 @@ impl KhiveRuntime {
                 )))
             }
         };
-        self.append_link_mutation_event(token, &result).await?;
+        self.append_link_mutation_event(token, &result, source_kind, target_kind)
+            .await?;
         Ok(result)
     }
 
@@ -3115,7 +3182,8 @@ impl KhiveRuntime {
     ///
     /// Called by the `SubstrateCoordinator` when source and target are on
     /// different backends. The coordinator validates endpoints before calling
-    /// this method via [`Self::validate_link_endpoints`], so endpoint validation is
+    /// this method via [`Self::validate_link_endpoints`], and supplies the
+    /// resolved endpoint kinds for the lifecycle event. Endpoint validation is
     /// skipped here. The edge is written on the source backend only.
     #[allow(clippy::too_many_arguments)]
     pub async fn link_with_target_backend(
@@ -3123,6 +3191,8 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         source_id: Uuid,
         target_id: Uuid,
+        source_kind: EdgeEndpointKind,
+        target_kind: EdgeEndpointKind,
         relation: EdgeRelation,
         weight: f64,
         metadata: Option<serde_json::Value>,
@@ -3132,6 +3202,8 @@ impl KhiveRuntime {
             token,
             source_id,
             target_id,
+            source_kind,
+            target_kind,
             relation,
             weight,
             metadata,
@@ -3151,6 +3223,8 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         source_id: Uuid,
         target_id: Uuid,
+        source_kind: EdgeEndpointKind,
+        target_kind: EdgeEndpointKind,
         relation: EdgeRelation,
         weight: f64,
         metadata: Option<serde_json::Value>,
@@ -3158,7 +3232,11 @@ impl KhiveRuntime {
         resurrect: bool,
     ) -> RuntimeResult<EdgeUpsertResult> {
         validate_edge_weight(weight)?;
-        let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
+        let (canonical_source, canonical_target) =
+            canonical_edge_endpoints(relation, source_id, target_id);
+        let (source_kind, target_kind) =
+            canonical_edge_endpoint_kinds(source_id, canonical_source, source_kind, target_kind);
+        let (source_id, target_id) = (canonical_source, canonical_target);
         validate_edge_metadata(relation, metadata.as_ref())?;
         let now = chrono::Utc::now();
         let ns = token.namespace().as_str();
@@ -3188,7 +3266,8 @@ impl KhiveRuntime {
                     error.into()
                 }
             })?;
-        self.append_link_mutation_event(token, &result).await?;
+        self.append_link_mutation_event(token, &result, source_kind, target_kind)
+            .await?;
         Ok(result)
     }
 
@@ -3196,6 +3275,8 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         result: &EdgeUpsertResult,
+        source_kind: EdgeEndpointKind,
+        target_kind: EdgeEndpointKind,
     ) -> RuntimeResult<()> {
         let kind = match result.disposition {
             EdgeUpsertDisposition::Created => EventKind::LinkCreated,
@@ -3205,15 +3286,7 @@ impl KhiveRuntime {
         };
         let edge_id = Uuid::from(result.edge.id);
         let actor = format!("{}:{}", token.actor().kind, token.actor().id);
-        let event = khive_storage::event::Event::new(
-            result.edge.namespace.clone(),
-            "link",
-            kind,
-            SubstrateKind::Entity,
-            actor,
-        )
-        .with_target(edge_id)
-        .with_payload(serde_json::json!({
+        let mut payload = serde_json::json!({
             "id": edge_id,
             "namespace": result.edge.namespace,
             "mutation": result.disposition.name(),
@@ -3223,7 +3296,20 @@ impl KhiveRuntime {
             "weight": result.edge.weight,
             "metadata": result.edge.metadata,
             "previous": result.previous,
-        }));
+        });
+        if kind == EventKind::LinkCreated {
+            payload["source_kind"] = serde_json::json!(source_kind.name());
+            payload["target_kind"] = serde_json::json!(target_kind.name());
+        }
+        let event = khive_storage::event::Event::new(
+            result.edge.namespace.clone(),
+            "link",
+            kind,
+            SubstrateKind::Entity,
+            actor,
+        )
+        .with_target(edge_id)
+        .with_payload(payload);
         self.events(token)?
             .append_event(event)
             .await
@@ -3285,17 +3371,55 @@ impl KhiveRuntime {
         kind: &str,
         tag: &str,
     ) -> RuntimeResult<Option<Uuid>> {
+        self.latest_annotating_note_inner(token, node_id, kind, tag, None)
+            .await
+    }
+
+    /// Select a latest annotation only after its exact top-level string
+    /// property has been checked by the bound store.
+    pub async fn latest_annotating_note_with_property(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        property_key: &str,
+        property_value: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        self.latest_annotating_note_inner(
+            token,
+            node_id,
+            kind,
+            tag,
+            Some((property_key, property_value)),
+        )
+        .await
+    }
+
+    async fn latest_annotating_note_inner(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        required_property: Option<(&str, &str)>,
+    ) -> RuntimeResult<Option<Uuid>> {
         if !self.substrate_exists_in_ns(token, node_id).await? {
             return Ok(None);
         }
         let mut latest: Option<(Uuid, i64)> = None;
         for namespace in token.visible_namespaces() {
             let scoped = NamespaceToken::for_namespace(namespace.clone());
-            if let Some(candidate) = self
-                .graph(&scoped)?
-                .latest_annotating_note(node_id, kind, tag)
-                .await?
-            {
+            let graph = self.graph(&scoped)?;
+            let candidate = match required_property {
+                Some((key, value)) => {
+                    graph
+                        .latest_annotating_note_with_property(node_id, kind, tag, key, value)
+                        .await?
+                }
+                None => graph.latest_annotating_note(node_id, kind, tag).await?,
+            };
+            if let Some(candidate) = candidate {
                 if latest.is_none_or(|(id, created_at)| {
                     candidate.1 > created_at || (candidate.1 == created_at && candidate.0 < id)
                 }) {
@@ -3859,10 +3983,44 @@ impl KhiveRuntime {
         let (note, _, degradations, _) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
-                false,
+                false, false,
             )
             .await?;
         legacy_post_commit_result("create_note", note.id, note, degradations)
+    }
+
+    /// Publish a network receipt with provenance that generic note writes
+    /// cannot supply. The web pack provides only the request record and the
+    /// annotation targets; this entry point fixes the note kind, tag, and
+    /// provenance before the first storage write.
+    pub async fn create_web_receipt_note(
+        &self,
+        token: &NamespaceToken,
+        summary: &str,
+        request: serde_json::Value,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<Note> {
+        let properties = serde_json::json!({
+            "tags": ["web.receipt"],
+            "request": request,
+        });
+        let (note, _, degradations, _) = self
+            .create_note_inner(
+                token,
+                "observation",
+                None,
+                summary,
+                None,
+                None,
+                None,
+                Some(properties),
+                annotates,
+                None,
+                false,
+                true,
+            )
+            .await?;
+        legacy_post_commit_result("create_web_receipt_note", note.id, note, degradations)
     }
 
     /// Like [`Self::create_note`], but lets the caller supply a smaller text
@@ -3900,6 +4058,7 @@ impl KhiveRuntime {
                 annotates,
                 None,
                 false,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -3934,6 +4093,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
                 false,
             )
             .await?;
@@ -3974,6 +4134,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
                 false,
             )
             .await?;
@@ -4039,6 +4200,7 @@ impl KhiveRuntime {
                 annotates,
                 embedding_model,
                 false,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4078,6 +4240,7 @@ impl KhiveRuntime {
                 annotates,
                 embedding_model,
                 true,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4295,7 +4458,7 @@ impl KhiveRuntime {
         }
 
         // Best-effort vector embedding: log and continue on failure.
-        let embed_model_names = self.registered_embedding_model_names();
+        let embed_model_names = self.embedding_models_for_note_kind(kind);
         for model_name in &embed_model_names {
             match self
                 .embed_document_with_model_outcome_for_token(
@@ -4366,6 +4529,7 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
         capture_visibility: bool,
+        web_receipt: bool,
     ) -> RuntimeResult<(
         Note,
         crate::retrieval::EmbeddingTruncationReport,
@@ -4378,8 +4542,20 @@ impl KhiveRuntime {
         // the generic `create` verb and direct Rust callers alike — stores the
         // same derived values. Runs before the secret gate so the gate scans
         // exactly what will be written.
-        let properties = self.derive_note_write_properties(kind, token, properties)?;
+        let mut properties = self.derive_note_write_properties(kind, token, properties)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
+        if web_receipt {
+            let map = properties
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("web receipt properties are constructed as an object");
+            map.insert(
+                crate::secret_gate::RESERVED_WEB_RECEIPT_KEY.to_string(),
+                serde_json::Value::String(
+                    crate::secret_gate::WEB_RECEIPT_PROVENANCE_VALUE.to_string(),
+                ),
+            );
+        }
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check_at(content, "note", "content")?;
         if let Some(n) = name {
@@ -4455,7 +4631,12 @@ impl KhiveRuntime {
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
-        self.notes(token)?.upsert_note(note.clone()).await?;
+        let notes = if web_receipt {
+            self.raw_notes(token)?
+        } else {
+            self.notes(token)?
+        };
+        notes.upsert_note(note.clone()).await?;
 
         // From here on, any error must compensate by removing the note row, its
         // FTS document, and any vector entries already inserted — the same
@@ -4465,18 +4646,7 @@ impl KhiveRuntime {
         let embed_model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
-            // Fan out to ALL registered models — includes both lattice models
-            // from RuntimeConfig and any custom providers added via
-            // register_embedder(). Gate on the registry, not
-            // config().embedding_model, so that custom-only runtimes (no
-            // lattice model in config) also fan out.
-            let names = self.registered_embedding_model_names();
-            if names.is_empty() {
-                // No models configured at all — skip vector embedding.
-                vec![]
-            } else {
-                names
-            }
+            self.embedding_models_for_note_kind(kind)
         };
 
         // FTS step — compensate note row on failure.
@@ -4515,7 +4685,7 @@ impl KhiveRuntime {
         // Vector embedding + insert step — compensate note row + FTS doc on failure.
         // Multi-model vector embedding:
         //   - explicit embedding_model → single model (existing behaviour)
-        //   - None + any models registered → ALL registered models in parallel
+        //   - None → the note kind's declared model policy
         //   - None + no models configured → skip (text-only)
         // The effective text sent to every embedder: the caller-supplied
         // capped override when present, otherwise the full stored content.
@@ -5142,13 +5312,7 @@ impl KhiveRuntime {
         let mut vector_error: Option<String> = None;
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
             match self
-                .vector_search(
-                    token,
-                    query_vector,
-                    Some(query_text),
-                    candidates,
-                    Some(SubstrateKind::Note),
-                )
+                .note_search_vector_search(token, query_vector, query_text, candidates)
                 .await
             {
                 Ok(hits) => hits,
@@ -5180,9 +5344,11 @@ impl KhiveRuntime {
         // match `note_kind` are dropped post-fetch — they're a small set
         // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
+        let search_pool = self.backend().pool_arc();
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
+                search_pool.record_note_candidate_hydration_row();
                 if note.deleted_at.is_some() {
                     continue;
                 }
@@ -5703,11 +5869,15 @@ impl KhiveRuntime {
             statement: row_statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
-        if substrate == SubstrateKind::Entity {
+        if matches!(substrate, SubstrateKind::Entity | SubstrateKind::Note) {
             statements.push(PlanStatement {
                 statement: khive_db::stores::attachment::delete_record_attachments_statement(
                     node_id,
-                    AttachmentSubstrate::Entity,
+                    if substrate == SubstrateKind::Entity {
+                        AttachmentSubstrate::Entity
+                    } else {
+                        AttachmentSubstrate::Note
+                    },
                 ),
                 guard: None,
             });
@@ -7561,6 +7731,16 @@ impl KhiveRuntime {
     /// layer. If `spec.namespace` is set it must match `token.namespace()`;
     /// a mismatch returns `RuntimeError::InvalidInput`.
     pub async fn build_edge(&self, token: &NamespaceToken, spec: &LinkSpec) -> RuntimeResult<Edge> {
+        self.build_edge_with_endpoint_kinds(token, spec)
+            .await
+            .map(|(edge, _)| edge)
+    }
+
+    async fn build_edge_with_endpoint_kinds(
+        &self,
+        token: &NamespaceToken,
+        spec: &LinkSpec,
+    ) -> RuntimeResult<(Edge, (EdgeEndpointKind, EdgeEndpointKind))> {
         validate_edge_metadata(spec.relation, spec.metadata.as_ref())?;
         let ns_str = match &spec.namespace {
             Some(s) => {
@@ -7575,10 +7755,17 @@ impl KhiveRuntime {
             }
             None => token.namespace().as_str(),
         };
-        self.validate_edge_relation_endpoints(token, spec.source_id, spec.target_id, spec.relation)
+        let endpoint_kinds = self
+            .validate_edge_relation_endpoints(token, spec.source_id, spec.target_id, spec.relation)
             .await?;
         let (source_id, target_id) =
             canonical_edge_endpoints(spec.relation, spec.source_id, spec.target_id);
+        let endpoint_kinds = canonical_edge_endpoint_kinds(
+            spec.source_id,
+            source_id,
+            endpoint_kinds.0,
+            endpoint_kinds.1,
+        );
         let metadata = if spec.relation == EdgeRelation::DependsOn {
             // By-ID, unfiltered — matches the namespace-agnostic endpoint validation
             // above. The visible-set-scoped `resolve` would silently drop the
@@ -7598,19 +7785,22 @@ impl KhiveRuntime {
         };
         validate_edge_metadata(spec.relation, metadata.as_ref())?;
         let now = chrono::Utc::now();
-        Ok(Edge {
-            id: LinkId::from(Uuid::new_v4()),
-            namespace: ns_str.to_string(),
-            source_id,
-            target_id,
-            relation: spec.relation,
-            weight: spec.weight,
-            created_at: now,
-            updated_at: now,
-            deleted_at: None,
-            metadata,
-            target_backend: None,
-        })
+        Ok((
+            Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                namespace: ns_str.to_string(),
+                source_id,
+                target_id,
+                relation: spec.relation,
+                weight: spec.weight,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                metadata,
+                target_backend: None,
+            },
+            endpoint_kinds,
+        ))
     }
 
     /// Validate and atomically upsert a batch of edges.
@@ -7651,8 +7841,11 @@ impl KhiveRuntime {
             return Ok(vec![]);
         }
         let mut edges = Vec::with_capacity(specs.len());
+        let mut endpoint_kinds = Vec::with_capacity(specs.len());
         for spec in &specs {
-            edges.push(self.build_edge(token, spec).await?);
+            let (edge, kinds) = self.build_edge_with_endpoint_kinds(token, spec).await?;
+            edges.push(edge);
+            endpoint_kinds.push(kinds);
         }
         // `upsert_edges_guarded` re-checks every edge's endpoints as part of the
         // same write, not the separate per-spec `build_edge` validation reads
@@ -7691,10 +7884,71 @@ impl KhiveRuntime {
                 }
             };
         }
-        for row in &outcome.rows {
-            self.append_link_mutation_event(token, row).await?;
+        if outcome.rows.len() != endpoint_kinds.len() {
+            return Err(RuntimeError::Internal(
+                "link_many: edge result count differs from validated endpoint count".into(),
+            ));
+        }
+        for (row, (source_kind, target_kind)) in outcome.rows.iter().zip(endpoint_kinds) {
+            self.append_link_mutation_event(token, row, source_kind, target_kind)
+                .await?;
         }
         Ok(outcome.rows)
+    }
+
+    /// Create a historical commit-to-project annotation without replacing a
+    /// curated edge or reviving a tombstone. The store rechecks the exact live
+    /// commit SHA and project under its writer transaction; only a newly
+    /// inserted edge produces the ordinary LinkCreated lifecycle event.
+    pub async fn link_commit_annotation_if_absent(
+        &self,
+        token: &NamespaceToken,
+        commit_id: Uuid,
+        project_id: Uuid,
+        guard: CommitAnnotationGuard,
+    ) -> RuntimeResult<CommitAnnotationInsertOutcome> {
+        if !matches!(guard.expected_sha.len(), 40 | 64)
+            || !guard
+                .expected_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "expected full commit SHA".into(),
+            ));
+        }
+        let edge = self
+            .build_edge(
+                token,
+                &LinkSpec {
+                    namespace: None,
+                    source_id: commit_id,
+                    target_id: project_id,
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                },
+            )
+            .await?;
+        let result = self
+            .graph(token)?
+            .insert_commit_annotation_if_absent(edge, guard)
+            .await?;
+        if let CommitAnnotationInsertOutcome::Created(edge) = &result {
+            self.append_link_mutation_event(
+                token,
+                &EdgeUpsertResult {
+                    edge: edge.clone(),
+                    disposition: EdgeUpsertDisposition::Created,
+                    previous: None,
+                },
+                EdgeEndpointKind::Note,
+                EdgeEndpointKind::Entity,
+            )
+            .await?;
+        }
+        Ok(result)
     }
 
     /// Create a batch of entities atomically.
@@ -19965,6 +20219,71 @@ mod tests {
         );
     }
 
+    // ── Location endpoint pair (ADR-196) ─────────────────────────────────────
+    // The base contract is one row, concept->concept; other base kinds are left
+    // to the first pack that emits them.
+
+    #[tokio::test]
+    async fn link_concept_located_in_concept_allowed_other_base_kinds_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let pneumonia = rt
+            .create_entity(&tok, "concept", None, "Pneumonia", None, None, vec![])
+            .await
+            .unwrap();
+        let lung = rt
+            .create_entity(&tok, "concept", None, "Lung", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(
+                &tok,
+                pneumonia.id,
+                lung.id,
+                EdgeRelation::LocatedIn,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "concept->concept located_in must be allowed by the ADR-196 \
+             endpoint amendment; got {result:?}"
+        );
+        let edge = result.unwrap();
+        assert_eq!(edge.relation, EdgeRelation::LocatedIn);
+        assert!(
+            edge.metadata.is_none(),
+            "located_in carries no governed metadata and infers none; got {:?}",
+            edge.metadata
+        );
+
+        let page = rt
+            .create_entity(&tok, "document", None, "Atlas page", None, None, vec![])
+            .await
+            .unwrap();
+        let concept_to_doc = rt
+            .link(
+                &tok,
+                pneumonia.id,
+                page.id,
+                EdgeRelation::LocatedIn,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            concept_to_doc
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "concept->document located_in must be refused with the \
+             endpoint-contract error; got {concept_to_doc}"
+        );
+    }
+
     #[tokio::test]
     async fn link_org_introduced_by_document_rejected_direction_matters() {
         let rt = rt();
@@ -20684,6 +21003,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_web_receipt_writer_can_establish_provenance() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let forged = serde_json::json!({
+            "tags": ["web.receipt"],
+            "request": {"verb": "web.fetch"},
+            "khive:web_receipt": "v1",
+        });
+        let error = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "forged",
+                None,
+                Some(forged),
+                vec![],
+            )
+            .await
+            .expect_err("generic create must reject receipt provenance");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("khive:web_receipt"))
+        );
+
+        let receipt = rt
+            .create_web_receipt_note(
+                &tok,
+                "web.fetch",
+                serde_json::json!({"verb": "web.fetch"}),
+                vec![],
+            )
+            .await
+            .expect("web writer must publish provenance with its receipt");
+        assert_eq!(
+            receipt.properties.as_ref().unwrap()["khive:web_receipt"],
+            "v1"
+        );
+        let error = rt
+            .update_note(
+                &tok,
+                receipt.id,
+                crate::curation::NotePatch {
+                    properties: Some(serde_json::json!({"request": {"verb": "web.refresh"}})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("generic update must not rewrite a trusted receipt");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("web receipt"))
+        );
+    }
+
+    #[tokio::test]
     async fn create_many_rejects_reserved_secret_gate_key_atomically() {
         let rt = rt();
         let tok = NamespaceToken::local();
@@ -20790,5 +21163,128 @@ mod tests {
         assert_eq!(attachments[0].content_ref, content_ref);
         assert_eq!(attachments[1].role, "fann-network");
         assert_eq!(attachments[1].content_ref, network_ref);
+    }
+
+    #[tokio::test]
+    async fn create_entity_with_attachments_reports_failed_created_event_after_commit() {
+        use khive_db::stores::blob::FsBlobStore;
+        use khive_storage::BlobStore as _;
+
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let blob_store =
+            Arc::new(FsBlobStore::new(blob_dir.path().to_path_buf(), 0).expect("blob store"));
+        let content_ref = blob_store
+            .put(b"bundle".to_vec())
+            .await
+            .expect("publish bundle");
+        let network_ref = blob_store
+            .put(b"network".to_vec())
+            .await
+            .expect("publish network");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+
+        let mut writer = runtime.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_attachment_created_event BEFORE INSERT ON events \
+                 WHEN NEW.kind = 'entity_created' \
+                 BEGIN SELECT RAISE(ABORT, 'injected attachment created-event failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let error = runtime
+            .create_entity_with_attachments(
+                &token,
+                "artifact",
+                None,
+                "artifact with failed created event",
+                None,
+                None,
+                vec![],
+                vec![
+                    NewAttachment {
+                        role: "content".to_string(),
+                        content_ref: content_ref.clone(),
+                        media_type: Some("application/json".to_string()),
+                        size_bytes: Some(6),
+                    },
+                    NewAttachment {
+                        role: "fann-network".to_string(),
+                        content_ref: network_ref.clone(),
+                        media_type: Some("application/octet-stream".to_string()),
+                        size_bytes: Some(7),
+                    },
+                ],
+            )
+            .await
+            .expect_err("the committed entity must report the failed event append");
+        let RuntimeError::Khive(domain) = error.refusal_source() else {
+            panic!("attachment create lost its typed post-commit error: {error:?}");
+        };
+        assert_eq!(domain.kind(), khive_types::ErrorKind::Internal);
+        let details = domain.details().expect("post-commit details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(
+            details.get("operation"),
+            Some("create_entity_with_attachments")
+        );
+        assert_eq!(details.get("committed"), Some("true"));
+        assert_eq!(details.get("retryable"), Some("false"));
+        let entity_id = details
+            .get("record_id")
+            .expect("committed entity id")
+            .parse::<Uuid>()
+            .expect("canonical entity id");
+        let degradations: serde_json::Value = serde_json::from_str(
+            details
+                .get("post_commit_degradations")
+                .expect("complete degradation list"),
+        )
+        .expect("degradations are JSON");
+        let failures = degradations.as_array().expect("degradation array");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["stage"], "event_append");
+        assert!(failures[0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("injected attachment created-event failure")));
+
+        let stored = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("entity row committed");
+        assert_eq!(stored.id, entity_id);
+        assert_eq!(stored.content_ref.as_deref(), Some(content_ref.as_str()));
+        let attachments = runtime
+            .attachments()
+            .expect("main attachment store")
+            .list_attachments(entity_id)
+            .await
+            .expect("attachment rows committed");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].role, "content");
+        assert_eq!(attachments[0].content_ref, content_ref);
+        assert_eq!(attachments[1].role, "fann-network");
+        assert_eq!(attachments[1].content_ref, network_ref);
+
+        let events = runtime
+            .list_events(
+                &token,
+                EventFilter {
+                    target_id: Some(entity_id),
+                    kinds: vec![EventKind::EntityCreated],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .expect("query created events");
+        assert!(events.items.is_empty());
     }
 }

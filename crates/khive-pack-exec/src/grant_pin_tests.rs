@@ -4,7 +4,10 @@ use khive_pack_kg::KgPack;
 use khive_pack_tool::ToolPack;
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
+use khive_storage::types::PageRequest;
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::EventFilter;
+use khive_types::EventKind;
 use khive_types::Namespace;
 use std::path::PathBuf;
 
@@ -131,6 +134,42 @@ impl Fixture {
             label:Some("test_grant_pin_only_mutation".into()),
         }).await.unwrap(), 1);
     }
+}
+
+#[tokio::test]
+async fn exec_preflight_writes_tool_check_decision_receipt() {
+    let fixture = Fixture::new();
+    let (entity, grant) = fixture.register_and_grant().await;
+    let cursor = chrono::Utc::now().timestamp_micros().saturating_sub(1);
+    fixture.run_to_preflight_receipt("grant").await;
+
+    let page = fixture
+        .runtime
+        .list_events(
+            &fixture.token,
+            EventFilter {
+                kinds: vec![EventKind::ToolCheckDecided],
+                verbs: vec!["tool.check".into()],
+                after: Some(cursor),
+                ..EventFilter::default()
+            },
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("exec decision events");
+    assert_eq!(page.items.len(), 1);
+    let data = &page.items[0].payload;
+    assert_eq!(data["actor"], "agent:pin");
+    assert_eq!(data["tool"].as_str(), Some(entity.name.as_str()));
+    assert_eq!(data["registered"], true);
+    assert_eq!(data["decision"], "allow");
+    assert_eq!(data["source"], "grant");
+    assert_eq!(data["id"], grant["id"]);
+    assert_eq!(data["scope"], Value::Null);
+    assert_eq!(data["caller_verb"], "exec.run");
 }
 
 #[tokio::test]

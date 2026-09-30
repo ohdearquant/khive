@@ -144,6 +144,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-116](ADR-116-memory-ann-generation-coherence.md)                   | Durable Per-Model Generation Coherence for the Memory ANN Warm Path                                        |
 | [ADR-117](ADR-117-session-continuity-search.md)                         | Session Continuity — Cross-Session Search and Remote Ingestion                                             |
 | [ADR-117a](ADR-117a-session-identity-tenant-isolation.md)               | Session Identity and Tenant Isolation                                                                      |
+| [ADR-117b](ADR-117b-session-deletion-retention.md)                      | Session Mirror Deletion and Storage-Cap Retention                                                          |
 | [ADR-118](ADR-118-fresh-tail-recall-visibility.md)                      | Fresh-Tail Exact Leg — Read-Your-Writes Visibility for Vector Recall                                       |
 | [ADR-119](ADR-119-daemon-component-supervision.md)                      | Host-Supervised Daemon Components Beside the Verb Plane                                                    |
 | [ADR-120](ADR-120-khive-flow-control-flow-envelope.md)                  | Khive Flow — A Bounded Control-Flow Envelope in the Request DSL                                            |
@@ -222,6 +223,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-193](ADR-193-charter-runs.md)                                      | Charter Runs — Procedural Actions Admitted Only on Recorded Evidence                                       |
 | [ADR-194](ADR-194-sqlite-wal-extent-ceiling.md)                         | Bounded SQLite WAL Extent Ceiling Under a Pinned Reader                                                    |
 | [ADR-195](ADR-195-comm-actor-trust-classes.md)                          | Actor Trust Classes and Per-Pair Message Policy for comm                                                   |
+| [ADR-196](ADR-196-located-in-relation.md)                               | The `located_in` Relation                                                                                  |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -239,8 +241,8 @@ Supporting documents are exhibits cited by an ADR. They are not ADRs, carry no A
 ## Closed Taxonomies — Quick Reference
 
 - **Entity kinds**: 8 shared base kinds in `khive_types` (`concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`) plus KG pack-side `resource` governance for actionable knowledge resources (ADR-001, ADR-048)
-- **Edge relations (17 in 9 categories)** (ADR-002, extended by ADR-055):
-  - Structure: `contains`, `part_of`, `instance_of`
+- **Edge relations (19 in 9 categories)** (ADR-002, extended by ADR-055, ADR-191 and ADR-196):
+  - Structure: `contains`, `part_of`, `instance_of`, `links_to`, `located_in`
   - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
   - Provenance: `derived_from`
   - Temporal: `precedes`
@@ -281,6 +283,7 @@ Amendments to accepted records:
 - [ADR-119 Amendment 6](ADR-119-daemon-component-supervision.md#amendment-6-cancellation-during-inbound-transport-reads-2026-09-14) (2026-09-14): cancellation during inbound transport reads.
 - [ADR-130 Amendment 5](ADR-130-search-response-completeness-and-ranking-evidence.md#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14) (2026-09-14): search limit disclosure at the MCP operation boundary.
 - [ADR-180 Amendment 2](ADR-180-tool-pack.md#amendment-2-2026-09-11-the-grant-digest-and-the-exec-receipt-canonicalize-by-the-same-function) (2026-09-11): the grant digest and the exec receipt canonicalize by the same function.
+- [ADR-181 Amendment 11](ADR-181-exec-verb-sandboxed-run.md#amendment-11-2026-09-29-timeout-residual-for-detached-descendants) (2026-09-29): timeout residual for detached descendants.
 - [ADR-182 Amendment 2, item 10](ADR-182-git-dev-loop-verbs.md#amendment-2-2026-09-08-exact-compares-actor-only-credentials-dispositions-receipts) (2026-09-08): operator read, a policy-gated `git.receipts.all`.
 
 Amendments inside records whose own status is Proposed:

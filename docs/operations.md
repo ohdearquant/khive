@@ -38,6 +38,7 @@ explicitly and describes what the code does.
 | `reindex`                            | yes (vectors + FTS)                        | Re-embed entities/notes/knowledge, fanning out across configured engines                |
 | `exec`                               | depends on the ops given                   | Run a verb DSL expression, or drain due `scheduled_event` notes with `--pending-events` |
 | `mcp`                                | yes (serves writes)                        | Serve the MCP `request` surface (stdio/daemon/transport)                                |
+| `git-annotation-repair`              | apply yes; preview reads repair state      | Reconcile historical commit-to-project annotations for one project                      |
 | `backend list` / `info`              | yes (see caveat below)                     | Enumerate configured backends                                                           |
 
 Read-only vs. mutating is a useful mental split when deciding what's safe to run against a
@@ -586,8 +587,8 @@ computation happens today. Do not script against these as if they perform work.
 `vector capabilities [--human] [--engine <name>] [--db <path>]` prints a **static** capability
 record matching the sqlite-vec backend's compiled-in `OnceLock` (`supports_filter` /
 `supports_batch_search` / `supports_quantization` / `supports_update` / `supports_multi_field`
-all `false`, `supports_orphan_sweep: true`, `max_dimensions: 8192`,
-`index_kinds: ["sqlite_vec"]`). Every capability field is pinned to the backend's
+all `false`, `supports_orphan_sweep: true`, `supports_vector_read: true`,
+`max_dimensions: 8192`, `index_kinds: ["sqlite_vec"]`). Every capability field is pinned to the backend's
 `capabilities()` value by a comparison test. The command does not open the database named by
 `--db` or inspect the configured engines; `--engine` only sets the report's `engine_name` label
 (default `"default"`). The capability values describe the compiled sqlite-vec backend
@@ -634,6 +635,40 @@ stores. A dry run accounts for the same shared budget while leaving `deleted` at
 ---
 
 ## 4. Maintenance
+
+### Historical commit annotation repair (#3532)
+
+Use the selected project's canonical local Git source and a frozen full
+commit OID. Run preview first; save its JSON, including `preview_id`, counts,
+and `complete_coverage`. Apply only that ID to the same project, source,
+namespace, database, and tip:
+
+```bash
+kkernel git-annotation-repair --db /path/to/khive.db --namespace local \
+  --repo /absolute/repo --project <full-project-uuid> --frozen-tip <full-commit-oid>
+kkernel git-annotation-repair --db /path/to/khive.db --namespace local \
+  --repo /absolute/repo --project <full-project-uuid> --frozen-tip <full-commit-oid> \
+  --apply-preview <preview-id>
+```
+
+The preview is a read-only repair pass after ordinary runtime startup, which
+can apply pending schema migrations. `complete_coverage=false` means the
+checkpoint cannot prove the entire acknowledged history; a non-null
+`base_cursor`, unavailable or diverged Git objects, an inconsistent sidecar,
+or a changed cursor row is a stop condition. The command also refuses apply
+when the preview is stale or an acknowledged SHA has a missing, deleted, or
+ambiguous commit note. Tombstoned annotation edges are intentional exclusions,
+not links to recreate.
+
+Apply reports `apply.created`, race/skipped counts, failures, and
+`after_apply` counts. It leaves both commit cursor rows unchanged and checks
+them in each link's write transaction. Success requires complete post-apply
+coverage and zero missing links. If a link fails after earlier inserts, save
+the partial-write count, fix the cause, then take a new preview and apply its
+new ID. The insert is create-only, so this rerun does not duplicate edges or
+overwrite curated weights and metadata. See the
+[accepted ADR-088 Amendment 1 historical shared-commit rider](adr/ADR-088-amendment-1-git-digest.md#adr-088-amendment-1-rider--historical-shared-commit-project-annotations-3532)
+and `crates/khive-pack-git/src/reconcile.rs` for the exact coverage checks.
 
 ### Blob-GC attachment rollout: Phase4a before Phase4b
 

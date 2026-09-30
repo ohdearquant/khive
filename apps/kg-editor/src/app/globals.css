@@ -157,6 +157,7 @@ svg line.ontology-edge[data-edge-treatment="epistemic"] { stroke-dasharray: 8 2;
 svg line.ontology-edge[data-edge-variant="secondary"] { stroke-dashoffset: 2; }
 svg line.ontology-edge[data-edge-variant="tertiary"] { stroke-dashoffset: 4; }
 svg line.ontology-edge[data-edge-variant="quaternary"] { stroke-dashoffset: 6; }
+svg line.ontology-edge[data-edge-variant="quinary"] { stroke-dashoffset: 8; }
 svg line.ontology-edge[data-edge-origin="derived"] { stroke-dasharray: 2 2; }
 
 .ontology-edge-glyph {
@@ -1017,6 +1018,94 @@ i.context,
 
 .change-list {
   padding: 13px;
+}
+
+.review-thread-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 42%) minmax(0, 1fr);
+  min-height: 545px;
+}
+
+.review-thread-list-pane {
+  border-right: 1px solid var(--line);
+  min-width: 0;
+}
+
+.review-thread-pane {
+  min-width: 0;
+  padding: 15px 18px;
+}
+
+.review-thread-pane-heading {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  padding: 11px 14px 0;
+}
+
+.review-thread-pane > .review-thread-pane-heading {
+  padding: 0;
+}
+
+.review-thread-pane-heading h3 {
+  margin: 4px 0;
+}
+
+.review-thread-pane-heading span,
+.review-thread-event-meta {
+  color: var(--ink-faint);
+  font-size: var(--khive-type-xs);
+}
+
+.review-thread-unit-id {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.review-thread-selected-id {
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 9px 0;
+}
+
+.review-thread-evidence-state,
+.review-thread-unlinked {
+  margin: 12px 0;
+}
+
+.review-thread-events {
+  padding: 0;
+}
+
+.review-thread-composer {
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  padding-top: 15px;
+}
+
+.review-thread-composer textarea {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--khive-radius-md);
+  min-height: 92px;
+  padding: 10px;
+  resize: vertical;
+  width: 100%;
+}
+
+.review-thread-composer button {
+  justify-self: end;
+}
+
+.review-thread-unlinked {
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+  font-size: var(--khive-type-xs);
+  padding: 0 18px;
 }
 
 .change-card {
@@ -2097,6 +2186,21 @@ i.context,
   position: relative;
 }
 
+.activity-list .review-activity-event {
+  background: var(--khive-color-transparent);
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+  width: 100%;
+}
+
+.activity-list article.selected .review-activity-event p,
+.activity-list .review-activity-event:hover p {
+  border-color: var(--khive-color-accent-soft);
+}
+
 .activity-list article:not(:last-child)::after {
   background: var(--line);
   bottom: -2px;
@@ -2445,6 +2549,15 @@ i.context,
 }
 
 @media (max-width: 840px) {
+  .review-thread-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .review-thread-list-pane {
+    border-bottom: 1px solid var(--line);
+    border-right: 0;
+  }
+
   .topbar {
     padding: 0 14px;
   }
