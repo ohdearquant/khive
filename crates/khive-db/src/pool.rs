@@ -5,7 +5,7 @@ use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::ops::{Deref, DerefMut};
@@ -677,6 +677,19 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
     )))
 }
 
+/// Pool-scoped counters for ADR-166's search mechanism guards.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SearchMechanismSnapshot {
+    /// Coordinator calls actually issued to each registered backend, keyed by
+    /// the request's canonical kind. A backend skipped by served-kind routing
+    /// has no entry for that kind.
+    pub dispatches_by_backend_and_kind: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Candidate note rows fetched after the text/vector fusion and fresh-tail
+    /// merge, including rows later filtered as deleted. Result metadata fetched
+    /// later by the KG handler is excluded.
+    pub note_candidate_hydration_rows: u64,
+}
+
 /// A read-write connection pool for SQLite.
 ///
 /// Architecture:
@@ -720,6 +733,10 @@ pub struct ConnectionPool {
     /// store and raw-SQL caller inherits it without per-verb bookkeeping
     /// (ADR-165 Slice 2 / ADR-166 G2).
     reader_acquisition_counters: ReaderAcquisitionCounters,
+    /// ADR-166 G4/G5 process-lifetime mechanism counters for this physical
+    /// backend. Backend IDs remain separate even when aliases share a pool.
+    search_dispatches: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
+    note_candidate_hydration_rows: AtomicU64,
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
@@ -1662,6 +1679,8 @@ impl ConnectionPool {
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             write_admission,
             reader_acquisition_counters: ReaderAcquisitionCounters::default(),
+            search_dispatches: Mutex::new(BTreeMap::new()),
+            note_candidate_hydration_rows: AtomicU64::new(0),
             readers,
             max_readers,
             config,
@@ -2019,6 +2038,40 @@ impl ConnectionPool {
     /// was constructed.
     pub fn writer_acquisition_snapshot(&self) -> WriterAcquisitionSnapshot {
         self.writer_acquisition_counters.snapshot()
+    }
+
+    /// Count a coordinator call only after served-kind filtering selects this
+    /// backend. The canonical requested kind is the granular kind when one was
+    /// supplied, or the entity/note substrate otherwise.
+    pub fn record_search_dispatch(&self, backend_id: &str, requested_kind: &str) {
+        let mut dispatches = self.search_dispatches.lock();
+        let count = dispatches
+            .entry(backend_id.to_owned())
+            .or_default()
+            .entry(requested_kind.to_owned())
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// Count one actual candidate note row returned at the post-fusion
+    /// hydration seam, including rows later filtered as deleted. Absent rows
+    /// and later result metadata are excluded.
+    pub fn record_note_candidate_hydration_row(&self) {
+        let _ = self.note_candidate_hydration_rows.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(1)),
+        );
+    }
+
+    /// Snapshot ADR-166 G4/G5 counters. Values reset only with this pool.
+    pub fn search_mechanism_snapshot(&self) -> SearchMechanismSnapshot {
+        SearchMechanismSnapshot {
+            dispatches_by_backend_and_kind: self.search_dispatches.lock().clone(),
+            note_candidate_hydration_rows: self
+                .note_candidate_hydration_rows
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Snapshot reader acquisition, saturation, and hold lifecycle outcomes

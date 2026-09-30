@@ -5175,9 +5175,11 @@ impl KhiveRuntime {
         // match `note_kind` are dropped post-fetch — they're a small set
         // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
+        let search_pool = self.backend().pool_arc();
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
+                search_pool.record_note_candidate_hydration_row();
                 if note.deleted_at.is_some() {
                     continue;
                 }
