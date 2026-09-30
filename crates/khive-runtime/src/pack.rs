@@ -24,9 +24,10 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode, NoteKindSpec,
-    NoteLifecycleSpec, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef,
-    VerbCategory, VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
+    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode,
+    NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec,
+    PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
+    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -313,6 +314,11 @@ pub trait PackRuntime: Send + Sync {
     /// and future enforcement.  Defaults to empty so existing packs compile
     /// without changes.
     fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
+        &[]
+    }
+
+    /// Per-kind write-time embedding policy; unlisted kinds use every model.
+    fn note_embedding_policies(&self) -> &'static [NoteEmbeddingPolicySpec] {
         &[]
     }
 
@@ -4198,6 +4204,14 @@ impl VerbRegistry {
             .collect()
     }
 
+    /// Collect pack-declared embedding policies for registered note kinds.
+    pub fn all_note_embedding_policies(&self) -> Vec<NoteEmbeddingPolicySpec> {
+        self.packs
+            .iter()
+            .flat_map(|pack| pack.note_embedding_policies().iter().copied())
+            .collect()
+    }
+
     /// All pack-contributed validation rules across registered packs.
     ///
     /// Returns references into the pack-owned `'static` slices — no allocation
@@ -4354,6 +4368,8 @@ impl VerbRegistry {
     ///   event with a freshly generated id and no natural key at all.
     /// - `telemetry.emit` can append a durable stream record with a fresh
     ///   identity and sequence, depending on the configured channel policy.
+    /// - `tool.check` appends a `tool_check_decided` receipt with a fresh
+    ///   event id for every evaluated decision (ADR-180 Amendment 6).
     ///
     /// The speech-act category alone cannot rule this out — it describes
     /// what the verb tells the *caller*, not what it schedules against
@@ -4361,7 +4377,7 @@ impl VerbRegistry {
     /// was made idempotent) is a correctness decision requiring the same
     /// scrutiny as the categorization itself.
     pub const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
-        &["memory.recall", "search", "telemetry.emit"];
+        &["memory.recall", "search", "telemetry.emit", "tool.check"];
 
     /// Whether a response lost to the daemon frame budget may be truthfully
     /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
@@ -6650,6 +6666,7 @@ pub(crate) mod tests {
             ("search", "/../khive-pack-kg/src/handler_defs.rs"),
             ("memory.recall", "/../khive-pack-memory/src/pack.rs"),
             ("telemetry.emit", "/../khive-pack-telemetry/src/pack.rs"),
+            ("tool.check", "/../khive-pack-tool/src/vocab.rs"),
         ];
         assert_eq!(
             sources.len(),

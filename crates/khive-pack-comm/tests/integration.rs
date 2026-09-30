@@ -3576,6 +3576,10 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         "schema plan must declare idx_comm_message_outbound_ref; got: {combined}"
     );
     assert!(
+        !combined.contains("idx_comm_message_outbound_due"),
+        "the function-backed channel deadline index must be installed by a numbered core migration"
+    );
+    assert!(
         combined.contains("CREATE INDEX IF NOT EXISTS"),
         "schema plan DDL must be idempotent; got: {combined}"
     );
@@ -11416,15 +11420,16 @@ async fn i66_inbox_limit_zero_carries_real_unread_count() {
     assert_eq!(inbox["unread_count_saturated"], false);
 }
 
-/// A send must land the outbound + inbound note, an FTS document for each, and one vector row PER registered embedding model for EACH note, all inside the single atomic unit.
+/// Each message gets one vector row in the configured default space, while an
+/// ordinary note still writes every configured space.
 #[tokio::test]
-async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
+async fn send_uses_default_space_while_ordinary_note_uses_all_models() {
     use async_trait::async_trait;
-    use khive_runtime::EmbedderProvider;
+    use khive_runtime::{EmbedderProvider, NoteEmbeddingPolicy, NoteEmbeddingPolicySpec};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 
     macro_rules! stub_model {
-        ($provider:ident, $service:ident, $name:literal, $dims:literal) => {
+        ($provider:ident, $service:ident, $name:literal, $dims:expr) => {
             struct $service;
             #[async_trait]
             impl EmbeddingService for $service {
@@ -11460,27 +11465,54 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
     stub_model!(
         SendCountsModelA,
         SendCountsServiceA,
-        "send-counts-model-a",
-        4
+        "all-minilm-l6-v2",
+        EmbeddingModel::AllMiniLmL6V2.dimensions()
     );
     stub_model!(
         SendCountsModelB,
         SendCountsServiceB,
-        "send-counts-model-b",
-        6
+        "paraphrase-multilingual-minilm-l12-v2",
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2.dimensions()
     );
 
-    let (registry, rt) = build_registry_for_ns("agent:sender");
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
+        packs: vec!["kg".into(), "comm".into()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("two configured models");
     rt.register_embedder(SendCountsModelA);
     rt.register_embedder(SendCountsModelB);
+    let mut builder = VerbRegistryBuilder::new();
+    khive_runtime::PackRegistry::register_packs(
+        &["kg".into(), "comm".into()],
+        rt.clone(),
+        &mut builder,
+    )
+    .expect("register kg and comm");
+    builder.with_default_namespace("agent:sender");
+    let registry = builder.build().expect("registry builds");
 
-    registry
-        .dispatch(
-            "comm.send",
-            serde_json::json!({ "to": "agent:sender", "content": "multi-model counts" }),
-        )
-        .await
-        .expect("send succeeds");
+    let send_usage = khive_runtime::usage::UsageContext::new();
+    khive_runtime::usage::scope(send_usage.clone(), async {
+        for content in ["first message", "second message"] {
+            registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({ "to": "agent:sender", "content": content }),
+                )
+                .await
+                .expect("send succeeds");
+        }
+    })
+    .await;
+    assert_eq!(
+        send_usage.snapshot()["embed_calls"],
+        2,
+        "two distinct message texts must cause two embeds, not four"
+    );
 
     let local_tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
@@ -11488,7 +11520,11 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
         .await
         .expect("list_notes");
     let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
-    assert_eq!(alive.len(), 2, "expected outbound + inbound; got {alive:?}");
+    assert_eq!(
+        alive.len(),
+        4,
+        "expected two outbound + inbound pairs; got {alive:?}"
+    );
 
     let fts = rt.text_for_notes(&local_tok).expect("text store");
     for note in &alive {
@@ -11502,14 +11538,96 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
         );
     }
 
-    for model in ["send-counts-model-a", "send-counts-model-b"] {
-        let vs = rt.vectors_for_model(&local_tok, model).expect("vec store");
-        assert_eq!(
-            vs.count().await.expect("count"),
-            2,
-            "expected one vector row per note ({model}): outbound + inbound"
-        );
+    let primary = rt
+        .vectors_for_model(&local_tok, "all-minilm-l6-v2")
+        .expect("primary vector store");
+    let secondary = rt
+        .vectors_for_model(&local_tok, "paraphrase-multilingual-minilm-l12-v2")
+        .expect("secondary vector store");
+    assert_eq!(primary.count().await.expect("primary rows"), 4);
+    assert_eq!(secondary.count().await.expect("secondary rows"), 0);
+
+    let note_usage = khive_runtime::usage::UsageContext::new();
+    khive_runtime::usage::scope(note_usage.clone(), async {
+        rt.create_note(
+            &local_tok,
+            "observation",
+            None,
+            "ordinary note text",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("ordinary note succeeds");
+    })
+    .await;
+    assert_eq!(
+        note_usage.snapshot()["embed_calls"],
+        2,
+        "ordinary note must still embed once per configured model"
+    );
+    assert_eq!(primary.count().await.expect("primary rows"), 5);
+    assert_eq!(secondary.count().await.expect("secondary rows"), 1);
+
+    let mut all_model_us = 0;
+    let mut default_model_us = 0;
+    for (arm, policy) in [
+        (0, NoteEmbeddingPolicy::AllModels),
+        (1, NoteEmbeddingPolicy::DefaultModel),
+        (2, NoteEmbeddingPolicy::DefaultModel),
+        (3, NoteEmbeddingPolicy::AllModels),
+    ] {
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy,
+        }]);
+        let secondary_before = secondary.count().await.expect("secondary rows before arm");
+        let started = std::time::Instant::now();
+        for round in 0..8 {
+            let message = format!("contention message {arm} {round}");
+            let contender = format!("contention note {arm} {round}");
+            let (send, note) = tokio::join!(
+                registry.dispatch(
+                    "comm.send",
+                    serde_json::json!({ "to": "agent:sender", "content": message }),
+                ),
+                rt.create_note(
+                    &local_tok,
+                    "observation",
+                    None,
+                    &contender,
+                    None,
+                    None,
+                    vec![]
+                )
+            );
+            send.expect("contended send succeeds");
+            note.expect("contending note succeeds");
+        }
+        let elapsed_us = started.elapsed().as_micros();
+        let secondary_delta =
+            secondary.count().await.expect("secondary rows after arm") - secondary_before;
+        match policy {
+            NoteEmbeddingPolicy::AllModels => {
+                assert_eq!(
+                    secondary_delta, 24,
+                    "eight sends and notes each write secondary rows"
+                );
+                all_model_us += elapsed_us;
+            }
+            NoteEmbeddingPolicy::DefaultModel => {
+                assert_eq!(
+                    secondary_delta, 8,
+                    "only eight ordinary notes write secondary rows"
+                );
+                default_model_us += elapsed_us;
+            }
+        }
     }
+    eprintln!(
+        "paired writer-contention diagnostic (16 sends and 16 competing notes per policy): all_models_us={all_model_us} default_model_us={default_model_us}"
+    );
 }
 
 async fn insert_i1422_message(
@@ -16359,5 +16477,25 @@ mod mailbox_views {
             .unwrap();
         assert_eq!(count["unread_count"], 1000);
         assert_eq!(count["unread_count_saturated"], true);
+    }
+}
+
+#[tokio::test]
+async fn wire_ingest_cannot_select_verified_recipient_commit() {
+    let (registry, runtime) = build_registry();
+    registry.dispatch("comm.ingest",serde_json::json!({"from":"remote","to":"local","content":"ordinary wire message","verified":true,"verified_recipient":true,"receipt_ticket":{"logical_message_id":uuid::Uuid::new_v4(),"sender_agent_id":uuid::Uuid::new_v4()},"disposition":"stored"})).await.expect("ordinary ingest remains accepted");
+    let guard = runtime.backend().pool().writer().unwrap();
+    for table in [
+        "comm_recipient_replay",
+        "comm_ack_work",
+        "comm_recipient_quarantine",
+    ] {
+        let count: i64 = guard
+            .conn()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "wire parameters must not select verified ingest");
     }
 }

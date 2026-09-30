@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 use khive_db::{ConnectionPool, StorageBackend};
 #[cfg(test)]
@@ -260,6 +260,13 @@ struct CoreEmbedderState {
     additional_embedding_models: Vec<EmbeddingModel>,
 }
 
+#[derive(Clone)]
+struct NoteKindEntry {
+    name: String,
+    embedding_policy: crate::NoteEmbeddingPolicy,
+    registered: bool,
+}
+
 /// An already-open serving backend eligible for operator diagnostics.
 /// Aliases of the same canonical database file share one entry.
 #[derive(Clone)]
@@ -267,6 +274,19 @@ pub struct OpenedDiagnosticBackend {
     pub backend_names: Vec<String>,
     pub canonical_path: Option<PathBuf>,
     pub pool: Arc<ConnectionPool>,
+}
+
+struct LateOpenedDiagnosticBackend {
+    backend_names: Vec<&'static str>,
+    pool: Weak<ConnectionPool>,
+}
+
+fn same_diagnostic_database(a: &OpenedDiagnosticBackend, b: &OpenedDiagnosticBackend) -> bool {
+    match (a.pool.canonical_path(), b.pool.canonical_path()) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => Arc::ptr_eq(&a.pool, &b.pool),
+        _ => false,
+    }
 }
 
 /// for each storage capability, plus a lazily-loaded embedder.
@@ -288,8 +308,12 @@ pub struct KhiveRuntime {
     /// All SQLite backends declared by the host process, including those
     /// assigned to other packs. The code pack fences these from ingest.
     declared_backend_db_paths: Arc<[PathBuf]>,
-    /// Pools opened by the serving host, grouped by canonical database file.
+    /// Pools opened during serving host composition, grouped by canonical
+    /// database file.
     diagnostic_backends: Arc<[OpenedDiagnosticBackend]>,
+    /// Pools opened later by this serving runtime and its pack handles.
+    /// Weak references keep diagnostics from extending their lifetime.
+    late_diagnostic_backends: Arc<Mutex<Vec<LateOpenedDiagnosticBackend>>>,
     /// ADR-118 exact-leg policy, sampled once at runtime construction.
     /// Request-time memory/knowledge serving must never re-read the process
     /// environment because tests and embedded runtimes share one process.
@@ -313,7 +337,7 @@ pub struct KhiveRuntime {
     /// via `Arc<RwLock<_>>`; installed once by the transport after the
     /// `VerbRegistry` is built. Empty until installed
     edge_rules: Arc<RwLock<Vec<EdgeEndpointRule>>>,
-    /// Pack-aggregated valid entity and note kind strings.
+    /// Pack-aggregated valid entity kinds and note-kind policy entries.
     ///
     /// Installed by the transport layer after building the `VerbRegistry`.
     /// When non-empty, `create_entity`, `create_note_inner`, and `import_kg`
@@ -321,7 +345,7 @@ pub struct KhiveRuntime {
     /// bare runtime in unit tests), kind validation is skipped — the pack
     /// handler layer is the primary enforcement point.
     valid_entity_kinds: Arc<RwLock<Vec<String>>>,
-    valid_note_kinds: Arc<RwLock<Vec<String>>>,
+    valid_note_kinds: Arc<RwLock<Vec<NoteKindEntry>>>,
     /// Pack-installed entity-type validator.
     ///
     /// When `Some`, `create_many` calls this function to validate and normalise
@@ -573,6 +597,7 @@ impl KhiveRuntime {
             config,
             declared_backend_db_paths: Vec::new().into(),
             diagnostic_backends: Vec::new().into(),
+            late_diagnostic_backends: Arc::new(Mutex::new(Vec::new())),
             ann_fresh_tail_enabled,
             embedder_registry: Arc::new(std::sync::RwLock::new(registry)),
             default_embedder_name,
@@ -720,6 +745,7 @@ impl KhiveRuntime {
                     config: core_config,
                     declared_backend_db_paths: self.declared_backend_db_paths.clone(),
                     diagnostic_backends: self.diagnostic_backends.clone(),
+                    late_diagnostic_backends: self.late_diagnostic_backends.clone(),
                     ann_fresh_tail_enabled: self.ann_fresh_tail_enabled,
                     embedder_registry,
                     default_embedder_name,
@@ -792,18 +818,90 @@ impl KhiveRuntime {
         self
     }
 
+    /// Share late-opened diagnostics with pack runtimes from the same serving
+    /// host. Independent runtimes retain independent observers.
+    pub fn with_diagnostic_observer_from(mut self, main: &KhiveRuntime) -> Self {
+        self.late_diagnostic_backends = Arc::clone(&main.late_diagnostic_backends);
+        self
+    }
+
+    fn register_late_diagnostic_pool(
+        &self,
+        backend_name: &'static str,
+        pool: &Arc<ConnectionPool>,
+    ) {
+        let mut backends = self
+            .late_diagnostic_backends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        backends.retain(|entry| entry.pool.strong_count() > 0);
+        if let Some(existing) = backends.iter_mut().find(|entry| {
+            entry
+                .pool
+                .upgrade()
+                .is_some_and(|live| Arc::ptr_eq(&live, pool))
+        }) {
+            if !existing.backend_names.contains(&backend_name) {
+                existing.backend_names.push(backend_name);
+            }
+            return;
+        }
+        backends.push(LateOpenedDiagnosticBackend {
+            backend_names: vec![backend_name],
+            pool: Arc::downgrade(pool),
+        });
+    }
+
+    fn live_late_diagnostic_backends(&self) -> Vec<OpenedDiagnosticBackend> {
+        let mut backends = self
+            .late_diagnostic_backends
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut live = Vec::new();
+        backends.retain(|entry| {
+            let Some(pool) = entry.pool.upgrade() else {
+                return false;
+            };
+            live.push(OpenedDiagnosticBackend {
+                backend_names: entry
+                    .backend_names
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
+                canonical_path: pool.canonical_path().map(PathBuf::from),
+                pool,
+            });
+            true
+        });
+        live
+    }
+
     pub fn diagnostic_backends(&self) -> Arc<[OpenedDiagnosticBackend]> {
-        if self.diagnostic_backends.is_empty() {
+        let mut opened: Vec<OpenedDiagnosticBackend> = if self.diagnostic_backends.is_empty() {
             let main = self.core().backend.pool_arc();
             vec![OpenedDiagnosticBackend {
                 backend_names: vec![BackendId::MAIN.to_string()],
                 canonical_path: main.canonical_path().map(PathBuf::from),
                 pool: main,
             }]
-            .into()
         } else {
-            self.diagnostic_backends.clone()
+            self.diagnostic_backends.iter().cloned().collect()
+        };
+        for late in self.live_late_diagnostic_backends() {
+            if let Some(existing) = opened
+                .iter_mut()
+                .find(|existing| same_diagnostic_database(existing, &late))
+            {
+                for name in late.backend_names {
+                    if !existing.backend_names.contains(&name) {
+                        existing.backend_names.push(name);
+                    }
+                }
+            } else {
+                opened.push(late);
+            }
         }
+        opened.into()
     }
 
     /// Whether this runtime selects the vector arm for a hybrid search —
@@ -1079,12 +1177,13 @@ impl KhiveRuntime {
                     if !split.db_path.exists() {
                         return Ok(legacy);
                     }
-                    let lane = crate::events_split::direct_backend_with_max_readers(
+                    let lane_backend = crate::events_split::direct_backend_with_max_readers(
                         &split.db_path,
                         true,
                         Some(self.backend.pool().config().max_readers),
-                    )?
-                    .events_for_namespace(namespace)?;
+                    )?;
+                    self.register_late_diagnostic_pool("events", &lane_backend.pool_arc());
+                    let lane = lane_backend.events_for_namespace(namespace)?;
                     return Ok(Arc::new(crate::events_split::SplitEventStore::new(
                         legacy, lane,
                     )));
@@ -1105,12 +1204,15 @@ impl KhiveRuntime {
                                 .to_string(),
                         ));
                     }
-                    None => crate::events_split::direct_backend_with_max_readers(
-                        &split.db_path,
-                        false,
-                        Some(self.backend.pool().config().max_readers),
-                    )?
-                    .events_for_namespace(namespace)?,
+                    None => {
+                        let lane_backend = crate::events_split::direct_backend_with_max_readers(
+                            &split.db_path,
+                            false,
+                            Some(self.backend.pool().config().max_readers),
+                        )?;
+                        self.register_late_diagnostic_pool("events", &lane_backend.pool_arc());
+                        lane_backend.events_for_namespace(namespace)?
+                    }
                 };
                 Ok(Arc::new(crate::events_split::SplitEventStore::new(
                     legacy, lane,
@@ -1161,6 +1263,7 @@ impl KhiveRuntime {
                         Some(self.backend.pool().config().max_readers),
                     )?
                 };
+                self.register_late_diagnostic_pool("events", &backend.pool_arc());
                 Ok(Some(backend.sql()))
             }
         }
@@ -1778,7 +1881,64 @@ impl KhiveRuntime {
             *guard = entity_kinds;
         }
         if let Ok(mut guard) = self.valid_note_kinds.write() {
-            *guard = note_kinds;
+            let prior = std::mem::take(&mut *guard);
+            *guard = note_kinds
+                .into_iter()
+                .map(|name| NoteKindEntry {
+                    embedding_policy: prior
+                        .iter()
+                        .find(|entry| entry.name == name)
+                        .map(|entry| entry.embedding_policy)
+                        .unwrap_or_default(),
+                    name,
+                    registered: true,
+                })
+                .collect();
+        }
+    }
+
+    /// Install pack-declared embedding policy on the note-kind registry.
+    /// The transport calls this for every runtime after pack registration.
+    pub fn install_note_embedding_policies(&self, policies: &[crate::NoteEmbeddingPolicySpec]) {
+        if let Ok(mut guard) = self.valid_note_kinds.write() {
+            for spec in policies {
+                if let Some(entry) = guard.iter_mut().find(|entry| entry.name == spec.kind) {
+                    entry.embedding_policy = spec.policy;
+                } else {
+                    guard.push(NoteKindEntry {
+                        name: spec.kind.to_owned(),
+                        embedding_policy: spec.policy,
+                        registered: false,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Registered models selected by the installed embedding policy for a note kind.
+    /// Unknown kinds retain the all-models default.
+    pub fn embedding_models_for_note_kind(&self, kind: &str) -> Vec<String> {
+        let policy = self
+            .valid_note_kinds
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .iter()
+                    .find(|entry| entry.name == kind)
+                    .map(|entry| entry.embedding_policy)
+            })
+            .unwrap_or_default();
+        let models = self.registered_embedding_model_names();
+        match policy {
+            crate::NoteEmbeddingPolicy::AllModels => models,
+            crate::NoteEmbeddingPolicy::DefaultModel => {
+                let default = self.default_embedder_name();
+                models
+                    .into_iter()
+                    .filter(|name| name.as_str() == default)
+                    .collect()
+            }
         }
     }
 
@@ -1833,15 +1993,24 @@ impl KhiveRuntime {
         let guard = self.valid_note_kinds.read().map_err(|_| {
             crate::RuntimeError::Internal("note kind registry lock poisoned".into())
         })?;
-        if guard.is_empty() {
+        if !guard.iter().any(|entry| entry.registered) {
             return Ok(());
         }
-        if guard.iter().any(|k| k == kind) {
+        if guard
+            .iter()
+            .any(|entry| entry.registered && entry.name == kind)
+        {
             Ok(())
         } else {
+            let valid = guard
+                .iter()
+                .filter(|entry| entry.registered)
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             Err(crate::RuntimeError::InvalidInput(format!(
                 "unknown note kind {kind:?}; valid: {}",
-                guard.join(", ")
+                valid
             )))
         }
     }
@@ -2618,6 +2787,189 @@ mod tests {
             .writer_contention
             .audit_append_failures_unavailable_reason
             .is_none());
+    }
+
+    #[test]
+    fn diagnostics_tracks_late_events_sidecar_without_retaining_its_pool() {
+        let dir = tempfile::tempdir().expect("diagnostics database directory");
+        let guard = crate::events_split::TestRegistryGuard::new(dir.path());
+        let sidecar_path = dir.path().join("main.db.events.db");
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = Some(dir.path().join("main.db"));
+        config.events_split = Some(crate::events_split::EventsSplitConfig {
+            db_path: sidecar_path.clone(),
+            socket_path: None,
+        });
+        let runtime = KhiveRuntime::new_for_test(config).expect("main runtime");
+        let clone = runtime.clone();
+
+        assert!(!sidecar_path.exists());
+        assert_eq!(
+            runtime
+                .diagnostic_backends()
+                .iter()
+                .filter(|backend| backend.canonical_path.as_deref() == Some(sidecar_path.as_path()))
+                .count(),
+            0,
+            "an unopened sidecar must not appear in diagnostics"
+        );
+        assert!(runtime
+            .events_sidecar_sql_read_only()
+            .expect("missing sidecar lookup")
+            .is_none());
+        assert!(
+            !sidecar_path.exists(),
+            "inspection must not create the sidecar"
+        );
+
+        std::fs::File::create(&sidecar_path).expect("preexisting events sidecar");
+        let sql = runtime
+            .events_sidecar_sql_read_only()
+            .expect("sidecar SQL lookup")
+            .expect("preexisting sidecar opens");
+        let canonical_sidecar = sidecar_path.canonicalize().expect("canonical sidecar path");
+        let snapshot = clone.diagnostic_backends();
+        let entries: Vec<_> = snapshot
+            .iter()
+            .filter(|backend| {
+                backend.canonical_path.as_deref() == Some(canonical_sidecar.as_path())
+            })
+            .collect();
+        assert_eq!(entries.len(), 1, "sidecar opens after runtime composition");
+        assert_eq!(entries[0].backend_names, vec!["events".to_string()]);
+        let weak_sidecar_pool = Arc::downgrade(&entries[0].pool);
+
+        let event_store = runtime
+            .raw_events_for_namespace("local")
+            .expect("direct events store");
+        let repeated = runtime.diagnostic_backends();
+        assert_eq!(
+            repeated
+                .iter()
+                .filter(|backend| backend.canonical_path.as_deref()
+                    == Some(canonical_sidecar.as_path()))
+                .count(),
+            1,
+            "the SQL and event-store paths must report one physical file"
+        );
+
+        let boot_alias =
+            StorageBackend::sqlite_for_test(dir.path().join(".").join("main.db.events.db"))
+                .expect("second pool for canonical-file alias");
+        let boot_alias_pool = boot_alias.pool_arc();
+        let main_pool = runtime.backend().pool_arc();
+        let with_boot_alias = runtime.clone().with_diagnostic_backends(
+            vec![
+                OpenedDiagnosticBackend {
+                    backend_names: vec!["main".into()],
+                    canonical_path: main_pool.canonical_path().map(PathBuf::from),
+                    pool: main_pool,
+                },
+                OpenedDiagnosticBackend {
+                    backend_names: vec!["boot_alias".into()],
+                    canonical_path: boot_alias_pool.canonical_path().map(PathBuf::from),
+                    pool: Arc::clone(&boot_alias_pool),
+                },
+            ]
+            .into(),
+        );
+        let with_boot_alias_snapshot = with_boot_alias.diagnostic_backends();
+        let merged: Vec<_> = with_boot_alias_snapshot
+            .iter()
+            .filter(|backend| {
+                backend.canonical_path.as_deref() == Some(canonical_sidecar.as_path())
+            })
+            .collect();
+        assert_eq!(merged.len(), 1, "two pools over one canonical file");
+        assert_eq!(
+            merged[0].backend_names,
+            vec!["boot_alias".to_string(), "events".to_string()]
+        );
+        assert!(Arc::ptr_eq(&merged[0].pool, &boot_alias_pool));
+
+        drop(with_boot_alias_snapshot);
+        drop(with_boot_alias);
+        drop(boot_alias_pool);
+        drop(boot_alias);
+        drop(repeated);
+        drop(snapshot);
+        drop(guard);
+        assert!(weak_sidecar_pool.upgrade().is_some());
+        assert!(runtime.diagnostic_backends().iter().any(|backend| {
+            backend.canonical_path.as_deref() == Some(canonical_sidecar.as_path())
+        }));
+
+        drop(event_store);
+        drop(sql);
+        assert!(weak_sidecar_pool.upgrade().is_none());
+        assert_eq!(
+            runtime
+                .diagnostic_backends()
+                .iter()
+                .filter(|backend| backend.canonical_path.as_deref()
+                    == Some(canonical_sidecar.as_path()))
+                .count(),
+            0,
+            "diagnostics must not retain a pool after its owner releases it"
+        );
+    }
+
+    #[test]
+    fn diagnostics_tracks_direct_events_open_after_runtime_composition() {
+        let dir = tempfile::tempdir().expect("diagnostics database directory");
+        let guard = crate::events_split::TestRegistryGuard::new(dir.path());
+        let sidecar_path = dir.path().join("main.db.events.db");
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = Some(dir.path().join("main.db"));
+        config.events_split = Some(crate::events_split::EventsSplitConfig {
+            db_path: sidecar_path.clone(),
+            socket_path: None,
+        });
+        let runtime = KhiveRuntime::new_for_test(config.clone()).expect("main runtime");
+
+        assert!(!sidecar_path.exists());
+        let events = runtime
+            .raw_events_for_namespace("local")
+            .expect("direct event store opens sidecar");
+        let canonical_sidecar = sidecar_path.canonicalize().expect("canonical sidecar path");
+        let opened = runtime.clone().diagnostic_backends();
+        let matching: Vec<_> = opened
+            .iter()
+            .filter(|backend| {
+                backend.canonical_path.as_deref() == Some(canonical_sidecar.as_path())
+            })
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].backend_names, vec!["events".to_string()]);
+        let weak_sidecar_pool = Arc::downgrade(&matching[0].pool);
+
+        let pack_runtime = KhiveRuntime::memory()
+            .expect("pack runtime")
+            .with_diagnostic_observer_from(&runtime);
+        assert!(pack_runtime.diagnostic_backends().iter().any(|backend| {
+            backend.canonical_path.as_deref() == Some(canonical_sidecar.as_path())
+        }));
+
+        let unrelated = KhiveRuntime::new_for_test(config).expect("independent runtime");
+        assert_eq!(
+            unrelated.diagnostic_backends().len(),
+            1,
+            "an independent runtime must not inherit another runtime's events pool"
+        );
+
+        drop(opened);
+        drop(guard);
+        assert!(weak_sidecar_pool.upgrade().is_some());
+        assert!(runtime.diagnostic_backends().iter().any(|backend| {
+            backend.canonical_path.as_deref() == Some(canonical_sidecar.as_path())
+        }));
+
+        drop(events);
+        assert!(weak_sidecar_pool.upgrade().is_none());
+        assert!(runtime
+            .diagnostic_backends()
+            .iter()
+            .all(|backend| backend.canonical_path.as_deref() != Some(canonical_sidecar.as_path())));
     }
 
     #[test]

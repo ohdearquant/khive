@@ -7,6 +7,25 @@ function-specific technical reference for the pool's private/internal
 mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 ("Single-Writer Write Queue") for the ADR-067 rationale.
 
+## Physical database identity
+
+On the first writable open of a new or legacy file-backed database, the pool
+creates `main._khive_database_identity`, a singleton table containing a UUID.
+This is a persistent startup write and a schema change. The pool reads the
+UUID from each subsequently opened connection to detect a swapped main file.
+It is pool infrastructure rather than a service table: the pool needs the
+identity before `apply_schema()`, and it also opens secondary databases with
+independent migration ledgers. For that reason, this table is installed by the
+pool instead of a numbered service migration. Read-only pools never install it.
+
+At or below the write reserve, a writable pool skips installation when the
+table is absent, so startup and checkpoint infrastructure remain available.
+Write admissions still fail at the reserve. A pool with no UUID pinned accepts
+a later installation by another process; on Unix, device/inode checks still
+guard new connections to its opened file. The next writable pool open above
+the reserve installs and pins the UUID. The startup transaction uses the
+configured busy timeout.
+
 ## SQLite write reserve
 
 Writable file-backed pools use `KHIVE_DB_FREE_SPACE_FLOOR_BYTES` as their
@@ -254,12 +273,15 @@ to pooled routing for its next ordinary query.
 ### Reader diagnostics
 
 The verb's existing root fields describe main. Its additive `databases` array has one entry
-per canonical file (or distinct in-memory pool) already opened by the serving host. Each
-entry has all alias `backend_names`, canonical `path`, and either the same per-file
+per canonical file (or distinct in-memory pool) opened by this serving runtime and its
+pack handles, including events sidecars opened through runtime accessors after host
+composition. Each entry has all alias
+`backend_names`, canonical `path`, and either the same per-file
 `diagnostics` field set or an `error` for that file. A
 failed inspection does not suppress the other entries. This collector does not open any
 unopened database path. Process checkpoint and audit counters are shared across entries;
-reader and writer counters belong to each entry's pool.
+reader and writer counters belong to each entry's representative pool. Diagnostics
+holds late-opened pools only while collecting the report.
 
 `db_diagnostics.reader_contention` is pool-scoped and resets only when the
 `ConnectionPool` is reconstructed. It reports:

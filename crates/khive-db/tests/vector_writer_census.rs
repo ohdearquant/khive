@@ -85,6 +85,13 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
         1,
     ),
     (
+        "khive-runtime/src/curation.rs",
+        "reindex_note_with_plan",
+        "DELETE",
+        "{table}",
+        1,
+    ),
+    (
         "khive-db/src/namespace_move.rs",
         "move_vectors",
         "DELETE",
@@ -136,6 +143,15 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
         "ensure_fts_rowid_map_backfilled",
         "INSERT",
         "{state}",
+        1,
+    ),
+    // Database identity bootstrap writes one fixed metadata table, never a
+    // vec0 or note table. Keep the dynamic DML site visible to this census.
+    (
+        "khive-db/src/pool.rs",
+        "initialize_database_id",
+        "INSERT",
+        "main.{DATABASE_ID_TABLE}",
         1,
     ),
     (
