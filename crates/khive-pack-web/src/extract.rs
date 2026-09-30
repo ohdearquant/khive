@@ -405,7 +405,7 @@ async fn resolve_target(
             let url = Url::parse(url_str)
                 .map_err(|error| RuntimeError::InvalidInput(format!("invalid url: {error}")))?;
             let canonical = identity::canonicalize(url);
-            let site = identity::site_id(&canonical);
+            let site = identity::site_id(token.namespace(), &canonical);
             identity::document_id(site, &identity::path_and_query(&canonical))
         }
         (Some(_), Some(_)) => {
@@ -791,7 +791,7 @@ async fn extract_links(
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(token.namespace(), &canonical);
         let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
         present.insert(target_id);
         let evidence = json!({
@@ -999,7 +999,7 @@ async fn extract_entries(
         if !seen.insert(canonical.clone()) {
             continue;
         }
-        let entry_site = identity::site_id(&canonical);
+        let entry_site = identity::site_id(token.namespace(), &canonical);
         let target_id = identity::document_id(entry_site, &identity::path_and_query(&canonical));
         crate::entities::get_or_create(
             runtime,
@@ -1257,7 +1257,8 @@ async fn run_extract_with_link_selection(
         .to_string();
     let base_url = Url::parse(&url_str)
         .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))?;
-    let site_id = identity::site_id(&identity::canonicalize(base_url.clone()));
+    let canonical = identity::canonicalize(base_url.clone());
+    let site_id = crate::fetch::canonical_site(runtime, token, &canonical).await?;
     let entity_type = entity.entity_type.as_deref().unwrap_or("resource");
     let content_type = properties.get("content_type").and_then(Value::as_str);
 
@@ -1816,7 +1817,7 @@ mod tests {
     ) -> Uuid {
         let url = Url::parse(url_str).unwrap();
         let canonical = identity::canonicalize(url);
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical);
         crate::entities::get_or_create(
             runtime,
             token,
@@ -2020,6 +2021,7 @@ mod tests {
                 .await
                 .unwrap();
             let site = identity::site_id(
+                &khive_types::Namespace::local(),
                 &Url::parse("https://duplicate-kind.example.test/map.xml").unwrap(),
             );
             let neighbors = runtime
@@ -2081,8 +2083,10 @@ mod tests {
         assert_eq!(reply["result"]["feed"]["entries"], 0);
         assert_eq!(reply["result"]["feed"]["skipped"], 2);
 
-        let site =
-            identity::site_id(&Url::parse("https://publisher.example.test/map.xml").unwrap());
+        let site = identity::site_id(
+            &khive_types::Namespace::local(),
+            &Url::parse("https://publisher.example.test/map.xml").unwrap(),
+        );
         let neighbors = runtime
             .neighbors(
                 &token,
@@ -2100,7 +2104,7 @@ mod tests {
         );
         let fourth = Url::parse("https://entries.example.test/3").unwrap();
         let fourth_id = identity::document_id(
-            identity::site_id(&fourth),
+            identity::site_id(&khive_types::Namespace::local(), &fourth),
             &identity::path_and_query(&fourth),
         );
         assert!(runtime
@@ -2393,8 +2397,10 @@ mod tests {
             .unwrap();
         assert_eq!(edges.len(), 3);
         let same = identity::canonicalize(Url::parse("https://links.example.test/same").unwrap());
-        let same_id =
-            identity::document_id(identity::site_id(&same), &identity::path_and_query(&same));
+        let same_id = identity::document_id(
+            identity::site_id(&khive_types::Namespace::local(), &same),
+            &identity::path_and_query(&same),
+        );
         let same_edge = edges.iter().find(|edge| edge.target_id == same_id).unwrap();
         let metadata = same_edge.metadata.as_ref().unwrap();
         assert_eq!(metadata["occurrence_count"], 2);
@@ -3532,7 +3538,7 @@ mod tests {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://origin.example.test/never-fetched").unwrap();
         let canonical = identity::canonicalize(url);
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical);
         let id = identity::document_id(site, &identity::path_and_query(&canonical));
         crate::entities::get_or_create(
             &runtime,
