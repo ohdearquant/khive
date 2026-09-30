@@ -9,22 +9,22 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FileNamesInformation, NtCreateFile, NtQueryDirectoryFile, FILE_CREATE, FILE_NAMES_INFORMATION,
-    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT,
+    FileNamesInformation, NtCreateFile, NtQueryDirectoryFile, FILE_CREATE, FILE_DIRECTORY_FILE,
+    FILE_NAMES_INFORMATION, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
     RtlNtStatusToDosError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     OBJ_CASE_INSENSITIVE, STATUS_NO_MORE_FILES, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FileRenameInfoEx,
+    CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FileIdInfo, FileRenameInfoEx,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY,
     FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
-    VOLUME_NAME_DOS,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, OPEN_EXISTING,
+    SYNCHRONIZE, VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::WindowsProgramming::{
     FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
@@ -68,19 +68,100 @@ fn open_checkpoint_directory_with_access(
         return Err(std::io::Error::from(std::io::ErrorKind::NotADirectory));
     }
     let expected = std::fs::canonicalize(dir)?;
+    open_verified_directory_with(dir, &expected, desired_access, || {})
+        .map_err(std::io::Error::other)
+}
+
+fn open_verified_directory_with(
+    dir: &Path,
+    expected: &Path,
+    desired_access: u32,
+    before_retained_open: impl FnOnce(),
+) -> Result<std::fs::File, ExternalIdsWriteError> {
+    let pinned = open_directory_component_walk(expected)?;
+    let expected_identity = directory_identity(&pinned)?;
     let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
-    let handle = open_directory(dir, desired_access).map_err(std::io::Error::other)?;
-    verify_handle_kind(&handle, true, "inspect opened checkpoint dir")
-        .map_err(std::io::Error::other)?;
-    if !windows_final_path_matches(
-        &expected_wide,
-        &final_path(&handle).map_err(std::io::Error::other)?,
-    ) {
-        return Err(std::io::Error::other(
-            "checkpoint directory identity changed",
+    if !windows_final_path_matches(&expected_wide, &final_path(&pinned)?) {
+        return Err(ExternalIdsWriteError::DirectoryIdentityChanged);
+    }
+
+    before_retained_open();
+    let retained = open_directory(dir, desired_access)?;
+    verify_handle_kind(&retained, true, "inspect retained checkpoint dir")?;
+    // A directory replaced at the same pathname has the same final path but
+    // a different native identity. Keep the checked handle alive until the
+    // independently opened handle is bound to it.
+    if directory_identity(&retained)? != expected_identity {
+        return Err(ExternalIdsWriteError::DirectoryIdentityChanged);
+    }
+    if !windows_final_path_matches(&expected_wide, &final_path(&retained)?) {
+        return Err(ExternalIdsWriteError::DirectoryIdentityChanged);
+    }
+    Ok(retained)
+}
+
+fn open_directory_component_walk(path: &Path) -> Result<std::fs::File, ExternalIdsWriteError> {
+    use std::path::Component;
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Err(ExternalIdsWriteError::InvalidPath {
+            context: "pin checkpoint root",
+            detail: "canonical directory has no Windows prefix".into(),
+        });
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(ExternalIdsWriteError::InvalidPath {
+            context: "pin checkpoint root",
+            detail: "canonical directory is not rooted".into(),
+        });
+    }
+    let mut root = std::path::PathBuf::from(prefix.as_os_str());
+    root.push("\\");
+    let access = FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE;
+    let mut current = open_directory(&root, access)?;
+    verify_handle_kind(&current, true, "inspect checkpoint root handle")?;
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(ExternalIdsWriteError::InvalidPath {
+                context: "pin checkpoint directory component",
+                detail: "canonical directory contains a non-normal component".into(),
+            });
+        };
+        let child =
+            open_relative_with_options(&current, name, access, FILE_OPEN, FILE_DIRECTORY_FILE)
+                .map_err(|error| {
+                    ExternalIdsWriteError::io("open checkpoint directory component", error)
+                })?;
+        verify_handle_kind(
+            &child,
+            true,
+            "inspect checkpoint directory component handle",
+        )?;
+        current = child;
+    }
+    Ok(current)
+}
+
+fn directory_identity(directory: &std::fs::File) -> Result<(u64, [u8; 16]), ExternalIdsWriteError> {
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: the live handle and correctly sized writable FileIdInfo buffer
+    // remain valid for this synchronous query.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            directory.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(ExternalIdsWriteError::io(
+            "inspect checkpoint directory file identity",
+            std::io::Error::last_os_error(),
         ));
     }
-    Ok(handle)
+    Ok((info.VolumeSerialNumber, info.FileId.Identifier))
 }
 
 pub(crate) fn list_checkpoint_names_bounded(
@@ -237,15 +318,8 @@ fn write_via_dir_handle_with(
     lexical_prefilter(dir)?;
     let expected = std::fs::canonicalize(dir)
         .map_err(|error| ExternalIdsWriteError::io("canonicalize segment dir", error))?;
-    let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
     lexical_prefilter(dir)?;
-
-    let dir_file = open_directory(dir, FILE_READ_ATTRIBUTES)?;
-    verify_handle_kind(&dir_file, true, "inspect opened segment dir")?;
-    let opened_path = final_path(&dir_file)?;
-    if !windows_final_path_matches(&expected_wide, &opened_path) {
-        return Err(ExternalIdsWriteError::DirectoryIdentityChanged);
-    }
+    let dir_file = open_verified_directory_with(dir, &expected, FILE_READ_ATTRIBUTES, || {})?;
 
     remove_relative_if_exists(&dir_file, TMP_NAME, "remove stale external_ids.bin.tmp")?;
     let mut tmp_file = open_relative(
@@ -390,7 +464,23 @@ fn open_relative(
     desired_access: u32,
     create_disposition: u32,
 ) -> std::io::Result<std::fs::File> {
-    let mut wide: Vec<u16> = OsStr::new(name).encode_wide().collect();
+    open_relative_with_options(
+        dir,
+        OsStr::new(name),
+        desired_access,
+        create_disposition,
+        FILE_NON_DIRECTORY_FILE,
+    )
+}
+
+fn open_relative_with_options(
+    dir: &std::fs::File,
+    name: &OsStr,
+    desired_access: u32,
+    create_disposition: u32,
+    kind_option: u32,
+) -> std::io::Result<std::fs::File> {
+    let mut wide: Vec<u16> = name.encode_wide().collect();
     let byte_len = wide
         .len()
         .checked_mul(std::mem::size_of::<u16>())
@@ -423,7 +513,7 @@ fn open_relative(
             FILE_ATTRIBUTE_NORMAL,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             create_disposition,
-            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            kind_option | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
             std::ptr::null(),
             0,
         )

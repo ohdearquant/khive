@@ -3255,23 +3255,15 @@ pub(crate) async fn fresh_tail_serving(
                     fresh_tail_reresolve(rt, ann, key, model, search, new_s, consumer).await
                 }
                 None => {
-                    // Re-resolution isn't possible: floor at the
-                    // same-snapshot registry minimum instead of dropping the
-                    // leg — a coherent (old candidates, registry minimum) pair.
-                    let outcome = fetch_final_tail_on(reader.as_mut(), model, m, None).await;
+                    // Missing publication metadata or a base below `m` cannot
+                    // account for the compacted interval `(s, m]`. A tail
+                    // above `m` cannot make the captured candidates complete.
                     end_read_snapshot(reader.as_mut()).await;
-                    // Force re-adoption so a future query gets a fresh bridge.
                     bump_generation(ann, key).await;
-                    match outcome {
-                        Ok((ops, _)) => FreshTailOutcome::Ops(ops),
-                        Err(e) => {
-                            tracing::warn!(error = %e, model, "fresh-tail: floored tail fetch failed; skipping exact leg");
-                            FreshTailOutcome::Skipped(SkipReason::with_error(
-                                "fresh-tail: floored tail fetch failed",
-                                e,
-                            ))
-                        }
-                    }
+                    FreshTailOutcome::Replace(
+                        Vec::new(),
+                        Some("fresh-tail: persisted segment does not cover registry minimum; dropped stale candidates"),
+                    )
                 }
             };
         }
@@ -3904,6 +3896,15 @@ async fn classify_and_adopt_segment(
     // Rule 4: own wildcard registry row absent for an extended-format state →
     // Cold after re-registering as pending.
     match read_own_watermark(rt, model).await {
+        Ok(Some(watermark)) if u64::try_from(watermark).is_ok_and(|watermark| watermark > s) => {
+            tracing::warn!(
+                model,
+                watermark,
+                persisted_seq = s,
+                "memory ANN publication is behind its active registry watermark; Cold rebuild"
+            );
+            return SegmentOutcome::Cold;
+        }
         Ok(Some(_)) => {}
         Ok(None) => {
             tracing::info!(model = %model,
@@ -7237,10 +7238,10 @@ mod tests {
         );
     }
 
-    /// When the registry minimum outpaces the bridge watermark and no newer segment exists, the leg must floor its scan, never `Skipped`.
+    /// An active registry ahead of the only persisted base cannot establish coverage of compacted writes.
     #[tokio::test]
     #[serial(adr118_fresh_tail)]
-    async fn fresh_tail_leg_floors_when_registry_minimum_outpaces_bridge_watermark() {
+    async fn fresh_tail_leg_drops_stale_candidates_when_registry_minimum_exceeds_persisted_base() {
         const MODEL: &str = "adr118-compaction-guard-test-model";
         const DIMS: usize = 8;
         let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
@@ -7305,28 +7306,25 @@ mod tests {
         let generation_before = current_generation(&ann, &key).await;
         let query = fnv_to_vec("compaction guard seed note 0", DIMS);
         let outcome = fresh_tail_leg(&rt, &ann, &key, MODEL, &query, 10, Some(s1)).await;
-        let ops = match outcome {
-            FreshTailOutcome::Ops(ops) => ops,
-            FreshTailOutcome::Replace(..) => panic!(
-                "re-resolution must not succeed here: the only persisted \
-                 segment is exactly as stale as the in-memory bridge"
-            ),
-            FreshTailOutcome::Skipped(_) => panic!(
-                "a mismatch must never silently drop the leg — it floors at \
-                 the same-snapshot registry minimum instead of skipping"
-            ),
-        };
-        assert!(
-            ops.is_empty(),
-            "the floored scan starts at the registry minimum, above which \
-             every row was already compacted away, so it must legitimately \
-             find nothing, got: {ops:?}"
-        );
+        match outcome {
+            FreshTailOutcome::Replace(candidates, reason) => {
+                assert!(candidates.is_empty());
+                assert_eq!(
+                    reason,
+                    Some("fresh-tail: persisted segment does not cover registry minimum; dropped stale candidates"),
+                );
+            }
+            FreshTailOutcome::Ops(ops) => {
+                panic!("a tail above the registry minimum cannot repair stale candidates: {ops:?}")
+            }
+            FreshTailOutcome::Skipped(_) => {
+                panic!("an unproved publication must drop stale candidates, not skip")
+            }
+        }
         assert!(
             current_generation(&ann, &key).await > generation_before,
             "the mismatch must force re-adoption (bump_generation) so a \
-             future query gets a fresh bridge instead of repeating the \
-             floor fallback forever"
+             future query gets a fresh bridge"
         );
     }
 
@@ -7754,6 +7752,163 @@ mod tests {
             generation_before,
         )
         .await;
+    }
+
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_drops_stale_candidates_when_publication_metadata_is_missing() {
+        const MODEL: &str = "ann-missing-publication-coverage-test-model";
+        const DIMS: usize = 8;
+        let fixture = compacted_peer_delta(MODEL, DIMS).await;
+        std::fs::remove_file(fixture.dir.join("metadata.bin")).expect("remove fixture metadata");
+        assert!(read_commit_info(&fixture.dir).unwrap().is_none());
+
+        let generation_before = current_generation(&fixture.ann, &fixture.key).await;
+        let query = fnv_to_vec("compacted peer delta note inside the published delta", DIMS);
+        let outcome = fresh_tail_leg(
+            &fixture.rt,
+            &fixture.ann,
+            &fixture.key,
+            MODEL,
+            &query,
+            10,
+            Some(fixture.s1),
+        )
+        .await;
+        assert_dropped_stale_candidates(
+            outcome,
+            "fresh-tail: persisted segment does not cover registry minimum; dropped stale candidates",
+            &fixture,
+            generation_before,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_drops_stale_candidates_when_publication_metadata_is_malformed() {
+        const MODEL: &str = "ann-malformed-publication-coverage-test-model";
+        const DIMS: usize = 8;
+        let fixture = compacted_peer_delta(MODEL, DIMS).await;
+        std::fs::write(
+            fixture.dir.join("metadata.bin"),
+            b"invalid fixture commit record",
+        )
+        .expect("replace fixture metadata");
+        assert!(read_commit_info(&fixture.dir).unwrap().is_none());
+
+        let generation_before = current_generation(&fixture.ann, &fixture.key).await;
+        let query = fnv_to_vec("compacted peer delta note inside the published delta", DIMS);
+        let outcome = fresh_tail_leg(
+            &fixture.rt,
+            &fixture.ann,
+            &fixture.key,
+            MODEL,
+            &query,
+            10,
+            Some(fixture.s1),
+        )
+        .await;
+        assert_dropped_stale_candidates(
+            outcome,
+            "fresh-tail: persisted segment does not cover registry minimum; dropped stale candidates",
+            &fixture,
+            generation_before,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_drops_stale_candidates_when_delta_head_is_missing_below_minimum() {
+        const MODEL: &str = "ann-missing-head-coverage-test-model";
+        const DIMS: usize = 8;
+        let fixture = compacted_peer_delta(MODEL, DIMS).await;
+        let base_seq = read_commit_info(&fixture.dir)
+            .unwrap()
+            .and_then(|info| info.last_applied_seq)
+            .expect("fixture base watermark");
+        assert_eq!(base_seq, fixture.s1);
+        assert_eq!(
+            effective_persisted_state(&fixture.dir, base_seq).unwrap().0,
+            fixture.delta_s
+        );
+        std::fs::remove_file(fixture.dir.join(delta::HEAD_FILE)).expect("remove fixture HEAD");
+        assert_eq!(
+            effective_persisted_state(&fixture.dir, base_seq).unwrap().0,
+            base_seq
+        );
+        assert!(
+            base_seq < fixture.delta_s,
+            "base cannot cover the compacted prefix"
+        );
+
+        let generation_before = current_generation(&fixture.ann, &fixture.key).await;
+        let query = fnv_to_vec("compacted peer delta note inside the published delta", DIMS);
+        let outcome = fresh_tail_leg(
+            &fixture.rt,
+            &fixture.ann,
+            &fixture.key,
+            MODEL,
+            &query,
+            10,
+            Some(fixture.s1),
+        )
+        .await;
+        assert_dropped_stale_candidates(
+            outcome,
+            "fresh-tail: persisted segment does not cover registry minimum; dropped stale candidates",
+            &fixture,
+            generation_before,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn segment_classifier_rebuilds_when_delta_head_is_missing_below_active_watermark() {
+        const MODEL: &str = "ann-missing-head-rebuild-test-model";
+        const DIMS: usize = 8;
+        let fixture = compacted_peer_delta(MODEL, DIMS).await;
+        std::fs::remove_file(fixture.dir.join(delta::HEAD_FILE)).expect("remove fixture HEAD");
+        assert_eq!(
+            read_own_watermark(&fixture.rt, MODEL).await.unwrap(),
+            Some(fixture.delta_s as i64)
+        );
+        let restarted = new_shared();
+        let mut details = AnnWarmDetails::default();
+        let outcome = classify_and_adopt_segment(
+            &fixture.rt,
+            &restarted,
+            &fixture.key,
+            MODEL,
+            &fixture.dir,
+            0,
+            0,
+            &mut details,
+        )
+        .await;
+        assert!(
+            matches!(outcome, SegmentOutcome::Cold),
+            "an empty compacted tail cannot make an old base Hot"
+        );
+        assert!(restarted.indexes.read().await.get(&fixture.key).is_none());
+
+        let token = fixture.rt.authorize(Namespace::local()).unwrap();
+        let status = ensure_ann_for_model(&fixture.rt, &token, &restarted, MODEL)
+            .await
+            .unwrap();
+        assert!(matches!(status, AnnEnsureStatus::Built { .. }));
+        assert!(bridge_applied_seq(&restarted, &fixture.key).await.unwrap() >= fixture.delta_s);
+        let query = fnv_to_vec("compacted peer delta note inside the published delta", DIMS);
+        let candidates = search_loaded(&restarted, &fixture.key, &query, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            candidates.iter().any(|(id, _)| *id == fixture.inside),
+            "full rebuild must recover the fixture write already compacted out of the log"
+        );
     }
 
     /// Re-resolution loads an intact newer segment but its search fails. The
