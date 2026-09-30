@@ -1410,7 +1410,10 @@ impl GtdPack {
                     )
                     .await
                 {
-                    Ok((note, _)) => (note, false),
+                    Ok((note, truncation)) => {
+                        embedding_truncation = truncation;
+                        (note, false)
+                    }
                     Err(error) => {
                         let raced = self
                             .runtime()

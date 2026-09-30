@@ -65,6 +65,24 @@ pub async fn create_keyed_memory(
     token: &NamespaceToken,
     spec: KeyedMemorySpec<'_>,
 ) -> RuntimeResult<(Note, Option<Uuid>, bool)> {
+    let (note, edge_id, replayed, _) =
+        create_keyed_memory_with_report(runtime, token, spec).await?;
+    Ok((note, edge_id, replayed))
+}
+
+/// Same as [`create_keyed_memory`], also returning the embedding-input
+/// truncation report for a freshly written memory. A replay stores nothing
+/// new, so it reports no truncation.
+pub async fn create_keyed_memory_with_report(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    spec: KeyedMemorySpec<'_>,
+) -> RuntimeResult<(
+    Note,
+    Option<Uuid>,
+    bool,
+    crate::retrieval::EmbeddingTruncationReport,
+)> {
     validate_memory_key(spec.key)?;
     if spec.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -102,7 +120,7 @@ pub async fn create_keyed_memory(
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 note.key = Some(spec.key.to_owned());
                 note.version = 2;
-                return Ok((note, edge_id, false));
+                return Ok((note, edge_id, false, prepared.embedding_truncation));
             }
             Ok(AtomicRunOutcome::RolledBack {
                 failure:
@@ -118,7 +136,12 @@ pub async fn create_keyed_memory(
                     .await;
                 if let Some(holder) = resolve_holder(runtime, token, spec.key).await? {
                     if holder.content == spec.content {
-                        return Ok((holder, None, true));
+                        return Ok((
+                            holder,
+                            None,
+                            true,
+                            crate::retrieval::EmbeddingTruncationReport::default(),
+                        ));
                     }
                     return Err(idempotency_conflict(spec.key, &holder));
                 }

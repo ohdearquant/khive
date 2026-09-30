@@ -100,3 +100,39 @@ async fn assign_over_embedding_budget_records_dependencies_and_discloses_truncat
         "the committed task must still get its depends_on edge; got {targets:?}"
     );
 }
+
+#[tokio::test]
+async fn keyed_assign_discloses_truncation_on_fresh_write_and_not_on_replay() {
+    let rt = rt();
+    rt.register_embedder(TruncationEmbedderProvider);
+    let pack = pack(rt.clone());
+
+    let args = json!({
+        "title": "keyed oversized task",
+        "description": "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1),
+        "idempotency_key": "keyed-truncation",
+    });
+
+    let created = assign(&pack, args.clone()).await;
+    assert!(
+        created.get("replayed").is_none(),
+        "first call is a fresh write: {created}"
+    );
+    assert_eq!(
+        created["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "a fresh keyed assign must disclose the truncated embedding input: {created}"
+    );
+
+    let replayed = assign(&pack, args).await;
+    assert_eq!(
+        replayed["replayed"],
+        json!(true),
+        "second call replays: {replayed}"
+    );
+    assert_eq!(replayed["full_id"], created["full_id"]);
+    assert!(
+        replayed.get("warnings").is_none(),
+        "a replay embeds nothing, so it must carry no truncation warning: {replayed}"
+    );
+}

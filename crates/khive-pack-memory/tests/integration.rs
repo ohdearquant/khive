@@ -7183,3 +7183,52 @@ async fn remember_over_embedding_budget_succeeds_and_discloses_truncation() {
         .expect("the committed memory must be readable");
     assert_eq!(stored["id"], json!(note_id));
 }
+
+/// A keyed memory over the embedder input budget discloses the truncation on
+/// the fresh write; replaying the same key embeds nothing and warns of nothing.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn keyed_remember_discloses_truncation_on_fresh_write_and_not_on_replay() {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new("truncation-enc", 4, 0.9));
+    let registry = make_registry(rt);
+
+    let args = json!({
+        "content": "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1),
+        "key": "keyed-truncation",
+    });
+    let created = registry
+        .dispatch("memory.remember", args.clone())
+        .await
+        .expect("an over-budget keyed memory must not fail after commit");
+    assert!(
+        created.get("replayed").is_none(),
+        "first call is a fresh write: {created}"
+    );
+    assert_eq!(
+        created["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "a fresh keyed remember must disclose the truncated embedding input: {created}"
+    );
+
+    let replayed = registry
+        .dispatch("memory.remember", args)
+        .await
+        .expect("replay must succeed");
+    assert_eq!(
+        replayed["replayed"],
+        json!(true),
+        "second call replays: {replayed}"
+    );
+    assert_eq!(replayed["id"], created["id"]);
+    assert!(
+        replayed.get("warnings").is_none(),
+        "a replay embeds nothing, so it must carry no truncation warning: {replayed}"
+    );
+}
