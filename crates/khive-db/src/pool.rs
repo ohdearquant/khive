@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use crate::error::SqliteError;
+#[cfg(windows)]
+use crate::file_identity::sqlite_opened_file_identity;
+#[cfg(any(unix, windows))]
+use crate::file_identity::{database_file_identity, DatabaseFileIdentity};
 use crate::writer_task::WriterTaskHandle;
 use khive_storage::error::StorageError;
 use khive_storage::tx_registry::{DbIdentity, TxOrigin};
@@ -822,9 +826,9 @@ pub struct ConnectionPool {
     /// derivation) use this, the same canonical value the identity was
     /// minted from, via [`Self::canonical_path`].
     identity_path: Option<PathBuf>,
-    /// The file observed at the canonical target after the first writer opens.
-    /// Later standalone opens refuse a replacement at that path.
-    #[cfg(unix)]
+    /// The physical file SQLite opened, checked against the canonical path.
+    /// Later reader and standalone opens must retain this identity.
+    #[cfg(any(unix, windows))]
     opened_file_identity: Option<DatabaseFileIdentity>,
     /// A persistent nonce read through SQLite's opened main database, rather
     /// than through the pathname that may have been replaced during open.
@@ -1714,7 +1718,7 @@ impl ConnectionPool {
             Arc::new(WriteAdmission::new(None, 0))
         };
         let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let identity_before_open = identity_path
             .as_deref()
             .map(database_file_identity_if_exists)
@@ -1744,27 +1748,32 @@ impl ConnectionPool {
                 Some(&writer),
             );
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let identity_before_write = identity_path
             .as_deref()
             .map(database_file_identity)
             .transpose()?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if identity_before_open.is_some() && identity_before_open != identity_before_write {
             return Err(SqliteError::InvalidData(
                 "database file identity changed while opening the pool".to_string(),
             ));
         }
-        #[cfg(unix)]
-        if identity_path.is_some() {
-            verify_sqlite_opened_file_still_at_path(&writer)?;
+        #[cfg(any(unix, windows))]
+        if let Some(path) = identity_path.as_deref() {
+            let opened = opened_sqlite_file_identity(&writer, path)?;
+            if identity_before_write != Some(opened) {
+                return Err(SqliteError::InvalidData(
+                    "database file identity changed while opening the pool".to_string(),
+                ));
+            }
         }
         let opened_database_id =
             if identity_path.is_some() && !config.read_only && initial_database_id.is_none() {
                 match write_admission.check() {
                     Ok(()) => Some(initialize_database_id(&mut writer)?),
                     // Recovery must be able to open this pool and its checkpoint
-                    // connection below the reserve. Unix dev/inode pinning still
+                    // connection below the reserve. Physical file pinning still
                     // applies; a later pool open can install the nonce.
                     Err(SqliteError::CapacityFloor { .. }) => None,
                     Err(error) => return Err(error),
@@ -1780,20 +1789,16 @@ impl ConnectionPool {
                 Some(&writer),
             );
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let opened_file_identity = identity_path
             .as_deref()
-            .map(database_file_identity)
+            .map(|path| opened_sqlite_file_identity(&writer, path))
             .transpose()?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if identity_before_write != opened_file_identity {
             return Err(SqliteError::InvalidData(
                 "database file identity changed while opening the pool".to_string(),
             ));
-        }
-        #[cfg(unix)]
-        if identity_path.is_some() {
-            verify_sqlite_opened_file_still_at_path(&writer)?;
         }
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
@@ -1821,7 +1826,7 @@ impl ConnectionPool {
             writer_task_join_stored: AtomicBool::new(false),
             origin,
             identity_path,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             opened_file_identity,
             opened_database_id,
             identity_registration: None,
@@ -2370,14 +2375,18 @@ impl ConnectionPool {
         self.identity_path.as_deref()
     }
 
-    /// Unix file identity pinned while opening this pool's SQLite main file.
-    /// Construction verifies this path identity around SQLite's actual open
-    /// (including `SQLITE_FCNTL_HAS_MOVED`) before admitting the pool. This is
-    /// the identity topology dedup must use after open, not a pre-open stat.
+    /// Unix file identity retained for callers using the original tuple API.
     #[cfg(unix)]
     pub fn opened_file_identity(&self) -> Option<(u64, u64)> {
         self.opened_file_identity
-            .map(|identity| (identity.device, identity.inode))
+            .map(DatabaseFileIdentity::unix_parts)
+    }
+
+    /// Physical file identity pinned to SQLite's opened main file. Construction
+    /// compares it with the path on both sides of the open before admission.
+    #[cfg(any(unix, windows))]
+    pub fn opened_file_identity_record(&self) -> Option<DatabaseFileIdentity> {
+        self.opened_file_identity
     }
 
     /// Whether the write queue is effectively enabled for this pool: the
@@ -2611,15 +2620,14 @@ impl ConnectionPool {
 
     fn open_reader_connection(&self) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(identity_path) = self.identity_path.as_deref() {
             self.verify_opened_file_identity(identity_path)?;
         }
         let conn = open_reader_connection(path, &self.config)?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(identity_path) = self.identity_path.as_deref() {
-            self.verify_opened_file_identity(identity_path)?;
-            verify_sqlite_opened_file_still_at_path(&conn)?;
+            self.verify_connection_file_identity(&conn, identity_path)?;
         }
         self.verify_opened_database_id(&conn)?;
         Ok(conn)
@@ -2680,7 +2688,7 @@ impl ConnectionPool {
         // The configured spelling may be a symlink that changed since this
         // pool opened. Use its pinned target, and refuse replacement of that
         // target before SQLite can execute the diagnostics PASSIVE checkpoint.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.verify_opened_file_identity(path)?;
 
         #[cfg(test)]
@@ -2694,11 +2702,9 @@ impl ConnectionPool {
         )?;
         #[cfg(test)]
         run_identity_open_hook(path, IdentityOpenStage::AfterStandaloneOpen, Some(&conn));
-        #[cfg(unix)]
-        self.verify_opened_file_identity(path)?;
+        #[cfg(any(unix, windows))]
+        self.verify_connection_file_identity(&conn, path)?;
         self.verify_opened_database_id(&conn)?;
-        #[cfg(unix)]
-        verify_sqlite_opened_file_still_at_path(&conn)?;
         #[cfg(feature = "namespace-trigram-proto")]
         register_namespace_trigram(&conn)?;
         register_writer_clock(&conn)?;
@@ -2725,7 +2731,7 @@ impl ConnectionPool {
         Ok(conn)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn verify_opened_file_identity(&self, path: &Path) -> Result<(), SqliteError> {
         let Some(expected) = self.opened_file_identity else {
             return Err(SqliteError::InvalidData(
@@ -2734,6 +2740,22 @@ impl ConnectionPool {
         };
         let current = database_file_identity(path).ok();
         if current != Some(expected) {
+            return Err(SqliteError::InvalidData(
+                "pool database file identity changed since the first open; refusing standalone connection"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    fn verify_connection_file_identity(
+        &self,
+        conn: &Connection,
+        path: &Path,
+    ) -> Result<(), SqliteError> {
+        let opened = opened_sqlite_file_identity(conn, path)?;
+        if self.opened_file_identity != Some(opened) {
             return Err(SqliteError::InvalidData(
                 "pool database file identity changed since the first open; refusing standalone connection"
                     .to_string(),
@@ -2839,7 +2861,7 @@ impl ConnectionPool {
     ) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
 
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(identity_path) = self.identity_path.as_deref() {
             self.verify_opened_file_identity(identity_path)?;
         }
@@ -2850,10 +2872,9 @@ impl ConnectionPool {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(identity_path) = self.identity_path.as_deref() {
-            self.verify_opened_file_identity(identity_path)?;
-            verify_sqlite_opened_file_still_at_path(&conn)?;
+            self.verify_connection_file_identity(&conn, identity_path)?;
         }
         self.verify_opened_database_id(&conn)?;
         configure_reader_connection(&conn, &self.config)?;
@@ -3001,32 +3022,36 @@ fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), Sql
     ))
 }
 
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DatabaseFileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(unix)]
-fn database_file_identity(path: &Path) -> Result<DatabaseFileIdentity, SqliteError> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let metadata = fs::metadata(path)?;
-    Ok(DatabaseFileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn database_file_identity_if_exists(
     path: &Path,
 ) -> Result<Option<DatabaseFileIdentity>, SqliteError> {
     match database_file_identity(path) {
         Ok(identity) => Ok(Some(identity)),
-        Err(SqliteError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn opened_sqlite_file_identity(
+    conn: &Connection,
+    path: &Path,
+) -> Result<DatabaseFileIdentity, SqliteError> {
+    #[cfg(unix)]
+    {
+        verify_sqlite_opened_file_still_at_path(conn)?;
+        Ok(database_file_identity(path)?)
+    }
+    #[cfg(windows)]
+    {
+        let opened = sqlite_opened_file_identity(conn)?;
+        if database_file_identity(path).ok() != Some(opened) {
+            return Err(SqliteError::InvalidData(
+                "database file identity changed while SQLite held the opened file".to_string(),
+            ));
+        }
+        Ok(opened)
     }
 }
 
@@ -5291,6 +5316,48 @@ mod tests {
         let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
         assert!(path.exists());
         assert!(pool.max_readers() > 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_only_legacy_reader_rejects_different_opened_file_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let replacement = dir.path().join("replacement.db");
+        for target in [&path, &replacement] {
+            let conn = Connection::open(target).unwrap();
+            conn.execute_batch("CREATE TABLE marker (value INTEGER)")
+                .unwrap();
+        }
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            read_only: true,
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open a legacy read-only pool without a stored database UUID");
+        assert_eq!(pool.opened_database_id, None);
+        assert_eq!(
+            pool.opened_file_identity,
+            Some(database_file_identity(&path).unwrap())
+        );
+        pool.open_reader_connection()
+            .expect("a later reader of the pinned file succeeds");
+
+        // SQLite's Windows VFS omits FILE_SHARE_DELETE, so a live pool bars
+        // pathname replacement. Exercise the same post-open gate with an
+        // actual connection to another file while the legacy pool stays live.
+        let other =
+            Connection::open_with_flags(&replacement, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let error = pool
+            .verify_connection_file_identity(&other, &path)
+            .expect_err("the opened handle differs from the requested path");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        let error = pool
+            .verify_connection_file_identity(&other, &replacement)
+            .expect_err("a different opened main handle cannot join this pool");
+        assert!(error.to_string().contains("identity changed"), "{error}");
     }
 
     #[cfg(unix)]

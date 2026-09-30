@@ -2280,7 +2280,7 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum BackendAliasIdentity {
     /// An existing file can have several distinct canonical hard-link paths.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     File(FileIdentity),
     /// A not-yet-created file has only a resolved path to compare.
     Path(PathBuf),
@@ -2290,15 +2290,10 @@ fn backend_alias_identity(
     backend_name: &str,
     canonical: &std::path::Path,
 ) -> anyhow::Result<BackendAliasIdentity> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        use std::os::unix::fs::MetadataExt as _;
-
-        match std::fs::metadata(canonical) {
-            Ok(meta) => Ok(BackendAliasIdentity::File(FileIdentity {
-                device: meta.dev(),
-                inode: meta.ino(),
-            })),
+        match khive_db::file_identity::database_file_identity(canonical) {
+            Ok(identity) => Ok(BackendAliasIdentity::File(identity)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
             }
@@ -2308,7 +2303,7 @@ fn backend_alias_identity(
             ),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = backend_name;
         Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
@@ -2322,17 +2317,20 @@ fn opened_backend_alias_identity(
     backend: &StorageBackend,
     canonical: &std::path::Path,
 ) -> anyhow::Result<BackendAliasIdentity> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        let (device, inode) = backend.pool().opened_file_identity().ok_or_else(|| {
-            anyhow::anyhow!(
-                "file-backed backend {} has no opened SQLite file identity",
-                canonical.display()
-            )
-        })?;
-        Ok(BackendAliasIdentity::File(FileIdentity { device, inode }))
+        let identity = backend
+            .pool()
+            .opened_file_identity_record()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "file-backed backend {} has no opened SQLite file identity",
+                    canonical.display()
+                )
+            })?;
+        Ok(BackendAliasIdentity::File(identity))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = backend;
         Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
@@ -2343,12 +2341,12 @@ fn snapshot_matches_opened_backend(
     snapshot: &BackendAliasIdentity,
     opened: &BackendAliasIdentity,
 ) -> bool {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         // An absent first-open path has no file identity to compare yet.
         matches!(snapshot, BackendAliasIdentity::Path(_)) || snapshot == opened
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         snapshot == opened
     }
@@ -2806,29 +2804,20 @@ pub fn reject_conflicting_db_override_with_source(
 /// Filesystem identity of a reindex target, captured so a symlink retargeted
 /// or a file replaced in place between validation and open can be told apart
 /// from the declared file validation actually checked.
+#[cfg(any(unix, windows))]
+type FileIdentity = khive_db::file_identity::DatabaseFileIdentity;
+
+#[cfg(not(any(unix, windows)))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
+struct FileIdentity;
 
 fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let meta = std::fs::metadata(path).ok()?;
-        Some(FileIdentity {
-            device: meta.dev(),
-            inode: meta.ino(),
-        })
+        khive_db::file_identity::database_file_identity(path).ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        // The standard library exposes no stable file-identity accessor off
-        // unix (the Windows volume-serial and file-index accessors are
-        // unstable), so the pre-open re-check degrades to path-level
-        // validation there. This crate's non-unix lane is compile-checked
-        // only.
         let _ = path;
         None
     }
@@ -2866,7 +2855,7 @@ pub fn capture_existing_database_target(
         path.display()
     );
     let identity = file_identity(&path);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     anyhow::ensure!(
         identity.is_some(),
         "cannot capture database identity for {}",
@@ -2883,12 +2872,10 @@ pub fn capture_existing_database_target(
 /// to the same canonical (already symlink-free) path, so pinning the open to
 /// `target.path` defeats that redirect by construction; a declared file
 /// replaced in place (e.g. another database renamed over it) keeps the same
-/// path string but changes `(device, inode)`, which this call catches.
+/// path string but changes its physical file identity, which this call catches.
 ///
-/// The gap this does not close: a parent directory replaced in the sliver of
-/// time between this call returning and the underlying SQLite `open()`
-/// syscall. No API the sqlite binding used here exposes reaches an
-/// already-open file descriptor's identity, so that final window stays open.
+/// This pre-open check alone cannot close a replacement window between its
+/// return and the underlying SQLite `open()` syscall.
 pub fn reverify_reindex_target_identity(target: &ValidatedReindexTarget) -> anyhow::Result<()> {
     let observed = file_identity(&target.path);
     if observed != target.identity {
@@ -9887,8 +9874,8 @@ region = "us-east-1"
                 std::fs::rename(&staged, &main).unwrap();
                 let backend = open_backend(cfg, max_readers)?;
                 assert_eq!(
-                    backend.pool().opened_file_identity(),
-                    Some((replacement_identity.device, replacement_identity.inode))
+                    backend.pool().opened_file_identity_record(),
+                    Some(replacement_identity)
                 );
                 opened_main = true;
                 Ok(backend)
@@ -9898,6 +9885,52 @@ region = "us-east-1"
         })
         .err()
         .expect("the opened replacement must not inherit the old topology snapshot");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backend_alias_snapshot_rejects_same_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                std::fs::remove_file(&main).unwrap();
+                std::fs::hard_link(&replacement, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                assert_eq!(
+                    backend.pool().opened_file_identity_record(),
+                    Some(replacement_identity)
+                );
+                opened_main = true;
+                Ok(backend)
+            } else {
+                panic!("reject before cached alias reuse")
+            }
+        })
+        .err()
+        .expect("a read-only legacy database replacement must fail before alias routing");
         assert!(opened_main);
         assert_eq!(file_identity(&main), Some(replacement_identity));
         assert_eq!(file_identity(&alias), Some(original_identity));
@@ -9931,8 +9964,8 @@ region = "us-east-1"
             if cfg.name == "main" {
                 assert_eq!(file_identity(&main), Some(original_identity));
                 assert_eq!(
-                    backend.pool().opened_file_identity(),
-                    Some((original_identity.device, original_identity.inode))
+                    backend.pool().opened_file_identity_record(),
+                    Some(original_identity)
                 );
                 opened_main = true;
                 let staged = dir.path().join("staged-replacement.db");
