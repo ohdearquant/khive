@@ -128,26 +128,53 @@ pub struct MirrorStats {
 }
 
 /// Stable across appends, but different for a replacement file at the same
-/// path. Creation time is the ADR-080 identity where Unix file IDs are absent.
-pub(crate) fn file_identity(metadata: &std::fs::Metadata) -> String {
+/// path. The identity is read from the open handle, so the identity a caller
+/// compares is the identity of the object it reads:
+///
+/// - Unix: device and inode (`unix:<dev>:<ino>`).
+/// - Windows: volume serial number and 128-bit file id from `FileIdInfo`
+///   (`windows:<volume>:<file id>`, hexadecimal). Creation time is not used
+///   there: NTFS file system tunneling can give a file re-created or renamed
+///   into a recently vacated name the creation time of the file it replaced.
+/// - Other targets, which have neither: file creation time where available.
+pub(crate) fn file_identity(file: &std::fs::File) -> std::io::Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        format!("unix:{}:{}", metadata.dev(), metadata.ino())
+        let metadata = file.metadata()?;
+        Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        // Keep the existing cursor spelling when `created()` is available.
-        // Windows always exposes raw creation time even if that conversion fails.
-        metadata
-            .created()
-            .map(|created| format!("created:{:?}", Some(created)))
-            .unwrap_or_else(|_| format!("created:windows:{}", metadata.creation_time()))
+        use std::fmt::Write as _;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+        };
+
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: `file` keeps the handle live for the call; `info` is a
+        // writable buffer of the exact size FileIdInfo requires.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&raw mut info).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut identity = format!("windows:{:016x}:", info.VolumeSerialNumber);
+        for byte in info.FileId.Identifier {
+            let _ = write!(identity, "{byte:02x}");
+        }
+        Ok(identity)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        format!("created:{:?}", metadata.created().ok())
+        Ok(format!("created:{:?}", file.metadata()?.created().ok()))
     }
 }
 
@@ -216,7 +243,7 @@ pub(crate) fn open_source_file_beneath(
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
     let mut directory = options.open(root_path)?;
     let mut directory_identities = Vec::new();
-    let root_identity = file_identity(&directory.metadata()?);
+    let root_identity = file_identity(&directory)?;
     if expected_directories.is_some_and(|expected| expected.first() != Some(&root_identity)) {
         return Err(std::io::Error::other(
             "mirror source root changed after its metadata probe",
@@ -260,7 +287,7 @@ pub(crate) fn open_source_file_beneath(
             }
             return Ok((opened, directory_identities));
         }
-        let identity = file_identity(&opened.metadata()?);
+        let identity = file_identity(&opened)?;
         if expected_directories
             .is_some_and(|expected| expected.get(directory_depth) != Some(&identity))
         {
@@ -459,11 +486,10 @@ mod windows_source_open {
 
         let mut pinned_directories = open_root(root)?;
         let root_identity = file_identity(
-            &pinned_directories
+            pinned_directories
                 .last()
-                .ok_or_else(|| invalid("mirror source root is empty"))?
-                .metadata()?,
-        );
+                .ok_or_else(|| invalid("mirror source root is empty"))?,
+        )?;
         if expected_directories.is_some_and(|expected| expected.first() != Some(&root_identity)) {
             return Err(io::Error::other(
                 "mirror source root changed after its metadata probe",
@@ -497,7 +523,7 @@ mod windows_source_open {
                 }
                 return Ok((opened, directory_identities));
             }
-            let identity = file_identity(&opened.metadata()?);
+            let identity = file_identity(&opened)?;
             if expected_directories
                 .is_some_and(|expected| expected.get(directory_depth) != Some(&identity))
             {
@@ -567,6 +593,7 @@ pub(crate) fn open_source_file_beneath(
 }
 
 fn checked_identity(
+    file: &std::fs::File,
     metadata: &std::fs::Metadata,
     expected_identity: Option<&str>,
 ) -> std::io::Result<String> {
@@ -576,7 +603,7 @@ fn checked_identity(
             "mirror source is not a regular file",
         ));
     }
-    let identity = file_identity(metadata);
+    let identity = file_identity(file)?;
     if expected_identity.is_some_and(|expected| expected != identity.as_str()) {
         return Err(std::io::Error::other(
             "mirror source was replaced after its metadata probe",
@@ -853,7 +880,7 @@ fn read_bounded_chunk(
         None => open_source_file(path)?,
     };
     let metadata = file.metadata()?;
-    let identity = checked_identity(&metadata, expected_identity)?;
+    let identity = checked_identity(&file, &metadata, expected_identity)?;
     let file_len = metadata.len();
     if start_offset >= file_len {
         return Ok(MirrorChunk {
@@ -1286,7 +1313,7 @@ async fn mirror_whole_file_export(
     let metadata = file.metadata().map_err(|e| {
         RuntimeError::Internal(format!("{}: failed to stat {path:?}: {e}", spec.operation))
     })?;
-    let identity = checked_identity(&metadata, expected_identity).map_err(|e| {
+    let identity = checked_identity(&file, &metadata, expected_identity).map_err(|e| {
         RuntimeError::Internal(format!(
             "{}: failed to verify {path:?}: {e}",
             spec.operation
@@ -1900,7 +1927,9 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &parent).expect("replace parent with symlink");
 
         assert!(open_source_file_beneath(&root, &source, None).is_err());
-        let outside_identity = file_identity(&std::fs::metadata(&outside_source).expect("outside"));
+        let outside_identity =
+            file_identity(&std::fs::File::open(&outside_source).expect("outside"))
+                .expect("outside identity");
         assert!(read_bounded_chunk(
             &source,
             0,
@@ -1918,19 +1947,42 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn mirror_windows_file_identity_uses_creation_time() {
-        use std::os::windows::fs::MetadataExt;
-
-        let source = NamedTempFile::new().expect("source file");
-        let metadata = source.as_file().metadata().expect("source metadata");
-        assert_eq!(
-            file_identity(&metadata),
-            format!(
-                "created:{:?}",
-                Some(metadata.created().expect("creation time"))
-            )
+    fn mirror_windows_file_identity_changes_when_renamed_replacement_takes_the_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, b"original\n").expect("original file");
+        let original = file_identity(&open_source_file(&path).expect("open original"))
+            .expect("original identity");
+        assert!(
+            original.starts_with("windows:"),
+            "unexpected identity spelling: {original}"
         );
-        assert_ne!(metadata.creation_time(), 0);
+
+        let mut appender = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for append");
+        appender.write_all(b"appended\n").expect("append");
+        drop(appender);
+        assert_eq!(
+            file_identity(&open_source_file(&path).expect("open appended"))
+                .expect("appended identity"),
+            original,
+            "an append keeps the file identity"
+        );
+
+        // Save-by-rename: write a sibling temp file, then rename it over the
+        // original name. The replacement may inherit the original's creation
+        // time, so only the handle's file id can tell the two files apart.
+        let staged = dir.path().join("transcript.jsonl.tmp");
+        std::fs::write(&staged, b"replacement\n").expect("staged file");
+        std::fs::rename(&staged, &path).expect("rename over original");
+        let replaced = file_identity(&open_source_file(&path).expect("open replacement"))
+            .expect("replacement identity");
+        assert_ne!(
+            replaced, original,
+            "a same-path replacement must not reuse the original identity"
+        );
     }
 
     #[cfg(windows)]
@@ -4002,9 +4054,10 @@ mod tests {
         assert_eq!(
             stats,
             MirrorStats {
-                file_identity: Some(file_identity(
-                    &std::fs::metadata(&path).expect("export metadata")
-                )),
+                file_identity: Some(
+                    file_identity(&std::fs::File::open(&path).expect("open export"))
+                        .expect("export identity")
+                ),
                 ..MirrorStats::default()
             }
         );

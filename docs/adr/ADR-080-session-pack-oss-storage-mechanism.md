@@ -230,8 +230,9 @@ has not fallen below the cursor.
 
 **File replacement amendment (2026-09-28, #1761).** Each cursor advance stores a nullable
 `file_identity` in the same row and transaction as its byte offset. The identity is stable
-across appends and changes when a new file replaces the path (device and inode on Unix; file
-creation time where Unix IDs are unavailable). A different identity or a file shorter than the
+across appends and changes when a new file replaces the path (device and inode on Unix; volume
+serial number and file id on Windows; file creation time only on targets with neither). A
+different identity or a file shorter than the
 stored offset restarts ingestion at byte zero. A legacy cursor with no identity also restarts
 from zero when backfill is enabled: its prefix was already eligible for ingestion, so the
 insert-once event keys make replay safe. With `KHIVE_MIRROR_BACKFILL=false`, a legacy cursor

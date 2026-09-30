@@ -21,8 +21,12 @@ repeatedly on the same file; the unique
 allowing equal provider identifiers from different sources.
 
 The service pairs each persisted offset with the identity of the file handle
-that supplied its bytes. On Unix this is the device and inode; elsewhere it
-uses file creation time when available. A same-path replacement or a file that
+that supplied its bytes, read from the opened handle. On Unix this is the device
+and inode. On Windows it is the volume serial number and the 128-bit file id
+(`FileIdInfo`); creation time is not used there, because NTFS file system
+tunneling can give a file created or renamed into a recently vacated name the
+creation time of the file it replaced. Targets with neither use file creation
+time when available. A same-path replacement or a file that
 shrinks below the offset restarts at zero. An older cursor row without an identity
 starts at zero when backfill is enabled; with `KHIVE_MIRROR_BACKFILL=false`, it
 keeps its offset and persists the observed identity so the skipped prefix stays

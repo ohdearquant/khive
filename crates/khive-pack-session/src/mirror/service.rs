@@ -1694,11 +1694,12 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 );
                 continue;
             };
-            let (metadata, directory_identities) =
+            let (metadata, observed_identity, directory_identities) =
                 match ingest::open_source_file_beneath(root, &scheduled_file.path, None).and_then(
                     |(file, directory_identities)| {
-                        file.metadata()
-                            .map(|metadata| (metadata, directory_identities))
+                        let metadata = file.metadata()?;
+                        let identity = ingest::file_identity(&file)?;
+                        Ok((metadata, identity, directory_identities))
                     },
                 ) {
                     Ok(probe) => probe,
@@ -1735,7 +1736,6 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
             }
             let file_len = metadata.len();
             let modified = metadata.modified().ok();
-            let observed_identity = ingest::file_identity(&metadata);
 
             let cursor = cursors
                 .entry(scheduled_file.path.clone())
@@ -3174,6 +3174,22 @@ mod cursor_retry_tests {
         assert_eq!(cursor.byte_offset, 0, "truncation restarts from zero");
     }
 
+    #[test]
+    fn cursor_identity_change_rewinds_without_truncation() {
+        for backfill in [true, false] {
+            let mut cursor = CursorState {
+                byte_offset: 100,
+                file_identity: Some("old-file".into()),
+            };
+            assert!(cursor.reset_if_replaced("new-file", 150, backfill));
+            assert_eq!(
+                cursor.byte_offset, 0,
+                "a replacement at least as long as the offset restarts from zero"
+            );
+            assert_eq!(cursor.file_identity.as_deref(), Some("new-file"));
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn same_size_atomic_replacement_is_reingested_after_cursor_reload() {
@@ -3200,10 +3216,15 @@ mod cursor_retry_tests {
         assert_eq!(cursor.byte_offset, original.len() as u64);
         assert_eq!(
             cursor.file_identity.as_deref(),
-            Some(file_identity(&std::fs::metadata(&path).expect("original metadata")).as_str())
+            Some(
+                file_identity(&std::fs::File::open(&path).expect("open original"))
+                    .expect("original identity")
+                    .as_str()
+            )
         );
         assert!(!cursor.reset_if_replaced(
-            &file_identity(&std::fs::metadata(&path).expect("unchanged metadata")),
+            &file_identity(&std::fs::File::open(&path).expect("open unchanged"))
+                .expect("unchanged identity"),
             original.len() as u64,
             true,
         ));
@@ -3211,7 +3232,8 @@ mod cursor_retry_tests {
         let staged = dir.path().join("replacement.jsonl");
         std::fs::write(&staged, replacement).expect("replacement transcript");
         std::fs::rename(&staged, &path).expect("atomic replacement");
-        let new_identity = file_identity(&std::fs::metadata(&path).expect("replacement metadata"));
+        let new_identity = file_identity(&std::fs::File::open(&path).expect("open replacement"))
+            .expect("replacement identity");
         assert!(cursor.reset_if_replaced(&new_identity, original.len() as u64, true));
         assert_eq!(cursor.byte_offset, 0);
         let second = mirror_file(
@@ -3302,7 +3324,8 @@ mod cursor_retry_tests {
             .remove(&path)
             .expect("legacy row retained");
         let file_len = std::fs::metadata(&path).expect("transcript metadata").len();
-        let identity = file_identity(&std::fs::metadata(&path).expect("transcript metadata"));
+        let identity = file_identity(&std::fs::File::open(&path).expect("open transcript"))
+            .expect("transcript identity");
         assert!(
             !reconcile_cursor_identity(&rt, &path, &mut cursor, &identity, file_len, false)
                 .await
