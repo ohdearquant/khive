@@ -138,7 +138,7 @@ async fn first_fetch_then_refresh_keeps_negotiation_on_the_rooted_body() {
     );
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr-CA"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["fr-CA"], "accept-encoding": ["identity"]})
     );
 
     let mut headers = response_headers();
@@ -152,7 +152,7 @@ async fn first_fetch_then_refresh_keeps_negotiation_on_the_rooted_body() {
     );
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr-CA"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["fr-CA"], "accept-encoding": ["identity"]})
     );
     assert_eq!(properties["etag"], "refreshed-etag");
     assert_eq!(reply["changed"], false);
@@ -397,7 +397,7 @@ async fn redirected_refresh_updates_terminal_metadata_and_negotiation() {
             );
             assert_eq!(
                 properties["request_headers"],
-                json!({"accept": ["application/json"], "accept-language": ["fr"], "accept-encoding": ["gzip"]}),
+                json!({"accept": ["application/json"], "accept-language": ["fr"], "accept-encoding": ["identity"]}),
                 "terminal refresh must retain the sent negotiation"
             );
             assert_eq!(properties["status"], 200);
@@ -559,7 +559,6 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
-        .gzip(true)
         .build()
         .unwrap();
     let headers = effective_request_headers(
@@ -592,7 +591,7 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
     .await
     .unwrap();
     let id = Uuid::parse_str(fetched["id"].as_str().unwrap()).unwrap();
-    let expected = json!({"accept": ["application/json"], "accept-language": ["fr-CA,fr;q=0.8"], "accept-encoding": ["gzip"]});
+    let expected = json!({"accept": ["application/json"], "accept-language": ["fr-CA,fr;q=0.8"], "accept-encoding": ["identity"]});
     assert_eq!(
         receipt(&runtime, &token, &fetched).await["request_headers"],
         expected,
@@ -645,7 +644,7 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
         );
         assert_eq!(
             headers.get("accept-encoding"),
-            Some(&vec!["gzip".to_string()]),
+            Some(&vec!["identity".to_string()]),
             "the built client must send its fixed encoding on fetch and refresh"
         );
     }
@@ -709,7 +708,7 @@ async fn fetch_and_refresh_receipts_allowlist_metadata() {
         4,
         "only negotiation header values are durable"
     );
-    let expected = json!({"accept": ["application/json", "text/plain;q=0.5"], "accept-language": ["en"], "accept-encoding": ["gzip"]});
+    let expected = json!({"accept": ["application/json", "text/plain;q=0.5"], "accept-language": ["en"], "accept-encoding": ["identity"]});
     let mut conditional_sent = sent.clone();
     conditional_sent.push(("If-None-Match".into(), "old-etag".into()));
     let refreshed = settle_refresh_with_request_headers(
@@ -778,14 +777,14 @@ async fn head_preserves_cached_get_negotiation_and_unnegotiated_get_clears_it() 
     );
     assert_eq!(
         receipt(&runtime, &token, &reply).await["request_headers"],
-        json!({"accept": ["text/html"], "accept-encoding": ["gzip"]})
+        json!({"accept": ["text/html"], "accept-encoding": ["identity"]})
     );
     seed(&runtime, &token, &url, &[]).await;
     let properties = entity(&runtime, &token, id).await.properties.unwrap();
     assert_eq!(
         crate::fetch::stored_negotiation_headers(&properties).unwrap(),
-        vec![("accept-encoding".to_string(), "gzip".to_string())],
-        "a later unnegotiated GET clears caller fields but retains fixed gzip"
+        vec![("accept-encoding".to_string(), "identity".to_string())],
+        "a later unnegotiated GET clears caller fields but retains the fixed encoding"
     );
 }
 
@@ -981,7 +980,7 @@ async fn redirected_refresh_keeps_a_get_written_after_the_terminal_request() {
     assert_eq!(properties["content_language"], "fr");
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["fr"], "accept-encoding": ["identity"]})
     );
 }
 
@@ -1049,7 +1048,7 @@ async fn redirected_refresh_keeps_a_newer_get_body_after_the_terminal_request() 
     assert_eq!(properties["etag"], "newer-get-body");
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["fr"], "accept-encoding": ["identity"]})
     );
     let body_ref =
         khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
@@ -1414,7 +1413,7 @@ fn vary_gate_requires_every_stored_selector_and_value() {
         "request_headers": {
             "accept": ["text/plain"],
             "accept-language": ["fr-CA"],
-            "accept-encoding": ["gzip"]
+            "accept-encoding": ["identity"]
         }
     });
     for (vary, replayable) in [
@@ -1466,7 +1465,7 @@ fn vary_gate_requires_every_stored_selector_and_value() {
     assert!(conditional_headers_for_hop(&missing_encoding, &url, &url, true).is_empty());
     let mut wrong_encoding = base.clone();
     wrong_encoding["vary"] = json!(["Accept-Encoding"]);
-    wrong_encoding["request_headers"]["accept-encoding"] = json!(["identity"]);
+    wrong_encoding["request_headers"]["accept-encoding"] = json!(["br"]);
     assert!(conditional_headers_for_hop(&wrong_encoding, &url, &url, true).is_empty());
     let mut missing = base;
     missing["vary"] = json!(["Accept-Language"]);
@@ -1482,14 +1481,119 @@ fn vary_accept_encoding_with_fixed_record_sends_validator() {
         "etag": "encoded-etag",
         "truncated": false,
         "vary": ["Accept-Encoding"],
-        "request_headers": {"accept-encoding": ["gzip"]}
+        "request_headers": {"accept-encoding": ["identity"]}
     });
     let sent = refresh_request_headers(&properties).unwrap();
-    assert!(sent
-        .iter()
-        .any(|(name, value)| { name.eq_ignore_ascii_case("accept-encoding") && value == "gzip" }));
+    assert!(sent.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("accept-encoding") && value == "identity"
+    }));
     assert!(sent.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("if-none-match") && value == "encoded-etag"
+    }));
+}
+
+#[test]
+fn stored_gzip_encoding_map_replays_identity_without_validators() {
+    let url = Url::parse("https://metadata.example/stored-gzip-map").unwrap();
+    let properties = json!({
+        "url": url.as_str(),
+        "etag": "stored-etag",
+        "truncated": false,
+        "vary": ["Accept, Accept-Encoding"],
+        "request_headers": {
+            "accept": ["text/plain"],
+            "accept-encoding": ["gzip"]
+        }
+    });
+    let sent = refresh_request_headers(&properties).unwrap();
+    assert_eq!(
+        crate::fetch::negotiation_headers(&sent),
+        crate::fetch::negotiation_headers(&[
+            ("accept".to_string(), "text/plain".to_string()),
+            ("accept-encoding".to_string(), "identity".to_string()),
+        ]),
+        "an earlier record keeps its replayed fields and never resends gzip"
+    );
+    assert!(sent.iter().all(|(name, _)| {
+        !name.eq_ignore_ascii_case("if-none-match")
+            && !name.eq_ignore_ascii_case("if-modified-since")
+    }));
+}
+
+#[tokio::test]
+async fn legacy_gzip_body_requires_identity_get_before_validation() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/legacy-gzip-body").unwrap();
+    let id = seed(&runtime, &token, &url, &[]).await;
+    crate::entities::patch(
+        &runtime,
+        &token,
+        id,
+        None,
+        json!({
+            "vary": ["Accept-Encoding"],
+            "request_headers": {"accept-encoding": ["gzip"]}
+        }),
+    )
+    .await
+    .unwrap();
+    let before = entity(&runtime, &token, id).await;
+    let properties = before.properties.as_ref().unwrap();
+    let sent = refresh_request_headers(properties).unwrap();
+    assert_eq!(
+        crate::fetch::negotiation_headers(&sent)["accept-encoding"],
+        vec!["identity".to_string()]
+    );
+    assert!(sent.iter().all(|(name, _)| {
+        !name.eq_ignore_ascii_case("if-none-match")
+            && !name.eq_ignore_ascii_case("if-modified-since")
+    }));
+
+    let no_body = settle_refresh_with_request_headers(
+        &runtime,
+        &token,
+        id,
+        url.as_str(),
+        properties["blob_ref"].as_str().unwrap(),
+        HopOutcome {
+            status: 304,
+            final_url: url.clone(),
+            headers: HeaderMap::new(),
+            redirect_to: None,
+            body: Some((vec![], false)),
+        },
+        &[],
+        &sent,
+    )
+    .await;
+    assert!(
+        no_body
+            .unwrap_err()
+            .to_string()
+            .contains("unsolicited_not_modified"),
+        "an unsolicited 304 cannot bless the legacy body"
+    );
+    assert_eq!(
+        serde_json::to_value(entity(&runtime, &token, id).await).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "a bodyless reply cannot change the legacy row"
+    );
+    assert_eq!(
+        entity(&runtime, &token, id).await.properties.unwrap()["request_headers"]
+            ["accept-encoding"],
+        json!(["gzip"])
+    );
+
+    refresh(&runtime, &token, id, &url, 200, response_headers(), &[]).await;
+    let after = entity(&runtime, &token, id).await;
+    let properties = after.properties.unwrap();
+    assert_eq!(
+        properties["request_headers"]["accept-encoding"],
+        json!(["identity"])
+    );
+    let next = refresh_request_headers(&properties).unwrap();
+    assert!(next.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("if-none-match") && value == "old-etag"
     }));
 }
 
@@ -1510,7 +1614,7 @@ async fn represented_accept_encoding_on_304_updates_vary() {
 }
 
 #[tokio::test]
-async fn legacy_map_304_represents_wire_gzip_but_next_refresh_is_unconditional() {
+async fn legacy_map_304_represents_wire_identity_but_next_refresh_is_unconditional() {
     let (runtime, token, _dir) = fixture();
     let url = Url::parse("https://metadata.example/legacy-encoding-304").unwrap();
     let id = seed(&runtime, &token, &url, &[]).await;
@@ -1757,7 +1861,7 @@ async fn concurrent_get_keeps_its_negotiation_after_same_body_refresh() {
     let after_get = entity(&runtime, &token, id).await;
     assert_eq!(
         after_get.properties.as_ref().unwrap()["request_headers"],
-        json!({"accept-language": ["en"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["en"], "accept-encoding": ["identity"]})
     );
     assert_eq!(
         after_get.properties.as_ref().unwrap()["blob_ref"],
@@ -1770,7 +1874,7 @@ async fn concurrent_get_keeps_its_negotiation_after_same_body_refresh() {
     let final_entity = entity(&runtime, &token, id).await;
     assert_eq!(
         final_entity.properties.unwrap()["request_headers"],
-        json!({"accept-language": ["en"], "accept-encoding": ["gzip"]}),
+        json!({"accept-language": ["en"], "accept-encoding": ["identity"]}),
         "A5 allows only the caller's GET to replace stored negotiation"
     );
 }
@@ -2026,7 +2130,7 @@ mod refresh_revision_tests {
         assert_eq!(row.content_ref.as_deref(), Some(expected_ref));
         assert_eq!(
             properties["request_headers"],
-            json!({"accept-language": [language], "accept-encoding": ["gzip"]}),
+            json!({"accept-language": [language], "accept-encoding": ["identity"]}),
             "a refresh must not replace the later caller-issued GET negotiation"
         );
         assert_eq!(
@@ -2140,7 +2244,7 @@ mod refresh_revision_tests {
                 assert_eq!(audit["lost_race"], true);
                 assert_eq!(
                     audit["request_headers"],
-                    json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]}),
+                    json!({"accept-language": ["fr"], "accept-encoding": ["identity"]}),
                     "receipt must report A's actual request, not B's saved context"
                 );
             }

@@ -738,19 +738,37 @@ predicate emitted by `build_note_filter_where`. A literal-value partial index
 planner sees different predicates and falls back to a table scan.
 `deleted_at IS NULL` is always present in filtered queries, so the partial
 condition is always satisfied and the index is eligible. `kind` is included
-as an indexed column so the `kind = ?N` predicate is covered. Statements are
-idempotent (`CREATE INDEX IF NOT EXISTS`).
+as an indexed column so the `kind = ?N` predicate is covered. The remaining
+pack statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
 
 `idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
 namespace, note kind, direction, sender actor, and `properties.outbound_ref`.
 
-`idx_comm_message_outbound_recipient` serves the channel delivery loops' outbox
-scan: a seek on direction plus a range on `properties.to_actor` (the channel
-prefix, `email:` or `telegram:`, rendered by `FilterOp::TextStartsWithIndexed`),
-then `created_at DESC, id ASC`. The prefix is in the statement because every
-actor-to-actor outbound row satisfies the pending predicate indefinitely, so a
-scan that pages first and filters the recipient afterwards stops reaching a
-channel's rows once enough other rows sort ahead of them.
+`idx_comm_message_outbound_recipient` serves outbox scans with arbitrary
+partial recipient prefixes: a seek on direction plus a range on
+`properties.to_actor` rendered by `FilterOp::TextStartsWithIndexed`, then
+`created_at DESC, id ASC`. The prefix belongs in the SQL statement because
+actor-to-actor outbound rows remain pending indefinitely; filtering them after
+the page would starve channel rows.
+
+`idx_comm_message_outbound_due` is installed by numbered core migration V44,
+not the pack schema plan. Supported note writers store a strict RFC 3339 UTC
+key and the source deadline text in the same write as `properties`. Its
+builtins-only expression compares that source with the current JSON property;
+if they differ, the row gets the empty BLOB key and enters the due candidates.
+The read path then applies a strict parser residual, so raw property edits
+cannot hide a newly due message or deliver a future one early. Raw SQLite
+connections need no application function to delete notes, check integrity, or
+vacuum. The index serves full colon-terminated channel prefixes.
+Its first-colon recipient bucket is an equality key ahead of the stored retry
+deadline, so a channel with many future retries and no due messages can seek
+past the backlog. Missing or malformed deadlines use the empty BLOB key and
+remain eligible. A full `name:` bucket exactly matches the corresponding
+recipient prefix; arbitrary partial prefixes use the recipient index above.
+The channel due page sorts by `+created_at DESC, id ASC`: `created_at` is an
+INTEGER timestamp, so this preserves the answer order while preventing an
+analyzed planner from walking the creation-order index through future retries
+to fill a small `LIMIT`.
 
 `idx_comm_quarantine_expiry` supports the daemon's bounded, channel-scoped
 expiry page by namespace, kind, channel identity, and expiry timestamp.
