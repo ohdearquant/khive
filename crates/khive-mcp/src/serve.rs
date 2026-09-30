@@ -442,12 +442,31 @@ fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRunti
     runtime.filter(|runtime| !runtime.is_read_only())
 }
 
+#[cfg(all(test, feature = "channel-email"))]
+thread_local! {
+    static EMAIL_POLL_TEST_CHANNEL: std::cell::RefCell<Option<std::sync::Arc<dyn khive_channel::Channel>>> =
+        const { std::cell::RefCell::new(None) };
+    static EMAIL_POLL_TEST_SHUTDOWN: std::cell::RefCell<Option<tokio_util::sync::CancellationToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "channel-email")]
+fn email_poll_shutdown_token(
+    process_shutdown: tokio_util::sync::CancellationToken,
+) -> tokio_util::sync::CancellationToken {
+    #[cfg(test)]
+    let process_shutdown = EMAIL_POLL_TEST_SHUTDOWN
+        .with(|token| token.borrow_mut().take())
+        .unwrap_or(process_shutdown);
+    process_shutdown
+}
+
+#[cfg(feature = "channel-email")]
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
 /// warning and returns on incomplete config. Only call this with the
 /// role-and-runtime admission returned by [`channel_loop_plan`] — use
 /// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
-#[cfg(feature = "channel-email")]
 fn spawn_email_channel_loops(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
@@ -461,6 +480,10 @@ fn spawn_email_channel_loops(
             let email_ch = Arc::new(email_ch);
             let mut ch_registry = ChannelRegistry::new();
             let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
+            #[cfg(test)]
+            let dyn_ch = EMAIL_POLL_TEST_CHANNEL
+                .with(|channel| channel.borrow_mut().take())
+                .unwrap_or(dyn_ch);
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
@@ -484,6 +507,8 @@ fn spawn_email_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
+                    let poll_shutdown =
+                        email_poll_shutdown_token(khive_runtime::daemon_shutdown_token());
                     khive_runtime::track_named_background_task("email_channel_poll", async move {
                         if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
                         {
@@ -498,7 +523,7 @@ fn spawn_email_channel_loops(
                             verb_reg_poll,
                             ingest_ns_clone,
                             default_actor_clone,
-                            khive_runtime::daemon_shutdown_token(),
+                            poll_shutdown,
                         )
                         .await;
                     });
@@ -4428,6 +4453,7 @@ fn build_pack_runtime(
     let rt = KhiveRuntime::from_backend(backend, rt_config)
         .with_declared_backend_db_paths(declared_backend_db_paths)
         .with_diagnostic_backends(diagnostic_backends)
+        .with_diagnostic_observer_from(main_runtime)
         .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
@@ -13476,17 +13502,30 @@ backend = "kg-backend"
     #[cfg(feature = "channel-email")]
     mod spawn_email_channel_loops_tests {
         use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use std::sync::{Arc, Mutex};
 
-        const EMAIL_ENV_VARS: [&str; 9] = [
+        const EMAIL_ENV_VARS: &[&str] = &[
             "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_SMTP_PORT",
             "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_IMAP_PORT",
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
             "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAILBOX",
             "KHIVE_EMAIL_MAINTAINER_ADDRESS",
             "KHIVE_EMAIL_AUTHSERV_ID",
             "KHIVE_EMAIL_PASSWORD",
             "KHIVE_EMAIL_OAUTH_TENANT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
+            "KHIVE_EMAIL_QUARANTINE_STORE",
+            "KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS",
+            "KHIVE_EMAIL_INGEST_NAMESPACE",
+            "KHIVE_EMAIL_DEFAULT_ACTOR",
         ];
 
         /// RAII guard: snapshots each `KHIVE_EMAIL_*` var's current value, clears it,
@@ -13518,6 +13557,158 @@ backend = "kg-backend"
                     }
                 }
             }
+        }
+
+        struct OneMessageEmailChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for OneMessageEmailChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(self.envelope.lock().unwrap().take().into_iter().collect())
+            }
+        }
+
+        #[test]
+        fn email_poll_shutdown_override_survives_cancelled_process_token() {
+            let cancelled_process = tokio_util::sync::CancellationToken::new();
+            cancelled_process.cancel();
+            let isolated = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(isolated.clone());
+            });
+
+            let selected = email_poll_shutdown_token(cancelled_process);
+            assert!(!selected.is_cancelled());
+            selected.cancel();
+            assert!(isolated.is_cancelled());
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial]
+        async fn production_email_spawn_routes_unset_default_actor_to_channel_mailbox() {
+            let _env_guard = EmailEnvGuard::clear();
+            std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_USERNAME", "mailbox@example.com");
+            std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+            std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.example.com");
+            std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+            assert!(std::env::var_os("KHIVE_EMAIL_DEFAULT_ACTOR").is_none());
+            khive_channel_email::EmailChannel::from_env().expect("email config takes the Ok arm");
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let blob_dir = tempfile::tempdir().expect("blob directory");
+            runtime
+                .install_blob_store(Arc::new(
+                    khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                        .expect("blob store"),
+                ))
+                .expect("install quarantine blob store");
+            let server = KhiveMcpServer::with_packs(
+                runtime,
+                &["kg".to_string(), "comm".to_string(), "blob".to_string()],
+            )
+            .expect("server builds with comm and blob storage");
+            let registry = server.verb_registry_clone();
+            let mut admission = server.channel_loop_admission();
+            assert!(
+                admission.inbound_poll,
+                "writable comm runtime admits polling"
+            );
+            admission.outbound_delivery = false;
+
+            // Replace the transport and process-global shutdown token. The
+            // real spawn path still resolves the actor, starts
+            // channel_poll_loop, and dispatches comm.ingest.
+            let test_shutdown = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(test_shutdown.clone());
+            });
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Arc::new(OneMessageEmailChannel {
+                    envelope: Mutex::new(Some(
+                        ChannelEnvelope::new(
+                            "email:sender@example.com",
+                            "email:mailbox@example.com",
+                            "production actor wiring",
+                        )
+                        .with_external_id("email-production-default-actor"),
+                    )),
+                }));
+            });
+            spawn_email_channel_loops(&server, admission);
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed fake transport"
+                );
+            });
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed test-scoped shutdown token"
+                );
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let message = loop {
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                tokio::task::yield_now().await;
+                let channel_inbox = registry
+                    .dispatch_with_identity(
+                        "comm.inbox",
+                        serde_json::json!({"status": "all"}),
+                        Some(khive_runtime::RequestIdentity {
+                            namespace: "local".to_string(),
+                            actor_id: Some("channel:email".to_string()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .expect("channel actor reads its own inbox");
+                if let Some(message) = channel_inbox["messages"]
+                    .as_array()
+                    .expect("channel inbox messages")
+                    .iter()
+                    .find(|message| message["content"] == "production actor wiring")
+                {
+                    break message.clone();
+                }
+                let local_inbox = registry
+                    .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                    .await
+                    .expect("local actor reads its own inbox");
+                assert!(
+                    !local_inbox["messages"]
+                        .as_array()
+                        .expect("local inbox messages")
+                        .iter()
+                        .any(|message| message["content"] == "production actor wiring"),
+                    "the production poll must not pass local as comm.ingest's default actor"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "production polling did not ingest its test message within 30s"
+                );
+            };
+            assert_eq!(message["properties"]["to_actor"], "channel:email");
+            test_shutdown.cancel();
         }
 
         #[tokio::test]

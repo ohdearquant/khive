@@ -88,8 +88,12 @@ Repeated kind triples may pair one substrate label (`entity`, `note`, `event`, o
 one granular kind label; both constrain the same node regardless of triple order. Different
 labels within either class are parse errors. Repeated string-property triples are accepted as one
 constraint when their values compare equal under the compiler's collation: ASCII case-insensitive
-for ordinary string properties, exact for `entity_type`. Conflicting values for the same subject
-kind or property predicate are parse errors rather than silently replacing an earlier constraint.
+for ordinary string properties, exact for `entity_type`. Conflicting kind labels or repeated
+string-property values for the same subject and predicate are parse errors rather than silently
+replacing an earlier constraint. Numeric-property triples remain separate JSON-property equality
+conditions in the `AND` tree, including when the same predicate has different numeric values.
+Because each JSON property is scalar, contradictory numeric equalities return no rows; they are
+not parse errors. A string and a numeric triple on the same predicate are likewise both retained.
 
 SPARQL `*` is rejected: it means zero-or-more, while the recursive SQL seed begins at depth one and cannot emit the start node as a depth-zero result. Treating `*` as `+` would lose valid matches.
 

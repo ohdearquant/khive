@@ -19,9 +19,9 @@
 //!
 //! If the dedicated connection is unavailable (never opened yet, or dropped
 //! after a prior tick's connection-level pragma failure), the tick reports
-//! `CheckpointTick::Skipped` and the next tick lazily reopens it. A busy PASSIVE
-//! result also skips pressure decisions without replacing the last valid WAL
-//! sample; a busy pool writer does not cause either kind of skip.
+//! `CheckpointTick::Skipped` and the next tick lazily reopens it. A busy or
+//! inconsistent PASSIVE result also skips pressure decisions without replacing
+//! the last valid WAL sample; a busy pool writer does not cause either skip.
 //!
 //! `warn_pages` / `high_water_pages` WARNs fire at most once per below→above
 //! crossing; a skipped tick leaves crossing state unchanged. An age-based
@@ -69,7 +69,8 @@ static TRUNCATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static TRUNCATE_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Count of checkpoint ticks without a usable WAL frame observation because
-/// the dedicated connection was unavailable or SQLite returned a busy row.
+/// the dedicated connection was unavailable or SQLite returned a busy or
+/// inconsistent PASSIVE row.
 /// Never reset outside `#[cfg(test)]`.
 static CHECKPOINT_SKIPPED_TICKS: AtomicU64 = AtomicU64::new(0);
 
@@ -601,10 +602,10 @@ pub(crate) fn reset_checkpoint_metrics_for_tests() {
 /// Outcome of a single checkpoint attempt.
 ///
 /// `Skipped` is returned when the dedicated connection is unavailable or its
-/// PASSIVE result is busy and has no usable WAL frame observation. A concurrent
-/// pool writer does not cause a skip: the task never checks out its writer
-/// mutex. `Observed` carries the WAL page count read during the tick. A skipped
-/// tick leaves threshold-crossing state unchanged.
+/// PASSIVE result is busy or inconsistent and has no usable WAL frame
+/// observation. A concurrent pool writer does not cause a skip: the task never
+/// checks out its writer mutex. `Observed` carries the WAL page count read
+/// during the tick. A skipped tick leaves threshold-crossing state unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointTick {
     /// No usable WAL frame observation was available this tick.
@@ -2073,7 +2074,8 @@ impl Drop for CheckpointLifecycleEmitter {
 /// `None` between ticks means the connection is unavailable (never opened
 /// yet, or dropped after a prior tick's connection-level pragma failure) —
 /// the caller must report that tick `Skipped` and retry the open on the next
-/// one. This is now the ONLY source of a `Skipped` tick.
+/// one. A busy or inconsistent PASSIVE result also skips a tick while keeping
+/// this connection open.
 ///
 /// ADR-136 D1 gate 5 classification: **checkpoint writer**. Explicitly
 /// exempt from `WriterTask`/queue routing by design (see the admission-path
@@ -2878,6 +2880,7 @@ fn log_wal_high_water_warn(
 #[must_use]
 struct CheckpointCoreOutcome {
     wal_pages: Option<u64>,
+    unavailable_reason: Option<CheckpointUnavailableReason>,
     sidecar_attribution: Option<WalpinAttributionRequest>,
 }
 
@@ -2886,7 +2889,8 @@ struct CheckpointCoreOutcome {
 /// mutex).
 ///
 /// Returns the observed WAL page count on success. A busy PASSIVE row has no
-/// usable observation and the compatibility wrapper returns `SQLITE_BUSY`.
+/// usable observation and the compatibility wrapper returns `SQLITE_BUSY`;
+/// an inconsistent nonbusy frame pair instead returns `SQLITE_ERROR`.
 /// A connection-level pragma error is also returned; the task caller drops
 /// that connection and reopens next tick. TRUNCATE errors remain non-fatal.
 ///
@@ -2908,16 +2912,20 @@ pub fn checkpoint_once(
     config: &CheckpointConfig,
     truncate_state: &mut TruncateState,
 ) -> Result<u64, rusqlite::Error> {
-    checkpoint_once_core(pool, conn, config, truncate_state)?
-        .wal_pages
-        .ok_or_else(|| {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-                Some(
-                    "PASSIVE checkpoint returned a busy row without a WAL frame observation".into(),
-                ),
-            )
-        })
+    let outcome = checkpoint_once_core(pool, conn, config, truncate_state)?;
+    outcome.wal_pages.ok_or_else(|| match outcome
+        .unavailable_reason
+        .expect("unavailable core outcome has a reason")
+    {
+        CheckpointUnavailableReason::Busy => rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("PASSIVE checkpoint returned a busy row without a WAL frame observation".into()),
+        ),
+        CheckpointUnavailableReason::InconsistentFrames => rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some("PASSIVE checkpoint returned an inconsistent frame pair without a WAL frame observation".into()),
+        ),
+    })
 }
 
 /// Synchronous PASSIVE/TRUNCATE core used by the async task. Unlike the
@@ -2932,7 +2940,7 @@ fn checkpoint_once_core(
     #[cfg(unix)]
     truncate_state.begin_tick();
     let started = Instant::now();
-    let checkpoint_result = query_checkpoint_observation(conn);
+    let checkpoint_result = query_routine_checkpoint_observation(pool, conn);
     let elapsed_us = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     record_checkpoint_timing(
         pool,
@@ -2958,18 +2966,31 @@ fn checkpoint_once_core(
             raw_observation.checkpointed_frames,
         )),
     );
-    let Some(wal_pages) = observed_wal_pages(raw_observation) else {
-        tracing::debug!(
-            busy = raw_observation.busy,
-            wal_log_frames = raw_observation.log_frames,
-            wal_checkpointed_frames = raw_observation.checkpointed_frames,
-            elapsed_us,
-            "WAL PASSIVE checkpoint returned a busy row; frame observation unavailable"
-        );
-        return Ok(CheckpointCoreOutcome {
-            wal_pages: None,
-            sidecar_attribution: None,
-        });
+    let wal_pages = match observed_wal_pages(raw_observation) {
+        Ok(wal_pages) => wal_pages,
+        Err(reason) => {
+            match reason {
+                CheckpointUnavailableReason::Busy => tracing::debug!(
+                    busy = raw_observation.busy,
+                    wal_log_frames = raw_observation.log_frames,
+                    wal_checkpointed_frames = raw_observation.checkpointed_frames,
+                    elapsed_us,
+                    "WAL PASSIVE checkpoint returned a busy row; frame observation unavailable"
+                ),
+                CheckpointUnavailableReason::InconsistentFrames => tracing::warn!(
+                    busy = raw_observation.busy,
+                    wal_log_frames = raw_observation.log_frames,
+                    wal_checkpointed_frames = raw_observation.checkpointed_frames,
+                    elapsed_us,
+                    "WAL PASSIVE checkpoint returned an inconsistent frame pair; frame observation unavailable"
+                ),
+            }
+            return Ok(CheckpointCoreOutcome {
+                wal_pages: None,
+                unavailable_reason: Some(reason),
+                sidecar_attribution: None,
+            });
+        }
     };
     let observation = record_routine_wal_observation(pool, raw_observation);
     LAST_WAL_PAGES.store(wal_pages, Ordering::Relaxed);
@@ -2988,6 +3009,7 @@ fn checkpoint_once_core(
 
     Ok(CheckpointCoreOutcome {
         wal_pages: Some(wal_pages),
+        unavailable_reason: None,
         sidecar_attribution,
     })
 }
@@ -3665,7 +3687,7 @@ fn log_backfill_gap(pool: &ConnectionPool, conn: &rusqlite::Connection) {
                     observation.checkpointed_frames,
                 )),
             );
-            if observed_wal_pages(observation).is_some() {
+            if observed_wal_pages(observation).is_ok() {
                 tracing::warn!(
                     busy = observation.busy,
                     wal_log_frames = observation.log_frames,
@@ -3732,16 +3754,33 @@ struct RawCheckpointObservation {
     checkpointed_frames: i64,
 }
 
-fn observed_wal_pages(observation: RawCheckpointObservation) -> Option<u64> {
+/// Why a syntactically valid SQLite checkpoint row has no usable frame count.
+/// Keep the raw `busy` indication distinct from an inconsistent frame pair:
+/// only SQLite's nonzero busy column may become a busy error or busy log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointUnavailableReason {
+    Busy,
+    InconsistentFrames,
+}
+
+fn observed_wal_pages(
+    observation: RawCheckpointObservation,
+) -> Result<u64, CheckpointUnavailableReason> {
     if observation.busy != 0 {
-        return None;
+        return Err(CheckpointUnavailableReason::Busy);
     }
     if observation.log_frames == -1 && observation.checkpointed_frames == -1 {
         // SQLite reports an absent WAL with two -1 frame columns.
-        return Some(0);
+        return Ok(0);
     }
-    (observation.log_frames >= 0 && observation.checkpointed_frames >= 0)
-        .then_some(observation.log_frames as u64)
+    if observation.log_frames >= 0
+        && observation.checkpointed_frames >= 0
+        && observation.checkpointed_frames <= observation.log_frames
+    {
+        Ok(observation.log_frames as u64)
+    } else {
+        Err(CheckpointUnavailableReason::InconsistentFrames)
+    }
 }
 
 /// Issue one PASSIVE checkpoint and retain the complete SQLite result row.
@@ -3757,6 +3796,47 @@ fn query_checkpoint_observation(
             checkpointed_frames: row.get(2)?,
         })
     })
+}
+
+/// The routine caller uses the real SQLite row. Unit tests can inject one
+/// exact raw row for a uniquely keyed pool to exercise a frame combination
+/// that SQLite does not normally emit without changing the production path.
+fn query_routine_checkpoint_observation(
+    pool: &ConnectionPool,
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<RawCheckpointObservation> {
+    #[cfg(test)]
+    if let Some(row) = test_take_passive_row(pool) {
+        return Ok(row);
+    }
+    #[cfg(not(test))]
+    let _ = pool;
+    query_checkpoint_observation(conn)
+}
+
+#[cfg(test)]
+static TEST_PASSIVE_ROWS: OnceLock<Mutex<HashMap<Option<PathBuf>, RawCheckpointObservation>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn test_passive_rows() -> &'static Mutex<HashMap<Option<PathBuf>, RawCheckpointObservation>> {
+    TEST_PASSIVE_ROWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn test_arm_passive_row(pool: &ConnectionPool, row: RawCheckpointObservation) {
+    test_passive_rows()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(checkpoint_db_key(pool), row);
+}
+
+#[cfg(test)]
+fn test_take_passive_row(pool: &ConnectionPool) -> Option<RawCheckpointObservation> {
+    test_passive_rows()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&checkpoint_db_key(pool))
 }
 
 fn query_truncate_observation(
@@ -3788,7 +3868,9 @@ fn query_wal_pages(pool: &ConnectionPool, conn: &rusqlite::Connection) -> Option
             )
         }),
     );
-    let pages = observation.ok().and_then(observed_wal_pages);
+    let pages = observation
+        .ok()
+        .and_then(|row| observed_wal_pages(row).ok());
     if let Some(pages) = pages {
         LAST_WAL_PAGES.store(pages, Ordering::Relaxed);
         note_checkpoint_observed(pages);
@@ -4605,7 +4687,10 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         writer_task.join().expect("commit loop must finish");
         shutdown_tx.send(()).unwrap();
-        task.await.expect("checkpoint task must not panic");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("commit-churn checkpoint task shutdown exceeded 5 s")
+            .expect("checkpoint task must not panic");
         assert!(
             !saw_oldest_pinned_frame,
             "short-lived backfill rows without a reader must not age into pins"
@@ -7993,7 +8078,7 @@ mod tests {
         ];
         let ticks: Vec<(bool, u64)> = rows
             .iter()
-            .filter_map(|row| observed_wal_pages(*row))
+            .filter_map(|row| observed_wal_pages(*row).ok())
             .map(|pages| (pages >= config.warn_pages, pages))
             .collect();
         assert_eq!(ticks, vec![(true, 20), (true, 20), (false, 5)]);
@@ -8015,7 +8100,7 @@ mod tests {
         let mut high_water_warnings = 0;
         let mut rungs = Vec::new();
         for row in rows {
-            if let Some(pages) = observed_wal_pages(row) {
+            if let Ok(pages) = observed_wal_pages(row) {
                 high_water_warnings += usize::from(crossing_warn(
                     pages >= config.high_water_pages,
                     &mut was_above_high_water,
@@ -8043,7 +8128,7 @@ mod tests {
                 log_frames: 100,
                 checkpointed_frames: 99,
             }),
-            None,
+            Err(CheckpointUnavailableReason::Busy),
             "a populated busy row is neutral too"
         );
         assert_eq!(
@@ -8052,7 +8137,7 @@ mod tests {
                 log_frames: -1,
                 checkpointed_frames: -1,
             }),
-            Some(0),
+            Ok(0),
             "a nonbusy row with no WAL is a measured zero"
         );
         assert_eq!(
@@ -8061,9 +8146,121 @@ mod tests {
                 log_frames: 20,
                 checkpointed_frames: -1,
             }),
-            None,
+            Err(CheckpointUnavailableReason::InconsistentFrames),
             "a malformed frame pair must not be clamped into a measurement"
         );
+        assert_eq!(
+            observed_wal_pages(RawCheckpointObservation {
+                busy: 0,
+                log_frames: 5,
+                checkpointed_frames: 6,
+            }),
+            Err(CheckpointUnavailableReason::InconsistentFrames),
+            "a checkpointed count above the log count is inconsistent"
+        );
+    }
+
+    #[test]
+    #[serial(checkpoint_skip_metrics)]
+    fn inconsistent_nonbusy_row_is_not_reported_as_sqlite_busy() {
+        reset_checkpoint_metrics_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("inconsistent_checkpoint_row.db"));
+        let conn = checkpoint_conn(&pool);
+        let row = RawCheckpointObservation {
+            busy: 0,
+            log_frames: 20,
+            checkpointed_frames: -1,
+        };
+        assert_eq!(
+            observed_wal_pages(row),
+            Err(CheckpointUnavailableReason::InconsistentFrames)
+        );
+        test_arm_passive_row(&pool, row);
+
+        let mut result = None;
+        let events = capture(|| {
+            result = Some(checkpoint_once(
+                &pool,
+                &conn,
+                &CheckpointConfig::default(),
+                &mut TruncateState::default(),
+            ));
+        });
+        let error = result
+            .expect("checkpoint_once ran")
+            .expect_err("an inconsistent nonbusy row cannot be measured");
+        let rusqlite::Error::SqliteFailure(code, Some(message)) = error else {
+            panic!("expected an explicit SQLite error for inconsistent frames");
+        };
+        assert_eq!(code.extended_code, rusqlite::ffi::SQLITE_ERROR);
+        assert!(message.contains("inconsistent frame pair"));
+        assert!(!message.contains("busy"));
+        assert!(events.iter().any(|event| {
+            event.message.as_deref()
+                == Some("WAL PASSIVE checkpoint returned an inconsistent frame pair; frame observation unavailable")
+                && event.busy == Some(0)
+        }));
+        assert_eq!(checkpoint_timing(&pool).busy_ticks, 0);
+        assert!(test_take_passive_row(&pool).is_none());
+    }
+
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
+    async fn periodic_task_skips_a_passive_busy_row_after_opening_its_connection() {
+        reset_checkpoint_metrics_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let pool = file_pool(&dir.path().join("periodic_busy_row.db"));
+        {
+            let writer = pool.writer().expect("seed WAL database");
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1)")
+                .expect("seed row");
+        }
+        // The real periodic task owns its dedicated connection. Inject only
+        // its first SQLite-shaped PASSIVE return row, not a missing connection
+        // or a hand-built CheckpointTick, so the production mapping to
+        // `Skipped` and the skip counter are both exercised.
+        test_arm_passive_row(
+            &pool,
+            RawCheckpointObservation {
+                busy: 1,
+                log_frames: 10,
+                checkpointed_frames: 5,
+            },
+        );
+        let skipped_before = checkpoint_skipped_ticks();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let task = tokio::spawn(run_checkpoint_task(
+            Arc::clone(&pool),
+            CheckpointConfig {
+                interval: Duration::from_millis(10),
+                truncate_high_water_pages: u64::MAX,
+                ..CheckpointConfig::default()
+            },
+            None,
+            shutdown_rx,
+            false,
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while checkpoint_timing(&pool).busy_ticks == 0
+            || checkpoint_skipped_ticks() == skipped_before
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "periodic task did not classify the busy PASSIVE row as a skipped tick"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        shutdown_tx.send(()).expect("stop checkpoint task");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("checkpoint task stops")
+            .expect("checkpoint task does not panic");
+        assert!(test_take_passive_row(&pool).is_none());
+        assert!(checkpoint_timing(&pool).busy_ticks >= 1);
+        assert!(checkpoint_skipped_ticks() > skipped_before);
     }
 
     /// #1857 regression: a dropped recovery handoff must not fold the next,

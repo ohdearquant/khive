@@ -82,6 +82,18 @@ fn validate_sha_shape(sha: &str) -> Result<(), RuntimeError> {
     }
 }
 
+fn validate_commit_key_sha(key: Option<&str>, sha: &str) -> Result<(), RuntimeError> {
+    if let Some(key) = key.filter(|key| key.starts_with("git.commit:")) {
+        let expected = format!("git.commit:{sha}");
+        if key != expected {
+            return Err(RuntimeError::InvalidInput(format!(
+                "commit key {key:?} must equal {expected:?} for properties.sha {sha:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Shared shape predicate for `commit properties.parents`, given whatever
 /// raw JSON value the key held (including an explicit `null`, which is not
 /// an array and so is refused the same way on create and on update).
@@ -187,6 +199,7 @@ impl KindHook for CommitHook {
             .and_then(Value::as_str)
             .ok_or_else(|| RuntimeError::InvalidInput("commit requires properties.sha".into()))?;
         validate_sha_shape(sha)?;
+        validate_commit_key_sha(args.get("key").and_then(Value::as_str), sha)?;
 
         if let Some(parents) = props.get("parents") {
             validate_parents_shape(parents)?;
@@ -242,6 +255,14 @@ impl KindHook for CommitHook {
                 RuntimeError::InvalidInput("commit requires properties.sha".into())
             })?;
             validate_sha_shape(sha)?;
+        }
+
+        let effective_sha = patch
+            .get("sha")
+            .and_then(Value::as_str)
+            .or_else(|| note_property_str(note, "sha"));
+        if let Some(sha) = effective_sha {
+            validate_commit_key_sha(note.key.as_deref(), sha)?;
         }
 
         // parents is optional at create (the key may be omitted), but create
@@ -549,6 +570,63 @@ mod tests {
                 .contains("must be a 40-character hex string"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_commit_refuses_reserved_key_for_another_sha() {
+        let (_token, registry) = fixture().await;
+        let key = format!("git.commit:{}", valid_sha());
+        let sha = other_valid_sha();
+        let err = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "commit",
+                    "key": key,
+                    "content": "a mismatched commit",
+                    "properties": {"sha": sha},
+                }),
+            )
+            .await
+            .expect_err("a reserved key cannot preclaim a different SHA");
+        assert!(
+            err.to_string().contains(&key) && err.to_string().contains(&sha),
+            "the refusal must name the key and claimed SHA: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_commit_cannot_rebind_a_reserved_key_to_another_sha() {
+        let (_token, registry) = fixture().await;
+        let original = valid_sha();
+        let key = format!("git.commit:{original}");
+        let created = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "commit",
+                    "key": key,
+                    "content": "an owned commit",
+                    "properties": {"sha": original},
+                }),
+            )
+            .await
+            .expect("a matching reserved key is accepted");
+        let id = created["id"].as_str().expect("commit id");
+        let changed = other_valid_sha();
+        let err = registry
+            .dispatch("update", json!({"id": id, "properties": {"sha": changed}}))
+            .await
+            .expect_err("a property update cannot leave a keyed commit mismatched");
+        assert!(
+            err.to_string().contains(&key) && err.to_string().contains(&changed),
+            "the refusal must name the key and proposed SHA: {err}"
+        );
+        let stored = registry
+            .dispatch("get", json!({"id": id}))
+            .await
+            .expect("read unchanged commit");
+        assert_eq!(stored["properties"]["sha"], json!(original));
     }
 
     // ---------------------------------------------------------------------

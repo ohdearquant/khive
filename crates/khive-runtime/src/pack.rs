@@ -2441,6 +2441,8 @@ impl VerbRegistry {
         ("session", "session.resume"),
         ("session", "session.export"),
         ("session", "session.search"),
+        // Fixed SQL reads and file metadata only; no domain or maintenance write.
+        ("session", "session.stats"),
         // tool (registry, grant and policy reads; tool.suggest runs the same
         // hybrid search as the kg search and context verbs above)
         ("tool", "tool.suggest"),
@@ -6373,6 +6375,42 @@ pub(crate) mod tests {
             after_build,
             "a miss must not re-scan any pack's handlers() either"
         );
+    }
+
+    #[test]
+    fn session_stats_admission_degrade_requires_trusted_session_owner() {
+        static HANDLERS: [HandlerDef; 2] = [
+            HandlerDef {
+                name: "session.stats",
+                description: "read session store statistics",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "session.vacuum",
+                description: "compact session store",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            },
+        ];
+
+        let pack = || CountingHandlersPack {
+            name: "session",
+            handlers: &HANDLERS,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut trusted = VerbRegistryBuilder::new();
+        trusted.register_trusted(pack());
+        let trusted = trusted.build().expect("trusted session registry");
+        assert!(trusted.admission_degrade_safe_probe("session.stats"));
+        assert!(!trusted.admission_degrade_safe_probe("session.vacuum"));
+
+        let mut untrusted = VerbRegistryBuilder::new();
+        untrusted.register(pack());
+        let untrusted = untrusted.build().expect("untrusted session registry");
+        assert!(!untrusted.admission_degrade_safe_probe("session.stats"));
     }
 
     #[test]

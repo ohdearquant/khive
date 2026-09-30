@@ -5,7 +5,7 @@ use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::ops::{Deref, DerefMut};
@@ -719,6 +719,19 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
     )))
 }
 
+/// Pool-scoped counters for ADR-166's search mechanism guards.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SearchMechanismSnapshot {
+    /// Coordinator calls actually issued to each registered backend, keyed by
+    /// the request's canonical kind. A backend skipped by served-kind routing
+    /// has no entry for that kind.
+    pub dispatches_by_backend_and_kind: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Candidate note rows fetched after the text/vector fusion and fresh-tail
+    /// merge, including rows later filtered as deleted. Result metadata fetched
+    /// later by the KG handler is excluded.
+    pub note_candidate_hydration_rows: u64,
+}
+
 /// A read-write connection pool for SQLite.
 ///
 /// Architecture:
@@ -762,6 +775,10 @@ pub struct ConnectionPool {
     /// store and raw-SQL caller inherits it without per-verb bookkeeping
     /// (ADR-165 Slice 2 / ADR-166 G2).
     reader_acquisition_counters: ReaderAcquisitionCounters,
+    /// ADR-166 G4/G5 process-lifetime mechanism counters for this physical
+    /// backend. Backend IDs remain separate even when aliases share a pool.
+    search_dispatches: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
+    note_candidate_hydration_rows: AtomicU64,
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
@@ -1403,6 +1420,59 @@ pub struct WriterGuard<'pool> {
     origin: TxOrigin,
 }
 
+/// A zero-wait checkout that can run only the fixed checkpoint recovery
+/// pragmas. The connection remains private: exposing it would let a caller
+/// execute logical writes without disk-reserve admission (ADR-154 §5).
+///
+/// Ordinary SQL is deliberately unavailable through this capability:
+/// ```compile_fail
+/// use khive_db::{ConnectionPool, PoolConfig};
+/// let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+/// pool.try_checkpoint_nowait().unwrap().execute_batch("CREATE TABLE bypass (id INTEGER)");
+/// ```
+pub struct CheckpointGuard<'pool> {
+    guard: parking_lot::MutexGuard<'pool, Connection>,
+}
+
+/// SQLite's three-column result from a fixed WAL checkpoint pragma.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointResult {
+    /// Whether SQLite reported a busy checkpoint.
+    pub busy: i64,
+    /// WAL frames observed by SQLite (`-1` when there is no WAL).
+    pub log_frames: i64,
+    /// WAL frames copied back into the database.
+    pub checkpointed_frames: i64,
+}
+
+impl CheckpointGuard<'_> {
+    /// Run a PASSIVE checkpoint without disk-reserve admission.
+    pub fn passive(&self) -> Result<CheckpointResult, SqliteError> {
+        self.guard
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok(CheckpointResult {
+                    busy: row.get(0)?,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Run a TRUNCATE checkpoint without disk-reserve admission.
+    pub fn truncate(&self) -> Result<CheckpointResult, SqliteError> {
+        self.guard
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok(CheckpointResult {
+                    busy: row.get(0)?,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+            .map_err(Into::into)
+    }
+}
+
 /// Process-local monotonic counters for every instrumented writer acquisition
 /// boundary owned by one [`ConnectionPool`].
 ///
@@ -1738,6 +1808,8 @@ impl ConnectionPool {
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             write_admission,
             reader_acquisition_counters: ReaderAcquisitionCounters::default(),
+            search_dispatches: Mutex::new(BTreeMap::new()),
+            note_candidate_hydration_rows: AtomicU64::new(0),
             readers,
             max_readers,
             config,
@@ -2047,20 +2119,24 @@ impl ConnectionPool {
         }
     }
 
-    /// Zero-wait writer checkout for background tasks.
+    /// Zero-wait checkpoint checkout for recovery maintenance.
     ///
     /// Uses `try_lock()` (no timeout, no spin) — returns `Err` immediately when
-    /// any other caller holds the writer Mutex. Background tasks (e.g. the WAL
-    /// checkpoint task) MUST use this instead of `try_writer` so that a busy
-    /// writer causes the background task to skip its current tick rather than
-    /// stalling for up to `checkout_timeout` (default 5s) while write traffic
-    /// is in progress.
+    /// any other caller holds the writer Mutex. The scheduled checkpoint task
+    /// uses its own dedicated connection (ADR-091 Amendment 5); this optional
+    /// pooled capability remains available for zero-wait recovery callers.
     ///
-    /// This public checkout deliberately bypasses the disk-space admission
-    /// floor so checkpoint and recovery can run when the volume is low. It
-    /// returns a general writer guard; callers must reserve it for maintenance
-    /// and use `try_writer` for ordinary writes.
-    pub fn try_writer_nowait(&self) -> Result<WriterGuard<'_>, SqliteError> {
+    /// It bypasses the disk-reserve floor because checkpoints can recover WAL
+    /// space at or below that floor (ADR-154 §5). The returned guard exposes
+    /// only fixed PASSIVE and TRUNCATE checkpoint operations.
+    ///
+    /// The former unrestricted checkout must not return:
+    /// ```compile_fail
+    /// use khive_db::{ConnectionPool, PoolConfig};
+    /// let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+    /// pool.try_writer_nowait().unwrap().execute_batch("CREATE TABLE bypass (id INTEGER)");
+    /// ```
+    pub fn try_checkpoint_nowait(&self) -> Result<CheckpointGuard<'_>, SqliteError> {
         self.ensure_pooled_writer_active()?;
         let guard = self.writer.try_lock().ok_or_else(|| {
             SqliteError::InvalidData(
@@ -2068,10 +2144,7 @@ impl ConnectionPool {
             )
         })?;
         self.ensure_pooled_writer_active()?;
-        Ok(WriterGuard {
-            guard,
-            origin: self.origin(),
-        })
+        Ok(CheckpointGuard { guard })
     }
 
     pub(crate) fn retire_pooled_writer(&self, conn: &Connection) {
@@ -2097,6 +2170,40 @@ impl ConnectionPool {
     /// was constructed.
     pub fn writer_acquisition_snapshot(&self) -> WriterAcquisitionSnapshot {
         self.writer_acquisition_counters.snapshot()
+    }
+
+    /// Count a coordinator call only after served-kind filtering selects this
+    /// backend. The canonical requested kind is the granular kind when one was
+    /// supplied, or the entity/note substrate otherwise.
+    pub fn record_search_dispatch(&self, backend_id: &str, requested_kind: &str) {
+        let mut dispatches = self.search_dispatches.lock();
+        let count = dispatches
+            .entry(backend_id.to_owned())
+            .or_default()
+            .entry(requested_kind.to_owned())
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// Count one actual candidate note row returned at the post-fusion
+    /// hydration seam, including rows later filtered as deleted. Absent rows
+    /// and later result metadata are excluded.
+    pub fn record_note_candidate_hydration_row(&self) {
+        let _ = self.note_candidate_hydration_rows.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(1)),
+        );
+    }
+
+    /// Snapshot ADR-166 G4/G5 counters. Values reset only with this pool.
+    pub fn search_mechanism_snapshot(&self) -> SearchMechanismSnapshot {
+        SearchMechanismSnapshot {
+            dispatches_by_backend_and_kind: self.search_dispatches.lock().clone(),
+            note_candidate_hydration_rows: self
+                .note_candidate_hydration_rows
+                .load(Ordering::Relaxed),
+        }
     }
 
     /// Snapshot reader acquisition, saturation, and hold lifecycle outcomes
@@ -2592,7 +2699,13 @@ impl ConnectionPool {
         self.verify_opened_database_id(&conn)?;
         #[cfg(unix)]
         verify_sqlite_opened_file_still_at_path(&conn)?;
+        #[cfg(feature = "namespace-trigram-proto")]
+        register_namespace_trigram(&conn)?;
         register_writer_clock(&conn)?;
+        // Expression indexes over these keys are maintained by every writer
+        // (the write-queue task and per-store standalone writers included), so
+        // each of them needs the same functions the pooled writer registers.
+        register_rfc3339_key(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         self.checkpoint_ownership
             .configure_wal_autocheckpoint(&conn)?;
@@ -3164,7 +3277,10 @@ fn read_only_wal_open_target_for_path(path: &Path) -> Result<PathBuf, SqliteErro
 pub(crate) fn open_read_only_snapshot_connection(path: &Path) -> Result<Connection, SqliteError> {
     let (_, physical_path) = mint_db_identity(path)?;
     let target = read_only_wal_open_target_for_path(&physical_path)?;
-    Connection::open_with_flags(&target, reader_open_flags()).map_err(Into::into)
+    let conn = Connection::open_with_flags(&target, reader_open_flags())?;
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(&conn)?;
+    Ok(conn)
 }
 
 fn sqlite_header_uses_wal(path: &Path) -> Result<bool, SqliteError> {
@@ -3254,6 +3370,11 @@ fn reader_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX
 }
 
+#[cfg(feature = "namespace-trigram-proto")]
+fn register_namespace_trigram(conn: &Connection) -> Result<(), SqliteError> {
+    crate::namespace_trigram_proto::register(conn).map_err(SqliteError::InvalidData)
+}
+
 fn register_writer_clock(conn: &Connection) -> Result<(), SqliteError> {
     // Evaluated by SQLite at statement execution, never deterministic: stream
     // observation deadlines use the same UTC microsecond source as note stamps.
@@ -3275,7 +3396,17 @@ pub(crate) fn rfc3339_instant_key(instant: chrono::DateTime<chrono::Utc>) -> Vec
     key
 }
 
-fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
+/// The outbox deadline grammar is stricter than the general timestamp filter.
+/// This is shared by app-maintained stored keys, V44 backfill, and the read
+/// residual; no schema expression calls an application-defined function.
+pub(crate) fn strict_rfc3339_key(text: &str) -> Option<Vec<u8>> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)))
+}
+
+/// Register timestamp-key functions for read filters on pooled connections.
+pub(crate) fn register_rfc3339_key(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     use rusqlite::types::ValueRef;
 
@@ -3311,9 +3442,7 @@ fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
                 ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
                 _ => None,
             };
-            let key = text
-                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
-                .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)));
+            let key = text.and_then(strict_rfc3339_key);
             Ok(key)
         },
     )?;
@@ -3324,6 +3453,8 @@ fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
 ) -> Result<bool, SqliteError> {
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(conn)?;
     register_writer_clock(conn)?;
     register_rfc3339_key(conn)?;
     if config.read_only {
@@ -3374,6 +3505,8 @@ fn configure_writer_connection(
 }
 
 fn configure_reader_connection(conn: &Connection, config: &PoolConfig) -> Result<(), SqliteError> {
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(conn)?;
     register_rfc3339_key(conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
@@ -5496,6 +5629,73 @@ mod tests {
     }
 
     #[test]
+    fn every_writer_capable_connection_maintains_rfc3339_expression_indexes() {
+        const INSERT: &str = "INSERT INTO deadlines(id, due) VALUES (?1, ?2)";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rfc3339_expression_index.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("file-backed pool open");
+        {
+            let writer = pool.writer().expect("pooled writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE deadlines(id INTEGER PRIMARY KEY, due TEXT);
+                     CREATE INDEX idx_deadlines_strict \
+                         ON deadlines(ifnull(khive_rfc3339_strict_key(due), x''));
+                     CREATE INDEX idx_deadlines_relaxed \
+                         ON deadlines(khive_rfc3339_key(due));",
+                )
+                .expect("pooled writer registers both key functions");
+        }
+
+        // Control: a connection that did not go through the pool's
+        // initialization cannot maintain these indexes. This is the
+        // failure every unregistered writer used to hit.
+        let bare = Connection::open(&path).expect("bare connection");
+        let refused = bare
+            .execute(INSERT, rusqlite::params![1, "2026-01-01T00:00:00Z"])
+            .expect_err("an unregistered connection cannot maintain the index");
+        assert!(
+            refused.to_string().contains("unknown function"),
+            "unexpected refusal: {refused}"
+        );
+        drop(bare);
+
+        let tracked = pool.open_standalone_writer().expect("tracked standalone");
+        let untracked = pool
+            .open_standalone_writer_untracked()
+            .expect("untracked standalone");
+        for (id, conn) in [(2, &tracked), (3, &untracked)] {
+            conn.execute(INSERT, rusqlite::params![id, "2026-01-01T00:00:00Z"])
+                .unwrap_or_else(|error| panic!("standalone writer {id}: {error}"));
+        }
+        {
+            let writer = pool.writer().expect("pooled writer");
+            writer
+                .conn()
+                .execute(INSERT, rusqlite::params![4, "2026-01-01T00:00:00Z"])
+                .expect("pooled writer");
+        }
+        let reader = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .expect("standalone reader");
+        let indexed: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM deadlines \
+                 WHERE ifnull(khive_rfc3339_strict_key(due), x'') <= khive_rfc3339_strict_key(?1)",
+                ["2026-06-01T00:00:00Z"],
+                |row| row.get(0),
+            )
+            .expect("standalone reader registers the key functions");
+        assert_eq!(indexed, 3);
+    }
+
+    #[test]
     fn writer_connections_follow_checkpoint_ownership_claim() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_autocheckpoint.db");
@@ -6325,7 +6525,7 @@ mod tests {
         let before = pool.writer_acquisition_snapshot();
 
         assert!(
-            pool.try_writer_nowait().is_err(),
+            pool.try_checkpoint_nowait().is_err(),
             "zero-wait maintenance checkout must skip while held"
         );
 
@@ -6335,6 +6535,43 @@ mod tests {
             "a checkpoint-style zero-wait skip is not a finite-wait checkout timeout"
         );
         drop(held);
+    }
+
+    #[test]
+    fn checkpoint_capability_reclaims_wal_below_the_capacity_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_floor.db");
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.set_test_write_admission(0, |_| Ok(0));
+        pool.writer()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE checkpoint_floor (id INTEGER); \
+                 INSERT INTO checkpoint_floor VALUES (1)",
+            )
+            .unwrap();
+
+        let wal_path = path.with_extension("db-wal");
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
+        pool.set_test_write_admission(100, |_| Ok(99));
+        assert!(matches!(
+            pool.writer(),
+            Err(SqliteError::CapacityFloor { .. })
+        ));
+        let before = pool.writer_acquisition_snapshot();
+
+        let checkpoint = pool
+            .try_checkpoint_nowait()
+            .expect("checkpoint recovery must bypass the floor");
+        assert_eq!(checkpoint.passive().unwrap().busy, 0);
+        assert_eq!(checkpoint.truncate().unwrap().busy, 0);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        assert_eq!(pool.writer_acquisition_snapshot(), before);
     }
 
     /// ADR-091 Plank 0: `WriterGuard::transaction` registers/deregisters a
