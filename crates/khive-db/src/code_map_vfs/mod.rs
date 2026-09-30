@@ -249,6 +249,9 @@ pub(crate) struct CodeMapHandleGuard {
     // 0 = closed, 1 = authorized for one DELETE PRAGMA, 2 = consumed.
     mode_switch_phase: AtomicU8,
     exclusive_main_handles: AtomicUsize,
+    // The VFS can only answer SQLITE_CANTOPEN; the reason it discards is kept
+    // here until the caller that sees the error takes it.
+    last_refusal: Mutex<Option<String>>,
 }
 
 pub(crate) fn register_rollback(
@@ -261,7 +264,53 @@ pub(crate) fn register_rollback(
 
 pub(crate) use transition::prepare_rollback_target;
 
+/// Append the guard refusal last recorded for `vfs_name` to an error SQLite
+/// reported for it, keeping the error's variant and code. Only an open that
+/// SQLite reports as `SQLITE_CANTOPEN`, directly or inside a failed migration,
+/// takes the refusal; any other error is returned unchanged and leaves it.
+pub(crate) fn with_refusal(
+    error: crate::error::SqliteError,
+    vfs_name: &str,
+) -> crate::error::SqliteError {
+    use crate::error::SqliteError;
+    match error {
+        SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, message))
+            if code.code == rusqlite::ErrorCode::CannotOpen =>
+        {
+            let message = match (message, vfs::take_refusal(vfs_name)) {
+                (Some(message), Some(reason)) => Some(format!("{message}; {reason}")),
+                (None, Some(reason)) => Some(reason),
+                (message, None) => message,
+            };
+            SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, message))
+        }
+        SqliteError::Migration { version, error } => match vfs::take_refusal(vfs_name) {
+            Some(reason) => SqliteError::Migration {
+                version,
+                error: format!("{error}; {reason}"),
+            },
+            None => SqliteError::Migration { version, error },
+        },
+        other => other,
+    }
+}
+
 impl CodeMapHandleGuard {
+    fn record_refusal(&self, role: Role, error: &GuardError) {
+        *self
+            .last_refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(format!("code-map VFS refused the {role:?} open: {error}"));
+    }
+
+    fn take_refusal(&self) -> Option<String> {
+        self.last_refusal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
     pub(crate) fn new(
         target: PathBuf,
         mode: Mode,
@@ -294,6 +343,7 @@ impl CodeMapHandleGuard {
             opened_wal: Mutex::new(Vec::new()),
             mode_switch_phase: AtomicU8::new(0),
             exclusive_main_handles: AtomicUsize::new(0),
+            last_refusal: Mutex::new(None),
         };
         guard.preflight_locked(&ledger)?;
         Ok(guard)

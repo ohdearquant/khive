@@ -137,6 +137,18 @@ pub(super) fn register(guard: Arc<CodeMapHandleGuard>) -> Result<String, GuardEr
 }
 
 #[cfg(any(test, feature = "test-support"))]
+/// Take the refusal the guard registered as `name` last recorded, if any.
+pub(super) fn take_refusal(name: &str) -> Option<String> {
+    let guard = registrations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .rollback
+        .values()
+        .find(|entry| entry.name == name)
+        .map(|entry| Arc::clone(&entry.guard))?;
+    guard.take_refusal()
+}
+
 pub(super) fn registration_count() -> usize {
     registrations()
         .lock()
@@ -241,8 +253,12 @@ unsafe extern "C" fn open(
     {
         return ffi::SQLITE_CANTOPEN;
     }
-    let Ok(handle) = registration.guard.open(path_role, access) else {
-        return ffi::SQLITE_CANTOPEN;
+    let handle = match registration.guard.open(path_role, access) {
+        Ok(handle) => handle,
+        Err(error) => {
+            registration.guard.record_refusal(path_role, &error);
+            return ffi::SQLITE_CANTOPEN;
+        }
     };
     if !out_flags.is_null() {
         // SAFETY: SQLite supplies an optional writable output pointer.

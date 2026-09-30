@@ -7,6 +7,7 @@ use rusqlite::Connection;
 use super::{callbacks, vfs, CodeMapHandleGuard, GuardError, Mode, Role};
 #[cfg(unix)]
 use super::{OpenAccess, ProductionBase, ProductionKind};
+use crate::error::SqliteError;
 use crate::StorageBackend;
 
 const CHILD_TEST: &str = "KHIVE_CODE_MAP_VFS_TEST_CHILD";
@@ -565,4 +566,82 @@ fn rollback_registration_reuses_contract_then_caps_distinct_targets() {
     assert!(matches!(&error, GuardError::RegistrationFull), "{error}");
     assert!(error.to_string().contains("restart"));
     assert_eq!(vfs::registration_count(), before + 512);
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_open_names_the_guard_reason_through_cannot_open() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let production = dir.path().join("production.db");
+    let target = dir.path().join("code-map.db");
+    seed_rollback(&production);
+    std::fs::copy(&production, &target).unwrap();
+    let guard = Arc::new(
+        CodeMapHandleGuard::new(target.clone(), Mode::Rollback, vec![main_base(&production)])
+            .unwrap(),
+    );
+    let name = vfs::register(guard).unwrap();
+    let swap_target = target.clone();
+    let swap_production = production.clone();
+    super::set_before_os_open(move || {
+        std::fs::remove_file(&swap_target).unwrap();
+        std::os::unix::fs::symlink(&swap_production, &swap_target).unwrap();
+    });
+    let Err(error) = crate::pool::ConnectionPool::new(crate::pool::PoolConfig {
+        path: Some(target.clone()),
+        code_map_vfs: Some(name.clone()),
+        wal_mode: false,
+        ..crate::pool::PoolConfig::default()
+    }) else {
+        panic!("a main swapped for a symlink must refuse the guarded open");
+    };
+    match &error {
+        SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, Some(message))) => {
+            assert_eq!(code.code, rusqlite::ErrorCode::CannotOpen, "{error}");
+            assert!(
+                message.contains("code-map VFS refused the Main open: code-map VFS cannot prove"),
+                "{error}"
+            );
+        }
+        other => panic!("expected CannotOpen carrying the refusal, got {other}"),
+    }
+    assert_eq!(
+        vfs::take_refusal(&name),
+        None,
+        "a reported refusal is consumed"
+    );
+}
+
+#[test]
+fn migration_failure_names_a_recorded_refusal_once() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let target = dir.path().join("code-map.db");
+    seed_rollback(&target);
+    let guard = Arc::new(CodeMapHandleGuard::new(target, Mode::Rollback, vec![]).unwrap());
+    let name = vfs::register(Arc::clone(&guard)).unwrap();
+    guard.record_refusal(Role::Journal, &GuardError::ProtectedChanged);
+    let unrelated = super::with_refusal(SqliteError::InvalidData("unrelated".into()), &name);
+    assert!(
+        matches!(&unrelated, SqliteError::InvalidData(message) if message == "unrelated"),
+        "{unrelated}"
+    );
+    let failed = || SqliteError::Migration {
+        version: 5,
+        error: "unable to open database file".into(),
+    };
+    assert_eq!(
+        super::with_refusal(failed(), &name).to_string(),
+        "migration v5 failed: unable to open database file; code-map VFS refused the Journal \
+         open: code-map VFS protected production paths changed during admission"
+    );
+    assert_eq!(
+        super::with_refusal(failed(), &name).to_string(),
+        "migration v5 failed: unable to open database file"
+    );
 }

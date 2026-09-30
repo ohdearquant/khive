@@ -2865,7 +2865,8 @@ fn open_file_connection(
     config: &PoolConfig,
 ) -> Result<Connection, SqliteError> {
     match config.code_map_vfs.as_deref() {
-        Some(vfs) => Connection::open_with_flags_and_vfs(path, flags, vfs).map_err(Into::into),
+        Some(vfs) => Connection::open_with_flags_and_vfs(path, flags, vfs)
+            .map_err(|error| crate::code_map_vfs::with_refusal(error.into(), vfs)),
         None => Connection::open_with_flags(path, flags).map_err(Into::into),
     }
 }
