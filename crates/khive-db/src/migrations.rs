@@ -234,6 +234,9 @@ pub(crate) fn migrate_outbound_due_key(tx: &rusqlite::Transaction<'_>) -> rusqli
     tx.execute_batch(V44_UP)
 }
 
+const RECIPIENT_TRANSPORT_VERSION: u32 = 45;
+const V45_UP: &str = include_str!("../sql/045-recipient-transport.sql");
+
 const V21_STAGE_UP: &str = include_str!("../sql/021-attachments-a-stage.sql");
 
 const V21_ATTACHMENT_FENCES_UP: &str = include_str!("../sql/021-attachments-b-claim-fences.sql");
@@ -512,6 +515,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 44,
         name: "comm_outbound_due",
         up: V44_UP,
+    },
+    VersionedMigration {
+        version: RECIPIENT_TRANSPORT_VERSION,
+        name: "recipient_transport",
+        up: V45_UP,
     },
 ];
 
