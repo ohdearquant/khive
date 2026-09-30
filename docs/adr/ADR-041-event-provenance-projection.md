@@ -733,6 +733,10 @@ emits `EdgeUpdated`, and deletion emits `EdgeDeleted`; both retain their existin
 edge-only projection at position 0. There is no `LinkDeleted` event kind in the
 shipped vocabulary.
 
+Non-normative cross-reference: [ADR-014 Amendment 6](ADR-014-curation-operations.md#amendment-6-link-mutation-and-lifecycle-event-commit-together-3675)
+is Proposed and specifies a source-backend transaction boundary for four canonical link
+paths. It retains this amendment's projection contract and does not alter it while Proposed.
+
 ---
 
 ## References

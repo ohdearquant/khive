@@ -795,3 +795,146 @@ of destroyed rows is such a class.
 ### Refs
 
 #3262, #3219, #3174.
+
+## Amendment 6: Link mutation and lifecycle event commit together (#3675)
+
+**Status**: Proposed (2026-09-30)
+
+This amendment qualifies this record's "Audit trail via events" section for the four link
+paths below. It retains the accepted natural-key replacement, explicit resurrection,
+transaction-observed disposition and event payload rules. Until this amendment is accepted,
+the existing accepted clauses remain in force; this Proposed section does not authorize a
+dependent implementation to merge.
+
+### Context
+
+`KhiveRuntime::link_observed`, `link_with_target_backend_observed`, `link_many_observed` and
+`link_commit_annotation_if_absent` commit their graph write before calling
+`append_link_mutation_event` (`crates/khive-runtime/src/operations.rs`). An append failure
+returns an error while the edge is already live. Retrying an upsert reports `Updated` and
+emits `EdgeUpdated`; retrying the create-only commit annotation reports `ExistingLive` and
+emits nothing. Neither retry records the lost `LinkCreated`. A later batch append failure
+can leave every edge committed with only a prefix of its events.
+
+The request-atomic link path already includes the mutation and event in one unit
+(`crates/khive-runtime/src/atomic_prepare.rs`). ADR-099's accepted canonical-parity rule
+does not extend that stronger event boundary to these four canonical paths. The accepted
+merge-event amendment above provides the corresponding single-backend precedent.
+
+### Decision
+
+For each of these four paths, the source backend's edge mutation, its lifecycle event row
+and all derived `event_observations` rows form one writer transaction:
+
+| Path                                | Transaction contents                                                                       |
+| ----------------------------------- | ------------------------------------------------------------------------------------------ |
+| `link_observed`                     | Guarded observed edge upsert and its lifecycle event/projection                            |
+| `link_with_target_backend_observed` | Observed edge upsert and its lifecycle event/projection on the source backend              |
+| `link_many_observed`                | Every observed edge write and every lifecycle event/projection in the batch                |
+| `link_commit_annotation_if_absent`  | Guarded create-only annotation and its `LinkCreated` event/projection, only when `Created` |
+
+The transaction commits only after every required edge, event and projection write
+succeeds. An event append or observation insert failure rolls back its edge mutation;
+for a new edge, that edge is absent afterwards. An edge-write failure leaves no lifecycle
+event or observation for that attempted mutation. A later event/projection failure in
+`link_many_observed` rolls back earlier edges, events and observations as well as the
+failing row. Failed replacement and resurrection attempts leave their exact prior edge
+rows intact. Return the failure after the transaction owner has established its outcome;
+retry is safe after confirmed rollback. Existing writer outcome-unknown reporting still
+applies when commit or rollback cannot be established.
+
+For `link_with_target_backend_observed`, only the source backend participates in this
+transaction. The target backend's state is explicitly outside this atomic unit and
+remains unchanged. Endpoint location and validation remain the coordinator's responsibility;
+this decision does not make remote endpoint validation transactional with the source
+write or claim cross-backend atomicity. The persisted edge keeps its existing
+`target_backend` stamp.
+
+The event kind and payload are built from the result observed inside that same graph
+transaction: `Created` emits `LinkCreated`; `Updated` and `Resurrected` emit `EdgeUpdated`
+with the existing preimage. Capture `EventAttribution` from the sealed `NamespaceToken`
+before writer admission and stamp through that helper, preserving namespace, actor and
+operation attribution. Persist through the existing event insertion/projection engine,
+with ADR-041 Amendment A4's endpoint kinds, positions, historical decoding defaults and
+event-endpoint omission unchanged. The lifecycle event stays in the source domain store;
+it is not dispatched to a separate audit lane or a deferred append queue.
+
+A graph refusal writes no link mutation event or observation. This includes a missing
+endpoint, a tombstone without `resurrect=true`, or a failed commit-note/project/cursor
+guard. `ExistingLive` and `Tombstoned` annotation outcomes change no edge and emit no
+event. After a rolled-back annotation attempt, a successful retry creates one edge and
+one `LinkCreated`; a subsequent `ExistingLive` retry emits no second event. Normal live
+upserts retain their accepted replacement semantics and emit their corresponding update
+event.
+
+### Internal composition seam
+
+Introduce an internal transaction-enlisted graph composition seam that opens no
+transaction of its own. It reuses the existing `observed_edge_upsert`,
+`observed_edge_batch_upsert` and `conditional_commit_annotation_insert` engines in
+`crates/khive-db/src/stores/graph.rs`, including their endpoint, natural-key, tombstone and
+cursor guards. The transaction owner composes those engines with the existing
+`append_event_in_transaction` or `event_insert_statements` event engine and commits once.
+Do not copy their classification or SQL into an independent runtime implementation.
+Event generation uses the transaction-observed result, and a batch result-count mismatch
+must fail before commit.
+
+Use the existing WriterTask and compatibility transaction owners with the same outcome
+on file-backed and in-memory storage. Work under the writer transaction remains bounded,
+SQL-only and suspension-free under ADR-067/ADR-099; it performs no endpoint network lookup,
+embedding, filesystem work or nested asynchronous store dispatch. This amendment adds no
+agent-facing verb, GraphStore trait contract, schema or `EventKind`; raw storage writes
+outside these four runtime paths do not gain automatic lifecycle events.
+
+### Alternatives considered
+
+- Keep the separate append and reconcile missing events later: rejected; this amendment chooses one source-backend commit boundary for the mutation and its event.
+
+### Acceptance and controls
+
+1. For **each of the four paths**, start with a valid new-edge fixture and force the
+   lifecycle event insert to fail after the graph DML has run. Require the injected
+   diagnostic, an absent new edge afterwards, and zero event/observation rows for that
+   attempt. Remove the fault and retry: `Created`, one persisted edge, one `LinkCreated`
+   and its complete expected projection. **Control:** restore that path's old
+   post-commit append order; its test must run and fail the edge-absence assertion.
+2. For **each of the four paths**, force the edge insert itself to fail with otherwise
+   valid input. Assert no event or observation exists for that attempt. **Control:**
+   persist the event outside the edge transaction before the failing graph write; the
+   corresponding no-event assertion must fail.
+3. Fail the second event in a batch after the first edge, event and observations have
+   been written. Assert that every edge, event and projection from the unit rolls back.
+   Independently fail an observation insert and require the same rollback. **Controls:**
+   commit a prefix before the later failure, or append projections after commit; each
+   corresponding rollback assertion must fail.
+4. Exercise live replacement, explicit resurrection and canonical symmetric endpoint
+   order. Event/projection failure preserves the exact preimage; success preserves the
+   existing row ID and creation time and reports the existing disposition. Missing
+   endpoints and default tombstone conflicts write no mutation event. **Control:**
+   classify from a post-write lookup or omit a guard; the corresponding disposition or
+   refusal assertion must fail.
+5. For the commit annotation, preserve both selected cursor rows byte-for-byte on
+   failure, success and retry. Cover `SourceChanged`, `TargetChanged`, `CursorChanged`,
+   `Tombstoned` and `ExistingLive` as event-free outcomes. A rolled-back fresh attempt
+   retries to `Created`, then `ExistingLive` with a stable event count. **Control:**
+   emit on a no-write outcome or use a post-commit append; the event-count or absence
+   assertion must fail.
+6. Compare event actor, namespace, operation attribution and projected referent kinds/
+   positions with the existing token-stamped event engine, including a note annotating
+   an event. Cross-backend fixtures must show the event and observations on the source
+   store, the unchanged target store and the correct `target_backend` stamp. **Controls:**
+   omit sealed attribution, omit projection rows or route the event to the target store;
+   each corresponding parity/placement assertion must fail.
+7. Drive the matrix on file-backed WriterTask and compatibility routing and in-memory
+   routing. The fault must be witnessed at the intended write, and controls must reach
+   their stated assertions; a compile failure, skipped test or zero-test filter is not
+   a control result. A process stopped after a successful commit leaves the edge, event
+   and projections; a stop before commit leaves none of that unit's writes.
+
+### References
+
+- [ADR-009](ADR-009-backend-architecture.md): source-backend placement and observed upsert semantics.
+- [ADR-038](ADR-038-bulk-operations.md): all-or-nothing bulk links.
+- [ADR-041 Amendment A4](ADR-041-event-provenance-projection.md#amendment-a4-linkcreated-carries-endpoint-substrates): event projection parity.
+- [ADR-067](ADR-067-write-owner-daemon.md) and [ADR-099](ADR-099-bulk-apply-atomic-units.md): writer ownership, shared DML and suspension-free atomic units.
+- [ADR-088 annotation repair](ADR-088-amendment-1-git-digest.md): create-only historical commit annotations and unchanged cursors.
