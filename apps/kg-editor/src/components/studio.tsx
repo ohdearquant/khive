@@ -4,7 +4,6 @@ import {
   Activity,
   AlertTriangle,
   ArrowRight,
-  BookOpen,
   Bot,
   Box,
   Brain,
@@ -13,11 +12,9 @@ import {
   ChevronDown,
   Circle,
   Clock3,
-  Code2,
   Copy,
   Database,
   Download,
-  ExternalLink,
   FileJson2,
   FileText,
   GitBranch,
@@ -35,50 +32,108 @@ import {
   X,
   XCircle,
 } from "@/icons";
-import { useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
   edgeDirectionMark,
   edgeHueStyle,
   EntityKindMark,
   kindHueStyle,
-  NoteKindMark,
   OntologyKindMark,
   OntologyLegend,
   RelationMark,
 } from "@/components/ontology-mark";
 import { DataState } from "@/components/data-state";
+import { ReviewActivityTimeline } from "@/components/review-activity-timeline";
+import { ReviewThreadSurface } from "@/components/review-thread-surface";
 import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
 import { settleGraphLayout } from "@/lib/graph-layout";
 import { handleKeyboardRows } from "@/lib/keyboard-rows";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
+import { reviewActivityEvents } from "@/lib/review-activity";
 import {
   isReviewReport,
   parseReviewInput,
   REVIEW_IMPORT_MAX_BYTES,
   type ReviewBundle,
-  type ReviewChange,
+  type ReviewInput,
   type ReviewReport,
 } from "@/lib/review-bundle";
 import {
   canApproveReview,
-  groupChanges,
-  matchesReviewQuery,
   shortHash,
   type ReviewDecision,
 } from "@/lib/review-utils";
+import { buildReviewThreadModel, type ReviewAnnotation } from "@/lib/review-thread";
 
-type View = "changes" | "graph" | "checks" | "provenance" | "retrieval" | "activity";
+type View = "changes" | "graph" | "retrieval" | "activity";
 type Toast = { tone: "success" | "warning" | "neutral"; message: string } | null;
 
 const viewLabels: Record<View, string> = {
   changes: "Changes",
   graph: "Affected graph",
-  checks: "Checks",
-  provenance: "Provenance",
   retrieval: "Khive context",
   activity: "Activity",
 };
+
+type GraphSelection = { type: "node" | "edge"; id: string };
+type ReviewLocation = {
+  view: View;
+  selectedUnitKey: string;
+  selectedEventId: string;
+  graphSelection: GraphSelection;
+};
+
+function defaultReviewLocation(input: ReviewInput): ReviewLocation {
+  return {
+    view: "changes",
+    selectedUnitKey: buildReviewThreadModel(input).units[0]?.key ?? "",
+    selectedEventId: reviewActivityEvents(input)[0]?.id ?? "",
+    graphSelection: { type: "node", id: input.review_kind === "pull_request" ? input.graph.nodes.items[0]?.id ?? "" : "" },
+  };
+}
+
+function reviewLocationFromUrl(url: URL, input: ReviewInput): ReviewLocation {
+  const fallback = defaultReviewLocation(input);
+  const requestedView = url.searchParams.get("view");
+  const view = requestedView !== null && Object.prototype.hasOwnProperty.call(viewLabels, requestedView) &&
+    (input.review_kind === "pull_request" || requestedView === "changes" || requestedView === "activity")
+    ? requestedView as View
+    : fallback.view;
+  const requestedUnit = url.searchParams.get("unit");
+  let selectedUnitKey = fallback.selectedUnitKey;
+  if (requestedUnit !== null && buildReviewThreadModel(input).units.some((unit) => unit.key === requestedUnit)) {
+    selectedUnitKey = requestedUnit;
+  }
+  const requestedEvent = url.searchParams.get("event");
+  let selectedEventId = fallback.selectedEventId;
+  if (requestedEvent !== null && (
+    requestedEvent === "" || reviewActivityEvents(input).some((event) => event.id === requestedEvent)
+  )) selectedEventId = requestedEvent;
+
+  let graphSelection = fallback.graphSelection;
+  const edgeId = url.searchParams.get("edge");
+  const nodeId = url.searchParams.get("node");
+  if (input.review_kind === "pull_request") {
+    if (edgeId && input.graph.edges.items.some((edge) => edge.id === edgeId)) {
+      graphSelection = { type: "edge", id: edgeId };
+    } else if (nodeId && input.graph.nodes.items.some((node) => node.id === nodeId)) {
+      graphSelection = { type: "node", id: nodeId };
+    }
+  }
+  return { view, selectedUnitKey, selectedEventId, graphSelection };
+}
+
+function reviewLocationUrl(base: URL, location: ReviewLocation): URL {
+  const url = new URL(base.origin + base.pathname);
+  url.searchParams.set("view", location.view);
+  url.searchParams.set("unit", location.selectedUnitKey);
+  url.searchParams.set("event", location.selectedEventId);
+  if (location.graphSelection.id) {
+    url.searchParams.set(location.graphSelection.type, location.graphSelection.id);
+  }
+  return url;
+}
 
 const reviewerFamilies = [
   "family:demo-author",
@@ -95,12 +150,6 @@ function formatDate(value: string): string {
   }).format(new Date(value));
 }
 
-function formatValue(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (value === undefined) return "—";
-  return JSON.stringify(value, null, 2);
-}
-
 function displaySnapshotHash(bundle: ReviewBundle, length = 8): string {
   const hash = bundle.snapshot_identity.head_hash;
   return hash ? shortHash(hash, length) : "unavailable";
@@ -111,10 +160,6 @@ function StatusGlyph({ status }: { status: ReviewBundle["checks"]["items"][numbe
   if (status === "warning") return <AlertTriangle aria-hidden="true" />;
   if (status === "fail") return <XCircle aria-hidden="true" />;
   return <Clock3 aria-hidden="true" />;
-}
-
-function TierPill({ tier }: { tier: "tier_1" | "tier_2" }) {
-  return <span className={`tier-pill ${tier}`}>{tier === "tier_1" ? "T1 fast path" : "T2 review"}</span>;
 }
 
 type CapturedPage = Readonly<{
@@ -222,12 +267,10 @@ function Header({
 
 function Sidebar({ bundle, activeView, onView }: { bundle: ReviewBundle; activeView: View; onView: (view: View) => void }) {
   const navigation: { id: View; label: string; icon: typeof FileText; count?: number }[] = [
-    { id: "changes", label: "Changes", icon: FileJson2, count: bundle.changes.items.length },
+    { id: "changes", label: "Changes", icon: FileJson2, count: buildReviewThreadModel(bundle).units.length },
     { id: "graph", label: "Affected graph", icon: Network, count: bundle.graph.nodes.items.length },
-    { id: "checks", label: "Checks", icon: ShieldCheck, count: bundle.checks.items.length },
-    { id: "provenance", label: "Provenance", icon: BookOpen, count: bundle.evidence.items.length },
     { id: "retrieval", label: "Khive context", icon: Brain },
-    { id: "activity", label: "Activity", icon: Activity, count: bundle.activity.items.length },
+    { id: "activity", label: "Activity", icon: Activity, count: reviewActivityEvents(bundle).length },
   ];
 
   return (
@@ -342,12 +385,10 @@ function PullRequestHeader({ bundle, onCopy }: { bundle: ReviewBundle; onCopy: (
 
 function WorkspaceTabs({ activeView, onView, bundle }: { activeView: View; onView: (view: View) => void; bundle: ReviewBundle }) {
   const tabs: { id: View; label: string; count?: number }[] = [
-    { id: "changes", label: "Changes", count: bundle.changes.items.length },
+    { id: "changes", label: "Changes", count: buildReviewThreadModel(bundle).units.length },
     { id: "graph", label: "Graph", count: bundle.graph.nodes.items.length },
-    { id: "checks", label: "Checks", count: bundle.checks.items.length },
-    { id: "provenance", label: "Evidence", count: bundle.evidence.items.length },
     { id: "retrieval", label: "Context" },
-    { id: "activity", label: "Conversation", count: bundle.activity.items.length },
+    { id: "activity", label: "Activity", count: reviewActivityEvents(bundle).length },
   ];
   return (
     <div className="workspace-tabs" role="tablist" aria-label="Review views" data-keyboard-list>
@@ -370,139 +411,17 @@ function WorkspaceTabs({ activeView, onView, bundle }: { activeView: View; onVie
   );
 }
 
-function FieldDiff({ field }: { field: ReviewChange["fields"][number] }) {
-  const changed = field.before !== undefined && field.after !== undefined;
-  return (
-    <div className="field-diff">
-      <span className="field-name">{field.path}</span>
-      <div className="field-values">
-        {field.before !== undefined && (
-          <pre className="before"><span>−</span>{formatValue(field.before)}</pre>
-        )}
-        {field.after !== undefined && (
-          <pre className="after"><span>{changed ? "+" : "+"}</span>{formatValue(field.after)}</pre>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function ChangeOntologyMark({ change }: { change: ReviewChange }) {
-  const valueAt = (path: string) => {
-    const field = change.fields.find((candidate) => candidate.path === path);
-    return field?.after ?? field?.before;
-  };
-  if (change.substrate === "entity") {
-    const value = valueAt("entity_kind") ?? valueAt("kind");
-    const kind = typeof value === "string" ? value : "entity";
-    return <EntityKindMark className="substrate-chip" kind={kind} />;
-  }
-  if (change.substrate === "note") {
-    const value = valueAt("note_kind") ?? valueAt("kind");
-    const kind = typeof value === "string" ? value : "note";
-    return <NoteKindMark className="substrate-chip" kind={kind} />;
-  }
-  const value = valueAt("relation");
-  const relation = typeof value === "string" ? value : "edge";
-  return <RelationMark className="substrate-chip edge" relation={relation} />;
-}
-
-function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; selected: boolean; onSelect: () => void }) {
-  return (
-    <article className={`change-card ${change.change} ${selected ? "selected" : ""}`}>
-      <button className="change-summary" type="button" data-keyboard-row aria-keyshortcuts="J K Enter" onClick={onSelect} aria-expanded={selected}>
-        <span className="change-sign" aria-hidden="true">
-          {change.change === "added" ? "+" : change.change === "removed" ? "−" : "~"}
-        </span>
-        <div className="change-title">
-          <strong>{change.title}</strong>
-          <span>{change.subtitle}</span>
-        </div>
-        <ChangeOntologyMark change={change} />
-        <TierPill tier={change.tier} />
-        <ChevronDown className={selected ? "rotated" : ""} aria-hidden="true" />
-      </button>
-      {selected && (
-        <div className="change-detail">
-          <div className="record-id"><Code2 aria-hidden="true" /> {change.id}</div>
-          {change.fields.map((field) => <FieldDiff key={field.path} field={field} />)}
-          <div className="evidence-links">
-            <BookOpen aria-hidden="true" />
-            {change.evidence_ids.length} evidence anchor{change.evidence_ids.length === 1 ? "" : "s"} travel with this change
-          </div>
-        </div>
-      )}
-    </article>
-  );
-}
-
-function ChangesView({
+function GraphView({
   bundle,
-  query,
-  onQuery,
   onImport,
+  selection,
+  onSelect,
 }: {
   bundle: ReviewBundle;
-  query: string;
-  onQuery: (value: string) => void;
   onImport: () => void;
+  selection: GraphSelection;
+  onSelect: (selection: GraphSelection) => void;
 }) {
-  const filtered = bundle.changes.items.filter((change) => matchesReviewQuery(change, query));
-  const grouped = groupChanges(filtered);
-  const [selectedId, setSelectedId] = useState(bundle.changes.items.at(0)?.id ?? "");
-
-  return (
-    <div className="view-stack">
-      <div className="surface-toolbar">
-        <div>
-          <span className="eyebrow">Semantic diff</span>
-          <h2>{filtered.length} graph changes</h2>
-        </div>
-        <label className="filter-input">
-          <Search aria-hidden="true" />
-          <input value={query} onChange={(event) => onQuery(event.target.value)} placeholder="Filter entities, edges, tiers…" />
-          {query && <button type="button" onClick={() => onQuery("")} aria-label="Clear filter text"><X /></button>}
-        </label>
-      </div>
-      <div className="diff-legend">
-        <span><i className="added" /> {grouped.added.length} added</span>
-        <span><i className="modified" /> {grouped.modified.length} modified</span>
-        <span><i className="removed" /> {grouped.removed.length} removed</span>
-        <span className="content-hash"><Box aria-hidden="true" /> {bundle.snapshot_identity.hash_status === "fixture" ? "Fixture KG" : "KG"} {displaySnapshotHash(bundle, 10)}</span>
-      </div>
-      <div className="change-list" data-keyboard-list>
-        {filtered.map((change) => (
-          <ChangeCard
-            key={change.id}
-            change={change}
-            selected={selectedId === change.id}
-            onSelect={() => setSelectedId((current) => current === change.id ? "" : change.id)}
-          />
-        ))}
-        {filtered.length === 0 && isCompletePage(bundle.changes) && (
-          <DataState
-            className="empty-state"
-            state="empty"
-            title={query ? `No graph changes match “${query}”` : "No graph changes in this review bundle"}
-            message="Graph changes matching the selected relation, entity kind, or tier belong here."
-            action={query
-              ? { label: "Clear filter", onClick: () => onQuery("") }
-              : { label: "Import another review bundle", onClick: onImport }}
-          />
-        )}
-      </div>
-      <PageNotice page={bundle.changes} label="Graph changes" />
-    </div>
-  );
-}
-
-type GraphSelection = { type: "node" | "edge"; id: string };
-
-function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
-  const [selection, setSelection] = useState<GraphSelection>({
-    type: "node",
-    id: bundle.graph.nodes.items[0]?.id ?? "",
-  });
 
   const settledNodes = useMemo(
     () => settleGraphLayout(bundle.graph.nodes.items, bundle.graph.edges.items),
@@ -515,8 +434,8 @@ function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =>
   );
   const edgeById = useMemo(() => new Map(bundle.graph.edges.items.map((edge) => [edge.id, edge])), [bundle.graph.edges.items]);
 
-  const selectNode = (id: string) => setSelection({ type: "node", id });
-  const selectEdge = (id: string) => setSelection({ type: "edge", id });
+  const selectNode = (id: string) => onSelect({ type: "node", id });
+  const selectEdge = (id: string) => onSelect({ type: "edge", id });
 
   const selected = selection.type === "node"
     ? settledNodes.find((node) => node.id === selection.id) ?? settledNodes[0]
@@ -617,6 +536,7 @@ function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =>
           <button
             type="button"
             className={`graph-node ${node.state} ${selection.type === "node" && node.id === selection.id ? "selected" : ""}`}
+            aria-pressed={selection.type === "node" && node.id === selection.id}
             style={{ left: `${node.x}%`, top: `${node.y}%`, ...kindHueStyle(entityLegendFor(node.kind)) }}
             key={node.id}
             onClick={() => selectNode(node.id)}
@@ -708,92 +628,6 @@ function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =>
   );
 }
 
-function ChecksView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
-  const failed = bundle.checks.items.filter((check) => check.status === "fail").length;
-  return (
-    <div className="view-stack">
-      <div className="surface-toolbar">
-        <div><span className="eyebrow">Stage-time validation</span><h2>Semantic checks</h2></div>
-        <span className="checks-runtime">{bundle.checks.items.reduce((total, check) => total + check.duration_ms, 0)} ms total</span>
-      </div>
-      {isKnownEmptyPage(bundle.checks) ? (
-        <DataState
-          className="empty-state"
-          state="empty"
-          title="No semantic checks in this review bundle"
-          message="Stage-time validation checks belong here."
-          action={{ label: "Import another review bundle", onClick: onImport }}
-        />
-      ) : bundle.checks.items.length > 0 ? <><div className="checks-hero">
-        {failed > 0 ? <XCircle aria-hidden="true" /> : <ShieldCheck aria-hidden="true" />}
-        <div>
-          <strong>{failed > 0 ? `${failed} required check${failed === 1 ? "" : "s"} failed` : "No error-level findings"}</strong>
-          <span>{failed > 0 ? "Approval remains blocked until the review bundle is regenerated cleanly." : "Warnings and the independent-review gate remain visible."}</span>
-        </div>
-      </div>
-      <div className="checks-list detailed">
-        {bundle.checks.items.map((check) => (
-          <article className={`check-row ${check.status}`} key={check.id}>
-            <StatusGlyph status={check.status} />
-            <div><strong>{check.label}</strong><span>{check.detail}</span></div>
-            <code>{check.id}</code>
-            <time>{check.duration_ms ? `${check.duration_ms} ms` : "waiting"}</time>
-          </article>
-        ))}
-      </div>
-      </> : null}
-      <PageNotice page={bundle.checks} label="Checks" />
-    </div>
-  );
-}
-
-function ProvenanceView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
-  return (
-    <div className="view-stack">
-      <div className="surface-toolbar">
-        <div><span className="eyebrow">Evidence contract</span><h2>Why these edits exist</h2></div>
-        <span className="immutable-pill"><LockKeyhole aria-hidden="true" /> append-only anchors</span>
-      </div>
-      {isKnownEmptyPage(bundle.evidence) ? (
-        <DataState
-          className="empty-state"
-          state="empty"
-          title="No evidence anchors in this review bundle"
-          message="Evidence supporting the captured edits belongs here."
-          action={{ label: "Import another review bundle", onClick: onImport }}
-        />
-      ) : <div className="provenance-grid">
-        {bundle.evidence.items.map((evidence) => (
-          <article className="evidence-card" key={evidence.id}>
-            <div className="evidence-icon"><BookOpen aria-hidden="true" /></div>
-            <div className="evidence-body">
-              <span>{evidence.source}</span>
-              <h3>{evidence.title}</h3>
-              <blockquote>“{evidence.excerpt}”</blockquote>
-              <div className="evidence-meta"><code>{evidence.locator}</code><time>{formatDate(evidence.captured_at)}</time></div>
-            </div>
-            <ExternalLink aria-hidden="true" />
-          </article>
-        ))}
-      </div>
-      }
-      <PageNotice page={bundle.evidence} label="Evidence anchors" />
-      <div className="provenance-chain">
-        <span className="eyebrow">Attribution chain</span>
-        <div>
-          <span><Bot /> {bundle.change_set.envelope.producer}</span>
-          <ArrowRight />
-          <span><FileJson2 /> {bundle.change_set.envelope.batch_id}</span>
-          <ArrowRight />
-          <span><GitCommitHorizontal /> {shortHash(bundle.repository.head_sha)}</span>
-          <ArrowRight />
-          <span><Database /> {displaySnapshotHash(bundle)}</span>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function RetrievalView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
   const [mode, setMode] = useState<"search" | "recall" | "traverse">("search");
   const activePage = mode === "traverse" ? bundle.retrieval.traversal : bundle.retrieval[mode];
@@ -855,59 +689,6 @@ function RetrievalView({ bundle, onImport }: { bundle: ReviewBundle; onImport: (
   );
 }
 
-function ActivityView({
-  bundle,
-  onImport,
-  draft,
-  onDraft,
-  localNotes,
-  onAddLocalNote,
-}: {
-  bundle: ReviewBundle;
-  onImport: () => void;
-  draft: string;
-  onDraft: (value: string) => void;
-  localNotes: readonly string[];
-  onAddLocalNote: () => void;
-}) {
-  return (
-    <div className="view-stack">
-      <div className="surface-toolbar"><div><span className="eyebrow">Replayable review thread</span><h2>Conversation</h2></div></div>
-      {isKnownEmptyPage(bundle.activity) && localNotes.length === 0 ? (
-        <DataState
-          className="empty-state"
-          state="empty"
-          title="No conversation events in this review bundle"
-          message="Captured review activity and local session notes belong here."
-          action={{ label: "Import another review bundle", onClick: onImport }}
-        />
-      ) : <div className="activity-list">
-        {bundle.activity.items.map((item) => (
-          <article key={item.id} className={item.tone}>
-            <div className="avatar">{item.actor.split(":").at(-1)?.slice(0, 1).toUpperCase()}</div>
-            <div><div className="activity-heading"><strong>{item.actor}</strong><span>{item.action}</span><time>{formatDate(item.created_at)}</time></div><p>{item.body}</p></div>
-          </article>
-        ))}
-        {localNotes.map((note, index) => (
-          <article key={`local-note-${index}`} className="neutral">
-            <div className="avatar">Y</div>
-            <div>
-              <div className="activity-heading"><strong>you</strong><span>added a local note</span><time>this session</time></div>
-              <p>{note}</p>
-            </div>
-          </article>
-        ))}
-      </div>
-      }
-      <PageNotice page={bundle.activity} label="Conversation events" />
-      <div className="comment-composer">
-        <div className="avatar">Y</div>
-        <div><textarea aria-label="Review comment" value={draft} onChange={(event) => onDraft(event.target.value)} placeholder="Leave a review note…" /><div><span>Plain text · this session only</span><button className="button primary" type="button" disabled={!draft.trim()} onClick={onAddLocalNote}>Add local note</button></div></div>
-      </div>
-    </div>
-  );
-}
-
 function ReviewRail({
   bundle,
   reviewerFamily,
@@ -950,7 +731,7 @@ function ReviewRail({
 
       <section className="rail-card">
         <div className="rail-heading"><div><span className="eyebrow">Change-set</span><h3>Risk routing</h3></div><FileJson2 /></div>
-        <div className="tier-meter"><span style={{ width: `${(bundle.summary.tier_1 / bundle.change_set.operations.length) * 100}%` }} /><i /></div>
+        <div className="tier-meter"><span style={{ width: `${(bundle.summary.tier_1 / Math.max(1, bundle.change_set.operations.length)) * 100}%` }} /><i /></div>
         <div className="tier-counts">
           <div><strong>{bundle.summary.tier_1}</strong><span>Tier 1 additive</span></div>
           <div><strong>{bundle.summary.tier_2}</strong><span>Tier 2 reviewed</span></div>
@@ -982,9 +763,15 @@ function ViewSurface({
   query,
   onQuery,
   onImport,
+  selectedUnitKey,
+  onSelectUnit,
+  selectedEventId,
+  onSelectEvent,
+  graphSelection,
+  onSelectGraph,
   activityDraft,
   onActivityDraft,
-  localNotes,
+  annotations,
   onAddLocalNote,
 }: {
   activeView: View;
@@ -992,17 +779,20 @@ function ViewSurface({
   query: string;
   onQuery: (value: string) => void;
   onImport: () => void;
+  selectedUnitKey: string;
+  onSelectUnit: (key: string) => void;
+  selectedEventId: string;
+  onSelectEvent: (id: string) => void;
+  graphSelection: GraphSelection;
+  onSelectGraph: (selection: GraphSelection) => void;
   activityDraft: string;
   onActivityDraft: (value: string) => void;
-  localNotes: readonly string[];
+  annotations: readonly ReviewAnnotation[];
   onAddLocalNote: () => void;
 }) {
   const unavailable =
-    (activeView === "changes" && bundle.enrichment_status.semantic_changes === "unavailable") ||
     (activeView === "graph" && bundle.enrichment_status.affected_graph === "unavailable") ||
-    (activeView === "provenance" && bundle.enrichment_status.evidence === "unavailable") ||
-    (activeView === "retrieval" && bundle.enrichment_status.retrieval === "unavailable") ||
-    (activeView === "activity" && bundle.enrichment_status.activity === "unavailable");
+    (activeView === "retrieval" && bundle.enrichment_status.retrieval === "unavailable");
   if (unavailable) {
     return (
       <DataState
@@ -1013,34 +803,10 @@ function ViewSurface({
       />
     );
   }
-  if (activeView === "graph") return <GraphView bundle={bundle} onImport={onImport} />;
-  if (activeView === "checks") return <ChecksView bundle={bundle} onImport={onImport} />;
-  if (activeView === "provenance") return <ProvenanceView bundle={bundle} onImport={onImport} />;
+  if (activeView === "graph") return <GraphView bundle={bundle} onImport={onImport} selection={graphSelection} onSelect={onSelectGraph} />;
   if (activeView === "retrieval") return <RetrievalView bundle={bundle} onImport={onImport} />;
-  if (activeView === "activity") return <ActivityView bundle={bundle} onImport={onImport} draft={activityDraft} onDraft={onActivityDraft} localNotes={localNotes} onAddLocalNote={onAddLocalNote} />;
-  return <ChangesView bundle={bundle} query={query} onQuery={onQuery} onImport={onImport} />;
-}
-
-function OperationOntologyMark({
-  operation,
-}: {
-  operation: ReviewReport["change_set"]["operations"][number];
-}) {
-  const record = operation.after ?? operation.before;
-  const stringField = (...names: string[]) => {
-    for (const name of names) {
-      const value = record?.[name];
-      if (typeof value === "string") return value;
-    }
-    return undefined;
-  };
-  if (operation.target === "entity") {
-    return <EntityKindMark className="substrate-chip" kind={stringField("entity_kind", "kind") ?? "entity"} />;
-  }
-  if (operation.target === "note") {
-    return <NoteKindMark className="substrate-chip" kind={stringField("note_kind", "kind") ?? "note"} />;
-  }
-  return <RelationMark className="substrate-chip edge" relation={stringField("relation") ?? "edge"} />;
+  if (activeView === "activity") return <ReviewActivityTimeline input={bundle} selectedEventId={selectedEventId} onSelectEvent={onSelectEvent} />;
+  return <ReviewThreadSurface input={bundle} selectedUnitKey={selectedUnitKey} onSelectUnit={onSelectUnit} annotations={annotations} query={query} onQuery={onQuery} onImport={onImport} draft={activityDraft} onDraft={onActivityDraft} onAddLocalNote={onAddLocalNote} />;
 }
 
 function CoreReviewStudio({
@@ -1048,11 +814,31 @@ function CoreReviewStudio({
   onImport,
   onDownload,
   onUseDemo,
+  activeView,
+  onView,
+  selectedUnitKey,
+  onSelectUnit,
+  selectedEventId,
+  onSelectEvent,
+  annotations,
+  draft,
+  onDraft,
+  onAddLocalNote,
 }: {
   report: ReviewReport;
   onImport: () => void;
   onDownload: () => void;
   onUseDemo: () => void;
+  activeView: View;
+  onView: (view: View) => void;
+  selectedUnitKey: string;
+  onSelectUnit: (key: string) => void;
+  selectedEventId: string;
+  onSelectEvent: (id: string) => void;
+  annotations: readonly ReviewAnnotation[];
+  draft: string;
+  onDraft: (value: string) => void;
+  onAddLocalNote: () => void;
 }) {
   return (
     <div className="app-shell core-report-shell" onKeyDown={handleKeyboardRows}>
@@ -1065,9 +851,9 @@ function CoreReviewStudio({
         <RepositoryCommandPalette
           surface="review"
           triggerClassName="global-search"
-          views={[]}
-          activeReviewView="core-report"
-          onSelectReviewView={() => undefined}
+          views={[{ id: "changes", label: "Changes" }, { id: "activity", label: "Activity" }]}
+          activeReviewView={activeView}
+          onSelectReviewView={(view) => onView(view as View)}
           hasUnsavedReviewState
           onDownloadReview={onDownload}
           downloadSubject="report"
@@ -1100,30 +886,22 @@ function CoreReviewStudio({
           </div>
         </section>
 
+        <div className="workspace-tabs" role="tablist" aria-label="Review views" data-keyboard-list>
+          {(["changes", "activity"] as const).map((view) => (
+            <button key={view} type="button" role="tab" data-keyboard-row aria-keyshortcuts="J K Enter"
+              aria-selected={activeView === view} className={activeView === view ? "active" : ""}
+              onClick={() => onView(view)}>{viewLabels[view]}</button>
+          ))}
+        </div>
+
         <div className="review-layout core-review-layout">
-          <section className="review-surface" aria-label="Ordered change-set operations">
-            <div className="view-stack">
-              <div className="surface-toolbar"><div><span className="eyebrow">ADR-101 operation order</span><h2>{report.change_set.operations.length} staged operations</h2></div><code>{report.tier_summary.policy}</code></div>
-              <div className="change-list core-operation-list">
-                {report.change_set.operations.map((operation) => (
-                  <article className="change-card selected" key={`${operation.index}-${operation.id}`}>
-                    <div className="change-summary core-operation-summary">
-                      <span className="change-sign">{operation.index + 1}</span>
-                      <div className="change-title"><strong>{operation.summary}</strong><span>{operation.reason}</span></div>
-                      <OperationOntologyMark operation={operation} />
-                      <TierPill tier={operation.tier} />
-                    </div>
-                    <div className="change-detail core-operation-detail">
-                      <div className="record-id"><Code2 /> {operation.id}</div>
-                      <div className="core-operation-meta"><span>{operation.op}</span><span>{operation.entity_ids.length} subject ID{operation.entity_ids.length === 1 ? "" : "s"}</span></div>
-                      {operation.tier_reasons.length > 0 && <ul>{operation.tier_reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
-                      {operation.before !== undefined && <FieldDiff field={{ path: "preimage", before: operation.before }} />}
-                      {operation.after !== undefined && <FieldDiff field={{ path: "projected value", after: operation.after }} />}
-                    </div>
-                  </article>
-                ))}
-              </div>
-            </div>
+          <section className="review-surface" aria-label={viewLabels[activeView]} data-keyboard-scope tabIndex={-1}>
+            {activeView === "activity" ? (
+              <ReviewActivityTimeline input={report} selectedEventId={selectedEventId} onSelectEvent={onSelectEvent} />
+            ) : (
+              <ReviewThreadSurface input={report} selectedUnitKey={selectedUnitKey} onSelectUnit={onSelectUnit}
+                annotations={annotations} draft={draft} onDraft={onDraft} onAddLocalNote={onAddLocalNote} />
+            )}
           </section>
 
           <aside className="review-rail">
@@ -1156,15 +934,65 @@ function CoreReviewStudio({
 export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
   const [bundle, setBundle] = useState(initialBundle);
   const [coreReport, setCoreReport] = useState<ReviewReport | null>(null);
-  const [activeView, setActiveView] = useState<View>("changes");
+  const [reviewLocation, setReviewLocation] = useState(() => defaultReviewLocation(initialBundle));
+  const reviewLocationRef = useRef(reviewLocation);
+  const activeView = reviewLocation.view;
   const [query, setQuery] = useState("");
   const [reviewerFamily, setReviewerFamily] = useState(bundle.change_set.envelope.producer_model_family);
   const [decision, setDecision] = useState<ReviewDecision>("pending");
   const [activityDraft, setActivityDraft] = useState("");
-  const [localNotes, setLocalNotes] = useState<string[]>([]);
+  const [localNotes, setLocalNotes] = useState<ReviewAnnotation[]>([]);
+  const [coreDraft, setCoreDraft] = useState("");
+  const [coreNotes, setCoreNotes] = useState<ReviewAnnotation[]>([]);
   const [toast, setToast] = useState<Toast>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    function restoreLocation() {
+      const currentUrl = new URL(window.location.href);
+      const restored = reviewLocationFromUrl(currentUrl, coreReport ?? bundle);
+      const canonical = reviewLocationUrl(currentUrl, restored);
+      if (canonical.href !== currentUrl.href) {
+        window.history.replaceState(null, "", `${canonical.pathname}${canonical.search}`);
+      }
+      reviewLocationRef.current = restored;
+      setReviewLocation(restored);
+    }
+
+    restoreLocation();
+    window.addEventListener("popstate", restoreLocation);
+    return () => window.removeEventListener("popstate", restoreLocation);
+  }, [bundle, coreReport]);
+
+  function pushReviewLocation(next: ReviewLocation) {
+    const url = reviewLocationUrl(new URL(window.location.href), next);
+    if (url.href !== window.location.href) {
+      window.history.pushState(null, "", `${url.pathname}${url.search}`);
+    }
+    reviewLocationRef.current = next;
+    setReviewLocation(next);
+  }
+
+  function selectView(view: View) {
+    pushReviewLocation({ ...reviewLocationRef.current, view });
+  }
+
+  function selectUnit(key: string) {
+    const current = reviewLocationRef.current;
+    pushReviewLocation({
+      ...current,
+      selectedUnitKey: key,
+    });
+  }
+
+  function selectEvent(id: string) {
+    pushReviewLocation({ ...reviewLocationRef.current, selectedEventId: id });
+  }
+
+  function selectGraph(selection: GraphSelection) {
+    pushReviewLocation({ ...reviewLocationRef.current, graphSelection: selection });
+  }
 
   function showToast(next: Toast) {
     setToast(next);
@@ -1180,6 +1008,8 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
       const parsed = parseReviewInput(JSON.parse(await file.text()));
       if (isReviewReport(parsed)) {
         setCoreReport(parsed);
+        setCoreDraft("");
+        setCoreNotes([]);
         showToast({ tone: "success", message: "Loaded a read-only khive CLI review report." });
         return;
       }
@@ -1247,14 +1077,34 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
   function addLocalNote() {
     const note = activityDraft.trim();
     if (!note) return;
-    setLocalNotes((current) => [...current, note]);
+    setLocalNotes((current) => [...current, {
+      id: `local-${Date.now()}-${current.length}`,
+      unitKey: reviewLocationRef.current.selectedUnitKey,
+      actor: "you",
+      body: note,
+      createdAt: new Date().toISOString(),
+    }]);
     setActivityDraft("");
+  }
+
+  function addCoreNote() {
+    const note = coreDraft.trim();
+    if (!note) return;
+    setCoreNotes((current) => [...current, {
+      id: `local-${Date.now()}-${current.length}`,
+      unitKey: reviewLocationRef.current.selectedUnitKey,
+      actor: "you",
+      body: note,
+      createdAt: new Date().toISOString(),
+    }]);
+    setCoreDraft("");
   }
 
   const hasUnsavedReviewState = coreReport !== null || bundle !== initialBundle ||
     decision !== "pending" ||
     reviewerFamily !== bundle.change_set.envelope.producer_model_family ||
-    activityDraft.trim().length > 0 || localNotes.length > 0;
+    activityDraft.trim().length > 0 || localNotes.length > 0 ||
+    coreDraft.trim().length > 0 || coreNotes.length > 0;
 
   const filePicker = (
     <input
@@ -1275,6 +1125,16 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
           onImport={() => fileInput.current?.click()}
           onDownload={downloadBundle}
           onUseDemo={() => setCoreReport(null)}
+          activeView={activeView}
+          onView={selectView}
+          selectedUnitKey={reviewLocation.selectedUnitKey}
+          onSelectUnit={selectUnit}
+          selectedEventId={reviewLocation.selectedEventId}
+          onSelectEvent={selectEvent}
+          annotations={coreNotes}
+          draft={coreDraft}
+          onDraft={setCoreDraft}
+          onAddLocalNote={addCoreNote}
         />
         {toast && <div className={`toast ${toast.tone}`} role="status"><CheckCircle2 /><span>{toast.message}</span><button type="button" onClick={() => setToast(null)} aria-label="Dismiss"><X /></button></div>}
       </>
@@ -1295,7 +1155,7 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
             activeReviewView={activeView}
             hasUnsavedReviewState={hasUnsavedReviewState}
             onSelectReviewView={(view) => {
-              setActiveView(view as View);
+              selectView(view as View);
               queueMicrotask(() => document.querySelector<HTMLElement>(".review-surface")?.focus());
             }}
             onCopyCli={copyCli}
@@ -1307,12 +1167,12 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
       <button className="mobile-menu" type="button" onClick={() => setSidebarOpen((open) => !open)} aria-label="Toggle navigation"><Menu /></button>
       <div className="app-body">
         <div className={`sidebar-wrap ${sidebarOpen ? "open" : ""}`} onClick={() => setSidebarOpen(false)}>
-          <Sidebar bundle={bundle} activeView={activeView} onView={(view) => { setActiveView(view); setSidebarOpen(false); }} />
+          <Sidebar bundle={bundle} activeView={activeView} onView={(view) => { selectView(view); setSidebarOpen(false); }} />
         </div>
         <main className="workspace">
           <CapabilityBanner bundle={bundle} />
           <PullRequestHeader bundle={bundle} onCopy={() => void copyCli()} />
-          <WorkspaceTabs activeView={activeView} onView={setActiveView} bundle={bundle} />
+          <WorkspaceTabs activeView={activeView} onView={selectView} bundle={bundle} />
           <div className="review-layout">
             <section className="review-surface" aria-label={viewLabels[activeView]} data-keyboard-scope tabIndex={-1}>
               <ViewSurface
@@ -1322,9 +1182,15 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
                 query={query}
                 onQuery={setQuery}
                 onImport={() => fileInput.current?.click()}
+                selectedUnitKey={reviewLocation.selectedUnitKey}
+                onSelectUnit={selectUnit}
+                selectedEventId={reviewLocation.selectedEventId}
+                onSelectEvent={selectEvent}
+                graphSelection={reviewLocation.graphSelection}
+                onSelectGraph={selectGraph}
                 activityDraft={activityDraft}
                 onActivityDraft={setActivityDraft}
-                localNotes={localNotes}
+                annotations={localNotes}
                 onAddLocalNote={addLocalNote}
               />
             </section>

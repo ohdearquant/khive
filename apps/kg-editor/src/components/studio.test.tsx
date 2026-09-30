@@ -1,6 +1,6 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import { Studio } from "@/components/studio";
 import { demoReviewFixture } from "@/lib/fixtures/demo-review";
@@ -16,23 +16,26 @@ const zeroPageCases = [
     },
   },
   {
-    name: "checks",
-    view: /^checks/i,
-    empty: (bundle: ReviewBundle) => { bundle.checks.items = []; },
-  },
-  {
-    name: "evidence",
-    view: /provenance/i,
-    empty: (bundle: ReviewBundle) => { bundle.evidence.items = []; },
-  },
-  {
     name: "retrieval",
     view: /khive context/i,
     empty: (bundle: ReviewBundle) => { bundle.retrieval.search.items = []; },
   },
+] as const;
+
+const emptyActivityFacets = [
   {
-    name: "activity",
-    view: /^activity/i,
+    name: "validation",
+    facet: "Validation",
+    empty: (bundle: ReviewBundle) => { bundle.checks.items = []; },
+  },
+  {
+    name: "evidence",
+    facet: "Evidence",
+    empty: (bundle: ReviewBundle) => { bundle.evidence.items = []; },
+  },
+  {
+    name: "conversation",
+    facet: "Conversation",
     empty: (bundle: ReviewBundle) => { bundle.activity.items = []; },
   },
 ] as const;
@@ -72,6 +75,8 @@ function cliReviewReport(): ReviewReport {
 }
 
 describe("KG Studio", () => {
+  beforeEach(() => window.history.replaceState(null, "", "/review"));
+
   it("makes the no-write and unavailable capability boundary visible", () => {
     render(<Studio initialBundle={demoReviewFixture} />);
 
@@ -107,6 +112,23 @@ describe("KG Studio", () => {
     expect(within(state!).getByRole("button", { name: "Import another review bundle" })).toBeVisible();
   });
 
+  it.each(emptyActivityFacets)("shows an actionable empty $name facet in the shared timeline", async ({ facet, empty }) => {
+    const bundle = structuredClone(demoReviewFixture);
+    empty(bundle);
+    const user = userEvent.setup();
+    const { container } = render(<Studio initialBundle={bundle} />);
+
+    await user.click(screen.getByRole("tab", { name: /^Activity/i }));
+    await user.click(screen.getByRole("button", { name: new RegExp(`^${facet}$`) }));
+
+    const timeline = container.querySelector<HTMLElement>("[data-review-activity-timeline]");
+    expect(timeline).toBeVisible();
+    const state = timeline?.querySelector<HTMLElement>('[data-state="empty"]');
+    expect(state).toBeVisible();
+    await user.click(within(state!).getByRole("button", { name: "Show all activity" }));
+    expect(container.querySelector("[data-review-activity-rows] [data-activity-kind]")).toBeInTheDocument();
+  });
+
   it("renders Studio page bounds as the shared truncated state", () => {
     const bundle = structuredClone(demoReviewFixture);
     bundle.changes.truncated = true;
@@ -140,7 +162,7 @@ describe("KG Studio", () => {
   it.each([
     ["truncated", { truncated: true, next_cursor: null }],
     ["next cursor", { truncated: false, next_cursor: "next-page" }],
-  ] as const)("does not render the checks success hero for a zero-item %s page", async (_name, incomplete) => {
+  ] as const)("does not mislabel an incomplete zero-item validation facet as empty", async (_name, incomplete) => {
     const bundle = structuredClone(demoReviewFixture);
     bundle.checks.items = [];
     bundle.checks.truncated = incomplete.truncated;
@@ -148,12 +170,12 @@ describe("KG Studio", () => {
     const user = userEvent.setup();
     const { container } = render(<Studio initialBundle={bundle} />);
 
-    await user.click(screen.getAllByRole("button", { name: /^checks/i })[0]);
+    await user.click(screen.getByRole("tab", { name: /^Activity/i }));
+    await user.click(screen.getByRole("button", { name: /^Validation$/ }));
 
-    const surface = container.querySelector<HTMLElement>(".review-surface")!;
-    expect(within(surface).queryByText("No error-level findings")).not.toBeInTheDocument();
-    expect(surface.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
-    expect(surface.querySelector('[data-state="truncated"]')).toBeVisible();
+    const timeline = container.querySelector<HTMLElement>("[data-review-activity-timeline]")!;
+    expect(timeline.querySelector('[data-state="empty"]')).not.toBeInTheDocument();
+    expect(timeline.querySelector('[data-state="truncated"]')).toBeVisible();
   });
 
   it("navigates from semantic diff to the affected graph", async () => {
@@ -200,7 +222,7 @@ describe("KG Studio", () => {
     expect(container.querySelector('[data-kind="observation"]')).not.toHaveTextContent("Unsupported kind");
   });
 
-  it("uses explicit entity_kind in core review operation lists", async () => {
+  it("preserves explicit entity_kind in the core review selected thread", async () => {
     const user = userEvent.setup();
     const report = cliReviewReport();
     const serialized = JSON.stringify(report);
@@ -211,7 +233,12 @@ describe("KG Studio", () => {
     await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, imported);
 
     expect(await screen.findByRole("heading", { name: "Attributed change-set review" })).toBeVisible();
-    expect(container.querySelector('.core-operation-list [data-kind="concept"]')).toHaveTextContent("Concept");
+    expect(container.querySelectorAll("[data-review-unit-row]")).toHaveLength(1);
+    const thread = container.querySelector<HTMLElement>("[data-review-thread]")!;
+    expect(thread).toBeVisible();
+    expect(thread.querySelector('[data-kind="concept"]')).toHaveTextContent("Concept");
+    await user.click(within(thread).getByText("Record values"));
+    expect(thread).toHaveTextContent(/"entity_kind": "concept"/);
   });
 
   it("keeps the underlying review decision, notes, and draft after a CLI report import", async () => {
@@ -220,7 +247,6 @@ describe("KG Studio", () => {
 
     await user.click(screen.getByRole("button", { name: "Request changes" }));
     expect(screen.getByText(/Local decision: changes requested/i)).toBeVisible();
-    await user.click(screen.getAllByRole("button", { name: /^Activity/i })[0]);
     const comment = screen.getByRole("textbox", { name: "Review comment" });
     await user.type(comment, "Keep this note");
     await user.click(screen.getByRole("button", { name: "Add local note" }));
@@ -287,7 +313,6 @@ describe("KG Studio", () => {
     const user = userEvent.setup();
     const { container } = render(<Studio initialBundle={demoReviewFixture} />);
 
-    await user.click(screen.getAllByRole("button", { name: /^Activity/i })[0]);
     await user.type(screen.getByRole("textbox", { name: "Review comment" }), "Only for review 184");
     await user.click(screen.getByRole("button", { name: "Add local note" }));
     expect(screen.getByText("Only for review 184")).toBeVisible();
@@ -333,7 +358,7 @@ describe("KG Studio", () => {
     const user = userEvent.setup();
     const { container } = render(<Studio initialBundle={demoReviewFixture} />);
     const rows = Array.from(container.querySelectorAll<HTMLButtonElement>(
-      ".change-list [data-keyboard-row]",
+      "[data-review-unit-row]",
     ));
     expect(rows.length).toBeGreaterThan(1);
     rows[0].focus();
@@ -342,6 +367,9 @@ describe("KG Studio", () => {
     await user.keyboard("k");
     expect(rows[0]).toHaveFocus();
     await user.keyboard("j{Enter}");
-    expect(rows[1]).toHaveAttribute("aria-expanded", "true");
+    expect(rows[1]).toHaveAttribute("aria-pressed", "true");
+    expect(container.querySelector("[data-review-thread]")).toHaveTextContent(
+      demoReviewFixture.changes.items[1].id,
+    );
   });
 });
