@@ -823,7 +823,7 @@ async fn a3_degrade_safe_read_keeps_success_under_both_transient_reasons() {
 enum JsonSyntax {
     Object(Vec<(Option<String>, JsonSyntax)>),
     Array(Vec<JsonSyntax>),
-    Rust(syn::Expr),
+    Rust(Box<syn::Expr>),
 }
 
 impl syn::parse::Parse for JsonSyntax {
@@ -858,7 +858,7 @@ impl syn::parse::Parse for JsonSyntax {
             }
             Ok(Self::Array(items))
         } else {
-            Ok(Self::Rust(input.parse()?))
+            Ok(Self::Rust(Box::new(input.parse()?)))
         }
     }
 }
@@ -873,7 +873,14 @@ impl JsonSyntax {
             .find_map(|(name, value)| (name.as_deref() == Some(key)).then_some(value))
     }
     fn bool_is(&self, expected: bool) -> bool {
-        matches!(self, Self::Rust(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. })) if value.value == expected)
+        matches!(
+            self,
+            Self::Rust(expr)
+                if matches!(expr.as_ref(), syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Bool(value),
+                    ..
+                }) if value.value == expected)
+        )
     }
 }
 
@@ -985,7 +992,7 @@ impl ErrorConstructorCensus {
             }
             // json! delegates expressions to Rust. Parentheses or a block
             // around a nested constructor must not make it invisible.
-            JsonSyntax::Rust(expr) => syn::visit::Visit::visit_expr(self, expr),
+            JsonSyntax::Rust(expr) => syn::visit::Visit::visit_expr(self, expr.as_ref()),
         }
     }
     fn inspect_literal_pairs<'a>(&mut self, values: impl IntoIterator<Item = &'a syn::Expr>) {
