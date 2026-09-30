@@ -145,6 +145,15 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
         "{state}",
         1,
     ),
+    // Database identity bootstrap writes one fixed metadata table, never a
+    // vec0 or note table. Keep the dynamic DML site visible to this census.
+    (
+        "khive-db/src/pool.rs",
+        "initialize_database_id",
+        "INSERT",
+        "main.{DATABASE_ID_TABLE}",
+        1,
+    ),
     (
         "khive-db/src/namespace_move.rs",
         "move_kinded_subject",
