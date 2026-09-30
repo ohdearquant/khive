@@ -556,6 +556,11 @@ pub enum FilterOp {
     /// numeric field never matches. `PropertyFilter.value` is the prefix and
     /// must be `SqlValue::Text`; an empty prefix matches every text value.
     TextStartsWithIndexed,
+    /// Match a recipient's first colon-terminated channel prefix by equality
+    /// on its indexed bucket. The value must be a nonempty `SqlValue::Text`
+    /// prefix with exactly one trailing colon, such as `email:`. Arbitrary
+    /// partial prefixes use `TextStartsWithIndexed` instead.
+    TextColonPrefixBucketIndexed,
     /// Keep only RFC 3339 text values that parse as UTC instants.
     Rfc3339Valid,
     /// Compare parsed UTC instants, including subsecond precision and offsets.
