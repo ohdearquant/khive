@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    EmailMessageIdDomains, KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan,
-    VerbRegistry,
+    EmailMessageIdDomains, KhiveRuntime, KindHook, NamespaceToken, NoteEmbeddingPolicy,
+    NoteEmbeddingPolicySpec, RuntimeError, SchemaPlan, VerbRegistry,
 };
 use khive_types::{HandlerDef, Pack};
 
@@ -41,6 +41,11 @@ impl Pack for CommPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &COMM_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
+    const NOTE_EMBEDDING_POLICIES: &'static [NoteEmbeddingPolicySpec] =
+        &[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }];
 }
 
 impl CommPack {
@@ -53,6 +58,7 @@ impl CommPack {
     /// [`Self::new_with_channel_ingest_capability`] or
     /// [`khive_runtime::PackRuntime::accept_channel_ingest_capability`]).
     pub fn new(runtime: KhiveRuntime) -> Self {
+        runtime.install_note_embedding_policies(<Self as Pack>::NOTE_EMBEDDING_POLICIES);
         Self {
             runtime,
             inbox_signal: InboxSignal::new(),
@@ -365,6 +371,9 @@ impl PackRuntime for CommPack {
     }
     fn handlers(&self) -> &'static [HandlerDef] {
         &COMM_HANDLERS
+    }
+    fn note_embedding_policies(&self) -> &'static [NoteEmbeddingPolicySpec] {
+        <CommPack as Pack>::NOTE_EMBEDDING_POLICIES
     }
     fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn KindHook>> {
         match kind {
