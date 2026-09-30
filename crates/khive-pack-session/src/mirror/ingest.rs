@@ -207,9 +207,10 @@ pub(crate) struct TrustedSource<'a> {
 }
 
 /// Prove the configured root through native directory handles before its
-/// identity can become the first probe's witness. Root-owned ancestor links,
-/// such as macOS `/tmp`, resolve through those handles; the final root component
-/// still refuses every link. No pathname canonicalization admits a root.
+/// identity can become the first probe's witness. Root-owned ancestor links
+/// resolve only when a root-owned parent prevents non-root entry replacement.
+/// The final root component still refuses every link.
+/// No pathname canonicalization admits a root.
 #[cfg(unix)]
 fn open_source_root(root: &Path) -> std::io::Result<Vec<std::fs::File>> {
     use std::ffi::{CString, OsStr, OsString};
@@ -313,6 +314,16 @@ fn open_source_root(root: &Path) -> std::io::Result<Vec<std::fs::File>> {
                 "mirror source root has a non-root-owned ancestor symlink",
             ));
         }
+        let mut parent_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(parent_fd, parent_stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let parent_stat = unsafe { parent_stat.assume_init() };
+        if !ancestor_symlink_parent_is_trusted(parent_stat.st_uid, parent_stat.st_mode) {
+            return Err(std::io::Error::other(
+                "mirror source root ancestor symlink parent permits non-root entry replacement",
+            ));
+        }
         if *remaining_links == 0 {
             return Err(std::io::Error::other(
                 "mirror source root exceeds the ancestor symlink limit",
@@ -367,11 +378,15 @@ fn open_source_root(root: &Path) -> std::io::Result<Vec<std::fs::File>> {
     }
 
     let mut pinned_directories = vec![open_anchor(root.is_absolute())?];
-    // Match walpin's bounded root-owned ancestor resolution, retaining every
-    // handle until the source leaf opens.
+    // Retain every directory handle until the source leaf opens.
     let mut remaining_links = 8;
     walk_components(&mut pinned_directories, root, false, &mut remaining_links)?;
     Ok(pinned_directories)
+}
+
+#[cfg(unix)]
+fn ancestor_symlink_parent_is_trusted(uid: libc::uid_t, mode: libc::mode_t) -> bool {
+    uid == 0 && (mode & 0o022 == 0 || mode & libc::S_ISVTX != 0)
 }
 
 #[cfg(unix)]
@@ -2059,6 +2074,16 @@ mod tests {
 
     use super::*;
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
+
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_symlink_parent_trust_requires_protected_root_entry() {
+        assert!(ancestor_symlink_parent_is_trusted(0, 0o755));
+        assert!(ancestor_symlink_parent_is_trusted(0, 0o1777));
+        assert!(!ancestor_symlink_parent_is_trusted(0, 0o775));
+        assert!(!ancestor_symlink_parent_is_trusted(0, 0o757));
+        assert!(!ancestor_symlink_parent_is_trusted(501, 0o755));
+    }
 
     #[cfg(unix)]
     #[test]
