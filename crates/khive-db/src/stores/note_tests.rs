@@ -1638,6 +1638,34 @@ async fn text_starts_with_indexed_matches_prefix_only() {
     names.sort();
     assert_eq!(names, vec!["email:", "email:a@b.c"]);
 
+    let mut bucket_filter = filter.clone();
+    bucket_filter.property_filters[0].op = FilterOp::TextColonPrefixBucketIndexed;
+    let bucket_page = store
+        .query_notes_filtered_count_free(
+            "default",
+            &bucket_filter,
+            PageRequest {
+                limit: 50,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let mut bucket_names: Vec<_> = bucket_page
+        .items
+        .iter()
+        .map(|n| n.content.clone())
+        .collect();
+    bucket_names.sort();
+    assert_eq!(
+        bucket_names, names,
+        "channel bucket must match the full prefix"
+    );
+    for invalid in ["", "email", "email::"] {
+        bucket_filter.property_filters[0].value = SqlValue::Text(invalid.into());
+        assert!(build_note_filter_where("default", &bucket_filter).is_err());
+    }
+
     let every_text = NoteFilter {
         kind: Some("message".into()),
         property_filters: vec![PropertyFilter {

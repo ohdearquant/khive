@@ -925,11 +925,11 @@ mod tests {
         assert_eq!(sorted_ids(&disk_reply), sorted_ids(&crawl_reply));
         let http_graph = graph_snapshot(&http_runtime, &http_token).await;
         // Disk ingestion sent no HTTP request. The served GET sent the
-        // client's fixed gzip negotiation, so that one provenance field must
+        // client's fixed identity negotiation, so that one provenance field must
         // differ even though document identities, bodies and edges agree.
         for (graph, expected_context) in [
             (&disk_graph, json!({})),
-            (&http_graph, json!({"accept-encoding": ["gzip"]})),
+            (&http_graph, json!({"accept-encoding": ["identity"]})),
         ] {
             for entity in graph.0.as_array().unwrap() {
                 if entity["entity_type"] == "page" {
