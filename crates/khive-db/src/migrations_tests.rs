@@ -37,8 +37,14 @@ fn migrate_through(conn: &mut Connection, through_version: u32) {
         .filter(|migration| migration.version <= through_version)
     {
         let tx = conn.transaction().expect("begin historical migration");
-        tx.execute_batch(migration.up)
-            .expect("apply historical migration body");
+        // V44's columns and backfill run in Rust before its index body, as in
+        // the migration runner.
+        if migration.version == 44 {
+            migrate_outbound_due_key(&tx).expect("apply historical migration body");
+        } else {
+            tx.execute_batch(migration.up)
+                .expect("apply historical migration body");
+        }
         tx.execute(
             "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
             rusqlite::params![migration.version, migration.name],
