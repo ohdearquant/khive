@@ -43,17 +43,44 @@ impl QuarantineReason {
             Self::PolicyRejected => "policy_rejected",
         }
     }
+    fn parse(s: &str) -> StorageResult<Self> {
+        match s {
+            "invalid_plaintext" => Ok(Self::InvalidPlaintext),
+            "invalid_message" => Ok(Self::InvalidMessage),
+            "policy_rejected" => Ok(Self::PolicyRejected),
+            _ => Err(invalid("invalid stored quarantine reason")),
+        }
+    }
 }
+
+/// ADR-105 A.8 Receiving, step 3: the local quarantine bound this client sets,
+/// per local recipient agent, for quarantined items other than policy-refused
+/// ones. Past it the oldest such item is dropped and reported.
+pub const LOCAL_QUARANTINE_BOUND: usize = 512;
+
+/// ADR-105 A.8 Receiving, step 4: policy-refused items are not under the local
+/// quarantine bound. Each sender has its own bound, past which the oldest of
+/// that sender's policy-refused items is dropped and reported, so one sender's
+/// refusals never evict another's.
+pub const POLICY_REFUSED_PER_SENDER_BOUND: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct QuarantineRecord {
     pub reason: QuarantineReason,
     pub delivery_item: Vec<u8>,
+    /// The parsed plaintext object, present exactly for a policy refusal
+    /// (ADR-105 A.8 Receiving, step 4).
+    pub parsed_plaintext: Option<Value>,
 }
 /// Internal storage contract. Runtime supplies authenticated identity and a
 /// validated note; this structure is not a wire-ingest parameter.
 #[derive(Clone, Debug)]
 pub struct RecipientCommit {
-    pub note: Note,
+    /// The message note, present exactly for a stored disposition. A
+    /// quarantined delivery writes no message note.
+    pub note: Option<Note>,
+    /// Local recipient actor from the trusted enrollment binding.
+    pub recipient_actor: String,
     pub binding: Value,
     pub sender_agent_id: String,
     pub logical_message_id: Uuid,
@@ -63,13 +90,24 @@ pub struct RecipientCommit {
     pub in_reply_to: Option<Uuid>,
     pub correlation: Option<String>,
 }
+/// A quarantined item dropped to keep a quarantine bound. Its replay identity
+/// stays claimed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvictedQuarantine {
+    pub sender_agent_id: String,
+    pub logical_message_id: Uuid,
+    pub reason: QuarantineReason,
+}
 #[derive(Debug)]
 pub struct RecipientCommitResult {
-    pub note_id: Uuid,
+    /// The message note of a stored identity; a quarantined identity has none.
+    pub note_id: Option<Uuid>,
     pub disposition: RecipientDisposition,
     pub created: bool,
     /// Present only for a newly committed note, for best-effort indexing.
     pub note: Option<Note>,
+    /// Quarantined items this commit dropped to keep a quarantine bound.
+    pub evicted: Vec<EvictedQuarantine>,
 }
 fn invalid(message: &str) -> StorageError {
     StorageError::InvalidInput {
@@ -143,9 +181,100 @@ const INSERT_REPLAY_SQL: &str = concat!(
 
 const QUARANTINE_SQL: &str = concat!(
     "INSERT INTO comm_recipient_quarantine ",
-    "(sender_agent_id,logical_message_id,delivery_item,reason,created_at) VALUES ",
-    "(?1,?2,?3,?4,?5)",
+    "(sender_agent_id,logical_message_id,recipient_agent_id,delivery_item,reason,",
+    "parsed_plaintext,created_at) VALUES ",
+    "(?1,?2,?3,?4,?5,?6,?7)",
 );
+
+const LOCAL_BOUND_COUNT_SQL: &str = concat!(
+    "SELECT count(*) FROM comm_recipient_quarantine ",
+    "WHERE recipient_agent_id=?1 AND reason<>'policy_rejected'",
+);
+const LOCAL_BOUND_OLDEST_SQL: &str = concat!(
+    "SELECT sender_agent_id,logical_message_id,reason FROM comm_recipient_quarantine ",
+    "WHERE recipient_agent_id=?1 AND reason<>'policy_rejected' ",
+    "ORDER BY created_at,sender_agent_id,logical_message_id LIMIT ?2",
+);
+const SENDER_BOUND_COUNT_SQL: &str = concat!(
+    "SELECT count(*) FROM comm_recipient_quarantine ",
+    "WHERE recipient_agent_id=?1 AND sender_agent_id=?2 AND reason='policy_rejected'",
+);
+const SENDER_BOUND_OLDEST_SQL: &str = concat!(
+    "SELECT sender_agent_id,logical_message_id,reason FROM comm_recipient_quarantine ",
+    "WHERE recipient_agent_id=?1 AND sender_agent_id=?2 AND reason='policy_rejected' ",
+    "ORDER BY created_at,sender_agent_id,logical_message_id LIMIT ?3",
+);
+const DELETE_QUARANTINE_SQL: &str =
+    "DELETE FROM comm_recipient_quarantine WHERE sender_agent_id=?1 AND logical_message_id=?2";
+
+/// Make room for one more quarantined item of `reason` under its bound by
+/// dropping the oldest items in the same bound, oldest `created_at` first,
+/// then by key. Only the quarantine rows go: every replay identity stays claimed.
+fn evict_to_bound(
+    conn: &rusqlite::Connection,
+    recipient_agent_id: &str,
+    sender_agent_id: &str,
+    reason: QuarantineReason,
+    op: &'static str,
+) -> StorageResult<Vec<EvictedQuarantine>> {
+    let row = |r: &rusqlite::Row<'_>| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    };
+    let oldest: Vec<(String, String, String)> = if reason == QuarantineReason::PolicyRejected {
+        let held: i64 = conn
+            .query_row(
+                SENDER_BOUND_COUNT_SQL,
+                params![recipient_agent_id, sender_agent_id],
+                |r| r.get(0),
+            )
+            .map_err(|e| map_err(e, op))?;
+        let excess = held + 1 - POLICY_REFUSED_PER_SENDER_BOUND as i64;
+        if excess <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn
+            .prepare(SENDER_BOUND_OLDEST_SQL)
+            .map_err(|e| map_err(e, op))?;
+        let rows = stmt
+            .query_map(params![recipient_agent_id, sender_agent_id, excess], row)
+            .map_err(|e| map_err(e, op))?;
+        rows.collect::<Result<_, _>>().map_err(|e| map_err(e, op))?
+    } else {
+        let held: i64 = conn
+            .query_row(LOCAL_BOUND_COUNT_SQL, params![recipient_agent_id], |r| {
+                r.get(0)
+            })
+            .map_err(|e| map_err(e, op))?;
+        let excess = held + 1 - LOCAL_QUARANTINE_BOUND as i64;
+        if excess <= 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn
+            .prepare(LOCAL_BOUND_OLDEST_SQL)
+            .map_err(|e| map_err(e, op))?;
+        let rows = stmt
+            .query_map(params![recipient_agent_id, excess], row)
+            .map_err(|e| map_err(e, op))?;
+        rows.collect::<Result<_, _>>().map_err(|e| map_err(e, op))?
+    };
+    oldest
+        .into_iter()
+        .map(|(sender, logical, reason)| {
+            conn.execute(DELETE_QUARANTINE_SQL, params![sender, logical])
+                .map_err(|e| map_err(e, op))?;
+            Ok(EvictedQuarantine {
+                sender_agent_id: sender,
+                logical_message_id: Uuid::parse_str(&logical)
+                    .map_err(|_| invalid("invalid quarantined logical message id"))?,
+                reason: QuarantineReason::parse(&reason)?,
+            })
+        })
+        .collect()
+}
 
 const ACK_LOOKUP_SQL: &str =
     "SELECT binding,disposition FROM comm_ack_work WHERE delivery_attempt_id=?1";
@@ -245,7 +374,7 @@ impl RecipientTransportStore {
         self.notes
             .with_writer_tx_storage("recipient_transport_replay", move |conn| {
                 let op = "recipient_transport_replay";
-                let prior: Option<(String, String, String, String)> = conn
+                let prior: Option<(Option<String>, String, String, String)> = conn
                     .query_row(
                         REPLAY_SQL,
                         params![sender_agent_id, logical_message_id.to_string()],
@@ -259,8 +388,9 @@ impl RecipientTransportStore {
                 if prior_recipient != recipient_agent_id || prior_actor != recipient_actor {
                     return Err(invalid("replay recipient binding changed"));
                 }
-                let note_id =
-                    Uuid::parse_str(&id).map_err(|_| invalid("invalid replay note id"))?;
+                let note_id = id
+                    .map(|id| Uuid::parse_str(&id).map_err(|_| invalid("invalid replay note id")))
+                    .transpose()?;
                 let disposition = RecipientDisposition::parse(&disposition)?;
                 record_ack(
                     conn,
@@ -279,6 +409,7 @@ impl RecipientTransportStore {
                     disposition,
                     created: false,
                     note: None,
+                    evicted: Vec::new(),
                 }))
             })
             .await
@@ -286,12 +417,30 @@ impl RecipientTransportStore {
 
     /// Commit all recipient effects together, or none. A replay keeps its first
     /// disposition and creates only the acknowledgement for a new attempt.
+    ///
+    /// A stored disposition writes the message note. A quarantined one writes
+    /// the quarantine record and no message note (ADR-105 A.8 Receiving, step
+    /// 4), after dropping the oldest item of its quarantine bound when that
+    /// bound is full. Dropped items are returned in `evicted` and logged; their
+    /// replay identities stay claimed.
     pub async fn commit(&self, mut input: RecipientCommit) -> StorageResult<RecipientCommitResult> {
-        if input.disposition == RecipientDisposition::Quarantined && input.quarantine.is_none() {
-            return Err(invalid("quarantine requires replay bytes"));
-        }
-        if input.disposition == RecipientDisposition::Stored && input.quarantine.is_some() {
-            return Err(invalid("stored message cannot carry quarantine bytes"));
+        match input.disposition {
+            RecipientDisposition::Quarantined => {
+                if input.quarantine.is_none() {
+                    return Err(invalid("quarantine requires replay bytes"));
+                }
+                if input.note.is_some() {
+                    return Err(invalid("quarantined delivery cannot carry a message note"));
+                }
+            }
+            RecipientDisposition::Stored => {
+                if input.quarantine.is_some() {
+                    return Err(invalid("stored message cannot carry quarantine bytes"));
+                }
+                if input.note.is_none() {
+                    return Err(invalid("stored message requires a message note"));
+                }
+            }
         }
         if let Some(q) = &input.quarantine {
             if q.delivery_item.len() > 98_304
@@ -300,6 +449,20 @@ impl RecipientTransportStore {
                 return Err(invalid(
                     "quarantine delivery item must be one JSON object within 98304 bytes",
                 ));
+            }
+            match (q.reason, &q.parsed_plaintext) {
+                (QuarantineReason::PolicyRejected, Some(plaintext)) if plaintext.is_object() => {}
+                (QuarantineReason::PolicyRejected, _) => {
+                    return Err(invalid(
+                        "policy-refused quarantine requires its parsed plaintext object",
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(invalid(
+                        "only a policy-refused quarantine keeps parsed plaintext",
+                    ));
+                }
+                (_, None) => {}
             }
         }
         if input.binding.get("sender_agent_id").and_then(Value::as_str)
@@ -317,71 +480,83 @@ impl RecipientTransportStore {
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("missing recipient agent"))?
             .to_owned();
-        let actor = input
-            .note
-            .properties
-            .as_ref()
-            .and_then(|p| p.get("to_actor"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| invalid("missing recipient actor"))?
-            .to_owned();
-        let correlated_thread = if let (Some(correlation), Some(sender)) = (
-            input.correlation.as_deref(),
-            input
-                .note
+        if input.recipient_actor.trim().is_empty() {
+            return Err(invalid("missing recipient actor"));
+        }
+        let actor = input.recipient_actor.clone();
+        if let Some(note) = &input.note {
+            if note
+                .properties
+                .as_ref()
+                .and_then(|p| p.get("to_actor"))
+                .and_then(Value::as_str)
+                != Some(actor.as_str())
+            {
+                return Err(invalid(
+                    "message note is not addressed to the recipient actor",
+                ));
+            }
+        }
+        let correlated_thread = if let (Some(correlation), Some(note)) =
+            (input.correlation.as_deref(), input.note.as_ref())
+        {
+            if let Some(sender) = note
                 .properties
                 .as_ref()
                 .and_then(|p| p.get("from_actor"))
-                .and_then(Value::as_str),
-        ) {
-            let (spellings, id) = correlation_match_values(correlation);
-            let namespace = input.note.namespace.clone();
-            let sender = sender.to_owned();
-            let actor_for_query = actor.clone();
-            let correlation = correlation.to_owned();
-            let matched: Option<(String, Option<String>)> = self
-                .notes
-                .with_reader("recipient_transport_correlation", move |conn| {
-                    conn.query_row(
-                        CORRELATION_SQL,
-                        params![
-                            namespace,
-                            sender,
-                            actor_for_query,
-                            correlation,
-                            &spellings[0],
-                            &spellings[1],
-                            &spellings[2],
-                            &spellings[3],
-                            &spellings[4],
-                            &spellings[5],
-                            &spellings[6],
-                            &spellings[7],
-                            &spellings[8],
-                            id
-                        ],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()
-                })
-                .await?;
-            matched
-                .map(|(id, thread)| {
-                    let matched_id =
-                        Uuid::parse_str(&id).map_err(|_| invalid("invalid correlated note id"))?;
-                    Ok(thread
-                        .and_then(|s| Uuid::parse_str(&s).ok())
-                        .unwrap_or(matched_id))
-                })
-                .transpose()?
+                .and_then(Value::as_str)
+            {
+                let (spellings, id) = correlation_match_values(correlation);
+                let namespace = note.namespace.clone();
+                let sender = sender.to_owned();
+                let actor_for_query = actor.clone();
+                let correlation = correlation.to_owned();
+                let matched: Option<(String, Option<String>)> = self
+                    .notes
+                    .with_reader("recipient_transport_correlation", move |conn| {
+                        conn.query_row(
+                            CORRELATION_SQL,
+                            params![
+                                namespace,
+                                sender,
+                                actor_for_query,
+                                correlation,
+                                &spellings[0],
+                                &spellings[1],
+                                &spellings[2],
+                                &spellings[3],
+                                &spellings[4],
+                                &spellings[5],
+                                &spellings[6],
+                                &spellings[7],
+                                &spellings[8],
+                                id
+                            ],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()
+                    })
+                    .await?;
+                matched
+                    .map(|(id, thread)| {
+                        let matched_id = Uuid::parse_str(&id)
+                            .map_err(|_| invalid("invalid correlated note id"))?;
+                        Ok(thread
+                            .and_then(|s| Uuid::parse_str(&s).ok())
+                            .unwrap_or(matched_id))
+                    })
+                    .transpose()?
+            } else {
+                None
+            }
         } else {
             None
         };
-        self.notes
+        let result = self
+            .notes
             .with_writer_tx_storage("recipient_transport_commit", move |conn| {
                 let op = "recipient_transport_commit";
-                let prior: Option<(String, String, String, String)> = conn
+                let prior: Option<(Option<String>, String, String, String)> = conn
                     .query_row(
                         REPLAY_SQL,
                         params![input.sender_agent_id, input.logical_message_id.to_string()],
@@ -390,34 +565,37 @@ impl RecipientTransportStore {
                     .optional()
                     .map_err(|e| map_err(e, op))?;
                 let now = chrono::Utc::now().timestamp_micros();
+                let mut evicted = Vec::new();
                 let (note_id, disposition, created) =
                     if let Some((id, disposition, prior_recipient, prior_actor)) = prior {
                         if prior_recipient != recipient || prior_actor != actor {
                             return Err(invalid("replay recipient binding changed"));
                         }
                         (
-                            Uuid::parse_str(&id).map_err(|_| invalid("invalid replay note id"))?,
+                            id.map(|id| {
+                                Uuid::parse_str(&id).map_err(|_| invalid("invalid replay note id"))
+                            })
+                            .transpose()?,
                             RecipientDisposition::parse(&disposition)?,
                             false,
                         )
                     } else {
-                        let props = input
-                            .note
-                            .properties
-                            .as_mut()
-                            .and_then(Value::as_object_mut)
-                            .ok_or_else(|| invalid("missing message properties"))?;
-                        props
-                            .get("from_actor")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| invalid("missing sender actor"))?;
-                        if input.disposition == RecipientDisposition::Stored {
+                        let note_id = if let Some(note) = input.note.as_mut() {
+                            let props = note
+                                .properties
+                                .as_mut()
+                                .and_then(Value::as_object_mut)
+                                .ok_or_else(|| invalid("missing message properties"))?;
+                            props
+                                .get("from_actor")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| invalid("missing sender actor"))?;
                             if let Some(parent) = input.in_reply_to {
                                 let is_reply: bool = conn
                                     .query_row(
                                         OUTBOUND_PARENT_SQL,
                                         params![
-                                            input.note.namespace.as_str(),
+                                            note.namespace.as_str(),
                                             parent.to_string(),
                                             recipient.as_str(),
                                             input.sender_agent_id.as_str()
@@ -432,31 +610,34 @@ impl RecipientTransportStore {
                                     );
                                 }
                             }
-                        }
-                        let thread = correlated_thread.unwrap_or(input.note.id);
-                        props.insert("thread_id".into(), serde_json::json!(thread));
-                        let n = &input.note;
-                        conn.execute(
-                            INSERT_NOTE_SQL,
-                            params![
-                                n.id.to_string(),
-                                n.namespace,
-                                n.kind,
-                                n.status,
-                                n.name,
-                                n.content,
-                                n.salience,
-                                n.decay_factor,
-                                n.expires_at,
-                                n.properties.as_ref().map(Value::to_string),
-                                n.created_at,
-                                n.updated_at,
-                                n.deleted_at,
-                                n.key
-                            ],
-                        )
-                        .map_err(|e| map_err(e, op))?;
-                        assign_note_seq(conn, &n.id.to_string()).map_err(|e| map_err(e, op))?;
+                            let thread = correlated_thread.unwrap_or(note.id);
+                            props.insert("thread_id".into(), serde_json::json!(thread));
+                            let n = &*note;
+                            conn.execute(
+                                INSERT_NOTE_SQL,
+                                params![
+                                    n.id.to_string(),
+                                    n.namespace,
+                                    n.kind,
+                                    n.status,
+                                    n.name,
+                                    n.content,
+                                    n.salience,
+                                    n.decay_factor,
+                                    n.expires_at,
+                                    n.properties.as_ref().map(Value::to_string),
+                                    n.created_at,
+                                    n.updated_at,
+                                    n.deleted_at,
+                                    n.key
+                                ],
+                            )
+                            .map_err(|e| map_err(e, op))?;
+                            assign_note_seq(conn, &n.id.to_string()).map_err(|e| map_err(e, op))?;
+                            Some(n.id)
+                        } else {
+                            None
+                        };
                         conn.execute(
                             INSERT_REPLAY_SQL,
                             params![
@@ -464,26 +645,35 @@ impl RecipientTransportStore {
                                 input.logical_message_id.to_string(),
                                 recipient,
                                 actor,
-                                n.id.to_string(),
+                                note_id.map(|id| id.to_string()),
                                 input.disposition.as_str(),
                                 now
                             ],
                         )
                         .map_err(|e| map_err(e, op))?;
                         if let Some(q) = &input.quarantine {
+                            evicted = evict_to_bound(
+                                conn,
+                                &recipient,
+                                &input.sender_agent_id,
+                                q.reason,
+                                op,
+                            )?;
                             conn.execute(
                                 QUARANTINE_SQL,
                                 params![
                                     input.sender_agent_id,
                                     input.logical_message_id.to_string(),
+                                    recipient,
                                     q.delivery_item,
                                     q.reason.as_str(),
+                                    q.parsed_plaintext.as_ref().map(Value::to_string),
                                     now
                                 ],
                             )
                             .map_err(|e| map_err(e, op))?;
                         }
-                        (n.id, input.disposition, true)
+                        (note_id, input.disposition, true)
                     };
                 // This insertion deliberately shares the message/replay transaction.
                 record_ack(
@@ -502,10 +692,20 @@ impl RecipientTransportStore {
                     note_id,
                     disposition,
                     created,
-                    note: created.then_some(input.note),
+                    note: if created { input.note } else { None },
+                    evicted,
                 })
             })
-            .await
+            .await?;
+        for item in &result.evicted {
+            tracing::warn!(
+                sender_agent_id = %item.sender_agent_id,
+                logical_message_id = %item.logical_message_id,
+                reason = item.reason.as_str(),
+                "quarantine bound reached; dropped the oldest quarantined item"
+            );
+        }
+        Ok(result)
     }
 }
 #[cfg(test)]

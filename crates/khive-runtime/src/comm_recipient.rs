@@ -70,6 +70,9 @@ pub(crate) enum VerifiedInboundContent {
     },
     Quarantine {
         reason: QuarantineReason,
+        /// The parsed plaintext object, present exactly when the pair policy
+        /// refused a valid message (ADR-105 A.8 Receiving, step 4).
+        parsed_plaintext: Option<serde_json::Value>,
     },
 }
 fn invalid(message: &str) -> RuntimeError {
@@ -150,104 +153,84 @@ impl KhiveRuntime {
         let from = format!("khive1:{}/{}", local.realm, binding.sender_agent_id);
         let received_at = chrono::Utc::now().to_rfc3339();
         let mut in_reply_to = None;
-        let (content, subject, kind, correlation, disposition, quarantine, sent_at) = match payload
-        {
+        let mut correlation = None;
+        let (note, disposition, quarantine) = match payload {
             VerifiedInboundContent::Message {
                 content,
                 subject,
                 kind,
                 in_reply_to: parent,
-                correlation,
+                correlation: message_correlation,
                 sent_at,
             } => {
                 let parsed_sent_at = chrono::DateTime::parse_from_rfc3339(&sent_at)
                     .ok()
                     .filter(|stamp| stamp.offset().local_minus_utc() == 0);
                 if let Some(stamp) = parsed_sent_at {
-                    if content.trim().is_empty() {
-                        return Err(invalid("verified message content is empty"));
-                    }
+                    // An empty body is a valid A.5 message and is stored like any other.
                     crate::secret_gate::check_at(&content, "note", "content")?;
                     if let Some(subject) = &subject {
                         crate::secret_gate::check_at(subject, "note", "name")?;
                     }
                     in_reply_to = parent;
-                    (
-                        content,
-                        subject,
-                        Some(kind.map_or("unspecified", DeclaredMessageKind::as_str)),
-                        correlation,
-                        RecipientDisposition::Stored,
-                        None,
-                        Some(
-                            stamp
-                                .with_timezone(&chrono::Utc)
-                                .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-                        ),
-                    )
+                    correlation = message_correlation;
+                    let mut note = Note::new(token.namespace().as_str(), "message", content);
+                    note.name = subject.clone();
+                    let mut props = json!({
+                        "comm_schema_version": 1,
+                        "from": from,
+                        "from_actor": from,
+                        "to": local.actor,
+                        "to_actor": local.actor,
+                        "direction": "inbound",
+                        "read": false,
+                        "received_at": received_at,
+                        "channel_kind": "khive",
+                        "channel_slug": local.slug,
+                        "logical_message_id": binding.logical_message_id,
+                        "sent_at": stamp
+                            .with_timezone(&chrono::Utc)
+                            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                        "message_kind": kind.map_or("unspecified", DeclaredMessageKind::as_str),
+                    });
+                    if let Some(subject) = subject {
+                        props["subject"] = json!(subject);
+                    }
+                    if let Some(parent) = in_reply_to {
+                        props["in_reply_to"] = json!(parent);
+                    }
+                    crate::secret_gate::check_json_at(&props, "note", "properties")?;
+                    note.properties = Some(props);
+                    (Some(note), RecipientDisposition::Stored, None)
                 } else {
                     (
-                        "Quarantined authenticated message".into(),
-                        None,
-                        None,
                         None,
                         RecipientDisposition::Quarantined,
                         Some(QuarantineRecord {
                             reason: QuarantineReason::InvalidPlaintext,
                             delivery_item,
+                            parsed_plaintext: None,
                         }),
-                        None,
                     )
                 }
             }
-            VerifiedInboundContent::Quarantine { reason } => (
-                "Quarantined authenticated message".into(),
-                None,
-                None,
+            VerifiedInboundContent::Quarantine {
+                reason,
+                parsed_plaintext,
+            } => (
                 None,
                 RecipientDisposition::Quarantined,
                 Some(QuarantineRecord {
                     reason,
                     delivery_item,
+                    parsed_plaintext,
                 }),
-                None,
             ),
         };
-        let mut note = Note::new(token.namespace().as_str(), "message", content);
-        note.name = subject.clone();
-        let mut props = json!({
-            "comm_schema_version": 1,
-            "from": from,
-            "from_actor": from,
-            "to": local.actor,
-            "to_actor": local.actor,
-            "direction": "inbound",
-            "read": false,
-            "received_at": received_at,
-            "channel_kind": "khive",
-            "channel_slug": local.slug,
-            "logical_message_id": binding.logical_message_id,
-        });
-        if let Some(sent_at) = sent_at {
-            props["sent_at"] = json!(sent_at);
-        }
-        if let Some(subject) = subject {
-            props["subject"] = json!(subject);
-        }
-        if let Some(kind) = kind {
-            props["message_kind"] = json!(kind);
-        }
-        if let Some(parent) = in_reply_to {
-            props["in_reply_to"] = json!(parent);
-        }
-        if disposition == RecipientDisposition::Quarantined {
-            props["quarantined"] = json!(true);
-        }
-        crate::secret_gate::check_json_at(&props, "note", "properties")?;
-        note.properties = Some(props);
         let result = recipient_store
             .commit(RecipientCommit {
                 note,
+                recipient_actor: local.actor.clone(),
                 binding: binding_value,
                 sender_agent_id: binding.sender_agent_id.clone(),
                 logical_message_id: binding.logical_message_id,

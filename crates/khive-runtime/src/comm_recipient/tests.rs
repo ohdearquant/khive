@@ -159,7 +159,7 @@ async fn recipient_embedding_publishes_only_the_live_committed_revision() {
             .expect("recipient ingest must finish")
             .unwrap()
             .unwrap();
-        assert_eq!(result.note_id, note_id);
+        assert_eq!(result.note_id, Some(note_id));
         assert_eq!(
             vectors.count().await.unwrap(),
             u64::from(change == "unchanged"),
@@ -333,7 +333,7 @@ async fn delivered_replay_is_acked_before_gate_or_timestamp_revalidation() {
     let stored = runtime
         .notes(&token)
         .unwrap()
-        .get_note(first.note_id)
+        .get_note(first.note_id.unwrap())
         .await
         .unwrap()
         .unwrap();
@@ -389,15 +389,26 @@ async fn inbound_message_persists_declared_or_unspecified_kind() {
         let persisted = runtime
             .notes(&token)
             .unwrap()
-            .get_note(result.note_id)
+            .get_note(result.note_id.unwrap())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(persisted.properties.unwrap()["message_kind"], expected);
     }
 }
+fn table_count(runtime: &KhiveRuntime, table: &str) -> i64 {
+    runtime
+        .backend()
+        .pool()
+        .writer()
+        .unwrap()
+        .conn()
+        .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
 #[tokio::test]
-async fn invalid_sender_timestamp_is_quarantined_without_message_body() {
+async fn invalid_sender_timestamp_is_quarantined_without_message_note() {
     for sent_at in ["not-a-timestamp", "2026-09-01T12:34:56+01:00"] {
         let (runtime, token, local, binding) = fixture();
         let result = runtime
@@ -418,13 +429,12 @@ async fn invalid_sender_timestamp_is_quarantined_without_message_body() {
             .await
             .unwrap();
         assert_eq!(result.disposition, RecipientDisposition::Quarantined);
-        let note = result.note.unwrap();
-        assert!(!note.content.contains("private body"));
-        let props = note.properties.unwrap();
-        assert_eq!(props["quarantined"], true);
-        assert!(props.get("sent_at").is_none());
-        assert!(props.get("message_kind").is_none());
-        assert!(props["received_at"].is_string());
+        assert!(result.created);
+        assert_eq!(result.note_id, None);
+        assert!(result.note.is_none());
+        assert_eq!(table_count(&runtime, "notes"), 0, "{sent_at}");
+        assert_eq!(table_count(&runtime, "comm_recipient_quarantine"), 1);
+        assert_eq!(table_count(&runtime, "comm_ack_work"), 1);
     }
 }
 #[tokio::test]
@@ -538,7 +548,7 @@ async fn live_outbound_transport_parent_derives_reply_over_declared_ask() {
         result.note.as_ref().unwrap().properties.as_ref().unwrap()["in_reply_to"],
         parent.to_string()
     );
-    let note_id = result.note_id;
+    let note_id = result.note_id.unwrap();
     assert!(runtime
         .delete_note(&token, parent_note_id, true)
         .await
@@ -624,40 +634,108 @@ async fn deleted_outbound_parent_falls_back_to_declared_kind() {
 }
 
 #[tokio::test]
-async fn quarantine_notification_is_body_free_and_replay_is_verbatim() {
-    let (runtime, token, local, binding) = fixture();
-    let bytes = b"{ \"ciphertext\": \"opaque-sensitive-payload\" }".to_vec();
-    let result = runtime
-        .ingest_verified_recipient(
-            &token,
-            &local,
-            InboundReceiptTicket::new(binding, 1),
-            VerifiedInboundContent::Quarantine {
-                reason: QuarantineReason::InvalidPlaintext,
-            },
-            bytes.clone(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(result.disposition, RecipientDisposition::Quarantined);
-    let note = result.note.unwrap();
-    assert!(!note.content.contains("opaque-sensitive-payload"));
-    assert!(!note
-        .properties
-        .unwrap()
-        .to_string()
-        .contains("opaque-sensitive-payload"));
-    let stored: Vec<u8> = runtime
-        .backend()
-        .pool()
-        .writer()
-        .unwrap()
-        .conn()
-        .query_row(
-            "SELECT delivery_item FROM comm_recipient_quarantine",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(stored, bytes);
+async fn quarantine_writes_no_message_note_and_keeps_the_item_verbatim() {
+    let plaintext =
+        json!({"v":1,"subject":null,"body":"refused body","sent_at":"2026-09-01T12:34:56Z"});
+    for (reason, parsed_plaintext) in [
+        (QuarantineReason::InvalidPlaintext, None),
+        (QuarantineReason::InvalidMessage, None),
+        (QuarantineReason::PolicyRejected, Some(plaintext.clone())),
+    ] {
+        let (runtime, token, local, binding) = fixture();
+        let bytes = b"{ \"ciphertext\": \"opaque-sensitive-payload\" }".to_vec();
+        let result = runtime
+            .ingest_verified_recipient(
+                &token,
+                &local,
+                InboundReceiptTicket::new(binding.clone(), 1),
+                VerifiedInboundContent::Quarantine {
+                    reason,
+                    parsed_plaintext: parsed_plaintext.clone(),
+                },
+                bytes.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.disposition, RecipientDisposition::Quarantined);
+        assert_eq!(result.note_id, None, "{reason:?}");
+        assert!(result.note.is_none(), "{reason:?}");
+        assert_eq!(table_count(&runtime, "notes"), 0, "{reason:?}");
+        let (stored, kept): (Vec<u8>, Option<String>) = runtime
+            .backend()
+            .pool()
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT delivery_item,parsed_plaintext FROM comm_recipient_quarantine",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, bytes);
+        assert_eq!(
+            kept.map(|text| serde_json::from_str::<serde_json::Value>(&text).unwrap()),
+            parsed_plaintext,
+            "{reason:?}"
+        );
+
+        let mut retry = binding;
+        retry.delivery_attempt_id = Uuid::new_v4();
+        let replay = runtime
+            .ingest_verified_recipient(
+                &token,
+                &local,
+                InboundReceiptTicket::new(retry, 1),
+                payload(None),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(!replay.created);
+        assert_eq!(replay.disposition, RecipientDisposition::Quarantined);
+        assert_eq!(replay.note_id, None);
+        assert_eq!(table_count(&runtime, "notes"), 0, "{reason:?}");
+    }
+}
+
+#[tokio::test]
+async fn empty_body_is_stored_and_receipted() {
+    for body in ["", "  \n"] {
+        let (runtime, token, local, binding) = fixture();
+        let mut message = payload(None);
+        let VerifiedInboundContent::Message { content, .. } = &mut message else {
+            unreachable!("payload fixture is a message")
+        };
+        *content = body.into();
+        let result = runtime
+            .ingest_verified_recipient(
+                &token,
+                &local,
+                InboundReceiptTicket::new(binding, 1),
+                message,
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(result.created);
+        assert_eq!(result.disposition, RecipientDisposition::Stored);
+        let stored = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(result.note_id.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.content, body);
+        let ack: String = runtime
+            .backend()
+            .pool()
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row("SELECT disposition FROM comm_ack_work", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ack, "stored");
+    }
 }
