@@ -3,6 +3,7 @@
 
 pub(crate) mod export;
 pub(crate) mod list;
+pub(crate) mod maintenance;
 pub(crate) mod resume;
 pub(crate) mod search;
 pub(crate) mod store;
