@@ -244,15 +244,18 @@ separate whole-file transaction contract.
 
 Serial scheduling does not renew Khive's established request-read deadline per
 operation: one logical chunk retains one deadline. A trusted long-running local
-model batch whose inference can exceed the 30-second default must opt into a
-bounded documented override (1–3600 seconds), for example:
+model batch or bulk ingest whose work can exceed the 30-second default must opt
+into a bounded documented override (1–86400 seconds), for example:
 
 ```bash
-KHIVE_REQUEST_READ_TIMEOUT_SECS=3600 \
+KHIVE_REQUEST_READ_TIMEOUT_SECS=7200 \
   kkernel exec --ops-file image-batch.jsonl --serial
 ```
 
-Record this operator setting with run evidence; it is not a wire-limit bypass.
+A value above 86400 is clamped to 86400, and zero or a non-integer uses the
+30-second default; either correction logs a warning naming the value that was
+set. Record this operator setting with run evidence; it is not a wire-limit
+bypass.
 
 ### Stable refusal reasons
 
