@@ -16,7 +16,7 @@ pub const WEB_NAMESPACE: Uuid = Uuid::from_u128(0x1910_adb1_91ad_5eb0_91ad_b191_
 
 /// The address used for a request, distinct from the sorted-query identity key.
 /// Fragments identify a position within a document and are not sent over HTTP.
-pub(crate) fn request_url(mut url: url::Url) -> url::Url {
+pub fn request_url(mut url: url::Url) -> url::Url {
     url.set_fragment(None);
     url
 }
