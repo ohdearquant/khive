@@ -1,9 +1,7 @@
 //! Output capture (tail-preserving, byte-counting) and run-directory walks.
 
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::Read;
-use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -54,33 +52,48 @@ impl Tail {
     }
 }
 
-/// Drain `reader` into a tail buffer until EOF.
-pub async fn drain<R: AsyncRead + Unpin>(mut reader: R, cap: u64) -> Tail {
-    let mut tail = Tail::new(cap);
-    let mut chunk = vec![0u8; 64 * 1024];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(n) => tail.push(&chunk[..n]),
-            Err(_) => break,
-        }
-    }
-    tail
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStop {
+    Eof,
+    Deadline,
+    ReadError,
 }
 
-/// A regular file or symlink found in the run directory after the run.
-#[derive(Debug, Clone)]
-pub struct Found {
-    pub abs: PathBuf,
-    pub mode: u32,
+pub struct Drained {
+    pub tail: Tail,
+    pub stop: DrainStop,
+}
+
+/// Drain `reader` into a tail buffer until EOF or the run deadline.
+pub async fn drain_until<R: AsyncRead + Unpin>(
+    mut reader: R,
+    cap: u64,
+    deadline: tokio::time::Instant,
+) -> Drained {
+    let mut tail = Tail::new(cap);
+    let mut chunk = vec![0u8; 64 * 1024];
+    let stop = loop {
+        if tokio::time::Instant::now() >= deadline {
+            break DrainStop::Deadline;
+        }
+        match tokio::time::timeout_at(deadline, reader.read(&mut chunk)).await {
+            Ok(Ok(0)) => break DrainStop::Eof,
+            Ok(Ok(n)) => tail.push(&chunk[..n]),
+            Ok(Err(_)) => break DrainStop::ReadError,
+            Err(_) => break DrainStop::Deadline,
+        }
+    };
+    Drained { tail, stop }
 }
 
 /// One bounded file capture, with its content hash accumulated while reading.
+#[derive(Debug)]
 pub struct CapturedContent {
     pub bytes: Vec<u8>,
     pub digest: String,
 }
 
+#[derive(Debug)]
 pub enum CaptureRead {
     Complete(CapturedContent),
     TooLarge { observed_at_least: u64 },
@@ -122,103 +135,699 @@ fn read_regular_bounded(
     }))
 }
 
-impl Found {
-    pub fn read_content_bounded(&self, max_bytes: u64) -> std::io::Result<CaptureRead> {
-        if self.mode == 120000 {
-            let bytes = std::fs::read_link(&self.abs)?
-                .into_os_string()
-                .into_encoded_bytes();
-            if bytes.len() as u64 > max_bytes {
-                return Ok(CaptureRead::TooLarge {
-                    observed_at_least: bytes.len() as u64,
-                });
-            }
-            Ok(CaptureRead::Complete(CapturedContent {
-                digest: blake3::hash(&bytes).to_hex().to_string(),
-                bytes,
-            }))
-        } else {
-            let file = std::fs::File::open(&self.abs)?;
-            let advertised_len = file.metadata()?.len();
-            read_regular_bounded(file, advertised_len, max_bytes)
-        }
-    }
-}
+#[cfg(unix)]
+mod platform {
+    use super::{read_regular_bounded, CaptureRead, CapturedContent};
+    use std::collections::BTreeMap;
+    use std::ffi::{CStr, CString, OsStr, OsString};
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Path;
+    use std::sync::Arc;
 
-/// Walk `root` without following symlinks. Files and symlinks become entries;
-/// directories are descended; sockets, fifos and devices are reported in
-/// `skipped`. An unreadable entry is an error, never evidence that an input
-/// path was deleted.
-pub fn walk(root: &Path) -> std::io::Result<(BTreeMap<String, Found>, Vec<String>)> {
-    let mut files = BTreeMap::new();
-    let mut skipped = Vec::new();
-    let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
-    while let Some((dir, rel)) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!("read capture directory {}: {error}", dir.display()),
-            )
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("enumerate capture directory {}: {error}", dir.display()),
-                )
-            })?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            let child_rel = if rel.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel}/{name}")
-            };
-            let abs = entry.path();
-            let meta = std::fs::symlink_metadata(&abs).map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("stat capture entry {}: {error}", abs.display()),
-                )
-            })?;
-            let ft = meta.file_type();
-            if ft.is_symlink() {
-                files.insert(child_rel, Found { abs, mode: 120000 });
-                continue;
-            }
-            if ft.is_dir() {
-                stack.push((abs, child_rel));
-                continue;
-            }
-            if !ft.is_file() {
-                skipped.push(child_rel);
-                continue;
-            }
-            #[cfg(unix)]
-            let mode = {
-                use std::os::unix::fs::PermissionsExt;
-                if meta.permissions().mode() & 0o111 != 0 {
-                    755
-                } else {
-                    644
+    /// Longest relative path the walk accepts, in bytes of its lossy UTF-8
+    /// form. Each directory is re-resolved from the root one component at a
+    /// time, so this cap also bounds the per-directory reopen cost; a deeper
+    /// tree is a capture error rather than an unbounded walk.
+    const MAX_CAPTURE_PATH_BYTES: usize = 1024;
+
+    #[derive(Debug)]
+    pub struct CaptureRoot {
+        directory: Arc<File>,
+    }
+
+    impl CaptureRoot {
+        pub fn open(path: &Path) -> io::Result<Self> {
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)?;
+            Ok(Self {
+                directory: Arc::new(directory),
+            })
+        }
+
+        /// Asks the kernel for the pinned run directory's current path and
+        /// checks that the path still names it. A run directory the tool
+        /// removed, or removed and recreated at the same path, lists as empty
+        /// through the pinned descriptor and cannot be told from a run that
+        /// wrote nothing, and `st_nlink` does not drop to zero for it on macOS.
+        /// A renamed run directory is still the pinned one, so it passes, also
+        /// when a new directory is then created at the old path: capture lists
+        /// the pinned tree, not the new directory. Returns `Ok(None)` when the
+        /// root is still named. Otherwise `Ok(Some(detail))` names the detector
+        /// and starts with `root_missing` when the path is gone or names
+        /// another file, or `root_unverified` when the path could not be
+        /// queried or read (on macOS, `F_GETPATH` fails for a directory moved
+        /// to a path longer than the platform limit). `Err` with
+        /// [`io::ErrorKind::Unsupported`] means this platform has no
+        /// descriptor-to-path query; any other `Err` means the pinned
+        /// descriptor itself could not be read.
+        pub fn missing_root(&self) -> io::Result<Option<String>> {
+            use std::os::unix::fs::MetadataExt as _;
+
+            let path = match descriptor_path(&self.directory) {
+                Ok(path) => path,
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(error),
+                Err(error) => {
+                    return Ok(Some(format!(
+                    "root_unverified: {DESCRIPTOR_PATH_QUERY} on the run directory failed: {error}"
+                )))
                 }
             };
-            #[cfg(not(unix))]
-            let mode = 644;
-            files.insert(child_rel, Found { abs, mode });
+            let pinned = self.directory.metadata()?;
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if metadata.dev() == pinned.dev() && metadata.ino() == pinned.ino() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(format!(
+                            "root_missing: {DESCRIPTOR_PATH_QUERY} path of the run directory now names a different file"
+                        )))
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Some(format!(
+                    "root_missing: {DESCRIPTOR_PATH_QUERY} path of the run directory no longer exists"
+                ))),
+                Err(error) => Ok(Some(format!(
+                    "root_unverified: lstat of the {DESCRIPTOR_PATH_QUERY} path of the run directory failed: {error}"
+                ))),
+            }
         }
     }
-    Ok((files, skipped))
+
+    #[cfg(target_vendor = "apple")]
+    const DESCRIPTOR_PATH_QUERY: &str = "F_GETPATH";
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const DESCRIPTOR_PATH_QUERY: &str = "/proc/self/fd";
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    const DESCRIPTOR_PATH_QUERY: &str = "descriptor path query";
+
+    #[cfg(target_vendor = "apple")]
+    fn descriptor_path(file: &File) -> io::Result<std::path::PathBuf> {
+        let mut buffer = vec![0u8; libc::PATH_MAX as usize + 1];
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let len = buffer.iter().position(|&byte| byte == 0).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "F_GETPATH result is not terminated",
+            )
+        })?;
+        buffer.truncate(len);
+        Ok(std::path::PathBuf::from(OsString::from_vec(buffer)))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn descriptor_path(file: &File) -> io::Result<std::path::PathBuf> {
+        // A removed directory reads back as "<path> (deleted)", which the
+        // lstat comparison then reports as missing or as a different file.
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    fn descriptor_path(_file: &File) -> io::Result<std::path::PathBuf> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no descriptor-to-path query on this platform",
+        ))
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Found {
+        // Reopen checked ancestors at read time instead of pinning one fd per directory.
+        root: Arc<File>,
+        parent_path: Arc<Vec<DirectoryComponent>>,
+        name: OsString,
+        identity: Identity,
+        pub mode: u32,
+    }
+
+    #[derive(Debug, Clone)]
+    struct DirectoryComponent {
+        name: OsString,
+        identity: Identity,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct Identity {
+        dev: libc::dev_t,
+        ino: libc::ino_t,
+        kind: libc::mode_t,
+    }
+
+    impl From<&libc::stat> for Identity {
+        fn from(stat: &libc::stat) -> Self {
+            Self {
+                dev: stat.st_dev,
+                ino: stat.st_ino,
+                kind: stat.st_mode & libc::S_IFMT,
+            }
+        }
+    }
+
+    fn c_name(name: &OsStr) -> io::Result<CString> {
+        CString::new(name.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in capture name"))
+    }
+
+    fn stat_fd(file: &File) -> io::Result<libc::stat> {
+        let mut stat = std::mem::MaybeUninit::uninit();
+        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { stat.assume_init() })
+    }
+
+    fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
+        let name = c_name(name)?;
+        let mut stat = std::mem::MaybeUninit::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { stat.assume_init() })
+    }
+
+    fn changed() -> io::Error {
+        io::Error::other("capture entry changed after inspection")
+    }
+
+    fn open_at(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
+        let name = c_name(name)?;
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if directory { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn open_checked(
+        parent: &File,
+        name: &OsStr,
+        expected: Identity,
+    ) -> io::Result<(File, libc::stat)> {
+        let directory = expected.kind == libc::S_IFDIR;
+        let file = match open_at(parent, name, directory) {
+            Ok(file) => file,
+            Err(error) => {
+                if stat_at(parent, name).is_ok_and(|current| Identity::from(&current) != expected) {
+                    return Err(changed());
+                }
+                return Err(error);
+            }
+        };
+        let stat = stat_fd(&file)?;
+        if Identity::from(&stat) != expected {
+            return Err(changed());
+        }
+        Ok((file, stat))
+    }
+
+    /// Re-resolve from the pre-launch root, refusing changed or linked ancestors.
+    fn open_directory_path(root: &File, path: &[DirectoryComponent]) -> io::Result<Option<File>> {
+        let mut opened = None;
+        for component in path {
+            let parent = opened.as_ref().unwrap_or(root);
+            let (child, _) = open_checked(parent, &component.name, component.identity)?;
+            opened = Some(child);
+        }
+        Ok(opened)
+    }
+
+    struct DirStream(*mut libc::DIR);
+
+    impl Drop for DirStream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd"
+    ))]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::__error() }
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "emscripten",
+        target_os = "redox",
+        target_os = "hurd"
+    ))]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::__errno_location() }
+    }
+
+    #[cfg(any(
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "android",
+        target_os = "cygwin",
+        target_os = "nuttx"
+    ))]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::__errno() }
+    }
+
+    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::___errno() }
+    }
+
+    #[cfg(target_os = "aix")]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::_Errno() }
+    }
+
+    #[cfg(target_os = "haiku")]
+    fn errno_location() -> *mut libc::c_int {
+        unsafe { libc::_errnop() }
+    }
+
+    fn names(directory: &File) -> io::Result<Vec<OsString>> {
+        let fd = open_at(directory, OsStr::new("."), true)?.into_raw_fd();
+        let stream = unsafe { libc::fdopendir(fd) };
+        if stream.is_null() {
+            let error = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        let stream = DirStream(stream);
+        let mut result = Vec::new();
+        loop {
+            unsafe { *errno_location() = 0 };
+            let entry = unsafe { libc::readdir(stream.0) };
+            if entry.is_null() {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(0) {
+                    return Err(error);
+                }
+                break;
+            }
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                result.push(OsString::from_vec(name.to_vec()));
+            }
+        }
+        result.sort();
+        Ok(result)
+    }
+
+    fn read_link_at(parent: &File, name: &OsStr, max_bytes: u64) -> io::Result<CaptureRead> {
+        let name = c_name(name)?;
+        let ceiling = max_bytes.saturating_add(1).min(usize::MAX as u64) as usize;
+        let mut capacity = ceiling.clamp(1, 256);
+        loop {
+            let mut bytes = vec![0u8; capacity];
+            let len = unsafe {
+                libc::readlinkat(
+                    parent.as_raw_fd(),
+                    name.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if len < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if len as usize == capacity {
+                if capacity == ceiling {
+                    return Ok(CaptureRead::TooLarge {
+                        observed_at_least: capacity as u64,
+                    });
+                }
+                capacity = capacity.saturating_mul(2).min(ceiling);
+                continue;
+            }
+            bytes.truncate(len as usize);
+            return Ok(CaptureRead::Complete(CapturedContent {
+                digest: blake3::hash(&bytes).to_hex().to_string(),
+                bytes,
+            }));
+        }
+    }
+
+    impl Found {
+        pub fn read_content_bounded(&self, max_bytes: u64) -> io::Result<CaptureRead> {
+            let opened_parent = open_directory_path(&self.root, &self.parent_path)?;
+            let parent = opened_parent.as_ref().unwrap_or(&self.root);
+            if self.mode == 120000 {
+                let checked = stat_at(parent, &self.name)?;
+                if Identity::from(&checked) != self.identity {
+                    return Err(changed());
+                }
+                let content = read_link_at(parent, &self.name, max_bytes)?;
+                if Identity::from(&stat_at(parent, &self.name)?) != self.identity {
+                    return Err(changed());
+                }
+                Ok(content)
+            } else {
+                let (file, stat) = open_checked(parent, &self.name, self.identity)?;
+                read_regular_bounded(file, stat.st_size.max(0) as u64, max_bytes)
+            }
+        }
+    }
+
+    /// Walk from the descriptor opened before launch. Files and symlinks
+    /// become entries; special files are skipped.
+    pub fn walk(root: &CaptureRoot) -> io::Result<(BTreeMap<String, Found>, Vec<String>)> {
+        let mut files = BTreeMap::new();
+        let mut skipped = Vec::new();
+        let mut stack = vec![(Arc::new(Vec::new()), String::new())];
+        while let Some((path, rel)) = stack.pop() {
+            let opened_directory =
+                open_directory_path(&root.directory, &path).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("read capture directory {rel:?}: {error}"),
+                    )
+                })?;
+            let directory = opened_directory.as_ref().unwrap_or(&root.directory);
+            let entries = names(directory).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("read capture directory {rel:?}: {error}"),
+                )
+            })?;
+            for name in entries {
+                let child_rel = if rel.is_empty() {
+                    name.to_string_lossy().into_owned()
+                } else {
+                    format!("{rel}/{}", name.to_string_lossy())
+                };
+                if child_rel.len() > MAX_CAPTURE_PATH_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "capture path exceeds {MAX_CAPTURE_PATH_BYTES} bytes under {:?}",
+                            child_rel.chars().take(64).collect::<String>()
+                        ),
+                    ));
+                }
+                let stat = stat_at(directory, &name).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("stat capture entry {child_rel:?}: {error}"),
+                    )
+                })?;
+                match stat.st_mode & libc::S_IFMT {
+                    libc::S_IFDIR => {
+                        let mut child_path = path.as_ref().clone();
+                        child_path.push(DirectoryComponent {
+                            name,
+                            identity: Identity::from(&stat),
+                        });
+                        stack.push((Arc::new(child_path), child_rel));
+                    }
+                    libc::S_IFREG | libc::S_IFLNK => {
+                        let mode = if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                            120000
+                        } else if stat.st_mode & 0o111 != 0 {
+                            755
+                        } else {
+                            644
+                        };
+                        files.insert(
+                            child_rel,
+                            Found {
+                                root: Arc::clone(&root.directory),
+                                parent_path: Arc::clone(&path),
+                                name,
+                                identity: Identity::from(&stat),
+                                mode,
+                            },
+                        );
+                    }
+                    _ => skipped.push(child_rel),
+                }
+            }
+        }
+        Ok((files, skipped))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn capture_open_does_not_follow_symlink_in_run_directory() {
+            let run = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("outside"), b"outside bytes").unwrap();
+            std::os::unix::fs::symlink(outside.path().join("outside"), run.path().join("link"))
+                .unwrap();
+            let root = CaptureRoot::open(run.path()).unwrap();
+            assert!(open_at(&root.directory, OsStr::new("link"), false).is_err());
+        }
+
+        /// Create `levels` nested directories named `name` below `root` by
+        /// descriptor, so the chain may be longer than PATH_MAX.
+        fn mkdir_chain(root: &File, name: &OsStr, levels: usize) {
+            let mut parent = root.try_clone().unwrap();
+            for _ in 0..levels {
+                let c = c_name(name).unwrap();
+                let rc = unsafe { libc::mkdirat(parent.as_raw_fd(), c.as_ptr(), 0o700) };
+                assert_eq!(rc, 0, "mkdirat: {}", io::Error::last_os_error());
+                parent = open_at(&parent, name, true).unwrap();
+            }
+        }
+
+        #[test]
+        fn walk_refuses_a_path_past_the_capture_byte_cap() {
+            let name = OsString::from("d".repeat(200));
+
+            // Five levels: 5 * 200 bytes plus four separators = 1004 bytes.
+            let within = tempfile::tempdir().unwrap();
+            let root = CaptureRoot::open(within.path()).unwrap();
+            mkdir_chain(&root.directory, &name, 5);
+            let (files, skipped) = walk(&root).expect("a path within the cap is captured");
+            assert!(files.is_empty());
+            assert!(skipped.is_empty());
+
+            // Six levels: 1205 bytes, past the cap.
+            let past = tempfile::tempdir().unwrap();
+            let root = CaptureRoot::open(past.path()).unwrap();
+            mkdir_chain(&root.directory, &name, 6);
+            let error = walk(&root).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error.to_string().contains(&format!(
+                    "capture path exceeds {MAX_CAPTURE_PATH_BYTES} bytes"
+                )),
+                "{error}"
+            );
+        }
+
+        #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+        #[test]
+        fn missing_root_tells_a_removed_or_replaced_run_directory_from_a_renamed_one() {
+            let parent = tempfile::tempdir().unwrap();
+
+            let kept = parent.path().join("kept");
+            std::fs::create_dir(&kept).unwrap();
+            let root = CaptureRoot::open(&kept).unwrap();
+            assert_eq!(root.missing_root().unwrap(), None);
+
+            // Rename-away keeps the pinned directory, so capture stays complete.
+            let renamed = parent.path().join("renamed");
+            std::fs::create_dir(&renamed).unwrap();
+            let root = CaptureRoot::open(&renamed).unwrap();
+            std::fs::rename(&renamed, parent.path().join("moved")).unwrap();
+            assert_eq!(root.missing_root().unwrap(), None);
+
+            // A new directory at the old path does not change that: the pinned
+            // tree is still named at its new path.
+            std::fs::create_dir(&renamed).unwrap();
+            assert_eq!(root.missing_root().unwrap(), None);
+
+            let removed = parent.path().join("removed");
+            std::fs::create_dir(&removed).unwrap();
+            std::fs::write(removed.join("output"), b"x").unwrap();
+            let root = CaptureRoot::open(&removed).unwrap();
+            std::fs::remove_dir_all(&removed).unwrap();
+            let detail = root
+                .missing_root()
+                .unwrap()
+                .expect("removed root is missing");
+            assert!(detail.starts_with("root_missing: "), "{detail}");
+            assert!(detail.contains(DESCRIPTOR_PATH_QUERY), "{detail}");
+            let (files, _) = walk(&root).expect("the pinned directory still lists");
+            assert!(files.is_empty(), "a removed root lists as empty");
+
+            let replaced = parent.path().join("replaced");
+            std::fs::create_dir(&replaced).unwrap();
+            let root = CaptureRoot::open(&replaced).unwrap();
+            std::fs::remove_dir(&replaced).unwrap();
+            std::fs::create_dir(&replaced).unwrap();
+            let detail = root
+                .missing_root()
+                .unwrap()
+                .expect("a new directory at the same path is not the pinned one");
+            assert!(detail.starts_with("root_missing: "), "{detail}");
+            assert!(
+                detail.contains("different file") || detail.contains("no longer exists"),
+                "{detail}"
+            );
+        }
+
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn missing_root_reports_an_unqueryable_path_as_unverified() {
+            let parent = tempfile::tempdir().unwrap();
+            let run = parent.path().join("run");
+            std::fs::create_dir(&run).unwrap();
+            let root = CaptureRoot::open(&run).unwrap();
+
+            // Move the run directory under a chain whose path is longer than
+            // the platform limit; each step is relative, so no call passes it.
+            let name = "d".repeat(200);
+            let mut deep = std::fs::File::open(parent.path()).unwrap();
+            for _ in 0..7 {
+                let component = std::ffi::CString::new(name.as_str()).unwrap();
+                // SAFETY: `deep` is an open directory and `component` is a NUL-terminated name.
+                let made = unsafe { libc::mkdirat(deep.as_raw_fd(), component.as_ptr(), 0o700) };
+                assert_eq!(made, 0, "{}", io::Error::last_os_error());
+                // SAFETY: as above; the returned descriptor is owned by the new `File`.
+                let fd = unsafe {
+                    libc::openat(
+                        deep.as_raw_fd(),
+                        component.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    )
+                };
+                assert!(fd >= 0, "{}", io::Error::last_os_error());
+                // SAFETY: `fd` was just returned by `openat` and is not owned elsewhere.
+                deep = unsafe { std::fs::File::from_raw_fd(fd) };
+            }
+            let parent_dir = std::fs::File::open(parent.path()).unwrap();
+            let from = std::ffi::CString::new("run").unwrap();
+            // SAFETY: both descriptors are open directories and both names are NUL-terminated.
+            let moved = unsafe {
+                libc::renameat(
+                    parent_dir.as_raw_fd(),
+                    from.as_ptr(),
+                    deep.as_raw_fd(),
+                    from.as_ptr(),
+                )
+            };
+            assert_eq!(moved, 0, "{}", io::Error::last_os_error());
+
+            let detail = root
+                .missing_root()
+                .unwrap()
+                .expect("a path the kernel cannot report is not confirmed");
+            assert!(detail.starts_with("root_unverified: "), "{detail}");
+            let (files, _) = walk(&root).expect("the pinned directory still lists");
+            assert!(files.is_empty());
+        }
+    }
 }
 
-#[cfg(test)]
+#[cfg(unix)]
+pub use platform::{walk, CaptureRoot};
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    fn captured_bytes(found: &Found) -> Vec<u8> {
+    fn captured_bytes(found: &platform::Found) -> Vec<u8> {
         match found.read_content_bounded(1024).unwrap() {
             CaptureRead::Complete(content) => content.bytes,
             CaptureRead::TooLarge { .. } => panic!("small fixture exceeded capture cap"),
         }
+    }
+
+    #[test]
+    fn walk_captures_many_directories_under_256_fd_limit() {
+        const CHILD_MARKER: &str = "KHIVE_EXEC_CAPTURE_LOW_NOFILE_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let marker_dir = tempfile::tempdir().unwrap();
+            let marker = marker_dir.path().join("completed");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "capture::tests::walk_captures_many_directories_under_256_fd_limit",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_MARKER, &marker)
+                .output()
+                .expect("spawn isolated low-fd test process");
+            assert!(
+                output.status.success(),
+                "low-fd capture child failed: status={}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(&marker).expect("the filtered child test must run"),
+                b"completed"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..400 {
+            let child = dir.path().join(format!("sub-{i:03}"));
+            std::fs::create_dir(&child).unwrap();
+            std::fs::write(child.join("output"), b"captured").unwrap();
+        }
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        assert!(
+            limit.rlim_max >= 256,
+            "test requires a hard fd limit >= 256"
+        );
+        limit.rlim_cur = 256;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        let root = CaptureRoot::open(dir.path()).unwrap();
+        let (files, skipped) = walk(&root).expect("capture must not retain one fd per directory");
+        assert!(skipped.is_empty());
+        assert_eq!(files.len(), 400);
+        for i in 0..400 {
+            assert_eq!(
+                captured_bytes(&files[&format!("sub-{i:03}/output")]),
+                b"captured"
+            );
+        }
+        std::fs::write(
+            std::path::PathBuf::from(std::env::var_os(CHILD_MARKER).unwrap()),
+            b"completed",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -243,12 +852,10 @@ mod tests {
         let path = dir.path().join("sparse-output");
         let file = std::fs::File::create(&path).unwrap();
         file.set_len(1024 * 1024 * 1024).unwrap();
-        let found = Found {
-            abs: path,
-            mode: 644,
-        };
+        let root = CaptureRoot::open(dir.path()).unwrap();
+        let (files, _) = walk(&root).unwrap();
         assert!(matches!(
-            found.read_content_bounded(1024).unwrap(),
+            files["sparse-output"].read_content_bounded(1024).unwrap(),
             CaptureRead::TooLarge { observed_at_least } if observed_at_least == 1024 * 1024 * 1024
         ));
     }
@@ -276,9 +883,8 @@ mod tests {
     fn walk_reports_missing_root_instead_of_returning_an_empty_tree() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing-run");
-        let error = walk(&missing).unwrap_err();
+        let error = CaptureRoot::open(&missing).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-        assert!(error.to_string().contains("missing-run"));
     }
 
     #[cfg(unix)]
@@ -292,7 +898,8 @@ mod tests {
         std::fs::create_dir(&sealed).unwrap();
         std::fs::write(sealed.join("input"), b"still present").unwrap();
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let result = walk(dir.path());
+        let root = CaptureRoot::open(dir.path()).unwrap();
+        let result = walk(&root);
         std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
@@ -318,7 +925,8 @@ mod tests {
         ] {
             std::os::unix::fs::symlink(target, dir.path().join(name)).unwrap();
         }
-        let (files, skipped) = walk(dir.path()).unwrap();
+        let root = CaptureRoot::open(dir.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
         assert_eq!(
             files.keys().cloned().collect::<Vec<_>>(),
             vec![
@@ -356,7 +964,8 @@ mod tests {
             dir.path().join("link"),
         )
         .unwrap();
-        let (files, skipped) = walk(dir.path()).unwrap();
+        let root = CaptureRoot::open(dir.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
         assert!(skipped.is_empty());
         assert_eq!(files["link"].mode, 120000);
         assert_eq!(captured_bytes(&files["link"]), target);
@@ -371,9 +980,90 @@ mod tests {
         let _socket = std::os::unix::net::UnixListener::bind(dir.path().join("socket")).unwrap();
         let fifo = std::ffi::CString::new(dir.path().join("fifo").as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        let (files, mut skipped) = walk(dir.path()).unwrap();
+        let root = CaptureRoot::open(dir.path()).unwrap();
+        let (files, mut skipped) = walk(&root).unwrap();
         assert!(files.is_empty());
         skipped.sort();
         assert_eq!(skipped, vec!["fifo", "socket"]);
+    }
+
+    #[test]
+    fn capture_refuses_symlink_in_run_directory() {
+        let run = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside");
+        std::fs::write(&outside_file, b"outside bytes").unwrap();
+        let path = run.path().join("output");
+        std::fs::write(&path, b"inside bytes").unwrap();
+        let root = CaptureRoot::open(run.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert!(skipped.is_empty());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&outside_file, &path).unwrap();
+
+        let error = files["output"].read_content_bounded(1024).unwrap_err();
+        assert!(
+            error.to_string().contains("changed after inspection"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn capture_walk_uses_opened_directory() {
+        let container = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let run = container.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::write(run.join("output"), b"inside bytes").unwrap();
+        std::fs::write(outside.path().join("output"), b"outside bytes").unwrap();
+        let root = CaptureRoot::open(&run).unwrap();
+        std::fs::rename(&run, container.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &run).unwrap();
+
+        let (files, skipped) = walk(&root).unwrap();
+        assert!(skipped.is_empty());
+        assert_eq!(captured_bytes(&files["output"]), b"inside bytes");
+    }
+
+    #[test]
+    fn reopened_parent_refuses_replaced_directory() {
+        let run = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = run.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("output"), b"inside bytes").unwrap();
+        std::fs::write(outside.path().join("output"), b"outside bytes").unwrap();
+
+        let root = CaptureRoot::open(run.path()).unwrap();
+        let (files, skipped) = walk(&root).unwrap();
+        assert!(skipped.is_empty());
+        std::fs::rename(&parent, run.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+
+        let error = files["parent/output"]
+            .read_content_bounded(1024)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed after inspection"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_closes_a_held_stream() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(b"before").await.unwrap();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            drain_until(reader, 128, deadline),
+        )
+        .await
+        .expect("output drain exceeded its outer deadline");
+        assert_eq!(result.stop, DrainStop::Deadline);
+        assert_eq!(result.tail.retained(), b"before");
+        assert!(writer.write_all(b"after").await.is_err());
     }
 }
