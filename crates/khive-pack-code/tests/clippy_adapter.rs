@@ -233,6 +233,35 @@ fn windows_backslash_separator_normalizes_to_slash() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_drive_relative_and_stream_paths_are_refused() {
+    for path in ["C:../outside.rs", "C:foo.rs", r"src\lib.rs:stream"] {
+        let mut record = warning_record();
+        record["message"]["spans"][0]["file_name"] = json!(path);
+        let error =
+            ingest_clippy_json_lines(record.to_string().as_bytes(), provenance(), options())
+                .expect_err("Windows colon path must be refused");
+        assert!(
+            error.to_string().contains("relative repository path"),
+            "{path}: {error}"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unix_colon_filename_is_preserved() {
+    let mut record = warning_record();
+    record["message"]["spans"][0]["file_name"] = json!("src/a:b.rs");
+    let batch = ingest_clippy_json_lines(record.to_string().as_bytes(), provenance(), options())
+        .expect("colon is legal in a Unix filename");
+    assert_eq!(
+        properties(&batch.notes[0])["evidence"][0]["path"],
+        "src/a:b.rs"
+    );
+}
+
 #[test]
 fn repeated_lint_occurrences_get_distinct_order_independent_fingerprints() {
     let first = warning_record();

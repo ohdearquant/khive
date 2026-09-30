@@ -31,9 +31,10 @@ missing lint fields, ambiguous primary spans, and paths outside the repository a
 reported with the input line number. The caller must supply repo, branch, commit,
 and scope strings. On Unix, a literal backslash in a filename remains a backslash;
 on Windows, native backslash separators become `/`. A colon is a valid Unix
-filename character; an initial Windows absolute drive prefix such as `C:/`
-or `C:\foo` is refused on either host. A run without an explicit
-`source_run` uses the producer ID and commit, independent of observation date.
+filename character; on Windows, any colon in a span path is refused, including
+drive-relative paths and stream suffixes. An initial Windows absolute drive
+prefix such as `C:/` or `C:\foo` is refused on either host. A run without an
+explicit `source_run` uses the producer ID and commit, independent of observation date.
 
 Severity mapping is `error` → `high`, `warning` → `medium`, and
 `note`/`help`/`failure-note` → `info`; other levels are refused. The primary span
