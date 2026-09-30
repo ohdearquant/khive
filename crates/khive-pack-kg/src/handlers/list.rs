@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, MailboxView, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::Note;
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
@@ -22,6 +22,8 @@ use crate::KgPack;
 const ENTITY_LIST_CAP: u32 = 500;
 const NOTE_LIST_CAP: u32 = 200;
 const EVENT_LIST_CAP: u32 = 1000;
+const MESSAGE_FILTER_FIELDS: &[&str] =
+    &["thread_id", "direction", "from", "to", "read", "delivered"];
 
 fn validate_list_filter_scope(
     fields: &[String],
@@ -154,6 +156,7 @@ fn parse_after_cursor(raw: &str) -> Result<Option<uuid::Uuid>, RuntimeError> {
 async fn resolve_message_thread_filter(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    view: &MailboxView,
     raw: &str,
     primary_only: bool,
 ) -> Result<String, RuntimeError> {
@@ -194,7 +197,13 @@ async fn resolve_message_thread_filter(
     let rows = reader
         .query_all(SqlStatement {
             sql: sql!("message_threads_list").to_string(),
-            params: vec![SqlValue::Text(visible_json)],
+            params: vec![
+                SqlValue::Text(visible_json),
+                SqlValue::Text(view.actor_id.clone()),
+                SqlValue::Integer(i64::from(
+                    !view.delegated && token.actor().is_anonymous() && token.actor().id == "local",
+                )),
+            ],
             label: Some("list.resolve_message_thread_filter".to_string()),
         })
         .await
@@ -262,7 +271,15 @@ async fn resolve_message_thread_filter(
     )))
 }
 
-pub(super) fn note_matches_list_filters(note: &Note, params: &ListParams) -> bool {
+pub(super) fn note_matches_list_filters(
+    note: &Note,
+    params: &ListParams,
+    token: &NamespaceToken,
+    view: &MailboxView,
+) -> bool {
+    if !view.permits_message_note(token, note) {
+        return false;
+    }
     let properties = note.properties.as_ref();
     if let Some(wanted) = params.tags.as_deref().filter(|tags| !tags.is_empty()) {
         let stored = properties
@@ -379,6 +396,7 @@ impl KgPack {
         // become accepted on an unrelated substrate or note kind.
         let has_schedule_filters =
             params.get("status").is_some() || params.get("created_by_actor").is_some();
+        let original_params = params.clone();
         let mut p: ListParams = deser(params)?;
         if p.after.is_some() && p.offset.is_some() {
             return Err(RuntimeError::InvalidInput(
@@ -524,6 +542,27 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
+                let message_filters = supplied_fields
+                    .iter()
+                    .any(|field| MESSAGE_FILTER_FIELDS.contains(&field.as_str()));
+                let runtime = kind_filter
+                    .as_deref()
+                    .map(|kind| registry.kg_note_read_runtime_for_kind(&self.runtime, kind))
+                    .unwrap_or(&self.runtime);
+                let mailbox_view =
+                    runtime.authorize_mailbox_view(token, "list", None, &original_params)?;
+                if message_filters && kind_filter.as_deref() != Some("message") {
+                    let message_runtime =
+                        registry.kg_note_read_runtime_for_kind(&self.runtime, "message");
+                    if !message_runtime.shares_backend_storage_with(&self.runtime) {
+                        return Err(RuntimeError::Khive(khive_types::KhiveError::invalid_input(
+                            format!(
+                                "list: message filters require kind=\"message\" when messages are stored on backend {:?}",
+                                message_runtime.backend_id().as_str()
+                            ),
+                        )));
+                    }
+                }
                 if has_schedule_filters && kind_filter.as_deref() != Some("scheduled_event") {
                     return Err(RuntimeError::InvalidInput(format!(
                         "list: kind={:?} with note_kind={kind_filter:?}: status and created_by_actor filters require kind=scheduled_event or kind=note with note_kind=scheduled_event",
@@ -533,8 +572,9 @@ impl KgPack {
                 if let Some(raw_thread_id) = p.thread_id.clone() {
                     p.thread_id = Some(
                         resolve_message_thread_filter(
-                            &self.runtime,
+                            runtime,
                             token,
+                            &mailbox_view,
                             &raw_thread_id,
                             p.key_prefix.is_some(),
                         )
@@ -543,11 +583,18 @@ impl KgPack {
                 }
                 let requested = p.limit.unwrap_or(20);
                 let limit = effective_list_limit(requested, NOTE_LIST_CAP);
-                let filter = super::note_list::note_filter(&p, kind_filter.as_deref())?;
+                let mut filter = super::note_list::note_filter(&p, kind_filter.as_deref())?;
+                if matches!(kind_filter.as_deref(), None | Some("message")) {
+                    // The mailbox partition runs in the store, so the scan
+                    // window below holds only rows this caller may see and a
+                    // cursor taken from it can never name a hidden message.
+                    filter.mailbox = Some(mailbox_view.note_scope(token));
+                }
                 if p.key_prefix.is_some() {
                     return super::note_list::list_keyed_notes(
-                        &self.runtime,
+                        runtime,
                         token,
+                        &mailbox_view,
                         &p,
                         &filter,
                         requested,
@@ -555,13 +602,12 @@ impl KgPack {
                     )
                     .await;
                 }
-                let has_note_filter = p.tags.as_ref().is_some_and(|tags| !tags.is_empty())
-                    || p.thread_id.is_some()
-                    || p.direction.is_some()
-                    || p.from.is_some()
-                    || p.to.is_some()
-                    || p.read.is_some()
-                    || p.delivered.is_some();
+                // The mailbox partition is already in `filter`, so a list with no
+                // row-level filter keeps the store's own offset and cursor. The
+                // capped scan below would stop at MAX_SCAN_TOTAL and leave rows
+                // past it unreachable by offset.
+                let has_note_filter =
+                    p.tags.as_ref().is_some_and(|tags| !tags.is_empty()) || message_filters;
                 const PAGE_SIZE: u32 = 200;
                 const MAX_SCAN_TOTAL: u32 = 10_000;
 
@@ -579,8 +625,7 @@ impl KgPack {
                                 break collected.len() >= target;
                             }
                             let scan_limit = MAX_SCAN_TOTAL.saturating_sub(scanned).min(PAGE_SIZE);
-                            let (page, next_raw_after) = self
-                                .runtime
+                            let (page, next_raw_after) = runtime
                                 .list_notes_filtered_after(
                                     token,
                                     filter.clone(),
@@ -593,8 +638,10 @@ impl KgPack {
                             }
                             for note in page {
                                 scanned = scanned.saturating_add(1);
-                                last_scanned = Some(note.id);
-                                if note_matches_list_filters(&note, &p) {
+                                if mailbox_view.permits_message_note(token, &note) {
+                                    last_scanned = Some(note.id);
+                                }
+                                if note_matches_list_filters(&note, &p, token, &mailbox_view) {
                                     collected.push(note);
                                     if collected.len() >= target {
                                         break;
@@ -630,10 +677,12 @@ impl KgPack {
                             !has_more_match && raw_more && scanned >= MAX_SCAN_TOTAL,
                         )
                     } else {
-                        let (notes, next_after) = self
-                            .runtime
+                        let (mut notes, next_after) = runtime
                             .list_notes_filtered_after(token, filter.clone(), after, limit)
                             .await?;
+                        // The store applied the same partition; this only
+                        // omits a row if the two ever disagree.
+                        notes.retain(|note| mailbox_view.permits_message_note(token, note));
                         (notes, next_after, false)
                     };
 
@@ -683,8 +732,7 @@ impl KgPack {
                             scan_incomplete = true;
                             break;
                         }
-                        let page = self
-                            .runtime
+                        let page = runtime
                             .list_notes_filtered(token, filter.clone(), remaining_scan, db_offset)
                             .await?;
                         let fetched = page.len() as u32;
@@ -692,7 +740,7 @@ impl KgPack {
                             if note.deleted_at.is_some() {
                                 continue;
                             }
-                            if note_matches_list_filters(&note, &p) {
+                            if note_matches_list_filters(&note, &p, token, &mailbox_view) {
                                 collected.push(note);
                                 if collected.len() >= target_after_skip {
                                     break;
@@ -706,7 +754,7 @@ impl KgPack {
                     }
                     collected
                 } else {
-                    self.runtime
+                    runtime
                         .list_notes_filtered(token, filter.clone(), overfetch_limit(limit), offset)
                         .await?
                 };
@@ -742,7 +790,9 @@ impl KgPack {
                 } else {
                     notes
                         .iter()
-                        .filter(|n| n.deleted_at.is_none())
+                        .filter(|n| {
+                            n.deleted_at.is_none() && mailbox_view.permits_message_note(token, n)
+                        })
                         .take(limit as usize)
                         .map(|n| {
                             parse_note_content(
@@ -962,6 +1012,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn message_thread_scope_matches_a_routing_field_only_as_text() {
+        use khive_runtime::{KhiveRuntime, Namespace};
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let namespace = Namespace::parse("scope-one").expect("valid namespace");
+        let token = runtime.authorize(namespace).expect("authorized namespace");
+        for (thread, to_actor) in [
+            (
+                "aaaaaaaa-bbbb-4ccc-8ddd-000000000001",
+                serde_json::json!("x"),
+            ),
+            (
+                "aaaaaaaa-bbbb-4ccc-8ddd-000000000002",
+                serde_json::json!(["x"]),
+            ),
+        ] {
+            runtime
+                .create_note(
+                    &token,
+                    "message",
+                    None,
+                    "routed message",
+                    None,
+                    Some(serde_json::json!({
+                        "thread_id": thread,
+                        "direction": "inbound",
+                        "to_actor": to_actor,
+                    })),
+                    vec![],
+                )
+                .await
+                .expect("create message note");
+        }
+        // An array routing field renders as `["x"]` under json_extract; an
+        // actor id spelling that text must not be admitted to the thread.
+        for (actor, expected) in [
+            ("x", vec!["aaaaaaaa-bbbb-4ccc-8ddd-000000000001"]),
+            (r#"["x"]"#, vec![]),
+        ] {
+            let mut reader = runtime.sql().reader().await.expect("SQL reader");
+            let rows = reader
+                .query_all(SqlStatement {
+                    sql: sql!("message_threads_list").to_string(),
+                    params: vec![
+                        SqlValue::Text(r#"["scope-one"]"#.into()),
+                        SqlValue::Text(actor.into()),
+                        SqlValue::Integer(0),
+                    ],
+                    label: Some("test.message_threads_list".into()),
+                })
+                .await
+                .expect("message thread scope query");
+            let threads: Vec<String> = rows
+                .iter()
+                .map(|row| match row.get("thread_id") {
+                    Some(SqlValue::Text(thread)) => thread.clone(),
+                    other => panic!("thread_id column: {other:?}"),
+                })
+                .collect();
+            assert_eq!(threads, expected, "actor {actor}");
+        }
+    }
+
+    #[tokio::test]
     async fn message_thread_namespace_json_scope_handles_empty_single_and_past_bind_limit() {
         use khive_runtime::{KhiveRuntime, Namespace};
         use khive_storage::types::{SqlStatement, SqlValue};
@@ -999,7 +1114,11 @@ mod tests {
             let rows = reader
                 .query_all(SqlStatement {
                     sql: sql!("message_threads_list").to_string(),
-                    params: vec![SqlValue::Text(namespaces_json)],
+                    params: vec![
+                        SqlValue::Text(namespaces_json),
+                        SqlValue::Text("local".into()),
+                        SqlValue::Integer(1),
+                    ],
                     label: Some("test.message_threads_list".into()),
                 })
                 .await
