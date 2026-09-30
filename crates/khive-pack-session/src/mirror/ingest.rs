@@ -206,6 +206,58 @@ pub(crate) struct TrustedSource<'a> {
     pub(crate) directory_identities: &'a [String],
 }
 
+/// Prove the configured root through native directory handles before its
+/// identity can become the first probe's witness. Absolute paths start at `/`;
+/// relative paths start at the process's opened current directory. No pathname
+/// canonicalization may turn a linked component into an accepted root.
+#[cfg(unix)]
+fn open_source_root(root: &Path) -> std::io::Result<Vec<std::fs::File>> {
+    use std::ffi::{CString, OsStr};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+
+    let anchor = if root.is_absolute() { "/" } else { "." };
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut pinned_directories = vec![options.open(anchor)?];
+    for component in root.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => OsStr::new(".."),
+            Component::Normal(name) => name,
+            Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "mirror source root contains an unsupported path prefix",
+                ));
+            }
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mirror source root contains a NUL byte",
+            )
+        })?;
+        let parent = pinned_directories.last().expect("root anchor is retained");
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        pinned_directories.push(unsafe { std::fs::File::from_raw_fd(fd) });
+    }
+    Ok(pinned_directories)
+}
+
 #[cfg(unix)]
 pub(crate) fn open_source_file_beneath(
     root: &Path,
@@ -215,7 +267,6 @@ pub(crate) fn open_source_file_beneath(
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Component;
 
     let relative = path.strip_prefix(root).map_err(|_| {
@@ -232,18 +283,15 @@ pub(crate) fn open_source_file_beneath(
         ));
     }
 
-    let root_path = if root.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        root
-    };
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    let mut directory = options.open(root_path)?;
+    // Retain the configured root's ancestors and every subsequent directory
+    // until the leaf opens. Every child open uses the proved parent handle.
+    let mut pinned_directories = open_source_root(root)?;
     let mut directory_identities = Vec::new();
-    let root_identity = file_identity(&directory)?;
+    let root_identity = file_identity(
+        pinned_directories
+            .last()
+            .expect("configured root is retained"),
+    )?;
     if expected_directories.is_some_and(|expected| expected.first() != Some(&root_identity)) {
         return Err(std::io::Error::other(
             "mirror source root changed after its metadata probe",
@@ -274,6 +322,9 @@ pub(crate) fn open_source_file_beneath(
         } else {
             flags | libc::O_DIRECTORY
         };
+        let directory = pinned_directories
+            .last()
+            .expect("source parent is retained");
         let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
@@ -299,7 +350,7 @@ pub(crate) fn open_source_file_beneath(
             directory_identities.push(identity);
         }
         directory_depth += 1;
-        directory = opened;
+        pinned_directories.push(opened);
     }
     unreachable!("nonempty component iterator must return its final file")
 }
@@ -1907,9 +1958,10 @@ mod tests {
     #[test]
     fn scheduled_file_rejects_replaced_parent_symlink_at_probe_and_open() {
         let dir = TempDir::new().expect("tempdir");
-        let root = dir.path().join("root");
+        let fixture = std::fs::canonicalize(dir.path()).expect("fixture directory");
+        let root = fixture.join("root");
         let parent = root.join("staged");
-        let outside = dir.path().join("outside");
+        let outside = fixture.join("outside");
         std::fs::create_dir_all(&parent).expect("inside parent");
         std::fs::create_dir_all(&outside).expect("outside parent");
         let source = parent.join("source.jsonl");
@@ -1943,6 +1995,54 @@ mod tests {
             }),
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_keeps_absolute_relative_empty_and_parent_directory_semantics() {
+        let cwd = std::env::current_dir().expect("current directory");
+        let dir = TempDir::new_in(&cwd).expect("fixture beneath current directory");
+        let absolute_fixture = std::fs::canonicalize(dir.path()).expect("fixture directory");
+        let absolute_root = absolute_fixture.join("root");
+        std::fs::create_dir(&absolute_root).expect("source root");
+        let source = absolute_root.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("source fixture");
+        let identity = file_identity(&std::fs::File::open(&source).expect("source handle"))
+            .expect("source identity");
+        let relative_fixture = PathBuf::from(dir.path().file_name().expect("fixture name"));
+        let relative_root = relative_fixture.join("root");
+
+        for root in [
+            absolute_root.clone(),
+            relative_root.clone(),
+            relative_root.join("..").join("root"),
+        ] {
+            let path = root.join("source.jsonl");
+            let (file, directories) =
+                open_source_file_beneath(&root, &path, None).expect("configured root probe");
+            assert_eq!(file_identity(&file).expect("opened identity"), identity);
+            assert_eq!(directories.len(), 1, "root witness shape remains unchanged");
+            let (file, _) = open_source_file_beneath(&root, &path, Some(&directories))
+                .expect("checked source reopen");
+            assert_eq!(file_identity(&file).expect("reopened identity"), identity);
+        }
+
+        for root in [Path::new(""), Path::new(".")] {
+            let path = root.join(&relative_fixture).join("root/source.jsonl");
+            let (file, directories) =
+                open_source_file_beneath(root, &path, None).expect("current-directory root probe");
+            assert_eq!(file_identity(&file).expect("opened identity"), identity);
+            let (file, _) = open_source_file_beneath(root, &path, Some(&directories))
+                .expect("current-directory source reopen");
+            assert_eq!(file_identity(&file).expect("reopened identity"), identity);
+        }
+
+        let filesystem_root = open_source_root(Path::new("/")).expect("filesystem root");
+        assert_eq!(filesystem_root.len(), 1);
+        assert!(filesystem_root[0]
+            .metadata()
+            .expect("root metadata")
+            .is_dir());
     }
 
     #[cfg(windows)]

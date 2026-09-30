@@ -228,7 +228,7 @@ bounded discarded prefix mid-line. A file whose length has not grown past the cu
 skipped without being opened only while its stored file identity still matches and its length
 has not fallen below the cursor.
 
-**File replacement amendment (2026-09-28, #1761).** Each cursor advance stores a nullable
+Each cursor advance stores a nullable
 `file_identity` in the same row and transaction as its byte offset. The identity is stable
 across appends and changes when a new file replaces the path (device and inode on Unix; volume
 serial number and file id on Windows; file creation time only on targets with neither). A

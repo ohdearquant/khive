@@ -393,6 +393,114 @@ mod config_tests {
         assert!(super::ingest::open_source_file_beneath(root.path(), &export, None).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn initial_probe_refuses_a_linked_configured_root_ancestor() {
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let fixture = std::fs::canonicalize(temp.path()).expect("fixture anchor");
+        let inside = fixture.join("inside");
+        let root = inside.join("exports");
+        std::fs::create_dir_all(&root).expect("source root");
+        let export = root.join("conversations.json");
+        std::fs::write(&export, b"[]").expect("source fixture");
+        let (_, original_identity, _) =
+            super::probe_source_file(&root, &export).expect("ordinary initial probe");
+        let linked_ancestor = fixture.join("linked");
+        std::os::unix::fs::symlink(&inside, &linked_ancestor).expect("fixture ancestor link");
+        let linked_root = linked_ancestor.join("exports");
+        let linked_export = linked_root.join("conversations.json");
+
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(&linked_root, DirectoryKind::ChatGptExport, true);
+        assert!(discovery.files.contains_key(&linked_export));
+        assert!(
+            super::probe_source_file(&linked_root, &linked_export).is_err(),
+            "a linked ancestor must refuse before the initial root identity is admitted"
+        );
+        let (_, reopened_identity, _) =
+            super::probe_source_file(&root, &export).expect("ordinary root remains usable");
+        assert_eq!(reopened_identity, original_identity);
+        assert_eq!(std::fs::read(&export).expect("unchanged source"), b"[]");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_probe_refuses_a_root_ancestor_substituted_after_discovery() {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::TempDir::new().expect("fixture directory");
+        let fixture = std::fs::canonicalize(temp.path()).expect("fixture anchor");
+        let ancestor = fixture.join("configured");
+        let root = ancestor.join("exports");
+        let protected_ancestor = fixture.join("protected");
+        let protected_root = protected_ancestor.join("exports");
+        std::fs::create_dir_all(&root).expect("configured source root");
+        std::fs::create_dir_all(&protected_root).expect("protected fixture root");
+        let export = root.join("conversations.json");
+        let protected_export = protected_root.join("conversations.json");
+        std::fs::write(&export, b"[]").expect("configured fixture");
+        std::fs::write(&protected_export, b"[{}]").expect("protected fixture");
+        let protected_bytes = std::fs::read(&protected_export).expect("protected bytes before");
+        let protected_metadata =
+            std::fs::metadata(&protected_export).expect("protected metadata before");
+        let protected_identity = super::ingest::file_identity(
+            &std::fs::File::open(&protected_export).expect("protected fixture handle"),
+        )
+        .expect("protected identity before");
+
+        // Discovery is the pathname preflight. The first native probe has no
+        // directory witness yet, so the root chain must establish its safety.
+        let mut discovery = DiscoveryIndex::default();
+        discovery.add_directory_tree(&root, DirectoryKind::ChatGptExport, true);
+        let scheduled = discovery.schedule_files();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].path, export);
+
+        let barrier = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let swap_barrier = Arc::clone(&barrier);
+            let swap_ancestor = &ancestor;
+            let saved_ancestor = fixture.join("configured-original");
+            let swap_target = &protected_ancestor;
+            let swap = scope.spawn(move || -> std::io::Result<()> {
+                swap_barrier.wait();
+                std::fs::rename(swap_ancestor, saved_ancestor)?;
+                std::os::unix::fs::symlink(swap_target, swap_ancestor)
+            });
+            barrier.wait();
+            swap.join()
+                .expect("fixture substitution thread")
+                .expect("fixture substitution");
+            assert!(
+                super::probe_source_file(&root, &scheduled[0].path).is_err(),
+                "initial admission must refuse a root ancestor substituted after discovery"
+            );
+        });
+
+        let after = std::fs::metadata(&protected_export).expect("protected metadata after");
+        assert_eq!(
+            std::fs::read(&protected_export).expect("protected bytes after"),
+            protected_bytes
+        );
+        assert_eq!(after.len(), protected_metadata.len());
+        assert_eq!(
+            after.modified().expect("mtime after"),
+            protected_metadata.modified().expect("mtime before")
+        );
+        assert_eq!(
+            super::ingest::file_identity(
+                &std::fs::File::open(&protected_export).expect("protected fixture handle after"),
+            )
+            .expect("protected identity after"),
+            protected_identity
+        );
+        assert_eq!(
+            std::fs::read(fixture.join("configured-original/exports/conversations.json"))
+                .expect("configured source remains intact"),
+            b"[]"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn mirror_windows_junction_is_neither_discovered_nor_opened() {
@@ -1606,6 +1714,17 @@ fn trusted_root_for_file<'a>(
     })
 }
 
+fn probe_source_file(
+    root: &Path,
+    path: &Path,
+) -> io::Result<(std::fs::Metadata, String, Vec<String>)> {
+    ingest::open_source_file_beneath(root, path, None).and_then(|(file, directory_identities)| {
+        let metadata = file.metadata()?;
+        let identity = ingest::file_identity(&file)?;
+        Ok((metadata, identity, directory_identities))
+    })
+}
+
 /// Infinite background polling loop.  Returns only on a fatal setup error.
 ///
 /// Seed state from the `session_mirror_cursor` table and one initial discovery
@@ -1695,13 +1814,7 @@ pub async fn run_mirror_service(runtime: KhiveRuntime, config: MirrorConfig) {
                 continue;
             };
             let (metadata, observed_identity, directory_identities) =
-                match ingest::open_source_file_beneath(root, &scheduled_file.path, None).and_then(
-                    |(file, directory_identities)| {
-                        let metadata = file.metadata()?;
-                        let identity = ingest::file_identity(&file)?;
-                        Ok((metadata, identity, directory_identities))
-                    },
-                ) {
+                match probe_source_file(root, &scheduled_file.path) {
                     Ok(probe) => probe,
                     Err(e) => {
                         let missing = e.kind() == io::ErrorKind::NotFound;
