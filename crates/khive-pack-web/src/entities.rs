@@ -34,8 +34,8 @@ use uuid::Uuid;
 /// Refuse web writes that would reuse a differently attributed entity.
 ///
 /// Runtime by-ID reads remain namespace-agnostic under ADR-007 Rev 8. This
-/// is an interim web mutation safeguard while namespace-aware deterministic
-/// identity is pending; it does not change the UUID derivation or store policy.
+/// guards explicit IDs and insert races; deterministic web identities include
+/// the write namespace without changing the store policy.
 /// A refusal discloses only the requested ID, never the stored attribution.
 pub(crate) fn require_entity_namespace(
     token: &NamespaceToken,

@@ -20,7 +20,7 @@ async fn fixture() -> (KhiveRuntime, NamespaceToken, tempfile::TempDir) {
 fn document_id(url: &Url) -> Uuid {
     let canonical = crate::identity::canonicalize(url.clone());
     crate::identity::document_id(
-        crate::identity::site_id(&canonical),
+        crate::identity::site_id(&khive_types::Namespace::local(), &canonical),
         &crate::identity::path_and_query(&canonical),
     )
 }
@@ -44,7 +44,10 @@ async fn temporary_hops_do_not_mint_endpoints_or_patch_existing_source() {
                 .is_empty()
         );
         for url in [&from, &to] {
-            for id in [document_id(url), crate::identity::site_id(url)] {
+            for id in [
+                document_id(url),
+                crate::identity::site_id(&khive_types::Namespace::local(), url),
+            ] {
                 assert!(runtime
                     .entities(&token)
                     .unwrap()
@@ -146,7 +149,10 @@ async fn mixed_chain_only_materializes_permanent_endpoints_and_fetched_terminal(
     assert!(runtime
         .entities(&token)
         .unwrap()
-        .get_entity(crate::identity::site_id(&urls[0]))
+        .get_entity(crate::identity::site_id(
+            &khive_types::Namespace::local(),
+            &urls[0]
+        ))
         .await
         .unwrap()
         .is_none());
@@ -360,7 +366,10 @@ async fn transient_get_returns_exact_body_and_receipt_without_blob_storage() {
                 chrono::DateTime::parse_from_rfc3339(request["fetched_at"].as_str().unwrap())
                     .unwrap();
             assert!(fetched_at >= before && fetched_at <= after);
-            for id in [document_id(&url), crate::identity::site_id(&url)] {
+            for id in [
+                document_id(&url),
+                crate::identity::site_id(&khive_types::Namespace::local(), &url),
+            ] {
                 assert!(runtime
                     .entities(&token)
                     .unwrap()

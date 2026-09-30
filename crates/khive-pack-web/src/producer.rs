@@ -431,7 +431,7 @@ mod tests {
         );
 
         let canonical = crate::identity::canonicalize(url);
-        let site = crate::identity::site_id(&canonical);
+        let site = crate::identity::site_id(fetched_token.namespace(), &canonical);
         let id = crate::identity::document_id(site, &crate::identity::path_and_query(&canonical));
         let old_canonical = crate::identity::canonicalize(old_url);
         let old_id =
