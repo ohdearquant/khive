@@ -213,6 +213,48 @@ describe("KG Studio", () => {
     expect(document.querySelector(".edge-inspector")).toBeInTheDocument();
   });
 
+  it("deep-links an edge only when both endpoint nodes are loaded", () => {
+    const bundle = structuredClone(demoReviewFixture);
+    const edge = bundle.graph.edges.items[1];
+    window.history.replaceState(null, "", `/review?view=graph&edge=${edge.id}`);
+
+    render(<Studio initialBundle={bundle} />);
+
+    expect(new URL(window.location.href).searchParams.get("edge")).toBe(edge.id);
+    expect(document.querySelector(".edge-inspector")).toBeInTheDocument();
+  });
+
+  it.each(["source", "target"] as const)("falls back from a deep-linked edge whose %s node is not loaded", (end) => {
+    const bundle = structuredClone(demoReviewFixture);
+    const edge = bundle.graph.edges.items[1];
+    bundle.graph.nodes.items = bundle.graph.nodes.items.filter((node) => node.id !== edge[end]);
+    const fallbackNode = bundle.graph.nodes.items[0];
+    window.history.replaceState(null, "", `/review?view=graph&edge=${edge.id}`);
+
+    render(<Studio initialBundle={bundle} />);
+
+    const params = new URL(window.location.href).searchParams;
+    expect(params.get("edge")).toBeNull();
+    expect(params.get("node")).toBe(fallbackNode.id);
+    expect(document.querySelector(".edge-inspector")).not.toBeInTheDocument();
+    expect(document.querySelector(".node-inspector")).toHaveTextContent(fallbackNode.label);
+  });
+
+  it("uses the node parameter when the deep-linked edge has an unloaded endpoint", () => {
+    const bundle = structuredClone(demoReviewFixture);
+    const edge = bundle.graph.edges.items[1];
+    bundle.graph.nodes.items = bundle.graph.nodes.items.filter((node) => node.id !== edge.target);
+    const requested = bundle.graph.nodes.items[1];
+    window.history.replaceState(null, "", `/review?view=graph&edge=${edge.id}&node=${requested.id}`);
+
+    render(<Studio initialBundle={bundle} />);
+
+    const params = new URL(window.location.href).searchParams;
+    expect(params.get("edge")).toBeNull();
+    expect(params.get("node")).toBe(requested.id);
+    expect(document.querySelector(".node-inspector")).toHaveTextContent(requested.label);
+  });
+
   it("dispatches retrieval note kinds through the note legend", async () => {
     const user = userEvent.setup();
     const { container } = render(<Studio initialBundle={demoReviewFixture} />);

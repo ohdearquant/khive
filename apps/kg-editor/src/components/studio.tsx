@@ -115,7 +115,10 @@ function reviewLocationFromUrl(url: URL, input: ReviewInput): ReviewLocation {
   const edgeId = url.searchParams.get("edge");
   const nodeId = url.searchParams.get("node");
   if (input.review_kind === "pull_request") {
-    if (edgeId && input.graph.edges.items.some((edge) => edge.id === edgeId)) {
+    const loadedNodeIds = new Set(input.graph.nodes.items.map((node) => node.id));
+    if (edgeId && input.graph.edges.items.some((edge) => (
+      edge.id === edgeId && loadedNodeIds.has(edge.source) && loadedNodeIds.has(edge.target)
+    ))) {
       graphSelection = { type: "edge", id: edgeId };
     } else if (nodeId && input.graph.nodes.items.some((node) => node.id === nodeId)) {
       graphSelection = { type: "node", id: nodeId };
