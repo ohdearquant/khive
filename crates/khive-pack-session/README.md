@@ -1,6 +1,6 @@
 # khive-pack-session
 
-Session pack: registers the `session` note kind and five agent-facing verbs
+Session pack: registers the `session` note kind and seven agent-facing verbs
 for storing and retrieving agent-session records (transcripts or summaries)
 over the notes substrate (ADR-083).
 
@@ -21,6 +21,9 @@ over the notes substrate (ADR-083).
 - `session.search(query, limit?, since?, source?, cwd?)` — tenant-scoped mirror
   search. The public handler remains unavailable until transcript deletion and
   resume/export continuity support are available.
+- `session.stats()` — database-wide session mirror row and storage diagnostics.
+- `session.vacuum()` — explicit SQLite compaction, with before/after sizes when
+  the post-commit measurement remains available.
 
 ```text
 request(ops="session.store(content=\"...\", provider=\"codex\", provider_session_id=\"abc\")")

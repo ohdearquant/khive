@@ -326,7 +326,7 @@ is a **closed enum** — valid values: `overview` | `core_model` | `boundary_con
 `references` | `other`. Content must be **at least 80 characters**. Shorter content or an
 unrecognized `section_type` returns a validation error listing the valid values.
 
-### Session pack — 5 verbs (`session.` prefix)
+### Session pack — 7 verbs (`session.` prefix)
 
 | Verb             | What it does                                      | When to use                                                    |
 | ---------------- | ------------------------------------------------- | -------------------------------------------------------------- |
@@ -335,6 +335,8 @@ unrecognized `section_type` returns a validation error listing the valid values.
 | `session.resume` | Fetch one session's full content by UUID/prefix   | Continue or reference a specific session                       |
 | `session.export` | Serialize one session as JSON or markdown         | Share or archive a session outside khive                       |
 | `session.search` | Search scoped mirrored transcript text (gated)    | After transcript deletion and continuity support are available |
+| `session.stats`  | Database-wide session store rows and sizes        | Inspect mirror storage before maintenance                      |
+| `session.vacuum` | Compact the SQLite database                       | Reclaim pages after deletes                                    |
 
 Each `session.list` summary carries `full_id`, the canonical UUID to reuse with
 `session.resume` or `session.export`. Presentation mode does not remove it; the
@@ -527,7 +529,7 @@ annotates=[entity_id], ...)`.
 
 ---
 
-## The 17-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic)
+## The 19-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic; [ADR-191](docs/adr/ADR-191-web-pack-ontology-and-operations.md) `links_to`; [ADR-196](docs/adr/ADR-196-located-in-relation.md) `located_in`)
 
 When you `link` nodes, use ONLY these relations:
 
@@ -536,6 +538,8 @@ When you `link` nodes, use ONLY these relations:
 - `contains` — parent → child (system contains module)
 - `part_of` — inverse of contains
 - `instance_of` — specific is a case of general
+- `links_to` — a document references another document (document → document)
+- `located_in` — the source occupies, or is manifested in, the target without being a part of it (a finding in an organ); concept → concept
 
 ### Derivation
 
@@ -769,7 +773,7 @@ structural traces.
 | ------------------------------------------------- | -------------------------------------------------- |
 | Storing findings only as notes, never as entities | Notes are for context; entities are for structure  |
 | Creating duplicate entities                       | Always `search` first — link to existing if found  |
-| Using ad-hoc relations                            | Map to the closed 17-relation set or don't link    |
+| Using ad-hoc relations                            | Map to the closed 19-relation set or don't link    |
 | Reversed `introduced_by` direction                | concept → paper (the paper introduces the concept) |
 | One-hop neighbor queries when you need lineage    | Use `traverse` with `max_depth` for multi-hop      |
 | Adding `version`/`date` to entity names           | Those are properties, not names                    |

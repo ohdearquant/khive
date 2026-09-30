@@ -107,6 +107,9 @@ handler. Handlers MUST NOT inspect or branch on the mode.
 | Repeated field with `null` entries   | included                                            | empties filtered out                                                                                                                                    |
 | Score fields (see §Score truncation) | `0.1234567890`                                      | `0.123` (3-significant-digit truncation)                                                                                                                |
 
+**Timestamp row superseded:** [Amendment 9](#amendment-9-2026-09-29-exact-agent-timestamps)
+replaces the Agent form in the timestamp row above.
+
 **Drop semantics — lifecycle `null` preservation:** Drop `[]`, `{}`, and `""`.
 Do NOT drop `null` for fields whose absence carries lifecycle meaning. The
 following field names are preserved as `null` in Agent mode regardless of other
@@ -459,6 +462,9 @@ Two reasons:
 
 Verbose mode preserves absolute time for tooling that needs to compare
 timestamps across systems.
+
+Amendment 9 withdraws this rationale for Agent mode: Agent timestamps are exact, and list rows
+carry the relative form beside `created_at`.
 
 ### Why empty-field dropping (with lifecycle-null preservation)
 
@@ -1004,3 +1010,95 @@ measured at.
 - There is no tracking issue for the benchmark.
 - Transform changes made after the figures were written: #1995 and #2211 (Amendment 3), #2679
   (Amendment 5).
+
+## Amendment 9 (2026-09-29): exact Agent timestamps
+
+**Status: Accepted (2026-09-29).**
+**Related issue:** #1355.
+
+### Context
+
+The §3 timestamp row compacts every ISO-8601-shaped string outside a record's `properties` and the
+named exemptions (such as `trigger_at`, `due` and the Amendment 6 receipt paths) to a relative form
+(`"3m ago"`) when it is less than 24 hours old, and otherwise to its first 16 characters
+(`"2026-05-23T16:18"`). Both forms drop the offset and the seconds, so an Agent reader cannot
+compare two instants or hand one back to a verb. They also sit beside values the transform does not
+touch: a `comm.inbox` row renders `created_at` as `"29s ago"` while its `properties.sent_at` keeps
+`"2026-09-29T19:18:25.132811+00:00"`, so one row carries two dialects.
+
+The shape test also reaches strings that are not timestamps. Any string that begins
+`YYYY-MM-DDTHH:` and does not parse as a whole timestamp is cut to 16 characters, so a note or
+message body that begins with a date-time loses everything after its minute.
+
+### Decision
+
+**Exact form.** In Agent mode, a string that the §3 transform would compact is rendered as the same
+instant in UTC with a `Z` suffix: `YYYY-MM-DDTHH:MM:SS[.fraction]Z`. The fraction keeps the
+canonical value's digits exactly, neither padded nor truncated, and a canonical value without a
+fraction gains none. A canonical value with a non-zero offset is converted to UTC. The rule never
+writes the `+00:00` spelling.
+
+**Only whole timestamps.** The rule applies only to a string that parses in full as a date-time
+with an explicit offset (`Z`, `±HH:MM` or `±HHMM`). Any other string passes through byte-for-byte:
+free text that begins with a date-time, a date-time without an offset, and a malformed offset. The
+transform never supplies an offset the canonical value did not carry, and never shortens a string
+it cannot parse.
+
+**Relative form on list rows.** An object that is an immediate member of an array and carries a
+`created_at` string rendered by this rule also receives a sibling `created_at_relative`, computed
+against the response's single sampled `now` (§Implementation): `Ns ago` under one minute, `Nm ago`
+under one hour, `Nh ago` under one day, `Nd ago` otherwise, each `N` rounded down. No sibling is
+added when the instant is later than `now`, when `created_at` is not rendered by this rule, or when
+the object already has a `created_at_relative` key; the transform never overwrites a canonical
+field. A root result object, such as a single `get` record, receives no sibling. Other timestamp
+fields, `updated_at` included, receive the exact form and no relative sibling.
+
+### Unchanged
+
+- Verbose output, and Human at the runtime boundary, remain canonical. Canonical handler output is
+  not normalized: a producer that emits `+00:00` still does so under Verbose.
+- Values under a record's `properties`, the `trigger_at` and `due` payload timestamps, the
+  Amendment 6 receipt paths and opaque content protected by Amendment 7 keep their exact canonical
+  bytes, whatever their offset spelling. Byte-exact protection takes precedence over this rule, and
+  no object inside those values receives a relative sibling.
+- AlwaysVerbose verbs, whole-operation error envelopes, structural list and cursor envelopes, the
+  `$prev` chain (which sees canonical values) and ADR-078 format rendering keep their existing
+  rules. `format=table` and `format=auto` treat `created_at_relative` as an ordinary row field.
+
+The display-timezone setting, the renaming or unit documentation of raw-integer `*_us` fields,
+and normalization of canonical handler output stay open on #1355. They are not decided here.
+
+### Consequences
+
+- Agent responses heavy in timestamps grow: a compacted `"3m ago"` or 16-character value becomes an
+  exact value of at least 20 characters (27 with microseconds), and each list row gains one relative
+  field. Amendment 8 already withdrew the savings figures as a design constraint.
+- A value copied from Agent output can be passed back to a verb or compared with another system's
+  timestamp without a Verbose round trip.
+- Free text that begins with a date-time is no longer truncated.
+
+### Acceptance and mutation witnesses
+
+- **TS-EXACT:** at a fixed `now`, canonical inputs spelled with `Z`, `+00:00`, a non-zero offset and
+  the compact `±HHMM` offset, each with six, three and zero fractional digits, render in UTC with
+  `Z`. Parsing input and output yields the same instant, and the fraction digits are byte-identical.
+  Inputs both younger and older than 24 hours are covered.
+- **TS-PASSTHROUGH:** a body that begins with a date-time, a date-time without an offset, and a
+  malformed offset are returned byte-for-byte. Each case fails before this change.
+- **TS-PAIR:** at the transform, list rows in each unit band (seconds, minutes, hours, days) carry
+  the matching `created_at_relative`. Real Agent MCP calls to `comm.inbox`, a note `list` and
+  `memory.recall` return list rows whose `created_at` is exact and which carry the sibling. A single
+  `get` record, a row with a future `created_at`, and a row whose canonical form already carries
+  `created_at_relative` receive no added sibling, and the last keeps its own value.
+- **TS-UNCHANGED:** `properties` values, `trigger_at`, `due`, receipt paths, opt-in parsed content,
+  an AlwaysVerbose verb, Verbose mode, a whole-operation error and a `$prev` chain keep their
+  existing controls and outputs.
+- **TS-MUTATIONS:** each of the following must fail a named witness above: restoring minute
+  truncation or the relative-only form; emitting `+00:00`; padding or trimming the fraction;
+  assuming UTC for an offset-less value; shortening a string that does not parse; adding the
+  sibling to a root object or inside `properties`; overwriting an existing `created_at_relative`;
+  and adding a sibling for a future instant.
+
+The implementing change freezes its selectors, fixtures and individual mutants before it runs. A
+zero-test selection, a compile failure or a fixture that never reaches the presentation boundary is
+neither a baseline nor a mutation kill.

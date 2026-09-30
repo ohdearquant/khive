@@ -19,7 +19,9 @@ CREATE TABLE IF NOT EXISTS notes (
     updated_at   INTEGER NOT NULL,
     deleted_at   INTEGER,
     key          TEXT,
-    version      INTEGER NOT NULL DEFAULT 1
+    version      INTEGER NOT NULL DEFAULT 1,
+    strict_due_key BLOB,
+    due_source   TEXT
 );
 
 CREATE TRIGGER IF NOT EXISTS bump_note_version

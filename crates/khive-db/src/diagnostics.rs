@@ -1465,6 +1465,9 @@ pub struct DbDiagnostics {
     /// report's database file and reset only with the serving process.
     pub note_search_ann_route_total: u64,
     pub note_search_fallback_route_total: u64,
+    /// Pool-scoped, monotonic coordinator dispatch and note-candidate
+    /// hydration counts used by ADR-166 G4/G5. Reset on pool reconstruction.
+    pub search_mechanism: crate::pool::SearchMechanismSnapshot,
     /// `None` for an in-memory backend — the file-backed sections then carry
     /// their own unavailability reasons.
     pub db_path: Option<String>,
@@ -1733,6 +1736,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     let started = Instant::now();
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
+    let search_mechanism = pool.search_mechanism_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         &pool,
         Some(audit_append_failures),
@@ -1746,6 +1750,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
             process,
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
+            search_mechanism,
             db_path: None,
             wal_file: None,
             checkpoint_counters: counters,
@@ -1801,6 +1806,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         process,
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
+        search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
@@ -1857,6 +1863,7 @@ fn collect_inner(
     let process = ProcessIdentity::current(pool);
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
+    let search_mechanism = pool.search_mechanism_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         pool,
         audit_append_failures,
@@ -1869,6 +1876,7 @@ fn collect_inner(
             process,
             note_search_ann_route_total: 0,
             note_search_fallback_route_total: 0,
+            search_mechanism,
             db_path: None,
             wal_file: None,
             checkpoint_counters: counters,
@@ -1919,6 +1927,7 @@ fn collect_inner(
         process,
         note_search_ann_route_total: 0,
         note_search_fallback_route_total: 0,
+        search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
@@ -2752,6 +2761,30 @@ mod tests {
         assert!(
             probe.backfill_gap_frames() >= 0,
             "the one-row backfill gap clamps at 0: {probe:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_probe_reports_replaced_pool_file_instead_of_probing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, path) = seeded_pool(&dir);
+        let replacement = dir.path().join("replacement.db");
+        let replacement_conn = Connection::open(&replacement).expect("replacement database");
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .expect("initialize replacement database");
+        drop(replacement_conn);
+        std::fs::rename(&replacement, &path).expect("replace the pool's path");
+
+        let inspection = inspect_pool(&pool);
+        assert!(inspection.checkpoint_probe.is_none());
+        assert!(
+            inspection
+                .checkpoint_probe_error
+                .as_deref()
+                .is_some_and(|error| error.contains("file identity changed")),
+            "replacement must be reported as a probe failure"
         );
     }
 
