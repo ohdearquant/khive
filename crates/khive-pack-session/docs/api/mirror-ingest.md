@@ -35,6 +35,9 @@ Symlinked entries found while walking directories are ignored by discovery and
 refused at open on Unix. Scheduled files are probed and opened through
 no-follow directory components beneath their configured root; a parent that
 changes between probe and open is refused.
+On Windows, the root ancestors and each opened intermediate directory stay
+pinned without delete sharing until the final file opens, so a concurrent
+rename cannot move an opened directory outside the configured root mid-walk.
 A configured export root that is itself a symlink is refused once at discovery
 and is not scheduled for polling.
 An idempotent replay compares the stored content hash with the newly parsed

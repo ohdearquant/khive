@@ -324,7 +324,7 @@ mod windows_source_open {
         Ok(())
     }
 
-    fn open_root(root: &Path) -> io::Result<File> {
+    fn open_root(root: &Path) -> io::Result<Vec<File>> {
         let root = if root.as_os_str().is_empty() {
             Path::new(".")
         } else {
@@ -347,9 +347,10 @@ mod windows_source_open {
             verify_handle(&file, true)?;
             pinned.push(file);
         }
-        pinned
-            .pop()
-            .ok_or_else(|| invalid("mirror source root is empty"))
+        if pinned.is_empty() {
+            return Err(invalid("mirror source root is empty"));
+        }
+        Ok(pinned)
     }
 
     pub(super) fn open_file(path: &Path) -> io::Result<File> {
@@ -407,6 +408,11 @@ mod windows_source_open {
             FILE_DIRECTORY_FILE
         } | FILE_OPEN_REPARSE_POINT
             | FILE_SYNCHRONOUS_IO_NONALERT;
+        let share_mode = if last {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        };
         // SAFETY: the name buffer, structures, and pinned parent handle remain
         // live for the call. The successful child handle is owned by `File`.
         let status = unsafe {
@@ -417,7 +423,7 @@ mod windows_source_open {
                 &raw mut io_status,
                 std::ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                share_mode,
                 FILE_OPEN,
                 create_options,
                 std::ptr::null(),
@@ -451,8 +457,13 @@ mod windows_source_open {
             ));
         }
 
-        let mut directory = open_root(root)?;
-        let root_identity = file_identity(&directory.metadata()?);
+        let mut pinned_directories = open_root(root)?;
+        let root_identity = file_identity(
+            &pinned_directories
+                .last()
+                .ok_or_else(|| invalid("mirror source root is empty"))?
+                .metadata()?,
+        );
         if expected_directories.is_some_and(|expected| expected.first() != Some(&root_identity)) {
             return Err(io::Error::other(
                 "mirror source root changed after its metadata probe",
@@ -471,7 +482,13 @@ mod windows_source_open {
                 ));
             };
             let last = components.peek().is_none();
-            let opened = open_child(&directory, name, last)?;
+            let opened = open_child(
+                pinned_directories
+                    .last()
+                    .ok_or_else(|| invalid("mirror source root is empty"))?,
+                name,
+                last,
+            )?;
             if last {
                 if expected_directories.is_some_and(|expected| expected.len() != directory_depth) {
                     return Err(io::Error::other(
@@ -492,9 +509,48 @@ mod windows_source_open {
                 directory_identities.push(identity);
             }
             directory_depth += 1;
-            directory = opened;
+            pinned_directories.push(opened);
         }
         unreachable!("nonempty component iterator must return its final file")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::ffi::OsStr;
+
+        use super::{open_child, open_root};
+        use tempfile::TempDir;
+
+        #[test]
+        fn mirror_windows_pinned_intermediate_directory_cannot_leave_root() {
+            let temp = TempDir::new().expect("tempdir");
+            let root = temp.path().join("root");
+            let outside = temp.path().join("outside");
+            let parent = root.join("staged");
+            let moved = outside.join("staged");
+            std::fs::create_dir_all(&parent).expect("staged directory");
+            std::fs::create_dir_all(&outside).expect("outside directory");
+            std::fs::write(parent.join("source.jsonl"), b"inside\n").expect("source file");
+
+            std::fs::rename(&parent, &moved).expect("unheld directory can leave root");
+            std::fs::rename(&moved, &parent).expect("restore source directory");
+
+            let directories = open_root(&root).expect("pin root ancestors");
+            let directory = open_child(
+                directories.last().expect("root handle"),
+                OsStr::new("staged"),
+                false,
+            )
+            .expect("pin intermediate directory");
+            assert!(
+                std::fs::rename(&parent, &moved).is_err(),
+                "an opened intermediate directory must not leave its configured root"
+            );
+            assert!(open_child(&directory, OsStr::new("source.jsonl"), true).is_ok());
+
+            drop(directory);
+            std::fs::rename(&parent, &moved).expect("rename succeeds after releasing directory");
+        }
     }
 }
 

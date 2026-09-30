@@ -251,6 +251,8 @@ impl MirrorConfig {
 
 #[cfg(test)]
 mod config_tests {
+    #[cfg(windows)]
+    use super::{ingest, DirectoryFingerprint};
     use super::{parse_mirror_poll_secs, DirectoryKind, DiscoveredKind, DiscoveryIndex};
 
     /// Regression for PACKSESSION-AUD-002: `KHIVE_MIRROR_POLL_SECS=0` used to

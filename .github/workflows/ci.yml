@@ -1208,7 +1208,7 @@ jobs:
         shell: bash
         run: |
           cargo test -p khive-pack-session --lib mirror_windows_ 2>&1 | tee "$RUNNER_TEMP/mirror-windows.log"
-          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/mirror-windows.log" 3
+          ../scripts/assert-tests-ran.sh "$RUNNER_TEMP/mirror-windows.log" 4
 
   coverage-measurement:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Coverage measurement
