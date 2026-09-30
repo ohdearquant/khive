@@ -539,13 +539,15 @@ impl StorageBackend {
                 ))
             })?;
             let mut writer = self.pool.try_writer()?;
-            crate::migrations::run_migrations_with_database_gc_owner(writer.conn_mut(), &owner)
-                .map_err(|error| match self.pool.config().code_map_vfs.as_deref() {
-                    // A guarded journal or main open refused mid-migration
-                    // surfaces as SQLITE_CANTOPEN; name the refusal.
-                    Some(vfs) => crate::code_map_vfs::with_refusal(error, vfs),
-                    None => error,
-                })
+            let mut migrate = || {
+                crate::migrations::run_migrations_with_database_gc_owner(writer.conn_mut(), &owner)
+            };
+            match self.pool.config().code_map_vfs.as_deref() {
+                // A guarded journal or main open refused mid-migration
+                // surfaces as SQLITE_CANTOPEN; name the refusal.
+                Some(vfs) => crate::code_map_vfs::naming_refusal(vfs, migrate),
+                None => migrate(),
+            }
         }
     }
 

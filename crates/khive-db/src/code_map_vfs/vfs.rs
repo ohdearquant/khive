@@ -22,6 +22,9 @@ struct RollbackKey {
 #[derive(Default)]
 struct Registrations {
     rollback: HashMap<RollbackKey, RollbackEntry>,
+    // Every registration's guard by VFS name, transition guards included, so
+    // the caller that sees SQLITE_CANTOPEN can take the refusal behind it.
+    by_name: HashMap<String, Arc<CodeMapHandleGuard>>,
     total: usize,
 }
 
@@ -124,6 +127,9 @@ pub(super) fn register(guard: Arc<CodeMapHandleGuard>) -> Result<String, GuardEr
     }
     let registration = Box::leak(registration);
     registrations.total += 1;
+    registrations
+        .by_name
+        .insert(display_name.clone(), Arc::clone(&registration.guard));
     if let Some(key) = key {
         registrations.rollback.insert(
             key,
@@ -136,19 +142,18 @@ pub(super) fn register(guard: Arc<CodeMapHandleGuard>) -> Result<String, GuardEr
     Ok(display_name)
 }
 
-#[cfg(any(test, feature = "test-support"))]
 /// Take the refusal the guard registered as `name` last recorded, if any.
 pub(super) fn take_refusal(name: &str) -> Option<String> {
     let guard = registrations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .rollback
-        .values()
-        .find(|entry| entry.name == name)
-        .map(|entry| Arc::clone(&entry.guard))?;
+        .by_name
+        .get(name)
+        .map(Arc::clone)?;
     guard.take_refusal()
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn registration_count() -> usize {
     registrations()
         .lock()
@@ -245,18 +250,28 @@ unsafe extern "C" fn open(
         role_from_flags(flags),
         open_access(flags),
     ) else {
+        registration.guard.record_refusal(format!(
+            "code-map VFS refused an open of {} with flags {flags:#x}: no guarded role admits it",
+            path.display()
+        ));
         return ffi::SQLITE_CANTOPEN;
     };
     if path_role != flag_role
         || path_role == Role::Shm
         || (path_role == Role::Main && flags & ffi::SQLITE_OPEN_DELETEONCLOSE != 0)
     {
+        registration.guard.record_refusal(format!(
+            "code-map VFS refused the {path_role:?} open of {} with flags {flags:#x}",
+            path.display()
+        ));
         return ffi::SQLITE_CANTOPEN;
     }
     let handle = match registration.guard.open(path_role, access) {
         Ok(handle) => handle,
         Err(error) => {
-            registration.guard.record_refusal(path_role, &error);
+            registration.guard.record_refusal(format!(
+                "code-map VFS refused the {path_role:?} open: {error}"
+            ));
             return ffi::SQLITE_CANTOPEN;
         }
     };

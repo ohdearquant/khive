@@ -264,14 +264,26 @@ pub(crate) fn register_rollback(
 
 pub(crate) use transition::prepare_rollback_target;
 
+/// Run `operation` on a connection of the code-map VFS `vfs_name` and name the
+/// guard refusal behind a `SQLITE_CANTOPEN` it fails with. A refusal recorded
+/// before the operation started is discarded first, so the reason appended is
+/// one the guard recorded while the operation ran. Other connections of the
+/// same VFS record into the same slot; the pool admits one writer, so during a
+/// connection open or a core-schema migration only a concurrent reader open
+/// can interleave.
+pub(crate) fn naming_refusal<T>(
+    vfs_name: &str,
+    operation: impl FnOnce() -> Result<T, crate::error::SqliteError>,
+) -> Result<T, crate::error::SqliteError> {
+    let _earlier = vfs::take_refusal(vfs_name);
+    operation().map_err(|error| with_refusal(error, vfs_name))
+}
+
 /// Append the guard refusal last recorded for `vfs_name` to an error SQLite
 /// reported for it, keeping the error's variant and code. Only an open that
 /// SQLite reports as `SQLITE_CANTOPEN`, directly or inside a failed migration,
 /// takes the refusal; any other error is returned unchanged and leaves it.
-pub(crate) fn with_refusal(
-    error: crate::error::SqliteError,
-    vfs_name: &str,
-) -> crate::error::SqliteError {
+fn with_refusal(error: crate::error::SqliteError, vfs_name: &str) -> crate::error::SqliteError {
     use crate::error::SqliteError;
     match error {
         SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, message))
@@ -296,12 +308,11 @@ pub(crate) fn with_refusal(
 }
 
 impl CodeMapHandleGuard {
-    fn record_refusal(&self, role: Role, error: &GuardError) {
+    fn record_refusal(&self, reason: String) {
         *self
             .last_refusal
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(format!("code-map VFS refused the {role:?} open: {error}"));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
     }
 
     fn take_refusal(&self) -> Option<String> {

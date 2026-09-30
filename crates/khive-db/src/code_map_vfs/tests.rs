@@ -625,7 +625,11 @@ fn migration_failure_names_a_recorded_refusal_once() {
     seed_rollback(&target);
     let guard = Arc::new(CodeMapHandleGuard::new(target, Mode::Rollback, vec![]).unwrap());
     let name = vfs::register(Arc::clone(&guard)).unwrap();
-    guard.record_refusal(Role::Journal, &GuardError::ProtectedChanged);
+    guard.record_refusal(format!(
+        "code-map VFS refused the {:?} open: {}",
+        Role::Journal,
+        GuardError::ProtectedChanged
+    ));
     let unrelated = super::with_refusal(SqliteError::InvalidData("unrelated".into()), &name);
     assert!(
         matches!(&unrelated, SqliteError::InvalidData(message) if message == "unrelated"),
@@ -643,5 +647,61 @@ fn migration_failure_names_a_recorded_refusal_once() {
     assert_eq!(
         super::with_refusal(failed(), &name).to_string(),
         "migration v5 failed: unable to open database file"
+    );
+}
+
+fn cannot_open() -> SqliteError {
+    SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some("unable to open database file".into()),
+    ))
+}
+
+#[test]
+fn transition_guard_refusal_is_taken_by_its_vfs_name() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let target = dir.path().join("prior-wal.db");
+    let seed = Connection::open(&target).unwrap();
+    let mode: String = seed
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "wal");
+    drop(seed);
+    let guard = Arc::new(
+        CodeMapHandleGuard::new(target, Mode::QuiescentWalTransition, vec![])
+            .expect("attest original WAL target"),
+    );
+    let name = vfs::register(Arc::clone(&guard)).unwrap();
+    guard.record_refusal("transition refusal".into());
+    assert_eq!(
+        vfs::take_refusal(&name).as_deref(),
+        Some("transition refusal")
+    );
+}
+
+#[test]
+fn only_a_refusal_recorded_during_the_operation_is_named() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let target = dir.path().join("code-map.db");
+    seed_rollback(&target);
+    let guard = Arc::new(CodeMapHandleGuard::new(target, Mode::Rollback, vec![]).unwrap());
+    let name = vfs::register(Arc::clone(&guard)).unwrap();
+    guard.record_refusal("earlier refusal".into());
+    let error = super::naming_refusal::<()>(&name, || Err(cannot_open())).unwrap_err();
+    assert_eq!(error.to_string(), cannot_open().to_string());
+    let error = super::naming_refusal::<()>(&name, || {
+        guard.record_refusal("refusal during the open".into());
+        Err(cannot_open())
+    })
+    .unwrap_err();
+    assert!(
+        error.to_string().ends_with("; refusal during the open"),
+        "{error}"
     );
 }
