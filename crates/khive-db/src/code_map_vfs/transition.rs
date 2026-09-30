@@ -87,6 +87,30 @@ fn sqlite_is_busy(error: &rusqlite::Error) -> bool {
     )
 }
 
+/// Open `target` through the guarded VFS `vfs_name`, classifying a failure with
+/// `classify`. The VFS answers a refused open with `SQLITE_CANTOPEN` only, so
+/// the reason the guard recorded during this open is appended to the error; a
+/// reason left from an earlier open of the same registration is discarded.
+pub(super) fn open_guarded(
+    target: &Path,
+    flags: OpenFlags,
+    vfs_name: &str,
+    stage: &'static str,
+    classify: fn(&'static str, rusqlite::Error) -> TransitionError,
+) -> Result<Connection, TransitionError> {
+    let _earlier = vfs::take_refusal(vfs_name);
+    Connection::open_with_flags_and_vfs(target, flags, vfs_name).map_err(|error| {
+        let mut error = classify(stage, error);
+        if let Some(refusal) = vfs::take_refusal(vfs_name) {
+            let (TransitionError::Incomplete { reason, .. }
+            | TransitionError::Partial { reason, .. }) = &mut error;
+            reason.push_str("; ");
+            reason.push_str(&refusal);
+        }
+        error
+    })
+}
+
 fn incomplete_sql(stage: &'static str, error: rusqlite::Error) -> TransitionError {
     if sqlite_is_busy(&error) {
         incomplete_busy(stage, error)
@@ -224,8 +248,13 @@ pub(crate) fn prepare_rollback_target(
         .map_err(|error| incomplete("VFS registration", error))?;
     let shm_before = callbacks::shm_violation_count();
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags_and_vfs(&target, flags, transition_vfs.as_str())
-        .map_err(|error| incomplete_sql("guarded WAL open", error))?;
+    let conn = open_guarded(
+        &target,
+        flags,
+        transition_vfs.as_str(),
+        "guarded WAL open",
+        incomplete_sql,
+    )?;
     conn.busy_timeout(Duration::ZERO)
         .map_err(|error| incomplete_sql("zero busy timeout", error))?;
 
@@ -336,8 +365,13 @@ pub(crate) fn prepare_rollback_target(
     );
     let rollback_vfs = vfs::register(Arc::clone(&rollback_guard))
         .map_err(|error| partial("rollback VFS registration", error))?;
-    let reopened = Connection::open_with_flags_and_vfs(&target, flags, rollback_vfs.as_str())
-        .map_err(|error| partial("guarded rollback reopen", error))?;
+    let reopened = open_guarded(
+        &target,
+        flags,
+        rollback_vfs.as_str(),
+        "guarded rollback reopen",
+        partial,
+    )?;
     let final_mode: String = reopened
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .map_err(|error| partial("rollback mode proof", error))?;

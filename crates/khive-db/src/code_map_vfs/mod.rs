@@ -264,13 +264,18 @@ pub(crate) fn register_rollback(
 
 pub(crate) use transition::prepare_rollback_target;
 
+/// SQLite's message for `SQLITE_CANTOPEN`, which a migration keeps when it
+/// renders a failed statement's error as text.
+const CANTOPEN_MESSAGE: &str = "unable to open database file";
+
 /// Run `operation` on a connection of the code-map VFS `vfs_name` and name the
 /// guard refusal behind a `SQLITE_CANTOPEN` it fails with. A refusal recorded
 /// before the operation started is discarded first, so the reason appended is
 /// one the guard recorded while the operation ran. Other connections of the
-/// same VFS record into the same slot; the pool admits one writer, so during a
-/// connection open or a core-schema migration only a concurrent reader open
-/// can interleave.
+/// same VFS record into, and take from, the same slot; the pool admits one
+/// writer, so during a connection open or a core-schema migration only a
+/// concurrent reader open can interleave, and it can supply or consume that
+/// reason.
 pub(crate) fn naming_refusal<T>(
     vfs_name: &str,
     operation: impl FnOnce() -> Result<T, crate::error::SqliteError>,
@@ -296,13 +301,17 @@ fn with_refusal(error: crate::error::SqliteError, vfs_name: &str) -> crate::erro
             };
             SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, message))
         }
-        SqliteError::Migration { version, error } => match vfs::take_refusal(vfs_name) {
-            Some(reason) => SqliteError::Migration {
-                version,
-                error: format!("{error}; {reason}"),
-            },
-            None => SqliteError::Migration { version, error },
-        },
+        // A migration renders its failure as text; only an open failure can
+        // have a guard refusal behind it.
+        SqliteError::Migration { version, error } if error.contains(CANTOPEN_MESSAGE) => {
+            match vfs::take_refusal(vfs_name) {
+                Some(reason) => SqliteError::Migration {
+                    version,
+                    error: format!("{error}; {reason}"),
+                },
+                None => SqliteError::Migration { version, error },
+            }
+        }
         other => other,
     }
 }

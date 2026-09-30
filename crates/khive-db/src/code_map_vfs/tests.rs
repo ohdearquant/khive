@@ -705,3 +705,120 @@ fn only_a_refusal_recorded_during_the_operation_is_named() {
         "{error}"
     );
 }
+
+#[test]
+fn migration_failure_for_another_cause_leaves_the_refusal() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let target = dir.path().join("code-map.db");
+    seed_rollback(&target);
+    let guard = Arc::new(CodeMapHandleGuard::new(target, Mode::Rollback, vec![]).unwrap());
+    let name = vfs::register(Arc::clone(&guard)).unwrap();
+    guard.record_refusal("unrelated refusal".into());
+    let failed = SqliteError::Migration {
+        version: 5,
+        error: "near \"x\": syntax error".into(),
+    };
+    assert_eq!(
+        super::with_refusal(failed, &name).to_string(),
+        "migration v5 failed: near \"x\": syntax error"
+    );
+    assert_eq!(
+        vfs::take_refusal(&name).as_deref(),
+        Some("unrelated refusal")
+    );
+}
+
+#[test]
+fn cantopen_message_is_what_sqlite_reports() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let error = Connection::open_with_flags(
+        dir.path().join("missing-dir").join("map.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&error, rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::CannotOpen),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains(super::CANTOPEN_MESSAGE),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_guarded_transition_open_names_the_guard_reason() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let production = dir.path().join("production.db");
+    let target = dir.path().join("code-map.db");
+    seed_rollback(&production);
+    std::fs::copy(&production, &target).unwrap();
+    let guard = Arc::new(
+        CodeMapHandleGuard::new(target.clone(), Mode::Rollback, vec![main_base(&production)])
+            .unwrap(),
+    );
+    let name = vfs::register(guard).unwrap();
+    let swap_target = target.clone();
+    let swap_production = production.clone();
+    super::set_before_os_open(move || {
+        std::fs::remove_file(&swap_target).unwrap();
+        std::os::unix::fs::symlink(&swap_production, &swap_target).unwrap();
+    });
+    let Err(error) = super::transition::open_guarded(
+        &target,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        &name,
+        "guarded WAL open",
+        |stage, error| super::transition::TransitionError::Incomplete {
+            stage,
+            reason: error.to_string(),
+            busy: false,
+        },
+    ) else {
+        panic!("a main swapped for a symlink must refuse the guarded open");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("code-map VFS refused the Main open: code-map VFS cannot prove"),
+        "{error}"
+    );
+}
+
+#[test]
+fn guarded_transition_open_does_not_report_an_earlier_refusal() {
+    if run_in_child() {
+        return;
+    }
+    let dir = fixture();
+    let target = dir.path().join("code-map.db");
+    seed_rollback(&target);
+    let guard = Arc::new(CodeMapHandleGuard::new(target.clone(), Mode::Rollback, vec![]).unwrap());
+    let name = vfs::register(Arc::clone(&guard)).unwrap();
+    guard.record_refusal("earlier refusal".into());
+    // No access flag: SQLite rejects the call before it reaches the VFS.
+    let Err(error) = super::transition::open_guarded(
+        &target,
+        rusqlite::OpenFlags::empty(),
+        &name,
+        "guarded rollback reopen",
+        |stage, error| super::transition::TransitionError::Partial {
+            stage,
+            reason: error.to_string(),
+        },
+    ) else {
+        panic!("an open without an access flag must fail");
+    };
+    assert!(!error.to_string().contains("earlier refusal"), "{error}");
+}
