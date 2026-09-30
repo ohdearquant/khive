@@ -2,7 +2,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import { ReviewThreadSurface } from "@/components/review-thread-surface";
+import { ReviewThreadSurface, VALUE_TOO_DEEP } from "@/components/review-thread-surface";
 import { demoReviewFixture } from "@/lib/fixtures/demo-review";
 import type { ReviewReport } from "@/lib/review-bundle";
 import { buildReviewThreadModel, reviewUnitKey, type ReviewAnnotation } from "@/lib/review-thread";
@@ -112,6 +112,45 @@ describe("review list and thread surface", () => {
     expect(diff("aliases").querySelector("pre.after")).toHaveTextContent(/"first-alias",\s*"second-alias"/);
     expect(diff("retired_field").querySelector("pre.before")).toHaveTextContent("legacy value");
     expect(diff("retired_field").querySelector("pre.after")).toBeNull();
+  });
+
+  it("renders an imported value nested past the stringify recursion limit without throwing", async () => {
+    const deep: Record<string, unknown> = {};
+    let cursor = deep;
+    for (let level = 0; level < 8000; level += 1) {
+      const next: Record<string, unknown> = {};
+      cursor.nested = next;
+      cursor = next;
+    }
+    expect(() => JSON.stringify(deep, null, 2)).toThrow(RangeError);
+    const changeId = "e8400000-0000-4000-8000-000000000031";
+    const input = {
+      ...demoReviewFixture,
+      change_set: {
+        ...demoReviewFixture.change_set,
+        operations: demoReviewFixture.change_set.operations.map((operation) =>
+          operation.id === changeId ? { ...operation, before: deep } : operation,
+        ),
+      },
+      changes: {
+        ...demoReviewFixture.changes,
+        items: demoReviewFixture.changes.items.map((item) =>
+          item.id === changeId ? { ...item, fields: [{ path: "weight", before: deep, after: 0.62 }] } : item,
+        ),
+      },
+    };
+    const key = reviewUnitKey("edge", changeId);
+    const { container } = render(
+      <ReviewThreadSurface input={input} selectedUnitKey={key} onSelectUnit={vi.fn()} annotations={[]} />,
+    );
+    const thread = container.querySelector<HTMLElement>("[data-review-thread]")!;
+    const values = thread.querySelector<HTMLElement>(".review-thread-record-values")!;
+    await userEvent.click(within(values).getByText("Record values"));
+    expect(within(values).getByText("Before").parentElement!.querySelector("pre")).toHaveTextContent(VALUE_TOO_DEEP);
+    expect(within(values).getByText("After").parentElement!.querySelector("pre")).toHaveTextContent('"weight": 0.62');
+    const weight = thread.querySelector<HTMLElement>('[data-review-thread-fields] .field-diff[data-field-path="weight"]')!;
+    expect(weight.querySelector("pre.before")).toHaveTextContent(VALUE_TOO_DEEP);
+    expect(weight.querySelector("pre.after")).toHaveTextContent("0.62");
   });
 
   it("shows both the operation events and the semantic field diff for a unit that carries both", () => {

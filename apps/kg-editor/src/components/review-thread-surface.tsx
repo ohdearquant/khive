@@ -174,8 +174,8 @@ function ThreadEvent({ event }: { event: ReviewThreadEvent }) {
         {event.kind === "operation" && (event.operation.before || event.operation.after) && (
           <details className="review-thread-record-values">
             <summary>Record values</summary>
-            {event.operation.before && <div><strong>Before</strong><pre>{JSON.stringify(event.operation.before, null, 2)}</pre></div>}
-            {event.operation.after && <div><strong>After</strong><pre>{JSON.stringify(event.operation.after, null, 2)}</pre></div>}
+            {event.operation.before && <div><strong>Before</strong><pre>{formatValue(event.operation.before)}</pre></div>}
+            {event.operation.after && <div><strong>After</strong><pre>{formatValue(event.operation.after)}</pre></div>}
           </details>
         )}
       </div>
@@ -185,10 +185,18 @@ function ThreadEvent({ event }: { event: ReviewThreadEvent }) {
 
 type UnitField = NonNullable<ReviewThreadUnit["change"]>["fields"][number];
 
+export const VALUE_TOO_DEEP = "Value is nested too deeply to display.";
+
 function formatValue(value: unknown): string {
   if (typeof value === "string") return value;
   if (value === undefined) return "—";
-  return JSON.stringify(value, null, 2);
+  // Imported values are schema-checked only as unknown records, so their depth
+  // is unbounded; indented stringify recurses and throws past the engine limit.
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return VALUE_TOO_DEEP;
+  }
 }
 
 function FieldDiff({ field }: { field: UnitField }) {
