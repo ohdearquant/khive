@@ -259,7 +259,22 @@ fn macro_strings(tokens: TokenStream, strings: &mut Vec<String>) {
     }
 }
 
-type SqlBindings = BTreeMap<String, Option<String>>;
+/// What a name in scope denotes, as far as the census needs to know.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Binding {
+    /// A pattern binding (argument, `let`, closure input). It shadows a value
+    /// name but never the leading segment of a path, which Rust resolves in
+    /// the module namespace.
+    Local,
+    /// An import that is neither a note SQL constant nor a scanned module.
+    Other,
+    /// A note properties SQL constant, by its declared name.
+    Constant(String),
+    /// A scanned module, so a path through this name resolves inside it.
+    Module(ModuleId),
+}
+
+type SqlBindings = BTreeMap<String, Binding>;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ModuleId {
@@ -268,6 +283,10 @@ struct ModuleId {
 }
 
 type ModuleBindings = BTreeMap<ModuleId, SqlBindings>;
+
+/// Name that a `use` tree records for a glob import. It is not an identifier,
+/// so it cannot collide with an imported name.
+const GLOB_IMPORT: &str = "*";
 
 fn use_tree_imports(
     tree: &UseTree,
@@ -285,6 +304,15 @@ fn use_tree_imports(
                 use_tree_imports(item, prefix, imports);
             }
         }
+        // `{self}` and `{self as alias}` import the module the prefix names.
+        UseTree::Name(name) if name.ident == "self" => {
+            if let Some(module) = prefix.last() {
+                imports.push((module.clone(), prefix.clone()));
+            }
+        }
+        UseTree::Rename(rename) if rename.ident == "self" => {
+            imports.push((rename.rename.to_string(), prefix.clone()));
+        }
         UseTree::Name(name) => {
             let name = name.ident.to_string();
             let mut path = prefix.clone();
@@ -296,7 +324,15 @@ fn use_tree_imports(
             path.push(rename.ident.to_string());
             imports.push((rename.rename.to_string(), path));
         }
-        UseTree::Glob(_) => {}
+        UseTree::Glob(_) => imports.push((GLOB_IMPORT.to_owned(), prefix.clone())),
+    }
+}
+
+/// A binding the census follows: a note SQL constant or a scanned module.
+fn resolved(binding: Option<&Binding>) -> Option<Binding> {
+    match binding {
+        Some(binding @ (Binding::Constant(_) | Binding::Module(_))) => Some(binding.clone()),
+        _ => None,
     }
 }
 
@@ -307,12 +343,12 @@ fn import_target(
     current_module: Option<&SqlBindings>,
     module_id: &ModuleId,
     modules: &ModuleBindings,
-) -> Option<String> {
+) -> Option<Binding> {
     let (original, prefix) = path.split_last()?;
     if NOTE_PROPERTY_SQL_CONSTANTS.contains(&original.as_str()) {
-        return Some(original.clone());
+        return Some(Binding::Constant(original.clone()));
     }
-    let lookup = |scope: &SqlBindings| scope.get(original).cloned().flatten();
+    let lookup = |scope: &SqlBindings| resolved(scope.get(original));
     match prefix {
         [] => lookup(known).or_else(|| current_module.and_then(&lookup)),
         [qualifier] if qualifier.as_str() == "self" => {
@@ -328,25 +364,77 @@ fn import_target(
             .checked_sub(prefix.len())
             .and_then(|index| parents.get(index))
             .and_then(&lookup),
-        _ => qualified_target(path, module_id, modules),
+        _ => None,
+    }
+    .or_else(|| {
+        qualified_target(path, module_id, modules, &|first| {
+            import_scope_module(first, known, current_module)
+        })
+    })
+}
+
+/// The module that a leading path segment names through the imports in
+/// scope. The nearest scope that binds the name decides, as in Rust.
+fn import_scope_module(
+    first: &str,
+    known: &SqlBindings,
+    current_module: Option<&SqlBindings>,
+) -> Option<ModuleId> {
+    match std::iter::once(known)
+        .chain(current_module)
+        .find_map(|scope| scope.get(first))
+    {
+        Some(Binding::Module(module)) => Some(module.clone()),
+        _ => None,
     }
 }
 
-fn qualified_target(
-    path: &[String],
+fn child_module(parent: &ModuleId, name: &str, modules: &ModuleBindings) -> Option<ModuleId> {
+    let mut child = parent.clone();
+    child.segments.push(name.to_owned());
+    modules.contains_key(&child).then_some(child)
+}
+
+/// The library root of the workspace crate that an extern path names. Paths
+/// spell the crate directory `khive-db` as `khive_db`.
+fn crate_root(name: &str, modules: &ModuleBindings) -> Option<ModuleId> {
+    modules
+        .keys()
+        .find(|module| {
+            module.segments.is_empty()
+                && module.root.strip_suffix("/src/lib.rs").is_some_and(|dir| {
+                    dir.len() == name.len()
+                        && dir
+                            .bytes()
+                            .zip(name.bytes())
+                            .all(|(dir, name)| dir == name || (dir == b'-' && name == b'_'))
+                })
+        })
+        .cloned()
+}
+
+/// The scanned module a path prefix names, or `None` when the prefix leaves
+/// the scanned sources. A leading plain name resolves as Rust resolves it:
+/// through an import in scope, then a child module, then a workspace crate.
+/// Each later segment follows a child module or a re-exported module alias.
+fn resolve_module(
+    prefix: &[String],
     current: &ModuleId,
     modules: &ModuleBindings,
-) -> Option<String> {
-    let (name, prefix) = path.split_last()?;
-    let (mut module, consumed) = match prefix.first()?.as_str() {
+    in_scope: &dyn Fn(&str) -> Option<ModuleId>,
+) -> Option<ModuleId> {
+    let Some((first, rest)) = prefix.split_first() else {
+        return Some(current.clone());
+    };
+    let (mut module, rest) = match first.as_str() {
         "crate" => (
             ModuleId {
                 root: current.root.clone(),
                 segments: Vec::new(),
             },
-            1,
+            rest,
         ),
-        "self" => (current.clone(), 1),
+        "self" => (current.clone(), rest),
         "super" => {
             let depth = prefix
                 .iter()
@@ -355,17 +443,66 @@ fn qualified_target(
             let keep = current.segments.len().checked_sub(depth)?;
             let mut parent = current.clone();
             parent.segments.truncate(keep);
-            (parent, depth)
+            (parent, &prefix[depth..])
         }
-        _ => return None,
+        name => (
+            in_scope(name)
+                .or_else(|| child_module(current, name, modules))
+                .or_else(|| crate_root(name, modules))?,
+            rest,
+        ),
     };
-    for part in &prefix[consumed..] {
+    for part in rest {
         if matches!(part.as_str(), "crate" | "self" | "super") {
             return None;
         }
-        module.segments.push(part.clone());
+        module = match modules.get(&module).and_then(|bindings| bindings.get(part)) {
+            Some(Binding::Module(target)) => target.clone(),
+            _ => child_module(&module, part, modules)?,
+        };
     }
-    modules.get(&module)?.get(name).cloned().flatten()
+    Some(module)
+}
+
+fn qualified_target(
+    path: &[String],
+    current: &ModuleId,
+    modules: &ModuleBindings,
+    in_scope: &dyn Fn(&str) -> Option<ModuleId>,
+) -> Option<Binding> {
+    let (name, prefix) = path.split_last()?;
+    let module = resolve_module(prefix, current, modules, in_scope)?;
+    resolved(modules.get(&module).and_then(|bindings| bindings.get(name)))
+        .or_else(|| child_module(&module, name, modules).map(Binding::Module))
+}
+
+/// The names a glob import of `module` brings: its resolved imports, glob
+/// imports included, and its child modules.
+fn glob_names(module: &ModuleId, modules: &ModuleBindings) -> Vec<(String, Binding)> {
+    let mut names = modules
+        .get(module)
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, binding)| {
+            resolved(Some(binding)).map(|binding| (name.clone(), binding))
+        })
+        .collect::<Vec<_>>();
+    names.extend(
+        modules
+            .keys()
+            .filter(|child| {
+                child.root == module.root
+                    && child.segments.len() == module.segments.len() + 1
+                    && child.segments.starts_with(&module.segments)
+            })
+            .filter_map(|child| {
+                child
+                    .segments
+                    .last()
+                    .map(|name| (name.clone(), Binding::Module(child.clone())))
+            }),
+    );
+    names
 }
 
 fn resolve_imports(
@@ -377,15 +514,32 @@ fn resolve_imports(
 ) -> SqlBindings {
     let mut bindings = imports
         .iter()
-        .map(|(name, _)| (name.clone(), None))
+        .filter(|(name, _)| name != GLOB_IMPORT)
+        .map(|(name, _)| (name.clone(), Binding::Other))
         .collect::<SqlBindings>();
-    for _ in 0..imports.len() {
+    for _ in 0..=imports.len() {
         let known = bindings.clone();
         for (name, path) in imports {
+            if name == GLOB_IMPORT {
+                continue;
+            }
             bindings.insert(
                 name.clone(),
-                import_target(path, &known, parents, current_module, module_id, modules),
+                import_target(path, &known, parents, current_module, module_id, modules)
+                    .unwrap_or(Binding::Other),
             );
+        }
+        // Every explicit name is already bound, and explicit imports shadow
+        // glob imports, so a glob only fills the names left unbound.
+        for (_, path) in imports.iter().filter(|(name, _)| name == GLOB_IMPORT) {
+            let Some(source) = resolve_module(path, module_id, modules, &|first| {
+                import_scope_module(first, &known, current_module)
+            }) else {
+                continue;
+            };
+            for (name, binding) in glob_names(&source, modules) {
+                bindings.entry(name).or_insert(binding);
+            }
         }
         if known == bindings {
             break;
@@ -418,14 +572,16 @@ impl<'ast> Visit<'ast> for BoundNames {
     }
 }
 
-fn shadow_bindings<'a>(
-    patterns: impl Iterator<Item = &'a Pat>,
-) -> BTreeMap<String, Option<String>> {
+fn shadow_bindings<'a>(patterns: impl Iterator<Item = &'a Pat>) -> SqlBindings {
     let mut names = BoundNames::default();
     for pattern in patterns {
         names.visit_pat(pattern);
     }
-    names.0.into_iter().map(|name| (name, None)).collect()
+    names
+        .0
+        .into_iter()
+        .map(|name| (name, Binding::Local))
+        .collect()
 }
 
 struct SourceCollector<'modules> {
@@ -476,6 +632,21 @@ impl<'modules> SourceCollector<'modules> {
             site.class = DetectedClass::WholeObject;
         }
         site.evidence.insert(evidence);
+    }
+
+    /// The module that a leading path segment names through the imports in
+    /// scope. Pattern bindings live in the value namespace and never shadow it.
+    fn scoped_module(&self, first: &str) -> Option<ModuleId> {
+        match self
+            .bindings
+            .iter()
+            .rev()
+            .filter_map(|scope| scope.get(first))
+            .find(|binding| **binding != Binding::Local)
+        {
+            Some(Binding::Module(module)) => Some(module.clone()),
+            _ => None,
+        }
     }
 
     fn record_sql(&mut self, literal: &str) {
@@ -698,18 +869,20 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
                         None
                     }
                 };
-                let constant = if let Some(binding) = imported {
-                    binding.clone()
+                let binding = if let Some(binding) = imported {
+                    Some(binding.clone())
                 } else if NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str()) {
-                    Some(name.clone())
+                    Some(Binding::Constant(name.clone()))
                 } else {
                     let path = segments
                         .iter()
                         .map(|part| part.ident.to_string())
                         .collect::<Vec<_>>();
-                    qualified_target(&path, &self.module_id, self.modules)
+                    qualified_target(&path, &self.module_id, self.modules, &|first| {
+                        self.scoped_module(first)
+                    })
                 };
-                if let Some(constant) = constant {
+                if let Some(Binding::Constant(constant)) = binding {
                     self.record(
                         Substrate::Note,
                         DetectedClass::WholeObject,
@@ -1717,6 +1890,173 @@ fn qualified_reexport_with_reservation_passes_inventory() {
     assert_eq!(sites[0].class, DetectedClass::WholeObject);
     assert!(sites[0].evidence.contains("SQL constant NOTE_UPSERT_SQL"));
     assert!(check_inventory(&sites, &[qualified_reexport_route()], 0).is_ok());
+}
+
+/// A crate whose `sql_alias` module re-exports the note upsert statement under
+/// another name, a `plain` module with an unrelated constant of that same name,
+/// the given writer module and any extra source files.
+fn module_path_sources(writer: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut crate_root = String::from("mod sql_alias; mod plain; mod writer;");
+    for (path, _) in extra {
+        if let Some(name) = path
+            .strip_prefix("sample/src/")
+            .and_then(|file| file.strip_suffix(".rs"))
+        {
+            crate_root.push_str(&format!(" mod {name};"));
+        }
+    }
+    let mut sources = vec![
+        ("sample/src/lib.rs".to_owned(), crate_root),
+        (
+            "sample/src/sql_alias.rs".to_owned(),
+            "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;".to_owned(),
+        ),
+        (
+            "sample/src/plain.rs".to_owned(),
+            "pub const MERGE_SQL: &str = \"SELECT 1\";".to_owned(),
+        ),
+        ("sample/src/writer.rs".to_owned(), writer.to_owned()),
+    ];
+    sources.extend(
+        extra
+            .iter()
+            .map(|(path, source)| ((*path).to_owned(), (*source).to_owned())),
+    );
+    sources
+}
+
+// A path that reaches the re-exported statement through a module, rather than
+// by the statement's own name, must still reach the census.
+#[test]
+fn module_paths_to_reexported_note_sql_are_reported() {
+    let facade_alias = [("sample/src/facade.rs", "pub use crate::sql_alias as db;")];
+    let facade_glob = [("sample/src/facade.rs", "pub use crate::sql_alias::*;")];
+    let other_crate = [(
+        "dbx/src/lib.rs",
+        "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;",
+    )];
+    // (description, writer source, extra sample files)
+    type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
+    let cases: [Case; 9] = [
+        (
+            "renamed module import",
+            "use crate::sql_alias as db;
+             fn write(conn: &Connection) { conn.prepare_cached(db::MERGE_SQL); }",
+            &[],
+        ),
+        (
+            "module import",
+            "use crate::sql_alias;
+             fn write(conn: &Connection) { conn.prepare_cached(sql_alias::MERGE_SQL); }",
+            &[],
+        ),
+        (
+            "self import",
+            "use crate::sql_alias::{self as db};
+             fn write(conn: &Connection) { conn.prepare_cached(db::MERGE_SQL); }",
+            &[],
+        ),
+        (
+            "import through a module alias",
+            "use crate::sql_alias as db;
+             use db::MERGE_SQL as SQL;
+             fn write(conn: &Connection) { conn.prepare_cached(SQL); }",
+            &[],
+        ),
+        (
+            "block-level module alias",
+            "fn write(conn: &Connection) {
+                 use crate::sql_alias as db;
+                 conn.prepare_cached(db::MERGE_SQL);
+             }",
+            &[],
+        ),
+        (
+            "value binding of the alias name",
+            "use crate::sql_alias as db;
+             fn write(conn: &Connection, db: u8) { conn.prepare_cached(db::MERGE_SQL); }",
+            &[],
+        ),
+        (
+            "module re-exported part-way along the path",
+            "fn write(conn: &Connection) { conn.prepare_cached(crate::facade::db::MERGE_SQL); }",
+            &facade_alias,
+        ),
+        (
+            "glob re-export",
+            "fn write(conn: &Connection) { conn.prepare_cached(crate::facade::MERGE_SQL); }",
+            &facade_glob,
+        ),
+        (
+            "workspace crate",
+            "fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
+            &other_crate,
+        ),
+    ];
+    for (form, writer, extra) in cases {
+        let sites = scan_sources(&module_path_sources(writer, extra)).unwrap();
+        assert_eq!(sites.len(), 1, "{form}: {sites:?}");
+        assert_eq!(sites[0].key, "sample/src/writer.rs::write", "{form}");
+        assert!(
+            sites[0].evidence.contains("SQL constant NOTE_UPSERT_SQL"),
+            "{form}: {sites:?}"
+        );
+        assert!(
+            check_inventory(&sites, &[], 0)
+                .unwrap_err()
+                .contains("unmapped sample/src/writer.rs::write"),
+            "{form}"
+        );
+    }
+
+    let relative = scan_sources(&[
+        (
+            "sample/src/lib.rs".into(),
+            "mod sql_alias;
+             fn write(conn: &Connection) { conn.prepare_cached(sql_alias::MERGE_SQL); }"
+                .into(),
+        ),
+        (
+            "sample/src/sql_alias.rs".into(),
+            "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;".into(),
+        ),
+    ])
+    .unwrap();
+    assert_eq!(relative.len(), 1, "child module path: {relative:?}");
+    assert_eq!(relative[0].key, "sample/src/lib.rs::write");
+    assert!(relative[0]
+        .evidence
+        .contains("SQL constant NOTE_UPSERT_SQL"));
+}
+
+// Each fixture names `MERGE_SQL` through a module path that Rust resolves to
+// the unrelated constant, so reporting it would be a false route.
+#[test]
+fn module_paths_to_unrelated_names_are_not_reported() {
+    for (form, writer) in [
+        (
+            "module without the statement",
+            "use crate::plain as db;
+             fn write(conn: &Connection) { conn.prepare_cached(db::MERGE_SQL); }",
+        ),
+        (
+            "block import shadows the module alias",
+            "use crate::sql_alias as db;
+             fn write(conn: &Connection) {
+                 use crate::plain as db;
+                 conn.prepare_cached(db::MERGE_SQL);
+             }",
+        ),
+        (
+            "explicit import shadows a glob import",
+            "use crate::sql_alias::*;
+             use crate::plain::MERGE_SQL;
+             fn write(conn: &Connection) { conn.prepare_cached(MERGE_SQL); }",
+        ),
+    ] {
+        let sites = scan_sources(&module_path_sources(writer, &[])).unwrap();
+        assert!(sites.is_empty(), "{form}: {sites:?}");
+    }
 }
 
 #[test]
