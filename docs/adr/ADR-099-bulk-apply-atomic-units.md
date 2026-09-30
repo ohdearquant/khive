@@ -767,7 +767,7 @@ and success/aborted reconciliation. It changes scheduling only.
 The established request-read deadline remains one absolute deadline around the complete logical
 batch; serial mode does not renew or bypass it per operation. Trusted long-running local model
 batches must explicitly select the existing bounded `KHIVE_REQUEST_READ_TIMEOUT_SECS` operator
-configuration (1–3600 seconds) and record that setting in run evidence. Public request policy and
+configuration (1–3600 seconds when accepted; 1–86400 since ADR-091 Amendment 23) and record that setting in run evidence. Public request policy and
 wire limits remain unchanged.
 
 `--serial` requires `--ops-file` and conflicts with positional inline ops and `--atomic`. Atomic
