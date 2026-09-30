@@ -1766,7 +1766,7 @@ impl KhiveRuntime {
         // only the embedding re-insert needs an async step outside it.
         if !dry_run && !embedding_plan.is_empty() {
             match self
-                .reindex_entity_with_plan(token, &updated_entity, &embedding_plan)
+                .reindex_entity_with_plan(token, &updated_entity, &embedding_plan, None)
                 .await
             {
                 Ok(report) => summary.embedding_truncation = report,
@@ -1908,6 +1908,34 @@ impl KhiveRuntime {
         ]
     }
 
+    pub(crate) async fn publish_entity_vector_revision(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+        model_name: &str,
+        vector: &[f32],
+    ) -> RuntimeResult<bool> {
+        self.vectors_for_model(token, model_name)?;
+        let (storage_model, dimensions) = self.vector_model_metadata(model_name)?;
+        if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "non-finite entity vector at index {index}"
+            )));
+        }
+        if vector.len() != dimensions {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity vector has {} dimensions; expected {dimensions}",
+                vector.len()
+            )));
+        }
+        let table = format!("vec_{}", crate::config::sanitize_key(&storage_model));
+        let statements =
+            Self::entity_vector_insert_statements(&table, entity, &storage_model, vector);
+        #[cfg(test)]
+        race_seam::pause_before_entity_vector_publish().await;
+        self.apply_entity_index_revision(entity, statements).await
+    }
+
     /// Re-upsert FTS5 document and vector(s) for the entity across all registered models.
     ///
     /// Uses `entity.namespace` — the authoritative namespace stored on the record — rather
@@ -1926,7 +1954,18 @@ impl KhiveRuntime {
         entity: &Entity,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         let embedding_plan = EmbeddingModelPlan::capture(self);
-        self.reindex_entity_with_plan(token, entity, &embedding_plan)
+        self.reindex_entity_with_plan(token, entity, &embedding_plan, None)
+            .await
+    }
+
+    pub(crate) async fn reindex_entity_with_precomputed(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+        mut precomputed: HashMap<String, crate::retrieval::DocumentEmbeddingOutcome>,
+    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
+        let embedding_plan = EmbeddingModelPlan::capture(self);
+        self.reindex_entity_with_plan(token, entity, &embedding_plan, Some(&mut precomputed))
             .await
     }
 
@@ -1935,6 +1974,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         entity: &Entity,
         embedding_plan: &EmbeddingModelPlan,
+        mut precomputed: Option<&mut HashMap<String, crate::retrieval::DocumentEmbeddingOutcome>>,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         // Test-only fault seam: force the post-commit FTS leg to fail after a
         // merge or update has already persisted its entity row.
@@ -1965,75 +2005,30 @@ impl KhiveRuntime {
 
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
         for model_name in embedding_plan.model_names() {
-            match self
-                .embed_document_with_model_outcome_for_token(token, model_name, &embed_body)
-                .await
+            let embedding = match precomputed
+                .as_mut()
+                .and_then(|outcomes| outcomes.remove(model_name))
             {
+                Some(outcome) => Ok(outcome),
+                None => {
+                    self.embed_document_with_model_outcome_for_token(token, model_name, &embed_body)
+                        .await
+                }
+            };
+            match embedding {
                 Ok(outcome) => {
                     report.observe(&outcome);
-                    match self.vectors_for_model(token, model_name) {
-                        Ok(_) => {
-                            if let Some(index) =
-                                outcome.vector.iter().position(|value| !value.is_finite())
-                            {
-                                tracing::warn!(
-                                    model = model_name,
-                                    id = %entity.id,
-                                    index,
-                                    "reindex_entity: non-finite vector, skipping model"
-                                );
-                                continue;
-                            }
-                            let (storage_model, dimensions) = match self
-                                .vector_model_metadata(model_name)
-                            {
-                                Ok(metadata) => metadata,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        model = model_name,
-                                        id = %entity.id,
-                                        "reindex_entity: could not resolve vector model, skipping: {e}"
-                                    );
-                                    continue;
-                                }
-                            };
-                            if outcome.vector.len() != dimensions {
-                                tracing::warn!(
-                                    model = model_name,
-                                    id = %entity.id,
-                                    "reindex_entity: vector dimensions do not match model, skipping"
-                                );
-                                continue;
-                            }
-                            let table =
-                                format!("vec_{}", crate::config::sanitize_key(&storage_model));
-                            let statements = Self::entity_vector_insert_statements(
-                                &table,
-                                entity,
-                                &storage_model,
-                                &outcome.vector,
-                            );
-                            #[cfg(test)]
-                            race_seam::pause_before_entity_vector_publish().await;
-                            match self.apply_entity_index_revision(entity, statements).await {
-                                Ok(true) => {}
-                                Ok(false) => break,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        model = model_name,
-                                        id = %entity.id,
-                                        "reindex_entity: vector insert failed, skipping model: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                model = model_name,
-                                id = %entity.id,
-                                "reindex_entity: could not access vector store for model, skipping: {e}"
-                            );
-                        }
+                    match self
+                        .publish_entity_vector_revision(token, entity, model_name, &outcome.vector)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => tracing::warn!(
+                            model = model_name,
+                            id = %entity.id,
+                            "reindex_entity: vector insert failed, skipping model: {error}"
+                        ),
                     }
                 }
                 Err(e) => {
@@ -2152,6 +2147,15 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        if note.properties.as_ref().is_some_and(|properties| {
+            properties
+                .as_object()
+                .is_some_and(|map| map.contains_key(crate::secret_gate::RESERVED_WEB_RECEIPT_KEY))
+        }) {
+            return Err(RuntimeError::InvalidInput(
+                "web receipt notes are immutable through generic update".into(),
+            ));
+        }
         // The stored row as read. A no-op answers with this, not with the
         // patched snapshot: the patch may differ from the row in ways the
         // no-op decision ignores (tag order), and nothing was written.
@@ -2542,7 +2546,7 @@ impl KhiveRuntime {
     /// Non-wire outbox scan for the channel delivery loops.
     ///
     /// Fetches live `message` notes matching the SQL-side pending predicate
-    /// newest-first (`created_at DESC, id ASC`), bounded by an internal scan
+    /// newest-first (`created_at DESC, id ASC`), bounded by an internal page
     /// cap. Direction, `delivered_at`, terminal `delivery` state, the optional
     /// `to_actor` channel prefix, and `next_attempt_at` are filtered by SQLite
     /// before the page bound. Pending means `delivered_at`
@@ -2553,12 +2557,10 @@ impl KhiveRuntime {
     ///
     /// The channel prefix has to be in the statement, not applied to the
     /// fetched page: every actor-to-actor outbound row matches the pending
-    /// predicate forever (nothing marks those delivered), so that population
-    /// outgrows any scan cap and a page-then-filter scan never reaches a
-    /// channel's rows once enough other rows sort ahead of them. The prefix
-    /// renders as an index range served by
-    /// `idx_comm_message_outbound_recipient`, and the newest-first order
-    /// means due rows are returned in the same order as the prior scan.
+    /// predicate forever (nothing marks those delivered). A full `name:`
+    /// channel prefix also supplies an indexed bucket equality, followed by
+    /// an indexed deadline bound; arbitrary partial prefixes retain the
+    /// recipient range. The final newest-first sort preserves delivery order.
     /// This lives on the runtime rather than going through the wire registry
     /// for the same reason as
     /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
@@ -2628,7 +2630,7 @@ impl KhiveRuntime {
         limit: u32,
         slug_filter: OutboxSlugFilter<'_>,
     ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
-        const MAX_SCAN_TOTAL: u32 = 10_000;
+        const MAX_PAGE_TOTAL: u32 = 10_000;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -2670,9 +2672,17 @@ impl KhiveRuntime {
             },
         ];
         if let Some(prefix) = to_prefix {
+            let op = if prefix
+                .strip_suffix(':')
+                .is_some_and(|head| !head.is_empty() && !head.contains(':'))
+            {
+                FilterOp::TextColonPrefixBucketIndexed
+            } else {
+                FilterOp::TextStartsWithIndexed
+            };
             property_filters.push(PropertyFilter {
                 json_path: "$.to_actor".to_string(),
-                op: FilterOp::TextStartsWithIndexed,
+                op,
                 value: SqlValue::Text(prefix.to_string()),
             });
         }
@@ -2700,7 +2710,7 @@ impl KhiveRuntime {
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit: limit.min(MAX_SCAN_TOTAL),
+                    limit: limit.min(MAX_PAGE_TOTAL),
                     offset: 0,
                 },
             )
@@ -4712,6 +4722,7 @@ fn merge_note_sql(
     let props_str = merged_props
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let (due_key, due_source) = khive_db::stores::note::note_due_key_values(&merged_props);
 
     // The loop always runs so a dry-run reports a predictive `edges_rewired`
     // count instead of zero (mirrors the entity merge path).
@@ -4930,6 +4941,8 @@ fn merge_note_sql(
                 now,
                 into_note.deleted_at,
                 &into_note.key,
+                &due_key,
+                &due_source,
             ])?;
 
         let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
@@ -5966,6 +5979,16 @@ mod tests {
                 serde_json::json!({"direction": "outbound", "to_actor": "email:deleted"}),
                 Some(100),
             ),
+            make_note(
+                99,
+                serde_json::json!({"direction": "outbound", "to_actor": "emailx:not-this-channel"}),
+                None,
+            ),
+            make_note(
+                98,
+                serde_json::json!({"direction": "outbound", "to_actor": 42}),
+                None,
+            ),
         ];
         for note in &notes {
             store.upsert_note(note.clone()).await.expect("seed note");
@@ -5997,6 +6020,17 @@ mod tests {
         assert_eq!(
             actual_ids, expected_ids,
             "filtered scan changed answer or order"
+        );
+        let channel_ids: Vec<_> = rt
+            .list_undelivered_outbound_messages_for_channel(&tok, "email:", "primary", true, 200)
+            .await
+            .expect("channel scan succeeds")
+            .into_iter()
+            .map(|note| note.id)
+            .collect();
+        assert_eq!(
+            channel_ids, expected_ids,
+            "legacy channel pass changed answer or order"
         );
     }
 
@@ -6109,6 +6143,15 @@ mod tests {
             hits.iter().map(|note| note.id).collect::<Vec<_>>(),
             vec![due_id],
             "a due row behind {FUTURE_RETRIES} deferred rows remains deliverable"
+        );
+        let channel_hits = rt
+            .list_undelivered_outbound_messages_for_channel(&tok, "email:", "primary", true, 1)
+            .await
+            .expect("channel scan succeeds");
+        assert_eq!(
+            channel_hits.iter().map(|note| note.id).collect::<Vec<_>>(),
+            vec![due_id],
+            "the delivery pass must reach an older due row behind deferred retries"
         );
     }
 
@@ -13610,7 +13653,7 @@ mod tests {
         let embedding_plan = EmbeddingModelPlan::capture(&rt);
         rt.register_embedder(MergeTestVecProvider::new(LATE, DIMS));
 
-        rt.reindex_entity_with_plan(&tok, &entity, &embedding_plan)
+        rt.reindex_entity_with_plan(&tok, &entity, &embedding_plan, None)
             .await
             .expect("reindex entity with captured merge plan");
 

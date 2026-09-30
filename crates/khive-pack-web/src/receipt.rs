@@ -12,6 +12,8 @@
 
 pub const RECEIPT_TAG: &str = "web.receipt";
 pub const EXTRACTION_RECEIPT_TAG: &str = "web.extraction";
+pub const RECEIPT_PROVENANCE_KEY: &str = khive_runtime::secret_gate::RESERVED_WEB_RECEIPT_KEY;
+pub const RECEIPT_PROVENANCE_VALUE: &str = khive_runtime::secret_gate::WEB_RECEIPT_PROVENANCE_VALUE;
 
 use khive_runtime::{EntityPatch, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{
@@ -20,6 +22,13 @@ use khive_storage::{
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use uuid::Uuid;
+
+pub(crate) fn has_receipt_provenance(properties: Option<&Value>) -> bool {
+    properties
+        .and_then(|properties| properties.get(RECEIPT_PROVENANCE_KEY))
+        .and_then(Value::as_str)
+        == Some(RECEIPT_PROVENANCE_VALUE)
+}
 
 /// Find the receipt that stored the exact body selected by `web.extract`.
 /// A newer HEAD or 304 may annotate the same document without carrying that
@@ -32,7 +41,14 @@ pub(crate) async fn capture_for_body(
     content_ref: &str,
 ) -> Result<Option<(Uuid, Value)>, RuntimeError> {
     let latest = runtime
-        .latest_annotating_note(token, entity.id, "observation", RECEIPT_TAG)
+        .latest_annotating_note_with_property(
+            token,
+            entity.id,
+            "observation",
+            RECEIPT_TAG,
+            RECEIPT_PROVENANCE_KEY,
+            RECEIPT_PROVENANCE_VALUE,
+        )
         .await?;
     let stored = entity
         .properties
@@ -51,6 +67,7 @@ pub(crate) async fn capture_for_body(
         };
         if note.namespace == token.namespace().as_str()
             && note.kind == "observation"
+            && has_receipt_provenance(note.properties.as_ref())
             && note.properties.as_ref().is_some_and(|properties| {
                 properties["tags"]
                     .as_array()
@@ -82,6 +99,7 @@ pub(crate) async fn capture_for_body(
         };
         if note.namespace == token.namespace().as_str()
             && note.kind == "observation"
+            && has_receipt_provenance(note.properties.as_ref())
             && note.properties.as_ref().is_some_and(|properties| {
                 properties["tags"]
                     .as_array()
@@ -195,20 +213,8 @@ pub async fn write_receipt(
     request: Value,
     annotates: Vec<Uuid>,
 ) -> Result<Uuid, RuntimeError> {
-    let properties = json!({
-        "tags": [RECEIPT_TAG],
-        "request": request,
-    });
     let note = runtime
-        .create_note(
-            token,
-            "observation",
-            None,
-            summary,
-            None,
-            Some(properties),
-            annotates,
-        )
+        .create_web_receipt_note(token, summary, request, annotates)
         .await?;
     Ok(note.id)
 }

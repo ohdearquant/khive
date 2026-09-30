@@ -1330,6 +1330,41 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(tx_registry)]
+    async fn writer_task_connection_maintains_rfc3339_expression_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_rfc3339_expression_index.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.writer().expect("pooled writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE deadlines(id INTEGER PRIMARY KEY, due TEXT);
+                     CREATE INDEX idx_deadlines_strict \
+                         ON deadlines(ifnull(khive_rfc3339_strict_key(due), x''));",
+                )
+                .expect("pooled writer registers the key function");
+        }
+        let handle = spawn(&pool, 8).expect("writer task spawn");
+
+        let inserted = handle
+            .send(|conn| {
+                conn.execute(
+                    "INSERT INTO deadlines(id, due) VALUES (1, '2026-01-01T00:00:00Z')",
+                    [],
+                )
+                .map_err(|error| StorageError::Pool {
+                    operation: "test_insert".into(),
+                    message: error.to_string(),
+                })
+            })
+            .await
+            .expect("the writer task's connection maintains the expression index");
+        assert_eq!(inserted, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(tx_registry)]
     async fn successful_send_reply_waits_for_writer_tx_deregistration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_success_reply_lifecycle.db");

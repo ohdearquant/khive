@@ -134,6 +134,41 @@ fn assert_note_keys(notes: &[Note], expected_len: usize) {
 }
 
 #[tokio::test]
+async fn note_visibility_batch_projects_namespace_and_tombstones() {
+    let store = setup_memory_store();
+    let local = make_note("local", "memory", "local content");
+    let foreign = make_note("foreign", "memory", "foreign content");
+    let deleted = make_note("local", "memory", "deleted content");
+    for note in [&local, &foreign, &deleted] {
+        store.upsert_note((*note).clone()).await.unwrap();
+    }
+    store
+        .delete_note(deleted.id, DeleteMode::Soft)
+        .await
+        .unwrap();
+
+    let projection = store
+        .get_note_visibility_batch(&[local.id, foreign.id, deleted.id, Uuid::new_v4()])
+        .await
+        .unwrap();
+    assert_eq!(projection.len(), 3);
+    assert!(projection
+        .iter()
+        .any(|row| { row.id == local.id && row.namespace == "local" && row.deleted_at.is_none() }));
+    assert!(projection.iter().any(|row| {
+        row.id == foreign.id && row.namespace == "foreign" && row.deleted_at.is_none()
+    }));
+    assert!(projection.iter().any(|row| {
+        row.id == deleted.id && row.namespace == "local" && row.deleted_at.is_some()
+    }));
+    assert!(store
+        .get_note_visibility_batch(&[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn note_key_round_trips_through_every_note_read_projection() {
     let store = setup_memory_store();
     let mut notes = vec![
@@ -1602,6 +1637,34 @@ async fn text_starts_with_indexed_matches_prefix_only() {
     let mut names: Vec<_> = page.items.iter().map(|n| n.content.clone()).collect();
     names.sort();
     assert_eq!(names, vec!["email:", "email:a@b.c"]);
+
+    let mut bucket_filter = filter.clone();
+    bucket_filter.property_filters[0].op = FilterOp::TextColonPrefixBucketIndexed;
+    let bucket_page = store
+        .query_notes_filtered_count_free(
+            "default",
+            &bucket_filter,
+            PageRequest {
+                limit: 50,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let mut bucket_names: Vec<_> = bucket_page
+        .items
+        .iter()
+        .map(|n| n.content.clone())
+        .collect();
+    bucket_names.sort();
+    assert_eq!(
+        bucket_names, names,
+        "channel bucket must match the full prefix"
+    );
+    for invalid in ["", "email", "email::"] {
+        bucket_filter.property_filters[0].value = SqlValue::Text(invalid.into());
+        assert!(build_note_filter_where("default", &bucket_filter).is_err());
+    }
 
     let every_text = NoteFilter {
         kind: Some("message".into()),

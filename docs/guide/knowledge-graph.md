@@ -64,20 +64,20 @@ for your server's loaded-pack surface.
 
 ## Model relationships deliberately
 
-Edges are directed unless noted otherwise. Their 17 relation names are grouped
+Edges are directed unless noted otherwise. Their 19 relation names are grouped
 by purpose below; the set is closed.
 
-| Group          | Relations                                              | Typical reading                                    |
-| -------------- | ------------------------------------------------------ | -------------------------------------------------- |
-| Structure      | `contains`, `part_of`, `instance_of`                   | parent → child, child → parent, specific → general |
-| Derivation     | `extends`, `variant_of`, `introduced_by`, `supersedes` | newer or derived idea → its predecessor or source  |
-| Provenance     | `derived_from`                                         | output → input                                     |
-| Temporal       | `precedes`                                             | earlier → later                                    |
-| Dependency     | `depends_on`, `enables`                                | consumer → dependency; prerequisite → outcome      |
-| Implementation | `implements`                                           | code or project → concept                          |
-| Lateral        | `competes_with`, `composed_with`                       | peer relationship; both are symmetric              |
-| Annotation     | `annotates`                                            | note → its subject                                 |
-| Epistemic      | `supports`, `refutes`                                  | evidence → claim                                   |
+| Group          | Relations                                                      | Typical reading                                                                             |
+| -------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Structure      | `contains`, `part_of`, `instance_of`, `links_to`, `located_in` | parent → child, child → parent, specific → general, document → document, located → location |
+| Derivation     | `extends`, `variant_of`, `introduced_by`, `supersedes`         | newer or derived idea → its predecessor or source                                           |
+| Provenance     | `derived_from`                                                 | output → input                                                                              |
+| Temporal       | `precedes`                                                     | earlier → later                                                                             |
+| Dependency     | `depends_on`, `enables`                                        | consumer → dependency; prerequisite → outcome                                               |
+| Implementation | `implements`                                                   | code or project → concept                                                                   |
+| Lateral        | `competes_with`, `composed_with`                               | peer relationship; both are symmetric                                                       |
+| Annotation     | `annotates`                                                    | note → its subject                                                                          |
+| Epistemic      | `supports`, `refutes`                                          | evidence → claim                                                                            |
 
 The endpoint rules are part of the model, not suggestions. `annotates` is the
 cross-substrate relation. `supersedes`, `supports`, and `refutes` are

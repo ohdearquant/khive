@@ -1066,6 +1066,11 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     // depends_on); the endpoint pair is intentionally narrow (document only,
     // no service/concept targets — see ADR-191 D2/F10).
     ("document", EdgeRelation::LinksTo, "document"),
+    // ADR-002 amendment (ADR-196): location — the source occupies, or is
+    // manifested in, the target without being a constituent of it. The base
+    // contract is one row; packs and Subjects narrow it with typed endpoint
+    // rules for their own subtypes.
+    ("concept", EdgeRelation::LocatedIn, "concept"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -3366,17 +3371,55 @@ impl KhiveRuntime {
         kind: &str,
         tag: &str,
     ) -> RuntimeResult<Option<Uuid>> {
+        self.latest_annotating_note_inner(token, node_id, kind, tag, None)
+            .await
+    }
+
+    /// Select a latest annotation only after its exact top-level string
+    /// property has been checked by the bound store.
+    pub async fn latest_annotating_note_with_property(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        property_key: &str,
+        property_value: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        self.latest_annotating_note_inner(
+            token,
+            node_id,
+            kind,
+            tag,
+            Some((property_key, property_value)),
+        )
+        .await
+    }
+
+    async fn latest_annotating_note_inner(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        required_property: Option<(&str, &str)>,
+    ) -> RuntimeResult<Option<Uuid>> {
         if !self.substrate_exists_in_ns(token, node_id).await? {
             return Ok(None);
         }
         let mut latest: Option<(Uuid, i64)> = None;
         for namespace in token.visible_namespaces() {
             let scoped = NamespaceToken::for_namespace(namespace.clone());
-            if let Some(candidate) = self
-                .graph(&scoped)?
-                .latest_annotating_note(node_id, kind, tag)
-                .await?
-            {
+            let graph = self.graph(&scoped)?;
+            let candidate = match required_property {
+                Some((key, value)) => {
+                    graph
+                        .latest_annotating_note_with_property(node_id, kind, tag, key, value)
+                        .await?
+                }
+                None => graph.latest_annotating_note(node_id, kind, tag).await?,
+            };
+            if let Some(candidate) = candidate {
                 if latest.is_none_or(|(id, created_at)| {
                     candidate.1 > created_at || (candidate.1 == created_at && candidate.0 < id)
                 }) {
@@ -3940,9 +3983,43 @@ impl KhiveRuntime {
         let (note, _, degradations) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
+                false,
             )
             .await?;
         legacy_post_commit_result("create_note", note.id, note, degradations)
+    }
+
+    /// Publish a network receipt with provenance that generic note writes
+    /// cannot supply. The web pack provides only the request record and the
+    /// annotation targets; this entry point fixes the note kind, tag, and
+    /// provenance before the first storage write.
+    pub async fn create_web_receipt_note(
+        &self,
+        token: &NamespaceToken,
+        summary: &str,
+        request: serde_json::Value,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<Note> {
+        let properties = serde_json::json!({
+            "tags": ["web.receipt"],
+            "request": request,
+        });
+        let (note, _, degradations) = self
+            .create_note_inner(
+                token,
+                "observation",
+                None,
+                summary,
+                None,
+                None,
+                None,
+                Some(properties),
+                annotates,
+                None,
+                true,
+            )
+            .await?;
+        legacy_post_commit_result("create_web_receipt_note", note.id, note, degradations)
     }
 
     /// Like [`Self::create_note`], but lets the caller supply a smaller text
@@ -3979,6 +4056,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4013,6 +4091,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4051,6 +4130,7 @@ impl KhiveRuntime {
             properties,
             annotates,
             None,
+            false,
         )
         .await
     }
@@ -4113,6 +4193,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 embedding_model,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4400,6 +4481,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
+        web_receipt: bool,
     ) -> RuntimeResult<(
         Note,
         crate::retrieval::EmbeddingTruncationReport,
@@ -4411,8 +4493,20 @@ impl KhiveRuntime {
         // the generic `create` verb and direct Rust callers alike — stores the
         // same derived values. Runs before the secret gate so the gate scans
         // exactly what will be written.
-        let properties = self.derive_note_write_properties(kind, token, properties)?;
+        let mut properties = self.derive_note_write_properties(kind, token, properties)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
+        if web_receipt {
+            let map = properties
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("web receipt properties are constructed as an object");
+            map.insert(
+                crate::secret_gate::RESERVED_WEB_RECEIPT_KEY.to_string(),
+                serde_json::Value::String(
+                    crate::secret_gate::WEB_RECEIPT_PROVENANCE_VALUE.to_string(),
+                ),
+            );
+        }
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check_at(content, "note", "content")?;
         if let Some(n) = name {
@@ -4488,7 +4582,12 @@ impl KhiveRuntime {
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
-        self.notes(token)?.upsert_note(note.clone()).await?;
+        let notes = if web_receipt {
+            self.raw_notes(token)?
+        } else {
+            self.notes(token)?
+        };
+        notes.upsert_note(note.clone()).await?;
 
         // From here on, any error must compensate by removing the note row, its
         // FTS document, and any vector entries already inserted — the same
@@ -5171,9 +5270,11 @@ impl KhiveRuntime {
         // match `note_kind` are dropped post-fetch — they're a small set
         // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
+        let search_pool = self.backend().pool_arc();
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
+                search_pool.record_note_candidate_hydration_row();
                 if note.deleted_at.is_some() {
                     continue;
                 }
@@ -5694,11 +5795,15 @@ impl KhiveRuntime {
             statement: row_statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
-        if substrate == SubstrateKind::Entity {
+        if matches!(substrate, SubstrateKind::Entity | SubstrateKind::Note) {
             statements.push(PlanStatement {
                 statement: khive_db::stores::attachment::delete_record_attachments_statement(
                     node_id,
-                    AttachmentSubstrate::Entity,
+                    if substrate == SubstrateKind::Entity {
+                        AttachmentSubstrate::Entity
+                    } else {
+                        AttachmentSubstrate::Note
+                    },
                 ),
                 guard: None,
             });
@@ -20040,6 +20145,71 @@ mod tests {
         );
     }
 
+    // ── Location endpoint pair (ADR-196) ─────────────────────────────────────
+    // The base contract is one row, concept->concept; other base kinds are left
+    // to the first pack that emits them.
+
+    #[tokio::test]
+    async fn link_concept_located_in_concept_allowed_other_base_kinds_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let pneumonia = rt
+            .create_entity(&tok, "concept", None, "Pneumonia", None, None, vec![])
+            .await
+            .unwrap();
+        let lung = rt
+            .create_entity(&tok, "concept", None, "Lung", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(
+                &tok,
+                pneumonia.id,
+                lung.id,
+                EdgeRelation::LocatedIn,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "concept->concept located_in must be allowed by the ADR-196 \
+             endpoint amendment; got {result:?}"
+        );
+        let edge = result.unwrap();
+        assert_eq!(edge.relation, EdgeRelation::LocatedIn);
+        assert!(
+            edge.metadata.is_none(),
+            "located_in carries no governed metadata and infers none; got {:?}",
+            edge.metadata
+        );
+
+        let page = rt
+            .create_entity(&tok, "document", None, "Atlas page", None, None, vec![])
+            .await
+            .unwrap();
+        let concept_to_doc = rt
+            .link(
+                &tok,
+                pneumonia.id,
+                page.id,
+                EdgeRelation::LocatedIn,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            concept_to_doc
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "concept->document located_in must be refused with the \
+             endpoint-contract error; got {concept_to_doc}"
+        );
+    }
+
     #[tokio::test]
     async fn link_org_introduced_by_document_rejected_direction_matters() {
         let rt = rt();
@@ -20759,6 +20929,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_the_web_receipt_writer_can_establish_provenance() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let forged = serde_json::json!({
+            "tags": ["web.receipt"],
+            "request": {"verb": "web.fetch"},
+            "khive:web_receipt": "v1",
+        });
+        let error = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "forged",
+                None,
+                Some(forged),
+                vec![],
+            )
+            .await
+            .expect_err("generic create must reject receipt provenance");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("khive:web_receipt"))
+        );
+
+        let receipt = rt
+            .create_web_receipt_note(
+                &tok,
+                "web.fetch",
+                serde_json::json!({"verb": "web.fetch"}),
+                vec![],
+            )
+            .await
+            .expect("web writer must publish provenance with its receipt");
+        assert_eq!(
+            receipt.properties.as_ref().unwrap()["khive:web_receipt"],
+            "v1"
+        );
+        let error = rt
+            .update_note(
+                &tok,
+                receipt.id,
+                crate::curation::NotePatch {
+                    properties: Some(serde_json::json!({"request": {"verb": "web.refresh"}})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("generic update must not rewrite a trusted receipt");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("web receipt"))
+        );
+    }
+
+    #[tokio::test]
     async fn create_many_rejects_reserved_secret_gate_key_atomically() {
         let rt = rt();
         let tok = NamespaceToken::local();
@@ -20865,5 +21089,128 @@ mod tests {
         assert_eq!(attachments[0].content_ref, content_ref);
         assert_eq!(attachments[1].role, "fann-network");
         assert_eq!(attachments[1].content_ref, network_ref);
+    }
+
+    #[tokio::test]
+    async fn create_entity_with_attachments_reports_failed_created_event_after_commit() {
+        use khive_db::stores::blob::FsBlobStore;
+        use khive_storage::BlobStore as _;
+
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        let blob_dir = tempfile::tempdir().expect("blob tempdir");
+        let blob_store =
+            Arc::new(FsBlobStore::new(blob_dir.path().to_path_buf(), 0).expect("blob store"));
+        let content_ref = blob_store
+            .put(b"bundle".to_vec())
+            .await
+            .expect("publish bundle");
+        let network_ref = blob_store
+            .put(b"network".to_vec())
+            .await
+            .expect("publish network");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+
+        let mut writer = runtime.sql().writer().await.unwrap();
+        writer
+            .execute_script(
+                "CREATE TRIGGER reject_attachment_created_event BEFORE INSERT ON events \
+                 WHEN NEW.kind = 'entity_created' \
+                 BEGIN SELECT RAISE(ABORT, 'injected attachment created-event failure'); END;"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let error = runtime
+            .create_entity_with_attachments(
+                &token,
+                "artifact",
+                None,
+                "artifact with failed created event",
+                None,
+                None,
+                vec![],
+                vec![
+                    NewAttachment {
+                        role: "content".to_string(),
+                        content_ref: content_ref.clone(),
+                        media_type: Some("application/json".to_string()),
+                        size_bytes: Some(6),
+                    },
+                    NewAttachment {
+                        role: "fann-network".to_string(),
+                        content_ref: network_ref.clone(),
+                        media_type: Some("application/octet-stream".to_string()),
+                        size_bytes: Some(7),
+                    },
+                ],
+            )
+            .await
+            .expect_err("the committed entity must report the failed event append");
+        let RuntimeError::Khive(domain) = error.refusal_source() else {
+            panic!("attachment create lost its typed post-commit error: {error:?}");
+        };
+        assert_eq!(domain.kind(), khive_types::ErrorKind::Internal);
+        let details = domain.details().expect("post-commit details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(
+            details.get("operation"),
+            Some("create_entity_with_attachments")
+        );
+        assert_eq!(details.get("committed"), Some("true"));
+        assert_eq!(details.get("retryable"), Some("false"));
+        let entity_id = details
+            .get("record_id")
+            .expect("committed entity id")
+            .parse::<Uuid>()
+            .expect("canonical entity id");
+        let degradations: serde_json::Value = serde_json::from_str(
+            details
+                .get("post_commit_degradations")
+                .expect("complete degradation list"),
+        )
+        .expect("degradations are JSON");
+        let failures = degradations.as_array().expect("degradation array");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["stage"], "event_append");
+        assert!(failures[0]["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("injected attachment created-event failure")));
+
+        let stored = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("entity row committed");
+        assert_eq!(stored.id, entity_id);
+        assert_eq!(stored.content_ref.as_deref(), Some(content_ref.as_str()));
+        let attachments = runtime
+            .attachments()
+            .expect("main attachment store")
+            .list_attachments(entity_id)
+            .await
+            .expect("attachment rows committed");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].role, "content");
+        assert_eq!(attachments[0].content_ref, content_ref);
+        assert_eq!(attachments[1].role, "fann-network");
+        assert_eq!(attachments[1].content_ref, network_ref);
+
+        let events = runtime
+            .list_events(
+                &token,
+                EventFilter {
+                    target_id: Some(entity_id),
+                    kinds: vec![EventKind::EntityCreated],
+                    ..Default::default()
+                },
+                PageRequest::default(),
+            )
+            .await
+            .expect("query created events");
+        assert!(events.items.is_empty());
     }
 }

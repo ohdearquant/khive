@@ -157,6 +157,7 @@ svg line.ontology-edge[data-edge-treatment="epistemic"] { stroke-dasharray: 8 2;
 svg line.ontology-edge[data-edge-variant="secondary"] { stroke-dashoffset: 2; }
 svg line.ontology-edge[data-edge-variant="tertiary"] { stroke-dashoffset: 4; }
 svg line.ontology-edge[data-edge-variant="quaternary"] { stroke-dashoffset: 6; }
+svg line.ontology-edge[data-edge-variant="quinary"] { stroke-dashoffset: 8; }
 svg line.ontology-edge[data-edge-origin="derived"] { stroke-dasharray: 2 2; }
 
 .ontology-edge-glyph {

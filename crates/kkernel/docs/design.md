@@ -110,8 +110,8 @@
 
 - `kkernel vector capabilities` emits the sqlite-vec baseline capability flags.
   A comparison test pins every field to `SqliteVecStore::capabilities()` in `khive-db`,
-  including `supports_orphan_sweep: true`. It prints JSON by default or text with `--human`
-  without opening a database; `--engine` only labels this capability report.
+  including `supports_orphan_sweep: true` and `supports_vector_read: true`. It prints JSON by
+  default or text with `--human` without opening a database; `--engine` only labels this report.
 - `kkernel vector sweep [--namespace <ns>...] [--max-delete <n>] [--dry-run]
   [--engine <name>] [--db <path>]` calls the backend's orphan sweep for vectors whose subject
   has no live entity, note, or knowledge atom. Soft-deleted subjects count as orphans.

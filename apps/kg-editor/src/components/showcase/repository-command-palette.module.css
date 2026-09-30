@@ -188,6 +188,11 @@
   color: var(--repo-paper);
 }
 
+.result:disabled {
+  color: var(--repo-muted);
+  cursor: not-allowed;
+}
+
 .result[data-highlighted] .resultCopy strong,
 .result[data-highlighted] .resultCopy small,
 .result[data-highlighted] .resultMeta {

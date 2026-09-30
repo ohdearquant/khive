@@ -722,6 +722,58 @@ async fn repeat_contract_matrix_malformed_intervals_rejected() {
 }
 
 #[tokio::test]
+async fn repeat_without_a_representable_successor_is_rejected_by_both_creation_verbs() {
+    let (registry, runtime) = build_registry();
+    for (verb, params) in [
+        (
+            "schedule.remind",
+            serde_json::json!({
+                "content": "far future reminder",
+                "at": "2099-06-01T09:00:00Z",
+                "repeat": "every:100000000d"
+            }),
+        ),
+        (
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "stats()",
+                "at": "2099-06-01T09:00:00Z",
+                "repeat": "every:100000000d"
+            }),
+        ),
+    ] {
+        let error = registry.dispatch(verb, params).await.expect_err(verb);
+        let message = error.to_string();
+        assert!(message.contains("every:100000000d"), "{verb}: {message}");
+        assert!(
+            message.contains("no representable occurrence"),
+            "{verb}: {message}"
+        );
+    }
+
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize");
+    let page = runtime
+        .notes(&token)
+        .expect("notes")
+        .query_notes(
+            "local",
+            Some("scheduled_event"),
+            khive_storage::types::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("query scheduled events");
+    assert!(
+        page.items.is_empty(),
+        "rejected repeats must not create rows"
+    );
+}
+
+#[tokio::test]
 async fn repeat_contract_matrix_out_of_range_cron_rejected() {
     assert_repeat_rejected("99 * * * *").await;
 }

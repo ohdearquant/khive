@@ -34,6 +34,15 @@ pub struct Note {
     pub version: i64,
 }
 
+/// The columns needed to decide whether a note may appear in an ID-based result.
+/// Includes soft-deleted rows so the caller can apply its visibility policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteVisibility {
+    pub id: Uuid,
+    pub namespace: String,
+    pub deleted_at: Option<i64>,
+}
+
 const fn initial_note_version() -> i64 {
     1
 }
@@ -547,6 +556,11 @@ pub enum FilterOp {
     /// numeric field never matches. `PropertyFilter.value` is the prefix and
     /// must be `SqlValue::Text`; an empty prefix matches every text value.
     TextStartsWithIndexed,
+    /// Match a recipient's first colon-terminated channel prefix by equality
+    /// on its indexed bucket. The value must be a nonempty `SqlValue::Text`
+    /// prefix with exactly one trailing colon, such as `email:`. Arbitrary
+    /// partial prefixes use `TextStartsWithIndexed` instead.
+    TextColonPrefixBucketIndexed,
     /// Keep only RFC 3339 text values that parse as UTC instants.
     Rfc3339Valid,
     /// Compare parsed UTC instants, including subsecond precision and offsets.
@@ -1044,6 +1058,22 @@ pub trait NoteStore: Send + Sync + 'static {
         for &id in ids {
             if let Some(n) = self.get_note(id).await? {
                 out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch only the columns needed for note visibility checks by UUID.
+    /// Missing IDs are omitted; soft-deleted rows retain their deletion time.
+    async fn get_note_visibility_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<NoteVisibility>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(note) = self.get_note_including_deleted(id).await? {
+                out.push(NoteVisibility {
+                    id: note.id,
+                    namespace: note.namespace,
+                    deleted_at: note.deleted_at,
+                });
             }
         }
         Ok(out)

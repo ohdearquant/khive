@@ -91,6 +91,47 @@ WHERE result.id = CASE WHEN (SELECT count(*) FROM incident) <= 2 THEN (
     ORDER BY n.created_at DESC, n.id ASC LIMIT 1
 ) END"#;
 
+// The property predicate must run in both branches before ORDER BY/LIMIT;
+// filtering the single returned id in a caller lets a newer tagged decoy
+// conceal an older receipt with provenance.
+const LATEST_ANNOTATING_NOTE_WITH_PROPERTY_SQL: &str = r#"WITH incident AS MATERIALIZED (
+    SELECT source_id, deleted_at
+    FROM graph_edges INDEXED BY idx_graph_edges_ns_tgt_rel
+    WHERE namespace = ?1 AND target_id = ?2 AND relation = 'annotates'
+    LIMIT 3
+)
+SELECT result.id, result.created_at
+FROM notes AS result
+WHERE result.id = CASE WHEN (SELECT count(*) FROM incident) <= 2 THEN (
+    SELECT n.id
+    FROM incident AS e CROSS JOIN notes AS n
+    WHERE n.id = e.source_id AND e.deleted_at IS NULL
+      AND n.deleted_at IS NULL AND n.kind = ?3
+      AND EXISTS (SELECT 1 FROM json_each(CASE
+          WHEN json_type(n.properties, '$.tags') = 'array'
+          THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag
+          WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY)
+      AND EXISTS (SELECT 1 FROM json_each(n.properties) AS property
+          WHERE property.key = ?5 COLLATE BINARY AND property.type = 'text'
+            AND property.value = ?6 COLLATE BINARY)
+    ORDER BY n.created_at DESC, n.id ASC LIMIT 1
+) ELSE (
+    SELECT n.id
+    FROM notes AS n INDEXED BY idx_notes_created
+    WHERE n.deleted_at IS NULL AND n.kind = ?3
+      AND EXISTS (SELECT 1 FROM json_each(CASE
+          WHEN json_type(n.properties, '$.tags') = 'array'
+          THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag
+          WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY)
+      AND EXISTS (SELECT 1 FROM json_each(n.properties) AS property
+          WHERE property.key = ?5 COLLATE BINARY AND property.type = 'text'
+            AND property.value = ?6 COLLATE BINARY)
+      AND EXISTS (SELECT 1 FROM graph_edges AS e INDEXED BY idx_graph_edges_unique_triple
+          WHERE e.namespace = ?1 AND e.source_id = n.id AND e.target_id = ?2
+            AND e.relation = 'annotates' AND e.deleted_at IS NULL)
+    ORDER BY n.created_at DESC, n.id ASC LIMIT 1
+) END"#;
+
 // ---------------------------------------------------------------------------
 // Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
 // sibling block for the full rationale. `upsert_edge`/`delete_edge` below and
@@ -2094,6 +2135,34 @@ impl GraphStore for SqlGraphStore {
             conn.query_row(
                 LATEST_ANNOTATING_NOTE_SQL,
                 rusqlite::params![namespace, node_id, kind, tag],
+                |row| {
+                    let id: String = row.get(0)?;
+                    Ok((parse_uuid(&id)?, row.get(1)?))
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn latest_annotating_note_with_property(
+        &self,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        property_key: &str,
+        property_value: &str,
+    ) -> Result<Option<(Uuid, i64)>, StorageError> {
+        let namespace = self.namespace.clone();
+        let node_id = node_id.to_string();
+        let kind = kind.to_owned();
+        let tag = tag.to_owned();
+        let property_key = property_key.to_owned();
+        let property_value = property_value.to_owned();
+        self.with_reader("latest_annotating_note_with_property", move |conn| {
+            conn.query_row(
+                LATEST_ANNOTATING_NOTE_WITH_PROPERTY_SQL,
+                rusqlite::params![namespace, node_id, kind, tag, property_key, property_value],
                 |row| {
                     let id: String = row.get(0)?;
                     Ok((parse_uuid(&id)?, row.get(1)?))

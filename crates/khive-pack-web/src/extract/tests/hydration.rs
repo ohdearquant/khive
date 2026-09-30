@@ -8,7 +8,7 @@ use khive_storage::{
 };
 use serde_json::json;
 use std::future::{poll_fn, Future};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -24,13 +24,19 @@ enum ReadFailure {
 struct ObservedBlobStore {
     inner: Arc<dyn BlobStore>,
     reads: AtomicUsize,
+    sizes: AtomicUsize,
+    last_max_bytes: AtomicU64,
     puts: AtomicUsize,
+    reported_size: Mutex<Option<Option<u64>>>,
+    unsupported_size: AtomicBool,
     fail_next_read: Mutex<Option<ReadFailure>>,
     block_next_read: AtomicBool,
     read_started: Notify,
     read_release: Semaphore,
     block_next_put: AtomicBool,
+    block_puts: AtomicUsize,
     put_started: Notify,
+    put_started_count: Semaphore,
     put_release: Semaphore,
 }
 
@@ -38,8 +44,16 @@ struct ObservedBlobStore {
 impl BlobStore for ObservedBlobStore {
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef> {
         self.puts.fetch_add(1, Ordering::SeqCst);
-        if self.block_next_put.swap(false, Ordering::SeqCst) {
+        let block = self.block_next_put.swap(false, Ordering::SeqCst)
+            || self
+                .block_puts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                    count.checked_sub(1)
+                })
+                .is_ok();
+        if block {
             self.put_started.notify_one();
+            self.put_started_count.add_permits(1);
             self.put_release.acquire().await.unwrap().forget();
         }
         self.inner.put(bytes).await
@@ -51,14 +65,12 @@ impl BlobStore for ObservedBlobStore {
         max_bytes: u64,
     ) -> StorageResult<Vec<u8>> {
         self.reads.fetch_add(1, Ordering::SeqCst);
+        self.last_max_bytes.store(max_bytes, Ordering::SeqCst);
         if self.block_next_read.swap(false, Ordering::SeqCst) {
             self.read_started.notify_one();
             self.read_release.acquire().await.unwrap().forget();
         }
-        assert_eq!(
-            max_bytes, MAX_BLOB_WHOLE_BYTES,
-            "preserve the whole-body bound"
-        );
+        assert!(max_bytes <= MAX_BLOB_WHOLE_BYTES);
         let failure = self.fail_next_read.lock().unwrap().take();
         match failure {
             Some(ReadFailure::Digest) => Err(StorageError::BlobDigestMismatch {
@@ -83,6 +95,18 @@ impl BlobStore for ObservedBlobStore {
     }
 
     async fn size(&self, content_ref: &ContentRef) -> StorageResult<Option<u64>> {
+        self.sizes.fetch_add(1, Ordering::SeqCst);
+        if self.unsupported_size.load(Ordering::SeqCst) {
+            return Err(StorageError::Unsupported {
+                capability: khive_storage::StorageCapability::Blob,
+                operation: "size".into(),
+                message: "stat unavailable".into(),
+            });
+        }
+        let reported_size = *self.reported_size.lock().unwrap();
+        if let Some(size) = reported_size {
+            return Ok(size);
+        }
         self.inner.size(content_ref).await
     }
 
@@ -102,13 +126,19 @@ fn fixture() -> (
     let store = Arc::new(ObservedBlobStore {
         inner: Arc::new(inner),
         reads: AtomicUsize::new(0),
+        sizes: AtomicUsize::new(0),
+        last_max_bytes: AtomicU64::new(0),
         puts: AtomicUsize::new(0),
+        reported_size: Mutex::new(None),
+        unsupported_size: AtomicBool::new(false),
         fail_next_read: Mutex::new(None),
         block_next_read: AtomicBool::new(false),
         read_started: Notify::new(),
         read_release: Semaphore::new(0),
         block_next_put: AtomicBool::new(false),
+        block_puts: AtomicUsize::new(0),
         put_started: Notify::new(),
+        put_started_count: Semaphore::new(0),
         put_release: Semaphore::new(0),
     });
     let runtime = KhiveRuntime::new(RuntimeConfig {
@@ -121,6 +151,34 @@ fn fixture() -> (
     runtime.install_blob_store(store.clone()).unwrap();
     let registry = registry(&runtime);
     (runtime, registry, store, dir)
+}
+
+#[tokio::test]
+async fn source_size_stops_before_backend_on_expired_deadline_or_cancellation() {
+    let (_runtime, _registry, store, _dir) = fixture();
+    let content_ref = ContentRef::from_digest_bytes(blake3::hash(b"source").as_bytes());
+    let expired = khive_storage::RequestReadDeadline::after(Duration::ZERO);
+    let error = khive_storage::scope_request_read_deadline_at(
+        expired,
+        super::super::source_blob_size(store.as_ref(), &content_ref),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, StorageError::Timeout { ref operation }
+        if operation == "web_extract_blob_size"));
+
+    let (_cancel, cancelled) = tokio::sync::watch::channel(true);
+    let error = khive_storage::scope_request_read_cancellation(
+        cancelled,
+        super::super::source_blob_size(store.as_ref(), &content_ref),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, StorageError::Timeout { ref operation }
+        if operation == "web_extract_blob_size"));
+    assert_eq!(store.sizes.load(Ordering::SeqCst), 0);
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(store.puts.load(Ordering::SeqCst), 0);
 }
 
 fn registry(runtime: &KhiveRuntime) -> khive_runtime::VerbRegistry {
@@ -195,6 +253,21 @@ async fn extract_retains_shared_hydration_admission_through_persistence() {
         .await
         .expect("extraction reaches derived-text persistence");
         assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.last_max_bytes.load(Ordering::SeqCst),
+            body.len() as u64
+        );
+
+        let sibling = tokio::time::timeout(
+            Duration::from_secs(5),
+            hydrator.hydrate_verified(&content_ref, body.len() as u64),
+        )
+        .await
+        .expect("a second small read fits beside the source lease")
+        .unwrap();
+        assert_eq!(sibling.bytes(), body);
+        drop(sibling);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 2);
 
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
         let competitor = khive_storage::scope_request_read_cancellation(
@@ -219,7 +292,7 @@ async fn extract_retains_shared_hydration_admission_through_persistence() {
         );
         assert_eq!(
             store.reads.load(Ordering::SeqCst),
-            1,
+            2,
             "queued cancellation starts no read"
         );
 
@@ -266,8 +339,65 @@ async fn extract_retains_shared_hydration_admission_through_persistence() {
         .expect("finished extraction releases the shared budget")
         .unwrap();
         assert_eq!(next.bytes(), body);
-        assert_eq!(store.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(store.reads.load(Ordering::SeqCst), 3);
     }
+}
+
+#[tokio::test]
+async fn two_small_extracts_share_a_budget_smaller_than_two_full_reservations() {
+    let (runtime, registry, store, _dir) = fixture();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let first_body = vec![b'a'; 1024 * 1024];
+    let second_body = vec![b'b'; 1024 * 1024];
+    let first_id = seed_page(
+        &runtime,
+        &token,
+        "https://hydration.example.test/first",
+        "text/html",
+        &first_body,
+    )
+    .await;
+    let second_id = seed_page(
+        &runtime,
+        &token,
+        "https://hydration.example.test/second",
+        "text/html",
+        &second_body,
+    )
+    .await;
+    assert_eq!(
+        runtime.blob_hydrator().unwrap().budget_bytes(),
+        MAX_BLOB_WHOLE_BYTES
+    );
+    store.block_puts.store(2, Ordering::SeqCst);
+
+    let extracts = async {
+        tokio::join!(
+            registry.dispatch("web.extract", json!({ "id": first_id, "kinds": ["text"] })),
+            registry.dispatch("web.extract", json!({ "id": second_id, "kinds": ["text"] })),
+        )
+    };
+    tokio::pin!(extracts);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            result = &mut extracts => panic!("extracts skipped the put barrier: {result:?}"),
+            permit = store.put_started_count.acquire_many(2) => permit.unwrap().forget(),
+        }
+    })
+    .await
+    .expect("both source hydrations reach persistence together");
+    assert_eq!(store.reads.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        store.last_max_bytes.load(Ordering::SeqCst),
+        first_body.len() as u64
+    );
+
+    store.put_release.add_permits(2);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), &mut extracts)
+        .await
+        .expect("both extracts finish after persistence releases");
+    assert!(first.unwrap()["result"]["text"]["id"].is_string());
+    assert!(second.unwrap()["result"]["text"]["id"].is_string());
 }
 
 #[tokio::test]
@@ -277,12 +407,13 @@ async fn extract_hydration_errors_preserve_refusals_and_release_admission_withou
     for failure in [ReadFailure::Digest, ReadFailure::TooLarge] {
         let (runtime, registry, store, _dir) = fixture();
         let token = runtime.authorize(Namespace::local()).unwrap();
+        let body = b"<p>valid body</p><a href='/target'>Target</a>";
         let page_id = seed_page(
             &runtime,
             &token,
             "https://hydration.example.test/errors",
             "text/html",
-            b"<p>valid body</p><a href='/target'>Target</a>",
+            body,
         )
         .await;
         let before = domain_counts(&runtime).await;
@@ -300,14 +431,18 @@ async fn extract_hydration_errors_preserve_refusals_and_release_admission_withou
             ReadFailure::TooLarge => assert!(matches!(
                 error,
                 RuntimeError::Storage(StorageError::BlobTooLarge {
-                    max_bytes: MAX_BLOB_WHOLE_BYTES,
+                    max_bytes,
                     ..
-                })
+                }) if max_bytes == body.len() as u64
             )),
         }
         assert_eq!(domain_counts(&runtime).await, before);
         assert_eq!(store.puts.load(Ordering::SeqCst), puts_before);
         assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.last_max_bytes.load(Ordering::SeqCst),
+            body.len() as u64
+        );
 
         let reply = tokio::time::timeout(
             Duration::from_secs(5),
@@ -319,6 +454,90 @@ async fn extract_hydration_errors_preserve_refusals_and_release_admission_withou
         assert_eq!(reply["result"]["links"]["edges_created"], 1);
         assert!(reply["result"]["text"]["id"].is_string());
         assert_eq!(store.reads.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+async fn extract_refuses_underreported_or_oversized_body_before_derived_writes() {
+    for (reported_size, expected_reads) in [(1, 1usize), (MAX_BLOB_WHOLE_BYTES + 1, 0usize)] {
+        let (runtime, registry, store, _dir) = fixture();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://hydration.example.test/size",
+            "text/html",
+            b"<p>body</p>",
+        )
+        .await;
+        *store.reported_size.lock().unwrap() = Some(Some(reported_size));
+        let before = domain_counts(&runtime).await;
+        let puts_before = store.puts.load(Ordering::SeqCst);
+
+        let error = registry
+            .dispatch("web.extract", json!({ "id": page_id, "kinds": ["text"] }))
+            .await
+            .unwrap_err();
+        let (max_bytes, observed_at_least) = match error {
+            RuntimeError::Storage(StorageError::BlobTooLarge {
+                max_bytes,
+                observed_at_least,
+                ..
+            }) => (max_bytes, observed_at_least),
+            other => panic!("expected BlobTooLarge, got {other:?}"),
+        };
+        assert_eq!(max_bytes, reported_size.min(MAX_BLOB_WHOLE_BYTES));
+        assert!(observed_at_least > max_bytes);
+        assert_eq!(store.reads.load(Ordering::SeqCst), expected_reads);
+        assert_eq!(store.puts.load(Ordering::SeqCst), puts_before);
+        assert_eq!(domain_counts(&runtime).await, before);
+        if reported_size > MAX_BLOB_WHOLE_BYTES {
+            let content_ref =
+                ContentRef::from_digest_bytes(blake3::hash(b"<p>body</p>").as_bytes());
+            let verified = tokio::time::timeout(
+                Duration::from_secs(5),
+                runtime
+                    .blob_hydrator()
+                    .unwrap()
+                    .hydrate_verified(&content_ref, MAX_BLOB_WHOLE_BYTES),
+            )
+            .await
+            .expect("the refused preflight did not consume admission")
+            .unwrap();
+            assert_eq!(verified.bytes(), b"<p>body</p>");
+        }
+    }
+}
+
+#[tokio::test]
+async fn extract_uses_caller_cap_when_size_is_unknown() {
+    for unsupported in [false, true] {
+        let (runtime, registry, store, _dir) = fixture();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://hydration.example.test/unknown-size",
+            "text/html",
+            b"<p>body</p>",
+        )
+        .await;
+        if unsupported {
+            store.unsupported_size.store(true, Ordering::SeqCst);
+        } else {
+            *store.reported_size.lock().unwrap() = Some(None);
+        }
+
+        let reply = registry
+            .dispatch("web.extract", json!({ "id": page_id, "kinds": ["text"] }))
+            .await
+            .unwrap();
+        assert!(reply["result"]["text"]["id"].is_string());
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store.last_max_bytes.load(Ordering::SeqCst),
+            MAX_BLOB_WHOLE_BYTES
+        );
     }
 }
 

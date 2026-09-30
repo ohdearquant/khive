@@ -9,8 +9,13 @@
 //! 3. Serialize as `{"edges":[...],"entities":[...]}` with fixed field order and no whitespace.
 //! 4. SHA-256 the UTF-8 bytes; prefix with `"sha256:"`.
 
-use serde_json::{Map, Value};
+use std::io::{self, Write};
+
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Serialize, Serializer};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
 
@@ -19,143 +24,170 @@ use crate::types::SnapshotId;
 
 /// Compute the content-addressed `SnapshotId` for a `KgArchive`.
 ///
-/// The archive is assumed to already contain only non-deleted entities in the
-/// caller's intended order. This function performs the sort and serializes
-/// deterministically before hashing.
+/// Record references are sorted once, then serialized directly into SHA-256.
+/// The full canonical JSON and a cloned archive are never materialized.
 pub fn snapshot_id_for_archive(archive: &KgArchive) -> Result<SnapshotId, VcsError> {
-    let canonical = canonical_json(archive)?;
-    let digest = Sha256::digest(canonical.as_bytes());
-    let hex = hex::encode(digest);
-    SnapshotId::from_hash(&hex)
+    let canonical = CanonicalArchive::new(archive)?;
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, &canonical).map_err(VcsError::Json)?;
+    SnapshotId::from_hash(&hex::encode(writer.0.finalize()))
 }
 
-/// Produce the canonical JSON bytes for a `KgArchive`.
-///
-/// Entities are sorted by UUID (case-insensitive string comparison).
-/// Edges are sorted by (source, target, relation).
-/// Properties keys within each entity are sorted alphabetically.
-/// Tags within each entity are sorted lexicographically.
-/// No whitespace in the output.
+/// Produce canonical JSON for callers that need the bytes, using the same
+/// borrowed serializer as the hashing path.
 pub fn canonical_json(archive: &KgArchive) -> Result<String, VcsError> {
-    let mut entities = archive.entities.clone();
-    entities.sort_by(|a, b| {
-        a.id.to_string()
-            .to_ascii_lowercase()
-            .cmp(&b.id.to_string().to_ascii_lowercase())
-    });
+    serde_json::to_string(&CanonicalArchive::new(archive)?).map_err(VcsError::Json)
+}
 
-    let mut edges = archive.edges.clone();
-    // Runtime storage canonicalizes symmetric edge endpoints. Normalize the
-    // NDJSON side before sorting and hashing so a reversed source edge has
-    // the same identity as the row exported immediately after sync.
-    for edge in &mut edges {
-        if edge.relation.is_symmetric() && edge.target < edge.source {
-            std::mem::swap(&mut edge.source, &mut edge.target);
-        }
+struct HashWriter(Sha256);
+
+impl Write for HashWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
     }
-    edges.sort_by(|a, b| {
-        let ak = (
-            a.source.to_string(),
-            a.target.to_string(),
-            a.relation.to_string(),
-        );
-        let bk = (
-            b.source.to_string(),
-            b.target.to_string(),
-            b.relation.to_string(),
-        );
-        ak.cmp(&bk)
-    });
 
-    let entity_values: Vec<Value> = entities.iter().map(entity_to_canonical_value).collect();
-    let edge_values: Vec<Value> = edges
-        .iter()
-        .map(edge_to_canonical_value)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let mut root = Map::new();
-    root.insert("entities".to_string(), Value::Array(entity_values));
-    root.insert("edges".to_string(), Value::Array(edge_values));
-
-    serde_json::to_string(&Value::Object(root)).map_err(VcsError::Json)
-}
-
-/// Serialize a single entity with fixed key order and sorted sub-fields.
-///
-/// `entity_type` is included in the canonical representation so that two
-/// snapshots differing only in `entity_type` produce different `SnapshotId`s.
-fn entity_to_canonical_value(e: &ExportedEntity) -> Value {
-    let properties = sort_properties_value(e.properties.clone());
-    let mut tags = e.tags.clone();
-    tags.sort();
-
-    let mut obj = Map::new();
-    obj.insert("id".to_string(), Value::String(e.id.to_string()));
-    obj.insert("kind".to_string(), Value::String(e.kind.clone()));
-    obj.insert(
-        "entity_type".to_string(),
-        e.entity_type
-            .as_ref()
-            .map_or(Value::Null, |t| Value::String(t.clone())),
-    );
-    obj.insert("name".to_string(), Value::String(e.name.clone()));
-    obj.insert(
-        "description".to_string(),
-        e.description
-            .as_ref()
-            .map_or(Value::Null, |d| Value::String(d.clone())),
-    );
-    obj.insert("properties".to_string(), properties.unwrap_or(Value::Null));
-    obj.insert(
-        "tags".to_string(),
-        Value::Array(tags.into_iter().map(Value::String).collect()),
-    );
-    Value::Object(obj)
-}
-
-/// Serialize a single edge with fixed key order.
-fn edge_to_canonical_value(e: &ExportedEdge) -> Result<Value, VcsError> {
-    let mut obj = Map::new();
-    obj.insert("edge_id".to_string(), Value::String(e.edge_id.to_string()));
-    obj.insert("source".to_string(), Value::String(e.source.to_string()));
-    obj.insert("target".to_string(), Value::String(e.target.to_string()));
-    obj.insert(
-        "relation".to_string(),
-        Value::String(e.relation.to_string()),
-    );
-    let weight_num = serde_json::Number::from_f64(e.weight).ok_or_else(|| {
-        VcsError::Internal(format!(
-            "edge weight is not finite (NaN or Infinity): {}",
-            e.weight
-        ))
-    })?;
-    obj.insert("weight".to_string(), Value::Number(weight_num));
-    obj.insert(
-        "properties".to_string(),
-        sort_properties_value(e.properties.clone()).unwrap_or(Value::Null),
-    );
-    Ok(Value::Object(obj))
-}
-
-/// Recursively sort the keys of a JSON value so the hash is key-order-independent.
-fn sort_value_recursive(val: Value) -> Value {
-    match val {
-        Value::Object(map) => {
-            let mut pairs: Vec<(String, Value)> = map.into_iter().collect();
-            pairs.sort_by(|a, b| a.0.cmp(&b.0));
-            let sorted: Map<String, Value> = pairs
-                .into_iter()
-                .map(|(k, v)| (k, sort_value_recursive(v)))
-                .collect();
-            Value::Object(sorted)
-        }
-        Value::Array(arr) => Value::Array(arr.into_iter().map(sort_value_recursive).collect()),
-        other => other,
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
-fn sort_properties_value(props: Option<Value>) -> Option<Value> {
-    props.map(sort_value_recursive)
+struct CanonicalArchive<'a> {
+    entities: Vec<CanonicalEntity<'a>>,
+    edges: Vec<CanonicalEdge<'a>>,
+}
+
+impl<'a> CanonicalArchive<'a> {
+    fn new(archive: &'a KgArchive) -> Result<Self, VcsError> {
+        // UUID's byte ordering is the ordering of its canonical lowercase
+        // hyphenated string, without allocating that string per comparison.
+        let mut entities: Vec<_> = archive.entities.iter().map(CanonicalEntity).collect();
+        entities.sort_by_key(|entity| entity.0.id);
+
+        let mut edges = Vec::with_capacity(archive.edges.len());
+        for edge in &archive.edges {
+            let (mut source, mut target) = (edge.source, edge.target);
+            if edge.relation.is_symmetric() && target < source {
+                std::mem::swap(&mut source, &mut target);
+            }
+            let weight = serde_json::Number::from_f64(edge.weight).ok_or_else(|| {
+                VcsError::Internal(format!(
+                    "edge weight is not finite (NaN or Infinity): {}",
+                    edge.weight
+                ))
+            })?;
+            edges.push(CanonicalEdge {
+                record: edge,
+                source,
+                target,
+                relation: edge.relation.to_string(),
+                weight,
+            });
+        }
+        edges.sort_by(|a, b| {
+            (a.source, a.target, a.relation.as_str()).cmp(&(
+                b.source,
+                b.target,
+                b.relation.as_str(),
+            ))
+        });
+        Ok(Self { entities, edges })
+    }
+}
+
+impl Serialize for CanonicalArchive<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("edges", &self.edges)?;
+        map.serialize_entry("entities", &self.entities)?;
+        map.end()
+    }
+}
+
+struct CanonicalEntity<'a>(&'a ExportedEntity);
+
+impl Serialize for CanonicalEntity<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entity = self.0;
+        let mut tags: Vec<_> = entity.tags.iter().map(String::as_str).collect();
+        tags.sort_unstable();
+        let mut map = serializer.serialize_map(Some(7))?;
+        map.serialize_entry("description", &entity.description)?;
+        map.serialize_entry("entity_type", &entity.entity_type)?;
+        map.serialize_entry("id", &entity.id.to_string())?;
+        map.serialize_entry("kind", &entity.kind)?;
+        map.serialize_entry("name", &entity.name)?;
+        map.serialize_entry("properties", &entity.properties.as_ref().map(SortedValue))?;
+        map.serialize_entry("tags", &tags)?;
+        map.end()
+    }
+}
+
+struct CanonicalEdge<'a> {
+    record: &'a ExportedEdge,
+    source: Uuid,
+    target: Uuid,
+    relation: String,
+    weight: serde_json::Number,
+}
+
+impl Serialize for CanonicalEdge<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(6))?;
+        map.serialize_entry("edge_id", &self.record.edge_id.to_string())?;
+        map.serialize_entry(
+            "properties",
+            &self.record.properties.as_ref().map(SortedValue),
+        )?;
+        map.serialize_entry("relation", &self.relation)?;
+        map.serialize_entry("source", &self.source.to_string())?;
+        map.serialize_entry("target", &self.target.to_string())?;
+        map.serialize_entry("weight", &self.weight)?;
+        map.end()
+    }
+}
+
+/// Sort nested object keys without cloning property values. Array order stays
+/// unchanged; JSON string and number rendering remains serde_json's own.
+struct SortedValue<'a>(&'a Value);
+
+impl Serialize for SortedValue<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self.0 {
+            Value::Null => serializer.serialize_unit(),
+            Value::Bool(value) => serializer.serialize_bool(*value),
+            Value::Number(value) => value.serialize(serializer),
+            Value::String(value) => serializer.serialize_str(value),
+            Value::Array(values) => {
+                let mut sequence = serializer.serialize_seq(Some(values.len()))?;
+                for value in values {
+                    sequence.serialize_element(&SortedValue(value))?;
+                }
+                sequence.end()
+            }
+            Value::Object(values) => {
+                let mut entries: Vec<_> = values.iter().collect();
+                entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, &SortedValue(value))?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -165,6 +197,7 @@ mod tests {
     use chrono::Utc;
     use khive_runtime::portability::{ExportedEdge, ExportedEntity, KgArchive};
     use khive_storage::EdgeRelation;
+    use serde_json::{json, Map};
     use uuid::Uuid;
 
     use super::*;
@@ -538,5 +571,144 @@ mod tests {
             snapshot_id_for_archive(&a2).unwrap(),
             "entity_type must be included in canonical hash (VCS-AUD-003)"
         );
+    }
+
+    fn legacy_sorted_value(value: Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut pairs: Vec<_> = map.into_iter().collect();
+                pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                Value::Object(
+                    pairs
+                        .into_iter()
+                        .map(|(key, value)| (key, legacy_sorted_value(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(values) => {
+                Value::Array(values.into_iter().map(legacy_sorted_value).collect())
+            }
+            other => other,
+        }
+    }
+
+    // Keep the former materialized representation as a byte-level oracle for
+    // this small fixture. The production path no longer builds these Values.
+    fn legacy_canonical_json(archive: &KgArchive) -> String {
+        let mut entities = archive.entities.clone();
+        entities.sort_by(|a, b| {
+            a.id.to_string()
+                .to_ascii_lowercase()
+                .cmp(&b.id.to_string().to_ascii_lowercase())
+        });
+        let mut edges = archive.edges.clone();
+        for edge in &mut edges {
+            if edge.relation.is_symmetric() && edge.target < edge.source {
+                std::mem::swap(&mut edge.source, &mut edge.target);
+            }
+        }
+        edges.sort_by(|a, b| {
+            (
+                a.source.to_string(),
+                a.target.to_string(),
+                a.relation.to_string(),
+            )
+                .cmp(&(
+                    b.source.to_string(),
+                    b.target.to_string(),
+                    b.relation.to_string(),
+                ))
+        });
+        let entity_values: Vec<_> = entities
+            .iter()
+            .map(|entity| {
+                let mut tags = entity.tags.clone();
+                tags.sort();
+                let mut object = Map::new();
+                object.insert("id".into(), Value::String(entity.id.to_string()));
+                object.insert("kind".into(), Value::String(entity.kind.clone()));
+                object.insert(
+                    "entity_type".into(),
+                    entity
+                        .entity_type
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                );
+                object.insert("name".into(), Value::String(entity.name.clone()));
+                object.insert(
+                    "description".into(),
+                    entity
+                        .description
+                        .clone()
+                        .map_or(Value::Null, Value::String),
+                );
+                object.insert(
+                    "properties".into(),
+                    entity
+                        .properties
+                        .clone()
+                        .map_or(Value::Null, legacy_sorted_value),
+                );
+                object.insert(
+                    "tags".into(),
+                    Value::Array(tags.into_iter().map(Value::String).collect()),
+                );
+                Value::Object(object)
+            })
+            .collect();
+        let edge_values: Vec<_> = edges
+            .iter()
+            .map(|edge| {
+                let mut object = Map::new();
+                object.insert("edge_id".into(), Value::String(edge.edge_id.to_string()));
+                object.insert("source".into(), Value::String(edge.source.to_string()));
+                object.insert("target".into(), Value::String(edge.target.to_string()));
+                object.insert("relation".into(), Value::String(edge.relation.to_string()));
+                object.insert(
+                    "weight".into(),
+                    Value::Number(serde_json::Number::from_f64(edge.weight).unwrap()),
+                );
+                object.insert(
+                    "properties".into(),
+                    edge.properties
+                        .clone()
+                        .map_or(Value::Null, legacy_sorted_value),
+                );
+                Value::Object(object)
+            })
+            .collect();
+        let mut root = Map::new();
+        root.insert("entities".into(), Value::Array(entity_values));
+        root.insert("edges".into(), Value::Array(edge_values));
+        serde_json::to_string(&Value::Object(root)).unwrap()
+    }
+
+    #[test]
+    fn borrowed_serializer_preserves_legacy_canonical_bytes_and_hash() {
+        let low = Uuid::from_u128(1);
+        let high = Uuid::from_u128(2);
+        let mut archive = empty_archive();
+        let mut first = make_entity(low, "α\nquoted \"name\"");
+        first.entity_type = Some("paper".into());
+        first.description = Some("description".into());
+        first.tags = vec!["z".into(), "a".into(), "a".into()];
+        first.properties = Some(json!({"z":[{"b":2,"a":1},null],"a":{"y":true,"x":0.5}}));
+        archive.entities = vec![make_entity(high, "second"), first];
+        archive.edges = vec![ExportedEdge {
+            edge_id: Uuid::from_u128(3),
+            source: high,
+            target: low,
+            relation: EdgeRelation::ComposedWith,
+            weight: -0.0,
+            properties: Some(json!({"z":{"b":2,"a":1},"a":[3,2,1]})),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+
+        let legacy = legacy_canonical_json(&archive);
+        assert_eq!(canonical_json(&archive).unwrap(), legacy);
+        let expected =
+            SnapshotId::from_hash(&hex::encode(Sha256::digest(legacy.as_bytes()))).unwrap();
+        assert_eq!(snapshot_id_for_archive(&archive).unwrap(), expected);
     }
 }
