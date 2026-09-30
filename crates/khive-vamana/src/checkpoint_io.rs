@@ -16,6 +16,42 @@ pub struct AuxiliarySidecarReader {
     directory: CheckpointDirectory,
 }
 
+/// Keep cleanup on the directory inode opened before HEAD is removed. The
+/// checkpoint path can be renamed while cleanup is in progress.
+pub struct AuxiliarySidecarCleaner {
+    directory: CheckpointDirectory,
+}
+
+impl AuxiliarySidecarCleaner {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self {
+            directory: CheckpointDirectory::open_for_cleanup(path)?,
+        })
+    }
+
+    pub fn remove_and_sync(&self, name: &str) -> io::Result<()> {
+        self.directory.remove(name)?;
+        self.directory.sync()
+    }
+
+    /// Return at most `max_entries` UTF-8 names, counting every non-dot entry
+    /// against the scan budget even when its name is not UTF-8.
+    pub fn scan_names_bounded(&self, max_entries: usize) -> io::Result<(Vec<String>, bool)> {
+        self.directory.scan_names_bounded(max_entries)
+    }
+
+    pub fn remove_many_and_sync(&self, names: &[String]) -> io::Result<()> {
+        let mut first_error = None;
+        for name in names {
+            if let Err(error) = self.directory.remove(name) {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.directory.sync()?;
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
 impl AuxiliarySidecarReader {
     pub fn open(path: &Path) -> io::Result<Self> {
         Ok(Self {
@@ -76,6 +112,58 @@ impl CheckpointDirectory {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "secure checkpoint publication requires handle-relative filesystem operations",
+            ))
+        }
+    }
+
+    fn open_for_cleanup(path: &Path) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                dir: crate::external_ids::windows::open_checkpoint_directory_for_listing(path)?,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Self::open(path)
+        }
+    }
+
+    fn scan_names_bounded(&self, max_entries: usize) -> io::Result<(Vec<String>, bool)> {
+        #[cfg(unix)]
+        {
+            use nix::dir::Dir;
+
+            let mut directory = Dir::from_fd(self.dir.try_clone()?.into())
+                .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+            let mut names = Vec::new();
+            let mut visited = 0;
+            for entry in directory.iter() {
+                let entry = entry.map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." {
+                    continue;
+                }
+                if visited == max_entries {
+                    return Ok((names, true));
+                }
+                visited += 1;
+                if let Ok(name) = std::str::from_utf8(name) {
+                    names.push(name.to_owned());
+                }
+            }
+            Ok((names, false))
+        }
+        #[cfg(windows)]
+        {
+            crate::external_ids::windows::list_checkpoint_names_bounded(&self.dir, max_entries)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = max_entries;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure checkpoint directory scan unsupported",
             ))
         }
     }

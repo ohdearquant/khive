@@ -13,7 +13,7 @@ pub mod index;
 #[cfg(feature = "mmap")]
 pub use checkpoint_io::{
     remove_auxiliary_sidecar, remove_auxiliary_sidecars, write_auxiliary_sidecar_atomic,
-    AuxiliarySidecarReader,
+    AuxiliarySidecarCleaner, AuxiliarySidecarReader,
 };
 pub use config::VamanaConfig;
 pub use error::{Result, VamanaError};

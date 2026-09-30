@@ -5,18 +5,22 @@
 //! never reachable from HEAD; compaction clears HEAD after the full segment is
 //! committed and removes the old chunks.
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use uuid::Uuid;
 
 use super::AnnBridge;
-use khive_vamana::AuxiliarySidecarReader;
+use khive_vamana::{AuxiliarySidecarCleaner, AuxiliarySidecarReader};
 
 pub(super) const HEAD_FILE: &str = "memory_delta.head";
 const HEAD_MAGIC: &[u8; 8] = b"KHMDEH01";
 const CHUNK_MAGIC: &[u8; 8] = b"KHMDEC01";
 const HEAD_LEN: usize = 8 + 32 + 16 + 8 + 8 + 8 + 32;
 const CHUNK_LEN: usize = 8 + 32 + 16 + 16 + 8 + 8 + 8 + 32;
+const MIN_COMPACTION_OPS: usize = 5_000;
+// A chunk holds at least one raw operation. Twice the minimum compaction
+// floor is a fixed cleanup work budget, not a maximum chain size.
+const ORPHAN_SCAN_BUDGET: usize = MIN_COMPACTION_OPS * 2;
 
 #[derive(Clone)]
 pub(super) struct DeltaBatch {
@@ -63,7 +67,7 @@ fn checksum(prefix: &[u8], payload: &[u8]) -> [u8; 32] {
 pub(super) fn compaction_limit(base_ops: usize) -> u64 {
     u64::try_from(base_ops / 10 + usize::from(!base_ops.is_multiple_of(10)))
         .unwrap_or(u64::MAX)
-        .max(5_000)
+        .max(MIN_COMPACTION_OPS as u64)
 }
 
 fn chunk_name(nonce: Uuid) -> String {
@@ -390,26 +394,36 @@ pub(super) fn write(dir: &Path, bridge: &AnnBridge) -> Result<DeltaPublication, 
 /// unreachable. Cleanup is best effort so a failed orphan deletion cannot
 /// invalidate an otherwise complete full checkpoint.
 pub(super) fn clear(dir: &Path) -> Result<(), String> {
-    khive_vamana::remove_auxiliary_sidecar(dir, HEAD_FILE)
+    clear_with_scan_budget(dir, ORPHAN_SCAN_BUDGET)
+}
+
+fn clear_with_scan_budget(dir: &Path, scan_budget: usize) -> Result<(), String> {
+    clear_with_scan_budget_then(dir, scan_budget, || {})
+}
+
+fn clear_with_scan_budget_then(
+    dir: &Path,
+    scan_budget: usize,
+    after_head: impl FnOnce(),
+) -> Result<(), String> {
+    let cleaner = AuxiliarySidecarCleaner::open(dir)
+        .map_err(|error| format!("open memory delta directory for cleanup: {error}"))?;
+    cleaner
+        .remove_and_sync(HEAD_FILE)
         .map_err(|error| format!("remove memory delta HEAD: {error}"))?;
-    let entries = match fs::read_dir(dir) {
+    after_head();
+    let (entries, truncated) = match cleaner.scan_names_bounded(scan_budget) {
         Ok(entries) => entries,
         Err(error) => {
             tracing::warn!(%error, "memory delta orphan scan failed");
             return Ok(());
         }
     };
+    if truncated {
+        tracing::warn!(scan_budget, "memory delta orphan scan budget reached; remaining entries await a later full checkpoint");
+    }
     let mut chunks = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                tracing::warn!(%error, "memory delta orphan directory entry failed");
-                continue;
-            }
-        };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+    for name in entries {
         let Some(raw) = name
             .strip_prefix("memory_delta-")
             .and_then(|raw| raw.strip_suffix(".bin"))
@@ -417,11 +431,79 @@ pub(super) fn clear(dir: &Path) -> Result<(), String> {
             continue;
         };
         if Uuid::parse_str(raw).is_ok() {
-            chunks.push(name.to_string());
+            chunks.push(name);
         }
     }
-    if let Err(error) = khive_vamana::remove_auxiliary_sidecars(dir, &chunks) {
+    if let Err(error) = cleaner.remove_many_and_sync(&chunks) {
         tracing::warn!(%error, "memory delta orphan cleanup failed");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn orphan_cleanup_bounds_directory_visits_after_removing_head() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        fs::write(dir.join(HEAD_FILE), b"old HEAD").expect("write old HEAD");
+        for nonce in 1..=3 {
+            fs::write(dir.join(chunk_name(Uuid::from_u128(nonce))), b"orphan")
+                .expect("write orphan chunk");
+        }
+
+        clear_with_scan_budget(dir, 2).expect("bounded orphan cleanup");
+
+        assert!(!dir.join(HEAD_FILE).exists(), "HEAD must be removed first");
+        let remaining = fs::read_dir(dir)
+            .expect("list remaining chunks")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .expect("directory entry")
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("memory_delta-") && name.ends_with(".bin"))
+            })
+            .count();
+        assert_eq!(remaining, 1, "only two directory entries may be visited");
+
+        clear_with_scan_budget(dir, 2).expect("resume orphan cleanup");
+        assert_eq!(
+            fs::read_dir(dir).expect("list drained directory").count(),
+            0
+        );
+    }
+
+    #[test]
+    fn orphan_cleanup_keeps_one_directory_after_path_replacement() {
+        let temp = tempfile::tempdir().expect("parent directory");
+        let dir = temp.path().join("checkpoint");
+        let moved = temp.path().join("moved-checkpoint");
+        fs::create_dir(&dir).expect("create checkpoint directory");
+        let old_chunk = chunk_name(Uuid::from_u128(1));
+        let replacement_chunk = chunk_name(Uuid::from_u128(2));
+        fs::write(dir.join(HEAD_FILE), b"old HEAD").expect("write old HEAD");
+        fs::write(dir.join(&old_chunk), b"old orphan").expect("write old chunk");
+
+        clear_with_scan_budget_then(&dir, 10, || {
+            fs::rename(&dir, &moved).expect("move opened directory");
+            fs::create_dir(&dir).expect("replace checkpoint directory");
+            fs::write(dir.join(HEAD_FILE), b"replacement HEAD").expect("write replacement HEAD");
+            fs::write(dir.join(&replacement_chunk), b"replacement chunk")
+                .expect("write replacement chunk");
+        })
+        .expect("cleanup opened directory");
+
+        assert!(!moved.join(HEAD_FILE).exists());
+        assert!(!moved.join(&old_chunk).exists());
+        assert_eq!(fs::read(dir.join(HEAD_FILE)).unwrap(), b"replacement HEAD");
+        assert_eq!(
+            fs::read(dir.join(replacement_chunk)).unwrap(),
+            b"replacement chunk"
+        );
+    }
 }

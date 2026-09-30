@@ -9,20 +9,22 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
 use std::path::Path;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    NtCreateFile, FILE_CREATE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
-    FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileNamesInformation, NtCreateFile, NtQueryDirectoryFile, FILE_CREATE, FILE_NAMES_INFORMATION,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
     RtlNtStatusToDosError, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    OBJ_CASE_INSENSITIVE, STATUS_NO_MORE_FILES, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileAttributeTagInfo, FileDispositionInfo, FileRenameInfoEx,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
     FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
-    FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE, VOLUME_NAME_DOS,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+    FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_RENAME_INFO_0,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, SYNCHRONIZE,
+    VOLUME_NAME_DOS,
 };
 use windows_sys::Win32::System::WindowsProgramming::{
     FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
@@ -43,6 +45,20 @@ pub(super) fn write_via_dir_handle(dir: &Path, buf: &[u8]) -> Result<(), Externa
 /// The checkpoint writer shares the sidecar's verified directory-handle
 /// boundary. All later operations are relative to this pinned handle.
 pub(crate) fn open_checkpoint_directory(dir: &Path) -> std::io::Result<std::fs::File> {
+    open_checkpoint_directory_with_access(dir, FILE_READ_ATTRIBUTES)
+}
+
+pub(crate) fn open_checkpoint_directory_for_listing(dir: &Path) -> std::io::Result<std::fs::File> {
+    open_checkpoint_directory_with_access(
+        dir,
+        FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY | SYNCHRONIZE,
+    )
+}
+
+fn open_checkpoint_directory_with_access(
+    dir: &Path,
+    desired_access: u32,
+) -> std::io::Result<std::fs::File> {
     ensure_portable_ancestors_not_symlinks(dir, "inspect checkpoint dir ancestor")
         .map_err(std::io::Error::other)?;
     let metadata = ensure_not_symlink_or_reparse(dir, "inspect checkpoint dir")
@@ -53,7 +69,7 @@ pub(crate) fn open_checkpoint_directory(dir: &Path) -> std::io::Result<std::fs::
     }
     let expected = std::fs::canonicalize(dir)?;
     let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
-    let handle = open_directory(dir).map_err(std::io::Error::other)?;
+    let handle = open_directory(dir, desired_access).map_err(std::io::Error::other)?;
     verify_handle_kind(&handle, true, "inspect opened checkpoint dir")
         .map_err(std::io::Error::other)?;
     if !windows_final_path_matches(
@@ -65,6 +81,78 @@ pub(crate) fn open_checkpoint_directory(dir: &Path) -> std::io::Result<std::fs::
         ));
     }
     Ok(handle)
+}
+
+pub(crate) fn list_checkpoint_names_bounded(
+    dir: &std::fs::File,
+    max_entries: usize,
+) -> std::io::Result<(Vec<String>, bool)> {
+    let mut names = Vec::new();
+    let mut visited = 0;
+    let mut restart = true;
+    loop {
+        // A single entry needs at most 12 header bytes plus 255 UTF-16 code
+        // units; the aligned buffer also covers longer provider names.
+        let mut buffer = [0u64; 512];
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: the directory handle and writable output buffers remain live
+        // through the synchronous query. ReturnSingleEntry limits each visit.
+        let status = unsafe {
+            NtQueryDirectoryFile(
+                dir.as_raw_handle(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null(),
+                &raw mut status_block,
+                buffer.as_mut_ptr().cast(),
+                std::mem::size_of_val(&buffer) as u32,
+                FileNamesInformation,
+                true,
+                std::ptr::null(),
+                restart,
+            )
+        };
+        restart = false;
+        if status == STATUS_NO_MORE_FILES {
+            return Ok((names, false));
+        }
+        if status != 0 {
+            // SAFETY: translating an NTSTATUS has no preconditions.
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(std::io::Error::from_raw_os_error(code as i32));
+        }
+        let name_offset = std::mem::offset_of!(FILE_NAMES_INFORMATION, FileName);
+        if status_block.Information < name_offset {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint directory entry is truncated",
+            ));
+        }
+        // SAFETY: the aligned buffer contains the completed entry header.
+        let entry = unsafe { &*(buffer.as_ptr().cast::<FILE_NAMES_INFORMATION>()) };
+        let name_bytes = entry.FileNameLength as usize;
+        if !name_bytes.is_multiple_of(2)
+            || name_bytes > status_block.Information.saturating_sub(name_offset)
+            || status_block.Information > std::mem::size_of_val(&buffer)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "checkpoint directory entry has invalid name length",
+            ));
+        }
+        // SAFETY: the name length was checked against the completed buffer.
+        let units = unsafe { std::slice::from_raw_parts(entry.FileName.as_ptr(), name_bytes / 2) };
+        if units == [b'.' as u16] || units == [b'.' as u16, b'.' as u16] {
+            continue;
+        }
+        if visited == max_entries {
+            return Ok((names, true));
+        }
+        visited += 1;
+        if let Ok(name) = String::from_utf16(units) {
+            names.push(name);
+        }
+    }
 }
 
 pub(crate) fn open_checkpoint_lock(dir: &std::fs::File) -> std::io::Result<std::fs::File> {
@@ -152,7 +240,7 @@ fn write_via_dir_handle_with(
     let expected_wide: Vec<u16> = expected.as_os_str().encode_wide().collect();
     lexical_prefilter(dir)?;
 
-    let dir_file = open_directory(dir)?;
+    let dir_file = open_directory(dir, FILE_READ_ATTRIBUTES)?;
     verify_handle_kind(&dir_file, true, "inspect opened segment dir")?;
     let opened_path = final_path(&dir_file)?;
     if !windows_final_path_matches(&expected_wide, &opened_path) {
@@ -199,14 +287,14 @@ fn lexical_prefilter(dir: &Path) -> Result<(), ExternalIdsWriteError> {
     Ok(())
 }
 
-fn open_directory(dir: &Path) -> Result<std::fs::File, ExternalIdsWriteError> {
+fn open_directory(dir: &Path, desired_access: u32) -> Result<std::fs::File, ExternalIdsWriteError> {
     let wide = nul_terminated(dir.as_os_str(), "segment dir path")?;
     // SAFETY: `wide` is NUL-terminated and live for the call. A successful
     // handle is uniquely transferred into `File` below.
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            FILE_READ_ATTRIBUTES,
+            desired_access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,
