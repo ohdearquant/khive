@@ -1739,6 +1739,7 @@ impl KhiveMcpServer {
                 .map(str::to_string)
                 .collect(),
         );
+        runtime.install_note_embedding_policies(&registry.all_note_embedding_policies());
         registry.call_register_note_write_validators(&runtime);
         // #2943: install entity-kind update hooks so the generic entity
         // `update` path can re-run a pack's create-time invariant against

@@ -4411,7 +4411,7 @@ impl KhiveRuntime {
         }
 
         // Best-effort vector embedding: log and continue on failure.
-        let embed_model_names = self.registered_embedding_model_names();
+        let embed_model_names = self.embedding_models_for_note_kind(kind);
         for model_name in &embed_model_names {
             match self
                 .embed_document_with_model_outcome_for_token(
@@ -4597,18 +4597,7 @@ impl KhiveRuntime {
         let embed_model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
-            // Fan out to ALL registered models — includes both lattice models
-            // from RuntimeConfig and any custom providers added via
-            // register_embedder(). Gate on the registry, not
-            // config().embedding_model, so that custom-only runtimes (no
-            // lattice model in config) also fan out.
-            let names = self.registered_embedding_model_names();
-            if names.is_empty() {
-                // No models configured at all — skip vector embedding.
-                vec![]
-            } else {
-                names
-            }
+            self.embedding_models_for_note_kind(kind)
         };
 
         // FTS step — compensate note row on failure.
@@ -4647,7 +4636,7 @@ impl KhiveRuntime {
         // Vector embedding + insert step — compensate note row + FTS doc on failure.
         // Multi-model vector embedding:
         //   - explicit embedding_model → single model (existing behaviour)
-        //   - None + any models registered → ALL registered models in parallel
+        //   - None → the note kind's declared model policy
         //   - None + no models configured → skip (text-only)
         // The effective text sent to every embedder: the caller-supplied
         // capped override when present, otherwise the full stored content.
