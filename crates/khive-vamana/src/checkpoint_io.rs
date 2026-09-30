@@ -89,6 +89,20 @@ impl AuxiliarySidecarReader {
         }
         Ok(Some(bytes))
     }
+
+    /// Read at most the first `max_bytes` of a sidecar, whatever its size.
+    /// Missing entries return `None`; links and non-files fail closed.
+    pub fn read_prefix(&self, name: &str, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+        use io::Read as _;
+
+        let Some(file) = self.directory.open_read(name)? else {
+            return Ok(None);
+        };
+        let mut bytes = Vec::new();
+        file.take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+            .read_to_end(&mut bytes)?;
+        Ok(Some(bytes))
+    }
 }
 
 impl CheckpointDirectory {

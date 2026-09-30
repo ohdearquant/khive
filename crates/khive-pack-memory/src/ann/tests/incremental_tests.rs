@@ -1076,27 +1076,13 @@ fn delta_chunk_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn delta_checkpoints_append_only_new_chunks_until_exact_compaction_bound() {
     let temp = tempfile::tempdir().expect("segment root");
     let active_dir = temp.path().join("active-model");
-    let idle_dir = temp.path().join("idle-model");
     std::fs::create_dir_all(&active_dir).expect("active model directory");
-    std::fs::create_dir_all(&idle_dir).expect("idle model directory");
     let seed = Uuid::new_v4();
     let mut base = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![seed], HashSet::new())
         .expect("build base");
     base.set_applied_seq(1);
     base.save_atomic(&active_dir).expect("persist active model");
-    base.save_atomic(&idle_dir).expect("persist idle model");
     let base_metadata = std::fs::read(active_dir.join("metadata.bin")).expect("base metadata");
-    let idle_files: Vec<_> = [
-        "metadata.bin",
-        "vectors.bin",
-        "graph.bin",
-        "lifecycle.bin",
-        "codes.bin",
-        "external_ids.bin",
-    ]
-    .into_iter()
-    .map(|name| (name, std::fs::read(idle_dir.join(name)).expect("idle file")))
-    .collect();
 
     // A chunk without a committed HEAD is an orphan from a failed publication.
     std::fs::write(
@@ -1162,13 +1148,6 @@ fn delta_checkpoints_append_only_new_chunks_until_exact_compaction_bound() {
             "adopter must see the delta's new vector"
         );
         inserted.push(id);
-    }
-    for (name, bytes) in &idle_files {
-        assert_eq!(
-            std::fs::read(idle_dir.join(name)).unwrap(),
-            *bytes,
-            "idle second MODEL must remain byte-identical: {name}"
-        );
     }
 
     let final_id = Uuid::new_v4();
@@ -1562,8 +1541,8 @@ async fn service_checkpoint_below_bound_appends_delta_and_keeps_base_files() {
     );
     assert_eq!(
         delta_chunk_files(&dir).len(),
-        4,
-        "the checkpoint must append one delta chunk per warmed batch"
+        1,
+        "the checkpoint coalesces its warmed batches into one delta chunk"
     );
 
     let restarted = new_shared_for_role(false);

@@ -1,10 +1,13 @@
 //! Memory-owned, append-only checkpoint overlay for a stable v2 Vamana segment.
 //!
-//! A publication writes only its new immutable chunks, then atomically
-//! replaces a fixed-size HEAD. Orphan chunks from interrupted publications are
-//! never reachable from HEAD; compaction clears HEAD after the full segment is
-//! committed and removes the old chunks.
+//! A publication coalesces the batches applied since the previous publication
+//! into one new immutable chunk, then atomically replaces a fixed-size HEAD.
+//! Orphan chunks from interrupted publications are never reachable from HEAD.
+//! After a full segment is committed, cleanup walks the retired chain from
+//! HEAD, removes HEAD and every chunk on that chain, then runs a bounded
+//! best-effort sweep for crash leftovers.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use uuid::Uuid;
@@ -17,9 +20,11 @@ const HEAD_MAGIC: &[u8; 8] = b"KHMDEH01";
 const CHUNK_MAGIC: &[u8; 8] = b"KHMDEC01";
 const HEAD_LEN: usize = 8 + 32 + 16 + 8 + 8 + 8 + 32;
 const CHUNK_LEN: usize = 8 + 32 + 16 + 16 + 8 + 8 + 8 + 32;
+// Magic, base digest, nonce, and previous nonce: enough to follow a link.
+const CHUNK_LINK_LEN: usize = 8 + 32 + 16 + 16;
 const MIN_COMPACTION_OPS: usize = 5_000;
-// A chunk holds at least one raw operation. Twice the minimum compaction
-// floor is a fixed cleanup work budget, not a maximum chain size.
+// The retired chain is removed by following its links, so this budget bounds
+// only the sweep for crash leftovers (unpublished chunks and staging files).
 const ORPHAN_SCAN_BUDGET: usize = MIN_COMPACTION_OPS * 2;
 
 #[derive(Clone)]
@@ -360,14 +365,37 @@ pub(super) fn write(dir: &Path, bridge: &AnnBridge) -> Result<DeltaPublication, 
     {
         return Err("memory delta is empty or requires full compaction".into());
     }
-    let mut previous = bridge.last_delta_nonce.unwrap_or(Uuid::nil());
-    for batch in &bridge.delta_batches {
-        let nonce = Uuid::new_v4();
-        let bytes = encode_chunk(&base_digest, nonce, previous, batch);
-        khive_vamana::write_auxiliary_sidecar_atomic(dir, &chunk_name(nonce), &bytes)
-            .map_err(|error| format!("publish memory delta chunk: {error}"))?;
-        previous = nonce;
+    // One chunk per publication: the last final-state operation per UUID wins,
+    // raw counts add up, and the newest batch supplies the chunk watermark.
+    let mut seen = HashSet::new();
+    let mut ops = Vec::new();
+    for (id, vector) in bridge
+        .delta_batches
+        .iter()
+        .rev()
+        .flat_map(|batch| batch.ops.iter().rev())
+    {
+        if seen.insert(*id) {
+            ops.push((*id, vector.clone()));
+        }
     }
+    ops.reverse();
+    let coalesced = DeltaBatch {
+        applied_seq: bridge
+            .delta_batches
+            .last()
+            .map_or(0, |batch| batch.applied_seq),
+        raw_count: bridge
+            .delta_batches
+            .iter()
+            .fold(0u64, |sum, batch| sum.saturating_add(batch.raw_count)),
+        ops,
+    };
+    let nonce = Uuid::new_v4();
+    let previous = bridge.last_delta_nonce.unwrap_or(Uuid::nil());
+    let bytes = encode_chunk(&base_digest, nonce, previous, &coalesced);
+    khive_vamana::write_auxiliary_sidecar_atomic(dir, &chunk_name(nonce), &bytes)
+        .map_err(|error| format!("publish memory delta chunk: {error}"))?;
     let applied_seq = bridge
         .index
         .last_applied_seq()
@@ -375,7 +403,7 @@ pub(super) fn write(dir: &Path, bridge: &AnnBridge) -> Result<DeltaPublication, 
     let mut head = Vec::with_capacity(HEAD_LEN);
     head.extend_from_slice(HEAD_MAGIC);
     head.extend_from_slice(&base_digest);
-    head.extend_from_slice(previous.as_bytes());
+    head.extend_from_slice(nonce.as_bytes());
     head.extend_from_slice(&bridge.base_applied_seq.to_le_bytes());
     head.extend_from_slice(&applied_seq.to_le_bytes());
     head.extend_from_slice(&bridge.delta_raw_ops.to_le_bytes());
@@ -383,15 +411,81 @@ pub(super) fn write(dir: &Path, bridge: &AnnBridge) -> Result<DeltaPublication, 
     head.extend_from_slice(&hash);
     let publication = DeltaPublication {
         identity: identity(&base_digest, &head),
-        last_nonce: previous,
+        last_nonce: nonce,
     };
     khive_vamana::write_auxiliary_sidecar_atomic(dir, HEAD_FILE, &head)
         .map_err(|error| format!("publish memory delta HEAD: {error}"))?;
     Ok(publication)
 }
 
-/// Once the new full segment is committed, HEAD removal makes every old chunk
-/// unreachable. Cleanup is best effort so a failed orphan deletion cannot
+/// Chunk names on the chain HEAD currently names, newest first. Following the
+/// `previous` links costs one short read per chunk, independent of how many
+/// other entries the directory holds. The walk is best effort: it stops at a
+/// missing or malformed link and leaves the rest to the orphan sweep.
+fn retired_chain(dir: &Path) -> Vec<String> {
+    let reader = match AuxiliarySidecarReader::open(dir) {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::warn!(%error, "memory delta retired chain directory open failed");
+            return Vec::new();
+        }
+    };
+    let head = match read_optional(&reader, HEAD_FILE, HEAD_LEN) {
+        Ok(Some(head)) => head,
+        Ok(None) => return Vec::new(),
+        Err(error) => {
+            tracing::warn!(%error, "memory delta retired HEAD read failed");
+            return Vec::new();
+        }
+    };
+    if head.len() != HEAD_LEN
+        || &head[..8] != HEAD_MAGIC
+        || checksum(&head[..80], &[]) != head[80..]
+    {
+        tracing::warn!("memory delta retired HEAD is malformed; leaving its chain to the sweep");
+        return Vec::new();
+    }
+    let Ok(mut nonce) = read_nonce(&head, &mut 40) else {
+        return Vec::new();
+    };
+    let Ok(raw_count) = read_u64(&head, &mut 72) else {
+        return Vec::new();
+    };
+    // Every chunk carries at least one raw operation, so HEAD's raw count
+    // bounds the walk even if a link were to loop.
+    let mut names = Vec::new();
+    while !nonce.is_nil() && (names.len() as u64) < raw_count {
+        let name = chunk_name(nonce);
+        let link = match reader.read_prefix(&name, CHUNK_LINK_LEN) {
+            Ok(Some(link)) => link,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(%error, "memory delta retired chunk read failed");
+                break;
+            }
+        };
+        names.push(name);
+        if link.len() != CHUNK_LINK_LEN
+            || &link[..8] != CHUNK_MAGIC
+            || link[40..56] != *nonce.as_bytes()
+        {
+            break;
+        }
+        let Ok(previous) = Uuid::from_slice(&link[56..72]) else {
+            break;
+        };
+        nonce = previous;
+    }
+    names
+}
+
+/// Once the new full segment is committed, the retired chain is read from
+/// HEAD and its chunks are deleted by name, oldest first, with HEAD removed
+/// last. Readers already ignore that HEAD because the new base covers its
+/// watermark, and a crash part-way leaves HEAD naming exactly the surviving
+/// newer chunks, so the next full checkpoint resumes the walk. A bounded
+/// directory sweep then catches crash leftovers. Only HEAD removal is
+/// reported: chunk deletion is best effort so a failed unlink cannot
 /// invalidate an otherwise complete full checkpoint.
 pub(super) fn clear(dir: &Path) -> Result<(), String> {
     clear_with_scan_budget(dir, ORPHAN_SCAN_BUDGET)
@@ -408,6 +502,11 @@ fn clear_with_scan_budget_then(
 ) -> Result<(), String> {
     let cleaner = AuxiliarySidecarCleaner::open(dir)
         .map_err(|error| format!("open memory delta directory for cleanup: {error}"))?;
+    let mut retired = retired_chain(dir);
+    retired.reverse();
+    if let Err(error) = cleaner.remove_many_and_sync(&retired) {
+        tracing::warn!(%error, "memory delta retired chain cleanup failed");
+    }
     cleaner
         .remove_and_sync(HEAD_FILE)
         .map_err(|error| format!("remove memory delta HEAD: {error}"))?;
@@ -424,10 +523,12 @@ fn clear_with_scan_budget_then(
     }
     let mut chunks = Vec::new();
     for name in entries {
-        let Some(raw) = name
-            .strip_prefix("memory_delta-")
-            .and_then(|raw| raw.strip_suffix(".bin"))
-        else {
+        // `.bin.tmp` is the staging name of a chunk whose publication never
+        // reached its rename; writers hold the checkpoint lock, so it is stale.
+        let Some(raw) = name.strip_prefix("memory_delta-").and_then(|raw| {
+            raw.strip_suffix(".bin.tmp")
+                .or_else(|| raw.strip_suffix(".bin"))
+        }) else {
             continue;
         };
         if Uuid::parse_str(raw).is_ok() {
@@ -442,8 +543,232 @@ fn clear_with_scan_budget_then(
 
 #[cfg(test)]
 mod tests {
+    use super::super::{segment_commit_digest, write_external_ids_sidecar};
     use super::*;
     use std::fs;
+
+    fn persisted_base(dir: &Path) -> AnnBridge {
+        let mut base = AnnBridge::build(
+            vec![1.0, 0.0, 0.0, 0.0],
+            4,
+            vec![Uuid::new_v4()],
+            std::collections::HashSet::new(),
+        )
+        .expect("build base");
+        base.set_applied_seq(1);
+        base.save_atomic(dir).expect("persist base");
+        AnnBridge::load(dir).expect("load base")
+    }
+
+    fn publish(dir: &Path, bridge: &mut AnnBridge) -> DeltaPublication {
+        let publication = write(dir, bridge).expect("publish delta");
+        bridge.commit_digest = Some(publication.identity);
+        bridge.last_delta_nonce = Some(publication.last_nonce);
+        bridge.delta_batches.clear();
+        publication
+    }
+
+    fn delta_names(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .expect("list segment directory")
+            .filter_map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .into_string()
+                    .ok()
+            })
+            .filter(|name| name.starts_with("memory_delta-"))
+            .collect()
+    }
+
+    #[test]
+    fn publication_coalesces_pending_batches_into_one_chunk() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut bridge = persisted_base(dir);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let batches = [
+            (
+                vec![
+                    (a, Some(vec![0.0, 1.0, 0.0, 0.0])),
+                    (b, Some(vec![0.0, 0.0, 1.0, 0.0])),
+                ],
+                2,
+                2,
+            ),
+            (vec![(a, Some(vec![0.0, 0.0, 0.0, 1.0]))], 3, 3),
+            (vec![(b, None)], 4, 1),
+        ];
+        for (ops, seq, raw) in batches {
+            bridge
+                .apply_final_ops(ops.clone(), seq)
+                .expect("apply batch");
+            bridge.record_delta_batch(ops, seq, raw);
+        }
+
+        let publication = publish(dir, &mut bridge);
+
+        assert_eq!(
+            delta_names(dir),
+            vec![chunk_name(publication.last_nonce)],
+            "three pending batches publish exactly one chunk"
+        );
+        let base_digest = segment_commit_digest(dir).unwrap().expect("base commit");
+        let overlay = read(dir, &base_digest, 1, 4, 1)
+            .expect("read coalesced chain")
+            .expect("HEAD exists");
+        assert_eq!(overlay.batches.len(), 1);
+        let chunk = &overlay.batches[0];
+        assert_eq!((chunk.applied_seq, chunk.raw_count), (4, 6));
+        assert_eq!(
+            chunk.ops,
+            vec![(a, Some(vec![0.0, 0.0, 0.0, 1.0])), (b, None)],
+            "the last final-state operation per UUID wins"
+        );
+        let adopted = AnnBridge::load(dir).expect("replay coalesced chunk");
+        assert_eq!(adopted.commit_digest, Some(publication.identity));
+        assert!(adopted.id_map.contains(&a));
+    }
+
+    #[test]
+    fn full_checkpoint_reclaims_retired_chain_longer_than_scan_budget() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut bridge = persisted_base(dir);
+        let mut chain = Vec::new();
+        for seq in 2..=7u64 {
+            let ops = vec![(Uuid::new_v4(), Some(vec![0.0, 1.0, seq as f32, 0.0]))];
+            bridge
+                .apply_final_ops(ops.clone(), seq)
+                .expect("apply tail");
+            bridge.record_delta_batch(ops, seq, 1);
+            chain.push(chunk_name(publish(dir, &mut bridge).last_nonce));
+        }
+        assert_eq!(chain.len(), 6);
+
+        // Commit the new base exactly as a full save does, then retire the
+        // chain with a scan budget far smaller than the chain.
+        bridge.index.save_atomic(dir).expect("commit new base");
+        let digest = segment_commit_digest(dir).unwrap().expect("new commit");
+        write_external_ids_sidecar(dir, &digest, &bridge.id_map).expect("commit UUID sidecar");
+        clear_with_scan_budget(dir, 1).expect("retire chain");
+
+        assert!(!dir.join(HEAD_FILE).exists());
+        let left: Vec<_> = chain
+            .iter()
+            .filter(|name| dir.join(name).exists())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "every chunk on the retired chain must be removed, left {left:?}"
+        );
+        assert!(AnnBridge::load(dir).is_ok(), "the new base adopts cleanly");
+    }
+
+    /// Publish a six-chunk chain, then commit a new base over it exactly as a
+    /// full save does, leaving the chain retired but not yet cleaned.
+    fn retired_six_chunk_chain(dir: &Path) -> Vec<String> {
+        let mut bridge = persisted_base(dir);
+        let mut chain = Vec::new();
+        for seq in 2..=7u64 {
+            let ops = vec![(Uuid::new_v4(), Some(vec![0.0, 1.0, seq as f32, 0.0]))];
+            bridge
+                .apply_final_ops(ops.clone(), seq)
+                .expect("apply tail");
+            bridge.record_delta_batch(ops, seq, 1);
+            chain.push(chunk_name(publish(dir, &mut bridge).last_nonce));
+        }
+        bridge.index.save_atomic(dir).expect("commit new base");
+        let digest = segment_commit_digest(dir).unwrap().expect("new commit");
+        write_external_ids_sidecar(dir, &digest, &bridge.id_map).expect("commit UUID sidecar");
+        chain
+    }
+
+    #[test]
+    fn retired_chunks_are_removed_before_head() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path().to_path_buf();
+        let chain = retired_six_chunk_chain(&dir);
+        let observed = dir.clone();
+        clear_with_scan_budget_then(&dir, 1, move || {
+            let left: Vec<_> = chain
+                .iter()
+                .filter(|name| observed.join(name).exists())
+                .collect();
+            assert!(
+                left.is_empty(),
+                "HEAD must outlive every retired chunk, left at HEAD removal {left:?}"
+            );
+        })
+        .expect("retire chain");
+        assert!(!dir.join(HEAD_FILE).exists());
+    }
+
+    #[test]
+    fn retired_chain_cleanup_resumes_after_a_crash_before_head_removal() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let chain = retired_six_chunk_chain(dir);
+        // A crash part-way through cleanup leaves HEAD and the newer chunks,
+        // because chunks go oldest first and HEAD goes last.
+        for name in &chain[..3] {
+            fs::remove_file(dir.join(name)).expect("remove oldest chunk");
+        }
+        assert!(
+            AnnBridge::load(dir).is_ok(),
+            "a retired HEAD covered by the new base is ignored by the loader"
+        );
+
+        clear_with_scan_budget(dir, 1).expect("resume cleanup");
+
+        assert!(!dir.join(HEAD_FILE).exists());
+        let left: Vec<_> = chain
+            .iter()
+            .filter(|name| dir.join(name).exists())
+            .collect();
+        assert!(left.is_empty(), "resumed cleanup must remove {left:?}");
+    }
+
+    #[test]
+    fn orphan_sweep_removes_stale_chunk_staging_files() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let staged = format!("{}.tmp", chunk_name(Uuid::new_v4()));
+        fs::write(dir.join(&staged), b"interrupted staging").expect("stale staging file");
+        fs::write(dir.join("unrelated.tmp"), b"keep").expect("unrelated file");
+
+        clear_with_scan_budget(dir, 10).expect("sweep");
+
+        assert!(
+            !dir.join(&staged).exists(),
+            "stale chunk staging file removed"
+        );
+        assert!(
+            dir.join("unrelated.tmp").exists(),
+            "the sweep removes only delta chunk names"
+        );
+    }
+
+    #[test]
+    fn full_save_succeeds_when_cleanup_fails_after_commit() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut bridge = persisted_base(dir);
+        let before = fs::read(dir.join("metadata.bin")).expect("base metadata");
+        // A directory at the HEAD name cannot be unlinked as a file, so
+        // cleanup fails only after the new base has committed.
+        fs::create_dir(dir.join(HEAD_FILE)).expect("unremovable HEAD entry");
+        assert!(clear(dir).is_err(), "control: cleanup itself must fail");
+        bridge.set_applied_seq(2);
+
+        let digest = bridge
+            .save_atomic(dir)
+            .expect("a committed full save reports success");
+
+        assert_ne!(fs::read(dir.join("metadata.bin")).unwrap(), before);
+        assert_eq!(segment_commit_digest(dir).unwrap(), Some(digest));
+    }
 
     #[test]
     fn orphan_cleanup_bounds_directory_visits_after_removing_head() {

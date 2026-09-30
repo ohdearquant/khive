@@ -15,16 +15,22 @@ already cover.
 commit record, this consumer's wildcard registry row, and one same-snapshot (live, tail)
 read. It replaces the retired JSON-snapshot content-hash gate.
 
-| Rule | Condition | Outcome |
-| --- | --- | --- |
-| 1 | Commit record absent, corrupt, or invalid length | Cold |
-| 2 | Commit record readable but pre-amendment (no watermark) | Cold |
-| 3 | Configured embedder dimensions ≠ segment dimensions (read from embedder config, not the corpus — no storage I/O) | Cold |
-| 4 | Own wildcard registry row absent for an extended-format state | Cold, after re-registering as pending |
-| 5 | Zero live corpus | Empty, regardless of tail contents |
-| 6 | No tail above the segment's watermark `S` | Hot: mmap load, zero corpus I/O |
-| 7 | Tail exists and is within `ceil(rebuild_threshold * live)` | Stale-tail: mmap load + final-state replay, then checkpoint |
-| 8 | Tail exceeds the threshold | Stale-rebuild: serve the checksum-valid segment while a rebuild replaces it |
+| Rule | Condition                                                                                                        | Outcome                                                                     |
+| ---- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| 1    | Commit record absent, corrupt, or invalid length, or a delta HEAD that fails validation                          | Cold                                                                        |
+| 2    | Commit record readable but pre-amendment (no watermark)                                                          | Cold                                                                        |
+| 3    | Configured embedder dimensions ≠ segment dimensions (read from embedder config, not the corpus — no storage I/O) | Cold                                                                        |
+| 4    | Own wildcard registry row absent for an extended-format state                                                    | Cold, after re-registering as pending                                       |
+| 5    | Zero live corpus                                                                                                 | Empty, regardless of tail contents                                          |
+| 6    | No tail above the persisted watermark `S`                                                                        | Hot: mmap load, zero corpus I/O                                             |
+| 7    | Tail exists and is within `ceil(rebuild_threshold * live)`                                                       | Stale-tail: mmap load + final-state replay, then checkpoint                 |
+| 8    | Tail exceeds the threshold                                                                                       | Stale-rebuild: serve the checksum-valid segment while a rebuild replaces it |
+
+`S` is the watermark of the newest durable publication: the delta HEAD's watermark when a
+valid HEAD names the current base segment (see "Delta checkpoints" below), otherwise the base
+segment's own commit-record watermark. A delta chain that fails validation while loading
+(missing chunk, sequence or count mismatch, base digest mismatch, or a chain that does not
+terminate) fails the segment load, and every load-failure branch rebuilds Cold.
 
 **Evaluation order of rules 5 and 6.** Rule 6 is tested before rule 5. The tail-existence
 probe touches only the log table (no corpus join), so the common empty-tail case fast-paths
@@ -54,7 +60,8 @@ Three freshness markers have different roles:
   from replacing a newer one. It is not a durable log position.
 - **Applied watermark** records the log prefix already represented by the in-memory index.
   The next incremental batch starts above this position.
-- **Published watermark** records the committed segment's prefix. While the bridge has
+- **Published watermark** records the prefix of the newest durable publication (a full
+  segment or a delta HEAD). While the bridge has
   unpublished deltas, recall uses this earlier watermark for the fresh-tail exact leg.
   Successfully inserting a vector into the approximate graph does not by itself guarantee
   immediate recall visibility; the exact leg continues to cover those deltas until
@@ -62,11 +69,11 @@ Three freshness markers have different roles:
 
 The host batches publication using these environment settings:
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| `KHIVE_ANN_CHECKPOINT_OPS` | `1000` | Maximum dirty raw log-row threshold, further limited by the corpus-relative cap below; zero is clamped to one. |
-| `KHIVE_ANN_CHECKPOINT_SECS` | `300` | A dirty bridge becomes due when this many seconds have elapsed since its last checkpoint; zero disables the interval trigger. |
-| `KHIVE_ANN_CONSOLIDATE_TAU` | `40000` | Insert-plus-tombstone churn threshold for consolidation before publication; zero is clamped to one. |
+| Setting                     | Default | Meaning                                                                                                                       |
+| --------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `KHIVE_ANN_CHECKPOINT_OPS`  | `1000`  | Maximum dirty raw log-row threshold, further limited by the corpus-relative cap below; zero is clamped to one.                |
+| `KHIVE_ANN_CHECKPOINT_SECS` | `300`   | A dirty bridge becomes due when this many seconds have elapsed since its last checkpoint; zero disables the interval trigger. |
+| `KHIVE_ANN_CONSOLIDATE_TAU` | `40000` | Insert-plus-tombstone churn threshold for consolidation before publication; zero is clamped to one.                           |
 
 Invalid unsigned settings fall back to their defaults. These are environment settings;
 they do not imply that the ADR's described TOML or CLI configuration wiring is available.
@@ -95,18 +102,81 @@ deadline; shutdown cancels it. A newer checkpoint followed by another dirty peri
 off the remaining deadline, while failures wait for the next ordinary attempt. The local model lock
 serializes mutation and publication. Filesystem publication borrows the installed bridge
 under a read lock so searches may continue while it saves; it does not hold the index
-write lock across filesystem or database I/O. A successful file publication writes the
-complete segment and UUID sidecar before conditionally raising the registry watermark and
-compacting the protected log prefix, then re-adopts mmap backing. Applying a batch in RAM
-alone never raises that durable watermark or authorizes compaction.
+write lock across filesystem or database I/O. A successful file publication is either a
+delta checkpoint or a full save (next section); either one is durable before the
+publication conditionally raises the registry watermark and compacts the protected log
+prefix. Only a full save re-adopts mmap backing. Applying a batch in RAM alone never raises
+that durable watermark or authorizes compaction.
 
 The first valid insert after mmap adoption still copies the complete f32 vector store and
-SQ8 codes to owned memory. Later inserts reuse that owned backing until checkpoint and
+SQ8 codes to owned memory. Later inserts reuse that owned backing until a full save and
 re-adoption. Tombstones mutate graph and lifecycle state without promoting the mapped
-vector/code stores. Save and load remain full-segment operations: even a Hot load checksums
-the segment files and reconstructs owned graph, lifecycle, and UUID-map state. Batching
-amortizes those costs; it does not make the first insert or a checkpoint proportional only
-to the changed rows.
+vector/code stores. A delta checkpoint writes bytes proportional to the operations it
+publishes, not to the corpus. Loading remains a full-segment operation: even a Hot load
+checksums the segment files and reconstructs owned graph, lifecycle, and UUID-map state,
+then replays any delta chain.
+
+### Delta checkpoints
+
+The segment directory holds a stable base segment (the v2 Vamana files plus the UUID
+sidecar) and, beside it, an optional delta chain owned by the memory pack:
+
+- `memory_delta.head` is a fixed-size record: the base segment's commit digest, the newest
+  chunk's nonce, the base watermark, the delta watermark, the cumulative raw log-row count
+  of the chain, and a checksum.
+- `memory_delta-<nonce>.bin` is an immutable chunk: the base digest, its own nonce, the
+  previous chunk's nonce (nil for the first chunk after a full save), its watermark, its
+  raw row count, and the final-state operations it carries (an upsert with its vector, or a
+  delete), with a checksum over header and payload.
+
+A delta checkpoint coalesces every batch applied since the previous publication into one
+chunk: the last final-state operation per UUID wins, raw row counts are summed, and the
+newest batch's watermark becomes the chunk's watermark. It writes that chunk, then
+atomically replaces HEAD so HEAD names it. Both writes stage a `.tmp` file and rename it
+under the directory's checkpoint lock. A chunk written without its HEAD replacement is
+unreachable and is never read.
+
+A reader trusts HEAD only when its checksum is valid and it names the current base digest
+and base watermark. It then walks the chain from HEAD through the `previous` links and
+requires every chunk to match the base digest, a strictly increasing watermark from the
+base toward HEAD, a newest watermark equal to HEAD's, a raw count of at least one per chunk,
+raw counts summing to HEAD's count, and a chain that reaches nil. Chunks replay oldest
+first on top of the base. HEAD also changes the publication identity: the identity is a
+hash of the base digest and the HEAD bytes, and every HEAD carries a fresh chunk nonce, so
+each delta checkpoint is a new identity even though the base files are untouched.
+
+**Compaction bound.** A chain may accumulate fewer than `max(ceil(10% of base ops), 5000)`
+raw log rows, where base ops is the vector slot count of the base segment. A publication
+that would reach that bound is a full save instead, and a reader refuses a HEAD at or past
+it. A full save also happens whenever there is no pending delta batch to publish, which
+covers the first publication of a full corpus build. When a warm pass crosses the bound it
+publishes a full save in the same pass rather than rebuilding the corpus. Consolidation
+runs only before a full save. Because each chunk carries at least one raw row, the chain
+holds at most one fewer chunk than the bound.
+
+**Full save and cleanup.** A full save writes the complete segment and UUID sidecar; the
+commit record is the gate. After that commit it retires the old chain: it reads HEAD and
+walks the `previous` links to collect every chunk name on the chain, removes those chunks by
+name oldest first, removes HEAD last, and then runs a bounded sweep of at most 10,000 directory entries
+for crash leftovers: unreachable `memory_delta-<uuid>.bin` chunks and their
+`memory_delta-<uuid>.bin.tmp` staging files. Removing the retired chain costs one short
+read and one unlink per chunk, independent of the sweep budget, so a long chain is always
+reclaimed in full; the sweep covers only files no current HEAD names. Because HEAD goes last
+and readers already ignore it, a crash part-way through leaves HEAD naming exactly the
+surviving newer chunks, and the next full save resumes the walk. Once the commit has
+landed, a cleanup failure is logged and the save still reports success. A leftover HEAD
+whose watermark the new base covers is ignored by readers; any other HEAD that no longer
+names the base fails the load closed and rebuilds Cold.
+
+**Memory cost of an overlay.** Replaying a chain that contains any upsert goes through
+Vamana inserts, so the loader copies the complete f32 vector store and SQ8 codes out of
+the mapping into owned memory, exactly like the first insert after adoption. The publisher
+keeps its own owned copies after a delta checkpoint, because only a full save re-adopts
+mmap. So while a delta chain exists, every process that has loaded the segment (the
+publisher, restarted processes, peers following rotation, and processes that are not the
+warm index host) holds a private copy of the whole vector store and codes, and that
+resident memory is released only when a full save is adopted. A delete-only chain does not
+promote the mapped stores.
 
 ### Peer rotation and recovery
 
@@ -169,11 +239,13 @@ so a later generation-only rebuild remains monotone instead of regressing to `S 
 
 `checkpoint_raise_compact_readopt` persists a built bridge, raises the wildcard registry row,
 compacts the log across namespaces, then reopens the just-written segment via the mmap load
-path and swaps it in for the Owned build product (ADR-079 Amendment 1 §B). Pending
+path and swaps it in for the Owned build product (ADR-079 Amendment 1 §B). When the
+persisted form is a delta checkpoint (a stale-tail replay below the compaction bound), there
+is no new segment to reopen and the replayed Owned bridge is installed instead. Pending
 registration precedes the full scan (§A step 1). A failed persistence or fenced watermark
 publication never installs the candidate; a reopen failure after a successful publication may
 still serve the equivalent Owned bridge. In-memory backends install the Owned candidate
-*before* raising and compacting instead, because they have no segment for a concurrent
+_before_ raising and compacting instead, because they have no segment for a concurrent
 recall to re-resolve against — the registry guard rejects the candidate while it is pending,
 and that ordering ensures no old bridge remains observable after the watermark advances and
 its intervening tail can be deleted.
@@ -202,7 +274,7 @@ or absent registration means a peer may have retired the protection an already-c
 candidate set relied on, so the leg drops those candidates (`Replace(Vec::new(), Some(reason))`)
 even for an otherwise-disabled exact leg — a disabled leg must not leak stale state either.
 
-A pathless first checkpoint replaces the in-process bridge *before* activating its pending
+A pathless first checkpoint replaces the in-process bridge _before_ activating its pending
 row. If a query observes exactly that window, it waits on the same per-model lock the
 checkpoint holds and then revalidates, rather than risk the closed-state guard evicting a
 just-built, about-to-activate bridge.
@@ -212,7 +284,7 @@ just-built, about-to-activate bridge.
 `fresh_tail_serving` reads the wildcard-inclusive registry minimum inside the same read
 snapshot as its tail statement (the "Compaction linearization" guard, ADR-118 §1). If that
 minimum `m` exceeds the bridge's watermark `s`, the log may no longer retain every row above
-`s`, and completeness above it is unprovable — this is a *mismatch*.
+`s`, and completeness above it is unprovable — this is a _mismatch_.
 
 - **Pathless mismatch.** There is no filesystem commit record to re-resolve against by
   reading a file. A pathless checkpoint installs its replacement bridge before raising and
@@ -239,10 +311,10 @@ borrows a newer watermark while serving older, stale-bridge candidates. The load
 the query (not installed into the shared served map); `bump_generation` still forces the
 existing background machinery to adopt the segment for future queries.
 
-A further race is possible: a peer checkpoint can advance the registry minimum *past* the
+A further race is possible: a peer checkpoint can advance the registry minimum _past_ the
 just-loaded segment's own watermark in the window between the load and this function's own
 re-validation read — the same compaction race `fresh_tail_serving` already guards against for
-its own tail fetch. Unlike that primary-path guard, this one can *reload*: the segment this
+its own tail fetch. Unlike that primary-path guard, this one can _reload_: the segment this
 function loads is always the currently published one, and compaction through a minimum `M`
 implies the published segment already covers `M`. So a mismatch here re-loops instead of
 immediately falling back to a floored scan. Flooring on the first mismatch would leave the
@@ -267,7 +339,7 @@ disclosure — so no exceptional class is silently treated as healthy:
 - **`Replace(candidates, reason)`** — a compaction mismatch forced re-resolution; these
   candidates replace the caller's set outright (never merged with the stale one), since they
   are already a self-consistent `(new candidates, new watermark)` pair. `reason` is
-  `Some(..)` when the re-resolved candidates are served *without* their fresh-tail merge
+  `Some(..)` when the re-resolved candidates are served _without_ their fresh-tail merge
   (a reader/snapshot/registry/tail-fetch failure after re-resolution) — the candidate set is
   still coherent, but read-your-writes visibility was lost, and the caller must disclose
   that. `None` means the full `(candidates, tail)` pair was assembled — no degradation.

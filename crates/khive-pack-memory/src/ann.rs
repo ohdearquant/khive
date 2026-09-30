@@ -855,7 +855,10 @@ impl AnnBridge {
     /// Save this bridge to `dir` atomically: v2 Vamana segments (commit
     /// record is the gate), then the id-map sidecar bound to the blake3
     /// digest of that record. A crash between the two writes leaves a
-    /// digest mismatch that `load` detects as a torn pair.
+    /// digest mismatch that `load` detects as a torn pair. Once both are
+    /// committed, the retired delta HEAD and its chunks are removed; a failure
+    /// there is logged rather than returned, because readers already ignore a
+    /// HEAD whose watermark the new base covers.
     pub(crate) fn save_atomic(&self, dir: &std::path::Path) -> Result<[u8; 32], String> {
         let count = self.id_map.len();
         if count != self.index.num_vectors() {
@@ -873,7 +876,9 @@ impl AnnBridge {
                 "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
             })?;
         write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())?;
-        delta::clear(dir)?;
+        if let Err(error) = delta::clear(dir) {
+            tracing::warn!(%error, "memory delta cleanup failed after full checkpoint commit");
+        }
         Ok(digest)
     }
 
