@@ -330,11 +330,10 @@ not being provably retained in the log.
 
 The preflight reads only the delta HEAD, not the chunk chain it names, so a valid HEAD can
 promise a watermark the segment load then refuses to deliver (a missing or corrupt chunk).
-Any load failure inside `fresh_tail_reresolve` therefore takes the file-backed mismatch
-fallback above — the caller's candidates plus the tail above the registry minimum, read in
-one new snapshot and never below the minimum the preflight observed — rather than skipping,
-which would serve the stale candidates with no tail at all. A SQL failure while assembling
-that fallback drops the stale candidates with a disclosed `Replace`.
+A write compacted into that chain is then in neither the caller's candidates nor the log
+above the registry minimum, so no tail can complete the stale set. Any load failure inside
+`fresh_tail_reresolve` therefore drops the stale candidates with a disclosed `Replace` and
+forces re-adoption, rather than skipping, which would serve them with no tail at all.
 
 ### Outcome disclosure contract
 
@@ -356,9 +355,9 @@ disclosure — so no exceptional class is silently treated as healthy:
   but the non-empty `reason` must still be disclosed. `reason` is a failure-site label plus,
   whenever the site was holding the error that caused the skip, that error's own message,
   bounded to `SKIP_DETAIL_MAX_CHARS` characters and marked when cut. One label covers causes
-  that differ in what the caller should do next — a segment directory rewritten underneath the
-  read self-heals on the next query, a truncated segment does not, and both arrive as
-  "re-resolved segment load failed" — so a site that discards an error must pass it, and a site
+  that differ in what the caller should do next — a reader pool exhausted for a moment clears
+  on the next query, a database file the process cannot open does not, and both arrive as
+  "reader open failed" — so a site that discards an error must pass it, and a site
   that genuinely has none keeps emitting the bare label. The rendering is one string: callers
   may depend on the reason's presence, never on its wording.
 
