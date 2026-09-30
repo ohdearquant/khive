@@ -17,6 +17,7 @@ export const EDGE_RELATIONS = [
   "part_of",
   "instance_of",
   "links_to",
+  "located_in",
   "extends",
   "variant_of",
   "introduced_by",
@@ -60,7 +61,7 @@ export type NoteKind = (typeof NOTE_KINDS)[number];
 export type EdgeRelationFamily = (typeof EDGE_RELATION_FAMILY_NAMES)[number];
 
 export const EDGE_RELATION_FAMILIES = {
-  structure: ["contains", "part_of", "instance_of", "links_to"],
+  structure: ["contains", "part_of", "instance_of", "links_to", "located_in"],
   derivation: ["extends", "variant_of", "introduced_by", "supersedes"],
   provenance: ["derived_from"],
   temporal: ["precedes"],
@@ -182,7 +183,7 @@ export type EdgeLegendEntry = Readonly<{
   family: EdgeRelationFamily;
   glyph: string;
   treatment: EdgeLineTreatment;
-  variant: "primary" | "secondary" | "tertiary" | "quaternary";
+  variant: "primary" | "secondary" | "tertiary" | "quaternary" | "quinary";
   hue: string;
   directed: boolean;
 }>;
@@ -223,6 +224,15 @@ export const EDGE_RELATION_LEGEND = {
     glyph: "L",
     treatment: "quiet-solid",
     variant: "quaternary",
+    hue: neutralEdge,
+    directed: true,
+  },
+  located_in: {
+    label: "Located in",
+    family: "structure",
+    glyph: "LI",
+    treatment: "quiet-solid",
+    variant: "quinary",
     hue: neutralEdge,
     directed: true,
   },

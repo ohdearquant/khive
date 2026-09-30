@@ -92,6 +92,46 @@ async fn public_note_store_refuses_reserved_property_on_every_whole_object_route
     assert_eq!(raw.get_note(before.id).await.unwrap(), Some(before));
 }
 
+#[tokio::test]
+async fn public_note_store_cannot_forge_or_rewrite_web_receipt() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = NamespaceToken::local();
+    let store = runtime.notes(&token).unwrap();
+    let forged = Note::new("local", "observation", "forged").with_properties(json!({
+        "tags": ["web.receipt"],
+        "khive:web_receipt": "v1",
+        "request": {"verb": "web.fetch"},
+    }));
+    assert!(matches!(
+        store.upsert_note(forged).await,
+        Err(StorageError::InvalidInput { .. })
+    ));
+
+    let trusted = runtime
+        .create_web_receipt_note(&token, "web.fetch", json!({"verb": "web.fetch"}), vec![])
+        .await
+        .unwrap();
+    let mut rewritten = trusted.clone();
+    rewritten.properties.as_mut().unwrap()["request"]["verb"] = json!("web.refresh");
+    rewritten.updated_at += 1;
+    assert!(matches!(
+        store.upsert_note(rewritten).await,
+        Err(StorageError::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        store
+            .set_note_property(
+                trusted.id,
+                "request",
+                json!({"verb": "web.refresh"}),
+                trusted.updated_at + 1,
+            )
+            .await,
+        Err(StorageError::InvalidInput { .. })
+    ));
+    assert_eq!(store.get_note(trusted.id).await.unwrap(), Some(trusted));
+}
+
 async fn seed_health(runtime: &KhiveRuntime, deleted: bool) -> Note {
     let token = NamespaceToken::local();
     let mut note = Note::new("local", "channel_health", "heartbeat state");

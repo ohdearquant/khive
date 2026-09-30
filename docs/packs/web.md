@@ -39,7 +39,7 @@ spelling without being fetched again.
 ### Edge rules
 
 Two pack-declared rows — everything else this pack's verbs produce is already legal under the
-base 17-relation contract and needs no addition:
+base 19-relation contract and needs no addition:
 
 | Source         | Relation   | Target              | Written by                                             |
 | -------------- | ---------- | ------------------- | ------------------------------------------------------ |

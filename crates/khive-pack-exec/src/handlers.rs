@@ -21,7 +21,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use khive_pack_tool::policy::{actor_label, decide};
+use khive_pack_tool::policy::{
+    actor_label, decide_with_receipt, DecisionCaller, DecisionInvocation,
+};
 use khive_pack_tool::{registry_policy_inputs, RegistryPin};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::ContentRef;
@@ -970,11 +972,15 @@ async fn preflight_policy(
         .as_ref()
         .and_then(|properties| properties.get("side_effect"))
         .and_then(Value::as_str);
-    decide(
+    decide_with_receipt(
         rt,
-        token.namespace().as_str(),
-        actor,
-        &entity.name,
+        DecisionInvocation {
+            token,
+            actor,
+            tool: &entity.name,
+            registered: true,
+            caller: DecisionCaller::ExecRun,
+        },
         side_effect,
         Some(&pin),
     )

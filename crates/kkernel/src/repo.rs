@@ -1075,6 +1075,20 @@ fn preflight_tracked_inputs(repo: &Path) -> Result<()> {
             );
         }
     }
+
+    // The status check ignores submodules, so an index that drops a gitlink
+    // recorded in HEAD looks clean; the index loop above cannot see it either.
+    let head_tree = git_output(&root, &["ls-tree", "-r", "-z", "HEAD"])?;
+    for record in head_tree.split_terminator('\0') {
+        let (header, raw_path) = record
+            .split_once('\t')
+            .context("git ls-tree emitted a malformed HEAD tree record")?;
+        if header.split_ascii_whitespace().next() == Some("160000") {
+            bail!(
+                "tracked special file {raw_path:?} with Git mode 160000 is not accepted for showcase ingest"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1239,11 +1253,20 @@ mod tests {
         git(&["config", "filter.marker.smudge", helper.to_str().unwrap()]);
         git(&["config", "filter.marker.process", helper.to_str().unwrap()]);
         git(&["config", "filter.marker.required", "true"]);
-        std::fs::write(
-            repo.join("tracked.txt"),
-            "changed content with a new size\n",
-        )
-        .unwrap();
+        // Git compares size and mtime before hashing, so only a same-size edit
+        // with a stale mtime forces it to read the file through the filter.
+        let make_dirty = |contents: &[u8]| {
+            assert_eq!(contents.len(), b"original\n".len());
+            let path = repo.join("tracked.txt");
+            std::fs::write(&path, contents).unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(946_684_800))
+                .unwrap();
+        };
+        make_dirty(b"changed!\n");
 
         let attribute = Command::new("git")
             .arg("-C")
@@ -1267,6 +1290,24 @@ mod tests {
             String::from_utf8(configured_clean.stdout).unwrap().trim(),
             helper.to_str().unwrap()
         );
+
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args([
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=all",
+            ])
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .output()
+            .unwrap();
+        assert!(marker.is_file(), "ordinary git status must run the filter");
+        std::fs::remove_file(&marker).unwrap();
+        make_dirty(b"updated!\n");
         git(&["config", "core.fsmonitor", helper.to_str().unwrap()]);
 
         for key in ["clean", "smudge", "process"] {
@@ -1314,6 +1355,70 @@ mod tests {
         assert!(
             !marker.exists(),
             "repo export must not run the configured filter"
+        );
+    }
+
+    #[test]
+    fn export_preflight_refuses_head_gitlink_removed_from_index() {
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = fixture.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        let commit = |message: &str| {
+            git(&[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                message,
+            ]);
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("README"), "fixture\n").unwrap();
+        git(&["add", "README"]);
+        commit("base");
+
+        ensure_clean_snapshot(&repo).unwrap();
+        preflight_tracked_inputs(&repo)
+            .expect("a repository without gitlinks must pass the input preflight");
+
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},child"),
+        ]);
+        commit("record gitlink");
+        git(&["rm", "--cached", "-q", "child"]);
+        assert_eq!(
+            git(&["diff", "--cached", "--name-only"]),
+            "child",
+            "index must differ from HEAD"
+        );
+        ensure_clean_snapshot(&repo).expect("status ignores the staged gitlink removal");
+
+        let error = preflight_tracked_inputs(&repo).unwrap_err().to_string();
+        assert!(
+            error.contains("tracked special file \"child\" with Git mode 160000"),
+            "{error}"
         );
     }
 }

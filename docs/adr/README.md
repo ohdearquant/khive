@@ -223,6 +223,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-193](ADR-193-charter-runs.md)                                      | Charter Runs — Procedural Actions Admitted Only on Recorded Evidence                                       |
 | [ADR-194](ADR-194-sqlite-wal-extent-ceiling.md)                         | Bounded SQLite WAL Extent Ceiling Under a Pinned Reader                                                    |
 | [ADR-195](ADR-195-comm-actor-trust-classes.md)                          | Actor Trust Classes and Per-Pair Message Policy for comm                                                   |
+| [ADR-196](ADR-196-located-in-relation.md)                               | The `located_in` Relation                                                                                  |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -240,8 +241,8 @@ Supporting documents are exhibits cited by an ADR. They are not ADRs, carry no A
 ## Closed Taxonomies — Quick Reference
 
 - **Entity kinds**: 8 shared base kinds in `khive_types` (`concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`) plus KG pack-side `resource` governance for actionable knowledge resources (ADR-001, ADR-048)
-- **Edge relations (17 in 9 categories)** (ADR-002, extended by ADR-055):
-  - Structure: `contains`, `part_of`, `instance_of`
+- **Edge relations (19 in 9 categories)** (ADR-002, extended by ADR-055, ADR-191 and ADR-196):
+  - Structure: `contains`, `part_of`, `instance_of`, `links_to`, `located_in`
   - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
   - Provenance: `derived_from`
   - Temporal: `precedes`

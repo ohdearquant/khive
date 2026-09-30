@@ -7,6 +7,7 @@ use syn::parse::Parser;
 use syn::visit::Visit;
 
 const DB: &str = "khive-db/src/stores/note.rs";
+const MIGRATIONS: &str = "khive-db/src/migrations.rs";
 const EVENTS: &str = "khive-mcp/src/pending_events.rs";
 const GTD: &str = "khive-pack-gtd/src/handlers.rs";
 const GTD_REPAIR: &str = "khive-pack-gtd/src/repair.rs";
@@ -429,6 +430,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (DB, "note_set_property_statement"),
         (DB, "note_soft_delete_statement"),
         (DB, "execute_filtered_note_property_patch"),
+        (MIGRATIONS, "migrate_outbound_due_key"),
         (EVENTS, "claim_pending_event"),
         (EVENTS, "mark_dispatch_invoking"),
         (EVENTS, "renew_dispatch_lease"),
@@ -517,6 +519,9 @@ fn note_version_production_writers_never_assign_version() {
                 .replace("{p2}", "2")
                 .replace("{p3}", "3")
                 .replace("{p4}", "4")
+                .replace("{p5}", "5")
+                .replace("{p6}", "6")
+                .replace("{p7}", "7")
                 .replace("{where_clause}", "WHERE namespace='local'")
         } else if owner == "restore_note" {
             sql.replace("{key_clause}", "")
@@ -545,6 +550,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
     let writers = census();
     let cases = [
         (DB, "note_update_properties_statement", "memory", "{}"),
+        (MIGRATIONS, "migrate_outbound_due_key", "memory", "{}"),
         (
             EVENTS,
             "requeue_legacy_claim",
@@ -599,7 +605,17 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         let sql = &writers[&(file.to_owned(), owner.to_owned())];
         assert_eq!(version(&conn), 1);
         let changed = match file {
-            DB => conn.execute(sql, params![r#"{"checked":true}"#, 200_i64, ID]),
+            DB => conn.execute(
+                sql,
+                params![
+                    r#"{"checked":true}"#,
+                    200_i64,
+                    ID,
+                    rusqlite::types::Null,
+                    rusqlite::types::Null
+                ],
+            ),
+            MIGRATIONS => conn.execute(sql, params![vec![0_u8; 12], "2020-01-01T00:00:00Z", ID]),
             EVENTS => conn.execute(sql, params![200_i64, ID, "local", 100_i64, properties]),
             GTD => conn.execute(
                 sql,
