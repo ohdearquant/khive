@@ -9239,6 +9239,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(unix)]
     async fn dispatch_large_result_through_daemon(
         server: &KhiveMcpServer,
         ops: String,
@@ -9687,6 +9688,7 @@ mod tests {
         assert!(envelope["results"][0].get("result_omitted").is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn daemon_dispatch_marks_oversized_read_result_reducible_and_not_retryable() {
@@ -9725,6 +9727,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_dispatch_marks_oversized_side_effecting_assertive_verb_non_retryable_and_executed(
     ) {
@@ -9764,6 +9767,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_dispatch_marks_oversized_write_result_non_retryable_and_executed() {
         let server = large_result_test_server();
@@ -9797,6 +9801,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_chain_reports_later_write_truthfully_after_earlier_frame_budget_omission() {
         let server = large_result_test_server();
@@ -10587,6 +10592,7 @@ mod tests {
         assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn daemon_batch_keeps_rendered_result_when_compact_result_exceeds_frame() {
