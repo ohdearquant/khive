@@ -20601,7 +20601,11 @@ mod tests {
         }
     }
 
-    fn assert_embedding_truncation_after_commit(error: RuntimeError, operation: &str) -> Uuid {
+    fn assert_embedding_truncation_after_commit(
+        error: RuntimeError,
+        operation: &str,
+        discarded_bytes: u64,
+    ) -> Uuid {
         let RuntimeError::Khive(domain) = error.refusal_source() else {
             panic!("legacy caller lost its typed truncation signal: {error:?}");
         };
@@ -20617,7 +20621,7 @@ mod tests {
         )
         .expect("valid report");
         assert_eq!(report.truncated, 1);
-        assert!(report.discarded_bytes > 0);
+        assert_eq!(report.discarded_bytes, discarded_bytes);
         details
             .get("record_id")
             .expect("committed record id")
@@ -20641,7 +20645,7 @@ mod tests {
             .create_note(&tok, "observation", None, &content, None, None, vec![])
             .await
             .expect_err("legacy note create must disclose truncation");
-        let note_id = assert_embedding_truncation_after_commit(error, "create_note");
+        let note_id = assert_embedding_truncation_after_commit(error, "create_note", 8);
         let fetched = rt
             .notes(&tok)
             .unwrap()
@@ -20681,7 +20685,7 @@ mod tests {
             .expect("report-aware note create succeeds");
         assert_eq!(reported_note.content, content);
         assert_eq!(report.truncated, 1);
-        assert!(report.discarded_bytes > 0);
+        assert_eq!(report.discarded_bytes, 8);
 
         captured.lock().unwrap().clear();
         rt.reindex_note(&tok, &fetched)
@@ -20734,33 +20738,47 @@ mod tests {
             ..crate::RuntimeConfig::no_embeddings()
         })
         .unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
         rt.register_embedder(CapturingVecProvider {
             provider_name: model.to_string(),
             dims: 4,
-            captured: Arc::new(std::sync::Mutex::new(Vec::new())),
+            captured: Arc::clone(&captured),
         });
         let content = "x".repeat(MAX_TEXT_BYTES + 1);
         let outcome = rt.embed_document_outcome(&content).await.unwrap();
         assert!(outcome.truncated);
         assert_eq!(outcome.source_bytes, content.len());
+        assert_eq!(outcome.embedded_bytes, MAX_TEXT_BYTES);
+        assert_eq!(outcome.source_bytes - outcome.embedded_bytes, 1);
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &["x".repeat(MAX_TEXT_BYTES)]
+        );
         assert!(rt
             .embed_document(&content)
             .await
             .expect_err("legacy document embedding must disclose truncation")
             .to_string()
             .contains("embedding input truncated"));
-        assert!(
-            rt.embed_document_batch_outcomes(std::slice::from_ref(&content))
-                .await
-                .unwrap()[0]
-                .truncated
-        );
+        let outcomes = rt
+            .embed_document_batch_outcomes(std::slice::from_ref(&content))
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].truncated);
+        assert_eq!(outcomes[0].source_bytes, content.len());
+        assert_eq!(outcomes[0].embedded_bytes, MAX_TEXT_BYTES);
+        assert_eq!(outcomes[0].source_bytes - outcomes[0].embedded_bytes, 1);
         assert!(rt
             .embed_document_batch(&[content])
             .await
             .expect_err("default batch embedding must disclose truncation")
             .to_string()
             .contains("embedding input truncated"));
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &vec!["x".repeat(MAX_TEXT_BYTES); 4]
+        );
     }
 
     #[tokio::test]
@@ -20820,7 +20838,7 @@ mod tests {
             )
             .await
             .expect_err("legacy override variant must disclose truncation");
-        assert_embedding_truncation_after_commit(error, "create_note_with_embedding_content");
+        assert_embedding_truncation_after_commit(error, "create_note_with_embedding_content", 1);
 
         let error = rt
             .create_note_with_decay(&tok, "observation", None, &content, None, 0.5, None, vec![])
@@ -20829,6 +20847,7 @@ mod tests {
         assert_embedding_truncation_after_commit(
             error,
             "create_note_with_decay_for_embedding_model",
+            1,
         );
 
         let (note, report) = rt
@@ -20846,6 +20865,7 @@ mod tests {
             .expect("report-aware decay variant succeeds");
         assert_eq!(note.content, content);
         assert_eq!(report.truncated, 1);
+        assert_eq!(report.discarded_bytes, 1);
     }
 
     #[tokio::test]
@@ -20884,7 +20904,7 @@ mod tests {
             .await
             .expect_err("legacy guarded update must disclose truncation");
         let committed_id =
-            assert_embedding_truncation_after_commit(error, "update_entity_if_unchanged");
+            assert_embedding_truncation_after_commit(error, "update_entity_if_unchanged", 8);
         assert_eq!(committed_id, legacy.id);
         assert_eq!(
             rt.get_entity(&tok, committed_id)
@@ -20921,6 +20941,7 @@ mod tests {
             .await
             .expect("report-aware guarded update succeeds");
         assert_eq!(report.truncated, 1);
+        assert_eq!(report.discarded_bytes, 10);
     }
 
     #[tokio::test]
@@ -21517,7 +21538,10 @@ mod tests {
             .expect("report-aware attachment create succeeds");
         assert_eq!(reported.description.as_deref(), Some(description.as_str()));
         assert_eq!(report.truncated, 1);
-        assert!(report.discarded_bytes > 0);
+        assert_eq!(
+            report.discarded_bytes,
+            ("reported artifact ".len() + 1) as u64
+        );
 
         let error = runtime
             .create_entity_with_attachments(
@@ -21532,7 +21556,11 @@ mod tests {
             )
             .await
             .expect_err("legacy attachment create must disclose truncation");
-        let id = assert_embedding_truncation_after_commit(error, "create_entity_with_attachments");
+        let id = assert_embedding_truncation_after_commit(
+            error,
+            "create_entity_with_attachments",
+            ("legacy artifact ".len() + 1) as u64,
+        );
         let stored = runtime.get_entity(&token, id).await.unwrap();
         assert_eq!(stored.description.as_deref(), Some(description.as_str()));
     }

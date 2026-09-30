@@ -1149,12 +1149,27 @@ does not describe or certify truncation that may occur inside an independently r
    claim to discover every future public method. Behavioral tests exercise oversized inputs at the
    vector-only and record-only boundaries. A new public wrapper that can bound input must either
    return its outcome or report, or disclose truncation with an explicit error.
+6. `web.refresh` uses the report-aware guarded-update method for entity promotions and aggregates
+   those embedding reports for the refresh settlement. When at least one such input is bounded,
+   the reply exposes `embedding_truncation_report` and the stored receipt's `request` object carries
+   the same key and value. Both keys are absent when no input is bounded. The report contains the
+   existing `truncated` input count and `discarded_bytes` count; it does not add an aggregate
+   `embedded_bytes` field. This disclosure is distinct from the network-body `truncated` flag and
+   does not change capture ownership, deduplication or replay decisions. Tests assert the exact
+   report on both surfaces, its absence on ordinary input, and the exact bytes passed to the
+   provider; removing the receipt key must make the receipt-disclosure test fail.
+7. The entity-type backfill scan aggregates the reports from successful guarded updates in its
+   serialized `embedding_truncation_report`. A bounded embedding does not turn a committed
+   promotion into a scan failure; independent update failures retain the existing failure behavior.
+   The stock command disables embedding providers and reports zero counters. A registered-provider
+   scan fixture separately proves bounded-input disclosure and continued promotion of later rows.
 
 ### Boundary of this amendment
 
 The compatibility rule above covers the named direct vector, create, and guarded-update methods.
 Claim and reindex operations, entity and note restore, stream batch results, best-effort/trusted
-ingest, and backfill have different success and receipt contracts. They require a separate design
+ingest, and backfills other than the entity-type scan above have different success and receipt
+contracts. They require a separate design
 for aggregate or per-member disclosure; this amendment makes no assertion that their current
 return values disclose all truncation. The private atomic post-commit mapper is likewise outside
 the public API census.
@@ -1162,7 +1177,8 @@ the public API census.
 ### Consequences
 
 - External Rust consumers of the five narrowed methods must migrate to the named report-aware
-  alternatives. The MCP verb surface is unchanged.
+  alternatives. MCP verbs and parameters are unchanged; `web.refresh` adds the conditional reply
+  and receipt-request report described above.
 - Legacy write callers that previously received `Ok(record)` for bounded input now receive an
   error identifying the committed record. Normal-length input keeps its previous return shape.
 - Runtime byte accounting does not attest to provider-internal preprocessing or token limits.

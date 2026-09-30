@@ -340,6 +340,47 @@ fn entity_type_backfill_apply_canonicalizes_preserves_controls_and_is_idempotent
 }
 
 #[test]
+fn entity_type_backfill_apply_scans_two_rows_after_a_long_description_without_embeddings() {
+    let fixture = Fixture::new();
+    let description = "d".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+    {
+        let writer = fixture.runtime.backend().pool().writer().unwrap();
+        writer.execute("DELETE FROM entities", []).unwrap();
+        for (index, name, description) in [
+            (1, "First", description.as_str()),
+            (2, "Second", "short description"),
+        ] {
+            writer
+                .execute(
+                    "INSERT INTO entities \
+                     (id, namespace, kind, name, description, properties, created_at, updated_at) \
+                     VALUES (?1, ?2, 'document', ?3, ?4, '{\"type\":\"paper\"}', ?5, ?5)",
+                    (id(index), NAMESPACE, name, description, index as i64),
+                )
+                .unwrap();
+        }
+    }
+    // Target resolution disables every embedding provider for this command.
+    // The injected-provider scan regression separately exercises its latent
+    // re-embedding branch; this actual CLI run preserves the offline contract.
+    let value = report(&fixture.run(&["--apply"]));
+    assert_eq!(value["scanned"], 2);
+    assert_eq!(value["promoted"], 2);
+    assert_eq!(value["nullable_after"], 0);
+    assert_eq!(value["complete"], true);
+    assert_eq!(value["failures"], json!([]));
+    assert_eq!(
+        value["embedding_truncation_report"],
+        json!({"truncated": 0, "discarded_bytes": 0})
+    );
+    let after = fixture.entities();
+    assert_eq!(after[&id(1)]["description"], description);
+    for index in [1, 2] {
+        assert_eq!(after[&id(index)]["entity_type"], "paper");
+    }
+}
+
+#[test]
 fn entity_type_backfill_limit_counts_live_scanned_entities_not_only_candidates() {
     let fixture = Fixture::new();
     let before = fixture.entities();

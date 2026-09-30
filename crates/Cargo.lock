@@ -2585,6 +2585,7 @@ dependencies = [
  "khive-runtime",
  "khive-storage",
  "khive-types",
+ "lattice-embed",
  "libc",
  "regex",
  "reqwest 0.12.28",
