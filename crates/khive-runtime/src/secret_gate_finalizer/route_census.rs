@@ -267,7 +267,13 @@ enum Binding {
     /// the module namespace.
     Local,
     /// An import that is neither a note SQL constant nor a scanned module.
-    Other,
+    /// `type_like` is set when the imported name is UpperCamelCase, the
+    /// type-namespace convention. Only such an import hides a module or crate
+    /// of the same name at the head of a path: a function or constant lives
+    /// in the value namespace and hides nothing there, and an import whose
+    /// namespace is unknown keeps the lookup going, so it can add a reported
+    /// site but never drop one.
+    Other { type_like: bool },
     /// A note properties SQL constant, by its declared name.
     Constant(String),
     /// A scanned module, so a path through this name resolves inside it.
@@ -325,6 +331,16 @@ fn use_tree_imports(
             imports.push((rename.rename.to_string(), path));
         }
         UseTree::Glob(_) => imports.push((GLOB_IMPORT.to_owned(), prefix.clone())),
+    }
+}
+
+/// The binding for an import of `path` that the census does not follow.
+fn other_import(path: &[String]) -> Binding {
+    Binding::Other {
+        type_like: path.last().is_some_and(|name| {
+            name.starts_with(|c: char| c.is_ascii_uppercase())
+                && name.chars().any(|c| c.is_ascii_lowercase())
+        }),
     }
 }
 
@@ -446,12 +462,11 @@ fn resolve_module(
         name => (
             match in_scope(name) {
                 Some(Binding::Module(module)) => module,
-                // A name bound in scope to anything else hides child modules
-                // and workspace crates of the same name.
-                Some(_) => return None,
-                None => {
-                    child_module(current, name, modules).or_else(|| crate_root(name, modules))?
-                }
+                // A type imported under this name hides child modules and
+                // workspace crates of the same name. A value import does not,
+                // since a path head resolves in the type namespace.
+                Some(Binding::Other { type_like: true }) => return None,
+                _ => child_module(current, name, modules).or_else(|| crate_root(name, modules))?,
             },
             rest,
         ),
@@ -527,7 +542,7 @@ fn resolve_imports(
     let mut bindings = imports
         .iter()
         .filter(|(name, _)| name != GLOB_IMPORT)
-        .map(|(name, _)| (name.clone(), Binding::Other))
+        .map(|(name, path)| (name.clone(), other_import(path)))
         .collect::<SqlBindings>();
     for _ in 0..=imports.len() {
         let known = bindings.clone();
@@ -538,7 +553,7 @@ fn resolve_imports(
             bindings.insert(
                 name.clone(),
                 import_target(path, &known, parents, current_module, module_id, modules)
-                    .unwrap_or(Binding::Other),
+                    .unwrap_or_else(|| other_import(path)),
             );
         }
         // Every explicit name is already bound, and explicit imports shadow
@@ -1945,7 +1960,7 @@ fn module_paths_to_reexported_note_sql_are_reported() {
     )];
     // (description, writer source, extra sample files)
     type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
-    let cases: [Case; 11] = [
+    let cases: [Case; 14] = [
         (
             "renamed module import",
             "use crate::sql_alias as db;
@@ -2007,10 +2022,29 @@ fn module_paths_to_reexported_note_sql_are_reported() {
             &other_crate,
         ),
         (
+            "workspace crate imported under another name",
+            "use dbx as db;
+             fn write(conn: &Connection) { conn.prepare_cached(db::MERGE_SQL); }",
+            &other_crate,
+        ),
+        (
             "unrenamed self import",
             "use crate::sql_alias::{self};
              fn write(conn: &Connection) { conn.prepare_cached(sql_alias::MERGE_SQL); }",
             &[],
+        ),
+        (
+            "workspace crate behind a function import of the same name",
+            "use std::cmp::max as dbx;
+             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
+            &other_crate,
+        ),
+        (
+            "import path through a function import of the same name",
+            "use std::cmp::max as dbx;
+             use dbx::MERGE_SQL as merge;
+             fn write(conn: &Connection) { conn.prepare_cached(merge); }",
+            &other_crate,
         ),
     ];
     for (form, writer, extra) in cases {
