@@ -3749,22 +3749,8 @@ fn apply_presentation_to_result(
 fn request_read_timeout() -> std::time::Duration {
     static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
-        let configured = std::env::var("KHIVE_REQUEST_READ_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok());
-        let timeout = configured
-            .filter(|seconds| (1..=3_600).contains(seconds))
-            .map(std::time::Duration::from_secs)
-            .unwrap_or_else(|| {
-                if let Some(invalid) = configured {
-                    tracing::warn!(
-                        invalid,
-                        default = khive_storage::DEFAULT_REQUEST_READ_TIMEOUT_SECS,
-                        "KHIVE_REQUEST_READ_TIMEOUT_SECS must be in [1, 3600]"
-                    );
-                }
-                khive_storage::request_read_timeout_from_env()
-            });
+        // The storage resolver owns the accepted range and warns on a corrected value.
+        let timeout = khive_storage::request_read_timeout_from_env();
         khive_runtime::config_ledger::record_config_locked(
             "KHIVE_REQUEST_READ_TIMEOUT_SECS",
             timeout.as_secs().to_string(),
