@@ -432,7 +432,9 @@ pub(crate) async fn run_one_hop(
 
 /// Refuse any `Content-Encoding` other than `identity`. Every listed coding
 /// must be identity; an unreadable value is refused as well.
-fn refuse_content_encoding(headers: &reqwest::header::HeaderMap) -> Result<(), RuntimeError> {
+pub(crate) fn refuse_content_encoding(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<(), RuntimeError> {
     for value in headers.get_all(reqwest::header::CONTENT_ENCODING) {
         let text = value.to_str().ok();
         let coding = text.unwrap_or("<non-text value>");
