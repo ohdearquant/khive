@@ -69,10 +69,10 @@ async fn latest_receipt(
         .map(|_| id))
 }
 
-fn document_id_for_url(url: &Url) -> Uuid {
+fn document_id_for_url(token: &NamespaceToken, url: &Url) -> Uuid {
     let canonical = crate::identity::canonicalize(url.clone());
     crate::identity::document_id(
-        crate::identity::site_id(&canonical),
+        crate::identity::site_id(token.namespace(), &canonical),
         &crate::identity::path_and_query(&canonical),
     )
 }
@@ -368,7 +368,7 @@ async fn run_refresh(
                     if initial {
                         return Ok(None);
                     }
-                    let document_id = document_id_for_url(&current_url);
+                    let document_id = document_id_for_url(token, &current_url);
                     let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
                     if let Some(entity) = &snapshot {
                         crate::entities::require_entity_namespace(token, entity)?;
@@ -429,7 +429,7 @@ async fn settle_refresh_with_request_headers(
         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
     let terminal_request_snapshot = runtime
         .entities(token)?
-        .get_entity(document_id_for_url(&outcome.final_url))
+        .get_entity(document_id_for_url(token, &outcome.final_url))
         .await?;
     settle_refresh_from_snapshot(
         runtime,
@@ -467,7 +467,7 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
     let terminal_request_snapshot = runtime
         .entities(token)?
-        .get_entity(document_id_for_url(&outcome.final_url))
+        .get_entity(document_id_for_url(token, &outcome.final_url))
         .await?;
     settle_refresh_from_snapshot(
         runtime,
@@ -507,7 +507,7 @@ async fn settle_refresh_with_request_headers_before_settlement(
     // pauses after that request but before settlement, while retaining the
     // snapshot that production captures immediately before the send.
     let terminal_request_snapshot = entities
-        .get_entity(document_id_for_url(&outcome.final_url))
+        .get_entity(document_id_for_url(token, &outcome.final_url))
         .await?;
     before_settlement.await;
     settle_refresh_from_snapshot(
@@ -547,7 +547,7 @@ async fn settle_refresh_from_snapshot(
     let final_id = if redirect_hops.is_empty() {
         id
     } else {
-        document_id_for_url(&outcome.final_url)
+        document_id_for_url(token, &outcome.final_url)
     };
     if outcome.status == 304 && !redirect_hops.is_empty() {
         return Err(Refusal::new(
@@ -1379,7 +1379,7 @@ mod tests {
     async fn seed(runtime: &KhiveRuntime, token: &NamespaceToken, port: u16, body: &[u8]) -> Uuid {
         let url = Url::parse(&format!("http://127.0.0.1:{port}/r")).unwrap();
         let canonical = identity::canonicalize(url);
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical);
         crate::entities::get_or_create(
             runtime,
             token,
@@ -1923,7 +1923,10 @@ mod tests {
         assert_eq!(reply["redirects"], 1);
 
         let new_id = identity::document_id(
-            identity::site_id(&identity::canonicalize(new_url.clone())),
+            identity::site_id(
+                &khive_types::Namespace::local(),
+                &identity::canonicalize(new_url.clone()),
+            ),
             &identity::path_and_query(&identity::canonicalize(new_url.clone())),
         );
         let neighbors = runtime
@@ -1992,7 +1995,10 @@ mod tests {
         assert_eq!(reply2["redirects"], 1);
 
         let new_id2 = identity::document_id(
-            identity::site_id(&identity::canonicalize(new_url2.clone())),
+            identity::site_id(
+                &khive_types::Namespace::local(),
+                &identity::canonicalize(new_url2.clone()),
+            ),
             &identity::path_and_query(&identity::canonicalize(new_url2.clone())),
         );
         let neighbors2 = runtime
@@ -2058,7 +2064,7 @@ mod tests {
                 }
                 let canonical = identity::canonicalize(final_url.clone());
                 let final_id = identity::document_id(
-                    identity::site_id(&canonical),
+                    identity::site_id(&khive_types::Namespace::local(), &canonical),
                     &identity::path_and_query(&canonical),
                 );
                 let before_terminal = runtime

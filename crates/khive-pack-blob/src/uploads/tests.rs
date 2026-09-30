@@ -1513,3 +1513,12 @@ async fn transactional_gc_preserves_committed_and_staging_then_upload_sweep_only
         b"committed control"
     );
 }
+
+/// The verb ceiling is the storage whole-buffer ceiling. Callers that bound
+/// their inputs by `khive_storage::blob::MAX_BLOB_WHOLE_BYTES`, such as the
+/// email channel's message limit, rely on `blob.put` accepting exactly that
+/// many bytes.
+#[test]
+fn verb_object_ceiling_equals_the_storage_whole_buffer_ceiling() {
+    assert_eq!(MAX_OBJECT_BYTES, khive_storage::blob::MAX_BLOB_WHOLE_BYTES);
+}

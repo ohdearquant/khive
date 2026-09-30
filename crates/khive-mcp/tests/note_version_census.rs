@@ -450,7 +450,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (MESSAGE, "create_keyed_message_pair"),
         // A matching quarantine replay repairs legacy retention metadata in
         // one UPDATE. The note version trigger, not this writer, advances it.
-        (COMM, "handle_ingest"),
+        (COMM, "repair_duplicate_quarantine"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
@@ -578,7 +578,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         (MESSAGE, "create_keyed_message_pair", "message", "{}"),
         (
             COMM,
-            "handle_ingest",
+            "repair_duplicate_quarantine",
             "message",
             r#"{"quarantined":true,"quarantine_content_ref":"census-ref","channel_kind":"email"}"#,
         ),

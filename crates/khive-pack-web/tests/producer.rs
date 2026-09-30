@@ -35,7 +35,7 @@ async fn external_producer_mints_the_fetch_page_blob_edges_and_receipt_shape() {
     let (runtime, token, _dir) = fixture();
     let url = Url::parse("https://Example.test:443/article?z=9&a=2#section").unwrap();
     let canonical = identity::canonicalize(url.clone());
-    let expected_site = identity::site_id(&canonical);
+    let expected_site = identity::site_id(token.namespace(), &canonical);
     let expected_document =
         identity::document_id(expected_site, &identity::path_and_query(&canonical));
     let body = b"<html><body>fixture page</body></html>".to_vec();
@@ -236,7 +236,7 @@ async fn declared_compressed_body_is_refused_before_minting() {
         .unwrap_err();
     assert!(error.to_string().contains("unsupported_content_encoding"));
     let canonical = identity::canonicalize(url);
-    let site = identity::site_id(&canonical);
+    let site = identity::site_id(token.namespace(), &canonical);
     assert!(runtime
         .entities(&token)
         .unwrap()
@@ -301,7 +301,7 @@ async fn bodied_no_content_capture_is_refused_before_minting() {
     assert!(error
         .to_string()
         .contains("a 204 capture cannot carry body bytes"));
-    let site = identity::site_id(&identity::canonicalize(url));
+    let site = identity::site_id(token.namespace(), &identity::canonicalize(url));
     assert!(runtime
         .entities(&token)
         .unwrap()
