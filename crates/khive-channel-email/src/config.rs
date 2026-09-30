@@ -17,6 +17,14 @@ pub const TOPMOST_NO_AUTHSERV_ID_SENTINEL: &str = "!topmost-no-authserv-id";
 pub(crate) const DEFAULT_IMAP_MAX_MESSAGE_BYTES: usize = 25 * 1024 * 1024;
 pub(crate) const DEFAULT_IMAP_MAX_PAGE_BYTES: usize = 50 * 1024 * 1024;
 
+/// Largest accepted `KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES`. A quarantined
+/// message's original bytes are stored as one blob before the poll cursor
+/// advances past it, and a blob object holds at most 64 MiB
+/// (`khive_storage::blob::MAX_BLOB_WHOLE_BYTES`). A larger message ceiling
+/// would admit a message whose quarantine can never be stored, and the poller
+/// would hold its progress on that message forever.
+pub const MAX_IMAP_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 /// The trust-anchor mode this deployment uses to select which
 /// `Authentication-Results` header to trust (ADR-056 Amendment 2026-07-03,
 /// "EXO no-authserv-id trust anchor"). Parsed once, at config load, from
@@ -166,7 +174,8 @@ impl EmailChannelConfig {
     /// Optional variables with defaults:
     /// - `KHIVE_EMAIL_SMTP_PORT` (default `587`)
     /// - `KHIVE_EMAIL_IMAP_PORT` (default `993`)
-    /// - `KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES` (default 25 MiB)
+    /// - `KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES` (default 25 MiB, at most
+    ///   [`MAX_IMAP_MESSAGE_BYTES`])
     /// - `KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES` (default 50 MiB)
     /// - `KHIVE_EMAIL_MAILBOX` (default: same as `KHIVE_EMAIL_USERNAME`)
     /// - `KHIVE_EMAIL_QUARANTINE_STORE` (default `true`)
@@ -179,6 +188,12 @@ impl EmailChannelConfig {
             "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
             DEFAULT_IMAP_MAX_MESSAGE_BYTES,
         )?;
+        if imap_max_message_bytes > MAX_IMAP_MESSAGE_BYTES {
+            return Err(ChannelError::Config(format!(
+                "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES must be at most {MAX_IMAP_MESSAGE_BYTES}, \
+                 the largest message whose original a quarantine can store"
+            )));
+        }
         let imap_max_page_bytes = optional_positive_bytes(
             "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
             DEFAULT_IMAP_MAX_PAGE_BYTES,
@@ -851,5 +866,61 @@ mod tests {
 
         let config = EmailChannelConfig::from_env().expect("valid config must succeed");
         assert_eq!(config.trust_anchor, TrustAnchor::TopmostNoAuthservId);
+    }
+
+    #[test]
+    fn from_env_bounds_message_bytes_by_the_quarantine_blob_ceiling() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let keys = [
+            "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAINTAINER_ADDRESS",
+            "KHIVE_EMAIL_AUTHSERV_ID",
+            "KHIVE_EMAIL_PASSWORD",
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
+            TID,
+            CID,
+            CS,
+        ];
+        let _snap = EnvSnapshot::capture(&keys);
+
+        std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.com");
+        std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.com");
+        std::env::set_var("KHIVE_EMAIL_USERNAME", "user@example.com");
+        std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+        std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.example.com");
+        std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+        std::env::remove_var(TID);
+        std::env::remove_var(CID);
+        std::env::remove_var(CS);
+        // The page budget is set far above both arms, so only the message
+        // ceiling can refuse.
+        std::env::set_var(
+            "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
+            (4 * MAX_IMAP_MESSAGE_BYTES).to_string(),
+        );
+
+        std::env::set_var(
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            (MAX_IMAP_MESSAGE_BYTES + 1).to_string(),
+        );
+        let msg = EmailChannelConfig::from_env()
+            .expect_err("a message ceiling above the blob object ceiling must refuse")
+            .to_string();
+        assert!(
+            msg.contains("KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES")
+                && msg.contains(&MAX_IMAP_MESSAGE_BYTES.to_string()),
+            "got: {msg}"
+        );
+
+        std::env::set_var(
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            MAX_IMAP_MESSAGE_BYTES.to_string(),
+        );
+        let config = EmailChannelConfig::from_env()
+            .expect("a message ceiling equal to the blob object ceiling is accepted");
+        assert_eq!(config.imap_max_message_bytes, MAX_IMAP_MESSAGE_BYTES);
     }
 }

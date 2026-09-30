@@ -30,6 +30,10 @@ Every UID that passed the size preflight must appear exactly once in `fetched_ra
   detect a body that grew after the size check. The first UID that would exceed the page
   budget is left for the next poll, and the checkpoint advances only through
   the processed prefix. Missing or duplicate size responses reject the page.
+- `KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES` is accepted up to 64 MiB, and a larger value refuses
+  at startup. A quarantined message's original bytes are stored as one blob before the
+  cursor advances past it, and a blob object holds at most 64 MiB, so a larger ceiling
+  would admit a message whose quarantine could never be stored.
 - A fetch response for a UID **outside** `selected_uids` is unrequested (e.g. a stray server
   response) and is ignored with a `warn!`; it never affects page validity or the candidate
   high-water mark.

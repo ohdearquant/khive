@@ -655,8 +655,12 @@ alone does not own stored bytes. A duplicate transport id repairs a missing
 attachment only when its stored reference matches the replayed bytes and the
 exact channel kind and slug match. The one-release legacy IMAP lookup applies
 those same ownership checks before acknowledging a quarantined replay; the
-old-key note is not rewritten, though a missing matching attachment can be
-restored. A matching channel-scoped replay also
+old-key note keeps its stored `external_id`; the lookup already matched its
+`channel_slug`, and the repair backfills a missing `quarantine_content_ref` and
+restores a missing matching attachment. When that old-key row has no `expires_at`, the
+repair also installs one from replay time plus configured retention, so the row
+that now owns the original bytes is selected by channel cleanup; an existing
+deadline on an old-key row is left as it is. A matching channel-scoped replay also
 installs a missing expiry deadline from replay time plus configured retention
 while preserving a later existing deadline. An older quarantine row without a
 slug occupies the empty channel partition under ADR-056 and cannot be claimed

@@ -2281,8 +2281,13 @@ async fn repair_duplicate_quarantine(
     }
     // Compute the replay grace before installing the owner, so an
     // unrepresentable deadline cannot leave a partially repaired row.
+    // A current-key replay extends retention. A legacy-key row with no
+    // deadline at all also gets one, because the repair makes it the owner of
+    // the original bytes and no cleanup selector reaches a slugged row whose
+    // expiry is NULL. A legacy row that already has a deadline keeps it.
+    let install_deadline = extend_retention || duplicate.expires_at.is_none();
     let replay_deadline =
-        if extend_retention && stored_channel_kind.is_some() && channel_slug.is_some() {
+        if install_deadline && stored_channel_kind.is_some() && channel_slug.is_some() {
             let grace_us = i64::try_from(retention.as_micros()).map_err(|_| {
                 RuntimeError::InvalidInput(
                     "ingest: quarantine replay retention exceeds i64 microseconds".into(),
@@ -2357,8 +2362,9 @@ async fn repair_duplicate_quarantine(
         if needs_ref_backfill || replay_deadline.is_some() {
             // The duplicate lookup has already matched the exact channel kind
             // and slug. Repair a pre-attachment quarantine's ContentRef before
-            // acknowledging it, and extend retention only for a current-key
-            // replay. A concurrent identity change cannot redirect cleanup.
+            // acknowledging it, and install or extend retention for a
+            // current-key replay or a row with no deadline. A concurrent
+            // identity change cannot redirect cleanup.
             let sql = runtime.sql();
             let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
             let repaired = writer
@@ -2566,8 +2572,9 @@ pub(crate) async fn handle_ingest(
         None
     };
 
-    // One-release IMAP migration: read the pre-account key but never rewrite
-    // its stored row. The old key was shared across accounts on one host, so
+    // One-release IMAP migration: read the pre-account key and keep its stored
+    // external_id; a quarantine replay may only repair ownership and retention
+    // on the row. The old key was shared across accounts on one host, so
     // the lookup MUST include the credential slug; an old row for account A
     // must not suppress account B's first delivery of the same UID.
     if let Some(ref old_id) = p.legacy_external_id {
@@ -4949,6 +4956,156 @@ mod tests {
                 .expect("stored attachment"),
             Some(competing),
             "the competing writer's role must survive the replay"
+        );
+    }
+
+    /// A pre-retention row stored under the legacy IMAP key has a channel slug
+    /// and no `expires_at`. Replaying its quarantined message attaches the
+    /// original bytes to that row, so cleanup must be able to select the row
+    /// once retention elapses and release the attachment with it.
+    #[tokio::test]
+    async fn legacy_key_quarantine_replay_installs_a_deadline_that_cleanup_selects() {
+        use std::sync::Arc;
+
+        use khive_runtime::Namespace;
+        use khive_storage::{BlobStore as _, Note};
+
+        let retention = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+        let runtime = super::KhiveRuntime::memory().expect("in-memory runtime");
+        let blob_root = tempfile::tempdir().expect("blob root");
+        let blob_store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+                .expect("blob store"),
+        );
+        let original_ref = blob_store
+            .put(b"legacy quarantine original".to_vec())
+            .await
+            .expect("publish original");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let old_id = "imap:mail.example.com:17:legacy-retention";
+        let new_id = "imap:mail.example.com:a@example.com:17:legacy-retention";
+
+        // Plant the pre-retention row directly: matching slug, no deadline,
+        // no attachment.
+        let legacy_thread = uuid::Uuid::new_v4().as_hyphenated().to_string();
+        let legacy = Note::new("local", "message", "legacy quarantine").with_properties(json!({
+            "external_id": old_id,
+            "direction": "inbound",
+            "thread_id": legacy_thread,
+            "channel_kind": "email",
+            "channel_slug": "a@example.com",
+            "quarantined": true,
+        }));
+        assert!(legacy.expires_at.is_none(), "fixture must have no deadline");
+        let note_id = legacy.id;
+        assert!(runtime
+            .backend()
+            .notes()
+            .expect("backend notes")
+            .try_insert_note(legacy)
+            .await
+            .expect("seed legacy row"));
+
+        let signal = crate::inbox_signal::InboxSignal::new();
+        let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+        let replay_started = chrono::Utc::now().timestamp_micros();
+        let ack = super::handle_ingest(
+            &runtime,
+            &signal,
+            Some(&capability),
+            &Ok(None),
+            &token,
+            json!({
+                "from": "email:quarantine", "to": "local",
+                "content": "replayed quarantine", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": new_id,
+                "legacy_external_id": old_id,
+                "metadata": {
+                    "quarantined": true,
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+            retention,
+        )
+        .await
+        .expect("legacy-key replay");
+        assert_eq!(ack["deduplicated"], true);
+        assert_eq!(ack["thread_id"], legacy_thread);
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .expect("note store")
+                .count_notes("local", Some("message"))
+                .await
+                .unwrap(),
+            1,
+            "the replay must repair the legacy row, not create a second one"
+        );
+
+        let attachments = runtime.core().attachments().expect("attachment store");
+        assert_eq!(
+            attachments
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .expect("repair roots the original")
+                .content_ref,
+            original_ref
+        );
+        let notes = runtime.notes(&token).expect("note store");
+        let repaired = notes
+            .get_note(note_id)
+            .await
+            .expect("row lookup")
+            .expect("legacy row retained");
+        let deadline = repaired
+            .expires_at
+            .expect("the repair must give the owning row a deadline");
+        let retention_us = i64::try_from(retention.as_micros()).unwrap();
+        assert!(
+            deadline >= replay_started + retention_us,
+            "deadline {deadline} must be replay time plus retention"
+        );
+
+        let cleanup = |as_of: i64| {
+            super::handle_cleanup_expired_quarantine(
+                &runtime,
+                &token,
+                json!({
+                    "channel_kind": "email",
+                    "channel_slug": "a@example.com",
+                    "as_of_micros": as_of,
+                }),
+                retention,
+            )
+        };
+        assert_eq!(
+            cleanup(replay_started).await.expect("early cleanup")["deleted"],
+            0,
+            "an unexpired row and its attachment must survive"
+        );
+        assert!(notes.get_note(note_id).await.unwrap().is_some());
+
+        assert_eq!(
+            cleanup(deadline + 1).await.expect("expired cleanup")["deleted"],
+            1,
+            "cleanup must select the repaired legacy row once retention elapses"
+        );
+        assert!(notes
+            .get_note_including_deleted(note_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            attachments
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .is_none(),
+            "hard deletion must release the original's owner"
         );
     }
 

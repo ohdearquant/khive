@@ -13597,6 +13597,18 @@ backend = "kg-backend"
 
         const SOURCE: &str = "imap+tls:h:993:m:INBOX";
 
+        /// The poller stores every quarantined email's original as one blob
+        /// before it commits the cursor, so the channel's accepted message
+        /// ceiling must fit one blob object. A larger ceiling admits a message
+        /// whose quarantine `blob.put` refuses on every poll.
+        #[test]
+        fn email_message_ceiling_fits_one_blob_object() {
+            assert_eq!(
+                khive_channel_email::config::MAX_IMAP_MESSAGE_BYTES as u64,
+                khive_storage::blob::MAX_BLOB_WHOLE_BYTES
+            );
+        }
+
         /// First `poll_page` call returns one message that ingests cleanly
         /// and one that permanently fails `comm.ingest` validation (empty
         /// content) -- simulating a partial-page ingest failure. Every
