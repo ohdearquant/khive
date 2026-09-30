@@ -37,7 +37,8 @@ Every UID that passed the size preflight must appear exactly once in `fetched_ra
 - Quarantine storage is bounded in aggregate as well as per message.
   `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED` (default 256) caps how many live quarantine
   records in the ingest namespace may hold a stored original; the poller counts them
-  before each `blob.put` (the `quarantined_count` that `comm.health` reports, so the
+  before each `blob.put`, both for a message the adapter quarantined and for one it
+  quarantines because `comm.ingest` refused it (the `quarantined_count` that `comm.health` reports, so the
   cap survives restarts and frees up as expired records are cleaned up). Once the cap
   is reached, a quarantined message is still ingested and the cursor still advances,
   but its bytes are not stored: the record has no `quarantine_content_ref` and carries

@@ -781,6 +781,7 @@ async fn ensure_channel_quarantine_storage(
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
 async fn quarantine_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -789,6 +790,7 @@ async fn quarantine_channel_ingest_failure(
     default_inbound_actor: Option<&str>,
     envelope: &khive_channel::ChannelEnvelope,
     classification: khive_runtime::ChannelIngestFailureClass,
+    retention_limit: Option<usize>,
 ) -> Result<(), khive_runtime::RuntimeError> {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
@@ -805,17 +807,39 @@ async fn quarantine_channel_ingest_failure(
         .map(|replay| (replay.bytes.as_slice(), replay.notification_to.as_str()))
         .unwrap_or_else(|| (envelope.content.as_bytes(), envelope.to.as_str()));
 
-    let put = registry
-        .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
-        .await?;
-    let content_ref = put
-        .get("content_ref")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            khive_runtime::RuntimeError::Internal(
-                "blob.put returned no string content_ref for channel quarantine".to_string(),
-            )
-        })?;
+    // The same retention bound as the poller's own quarantine path: past it
+    // the message is still recorded, without its original bytes. An error
+    // reading the count holds progress through the caller.
+    let content_ref = if quarantine_original_may_be_retained(
+        registry,
+        ingest_namespace,
+        retention_limit,
+    )
+    .await?
+    {
+        let put = registry
+            .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
+            .await?;
+        Some(
+            put.get("content_ref")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    khive_runtime::RuntimeError::Internal(
+                        "blob.put returned no string content_ref for channel quarantine"
+                            .to_string(),
+                    )
+                })?
+                .to_string(),
+        )
+    } else {
+        tracing::warn!(
+            channel = channel_kind,
+            external_id,
+            limit = retention_limit,
+            "quarantine retention limit reached; recording the refused message without its original bytes"
+        );
+        None
+    };
 
     // Quarantine sender prefix invariant: the sender retains the originating
     // channel prefix because prefix-keyed consumers depend on it for alert
@@ -826,22 +850,33 @@ async fn quarantine_channel_ingest_failure(
         "quarantine sender prefix invariant: prefix-keyed consumers require the channel prefix"
     );
 
+    let mut metadata = json!({
+        "quarantined": "true",
+        "quarantine_classification": classification.name(),
+        "quarantine_reason": classification.reason(),
+        "quarantine_external_id": external_id,
+    });
+    let content = match &content_ref {
+        Some(content_ref) => {
+            metadata["quarantine_content_ref"] = json!(content_ref);
+            "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference."
+        }
+        None => {
+            metadata["quarantine_original_retained"] = json!("false");
+            metadata["quarantine_original_not_retained_reason"] = json!("retention-limit");
+            "Inbound channel message quarantined. Its original bytes were not stored because the quarantine retention limit was reached."
+        }
+    };
     let mut params = json!({
         "namespace": ingest_namespace,
         "from": quarantine_sender,
         "to": notification_to,
-        "content": "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference.",
+        "content": content,
         "channel_kind": channel_kind,
         "channel_slug": channel_slug,
         "external_id": external_id,
         "correlation_external_id": envelope.correlation_external_id.clone(),
-        "metadata": {
-            "quarantined": "true",
-            "quarantine_classification": classification.name(),
-            "quarantine_reason": classification.reason(),
-            "quarantine_external_id": external_id,
-            "quarantine_content_ref": content_ref,
-        },
+        "metadata": metadata,
     });
     if let Some(actor) = default_inbound_actor {
         params["default_inbound_actor"] = json!(actor);
@@ -852,6 +887,7 @@ async fn quarantine_channel_ingest_failure(
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
 async fn handle_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -860,6 +896,7 @@ async fn handle_channel_ingest_failure(
     envelope: &khive_channel::ChannelEnvelope,
     error: &khive_runtime::RuntimeError,
     unknown_attempts: &mut std::collections::HashMap<String, u8>,
+    retention_limit: Option<usize>,
 ) -> bool {
     let (channel_kind, channel_slug) = channel;
     let classification = error.channel_ingest_failure_class();
@@ -890,6 +927,7 @@ async fn handle_channel_ingest_failure(
                 default_inbound_actor,
                 envelope,
                 classification,
+                retention_limit,
             )
             .await
             {
@@ -981,7 +1019,7 @@ async fn channel_cycle_wait(
 /// (`comm.health`'s `quarantined_count`), so it survives restarts and shrinks
 /// as expired records are cleaned up. Records stored without an original count
 /// too, which keeps the bound conservative. `None` applies no bound.
-#[cfg(feature = "channel-email")]
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 async fn quarantine_original_may_be_retained(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -1334,6 +1372,7 @@ async fn channel_poll_loop(
                                 &env,
                                 &error,
                                 &mut unknown_ingest_attempts,
+                                channel.quarantine_retention_limit(),
                             )
                             .await;
                             if !handled {
@@ -2147,6 +2186,8 @@ async fn telegram_poll_loop(
                             &env,
                             &error,
                             &mut unknown_ingest_attempts,
+                            // The Telegram adapter declares no retention bound.
+                            None,
                         )
                         .await;
                         if !handled {
@@ -15461,6 +15502,114 @@ backend = "kg-backend"
             assert_eq!(stored_objects, 0);
         }
 
+        /// Quarantine three messages that `comm.ingest` refused, through the
+        /// ingest-failure path, under `limit`. Returns the stored message
+        /// properties sorted by external id and the number of blob objects.
+        async fn quarantine_three_refused_messages(
+            limit: Option<usize>,
+        ) -> (Vec<serde_json::Value>, usize) {
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            for index in 1..=3u32 {
+                let envelope = ChannelEnvelope::new(
+                    "email:maintainer@example.com",
+                    "email:mailbox@example.com",
+                    "refused body",
+                )
+                .with_external_id(format!("imap:h:refused:11:{index}"))
+                .with_quarantine_replay(
+                    format!("original message {index}").into_bytes(),
+                    "email:maintainer@example.com",
+                );
+                quarantine_channel_ingest_failure(
+                    &registry,
+                    "test-ns",
+                    "email",
+                    "email",
+                    Some("actor:test"),
+                    &envelope,
+                    khive_runtime::ChannelIngestFailureClass::Permanent {
+                        reason: "SecretDetected",
+                    },
+                    limit,
+                )
+                .await
+                .expect("a refused message is always recorded");
+            }
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let mut properties: Vec<serde_json::Value> = inbox["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .map(|note| note["properties"].clone())
+                .collect();
+            properties.sort_by_key(|props| props["external_id"].as_str().map(str::to_string));
+            (properties, count_files(blob_dir.path()))
+        }
+
+        #[tokio::test]
+        async fn refused_message_originals_stop_at_the_retention_limit_but_every_record_is_kept() {
+            let (notes, stored_objects) = quarantine_three_refused_messages(Some(2)).await;
+            assert_eq!(notes.len(), 3, "every refused message is recorded");
+            for retained in &notes[..2] {
+                assert!(
+                    retained["quarantine_content_ref"].is_string(),
+                    "below the limit the original is retained: {retained}"
+                );
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            let omitted = &notes[2];
+            assert_eq!(omitted["quarantined"], "true");
+            assert_eq!(omitted["external_id"], "imap:h:refused:11:3");
+            assert!(
+                omitted.get("quarantine_content_ref").is_none(),
+                "past the limit no original is published: {omitted}"
+            );
+            assert_eq!(omitted["quarantine_original_retained"], "false");
+            assert_eq!(
+                omitted["quarantine_original_not_retained_reason"],
+                "retention-limit"
+            );
+            assert_eq!(
+                stored_objects, 2,
+                "blob.put ran only for the two originals under the limit"
+            );
+        }
+
+        #[tokio::test]
+        async fn refused_message_originals_are_unbounded_without_a_limit() {
+            let (notes, stored_objects) = quarantine_three_refused_messages(None).await;
+            assert_eq!(notes.len(), 3);
+            for retained in &notes {
+                assert!(retained["quarantine_content_ref"].is_string());
+            }
+            assert_eq!(stored_objects, 3);
+        }
+
         #[tokio::test(start_paused = true)]
         async fn content_refusal_stores_exact_replay_and_ingests_body_free_quarantine() {
             const EXTERNAL_ID: &str = "imap:h:11:7";
@@ -15649,6 +15798,7 @@ backend = "kg-backend"
                 khive_runtime::ChannelIngestFailureClass::Permanent {
                     reason: "SecretDetected",
                 },
+                None,
             )
             .await
             .expect("duplicate quarantine repairs its missing blob owner");

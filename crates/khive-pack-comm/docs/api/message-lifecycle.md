@@ -687,7 +687,8 @@ cannot produce a success heartbeat or advance transport progress.
 The number of quarantine records that hold an original is bounded per channel
 configuration (for email, `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED`, default 256; see the
 [IMAP connector notes](../../../khive-channel-email/docs/api/imap-connector.md)).
-Before publishing an original the poller reads `comm.health`'s
+Before publishing an original, whether the adapter quarantined the message or
+`comm.ingest` refused it, the poller reads `comm.health`'s
 `quarantined_count` for the ingest namespace. At the cap, `comm.ingest`
 receives the quarantine record without `quarantine_content_ref` and with
 `quarantine_original_retained: "false"` and

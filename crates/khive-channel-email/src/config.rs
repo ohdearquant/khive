@@ -156,7 +156,7 @@ pub struct EmailChannelConfig {
     /// once. Every quarantined message is still recorded; once the ingest
     /// namespace holds this many live quarantine records, further records are
     /// stored without the original bytes and marked as such. Defaults to
-    /// [`DEFAULT_QUARANTINE_MAX_RETAINED`]; `0` stores no originals.
+    /// 256 (`KHIVE_EMAIL_QUARANTINE_MAX_RETAINED` sets it); `0` stores no originals.
     pub quarantine_max_retained: usize,
 }
 
