@@ -626,7 +626,7 @@ The body concordance checks fail closed when a capture changes during hydration 
 
 ## Amendment 8 (2026-09-29): web requests ask for identity encoding and refuse any declared content coding
 
-**Status: Proposed (2026-09-29).**
+**Status: Accepted (2026-09-29).**
 
 **Context.** The web pack's HTTP client used to send `Accept-Encoding: gzip` and decode the response before the byte bound was applied. ADR-175 A1.2 rule 5 gave the reason: a small compressed response can expand without limit, so a bound on the encoded stream bounds nothing the caller sees. The decoding was done by the `compression-codecs` crate, which `reqwest` reaches through its `gzip` feature. In `compression-codecs` releases through at least 0.4.43 (the parser reads the same in 0.4.38, 0.4.41 and 0.4.42; this workspace locked 0.4.42) the gzip header parser takes the parsed header state before it reads the header-CRC (FHCRC) flag. The flag therefore always reads as unset, and the two header-CRC bytes go to the inflater as compressed data. A response whose gzip header sets that flag can then decode into bytes that are not the origin's content, or fail to decode, depending on other header fields. In the first case the client reports no error, so the pack would store those bytes under a content digest and a receipt as if the origin had sent them. The requirement behind rule 5 stands: the byte bound must limit what the caller receives. This amendment meets it without a decoder. Nothing is decoded, so the bytes read are the bytes the origin sent.
 
@@ -683,7 +683,7 @@ The body concordance checks fail closed when a capture changes during hydration 
 
 ## Amendment 9 (2026-09-29): web receipt provenance and the legacy chain boundary
 
-**Status**: Proposed; pending Leo sign-off.
+**Status**: Accepted (2026-09-30)
 
 **Context.** A note with kind `observation`, tag `web.receipt`, matching request fields and an `annotates` edge could previously be written through generic `create`. Its shape alone did not prove that a web operation observed the claimed response. Refresh could reuse its validators and extraction could treat its response `Link` fields as capture evidence (#3499). Receipts already stored before this provenance change have the same unmarked shape.
 
