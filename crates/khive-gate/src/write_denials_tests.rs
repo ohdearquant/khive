@@ -202,6 +202,8 @@ fn operation_classification_is_sorted_explicit_and_not_inferred_from_names() {
         ("brain.record_serve", OperationAccess::Write),
         ("memory.recall", OperationAccess::Read),
         ("session.resume", OperationAccess::Read),
+        ("session.stats", OperationAccess::Read),
+        ("session.vacuum", OperationAccess::Write),
         ("agent.resume", OperationAccess::Write),
     ] {
         assert_eq!(classify_operation(verb), Some(expected));
@@ -211,4 +213,21 @@ fn operation_classification_is_sorted_explicit_and_not_inferred_from_names() {
         classify_operation("brain.feedback")
     );
     assert_eq!(classify_operation("new_pack.read"), None);
+}
+
+#[test]
+fn session_maintenance_respects_write_denials() {
+    let gate = CallerEnrollmentGate::with_write_denials(
+        vec!["seat:reader".into()],
+        false,
+        vec!["seat:reader".into()],
+    );
+    assert!(gate
+        .check(&request("seat:reader", "session.stats"))
+        .unwrap()
+        .is_allow());
+    assert!(matches!(
+        gate.check(&request("seat:reader", "session.vacuum")),
+        Ok(GateDecision::Deny { reason }) if reason.contains("deny_writes_for")
+    ));
 }

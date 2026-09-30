@@ -263,3 +263,160 @@ uploads that survive a daemon restart, and a dedup flag on the result.
    MinIO-compatible target (the ADR-111 Amendment 2 lane) and reads back byte-identical; abort leaves no
    staging object.
 10. Where ADR-111 Amendment 4's put ledger exists: no row before commit and exactly one after.
+
+## Amendment 1 (2026-09-29): per-upload leases on a shared filesystem root
+
+**Status: Proposed (2026-09-29).** This amendment specifies the fix for the shared-root expiry gap in
+[#3643](https://github.com/ohdearquant/khive/issues/3643). It amends §2, §3b, §4 and Acceptance
+5–6 as follows, and adds the seven Acceptance arms at its end. Today a filesystem sweep
+compares every staged file's mtime with the
+sweeping daemon's `KHIVE_BLOB_UPLOAD_IDLE_SECS`; a shorter-bound daemon can therefore
+remove another daemon's still-live upload. The S3 multipart lifecycle rule and its sweep
+are unchanged. This amendment closes the design gap identified in
+[ADR-121](ADR-121-attachments-first-class.md) Amendment 6, Decision 3,
+which is still proposed in [PR #3642](https://github.com/ohdearquant/khive/pull/3642) as
+this amendment is drafted. Reconcile that cross-reference if PR #3642 changes before merge;
+neither amendment treats an upload as an orphan-GC object.
+
+### Decision
+
+1. **The owner stamps an upload lease at begin.** For each filesystem staging file
+   `<root>/.uploads/<id>`, `begin_upload` writes a sibling `<root>/.uploads/<id>.lease`
+   containing `owner`, `idle_secs`, `renew_seq` and `renewed_at`. `owner` is the validated
+   durable store binding ID, or the main database's durable identity before a fresh
+   binding exists; it is never the caller actor or a process ID. `idle_secs` is the
+   positive `KHIVE_BLOB_UPLOAD_IDLE_SECS` value resolved by that upload's owning daemon at
+   begin, and remains fixed for that upload. The filesystem upload policy caps this
+   resolved bound at six hours: a configured value above 21,600 seconds clamps to 21,600
+   seconds and emits a warning naming `KHIVE_BLOB_UPLOAD_IDLE_SECS`, the configured value,
+   and the six-hour clamp. It does not refuse service startup; the S3 upload policy is
+   unchanged. Operators must drain uploads begun by older binaries before enabling the new
+   sweep. The fixed 24-hour no-lease floor in item 3 is then at least four times every
+   effective filesystem bound. `renew_seq` is 0 at begin, and `renewed_at` is the server's
+   wall-clock timestamp at begin. The pack must convey its resolved bound and the main
+   database/store identity to the filesystem backend; the sweeping daemon's environment
+   cannot supply either value for someone else's upload. Begin returns an `upload_id` only
+   after both the staging file and lease are written. A failure before then cleans up what
+   it can; a crash that leaves a staging file without a lease follows the 24-hour fallback
+   in item 3.
+
+2. **Each successful part call renews the lease.** `blob.put_part` atomically replaces the
+   lease with the same `owner` and `idle_secs`, `renew_seq` incremented by one and a new
+   `renewed_at` before acknowledging the call. For a new part, the staged bytes are synced
+   first. An accepted identical tail resend appends nothing but still renews the lease,
+   which increments `renew_seq`, and still resets the pack's in-memory idle clock; a
+   rejected call does neither. The lease write uses a temporary file in `.uploads`, syncs
+   it, renames it over `<id>.lease`, and syncs the directory; begin uses the same
+   temporary-file-and-rename publication. On platforms without a directory persistence
+   barrier, begin and renewal keep the file sync and the atomic replacing rename and claim
+   no directory barrier, as the non-Unix put path does; a crash that loses the rename also
+   ends the owning daemon, whose upload capability is process-local, and a lost or reverted
+   lease is covered by a changed `renew_seq` or the 24-hour no-lease floor. Both operations
+   and the sweep hold the existing
+   cross-process root write lock through their staging and lease work, so a sweep cannot
+   decide expiry between an append and its renewal. If renewal fails, the call is not
+   acknowledged and the upload is aborted through the existing error path. The storage
+   contract therefore needs a renewal path for an accepted tail resend without a second
+   append. Commit and abort remove the lease after the staging file is gone; a lease left
+   by a crash after publication or deletion is cleaned up on a later sweep.
+
+3. **A filesystem sweep times each lease on its own clock.** For every id-named staging
+   file, the sweeper reads its lease while holding the root write lock. Each sweeping
+   daemon keeps an in-memory observation map from upload id to the `(owner, renew_seq)`
+   pair it last read and the time, on its own monotonic clock, at which it first read that
+   pair. When the lease's pair differs from the map entry, or there is no entry, the
+   sweeper records the pair with the current monotonic time and retains the file. It
+   removes the staged file, then the lease, only when it has observed the same pair
+   unchanged for at least `idle_secs + 300 s` of its own monotonic time, where 300 seconds
+   is a fixed margin. An accepted renewal changes `renew_seq`, so it restarts every
+   sweeper's observation of that upload. Map entries for ids whose staging file is gone
+   are dropped. The map is not persisted: a restarted sweeper begins observing afresh,
+   which only delays reaping. A monotonic clock that pauses while its host sleeps likewise
+   only delays it.
+
+   **Backstop.** A sweeper that restarts more often than the bound never completes an
+   observation. So a sweeper also removes the staged file and its lease when its own wall
+   clock reads at least `renewed_at + idle_secs + 24 h`, whether or not it has observed
+   that lease.
+
+   The `idle_for` argument to `sweep_uploads` remains for backends that use it but is not
+   the expiry bound for a leased filesystem upload. Any daemon sharing the root may reap
+   an expired upload even if its own in-memory manager does not know the id; `owner`
+   records whose bound applies, not an exclusive sweeper. If the lease is absent, the
+   staged file is retained until its own mtime is at least a fixed 24 hours old,
+   regardless of the sweeping daemon's configured bound. A present lease that cannot be
+   parsed or validated is not treated as absent: the sweep retains the staging file and
+   reports the bad lease for repair. Validation checks the record's shape, timestamp,
+   sequence, durable owner ID and positive supported bound, not equality with the sweeping
+   daemon's owner ID. A lease with no staging file may be removed under the same lock. No
+   sweep follows a symlink or removes a non-id-named entry.
+
+   **Clock use.** The observation rule compares no clocks across daemons: each sweeper
+   times an unchanged lease on its own monotonic clock, and a live owner's renewals keep
+   resetting that timing, so wall-clock disagreement between hosts cannot make it reap a
+   live upload. Wall clocks enter the sweep in exactly two places, each with a 24-hour
+   margin: the backstop compares the owner's `renewed_at` with the sweeper's wall clock,
+   and the no-lease fallback compares a file's mtime with it. Each tolerates a sweeper
+   clock running up to 24 hours ahead of the clock that wrote the compared timestamp
+   before a live upload is at risk; a sweeper clock that runs behind only delays these
+   removals. A lease whose `renewed_at` is more than five minutes ahead of the sweeper's
+   wall clock is reported as a clock fault. The report is a diagnostic: it does not change
+   whether the lease is reaped.
+
+4. **Roll out lease-aware sweepers together.** Every daemon allowed to sweep a shared
+   filesystem root must use this rule before shared-root operation is enabled. Drain
+   older upload producers so new lease-less files cannot appear during the transition;
+   the 24-hour path is recovery for files already left without a lease, not a second
+   active-upload protocol. The orphan collector and the fresh-root binding check retain
+   [ADR-121](ADR-121-attachments-first-class.md) Amendment 6's separate treatment of
+   `.uploads` as root content.
+
+### Alternatives considered
+
+- One sweeper per root applying its own idle bound is rejected: it still substitutes
+  that daemon's policy for another owner's bound, and does not make the bound durable
+  across restart.
+- Skipping upload ids absent from the sweeper's in-memory table is rejected: after a
+  restart no process knows those ids, so their staged files would never expire.
+- Comparing the owner's `renewed_at` with the sweeper's wall clock within a small
+  allowance is rejected: a sweeper whose clock runs ahead of the owner's by more than the
+  allowance reaps live uploads, and the only report of the fault appears on the slower
+  host, not on the one that deletes.
+
+### Acceptance
+
+1. Two daemons use one root with different idle bounds. Both begin uploads and each lease
+   records its own durable owner and bound. Once the short-bound daemon has observed both
+   leases unchanged for longer than the short bound plus the margin but less than the long
+   bound, its next tick removes only the short-bound upload; the long-bound owner's next
+   part succeeds and commits. A mutant that compares both files with the sweeping daemon's
+   `idle_for` fails this test.
+2. A lease from another owner, observed unchanged for its own `idle_secs` plus the margin,
+   is reaped by a sweeper that has no in-memory upload record for its id; both the staged
+   file and lease are gone. A mutant that skips unknown ids fails this test.
+3. An id-named staged file without a lease survives a sweep with a one-hour bound when
+   its mtime is younger than 24 hours, and is removed at or after 24 hours. A malformed
+   lease beside an equally old staged file is retained and reported, rather than
+   silently taking the no-lease path.
+4. Begin and an accepted `put_part`, including an identical tail resend, each leave a
+   complete lease after a concurrent sweep, and each accepted renewal increments
+   `renew_seq` by one. The tail resend also resets the owner's in-memory idle clock.
+   Commit or abort leaves neither staging file nor lease. A failed lease renewal never
+   acknowledges the call.
+5. A filesystem daemon configured with `KHIVE_BLOB_UPLOAD_IDLE_SECS=43200` (12 hours)
+   starts upload service normally with an effective six-hour (21,600-second) bound and
+   emits a warning naming `KHIVE_BLOB_UPLOAD_IDLE_SECS`, the configured 43,200 seconds,
+   and the 21,600-second clamp. A configured bound at or below six hours remains
+   effective unchanged. This cap does not change the S3 upload policy.
+6. Two sweepers share the root with an owner whose upload has a 60-second bound, one with
+   its wall clock one hour ahead of the owner's and one with its wall clock one hour
+   behind. While the owner keeps renewing within its bound, neither sweeper reaps, however
+   many ticks run; the one-hour-behind sweeper reports the owner's leases as clock faults.
+   After the owner stops renewing, each sweeper reaps the upload once it has observed the
+   unchanged `renew_seq` for `idle_secs + 300 s` on its own monotonic clock, and not
+   before. A mutant that compares `renewed_at` with the sweeper's wall clock against the
+   bound fails the first arm; a mutant that drops the `renew_seq` comparison, timing only
+   from the first observation, also fails the first arm.
+7. A sweeper restarted more often than the bound never completes an observation, and the
+   abandoned upload is still removed once that sweeper's wall clock reads `renewed_at +
+   idle_secs + 24 h`. A mutant that drops the backstop fails this test.
