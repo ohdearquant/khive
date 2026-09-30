@@ -266,11 +266,13 @@ function Header({
 }
 
 function Sidebar({ bundle, activeView, onView }: { bundle: ReviewBundle; activeView: View; onView: (view: View) => void }) {
+  const unitCount = useMemo(() => buildReviewThreadModel(bundle).units.length, [bundle]);
+  const activityCount = useMemo(() => reviewActivityEvents(bundle).length, [bundle]);
   const navigation: { id: View; label: string; icon: typeof FileText; count?: number }[] = [
-    { id: "changes", label: "Changes", icon: FileJson2, count: buildReviewThreadModel(bundle).units.length },
+    { id: "changes", label: "Changes", icon: FileJson2, count: unitCount },
     { id: "graph", label: "Affected graph", icon: Network, count: bundle.graph.nodes.items.length },
     { id: "retrieval", label: "Khive context", icon: Brain },
-    { id: "activity", label: "Activity", icon: Activity, count: reviewActivityEvents(bundle).length },
+    { id: "activity", label: "Activity", icon: Activity, count: activityCount },
   ];
 
   return (
@@ -384,11 +386,13 @@ function PullRequestHeader({ bundle, onCopy }: { bundle: ReviewBundle; onCopy: (
 }
 
 function WorkspaceTabs({ activeView, onView, bundle }: { activeView: View; onView: (view: View) => void; bundle: ReviewBundle }) {
+  const unitCount = useMemo(() => buildReviewThreadModel(bundle).units.length, [bundle]);
+  const activityCount = useMemo(() => reviewActivityEvents(bundle).length, [bundle]);
   const tabs: { id: View; label: string; count?: number }[] = [
-    { id: "changes", label: "Changes", count: buildReviewThreadModel(bundle).units.length },
+    { id: "changes", label: "Changes", count: unitCount },
     { id: "graph", label: "Graph", count: bundle.graph.nodes.items.length },
     { id: "retrieval", label: "Context" },
-    { id: "activity", label: "Activity", count: reviewActivityEvents(bundle).length },
+    { id: "activity", label: "Activity", count: activityCount },
   ];
   return (
     <div className="workspace-tabs" role="tablist" aria-label="Review views" data-keyboard-list>
@@ -1074,31 +1078,24 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
     });
   }
 
-  function addLocalNote() {
-    const note = activityDraft.trim();
+  function addNote(
+    draft: string,
+    setNotes: (update: (current: ReviewAnnotation[]) => ReviewAnnotation[]) => void,
+    clearDraft: () => void,
+  ) {
+    const note = draft.trim();
     if (!note) return;
-    setLocalNotes((current) => [...current, {
+    setNotes((current) => [...current, {
       id: `local-${Date.now()}-${current.length}`,
       unitKey: reviewLocationRef.current.selectedUnitKey,
       actor: "you",
       body: note,
       createdAt: new Date().toISOString(),
     }]);
-    setActivityDraft("");
+    clearDraft();
   }
-
-  function addCoreNote() {
-    const note = coreDraft.trim();
-    if (!note) return;
-    setCoreNotes((current) => [...current, {
-      id: `local-${Date.now()}-${current.length}`,
-      unitKey: reviewLocationRef.current.selectedUnitKey,
-      actor: "you",
-      body: note,
-      createdAt: new Date().toISOString(),
-    }]);
-    setCoreDraft("");
-  }
+  const addLocalNote = () => addNote(activityDraft, setLocalNotes, () => setActivityDraft(""));
+  const addCoreNote = () => addNote(coreDraft, setCoreNotes, () => setCoreDraft(""));
 
   const hasUnsavedReviewState = coreReport !== null || bundle !== initialBundle ||
     decision !== "pending" ||

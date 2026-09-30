@@ -183,6 +183,30 @@ function ThreadEvent({ event }: { event: ReviewThreadEvent }) {
   );
 }
 
+type UnitField = NonNullable<ReviewThreadUnit["change"]>["fields"][number];
+
+function formatValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === undefined) return "—";
+  return JSON.stringify(value, null, 2);
+}
+
+function FieldDiff({ field }: { field: UnitField }) {
+  return (
+    <div className="field-diff" data-field-path={field.path}>
+      <span className="field-name">{field.path}</span>
+      <div className="field-values">
+        {field.before !== undefined && (
+          <pre className="before"><span>−</span>{formatValue(field.before)}</pre>
+        )}
+        {field.after !== undefined && (
+          <pre className="after"><span>+</span>{formatValue(field.after)}</pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function EvidenceNotice({ unit, onImport }: { unit: ReviewThreadUnit; onImport?: () => void }) {
   const { evidence } = unit;
   if (evidence.status === "available") return null;
@@ -303,6 +327,11 @@ export function ReviewThreadSurface({
               </div>
               <code className="record-id review-thread-selected-id">{selectedUnit.id}</code>
               <EvidenceNotice unit={selectedUnit} onImport={onImport} />
+              {selectedUnit.change && selectedUnit.change.fields.length > 0 && (
+                <section className="review-thread-fields" aria-label="Field changes" data-review-thread-fields>
+                  {selectedUnit.change.fields.map((field) => <FieldDiff key={field.path} field={field} />)}
+                </section>
+              )}
               {selectedUnit.events.length > 0 ? (
                 <div className="activity-list review-thread-events" aria-label="Unit events">
                   {selectedUnit.events.map((event) => <ThreadEvent key={event.key} event={event} />)}

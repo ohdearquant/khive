@@ -69,6 +69,65 @@ describe("review list and thread surface", () => {
     expect(sourceThread?.querySelector("[data-thread-event-kind='finding'] time")).toBeNull();
   });
 
+  it("shows a semantic-only pull request unit's field paths with their before and after values", () => {
+    const enrichmentId = "a1f00000-0000-4000-8000-0000000000ee";
+    const input = {
+      ...demoReviewFixture,
+      changes: {
+        ...demoReviewFixture.changes,
+        items: [
+          ...demoReviewFixture.changes.items,
+          {
+            id: enrichmentId,
+            substrate: "entity" as const,
+            change: "modified" as const,
+            title: "Enrichment-only concept",
+            subtitle: "concept · description rewrite",
+            tier: "tier_1" as const,
+            fields: [
+              { path: "description", before: "Old description text", after: "New description text" },
+              { path: "aliases", after: ["first-alias", "second-alias"] },
+              { path: "retired_field", before: "legacy value" },
+            ],
+            evidence_ids: [],
+          },
+        ],
+      },
+    };
+    const key = reviewUnitKey("entity", enrichmentId);
+    const model = buildReviewThreadModel(input, []);
+    expect(model.units.find((unit) => unit.key === key)?.operations).toHaveLength(0);
+    const { container } = render(
+      <ReviewThreadSurface input={input} selectedUnitKey={key} onSelectUnit={vi.fn()} annotations={[]} />,
+    );
+    const thread = container.querySelector<HTMLElement>("[data-review-thread]")!;
+    expect(eventKeys(thread)).toEqual([]);
+    const fields = thread.querySelector<HTMLElement>("[data-review-thread-fields]");
+    expect(fields).not.toBeNull();
+    const diff = (path: string) => fields!.querySelector<HTMLElement>(`.field-diff[data-field-path="${path}"]`)!;
+    expect(diff("description").querySelector(".field-name")).toHaveTextContent("description");
+    expect(diff("description").querySelector("pre.before")).toHaveTextContent("Old description text");
+    expect(diff("description").querySelector("pre.after")).toHaveTextContent("New description text");
+    expect(diff("aliases").querySelector("pre.before")).toBeNull();
+    expect(diff("aliases").querySelector("pre.after")).toHaveTextContent(/"first-alias",\s*"second-alias"/);
+    expect(diff("retired_field").querySelector("pre.before")).toHaveTextContent("legacy value");
+    expect(diff("retired_field").querySelector("pre.after")).toBeNull();
+  });
+
+  it("shows both the operation events and the semantic field diff for a unit that carries both", () => {
+    const change = demoReviewFixture.changes.items.find((item) => item.id.startsWith("e8400000"))!;
+    const key = reviewUnitKey(change.substrate, change.id);
+    const { container } = render(
+      <ReviewThreadSurface input={demoReviewFixture} selectedUnitKey={key} onSelectUnit={vi.fn()} annotations={[]} />,
+    );
+    const thread = container.querySelector<HTMLElement>("[data-review-thread]")!;
+    expect(eventKeys(thread).some((event) => event.startsWith("operation:") && event.endsWith(change.id))).toBe(true);
+    const weight = thread.querySelector<HTMLElement>('[data-review-thread-fields] .field-diff[data-field-path="weight"]');
+    expect(weight).not.toBeNull();
+    expect(weight!.querySelector("pre.before")).toHaveTextContent("0.84");
+    expect(weight!.querySelector("pre.after")).toHaveTextContent("0.62");
+  });
+
   it("uses the same full-ID rows and selected thread for the changeset variant", async () => {
     const first = demoReviewFixture.change_set.operations[0];
     const noteId = "a1f00000-0000-4000-8000-0000000000aa";

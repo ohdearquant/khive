@@ -126,3 +126,16 @@ test("a deep link opens the addressed graph edge", async ({ page }) => {
   await expect(page.locator(".review-surface")).toHaveAttribute("aria-label", "Affected graph");
   await expect(page.locator(".edge-inspector")).toBeVisible();
 });
+
+test("a deep-linked unit shows its semantic field before and after values beside its operation events", async ({ page }) => {
+  const change = demoReviewFixture.changes.items.find((item) => item.id.startsWith("e8400000"))!;
+  const weight = change.fields.find((field) => field.path === "weight")!;
+  await page.goto(`/review?view=changes&unit=${encodeURIComponent(`${change.substrate}:${change.id}`)}`);
+  const thread = page.locator("[data-review-thread]");
+  await expect(thread).toContainText(change.id);
+  await expect(thread.locator("[data-thread-event-kind='operation']")).not.toHaveCount(0);
+  const diff = thread.locator('[data-review-thread-fields] .field-diff[data-field-path="weight"]');
+  await expect(diff).toBeVisible();
+  await expect(diff.locator("pre.before")).toContainText(String(weight.before));
+  await expect(diff.locator("pre.after")).toContainText(String(weight.after));
+});
