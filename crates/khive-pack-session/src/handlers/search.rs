@@ -29,13 +29,14 @@ const VALID_SOURCES: &[&str] = &[
 /// A single SQL statement carries the scope predicate into both mirror tables.
 /// The `unknown` source is intentionally invisible unless it is requested by
 /// name; its rows are migration-preserved orphans without a parent session.
+/// Rank and limit the narrow match rows before FTS reads message text for snippets.
 const SEARCH_SQL: &str = r#"
 WITH hits AS MATERIALIZED (
   SELECT m.namespace, m.source, m.session_id, m.created_at,
-         bm25(session_messages_fts) AS fts_rank,
-         snippet(session_messages_fts, 0, '[', ']', '…', 32) AS snippet
+         session_messages_fts.rowid AS fts_rowid,
+         bm25(session_messages_fts) AS fts_rank
     FROM session_messages_fts
-    JOIN session_messages AS m ON m.mirror_rowid = session_messages_fts.rowid
+    CROSS JOIN session_messages AS m ON m.mirror_rowid = session_messages_fts.rowid
     LEFT JOIN sessions AS s
       ON s.namespace = ?2 AND s.namespace = m.namespace
      AND s.source = m.source AND s.provider_session_id = m.session_id
@@ -50,21 +51,46 @@ WITH hits AS MATERIALIZED (
   SELECT namespace, source, session_id, MIN(fts_rank) AS best_rank
     FROM hits
    GROUP BY namespace, source, session_id
+), limited_sessions AS MATERIALIZED (
+  SELECT namespace, source, session_id, best_rank
+    FROM session_ranks
+   ORDER BY best_rank ASC, source ASC, session_id ASC
+   LIMIT ?6
+), top_snippet_rowids AS MATERIALIZED (
+  SELECT namespace, source, session_id, fts_rowid, snippet_order
+    FROM (
+      SELECT h.namespace, h.source, h.session_id, h.fts_rowid,
+             ROW_NUMBER() OVER (
+               PARTITION BY h.namespace, h.source, h.session_id
+               ORDER BY h.fts_rank ASC, h.created_at DESC
+             ) AS snippet_order
+        FROM limited_sessions AS r
+        JOIN hits AS h
+          ON h.namespace = r.namespace AND h.source = r.source
+         AND h.session_id = r.session_id
+    )
+   WHERE snippet_order <= 3
+), selected_snippets AS MATERIALIZED (
+  SELECT c.namespace, c.source, c.session_id, c.snippet_order,
+         snippet(session_messages_fts, 0, '[', ']', '…', 32) AS snippet
+    FROM top_snippet_rowids AS c
+    CROSS JOIN session_messages_fts
+   WHERE session_messages_fts MATCH ?1
+     AND session_messages_fts.rowid = c.fts_rowid
 )
 SELECT r.namespace, r.source, r.session_id AS provider_session_id,
        s.cwd, s.first_seen_at, s.last_seen_at, s.message_count,
        (SELECT json_group_array(snippet) FROM (
-          SELECT h.snippet FROM hits AS h
+          SELECT h.snippet FROM selected_snippets AS h
            WHERE h.namespace = r.namespace AND h.source = r.source
              AND h.session_id = r.session_id
-           ORDER BY h.fts_rank ASC, h.created_at DESC LIMIT 3
+           ORDER BY h.snippet_order
        )) AS snippets
-  FROM session_ranks AS r
+  FROM limited_sessions AS r
   LEFT JOIN sessions AS s
     ON s.namespace = ?2 AND s.namespace = r.namespace
    AND s.source = r.source AND s.provider_session_id = r.session_id
- ORDER BY r.best_rank ASC, r.source ASC, r.session_id ASC
- LIMIT ?6"#;
+ ORDER BY r.best_rank ASC, r.source ASC, r.session_id ASC"#;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -316,9 +342,187 @@ async fn handle_search_with_scope(
 #[cfg(test)]
 mod tests {
     use khive_runtime::{KhiveRuntime, Namespace, RuntimeError};
+    use khive_storage::types::{SqlStatement, SqlValue};
+    use rusqlite::{params, Connection, StatementStatus};
     use serde_json::json;
 
-    use super::{handle_search, handle_search_with_scope, search_ready};
+    use super::{handle_search, handle_search_with_scope, search_ready, SEARCH_SQL};
+
+    #[tokio::test]
+    async fn search_plan_limits_sessions_and_snippet_rows_before_fts_text_reads() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut reader = runtime.sql().reader().await.expect("reader");
+        let plan = reader
+            .query_all(SqlStatement {
+                sql: format!("EXPLAIN QUERY PLAN {SEARCH_SQL}"),
+                params: vec![
+                    SqlValue::Text("\"needle\"".into()),
+                    SqlValue::Text("local".into()),
+                    SqlValue::Null,
+                    SqlValue::Null,
+                    SqlValue::Null,
+                    SqlValue::Integer(20),
+                ],
+                label: Some("session_search_fts_plan".into()),
+            })
+            .await
+            .expect("search plan");
+        let details: Vec<&str> = plan
+            .iter()
+            .filter_map(|row| match row.get("detail") {
+                Some(SqlValue::Text(detail)) => Some(detail.as_str()),
+                _ => None,
+            })
+            .collect();
+        for stage in [
+            "MATERIALIZE hits",
+            "MATERIALIZE limited_sessions",
+            "MATERIALIZE top_snippet_rowids",
+            "MATERIALIZE selected_snippets",
+        ] {
+            assert!(
+                details.iter().any(|detail| detail.contains(stage)),
+                "search must retain the {stage} stage: {details:?}"
+            );
+        }
+        let fts_scan = details
+            .iter()
+            .position(|detail| detail.contains("session_messages_fts VIRTUAL TABLE"))
+            .expect("MATCH must drive the first stage through FTS");
+        let mirror_lookup = details
+            .iter()
+            .position(|detail| detail.contains("SEARCH m USING INTEGER PRIMARY KEY"))
+            .expect("each FTS hit must seek one mirror row by primary key");
+        assert!(
+            fts_scan < mirror_lookup,
+            "FTS must drive mirror-row lookups: {details:?}"
+        );
+        let fts_paths: Vec<&str> = details
+            .iter()
+            .copied()
+            .filter(|detail| detail.contains("session_messages_fts VIRTUAL TABLE INDEX"))
+            .collect();
+        assert_eq!(
+            fts_paths.len(),
+            2,
+            "one ranking scan and one snippet probe: {details:?}"
+        );
+        let snippet_index = fts_paths[1]
+            .split("VIRTUAL TABLE INDEX")
+            .nth(1)
+            .expect("selected snippet FTS access path");
+        assert!(
+            snippet_index.contains('M') && snippet_index.contains('='),
+            "snippet FTS access must combine MATCH with rowid equality: {details:?}"
+        );
+
+        let (ranking_sql, snippet_sql) = SEARCH_SQL
+            .split_once("), selected_snippets AS MATERIALIZED (")
+            .expect("snippet stage must follow the bounded stages");
+        assert!(!ranking_sql.contains("snippet(session_messages_fts"));
+        assert!(snippet_sql.contains("snippet(session_messages_fts"));
+    }
+
+    #[test]
+    fn search_sql_snippet_vm_steps_stay_bounded_as_matches_grow() {
+        let mut conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            "CREATE TABLE sessions ( \
+               namespace TEXT, source TEXT, provider_session_id TEXT, cwd TEXT, \
+               first_seen_at INTEGER, last_seen_at INTEGER, message_count INTEGER); \
+             CREATE TABLE session_messages ( \
+               mirror_rowid INTEGER PRIMARY KEY, namespace TEXT, source TEXT, \
+               session_id TEXT, created_at INTEGER, text TEXT); \
+             CREATE VIRTUAL TABLE session_messages_fts USING \
+               fts5(text, content='session_messages', content_rowid='mirror_rowid'); \
+             INSERT INTO sessions VALUES ('local', 'codex', 'one', '/repo', 1, 1, 1000);",
+        )
+        .expect("FTS fixture");
+
+        fn insert_matches(conn: &mut Connection, first: i64, last: i64) {
+            let tx = conn.transaction().expect("fixture transaction");
+            for rowid in first..=last {
+                tx.execute(
+                    "INSERT INTO session_messages VALUES \
+                     (?1, 'local', 'codex', 'one', ?1, 'needle message')",
+                    params![rowid],
+                )
+                .expect("mirror row");
+                tx.execute(
+                    "INSERT INTO session_messages_fts(rowid, text) \
+                     VALUES (?1, 'needle message')",
+                    params![rowid],
+                )
+                .expect("FTS row");
+            }
+            tx.commit().expect("commit matching messages");
+        }
+
+        fn search_steps(conn: &Connection, sql: &str) -> i32 {
+            let mut stmt = conn.prepare(sql).expect("SEARCH_SQL statement");
+            let mut rows = stmt
+                .query(params![
+                    "\"needle\"",
+                    "local",
+                    None::<&str>,
+                    None::<i64>,
+                    None::<&str>,
+                    1_i64,
+                ])
+                .expect("search query");
+            let mut sessions = 0;
+            while let Some(row) = rows.next().expect("search row") {
+                let snippets: String = row.get(7).expect("snippets JSON");
+                let snippets: Vec<String> = serde_json::from_str(&snippets).expect("snippet list");
+                assert_eq!(snippets.len(), 3, "the returned snippet limit stays fixed");
+                sessions += 1;
+            }
+            assert_eq!(sessions, 1, "fixture has one matching session");
+            drop(rows);
+            stmt.get_status(StatementStatus::VmStep)
+        }
+
+        let snippet_call = "snippet(session_messages_fts, 0, '[', ']', '…', 32)";
+        assert_eq!(
+            SEARCH_SQL.matches(snippet_call).count(),
+            1,
+            "the measured statement has one snippet stage"
+        );
+        let literal_sql = SEARCH_SQL.replacen(snippet_call, "'fixed snippet'", 1);
+
+        insert_matches(&mut conn, 1, 10);
+        let small_search_steps = search_steps(&conn, SEARCH_SQL);
+        let small_literal_steps = search_steps(&conn, &literal_sql);
+        insert_matches(&mut conn, 11, 1000);
+        let large_search_steps = search_steps(&conn, SEARCH_SQL);
+        let large_literal_steps = search_steps(&conn, &literal_sql);
+
+        let small_snippet_steps = small_search_steps - small_literal_steps;
+        let large_snippet_steps = large_search_steps - large_literal_steps;
+        assert!(
+            large_search_steps > small_search_steps + 500,
+            "SEARCH_SQL must visit the additional matches: \
+             {small_search_steps} -> {large_search_steps} VM steps"
+        );
+        assert!(
+            small_snippet_steps > 0 && large_snippet_steps > 0,
+            "the real snippet call must add VM work over a literal: \
+             small {small_search_steps} vs {small_literal_steps}, \
+             large {large_search_steps} vs {large_literal_steps} steps"
+        );
+        // Both statements rank the same matches. Only the selected snippet()
+        // calls differ, so three calls may add fixed work while 990 extra hits
+        // cannot add snippet work. The 128-step allowance covers fixed FTS
+        // setup differences; a late LIMIT computes 990 extra snippets and
+        // exceeds it even if each call adds just one VM opcode.
+        assert!(
+            large_snippet_steps <= small_snippet_steps + 128,
+            "SEARCH_SQL must bound snippet work to three rows as matches grow \
+             from 10 to 1000: full {small_search_steps} -> {large_search_steps}, \
+             literal {small_literal_steps} -> {large_literal_steps}, \
+             snippet delta {small_snippet_steps} -> {large_snippet_steps} VM steps"
+        );
+    }
 
     #[tokio::test]
     async fn absent_scope_is_permission_denied_at_handler_seam_even_with_default_allow_gate() {
@@ -378,6 +582,9 @@ mod tests {
                    ('event','a','codex','same',0,'user',1,'scopedneedle alpha','{}','h1'),
                    ('event','a','claude_code','same',0,'user',1,'scopedneedle beta','{}','h2'),
                    ('event','b','codex','same',0,'user',1,'scopedneedle gamma','{}','h3'),
+                   ('event2','a','codex','same',1,'user',1,'scopedneedle bravo','{}','h5'),
+                   ('event3','a','codex','same',2,'user',1,'scopedneedle delta','{}','h6'),
+                   ('event4','a','codex','same',3,'user',1,'scopedneedle echo','{}','h7'),
                    ('lost','a','unknown','orphan',0,'user',1,'scopedneedle orphan','{}','h4');"#
                     .to_string(),
             )
@@ -415,6 +622,14 @@ mod tests {
         .expect("source and cwd narrow the scoped search");
         assert_eq!(codex_only["results"].as_array().unwrap().len(), 1);
         assert_eq!(codex_only["results"][0]["session"]["source"], "codex");
+        assert_eq!(
+            codex_only["results"][0]["snippets"]
+                .as_array()
+                .expect("bounded snippets")
+                .len(),
+            3,
+            "four matching messages still return only the best three snippets"
+        );
 
         let too_recent = search_ready(
             &runtime,

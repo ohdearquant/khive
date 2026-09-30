@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use khive_pack_exec::tree::{self, TreeEntry};
-use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_runtime::{KhiveRuntime, RuntimeError, VerifiedBlob};
 use khive_storage::{ContentRef, MAX_BLOB_WHOLE_BYTES};
 use serde::Serialize;
 
@@ -57,7 +57,11 @@ fn filter_overrides(program: &Path, repo: &Path) -> Vec<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(output) = command.output() else {
+    let Ok(output) = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .and_then(|child| child.wait_with_output()) else {
         return Vec::new();
     };
     let mut drivers: Vec<String> = Vec::new();
@@ -300,9 +304,11 @@ fn run_git_output(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|_| LocalGitError::new("git_spawn", format!("could not start git {operation}")))?;
+    let mut child = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .map_err(|_| LocalGitError::new("git_spawn", format!("could not start git {operation}")))?;
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
     let stdin = child.stdin.take();
@@ -389,6 +395,24 @@ async fn run_async(
     tokio::task::spawn_blocking(move || {
         let args: Vec<&str> = argv.iter().map(String::as_str).collect();
         run_git(&program, &repo, &args, input.as_deref(), None, false)
+    })
+    .await
+    .map_err(|_| LocalGitError::new("git_failed", "git object worker did not complete"))?
+}
+
+/// Keep hydration admission while the blocking git writer consumes stdin.
+async fn run_async_hydrated(
+    program: &Path,
+    repo: &Path,
+    argv: &[&str],
+    input: VerifiedBlob,
+) -> Result<Vec<u8>> {
+    let program = program.to_path_buf();
+    let repo = repo.to_path_buf();
+    let argv: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_git(&program, &repo, &args, Some(input.bytes()), None, false)
     })
     .await
     .map_err(|_| LocalGitError::new("git_failed", "git object worker did not complete"))?
@@ -660,21 +684,23 @@ pub(crate) async fn write_manifest_tree(
     let program = rt.config().git_write.git_program();
     let entries = tree::load(rt, manifest_ref).await?;
     tree::verify_blobs(rt, &entries).await?;
-    let store = tree::blob_store(rt)?;
+    let hydrator = rt
+        .blob_hydrator()
+        .ok_or_else(|| RuntimeError::Unconfigured("git blob hydrator is not installed".into()))?;
     let mut directories: BTreeMap<String, Vec<GitEntry>> = BTreeMap::new();
     directories.insert(String::new(), Vec::new());
     for entry in entries {
         let content_ref = ContentRef::from_hex(&entry.content_ref)
             .map_err(|error| LocalGitError::new("invalid_params", error))?;
-        let bytes = store
-            .get_bounded_verified(&content_ref, MAX_BLOB_WHOLE_BYTES)
+        let bytes = hydrator
+            .hydrate_verified(&content_ref, MAX_BLOB_WHOLE_BYTES)
             .await?;
         let oid = oid_output(
-            &run_async(
+            &run_async_hydrated(
                 program,
                 repo,
                 &["hash-object", "-w", "--no-filters", "--stdin"],
-                Some(bytes),
+                bytes,
             )
             .await?,
         )?;

@@ -612,7 +612,14 @@ mod tests {
         let id = seed(
             first.per_pack_runtimes["comm"].backend(),
             "routed-namespace",
-            json!({"quarantined": true, "quarantine_content_ref": original.to_string()}),
+            json!({"quarantined": true, "channel_kind": "email", "quarantine_content_ref": original.to_string()}),
+            false,
+        )
+        .await;
+        let retry_id = seed(
+            first.per_pack_runtimes["comm"].backend(),
+            "routed-namespace",
+            json!({"quarantined": true, "channel_kind": "email", "quarantine_content_ref": original.to_string()}),
             false,
         )
         .await;
@@ -641,5 +648,147 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        assert!(second
+            .default_runtime
+            .attachments()
+            .unwrap()
+            .get_attachment(retry_id, ORIGINAL_ROLE)
+            .await
+            .unwrap()
+            .is_some());
+
+        let comm = &second.per_pack_runtimes["comm"];
+        let token = comm
+            .authorize(khive_runtime::Namespace::parse("routed-namespace").unwrap())
+            .unwrap();
+        let notes = comm.notes(&token).unwrap();
+        let as_of = notes
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at
+            .max(notes.get_note(retry_id).await.unwrap().unwrap().created_at)
+            + 14 * 24 * 60 * 60 * 1_000_000
+            + 1;
+        // A historical operator-soft-deleted note remains eligible for the
+        // hard-delete pass and its targeted canonical-main owner detach.
+        assert!(notes
+            .delete_note(retry_id, khive_storage::DeleteMode::Soft)
+            .await
+            .unwrap());
+        assert!(notes.get_note(retry_id).await.unwrap().is_none());
+        assert!(notes
+            .get_note_including_deleted(retry_id)
+            .await
+            .unwrap()
+            .is_some());
+        let cleaned = second
+            .registry
+            .dispatch(
+                "comm.cleanup_expired_quarantine",
+                json!({
+                    "namespace": "routed-namespace",
+                    "channel_kind": "email",
+                    "channel_slug": "",
+                    "mode": "legacy_slugless",
+                    "as_of_micros": as_of,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleaned["deleted"], 2);
+        assert_eq!(cleaned["routed_owners_detached"], 2);
+        for note_id in [id, retry_id] {
+            assert!(notes
+                .get_note_including_deleted(note_id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(
+                second
+                    .default_runtime
+                    .attachments()
+                    .unwrap()
+                    .get_attachment(note_id, ORIGINAL_ROLE)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "main owner must be detached for a routed note"
+            );
+        }
+
+        // A wrong main owner makes the targeted detach refuse after the
+        // note's hard delete. The error reports one possible owner residue
+        // for the operator's ownerless-row inspection path (#3178).
+        let mismatch_id = seed(
+            comm.backend(),
+            "routed-namespace",
+            json!({"quarantined": true, "channel_kind": "email", "quarantine_content_ref": original.to_string()}),
+            true,
+        )
+        .await;
+        let wrong_ref = second
+            .default_runtime
+            .blob_store()
+            .unwrap()
+            .put(b"different original".to_vec())
+            .await
+            .unwrap();
+        let wrong_owner = Attachment::from_new(
+            mismatch_id,
+            AttachmentSubstrate::Note,
+            NewAttachment {
+                role: ORIGINAL_ROLE.into(),
+                content_ref: wrong_ref.clone(),
+                media_type: None,
+                size_bytes: None,
+            },
+            as_of,
+        );
+        assert!(second
+            .default_runtime
+            .attachments()
+            .unwrap()
+            .try_insert_attachment(wrong_owner)
+            .await
+            .unwrap());
+        let error = second
+            .registry
+            .dispatch(
+                "comm.cleanup_expired_quarantine",
+                json!({
+                    "namespace": "routed-namespace",
+                    "channel_kind": "email",
+                    "channel_slug": "",
+                    "mode": "legacy_slugless",
+                    "as_of_micros": as_of,
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("possible_owner_residue=1"), "{error}");
+        assert!(
+            notes
+                .get_note_including_deleted(mismatch_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "note hard-delete must precede owner detachment"
+        );
+        assert_eq!(
+            second
+                .default_runtime
+                .attachments()
+                .unwrap()
+                .get_attachment(mismatch_id, ORIGINAL_ROLE)
+                .await
+                .unwrap()
+                .unwrap()
+                .content_ref,
+            wrong_ref,
+            "a mismatched original remains for operator investigation"
+        );
     }
 }

@@ -1,6 +1,6 @@
 name: Pipeline Regression Gate
 
-# Runs on any PR that touches the retrieval/fusion/memory stack.
+# Runs on PRs that touch the retrieval/fusion/memory stack or benchmark clients.
 # Uses a deterministic LEXICAL hash embedder (bench-embedder / FNV-1a, no model
 # download) to drive the full daemon path end-to-end. What this gate verifies:
 # (a) daemon-path engagement — front-end spawns warm daemon child, binds bench
@@ -28,6 +28,9 @@ on:
       - "crates/khive-mcp/**"
       - "crates/kkernel/**"
       - "scripts/perf/bench_pipeline_daemon.py"
+      - "scripts/perf/test_bench_pipeline_daemon.py"
+      - "scripts/perf/mcp_bench_client.py"
+      - "scripts/perf/test_mcp_bench_client.py"
       - ".github/workflows/bench-pipeline.yml"
 
 permissions:
@@ -86,6 +89,13 @@ jobs:
           cp target/release/kkernel target/release/kkernel-bench
 
       - uses: astral-sh/setup-uv@v5
+
+      - name: Validate bench daemon and raw-frame client
+        working-directory: .
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/perf -p 'test_bench_pipeline_daemon.py' -v
+          python3 -m unittest discover -s scripts/perf -p 'test_mcp_bench_client.py' -v
 
       - name: Run pipeline regression gate
         working-directory: .

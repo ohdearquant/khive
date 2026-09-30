@@ -112,6 +112,20 @@ dependency on the reacting pack (e.g. KG's `update`/`delete` on a `kind="memory"
 default no-op leaves the runtime hook absent (skip-when-None), which is the correct behaviour for
 packs that don't cache note-derived state and for bare runtimes without packs.
 
+## register_note_search_ann_provider
+
+Called at the same transport boot sites as `register_note_mutation_hook`. The runtime
+owns `NoteSearchAnnProvider` and one optional installation slot; the memory pack
+installs its graph-backed provider only when both the logical backend identity
+and the actual opened backend instance match the runtime receiving the hook.
+Two independently opened databases can both be named `main`; that alone does
+not authorize sharing an ANN graph. A routed runtime on another backend leaves the
+slot empty and uses the exact note-vector search. The provider is responsible
+for its own durable `note_search` consumer registration, same-snapshot fresh-tail
+merge, and namespace/liveness post-filtering before it returns candidates.
+Its read-side runtime clone drops callback slots, so the installed provider
+does not retain its own installation through an Arc cycle.
+
 ## registered_embedding_model_names
 
 Used by ADR-103 Amendment 1's `model_count` computation at the dispatch audit-row emission seam

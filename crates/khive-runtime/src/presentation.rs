@@ -1,14 +1,14 @@
 //! Verb response presentation modes and transformation.
 //!
 //! Transforms canonical handler output into caller-appropriate form after dispatch
-//! and before wire serialization. `Agent` mode abbreviates UUIDs/timestamps and drops
+//! and before wire serialization. `Agent` mode abbreviates UUIDs and drops
 //! empty fields; `Verbose` and `Human` pass through canonical JSON unchanged.
 //!
 //! This module also contains the `OutputFormat` axis (ADR-078) which governs how
 //! the resulting `serde_json::Value` is serialized or rendered to an output string.
 //! `PresentationMode` and `OutputFormat` compose independently.
 
-use std::collections::HashSet;
+use std::{cmp::Ordering, collections::HashSet};
 
 use khive_types::VerbPresentationPolicy;
 use serde::{Deserialize, Serialize};
@@ -98,7 +98,7 @@ impl NoteContentScope {
 /// Output serialization format for verb results (ADR-078).
 ///
 /// Orthogonal to [`PresentationMode`]: `PresentationMode` controls field-level
-/// transforms (UUID shortening, timestamp compaction, empty-field dropping);
+/// transforms (UUID shortening, exact UTC timestamps, empty-field dropping);
 /// `OutputFormat` controls how the resulting `serde_json::Value` is serialized
 /// or rendered to the wire string.
 ///
@@ -615,9 +615,9 @@ pub fn rfc3339_to_utc_micros(raw: &str) -> Result<i64, chrono::ParseError> {
 pub enum PresentationMode {
     /// Token-efficient. Default for MCP callers (agents).
     ///
-    /// Short UUIDs (8-char), compact timestamps (minute granularity or
-    /// relative), empty fields dropped, structural nulls preserved, score
-    /// fields truncated to 3 significant figures.
+    /// Short UUIDs (8-char), exact UTC timestamps with relative labels on
+    /// list rows, empty fields dropped, structural nulls preserved, and
+    /// score fields truncated to 3 significant figures.
     #[default]
     Agent,
     /// Full canonical shape. Default for `kkernel exec` and CI/scripted callers.
@@ -704,7 +704,7 @@ fn is_stream_entry(map: &Map<String, Value>) -> bool {
 }
 
 /// Field names carrying caller-supplied payload timestamps that must never be
-/// compacted (relative-time or minute-truncated), regardless of nesting.
+/// transformed, regardless of nesting.
 ///
 /// These encode domain semantics the caller needs to round-trip verbatim —
 /// e.g. `trigger_at` on a `schedule.remind`/`schedule.schedule` create
@@ -712,9 +712,8 @@ fn is_stream_entry(map: &Map<String, Value>) -> bool {
 /// `full_id`, not nested under `"properties"`. The `inside_properties` guard
 /// alone only protects fields nested under a literal `"properties"` key
 /// (as returned by `agenda`/`get`); it does not cover this top-level case,
-/// which `compact_timestamp` rewrote into either a relative string or a
-/// minute-truncated absolute form — either way discarding the seconds and
-/// offset the caller needs to round-trip the exact submitted value (#871).
+/// which older Agent presentation rewrote into a relative or minute-truncated
+/// form, discarding the seconds and offset needed for round trips (#871).
 ///
 /// `due` on `gtd.assign`/`gtd.tasks`/`gtd.next` responses is the same shape:
 /// a top-level convenience field mirroring `properties.due`, which
@@ -775,11 +774,11 @@ fn should_shorten_uuid_field(key: &str) -> bool {
 /// [`PresentationMode`].
 ///
 /// - `Verbose` / `Human`: returns `value` unchanged.
-/// - `Agent`: applies UUID shortening, timestamp compaction, empty-field
+/// - `Agent`: applies UUID shortening, exact UTC timestamp rendering, empty-field
 ///   dropping, structural-null preservation, and score truncation.
 ///
-/// `now_unix_seconds` is sampled once per response and passed through so all
-/// relative datetime renderings within a response use the same instant.
+/// `now_unix_seconds` is a whole-second clock for callers without a finer
+/// sample. All relative list-row labels within a response use this instant.
 pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> Value {
     present_with_policy(
         value,
@@ -797,27 +796,72 @@ pub fn present_with_policy(
     now_unix_seconds: i64,
     policy: VerbPresentationPolicy,
 ) -> Value {
+    present_with_policy_at(value, mode, now_unix_seconds.into(), policy)
+}
+
+/// A response-wide clock sample. Fractional precision distinguishes a newly
+/// stored row from a truly future row within the same Unix second.
+#[derive(Clone, Copy)]
+pub struct PresentationNow {
+    seconds: i64,
+    nanoseconds: u32,
+}
+
+impl From<i64> for PresentationNow {
+    fn from(seconds: i64) -> Self {
+        Self {
+            seconds,
+            nanoseconds: 0,
+        }
+    }
+}
+
+impl From<i32> for PresentationNow {
+    fn from(seconds: i32) -> Self {
+        i64::from(seconds).into()
+    }
+}
+
+impl From<chrono::DateTime<chrono::Utc>> for PresentationNow {
+    fn from(now: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            seconds: now.timestamp(),
+            nanoseconds: now.timestamp_subsec_nanos(),
+        }
+    }
+}
+
+/// Present with the response's single sampled instant, including its fraction.
+pub fn present_with_policy_at(
+    value: Value,
+    mode: PresentationMode,
+    now: PresentationNow,
+    policy: VerbPresentationPolicy,
+) -> Value {
     if policy == VerbPresentationPolicy::AlwaysVerbose {
         return value;
     }
     match mode {
         PresentationMode::Verbose | PresentationMode::Human => value,
         PresentationMode::Agent => {
-            let preserved_nulls: HashSet<&str> = LIFECYCLE_NULL_PRESERVE.iter().copied().collect();
-            let score_fields: HashSet<&str> = SCORE_FIELDS.iter().copied().collect();
-            let payload_timestamps: HashSet<&str> =
-                PAYLOAD_TIMESTAMP_FIELDS.iter().copied().collect();
+            let config = AgentTransformConfig {
+                preserved_nulls: LIFECYCLE_NULL_PRESERVE.iter().copied().collect(),
+                scores: SCORE_FIELDS.iter().copied().collect(),
+                payload_timestamps: PAYLOAD_TIMESTAMP_FIELDS.iter().copied().collect(),
+                now,
+            };
             transform_agent(
                 value,
-                &preserved_nulls,
-                &score_fields,
-                &payload_timestamps,
-                now_unix_seconds,
-                false,
-                match policy {
-                    VerbPresentationPolicy::StreamAppendReceipt => ReceiptContext::AppendRoot,
-                    VerbPresentationPolicy::StreamBatchReceipts => ReceiptContext::BatchRoot,
-                    _ => ReceiptContext::None,
+                &config,
+                AgentTreeContext {
+                    inside_properties: false,
+                    object_properties: false,
+                    array_member: false,
+                    receipt_context: match policy {
+                        VerbPresentationPolicy::StreamAppendReceipt => ReceiptContext::AppendRoot,
+                        VerbPresentationPolicy::StreamBatchReceipts => ReceiptContext::BatchRoot,
+                        _ => ReceiptContext::None,
+                    },
                 },
             )
         }
@@ -833,25 +877,56 @@ enum ReceiptContext {
     BatchMember,
 }
 
+struct AgentTransformConfig {
+    preserved_nulls: HashSet<&'static str>,
+    scores: HashSet<&'static str>,
+    payload_timestamps: HashSet<&'static str>,
+    now: PresentationNow,
+}
+
+#[derive(Clone, Copy)]
+struct AgentTreeContext {
+    inside_properties: bool,
+    object_properties: bool,
+    array_member: bool,
+    receipt_context: ReceiptContext,
+}
+
 /// Apply the Agent-mode transform to an arbitrary JSON value.
 ///
-/// `inside_properties` is `true` when recursing inside a `"properties"` object.
-/// Caller-supplied payload timestamps (e.g. `trigger_at`) must not be compacted
+/// `inside_properties` is `true` when recursing inside a `"properties"` value.
+/// Caller-supplied payload timestamps (e.g. `trigger_at`) must not be normalized
 /// because they encode domain semantics the agent may need to round-trip.
 fn transform_agent(
     value: Value,
-    preserved_nulls: &HashSet<&str>,
-    scores: &HashSet<&str>,
-    payload_timestamps: &HashSet<&str>,
-    now: i64,
-    inside_properties: bool,
-    receipt_context: ReceiptContext,
+    config: &AgentTransformConfig,
+    context: AgentTreeContext,
 ) -> Value {
     match value {
         Value::Object(map) => {
             let preserve_list_envelope =
                 is_stable_list_envelope(&map) || is_keyset_cursor_envelope(&map);
             let stream_entry = is_stream_entry(&map);
+            let relative_created_at = (context.array_member
+                && !context.inside_properties
+                && !map.contains_key("created_at_relative")
+                && !matches!(
+                    context.receipt_context,
+                    ReceiptContext::AppendRoot | ReceiptContext::BatchMember
+                ))
+            .then(|| map.get("created_at").and_then(Value::as_str))
+            .flatten()
+            .and_then(|raw| {
+                let (_, created_at) = exact_timestamp(raw)?;
+                let age = config.now.seconds.checked_sub(created_at)?;
+                // Floor the full fractional age. The lexicographic comparison
+                // also handles canonical fractions longer than nanoseconds.
+                age.checked_sub(i64::from(
+                    timestamp_fraction_cmp(raw, config.now.nanoseconds) == Ordering::Greater,
+                ))
+            })
+            .filter(|difference| *difference >= 0)
+            .map(relative_time);
             let mut out = Map::new();
             for (k, v) in map {
                 if stream_entry && k == "record" {
@@ -859,14 +934,15 @@ fn transform_agent(
                     continue;
                 }
                 if v.is_string()
-                    && ((receipt_context == ReceiptContext::AppendRoot && k == "created_at")
-                        || (receipt_context == ReceiptContext::BatchMember
+                    && ((context.receipt_context == ReceiptContext::AppendRoot
+                        && k == "created_at")
+                        || (context.receipt_context == ReceiptContext::BatchMember
                             && matches!(k.as_str(), "created_at" | "updated_at")))
                 {
                     out.insert(k, v);
                     continue;
                 }
-                let child_receipt_context = if receipt_context == ReceiptContext::BatchRoot
+                let child_receipt_context = if context.receipt_context == ReceiptContext::BatchRoot
                     && k == "results"
                     && v.is_array()
                 {
@@ -877,17 +953,16 @@ fn transform_agent(
                 // ADR-045 Amendment 3 scopes the empty-string carve-out to
                 // strings nested under an object-valued `properties`; a
                 // scalar or array `properties` value gets no carve-out.
-                let child_inside_properties =
-                    inside_properties || (k == "properties" && v.is_object());
+                let child_inside_properties = context.inside_properties || k == "properties";
+                let child_object_properties =
+                    context.object_properties || (k == "properties" && v.is_object());
                 let transformed = transform_field_agent(
                     &k,
                     v,
-                    preserved_nulls,
-                    scores,
-                    payload_timestamps,
-                    now,
+                    config,
                     AgentFieldContext {
                         inside_properties: child_inside_properties,
+                        object_properties: child_object_properties,
                         preserve_list_envelope,
                         receipt_context: child_receipt_context,
                     },
@@ -899,6 +974,9 @@ fn transform_agent(
                     }
                 }
             }
+            if let Some(relative) = relative_created_at {
+                out.insert("created_at_relative".to_string(), Value::String(relative));
+            }
             Value::Object(out)
         }
         Value::Array(arr) => {
@@ -907,15 +985,18 @@ fn transform_agent(
                 .map(|v| {
                     transform_agent(
                         v,
-                        preserved_nulls,
-                        scores,
-                        payload_timestamps,
-                        now,
-                        inside_properties,
-                        if receipt_context == ReceiptContext::BatchResults {
-                            ReceiptContext::BatchMember
-                        } else {
-                            ReceiptContext::None
+                        config,
+                        AgentTreeContext {
+                            inside_properties: context.inside_properties,
+                            object_properties: context.object_properties,
+                            array_member: true,
+                            receipt_context: if context.receipt_context
+                                == ReceiptContext::BatchResults
+                            {
+                                ReceiptContext::BatchMember
+                            } else {
+                                ReceiptContext::None
+                            },
                         },
                     )
                 })
@@ -930,16 +1011,17 @@ fn transform_agent(
 ///
 /// Returns `None` if the field should be dropped.
 ///
-/// `inside_properties` suppresses timestamp compaction for caller-submitted
+/// `inside_properties` suppresses timestamp normalization for caller-submitted
 /// payload values nested under a literal `"properties"` key (e.g. `trigger_at`
-/// as returned by `agenda`/`get`). `payload_timestamps` suppresses compaction
+/// as returned by `agenda`/`get`). `payload_timestamps` suppresses normalization
 /// by field name regardless of nesting, covering top-level convenience fields
 /// such as the `trigger_at` returned directly in a `schedule.remind`/
 /// `schedule.schedule` create response (#871). Metadata timestamps at the top
-/// level (`created_at`, `updated_at`) are still compacted.
+/// level (`created_at`, `updated_at`) still render as exact UTC instants.
 #[derive(Clone, Copy)]
 struct AgentFieldContext {
     inside_properties: bool,
+    object_properties: bool,
     preserve_list_envelope: bool,
     receipt_context: ReceiptContext,
 }
@@ -947,16 +1029,13 @@ struct AgentFieldContext {
 fn transform_field_agent(
     key: &str,
     value: Value,
-    preserved_nulls: &HashSet<&str>,
-    scores: &HashSet<&str>,
-    payload_timestamps: &HashSet<&str>,
-    now: i64,
+    config: &AgentTransformConfig,
     context: AgentFieldContext,
 ) -> Option<Value> {
     match &value {
         // Preserve lifecycle and stable-envelope nulls; drop other nulls.
         Value::Null => {
-            if preserved_nulls.contains(key)
+            if config.preserved_nulls.contains(key)
                 || (context.preserve_list_envelope && key == "next_after")
             {
                 Some(value)
@@ -977,13 +1056,13 @@ fn transform_field_agent(
         // (set-to-empty vs absent, ADR-045 Amendment 3, issue #1995). Empty
         // arrays and objects under `properties` are still dropped per the
         // amendment's scope note.
-        Value::String(s) if s.is_empty() && context.inside_properties => Some(value),
+        Value::String(s) if s.is_empty() && context.object_properties => Some(value),
         // Drop other empty strings, arrays, objects.
         Value::String(s) if s.is_empty() => None,
         Value::Array(a) if a.is_empty() => None,
         Value::Object(o) if o.is_empty() => None,
         // Truncate score fields.
-        Value::Number(_) if scores.contains(key) => {
+        Value::Number(_) if config.scores.contains(key) => {
             if let Some(f) = value.as_f64() {
                 Some(truncate_to_3_sig_figs(f))
             } else {
@@ -994,24 +1073,27 @@ fn transform_field_agent(
         Value::String(s) if is_canonical_uuid(s) && should_shorten_uuid_field(key) => {
             Some(Value::String(s[..8].to_string()))
         }
-        // Compact ISO-8601 timestamps unless inside a caller-supplied payload
-        // object, or the field is a named payload timestamp at any nesting.
+        // Render whole, offset-bearing timestamps in exact UTC form unless
+        // this is caller-supplied or otherwise protected payload data.
         Value::String(s)
             if !context.inside_properties
-                && !payload_timestamps.contains(key)
+                && !config.payload_timestamps.contains(key)
                 && looks_like_iso8601(s) =>
         {
-            Some(Value::String(compact_timestamp(s, now)))
+            Some(Value::String(
+                exact_timestamp(s).map_or_else(|| s.clone(), |(rendered, _)| rendered),
+            ))
         }
         // Recurse into objects and arrays.
         Value::Object(_) | Value::Array(_) => Some(transform_agent(
             value,
-            preserved_nulls,
-            scores,
-            payload_timestamps,
-            now,
-            context.inside_properties,
-            context.receipt_context,
+            config,
+            AgentTreeContext {
+                inside_properties: context.inside_properties,
+                object_properties: context.object_properties,
+                array_member: false,
+                receipt_context: context.receipt_context,
+            },
         )),
         // Everything else passes through.
         _ => Some(value),
@@ -1054,34 +1136,58 @@ fn looks_like_iso8601(s: &str) -> bool {
         && b[11..13].iter().all(|c| c.is_ascii_digit())
 }
 
-/// Compact an ISO-8601 timestamp for Agent mode.
-///
-/// - Within the last 24 hours: relative form (e.g. `"3m ago"`, `"2h ago"`).
-/// - Older: minute-granularity absolute form `"YYYY-MM-DDTHH:MM"`.
-fn compact_timestamp(s: &str, now: i64) -> String {
-    // Parse Unix seconds from the timestamp if possible; fall back to truncation.
-    if let Some(unix) = parse_iso8601_unix(s) {
-        let diff = now - unix;
-        if (0..86400).contains(&diff) {
-            return relative_time(diff);
-        }
-    }
-    // Minute granularity: take the first 16 chars.
-    s.chars().take(16).collect()
+/// Render a whole timestamp in UTC while retaining its original fraction digits.
+fn exact_timestamp(s: &str) -> Option<(String, i64)> {
+    let unix = parse_iso8601_unix(s)?;
+    let tail = s.get(19..)?;
+    let fraction = if let Some(after_dot) = tail.strip_prefix('.') {
+        let digits = after_dot.bytes().take_while(u8::is_ascii_digit).count();
+        tail.get(..digits + 1)?
+    } else {
+        ""
+    };
+    let utc = chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)?;
+    Some((
+        format!("{}{fraction}Z", utc.format("%Y-%m-%dT%H:%M:%S")),
+        unix,
+    ))
 }
 
-/// Attempt to parse an ISO-8601 datetime string to Unix seconds.
+/// Compare the timestamp's decimal fraction with a sampled nanosecond value.
+/// Digits beyond nanoseconds matter when the leading nine digits tie.
+fn timestamp_fraction_cmp(timestamp: &str, now_nanoseconds: u32) -> Ordering {
+    let fraction = if timestamp.as_bytes().get(19) == Some(&b'.') {
+        timestamp.as_bytes()[20..]
+            .split(|byte| !byte.is_ascii_digit())
+            .next()
+            .unwrap_or_default()
+    } else {
+        &[]
+    };
+    let now_fraction = format!("{now_nanoseconds:09}");
+    for index in 0..fraction.len().max(9) {
+        let created_digit = fraction.get(index).copied().unwrap_or(b'0');
+        let now_digit = now_fraction.as_bytes().get(index).copied().unwrap_or(b'0');
+        match created_digit.cmp(&now_digit) {
+            Ordering::Equal => {}
+            difference => return difference,
+        }
+    }
+    Ordering::Equal
+}
+
+/// Parse a whole ISO-8601 datetime with an explicit offset to Unix seconds.
 ///
-/// Only handles the subset produced by khive handlers:
-/// `YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH:MM|±HHMM]`. Returns `None` for anything
-/// we can't parse (graceful degradation — the timestamp is still compacted
-/// by truncation).
+/// Accepts `YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM|±HHMM)`. An offset-less,
+/// invalid or trailing-text value stays byte-exact in Agent presentation.
 fn parse_iso8601_unix(s: &str) -> Option<i64> {
-    // Minimum parseable: "YYYY-MM-DDTHH:MM:SS"
-    if s.len() < 19 {
+    if s.len() < 20 {
         return None;
     }
     let b = s.as_bytes();
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
     let year: i64 = parse_digits(&b[0..4])?;
     let month: i64 = parse_digits(&b[5..7])?;
     let day: i64 = parse_digits(&b[8..10])?;
@@ -1089,13 +1195,20 @@ fn parse_iso8601_unix(s: &str) -> Option<i64> {
     let minute: i64 = parse_digits(&b[14..16])?;
     let second: i64 = parse_digits(&b[17..19])?;
 
-    // Simple Gregorian → local-wall-clock Unix seconds, then adjust for any
-    // trailing timezone offset (see `parse_tz_offset_secs`) to get the
-    // actual UTC instant.
-    let days_since_epoch = days_from_civil(year, month, day);
-    let local = days_since_epoch * 86400 + hour * 3600 + minute * 60 + second;
-    let offset_secs = parse_tz_offset_secs(&s[19..])?;
-    Some(local - offset_secs)
+    let local = chrono::NaiveDate::from_ymd_opt(
+        year.try_into().ok()?,
+        month.try_into().ok()?,
+        day.try_into().ok()?,
+    )?
+    .and_hms_opt(
+        hour.try_into().ok()?,
+        minute.try_into().ok()?,
+        second.try_into().ok()?,
+    )?
+    .and_utc()
+    .timestamp();
+    let offset_secs = parse_tz_offset_secs(s.get(19..)?)?;
+    local.checked_sub(offset_secs)
 }
 
 /// Parse the tail of an ISO-8601 timestamp (everything from byte index 19
@@ -1103,7 +1216,7 @@ fn parse_iso8601_unix(s: &str) -> Option<i64> {
 ///
 /// Handles, in order: optional fractional seconds (`.nnn`, skipped — this
 /// parser only has whole-second precision), then one of:
-/// - empty string or `"Z"` → offset 0
+/// - `"Z"` → offset 0
 /// - `±HH:MM` or the compact `±HHMM` form → `sign * (hh*3600 + mm*60)`
 ///
 /// Returns `None` for anything else (malformed tail).
@@ -1117,7 +1230,7 @@ fn parse_tz_offset_secs(tail: &str) -> Option<i64> {
         rest = &after_dot[frac_len..];
     }
 
-    if rest.is_empty() || rest == "Z" {
+    if rest == "Z" {
         return Some(0);
     }
 
@@ -1151,24 +1264,16 @@ fn parse_digits(b: &[u8]) -> Option<i64> {
     s.parse().ok()
 }
 
-/// Gregorian date → days since 1970-01-01. Algorithm: Howard Hinnant's civil.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
 /// Format a duration in seconds as a relative time string (e.g. `"3m ago"`).
 fn relative_time(diff_secs: i64) -> String {
     if diff_secs < 60 {
         format!("{diff_secs}s ago")
     } else if diff_secs < 3600 {
         format!("{}m ago", diff_secs / 60)
-    } else {
+    } else if diff_secs < 86400 {
         format!("{}h ago", diff_secs / 3600)
+    } else {
+        format!("{}d ago", diff_secs / 86400)
     }
 }
 
@@ -1191,7 +1296,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// A fixed "now" for deterministic tests: 2026-05-23T16:18:00Z ≈ 1748016480.
+    /// A fixed "now" for deterministic tests: 2025-05-23T16:08:00Z.
     const NOW: i64 = 1_748_016_480;
 
     #[test]
@@ -1199,7 +1304,7 @@ mod tests {
         let micros = 1_748_016_480_000_000_i64;
         assert_eq!(rfc3339_to_utc_micros(&micros_to_iso(micros)), Ok(micros));
         // Offset spellings resolve to the same instant; whitespace tolerated.
-        // (NOW's epoch value is 2025-05-23T16:08:00Z despite its comment.)
+        // The offset spelling names the same instant as NOW.
         assert_eq!(
             rfc3339_to_utc_micros(" 2025-05-23T12:08:00-04:00 "),
             Ok(micros)
@@ -1435,22 +1540,20 @@ mod tests {
     }
 
     #[test]
-    fn agent_compacts_old_timestamp_to_minutes() {
-        // Far past — not within 24h of NOW. Should be truncated to 16 chars.
+    fn agent_renders_old_timestamp_exactly() {
         let v = json!({"created_at": "2020-01-01T10:30:45.123456Z"});
         let out = agent(v);
-        assert_eq!(out["created_at"], json!("2020-01-01T10:30"));
+        assert_eq!(out["created_at"], json!("2020-01-01T10:30:45.123456Z"));
+        assert!(out.get("created_at_relative").is_none());
     }
 
     #[test]
-    fn agent_compacts_recent_timestamp_to_relative() {
-        // 3 minutes before NOW: diff = 180s.
+    fn agent_renders_recent_timestamp_exactly() {
         let ts_unix = NOW - 180;
-        // Format as ISO-8601.
         let ts = unix_to_iso8601(ts_unix);
-        let v = json!({"updated_at": ts});
+        let v = json!({"updated_at": ts.clone()});
         let out = agent(v);
-        assert_eq!(out["updated_at"], json!("3m ago"));
+        assert_eq!(out["updated_at"], json!(ts));
     }
 
     #[test]
@@ -1493,17 +1596,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_still_compacts_other_top_level_timestamps_alongside_trigger_at() {
+    fn agent_still_renders_other_top_level_timestamps_alongside_trigger_at() {
         // The `trigger_at` exemption is scoped to that field name only — a
-        // sibling generic timestamp field must still be compacted, so the
-        // fix does not blanket-disable Agent-mode compaction.
+        // sibling generic timestamp field still converts to exact UTC.
         let v = json!({
             "trigger_at": "2026-07-11T19:00:00-04:00",
             "created_at": "2020-01-01T10:30:45.123456Z",
         });
         let out = agent(v);
         assert_eq!(out["trigger_at"], json!("2026-07-11T19:00:00-04:00"));
-        assert_eq!(out["created_at"], json!("2020-01-01T10:30"));
+        assert_eq!(out["created_at"], json!("2020-01-01T10:30:45.123456Z"));
     }
 
     #[test]
@@ -2262,12 +2364,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_iso8601_unix_bare_form_unchanged() {
-        // No trailing Z/offset at all: existing "no offset" behavior preserved.
-        assert_eq!(
-            parse_iso8601_unix("2026-07-09T15:55:00"),
-            parse_iso8601_unix("2026-07-09T15:55:00Z")
-        );
+    fn parse_iso8601_unix_rejects_bare_form() {
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00"), None);
     }
 
     #[test]
@@ -2296,24 +2394,17 @@ mod tests {
     }
 
     #[test]
-    fn compact_timestamp_offset_bearing_future_time_not_shown_as_ago() {
-        // A wall-clock-identical-to-NOW timestamp carrying a "-02:00" offset
-        // is actually 2h in the future; an offset-naive parser would misread
-        // the wall-clock digits as UTC and report "0s ago".
-        let out = compact_timestamp("2025-05-23T16:08:00-02:00", NOW);
-        assert_ne!(out, "0s ago");
-        assert_eq!(out, "2025-05-23T16:08");
+    fn exact_timestamp_converts_future_offset_without_relative_form() {
+        let out = exact_timestamp("2025-05-23T16:08:00-02:00").unwrap();
+        assert_eq!(out.0, "2025-05-23T18:08:00Z");
+        assert!(out.1 > NOW);
     }
 
     #[test]
-    fn compact_timestamp_offset_bearing_past_time_renders_relative() {
-        // "20:05+04:00" == "16:05Z", which is 3 minutes before NOW
-        // (2025-05-23T16:08:00Z). Correct offset handling must produce
-        // "3m ago"; the old offset-naive parser would compare wall-clock
-        // 20:05 against NOW directly, landing outside the 24h window and
-        // falling back to truncated absolute form instead.
-        let out = compact_timestamp("2025-05-23T20:05:00+04:00", NOW);
-        assert_eq!(out, "3m ago");
+    fn exact_timestamp_converts_past_offset_and_retains_fraction() {
+        let out = exact_timestamp("2025-05-23T20:05:00.123+04:00").unwrap();
+        assert_eq!(out.0, "2025-05-23T16:05:00.123Z");
+        assert_eq!(out.1, NOW - 180);
     }
 }
 
@@ -2355,9 +2446,9 @@ mod issue_2537_standard_tests {
             "entry":{"seq":1,"id":uuid,"created_at":timestamp,"record":payload},
             "cursor":{"head_seq":0,"entries":[],"next_after":null}});
         let shown = present(value.clone(), PresentationMode::Agent, now);
-        assert_eq!(shown["updated_at"], "3m ago");
-        assert_eq!(shown["results"][0]["updated_at"], "3m ago");
-        assert_eq!(shown["results"][0]["details"]["updated_at"], "3m ago");
+        assert_eq!(shown["updated_at"], timestamp);
+        assert_eq!(shown["results"][0]["updated_at"], timestamp);
+        assert_eq!(shown["results"][0]["details"]["updated_at"], timestamp);
         assert_eq!(shown["id"], "aabbccdd");
         assert_eq!(shown["score"], json!(0.123));
         assert!(shown.get("empty").is_none());
@@ -2369,7 +2460,7 @@ mod issue_2537_standard_tests {
         assert_eq!(shown["trigger_at"], timestamp);
         assert_eq!(shown["due"], timestamp);
         assert_eq!(shown["entry"]["record"], payload);
-        assert_eq!(shown["entry"]["created_at"], "3m ago");
+        assert_eq!(shown["entry"]["created_at"], timestamp);
         assert_eq!(shown["cursor"], value["cursor"]);
         for mode in [PresentationMode::Verbose, PresentationMode::Human] {
             assert_eq!(present(value.clone(), mode, now), value);
@@ -2380,7 +2471,7 @@ mod issue_2537_standard_tests {
                 PresentationMode::Agent,
                 now
             )["properties"],
-            "3m ago"
+            timestamp
         );
         assert_eq!(
             present(
@@ -2388,7 +2479,7 @@ mod issue_2537_standard_tests {
                 PresentationMode::Agent,
                 now
             )["properties"],
-            json!([timestamp,{"created_at":"3m ago"}])
+            json!([timestamp,{"created_at":timestamp}])
         );
     }
 }
@@ -2429,15 +2520,19 @@ mod issue_2537_receipt_policy_tests {
             (batch, VerbPresentationPolicy::StreamBatchReceipts),
         ] {
             let mut expected = present(value.clone(), PresentationMode::Agent, NOW);
-            assert_eq!(expected["created_at"], "3m ago");
-            assert_eq!(expected["updated_at"], "3m ago");
+            assert_eq!(expected["created_at"], TIMESTAMP);
+            assert_eq!(expected["updated_at"], TIMESTAMP);
             assert_eq!(expected["id"], "aabbccdd");
-            assert_eq!(expected["ticker"]["last_tick_at"], "3m ago");
+            assert_eq!(expected["ticker"]["last_tick_at"], TIMESTAMP);
             if policy == VerbPresentationPolicy::StreamAppendReceipt {
                 expected["created_at"] = json!(TIMESTAMP);
             } else {
                 expected["results"][0]["created_at"] = json!(TIMESTAMP);
                 expected["results"][0]["updated_at"] = json!(TIMESTAMP);
+                expected["results"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("created_at_relative");
             }
             assert_eq!(
                 present_with_policy(value.clone(), PresentationMode::Agent, NOW, policy),
@@ -2587,5 +2682,177 @@ mod parsed_note_content_tests {
                 assert_eq!(actual.pointer(pointer), Some(&expected));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod adr045_amendment9_tests {
+    use super::*;
+    use serde_json::json;
+
+    const NOW: i64 = 1_748_016_480; // 2025-05-23T16:08:00Z
+
+    #[test]
+    fn agent_exact_utc_preserves_fraction_digits_and_instant() {
+        for (utc_clock, plus_clock, minus_clock) in [
+            (
+                "2025-05-23T16:05:00",
+                "2025-05-23T20:05:00",
+                "2025-05-23T12:05:00",
+            ),
+            (
+                "2020-01-01T10:30:45",
+                "2020-01-01T14:30:45",
+                "2020-01-01T06:30:45",
+            ),
+        ] {
+            for fraction in ["", ".123", ".123456"] {
+                let expected = format!("{utc_clock}{fraction}Z");
+                for (clock, offset) in [
+                    (utc_clock, "Z"),
+                    (utc_clock, "+00:00"),
+                    (plus_clock, "+0400"),
+                    (minus_clock, "-04:00"),
+                ] {
+                    let input = format!("{clock}{fraction}{offset}");
+                    let shown = present(
+                        json!({"updated_at": input.clone()}),
+                        PresentationMode::Agent,
+                        NOW,
+                    );
+                    assert_eq!(shown["updated_at"], expected, "{input}");
+                    assert_eq!(
+                        parse_iso8601_unix(&input),
+                        parse_iso8601_unix(&expected),
+                        "{input}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_preserves_timestamp_prefix_body() {
+        let body = "2025-05-23T16:05:00Z followed by ordinary message text";
+        let shown = present(json!({"content": body}), PresentationMode::Agent, NOW);
+        assert_eq!(shown["content"], body);
+    }
+
+    #[test]
+    fn agent_preserves_offsetless_timestamp() {
+        let body = "2025-05-23T16:05:00";
+        let shown = present(json!({"content": body}), PresentationMode::Agent, NOW);
+        assert_eq!(shown["content"], body);
+    }
+
+    #[test]
+    fn agent_preserves_malformed_offset() {
+        let body = "2025-05-23T16:05:00+25:00";
+        let shown = present(json!({"content": body}), PresentationMode::Agent, NOW);
+        assert_eq!(shown["content"], body);
+    }
+
+    #[test]
+    fn agent_list_rows_pair_exact_and_relative_time_in_each_band() {
+        let bands = [
+            (42, "42s ago"),
+            (180, "3m ago"),
+            (3 * 3600, "3h ago"),
+            (2 * 86400, "2d ago"),
+        ];
+        let rows: Vec<Value> = bands
+            .into_iter()
+            .map(|(age, _)| {
+                let created = chrono::DateTime::<chrono::Utc>::from_timestamp(NOW - age, 0)
+                    .unwrap()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                json!({"created_at": created, "updated_at": created})
+            })
+            .collect();
+        let shown = present(json!({"items": rows.clone()}), PresentationMode::Agent, NOW);
+        for (index, (_, relative)) in bands.into_iter().enumerate() {
+            assert_eq!(
+                shown["items"][index]["created_at"],
+                rows[index]["created_at"]
+            );
+            assert_eq!(
+                shown["items"][index]["updated_at"],
+                rows[index]["updated_at"]
+            );
+            assert_eq!(shown["items"][index]["created_at_relative"], relative);
+            assert!(shown["items"][index].get("updated_at_relative").is_none());
+        }
+    }
+
+    #[test]
+    fn agent_relative_sibling_obeys_array_properties_existing_and_future_bounds() {
+        let recent = "2025-05-23T16:05:00+00:00";
+        let future = "2025-05-23T16:08:10Z";
+        let shown = present(
+            json!({
+                "created_at": recent,
+                "items": [
+                    {"created_at": future},
+                    {"created_at": recent, "created_at_relative": "canonical"},
+                    {"created_at": "2025-05-23T16:05:00"},
+                    {"updated_at": recent},
+                    {"created_at": "2025-05-23T16:08:00.000001Z"},
+                    {"created_at": "2025-05-23T16:07:59.999999Z"},
+                    {"created_at": "2025-05-23T16:08:00.000000Z"},
+                    {"properties": [{"created_at": recent, "empty": ""}]}
+                ],
+                "properties": {"nested": [{"created_at": recent}]}
+            }),
+            PresentationMode::Agent,
+            NOW,
+        );
+        assert_eq!(shown["created_at"], "2025-05-23T16:05:00Z");
+        assert!(shown.get("created_at_relative").is_none());
+        assert_eq!(shown["items"][0]["created_at"], future);
+        assert!(shown["items"][0].get("created_at_relative").is_none());
+        assert_eq!(shown["items"][1]["created_at_relative"], "canonical");
+        assert_eq!(shown["items"][2]["created_at"], "2025-05-23T16:05:00");
+        assert!(shown["items"][2].get("created_at_relative").is_none());
+        assert!(shown["items"][3].get("created_at_relative").is_none());
+        assert!(shown["items"][4].get("created_at_relative").is_none());
+        assert_eq!(shown["items"][5]["created_at_relative"], "0s ago");
+        assert_eq!(shown["items"][6]["created_at_relative"], "0s ago");
+        assert_eq!(shown["items"][7]["properties"][0]["created_at"], recent);
+        assert!(shown["items"][7]["properties"][0]
+            .get("created_at_relative")
+            .is_none());
+        assert!(shown["items"][7]["properties"][0].get("empty").is_none());
+        assert_eq!(shown["properties"]["nested"][0]["created_at"], recent);
+        assert!(shown["properties"]["nested"][0]
+            .get("created_at_relative")
+            .is_none());
+    }
+
+    #[test]
+    fn agent_relative_sibling_uses_sampled_fraction_within_same_second() {
+        let sampled = chrono::DateTime::parse_from_rfc3339("2025-05-23T16:08:00.500000000Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let shown = present_with_policy_at(
+            json!({"items": [
+                {"created_at": "2025-05-23T16:08:00.499999999Z"},
+                {"created_at": "2025-05-23T16:08:00.500000000Z"},
+                {"created_at": "2025-05-23T16:08:00.5000000000Z"},
+                {"created_at": "2025-05-23T16:08:00.5000000001Z"},
+                {"created_at": "2025-05-23T16:08:00.500000001Z"},
+                {"created_at": "2025-05-23T16:07:59.500000001Z"},
+                {"created_at": "2025-05-23T16:07:59.500000000Z"}
+            ]}),
+            PresentationMode::Agent,
+            sampled.into(),
+            VerbPresentationPolicy::Standard,
+        );
+        for index in [0, 1, 2, 5] {
+            assert_eq!(shown["items"][index]["created_at_relative"], "0s ago");
+        }
+        for index in [3, 4] {
+            assert!(shown["items"][index].get("created_at_relative").is_none());
+        }
+        assert_eq!(shown["items"][6]["created_at_relative"], "1s ago");
     }
 }

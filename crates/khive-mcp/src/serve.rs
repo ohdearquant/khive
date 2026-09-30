@@ -10,8 +10,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use khive_runtime::{
     config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
-    BackendKind, BlobHydrator, ConnectionPool, KhiveConfig, KhiveRuntime, OutputFormat,
-    RuntimeConfig, StorageBackend,
+    BackendKind, BlobHydrator, ConnectionPool, KhiveConfig, KhiveRuntime, OpenedDiagnosticBackend,
+    OutputFormat, RuntimeConfig, StorageBackend,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -442,12 +442,31 @@ fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRunti
     runtime.filter(|runtime| !runtime.is_read_only())
 }
 
+#[cfg(all(test, feature = "channel-email"))]
+thread_local! {
+    static EMAIL_POLL_TEST_CHANNEL: std::cell::RefCell<Option<std::sync::Arc<dyn khive_channel::Channel>>> =
+        const { std::cell::RefCell::new(None) };
+    static EMAIL_POLL_TEST_SHUTDOWN: std::cell::RefCell<Option<tokio_util::sync::CancellationToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "channel-email")]
+fn email_poll_shutdown_token(
+    process_shutdown: tokio_util::sync::CancellationToken,
+) -> tokio_util::sync::CancellationToken {
+    #[cfg(test)]
+    let process_shutdown = EMAIL_POLL_TEST_SHUTDOWN
+        .with(|token| token.borrow_mut().take())
+        .unwrap_or(process_shutdown);
+    process_shutdown
+}
+
+#[cfg(feature = "channel-email")]
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
 /// warning and returns on incomplete config. Only call this with the
 /// role-and-runtime admission returned by [`channel_loop_plan`] — use
 /// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
-#[cfg(feature = "channel-email")]
 fn spawn_email_channel_loops(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
@@ -461,12 +480,16 @@ fn spawn_email_channel_loops(
             let email_ch = Arc::new(email_ch);
             let mut ch_registry = ChannelRegistry::new();
             let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
+            #[cfg(test)]
+            let dyn_ch = EMAIL_POLL_TEST_CHANNEL
+                .with(|channel| channel.borrow_mut().take())
+                .unwrap_or(dyn_ch);
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
             let runtime = server.channel_outbox_runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
-            let default_actor = default_inbound_actor_from_env();
+            let default_actor = email_default_inbound_actor_from_env();
             let mut allowlist = allowed_recipients_from_env();
             if allowlist.is_empty() {
                 allowlist.push(email_ch.maintainer_address().to_string());
@@ -484,6 +507,8 @@ fn spawn_email_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
+                    let poll_shutdown =
+                        email_poll_shutdown_token(khive_runtime::daemon_shutdown_token());
                     khive_runtime::track_named_background_task("email_channel_poll", async move {
                         if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
                         {
@@ -498,7 +523,7 @@ fn spawn_email_channel_loops(
                             verb_reg_poll,
                             ingest_ns_clone,
                             default_actor_clone,
-                            khive_runtime::daemon_shutdown_token(),
+                            poll_shutdown,
                         )
                         .await;
                     });
@@ -563,17 +588,22 @@ fn ingest_namespace_from_env() -> String {
 }
 
 /// Resolve the default inbound actor for fresh (uncorrelated) email messages.
-///
-/// Reads `KHIVE_EMAIL_DEFAULT_ACTOR`; falls back to `"local"` when the
-/// variable is unset or blank. Set it to `"channel:email"` to route fresh,
-/// uncorrelated email to a separately addressed mailbox. Called once at server
-/// startup alongside `ingest_namespace_from_env`.
 #[cfg(feature = "channel-email")]
-fn default_inbound_actor_from_env() -> String {
-    std::env::var("KHIVE_EMAIL_DEFAULT_ACTOR")
+fn email_default_inbound_actor_from_env() -> String {
+    default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email")
+}
+
+/// Resolve the default inbound actor for fresh (uncorrelated) channel messages.
+///
+/// Reads the supplied environment variable; falls back to the supplied channel
+/// actor when it is unset or blank. Both channel defaults are isolated
+/// from the anonymous `local` mailbox.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn default_inbound_actor_from_env(actor_variable: &str, fallback: &str) -> String {
+    std::env::var(actor_variable)
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "local".to_string())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 /// Parse the outbox allowlist from `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`.
@@ -786,6 +816,7 @@ async fn quarantine_channel_ingest_failure(
         "channel_kind": channel_kind,
         "channel_slug": channel_slug,
         "external_id": external_id,
+        "correlation_external_id": envelope.correlation_external_id.clone(),
         "metadata": {
             "quarantined": "true",
             "quarantine_classification": classification.name(),
@@ -880,6 +911,19 @@ async fn cleanup_expired_channel_quarantine(
                 "namespace": ingest_namespace,
                 "channel_kind": channel_kind,
                 "channel_slug": channel_slug,
+            }),
+        )
+        .await?;
+    // Historical quarantines predate channel slugs. Drain one bounded page
+    // per poll, with the same hold-on-error behavior as the exact-slug pass.
+    registry
+        .dispatch(
+            "comm.cleanup_expired_quarantine",
+            json!({
+                "namespace": ingest_namespace,
+                "channel_kind": channel_kind,
+                "channel_slug": "",
+                "mode": "legacy_slugless",
             }),
         )
         .await?;
@@ -1638,7 +1682,19 @@ pub(crate) async fn channel_outbox_loop(
     allowlist: Vec<String>,
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
-    let domain = mailbox.split('@').nth(1).unwrap_or("localhost").to_string();
+    let historical = match std::env::var(khive_runtime::HISTORICAL_DOMAINS_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => String::new(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(crate::components::ComponentError::Permanent(format!(
+                "{} must contain valid Unicode text",
+                khive_runtime::HISTORICAL_DOMAINS_ENV
+            )));
+        }
+    };
+    let domains =
+        khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(&mailbox, &historical)
+            .map_err(crate::components::ComponentError::Permanent)?;
     outbox::validate_loop_channel(email_channel.as_ref(), "email")?;
     let slug = email_channel.slug();
     let mut channels = khive_channel::ChannelRegistry::new();
@@ -1657,7 +1713,7 @@ pub(crate) async fn channel_outbox_loop(
             },
             outbox::OutboxPolicy::Email {
                 mailbox: &mailbox,
-                domain: &domain,
+                domains: &domains,
                 allowlist: &allowlist,
             },
             &runtime,
@@ -1685,12 +1741,15 @@ async fn channel_outbox_once(
     allowlist: &[String],
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<(), crate::components::ComponentError> {
+    let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(mailbox, "")
+        .map_err(crate::components::ComponentError::Permanent)?;
+    debug_assert_eq!(domains.current(), domain);
     let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(email_channel),
         outbox::OutboxPolicy::Email {
             mailbox,
-            domain,
+            domains: &domains,
             allowlist,
         },
         runtime,
@@ -1751,10 +1810,13 @@ fn spawn_telegram_channel_loops(
             let tg_ch = Arc::new(tg_ch);
             let verb_reg = server.verb_registry_clone();
             let ingest_ns = telegram_ingest_namespace_from_env();
+            let default_actor =
+                default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR", "telegram:bot");
 
             let verb_reg_poll = verb_reg.clone();
             let outbox_runtime = server.channel_outbox_runtime_clone();
             let ingest_ns_poll = ingest_ns.clone();
+            let default_actor_poll = default_actor.clone();
             let ingest_ns_outbox = ingest_ns.clone();
             let tg_ch_poll = Arc::clone(&tg_ch);
             let tg_ch_outbox = Arc::clone(&tg_ch);
@@ -1777,6 +1839,7 @@ fn spawn_telegram_channel_loops(
                                 tg_ch_poll,
                                 verb_reg_poll,
                                 ingest_ns_poll,
+                                default_actor_poll,
                                 khive_runtime::daemon_shutdown_token(),
                             )
                             .await;
@@ -1875,6 +1938,7 @@ async fn telegram_poll_loop(
     telegram_channel: std::sync::Arc<impl TelegramPollChannel>,
     registry: khive_runtime::VerbRegistry,
     ingest_namespace: String,
+    default_inbound_actor: String,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     use chrono::Utc;
@@ -1931,13 +1995,14 @@ async fn telegram_poll_loop(
                         "channel_slug": &slug,
                         "external_id": env.external_id.clone(),
                         "sent_at": env.sent_at.as_ref().map(|ts| ts.to_rfc3339()),
+                        "default_inbound_actor": default_inbound_actor,
                     });
                     if let Err(error) = registry.dispatch("comm.ingest", params).await {
                         let handled = handle_channel_ingest_failure(
                             &registry,
                             &ingest_namespace,
                             (kind, &slug),
-                            None,
+                            Some(&default_inbound_actor),
                             &env,
                             &error,
                             &mut unknown_ingest_attempts,
@@ -3106,6 +3171,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     // Every pack sees the whole serving topology, including stores assigned
     // to other packs, before handlers can accept a code.ingest target.
     let declared_backend_db_paths = declared_backend_db_paths(khive_cfg);
+    let diagnostic_backends = opened_diagnostic_backends(&backends);
 
     // Built before the pack loop: secondary-pack runtimes capture the main
     // runtime's embedder wiring so their `core()`-routed writes embed with
@@ -3115,7 +3181,8 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         cfg.backend_id = BackendId::main();
         cfg
     })
-    .with_declared_backend_db_paths(declared_backend_db_paths.clone());
+    .with_declared_backend_db_paths(declared_backend_db_paths.clone())
+    .with_diagnostic_backends(diagnostic_backends.clone());
 
     let pack_names = &base_config.packs;
     let mut per_pack_runtimes_local: HashMap<String, KhiveRuntime> = HashMap::new();
@@ -3148,6 +3215,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
                 &main_backend,
                 &default_runtime,
                 declared_backend_db_paths.clone(),
+                diagnostic_backends.clone(),
             ),
         );
     }
@@ -3249,6 +3317,10 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
     registry.call_register_note_mutation_hooks(&default_runtime);
+    registry.call_register_note_search_ann_providers(&default_runtime);
+    for rt in per_pack_runtimes_local.values() {
+        registry.call_register_note_search_ann_providers(rt);
+    }
     // Note-write identity: install the pack-owned kind set and the pack-owned
     // note-write validator so identity properties are derived at the write and
     // preserved through merge/update on every path, including the ones that
@@ -4132,6 +4204,47 @@ pub fn install_resolved_blob_store(
     Ok(hydrator)
 }
 
+/// Group the pools opened during boot by canonical file. Every configured name
+/// survives aliasing, including names not assigned to a loaded pack. In-memory
+/// pools have no file identity and are grouped only when they share one pool.
+fn opened_diagnostic_backends(
+    backends: &HashMap<String, Arc<StorageBackend>>,
+) -> Arc<[OpenedDiagnosticBackend]> {
+    let mut names: Vec<_> = backends.keys().cloned().collect();
+    names.sort();
+    names.sort_by_key(|name| name != BackendId::MAIN);
+    let mut by_path: HashMap<PathBuf, usize> = HashMap::new();
+    let mut by_memory_pool: HashMap<usize, usize> = HashMap::new();
+    let mut opened: Vec<OpenedDiagnosticBackend> = Vec::new();
+    for name in names {
+        let pool = backends[&name].pool_arc();
+        let path = pool.canonical_path().map(PathBuf::from);
+        let existing = match &path {
+            Some(path) => by_path.get(path).copied(),
+            None => by_memory_pool.get(&(Arc::as_ptr(&pool) as usize)).copied(),
+        };
+        if let Some(index) = existing {
+            opened[index].backend_names.push(name);
+            continue;
+        }
+        let index = opened.len();
+        match &path {
+            Some(path) => {
+                by_path.insert(path.clone(), index);
+            }
+            None => {
+                by_memory_pool.insert(Arc::as_ptr(&pool) as usize, index);
+            }
+        }
+        opened.push(OpenedDiagnosticBackend {
+            backend_names: vec![name],
+            canonical_path: path,
+            pool,
+        });
+    }
+    opened.into()
+}
+
 /// Construct one per-pack runtime, wiring `core_backend` for secondary-backend packs.
 ///
 /// Centralizing this in one helper ensures that both `build_registry_for_multi_backend`
@@ -4146,12 +4259,15 @@ fn build_pack_runtime(
     main_backend: &Arc<StorageBackend>,
     main_runtime: &KhiveRuntime,
     declared_backend_db_paths: Arc<[PathBuf]>,
+    diagnostic_backends: Arc<[OpenedDiagnosticBackend]>,
 ) -> KhiveRuntime {
     // Every pack runtime carries main's embedder wiring for core(): a
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
     let rt = KhiveRuntime::from_backend(backend, rt_config)
         .with_declared_backend_db_paths(declared_backend_db_paths)
+        .with_diagnostic_backends(diagnostic_backends)
+        .with_diagnostic_observer_from(main_runtime)
         .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
@@ -6023,6 +6139,170 @@ id = "lambda:project-actor"
             backend_id: BackendId::main(),
             ..RuntimeConfig::default()
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn db_diagnostics_lists_main_and_routed_secondary() {
+        use crate::tools::request::RequestParams;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let second_path = dir.path().join("second.db");
+        let config = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".into(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "second".into(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(second_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                },
+            ],
+            packs: HashMap::from([(
+                "comm".into(),
+                PackConfig {
+                    backend: "second".into(),
+                    no_embed: false,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+        let server =
+            build_server_multi_backend(base_runtime_config_for_multi_backend(), &config, None)
+                .await
+                .expect("two-backend boot");
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "db_diagnostics()".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("diagnostics dispatch");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["results"][0]["ok"],
+            serde_json::json!(true),
+            "{response}"
+        );
+        let result = &response["results"][0]["result"];
+        let databases = result["databases"].as_array().expect("database entries");
+        assert_eq!(databases.len(), 2, "{result}");
+        assert_eq!(databases[0]["backend_names"], serde_json::json!(["main"]));
+        assert_eq!(databases[1]["backend_names"], serde_json::json!(["second"]));
+        assert_eq!(
+            databases[0]["path"],
+            serde_json::json!(main_path.canonicalize().unwrap().display().to_string())
+        );
+        assert_eq!(
+            databases[1]["path"],
+            serde_json::json!(second_path.canonicalize().unwrap().display().to_string())
+        );
+        assert_eq!(result["db_path"], databases[0]["diagnostics"]["db_path"]);
+        for database in databases {
+            assert!(database["error"].is_null(), "{database}");
+            assert!(
+                database["diagnostics"]["wal_file"].is_object(),
+                "{database}"
+            );
+            assert!(
+                database["diagnostics"]["reader_contention"].is_object(),
+                "{database}"
+            );
+            assert!(
+                database["diagnostics"]["writer_contention"].is_object(),
+                "{database}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn db_diagnostics_deduplicates_shared_canonical_file_and_keeps_all_names() {
+        use crate::tools::request::RequestParams;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let shared_path = dir.path().join("shared.db");
+        let alias_path = dir.path().join(".").join("shared.db");
+        let sqlite = |name: &str, path: &PathBuf| BackendConfig {
+            name: name.into(),
+            kind: BackendKind::Sqlite,
+            path: Some(path.clone()),
+            cache_mb: None,
+            journal_mode: None,
+            served_kinds: None,
+            read_only: false,
+        };
+        let config = KhiveConfig {
+            backends: vec![
+                sqlite("main", &main_path),
+                sqlite("second", &shared_path),
+                sqlite("alias", &alias_path),
+            ],
+            packs: HashMap::from([
+                (
+                    "kg".into(),
+                    PackConfig {
+                        backend: "alias".into(),
+                        no_embed: false,
+                    },
+                ),
+                (
+                    "comm".into(),
+                    PackConfig {
+                        backend: "second".into(),
+                        no_embed: false,
+                    },
+                ),
+            ]),
+            ..KhiveConfig::default()
+        };
+        let server =
+            build_server_multi_backend(base_runtime_config_for_multi_backend(), &config, None)
+                .await
+                .expect("shared-backend boot");
+        let response = server
+            .dispatch_request_local(RequestParams {
+                ops: "db_diagnostics()".into(),
+                ..Default::default()
+            })
+            .await
+            .expect("diagnostics dispatch");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["results"][0]["ok"],
+            serde_json::json!(true),
+            "{response}"
+        );
+        let result = &response["results"][0]["result"];
+        let databases = result["databases"].as_array().expect("database entries");
+        assert_eq!(databases.len(), 2, "{result}");
+        assert_eq!(databases[0]["backend_names"], serde_json::json!(["main"]));
+        assert_eq!(
+            databases[1]["backend_names"],
+            serde_json::json!(["alias", "second"])
+        );
+        assert_eq!(
+            databases[1]["path"],
+            serde_json::json!(shared_path.canonicalize().unwrap().display().to_string())
+        );
+        assert!(databases[1]["diagnostics"]["reader_contention"].is_object());
     }
 
     #[tokio::test]
@@ -9880,16 +10160,24 @@ region = "us-east-1"
 
         #[test]
         #[serial]
-        fn default_inbound_actor_defaults_to_local() {
+        fn default_inbound_actor_defaults_to_channel_email() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(default_inbound_actor_from_env(), "local");
+            let actor = email_default_inbound_actor_from_env();
+            assert_eq!(actor, "channel:email");
+            for caller in [None, Some("  ")] {
+                assert_ne!(
+                    actor,
+                    khive_runtime::resolve_actor(caller).id,
+                    "an unconfigured caller must never resolve to the email mailbox actor"
+                );
+            }
         }
 
         #[test]
         #[serial]
         fn default_inbound_actor_reads_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "lambda:mybot");
-            let actor = default_inbound_actor_from_env();
+            let actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(actor, "lambda:mybot");
         }
@@ -9898,20 +10186,24 @@ region = "us-east-1"
         #[serial]
         fn default_inbound_actor_ignores_blank_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "  ");
-            let actor = default_inbound_actor_from_env();
+            let actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(actor, "local", "blank env var must fall back to default");
+            assert_eq!(
+                actor, "channel:email",
+                "blank env var must use the channel actor"
+            );
         }
 
         #[tokio::test]
         #[serial]
-        async fn fresh_uncorrelated_email_defaults_to_local_inbox() {
+        async fn explicit_local_override_routes_fresh_email_to_local_inbox() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            let default_actor = default_inbound_actor_from_env();
             assert_eq!(default_actor, "local");
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let registry = email_test_registry(runtime);
-            ingest_fresh_email(&registry, "email-default-local", &default_actor).await;
+            ingest_fresh_email(&registry, "email-explicit-local", &default_actor).await;
 
             let inbox = registry
                 .dispatch("comm.inbox", serde_json::json!({}))
@@ -9929,11 +10221,11 @@ region = "us-east-1"
 
         #[tokio::test]
         #[serial]
-        async fn opt_in_email_mailbox_is_visible_only_to_a_configured_reader() {
-            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email");
-            let default_actor = default_inbound_actor_from_env();
+        async fn fresh_uncorrelated_email_defaults_to_channel_mailbox() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let default_actor = email_default_inbound_actor_from_env();
             assert_eq!(default_actor, "channel:email");
+            assert_ne!(default_actor, khive_runtime::resolve_actor(None).id);
 
             let config: KhiveConfig = toml::from_str(&format!(
                 "[actor]\nid = 'channel:email'\nmailbox_readers = ['{EMAIL_READER}']\n"
@@ -9951,7 +10243,7 @@ region = "us-east-1"
             );
             let runtime = KhiveRuntime::new(runtime_config).expect("configured runtime");
             let registry = email_test_registry(runtime);
-            ingest_fresh_email(&registry, "email-opt-in-reader", &default_actor).await;
+            ingest_fresh_email(&registry, "email-default-channel", &default_actor).await;
 
             let inbox = dispatch_as(
                 &registry,
@@ -9964,6 +10256,18 @@ region = "us-east-1"
             let messages = inbox["messages"].as_array().expect("inbox messages");
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0]["content"], "fresh email");
+            assert_eq!(messages[0]["properties"]["to_actor"], "channel:email");
+
+            let local = dispatch_as(&registry, None, "comm.inbox", serde_json::json!({}))
+                .await
+                .expect("the anonymous local caller can read its own inbox");
+            assert!(
+                local["messages"]
+                    .as_array()
+                    .expect("inbox messages")
+                    .is_empty(),
+                "fresh email must not appear in the anonymous local inbox"
+            );
 
             let denied = dispatch_as(
                 &registry,
@@ -9986,8 +10290,9 @@ region = "us-east-1"
         #[tokio::test]
         #[serial]
         async fn email_sender_prefix_filters_fresh_ingest_from_local_sends() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            let default_actor = default_inbound_actor_from_env();
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let registry = email_test_registry(runtime);
             ingest_fresh_email(&registry, "email-prefix-filter", &default_actor).await;
@@ -10109,6 +10414,152 @@ region = "us-east-1"
             assert!(error
                 .to_string()
                 .contains("no channel-ingest capability grant"));
+        }
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    mod telegram_default_actor_routing_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
+        use std::sync::{Arc, Mutex};
+        use tokio_util::sync::CancellationToken;
+
+        struct OneMessageChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+            shutdown: CancellationToken,
+        }
+
+        #[async_trait]
+        impl Channel for OneMessageChannel {
+            fn kind(&self) -> &'static str {
+                "telegram"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                let envelope = self.envelope.lock().unwrap().take();
+                if envelope.is_none() {
+                    self.shutdown.cancel();
+                }
+                Ok(envelope.into_iter().collect())
+            }
+        }
+
+        impl TelegramPollChannel for OneMessageChannel {
+            fn commit_offset(&self) {
+                self.shutdown.cancel();
+            }
+        }
+
+        fn registry_for_actor(actor: &str) -> VerbRegistry {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.with_actor_id(Some(actor.to_string()));
+            khive_runtime::PackRegistry::register_packs(
+                &["kg".to_string(), "comm".to_string()],
+                runtime,
+                &mut builder,
+            )
+            .expect("register kg+comm through the factory path");
+            builder.build().expect("registry builds")
+        }
+
+        async fn run_poll_once(default_actor: String, reader_actor: &str) -> serde_json::Value {
+            let registry = registry_for_actor(reader_actor);
+            let shutdown = CancellationToken::new();
+            let channel = Arc::new(OneMessageChannel {
+                envelope: Mutex::new(Some(
+                    ChannelEnvelope::new(
+                        "telegram:maintainer",
+                        "telegram:bot",
+                        "telegram routing check",
+                    )
+                    .with_external_id("telegram-routing-check"),
+                )),
+                shutdown: shutdown.clone(),
+            });
+
+            telegram_poll_loop(
+                channel,
+                registry.clone(),
+                "local".to_string(),
+                default_actor,
+                shutdown,
+            )
+            .await;
+
+            registry
+                .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                .await
+                .expect("inbox query succeeds")
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn telegram_poll_loop_keeps_default_message_out_of_local_inbox() {
+            std::env::remove_var("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let actor =
+                default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR", "telegram:bot");
+            assert_eq!(actor, "telegram:bot");
+            let local_inbox = run_poll_once(actor.clone(), "local").await;
+            assert!(
+                local_inbox["messages"]
+                    .as_array()
+                    .expect("messages array")
+                    .is_empty(),
+                "anonymous local inbox must not see an uncorrelated Telegram message"
+            );
+            let inbox = run_poll_once(actor, "telegram:bot").await;
+            let messages = inbox["messages"].as_array().expect("messages array");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["content"], "telegram routing check");
+            assert_eq!(
+                messages[0]["properties"]["to_actor"], "telegram:bot",
+                "the default route must be stored on the ingested message"
+            );
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn telegram_poll_loop_delivers_uncorrelated_message_to_configured_actor_inbox() {
+            std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            std::env::set_var("KHIVE_TELEGRAM_DEFAULT_ACTOR", "telegram:receiver");
+            let actor =
+                default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR", "telegram:bot");
+            let inbox = run_poll_once(actor, "telegram:receiver").await;
+            let messages = inbox["messages"].as_array().expect("messages array");
+            std::env::remove_var("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| message["content"] == "telegram routing check"),
+                "configured actor inbox must list the uncorrelated Telegram message; got {messages:?}"
+            );
+            assert_eq!(
+                messages[0]["properties"]["to_actor"], "telegram:receiver",
+                "the configured route must be stored on the ingested message"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn telegram_default_actor_ignores_blank_env_var() {
+            std::env::set_var("KHIVE_TELEGRAM_DEFAULT_ACTOR", "  ");
+            let actor =
+                default_inbound_actor_from_env("KHIVE_TELEGRAM_DEFAULT_ACTOR", "telegram:bot");
+            std::env::remove_var("KHIVE_TELEGRAM_DEFAULT_ACTOR");
+            assert_eq!(actor, "telegram:bot", "blank env var must remain isolated");
         }
     }
 
@@ -12541,17 +12992,30 @@ backend = "kg-backend"
     #[cfg(feature = "channel-email")]
     mod spawn_email_channel_loops_tests {
         use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use std::sync::{Arc, Mutex};
 
-        const EMAIL_ENV_VARS: [&str; 9] = [
+        const EMAIL_ENV_VARS: &[&str] = &[
             "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_SMTP_PORT",
             "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_IMAP_PORT",
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
             "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAILBOX",
             "KHIVE_EMAIL_MAINTAINER_ADDRESS",
             "KHIVE_EMAIL_AUTHSERV_ID",
             "KHIVE_EMAIL_PASSWORD",
             "KHIVE_EMAIL_OAUTH_TENANT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
+            "KHIVE_EMAIL_QUARANTINE_STORE",
+            "KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS",
+            "KHIVE_EMAIL_INGEST_NAMESPACE",
+            "KHIVE_EMAIL_DEFAULT_ACTOR",
         ];
 
         /// RAII guard: snapshots each `KHIVE_EMAIL_*` var's current value, clears it,
@@ -12583,6 +13047,158 @@ backend = "kg-backend"
                     }
                 }
             }
+        }
+
+        struct OneMessageEmailChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for OneMessageEmailChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(self.envelope.lock().unwrap().take().into_iter().collect())
+            }
+        }
+
+        #[test]
+        fn email_poll_shutdown_override_survives_cancelled_process_token() {
+            let cancelled_process = tokio_util::sync::CancellationToken::new();
+            cancelled_process.cancel();
+            let isolated = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(isolated.clone());
+            });
+
+            let selected = email_poll_shutdown_token(cancelled_process);
+            assert!(!selected.is_cancelled());
+            selected.cancel();
+            assert!(isolated.is_cancelled());
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial]
+        async fn production_email_spawn_routes_unset_default_actor_to_channel_mailbox() {
+            let _env_guard = EmailEnvGuard::clear();
+            std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_USERNAME", "mailbox@example.com");
+            std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+            std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.example.com");
+            std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+            assert!(std::env::var_os("KHIVE_EMAIL_DEFAULT_ACTOR").is_none());
+            khive_channel_email::EmailChannel::from_env().expect("email config takes the Ok arm");
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let blob_dir = tempfile::tempdir().expect("blob directory");
+            runtime
+                .install_blob_store(Arc::new(
+                    khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                        .expect("blob store"),
+                ))
+                .expect("install quarantine blob store");
+            let server = KhiveMcpServer::with_packs(
+                runtime,
+                &["kg".to_string(), "comm".to_string(), "blob".to_string()],
+            )
+            .expect("server builds with comm and blob storage");
+            let registry = server.verb_registry_clone();
+            let mut admission = server.channel_loop_admission();
+            assert!(
+                admission.inbound_poll,
+                "writable comm runtime admits polling"
+            );
+            admission.outbound_delivery = false;
+
+            // Replace the transport and process-global shutdown token. The
+            // real spawn path still resolves the actor, starts
+            // channel_poll_loop, and dispatches comm.ingest.
+            let test_shutdown = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(test_shutdown.clone());
+            });
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Arc::new(OneMessageEmailChannel {
+                    envelope: Mutex::new(Some(
+                        ChannelEnvelope::new(
+                            "email:sender@example.com",
+                            "email:mailbox@example.com",
+                            "production actor wiring",
+                        )
+                        .with_external_id("email-production-default-actor"),
+                    )),
+                }));
+            });
+            spawn_email_channel_loops(&server, admission);
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed fake transport"
+                );
+            });
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed test-scoped shutdown token"
+                );
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let message = loop {
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                tokio::task::yield_now().await;
+                let channel_inbox = registry
+                    .dispatch_with_identity(
+                        "comm.inbox",
+                        serde_json::json!({"status": "all"}),
+                        Some(khive_runtime::RequestIdentity {
+                            namespace: "local".to_string(),
+                            actor_id: Some("channel:email".to_string()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .expect("channel actor reads its own inbox");
+                if let Some(message) = channel_inbox["messages"]
+                    .as_array()
+                    .expect("channel inbox messages")
+                    .iter()
+                    .find(|message| message["content"] == "production actor wiring")
+                {
+                    break message.clone();
+                }
+                let local_inbox = registry
+                    .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                    .await
+                    .expect("local actor reads its own inbox");
+                assert!(
+                    !local_inbox["messages"]
+                        .as_array()
+                        .expect("local inbox messages")
+                        .iter()
+                        .any(|message| message["content"] == "production actor wiring"),
+                    "the production poll must not pass local as comm.ingest's default actor"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "production polling did not ingest its test message within 30s"
+                );
+            };
+            assert_eq!(message["properties"]["to_actor"], "channel:email");
+            test_shutdown.cancel();
         }
 
         #[tokio::test]
@@ -13849,6 +14465,139 @@ backend = "kg-backend"
             assert_eq!(repaired.content_ref.as_str(), content_ref);
         }
 
+        #[tokio::test(start_paused = true)]
+        async fn correlated_content_refusal_routes_quarantine_to_original_sender() {
+            const EXTERNAL_ID: &str = "imap:correlated-quarantine:11:7";
+            const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
+
+            let config = RuntimeConfig {
+                db_path: None,
+                actor_id: Some("lambda:original-sender".to_string()),
+                ..RuntimeConfig::no_embeddings()
+            };
+            let runtime = KhiveRuntime::new(config).expect("in-memory sender runtime");
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            builder.with_actor_id(runtime.config().actor_id.clone());
+            let registry = builder.build().expect("registry builds");
+            ensure_channel_quarantine_storage(&registry)
+                .await
+                .expect("quarantine storage preflight");
+
+            let sent = registry
+                .dispatch(
+                    "comm.send",
+                    json!({"to": "email:recipient@example.com", "content": "original outbound"}),
+                )
+                .await
+                .expect("original sender's outbound message");
+            assert_eq!(sent["from"], "lambda:original-sender");
+            let thread_id = sent["thread_id"]
+                .as_str()
+                .expect("outbound thread ID")
+                .to_string();
+            let envelope = ChannelEnvelope::new(
+                "email:recipient@example.com",
+                "email:mailbox@example.com",
+                REFUSED_BODY,
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_correlation(thread_id.clone())
+            .with_quarantine_replay(
+                REFUSED_BODY.as_bytes().to_vec(),
+                "email:recipient@example.com",
+            );
+
+            let refused = registry
+                .dispatch(
+                    "comm.ingest",
+                    json!({
+                        "namespace": "local",
+                        "from": envelope.from.clone(),
+                        "to": envelope.to.clone(),
+                        "content": envelope.content.clone(),
+                        "channel_kind": "email",
+                        "external_id": EXTERNAL_ID,
+                        "correlation_external_id": thread_id.clone(),
+                        "default_inbound_actor": "channel:email",
+                    }),
+                )
+                .await
+                .expect_err("the real content gate must refuse the reply");
+            assert!(matches!(
+                refused,
+                khive_runtime::RuntimeError::SecretDetected(_)
+            ));
+
+            let mut channels = ChannelRegistry::new();
+            channels.register(Arc::new(ContentRefusalOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(channels),
+                registry.clone(),
+                "local".to_string(),
+                "channel:email".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor lookup");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a refused correlated message must quarantine and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let listed = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "local", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list messages");
+            let quarantined: Vec<_> = listed["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .filter(|note| note["properties"]["external_id"] == EXTERNAL_ID)
+                .collect();
+            assert_eq!(quarantined.len(), 1, "one quarantine for the refused reply");
+            let props = &quarantined[0]["properties"];
+            assert_eq!(props["from_actor"], "email:quarantine");
+            assert_eq!(props["to_actor"], "lambda:original-sender");
+            assert_ne!(props["to_actor"], "channel:email");
+            assert_eq!(props["thread_id"], sent["thread_id"]);
+            assert_eq!(props["quarantine_reason"], "SecretDetected");
+        }
+
         /// A real quarantine note plus GC-rooted original in one isolated
         /// runtime, shared by the retention deadline tests.
         async fn retained_quarantine_fixture() -> (
@@ -13914,6 +14663,37 @@ backend = "kg-backend"
                 .authorize(Namespace::parse("retention-ns").unwrap())
                 .unwrap();
             let notes = runtime.notes(&token).unwrap();
+            let annotator = runtime
+                .create_note(
+                    &token,
+                    "observation",
+                    None,
+                    "quarantine cleanup edge fixture",
+                    None,
+                    None,
+                    vec![note_id],
+                )
+                .await
+                .unwrap();
+            let incident_edge_query = || SqlStatement {
+                sql: "SELECT id FROM graph_edges \
+                      WHERE source_id = ?1 AND target_id = ?2 AND relation = 'annotates'"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(annotator.id.to_string()),
+                    SqlValue::Text(note_id.to_string()),
+                ],
+                label: Some("quarantine_retention_incident_edges".into()),
+            };
+            let edges_before = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(incident_edge_query())
+                .await
+                .unwrap();
+            assert_eq!(edges_before.len(), 1);
             let note = notes.get_note(note_id).await.unwrap().unwrap();
             let expires_at = note
                 .expires_at
@@ -13960,6 +14740,15 @@ backend = "kg-backend"
                 .expect("expired cleanup");
             assert_eq!(after["deleted"], 1);
             assert!(notes.get_note(note_id).await.unwrap().is_none());
+            let edges_after = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(incident_edge_query())
+                .await
+                .unwrap();
+            assert!(edges_after.is_empty());
             assert!(runtime
                 .attachments()
                 .unwrap()
@@ -13981,6 +14770,229 @@ backend = "kg-backend"
                 .await
                 .unwrap();
             assert!(blob_attachment_refs.is_empty());
+        }
+
+        #[tokio::test]
+        async fn legacy_slugless_cleanup_honors_retention_and_unowns_original() {
+            let (_blob_dir, runtime, registry, old_id, content_ref) =
+                retained_quarantine_fixture().await;
+            let token = runtime
+                .authorize(Namespace::parse("retention-ns").unwrap())
+                .unwrap();
+            let notes = runtime.notes(&token).unwrap();
+            let attachments = runtime.attachments().unwrap();
+            let other = registry
+                .dispatch(
+                    "blob.put",
+                    json!({"bytes": BASE64.encode(b"other retained original")}),
+                )
+                .await
+                .unwrap();
+            let other_ref = other["content_ref"].as_str().unwrap().to_string();
+            let ingest = |external_id: &str, slug: &str| {
+                json!({
+                    "namespace": "retention-ns",
+                    "from": "email:quarantine",
+                    "to": "email:maintainer@example.com",
+                    "content": "Inbound message quarantined",
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "external_id": external_id,
+                    "metadata": {
+                        "quarantined": "true",
+                        "quarantine_content_ref": other_ref,
+                    }
+                })
+            };
+            let young = registry
+                .dispatch("comm.ingest", ingest("imap:retention:1:2", "young"))
+                .await
+                .unwrap();
+            let young_id: uuid::Uuid = young["full_id"].as_str().unwrap().parse().unwrap();
+            let slugged = registry
+                .dispatch("comm.ingest", ingest("imap:retention:1:3", "named"))
+                .await
+                .unwrap();
+            let slugged_id: uuid::Uuid = slugged["full_id"].as_str().unwrap().parse().unwrap();
+            let as_of = Utc::now().timestamp_micros();
+            let retention_us = 14 * 24 * 60 * 60 * 1_000_000;
+            let sql = runtime.sql();
+            let mut writer = sql.writer().await.unwrap();
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET properties = json_remove(properties, '$.channel_slug'), \
+                              expires_at = NULL, created_at = ?1 WHERE id = ?2"
+                            .into(),
+                        params: vec![
+                            SqlValue::Integer(as_of - retention_us - 1),
+                            SqlValue::Text(old_id.to_string()),
+                        ],
+                        label: Some("old_slugless_retention_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET properties = json_set(properties, '$.channel_slug', '  '), \
+                              expires_at = NULL, created_at = ?1 WHERE id = ?2"
+                            .into(),
+                        params: vec![
+                            SqlValue::Integer(as_of - retention_us + 1),
+                            SqlValue::Text(young_id.to_string()),
+                        ],
+                        label: Some("young_slugless_retention_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                writer
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET expires_at = ?1 WHERE id = ?2".into(),
+                        params: vec![
+                            SqlValue::Integer(as_of - 1),
+                            SqlValue::Text(slugged_id.to_string()),
+                        ],
+                        label: Some("due_slugged_retention_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            drop(writer);
+
+            let ordinary_blank = registry
+                .dispatch(
+                    "comm.cleanup_expired_quarantine",
+                    json!({
+                        "namespace": "retention-ns",
+                        "channel_kind": "email",
+                        "channel_slug": "",
+                        "as_of_micros": as_of,
+                    }),
+                )
+                .await;
+            assert!(matches!(
+                ordinary_blank,
+                Err(khive_runtime::RuntimeError::InvalidInput(_))
+            ));
+
+            let legacy_args = json!({
+                "namespace": "retention-ns",
+                "channel_kind": "email",
+                "channel_slug": "",
+                "mode": "legacy_slugless",
+                "as_of_micros": as_of,
+            });
+            let first = registry
+                .dispatch("comm.cleanup_expired_quarantine", legacy_args.clone())
+                .await
+                .unwrap();
+            assert_eq!(first["deleted"], 1);
+            assert!(notes.get_note(old_id).await.unwrap().is_none());
+            assert!(
+                attachments
+                    .get_attachment(old_id, "quarantine-original")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "expired original must be unowned"
+            );
+            assert!(
+                runtime
+                    .blob_store()
+                    .unwrap()
+                    .exists(&khive_storage::ContentRef::from_hex(content_ref.clone()).unwrap())
+                    .await
+                    .unwrap(),
+                "retention cleanup leaves blob reclamation to the collector"
+            );
+            let original_owners = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(SqlStatement {
+                    sql: "SELECT record_uuid FROM attachments WHERE content_ref = ?1".into(),
+                    params: vec![SqlValue::Text(content_ref.clone())],
+                    label: Some("legacy_slugless_original_owners".into()),
+                })
+                .await
+                .unwrap();
+            assert!(
+                original_owners.is_empty(),
+                "expired original must have no owner rows"
+            );
+            for id in [young_id, slugged_id] {
+                assert!(notes.get_note(id).await.unwrap().is_some());
+                assert!(
+                    attachments
+                        .get_attachment(id, "quarantine-original")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "nonselected originals stay rooted"
+                );
+            }
+            let second = registry
+                .dispatch("comm.cleanup_expired_quarantine", legacy_args)
+                .await
+                .unwrap();
+            assert_eq!(second["deleted"], 0);
+        }
+
+        #[tokio::test]
+        async fn channel_poll_cleanup_drains_legacy_slugless_partition() {
+            let (_blob_dir, runtime, registry, note_id, _content_ref) =
+                retained_quarantine_fixture().await;
+            let old = Utc::now().timestamp_micros() - 14 * 24 * 60 * 60 * 1_000_000 - 1;
+            assert_eq!(
+                runtime
+                    .sql()
+                    .writer()
+                    .await
+                    .unwrap()
+                    .execute(SqlStatement {
+                        sql: "UPDATE notes SET properties = json_remove(properties, '$.channel_slug'), \
+                              expires_at = NULL, created_at = ?1 WHERE id = ?2"
+                            .into(),
+                        params: vec![SqlValue::Integer(old), SqlValue::Text(note_id.to_string())],
+                        label: Some("daemon_legacy_cleanup_fixture".into()),
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            cleanup_expired_channel_quarantine(
+                &registry,
+                "retention-ns",
+                "email",
+                "mailbox@example.com",
+            )
+            .await
+            .unwrap();
+            let token = runtime
+                .authorize(Namespace::parse("retention-ns").unwrap())
+                .unwrap();
+            assert!(runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(note_id)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(runtime
+                .attachments()
+                .unwrap()
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .unwrap()
+                .is_none());
         }
 
         #[tokio::test]

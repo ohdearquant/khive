@@ -93,6 +93,34 @@ fn unrecognized_marker_does_not_authorize_backup_recovery() {
 }
 
 #[test]
+fn undecodable_or_oversized_backup_marker_stays_unowned_during_publish() {
+    for marker_bytes in [vec![0xff, 0xfe], vec![b'x'; 1024 * 1024]] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("remotes");
+        std::fs::create_dir_all(&root).unwrap();
+        let contributor = contributor_directory(&root);
+        std::fs::write(contributor.join(REMOTE_BACKUP_OWNER_FILE), &marker_bytes).unwrap();
+
+        let target = publish(&root, "upstream", "first-target");
+        assert_eq!(
+            std::fs::read(contributor.join(REMOTE_BACKUP_OWNER_FILE)).unwrap(),
+            marker_bytes,
+            "unverified contributor marker must remain untouched"
+        );
+        assert!(contributor.join("notes.md").exists());
+        assert!(target.join("meta.json").exists());
+    }
+}
+
+#[test]
+fn marker_reader_stops_after_expected_length_plus_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("marker");
+    std::fs::write(&marker, vec![b'x'; 1024 * 1024]).unwrap();
+    assert_eq!(super::read_bounded_marker(&marker, 17).unwrap().len(), 18);
+}
+
+#[test]
 fn backup_path_collision_never_replaces_contributor_directory() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("remotes");

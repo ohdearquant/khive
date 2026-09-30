@@ -61,6 +61,20 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
     let denial_message =
         matches!(error, RuntimeError::PermissionDenied { .. }).then(|| error.to_string());
     let payload = match error {
+        RuntimeError::WithResolution { context } => {
+            let crate::error::ResolutionFailureContext { source, resolution } = context;
+            let mut value = runtime_error_value(*source, disposition);
+            let details = value
+                .as_object_mut()
+                .expect("runtime error projection is an object")
+                .entry("details")
+                .or_insert_with(|| json!({}));
+            if !details.is_object() {
+                *details = json!({});
+            }
+            details["resolution"] = json!(resolution);
+            return value;
+        }
         RuntimeError::RefusedWithEvents { context } => {
             let crate::error::RefusalEventContext { source, recordings } = context;
             // Project the source first so named dispositions, code/details,
@@ -130,8 +144,16 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             error.insert("domain_result".into(), domain_result);
             Value::Object(error)
         }
-        RuntimeError::Khive(k) => serde_json::to_value(&k)
-            .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()})),
+        RuntimeError::Khive(k) => {
+            let mut value = serde_json::to_value(&k)
+                .unwrap_or_else(|_| json!({"kind": "internal", "message": k.to_string()}));
+            if k.kind() == khive_types::ErrorKind::InvalidInput
+                && k.details().and_then(|d| d.get("reason")) == Some("external_id_unverifiable")
+            {
+                value["code"] = json!("external_id_unverifiable");
+            }
+            value
+        }
         RuntimeError::RemoteFetchError { remote, message } => json!({
             "kind": "remote_fetch_error",
             "remote": remote,
@@ -262,6 +284,63 @@ mod tests {
         let actual = runtime_error_value(source.into(), DomainDisposition::Unknown);
         assert_eq!(actual, expected);
         assert_eq!(serde_json::to_vec(&actual).unwrap(), expected_bytes);
+    }
+
+    #[test]
+    fn resolution_wrapper_adds_details_without_changing_source_classification() {
+        let source = RuntimeError::Khive(KhiveError::conflict("source conflict").with_details(
+            Details::new([("reason", "seq_conflict"), ("extra", "retained")]),
+        ));
+        let selected = uuid::Uuid::from_u128(1);
+        let duplicate = uuid::Uuid::from_u128(2);
+        let error = source.with_resolution(crate::error::ResolutionFacts {
+            project_id: selected,
+            duplicate_anchor_ids: vec![duplicate],
+            slug_backfilled: true,
+            project_created: false,
+            orphaned_project_id: None,
+            orphaned_note_count: 0,
+        });
+        assert!(matches!(error.refusal_source(), RuntimeError::Khive(_)));
+        let value = runtime_error_value(error, DomainDisposition::Unknown);
+        assert_eq!(value["domain_disposition"], "not_committed");
+        assert_eq!(value["details"]["reason"], "seq_conflict");
+        assert_eq!(value["details"]["extra"], "retained");
+        assert_eq!(
+            value["details"]["resolution"]["project_id"],
+            selected.to_string()
+        );
+        assert_eq!(
+            value["details"]["resolution"]["duplicate_anchor_ids"],
+            json!([duplicate])
+        );
+    }
+
+    #[test]
+    fn resolution_wrapper_projects_remote_fetch_type_and_anchor_facts() {
+        let selected = uuid::Uuid::from_u128(3);
+        let error = RuntimeError::RemoteFetchError {
+            remote: "https://example.com/repo".into(),
+            message: "cache repair failed".into(),
+        }
+        .with_resolution(crate::error::ResolutionFacts {
+            project_id: selected,
+            duplicate_anchor_ids: vec![],
+            slug_backfilled: false,
+            project_created: false,
+            orphaned_project_id: None,
+            orphaned_note_count: 0,
+        });
+        let value = runtime_error_value(error, DomainDisposition::Unknown);
+        assert_eq!(value["kind"], "remote_fetch_error");
+        assert_eq!(value["remote"], "https://example.com/repo");
+        assert_eq!(value["message"], "cache repair failed");
+        assert_eq!(value["domain_disposition"], "unknown");
+        assert_eq!(
+            value["details"]["resolution"]["project_id"],
+            selected.to_string()
+        );
+        assert_eq!(value["details"]["resolution"]["project_created"], false);
     }
 
     #[test]

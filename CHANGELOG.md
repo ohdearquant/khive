@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Fresh, uncorrelated inbound email now defaults to the `channel:email` mailbox
+  when `KHIVE_EMAIL_DEFAULT_ACTOR` is unset or blank. Deployments currently
+  reading new mail from `local` must configure a `channel:email` serving actor
+  with `[actor].mailbox_readers` and select that mailbox, or explicitly set
+  `KHIVE_EMAIL_DEFAULT_ACTOR=local` to retain the previous routing. Correlated
+  replies still route to the original sender.
+
 ## [0.9.0] - 2026-09-27
 
 ### Removed
@@ -200,6 +209,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching `KHIVE_EMAIL_INGEST_NAMESPACE` and the adjacent startup resolver,
   instead of a hard-coded identity with no meaning outside the deployment it
   was named for. Behaviour with the variable explicitly set is unchanged.
+- Uncorrelated Telegram messages can be routed with
+  `KHIVE_TELEGRAM_DEFAULT_ACTOR`; the unset or blank default remains the isolated
+  `telegram:bot` inbox. Routing them to `local` requires an access policy that
+  protects the local inbox from anonymous readers.
 - **Breaking**: `gtd.complete` and `gtd.transition` to `done` now refuse with
   `reason=dependency_blocked` when the task's dependency edges are unresolved,
   naming each blocker, its state, and the count; a cancelled or missing

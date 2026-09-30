@@ -77,6 +77,7 @@ pub struct CapabilitiesReport {
     pub supports_update: bool,
     pub supports_orphan_sweep: bool,
     pub supports_multi_field: bool,
+    pub supports_vector_read: bool,
     pub max_dimensions: Option<u32>,
     pub index_kinds: Vec<String>,
 }
@@ -128,6 +129,7 @@ fn cmd_vector_capabilities(args: VectorCapabilitiesArgs) -> Result<()> {
         println!("supports_update:       {}", report.supports_update);
         println!("supports_orphan_sweep: {}", report.supports_orphan_sweep);
         println!("supports_multi_field:  {}", report.supports_multi_field);
+        println!("supports_vector_read: {}", report.supports_vector_read);
         println!(
             "max_dimensions:        {}",
             report
@@ -152,6 +154,8 @@ fn sqlite_vec_capabilities(engine_name: String) -> CapabilitiesReport {
         supports_update: false,
         supports_orphan_sweep: true,
         supports_multi_field: false,
+        // sqlite-vec reads persisted embeddings through bounded point lookups.
+        supports_vector_read: true,
         // sqlite-vec 0.1.9: SQLITE_VEC_VEC0_MAX_DIMENSIONS = 8192
         max_dimensions: Some(8192),
         index_kinds: vec!["sqlite_vec".into()],

@@ -121,9 +121,16 @@ fn parse_paths_param(params: &Value) -> Result<Vec<String>, RuntimeError> {
 fn run_git(program: &Path, repo: &Path, argv: &[String]) -> Result<String, RuntimeError> {
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let mut command = crate::local_git::git_command(program, repo, &argv_refs, None);
-    let output = command
-        .output()
-        .map_err(|e| RuntimeError::InvalidInput(format!("spawning git {argv:?}: {e}")))?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let output = khive_runtime::process_retry::spawn_retrying_executable_busy(
+        &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+        || command.spawn(),
+    )
+    .and_then(|child| child.wait_with_output())
+    .map_err(|e| RuntimeError::InvalidInput(format!("spawning git {argv:?}: {e}")))?;
     if !output.status.success() {
         return Err(RuntimeError::InvalidInput(format!(
             "git {argv:?} failed: {}",

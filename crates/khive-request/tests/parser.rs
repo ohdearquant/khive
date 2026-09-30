@@ -1287,6 +1287,65 @@ fn prev_ref_in_fn_batch_is_rejected() {
     );
 }
 
+#[test]
+fn bracketed_unit_first_leaf_refuses_prev_in_every_argument_shape() {
+    for source in [
+        "[get(id=$prev.id) | stats()]",
+        r#"[get(id="$prev.id") | stats()]"#,
+        "[get(ids=[$prev.id]) | stats()]",
+        r#"[create(kind="concept", name="a", properties={"r": $prev.id}) | stats()]"#,
+        "[stats(), get(id=$prev.id) | stats()]",
+    ] {
+        assert!(
+            matches!(
+                parse_request(source),
+                Err(DslError::PrevRefOutsideChain { .. })
+            ),
+            "first leaf must not read a previous unit: {source}"
+        );
+    }
+
+    let allowed = req("[stats() | get(id=$prev.id), stats()]");
+    assert_eq!(allowed.mode, ExecutionMode::Parallel);
+    assert_eq!(allowed.ops.len(), 3);
+    assert_eq!(allowed.ranges, vec![0..2, 2..3]);
+    assert_eq!(
+        allowed.ops[1].args["id"],
+        ArgValue::PrevRef { path: "id".into() }
+    );
+
+    let escaped = req(r#"[get(id="\\$prev.id") | stats()]"#);
+    assert_eq!(escaped.mode, ExecutionMode::Parallel);
+    assert_eq!(val(&escaped.ops[0].args["id"]), &json!("$prev.id"));
+}
+
+#[test]
+fn bracketed_units_count_every_leaf_at_the_hundred_operation_boundary() {
+    let chain = |count: usize| {
+        (0..count)
+            .map(|_| "stats()")
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+
+    let one_unit = req(&format!("[{}]", chain(MAX_OPS)));
+    assert_eq!(one_unit.mode, ExecutionMode::Parallel);
+    assert_eq!(one_unit.ops.len(), MAX_OPS);
+    assert_eq!(one_unit.ranges, vec![0..MAX_OPS]);
+    assert!(matches!(
+        parse_request(&format!("[{}]", chain(MAX_OPS + 1))),
+        Err(DslError::TooManyOps { count, max }) if count == MAX_OPS + 1 && max == MAX_OPS
+    ));
+
+    let split = req(&format!("[{}, {}]", chain(50), chain(50)));
+    assert_eq!(split.ops.len(), MAX_OPS);
+    assert_eq!(split.ranges, vec![0..50, 50..100]);
+    assert!(matches!(
+        parse_request(&format!("[{}, {}]", chain(50), chain(51))),
+        Err(DslError::TooManyOps { count, max }) if count == MAX_OPS + 1 && max == MAX_OPS
+    ));
+}
+
 // ── MixedSeparators emitted at parse time ─────────────────────────────────────
 
 #[test]

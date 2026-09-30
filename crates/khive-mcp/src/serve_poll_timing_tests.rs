@@ -310,7 +310,13 @@ mod telegram {
         let gate = Gate::new(boundary);
         let mut task = tokio::spawn(ACTIVE.scope(
             gate.clone(),
-            telegram_poll_loop(channel, registry.clone(), "local".into(), token.clone()),
+            telegram_poll_loop(
+                channel,
+                registry.clone(),
+                "local".into(),
+                "local".into(),
+                token.clone(),
+            ),
         ));
         reach(&gate, &mut task).await;
         let parked_offsets = fixture.offsets();

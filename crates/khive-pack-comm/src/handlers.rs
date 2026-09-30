@@ -5,17 +5,19 @@
 //! in the `properties` JSON column; `content` is the message body.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    is_valid_mailbox_actor_label, KhiveRuntime, MailboxView, NamespaceToken, RuntimeError,
+    is_valid_mailbox_actor_label, EmailMessageIdDomains, KhiveRuntime, MailboxView, NamespaceToken,
+    RuntimeError,
 };
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
-use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, DeleteMode, NewAttachment};
+use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
 
 use crate::idempotency::MessageIdentity;
 use crate::inbox_signal::InboxSignal;
@@ -26,8 +28,8 @@ use crate::message::{
 };
 use crate::params::{
     deser, CleanupExpiredQuarantineParams, CursorCommitParams, CursorGetParams, DeliveredParams,
-    HeartbeatParams, InboxParams, IngestParams, MarkReadParams, ProbeParams, ReadParams,
-    ReplyParams, SendParams, ThreadParams, UnreadParams,
+    HeartbeatParams, InboxParams, IngestParams, MarkReadParams, ProbeParams, QuarantineCleanupMode,
+    ReadParams, ReplyParams, SendParams, ThreadParams, UnreadParams,
 };
 
 fn add_embedding_truncation_warning(
@@ -1553,6 +1555,7 @@ pub(crate) fn reply_subject_for(subject: &str) -> String {
 pub(crate) async fn handle_reply(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
+    email_domains: &Result<Option<EmailMessageIdDomains>, String>,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
@@ -1588,6 +1591,21 @@ pub(crate) async fn handle_reply(
         .as_ref()
         .cloned()
         .unwrap_or_else(|| json!({}));
+
+    // Every nonempty outbound external_id would become a parent mail header
+    // below, including a legacy row with no channel metadata at all.
+    if orig_props.get("direction").and_then(Value::as_str) == Some("outbound") {
+        if let Some(external_id) = orig_props.get("external_id").and_then(Value::as_str) {
+            if !external_id.is_empty()
+                && !verified_outbound_email_external_id(&original, email_domains)
+            {
+                return Err(external_id_unverifiable(
+                    original.id,
+                    "outbound parent has no own-ID-bound Message-ID in the configured sending domains",
+                ));
+            }
+        }
+    }
 
     // Issue #403: parent's wire Message-ID drives In-Reply-To/References for native
     // mail clients. `None` when the parent has none — see docs/api/message-lifecycle.md.
@@ -2245,6 +2263,7 @@ pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     inbox_signal: &InboxSignal,
     channel_ingest_capability: Option<&khive_runtime::ChannelIngestCapability>,
+    email_domains: &Result<Option<EmailMessageIdDomains>, String>,
     token: &NamespaceToken,
     params: Value,
     quarantine_retention: std::time::Duration,
@@ -2429,6 +2448,8 @@ pub(crate) async fn handle_ingest(
         if !corr.is_empty() {
             // Pass 1: match by $.external_id (RFC 822 Message-ID, standard In-Reply-To path).
             let mut pass1 = None;
+            let email_reply =
+                p.channel_kind.as_deref() == Some("email") || p.from.trim().starts_with("email:");
             for candidate in message_id_match_candidates(corr) {
                 let corr_filter = NoteFilter {
                     kind: Some("message".to_string()),
@@ -2446,36 +2467,52 @@ pub(crate) async fn handle_ingest(
                     ],
                     ..Default::default()
                 };
-                let corr_page = store
-                    .query_notes_filtered_count_free(
-                        ns,
-                        &corr_filter,
-                        PageRequest {
-                            limit: 1,
-                            offset: 0,
-                        },
-                    )
-                    .await?;
-                pass1 = corr_page.items.first().map(|n| {
-                    // Falls back to the matched note's own UUID as root (#479b, ADR-040)
-                    // when it carries no valid thread_id (e.g. legacy/imported row).
-                    let thread_id = n
-                        .properties
-                        .as_ref()
-                        .and_then(|props| props.get("thread_id"))
-                        .and_then(Value::as_str)
-                        .and_then(|s| s.parse::<Uuid>().ok())
-                        .map(|id| id.as_hyphenated().to_string())
-                        .unwrap_or_else(|| n.id.as_hyphenated().to_string());
-                    let from_actor = n
-                        .properties
-                        .as_ref()
-                        .and_then(|props| props.get("from_actor"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    (thread_id, from_actor)
-                });
+                let mut offset = 0;
+                loop {
+                    let corr_page = store
+                        .query_notes_filtered_count_free(
+                            ns,
+                            &corr_filter,
+                            PageRequest { limit: 100, offset },
+                        )
+                        .await?;
+                    let count = corr_page.items.len();
+                    if let Some(n) = corr_page.items.iter().find(|n| {
+                        if email_reply || outbound_email_message(n) {
+                            verified_outbound_email_external_id(n, email_domains)
+                        } else {
+                            true
+                        }
+                    }) {
+                        // A copied Message-ID can sort first. Only the row that
+                        // owns its UUID may supply the thread and actor.
+                        let thread_id = n
+                            .properties
+                            .as_ref()
+                            .and_then(|props| props.get("thread_id"))
+                            .and_then(Value::as_str)
+                            .and_then(|s| s.parse::<Uuid>().ok())
+                            .map(|id| id.as_hyphenated().to_string())
+                            .unwrap_or_else(|| n.id.as_hyphenated().to_string());
+                        let from_actor = n
+                            .properties
+                            .as_ref()
+                            .and_then(|props| props.get("from_actor"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        pass1 = Some((thread_id, from_actor));
+                        break;
+                    }
+                    if count < 100 {
+                        break;
+                    }
+                    offset = offset.checked_add(count as u64).ok_or_else(|| {
+                        RuntimeError::Internal(
+                            "ingest: correlation pagination offset overflowed".into(),
+                        )
+                    })?;
+                }
                 if pass1.is_some() {
                     break;
                 }
@@ -2882,6 +2919,91 @@ pub(crate) async fn handle_ingest(
     }))
 }
 
+/// Detach only the main-backend original owned by this already hard-deleted
+/// legacy note. The conditional DELETE rejects a competing replacement of the
+/// role after the owner read; it never scans for unrelated ownerless rows.
+async fn detach_deleted_legacy_original(
+    runtime: &KhiveRuntime,
+    id: Uuid,
+    expected_ref: Option<&str>,
+) -> Result<bool, RuntimeError> {
+    let core = runtime.core();
+    let attachments = core.attachments()?;
+    let Some(owner) = attachments
+        .get_attachment(id, "quarantine-original")
+        .await?
+    else {
+        return Ok(false);
+    };
+    let expected = expected_ref.ok_or_else(|| {
+        RuntimeError::Internal(format!(
+            "cleanup_expired_quarantine: deleted note {id} has an original owner but no original ref"
+        ))
+    })?;
+    let expected = ContentRef::from_hex(expected.to_string()).map_err(|error| {
+        RuntimeError::Internal(format!(
+            "cleanup_expired_quarantine: deleted note {id} has an invalid original ref: {error}"
+        ))
+    })?;
+    if owner.substrate != AttachmentSubstrate::Note || owner.content_ref != expected {
+        return Err(RuntimeError::Internal(format!(
+            "cleanup_expired_quarantine: deleted note {id} has a mismatched original owner"
+        )));
+    }
+    let detached = core
+        .sql()
+        .writer()
+        .await?
+        .execute(SqlStatement {
+            sql: "DELETE FROM attachments WHERE record_uuid = ?1 \
+                  AND role = 'quarantine-original' AND substrate = 'note' \
+                  AND content_ref = ?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(expected.as_str().to_string()),
+            ],
+            label: Some("comm_cleanup_legacy_quarantine_original".into()),
+        })
+        .await?;
+    if detached != 1 {
+        return Err(RuntimeError::Internal(format!(
+            "cleanup_expired_quarantine: deleted note {id} original owner changed during cleanup"
+        )));
+    }
+    Ok(true)
+}
+
+fn delete_note_error_committed(error: &RuntimeError, id: Uuid) -> bool {
+    let RuntimeError::Khive(domain) = error.refusal_source() else {
+        return false;
+    };
+    let Some(details) = domain.details() else {
+        return false;
+    };
+    details.get("reason") == Some("post_commit_degraded")
+        && details.get("operation") == Some("delete_note")
+        && details
+            .get("record_id")
+            .is_some_and(|stored| Uuid::parse_str(stored).ok() == Some(id))
+        && details.get("committed") == Some("true")
+}
+
+async fn note_deleted_after_attempt<F>(
+    delete_result: &Result<bool, RuntimeError>,
+    id: Uuid,
+    probe_absent: F,
+) -> Result<bool, RuntimeError>
+where
+    F: Future<Output = Result<bool, RuntimeError>>,
+{
+    match delete_result {
+        Ok(deleted) => Ok(*deleted),
+        Err(error) if delete_note_error_committed(error, id) => Ok(true),
+        Err(_) => probe_absent.await,
+    }
+}
+
 /// Internal channel-poller maintenance. One bounded page per tick ensures an
 /// empty poll still makes progress without monopolizing the writer. The token
 /// carries the ingest namespace explicitly; heartbeat rows use a different
@@ -2890,17 +3012,87 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
+    quarantine_retention: std::time::Duration,
 ) -> Result<Value, RuntimeError> {
     let p: CleanupExpiredQuarantineParams = deser(params)?;
-    if p.channel_kind.trim().is_empty() || p.channel_slug.trim().is_empty() {
+    if p.channel_kind.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
-            "cleanup_expired_quarantine: channel_kind and channel_slug must be nonblank".into(),
+            "cleanup_expired_quarantine: channel_kind must be nonblank".into(),
         ));
+    }
+    match p.mode {
+        QuarantineCleanupMode::Channel if p.channel_slug.trim().is_empty() => {
+            return Err(RuntimeError::InvalidInput(
+                "cleanup_expired_quarantine: channel_kind and channel_slug must be nonblank".into(),
+            ));
+        }
+        QuarantineCleanupMode::LegacySlugless if !p.channel_slug.is_empty() => {
+            return Err(RuntimeError::InvalidInput(
+                "cleanup_expired_quarantine: legacy_slugless requires an empty channel_slug".into(),
+            ));
+        }
+        _ => {}
     }
     let as_of = p
         .as_of_micros
         .unwrap_or_else(|| Utc::now().timestamp_micros());
+    let legacy_cutoff = if p.mode == QuarantineCleanupMode::LegacySlugless {
+        let retention_us = i64::try_from(quarantine_retention.as_micros()).map_err(|_| {
+            RuntimeError::InvalidInput(
+                "cleanup_expired_quarantine: retention exceeds i64 microseconds".into(),
+            )
+        })?;
+        Some(as_of.checked_sub(retention_us).ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "cleanup_expired_quarantine: retention cutoff underflow".into(),
+            )
+        })?)
+    } else {
+        None
+    };
     let namespace = token.namespace().as_str();
+    let (sql, sql_params) = if let Some(cutoff) = legacy_cutoff {
+        // Match the #3497 boot-repair selector: missing, JSON null, or a
+        // SQLite-space-only text slug. Existing tombstones stay eligible,
+        // including an operator-soft-deleted historical quarantine.
+        (
+            "SELECT id FROM notes \
+             WHERE namespace = ?1 AND kind = 'message' \
+               AND ((expires_at IS NOT NULL AND expires_at <= ?2) \
+                    OR (expires_at IS NULL AND created_at <= ?3)) \
+               AND json_extract(properties, '$.channel_kind') = ?4 \
+               AND (json_type(properties, '$.channel_slug') IS NULL \
+                    OR json_type(properties, '$.channel_slug') = 'null' \
+                    OR (json_type(properties, '$.channel_slug') = 'text' \
+                        AND trim(json_extract(properties, '$.channel_slug')) = '')) \
+               AND (json_extract(properties, '$.quarantined') = 'true' \
+                    OR json_type(properties, '$.quarantined') = 'true') \
+             ORDER BY COALESCE(expires_at, created_at), id LIMIT 128",
+            vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(as_of),
+                SqlValue::Integer(cutoff),
+                SqlValue::Text(p.channel_kind.clone()),
+            ],
+        )
+    } else {
+        (
+            "SELECT id FROM notes \
+             WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
+               AND expires_at IS NOT NULL AND expires_at <= ?2 \
+               AND json_extract(properties, '$.channel_kind') = ?3 \
+               AND json_extract(properties, '$.channel_slug') = ?4 \
+               AND (json_extract(properties, '$.quarantined') = 'true' \
+                    OR json_type(properties, '$.quarantined') = 'true') \
+             ORDER BY expires_at, id LIMIT 128",
+            vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Integer(as_of),
+                SqlValue::Text(p.channel_kind.clone()),
+                SqlValue::Text(p.channel_slug.clone()),
+            ],
+        )
+    };
     let mut reader = runtime
         .sql()
         .reader()
@@ -2908,33 +3100,19 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         .map_err(RuntimeError::Storage)?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT id FROM notes \
-                  WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
-                    AND expires_at IS NOT NULL AND expires_at <= ?2 \
-                    AND json_extract(properties, '$.channel_kind') = ?3 \
-                    AND json_extract(properties, '$.channel_slug') = ?4 \
-                    AND (json_extract(properties, '$.quarantined') = 'true' \
-                         OR json_type(properties, '$.quarantined') = 'true') \
-                  ORDER BY expires_at, id LIMIT 128"
-                .into(),
-            params: vec![
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Integer(as_of),
-                SqlValue::Text(p.channel_kind.clone()),
-                SqlValue::Text(p.channel_slug.clone()),
-            ],
+            sql: sql.into(),
+            params: sql_params,
             label: Some("comm_cleanup_expired_quarantine".into()),
         })
         .await
         .map_err(RuntimeError::Storage)?;
     drop(reader);
 
-    // NoteStore by-ID deletion is not namespace-scoped. Re-read each UUID
-    // through the authorized store and enforce the query's full predicate
-    // before hard deletion. Hard delete removes the note and its attachment
-    // row in one transaction; blob GC reclaims the orphan after its grace.
+    // Hard deletion by ID is not namespace-scoped. Re-read each UUID through
+    // the authorized store and enforce the query's full predicate.
     let store = runtime.notes(token)?;
     let mut deleted = 0usize;
+    let mut routed_owner_detached = 0usize;
     for row in rows {
         let id = match row.get("id") {
             Some(SqlValue::Text(id)) => Uuid::parse_str(id).map_err(|error| {
@@ -2948,31 +3126,106 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
                 ));
             }
         };
-        let Some(note) = store.get_note(id).await? else {
+        let note = if legacy_cutoff.is_some() {
+            store.get_note_including_deleted(id).await?
+        } else {
+            store.get_note(id).await?
+        };
+        let Some(note) = note else {
             continue;
         };
         let properties = note.properties.as_ref();
+        let slug = properties.and_then(|props| props.get("channel_slug"));
+        let slug_matches = match p.mode {
+            QuarantineCleanupMode::Channel => {
+                slug.and_then(Value::as_str) == Some(p.channel_slug.as_str())
+            }
+            QuarantineCleanupMode::LegacySlugless => match slug {
+                None | Some(Value::Null) => true,
+                Some(Value::String(value)) => value.trim().is_empty(),
+                _ => false,
+            },
+        };
         let still_due = note.namespace == namespace
             && note.kind == "message"
-            && note.expires_at.is_some_and(|expires| expires <= as_of)
+            && match legacy_cutoff {
+                Some(cutoff) => note
+                    .expires_at
+                    .map_or(note.created_at <= cutoff, |expires| expires <= as_of),
+                None => {
+                    note.deleted_at.is_none()
+                        && note.expires_at.is_some_and(|expires| expires <= as_of)
+                }
+            }
             && properties
                 .and_then(|props| props.get("channel_kind"))
                 .and_then(Value::as_str)
                 == Some(p.channel_kind.as_str())
-            && properties
-                .and_then(|props| props.get("channel_slug"))
-                .and_then(Value::as_str)
-                == Some(p.channel_slug.as_str())
+            && slug_matches
             && (properties.and_then(|props| props.get("quarantined")) == Some(&Value::Bool(true))
                 || properties
                     .and_then(|props| props.get("quarantined"))
                     .and_then(Value::as_str)
                     == Some("true"));
-        if still_due && store.delete_note(id, DeleteMode::Hard).await? {
-            deleted += 1;
+        if !still_due {
+            continue;
         }
+        let routed_legacy = p.mode == QuarantineCleanupMode::LegacySlugless
+            && runtime.backend_id() != runtime.core().backend_id();
+        let expected_ref = properties
+            .and_then(|props| props.get("quarantine_content_ref"))
+            .and_then(Value::as_str);
+        // The runtime hard-delete removes incident graph edges alongside the
+        // note and its local attachments in one transaction. A routed note's
+        // repaired original lives on canonical main and is detached by exact
+        // ID/ref only after that transaction commits.
+        let delete_result = runtime.delete_note(token, id, true).await;
+        // A typed post-commit error already proves the row/edge transaction
+        // committed. A second read can fail and must not block detaching the
+        // routed original that the now-absent note can never select again.
+        let note_deleted = note_deleted_after_attempt(&delete_result, id, async {
+            Ok(store.get_note_including_deleted(id).await?.is_none())
+        })
+        .await?;
+        if note_deleted {
+            deleted += 1;
+            if routed_legacy {
+                for attempt in 1..=3 {
+                    match detach_deleted_legacy_original(runtime, id, expected_ref).await {
+                        Ok(detached) => {
+                            routed_owner_detached += usize::from(detached);
+                            break;
+                        }
+                        Err(error) if attempt < 3 => {
+                            tracing::warn!(
+                                note_id = %id,
+                                attempt,
+                                error = %error,
+                                "targeted legacy quarantine owner detach will retry"
+                            );
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => {
+                            // There is no note left to select on a later tick.
+                            // The possible residue belongs to the operator's
+                            // blob ownerless-row inspection path (#3178).
+                            return Err(RuntimeError::Internal(format!(
+                                "cleanup_expired_quarantine: deleted_notes={deleted}, \
+                                 routed_owners_detached={routed_owner_detached}, \
+                                 possible_owner_residue=1 for note {id} after 3 attempts: {error}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        delete_result?;
     }
-    Ok(json!({"ok": true, "deleted": deleted}))
+    Ok(json!({
+        "ok": true,
+        "deleted": deleted,
+        "routed_owners_detached": routed_owner_detached,
+    }))
 }
 
 /// Deterministic UUID identifying the `channel_health` row for one
@@ -3948,6 +4201,57 @@ fn message_id_match_candidates(corr: &str) -> Vec<String> {
     }
 }
 
+fn outbound_email_message(note: &Note) -> bool {
+    let props = note.properties.as_ref();
+    props
+        .and_then(|p| p.get("direction"))
+        .and_then(Value::as_str)
+        == Some("outbound")
+        && (props
+            .and_then(|p| p.get("channel_kind"))
+            .and_then(Value::as_str)
+            == Some("email")
+            || props
+                .and_then(|p| p.get("channel_slug"))
+                .and_then(Value::as_str)
+                .is_some_and(|slug| slug.contains('@'))
+            || ["to_actor", "to", "from_actor", "from"].iter().any(|key| {
+                props
+                    .and_then(|p| p.get(*key))
+                    .and_then(Value::as_str)
+                    .is_some_and(|actor| actor.starts_with("email:"))
+            }))
+}
+
+fn verified_outbound_email_external_id(
+    note: &Note,
+    domains: &Result<Option<EmailMessageIdDomains>, String>,
+) -> bool {
+    let Some(domains) = domains.as_ref().ok().and_then(Option::as_ref) else {
+        return false;
+    };
+    let props = note.properties.as_ref();
+    domains.verifies_channel_slug(
+        props
+            .and_then(|p| p.get("channel_slug"))
+            .and_then(Value::as_str),
+    ) && props
+        .and_then(|p| p.get("external_id"))
+        .and_then(Value::as_str)
+        .is_some_and(|external_id| domains.verify(note.id, external_id))
+}
+
+fn external_id_unverifiable(note_id: Uuid, reason: &str) -> RuntimeError {
+    khive_types::KhiveError::invalid_input(format!(
+        "external_id_unverifiable: outbound message {note_id}: {reason}"
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "external_id_unverifiable".to_string()),
+        ("note_id", note_id.to_string()),
+    ]))
+    .into()
+}
+
 /// Normalize a stored Message-ID into RFC 5322 wire form (angle-bracketed);
 /// the single place that does so for `In-Reply-To`/`References` headers.
 fn wrap_message_id(raw: &str) -> String {
@@ -4104,6 +4408,181 @@ mod tests {
     use khive_storage::StorageError;
     use serde_json::{json, Value};
 
+    #[tokio::test]
+    async fn post_commit_delete_detaches_original_even_if_followup_read_would_fail() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let runtime = super::KhiveRuntime::memory().expect("runtime");
+        let note_id = uuid::Uuid::new_v4();
+        let content_ref =
+            khive_storage::ContentRef::from_hex("a".repeat(64)).expect("fixture content ref");
+        let attachments = runtime.core().attachments().expect("main attachments");
+        assert!(attachments
+            .try_insert_attachment(khive_storage::Attachment::from_new(
+                note_id,
+                khive_storage::AttachmentSubstrate::Note,
+                khive_storage::NewAttachment {
+                    role: "quarantine-original".into(),
+                    content_ref: content_ref.clone(),
+                    media_type: None,
+                    size_bytes: None,
+                },
+                1,
+            ))
+            .await
+            .expect("seed routed owner"));
+        let original_message = "injected post-commit delete failure";
+        let delete_error: khive_runtime::RuntimeError =
+            khive_types::KhiveError::internal(original_message)
+                .with_details(khive_types::Details::new_owned([
+                    ("reason", "post_commit_degraded".to_string()),
+                    ("operation", "delete_note".to_string()),
+                    ("record_id", note_id.to_string()),
+                    ("committed", "true".to_string()),
+                ]))
+                .into();
+        let delete_result = Err(delete_error);
+        let read_attempted = AtomicBool::new(false);
+        let note_deleted = super::note_deleted_after_attempt(&delete_result, note_id, async {
+            read_attempted.store(true, Ordering::SeqCst);
+            Err(khive_runtime::RuntimeError::Internal(
+                "injected follow-up read failure".into(),
+            ))
+        })
+        .await
+        .expect("typed committed error settles deletion without a read");
+        assert!(note_deleted);
+        assert!(!read_attempted.load(Ordering::SeqCst));
+        assert!(super::detach_deleted_legacy_original(
+            &runtime,
+            note_id,
+            Some(content_ref.as_str()),
+        )
+        .await
+        .expect("detach routed original"));
+        assert!(attachments
+            .get_attachment(note_id, "quarantine-original")
+            .await
+            .expect("owner lookup")
+            .is_none());
+        let returned = match delete_result {
+            Ok(_) => panic!("expected the original post-commit error"),
+            Err(error) => error,
+        };
+        let khive_runtime::RuntimeError::Khive(domain) = returned.refusal_source() else {
+            panic!("expected the typed post-commit error");
+        };
+        let details = domain.details().expect("post-commit details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(details.get("operation"), Some("delete_note"));
+        assert_eq!(details.get("committed"), Some("true"));
+        let note_id_str = note_id.to_string();
+        assert_eq!(details.get("record_id"), Some(note_id_str.as_str()));
+        assert!(returned.to_string().contains(original_message));
+    }
+
+    #[tokio::test]
+    async fn routed_cleanup_preserves_post_commit_error_after_detaching_original() {
+        use std::sync::Arc;
+
+        use khive_runtime::{BackendId, Namespace, RuntimeConfig, StorageBackend};
+        use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
+
+        let main = Arc::new(StorageBackend::memory().expect("main backend"));
+        let comm = Arc::new(StorageBackend::memory().expect("comm backend"));
+        main.prepare_core_schema().expect("main schema");
+        comm.prepare_core_schema().expect("comm schema");
+        let mut config = RuntimeConfig::no_embeddings();
+        config.backend_id = BackendId::parse("old-comm").expect("backend id");
+        config.packs = vec!["kg".into(), "comm".into()];
+        let runtime = super::KhiveRuntime::from_backend(comm, config).with_core_backend(main);
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let content_ref = ContentRef::from_hex("b".repeat(64)).expect("content ref");
+        let mut note = khive_storage::note::Note::new("local", "message", "legacy quarantine")
+            .with_properties(json!({
+                "quarantined": true,
+                "channel_kind": "email",
+                "quarantine_content_ref": content_ref.to_string(),
+            }));
+        note.expires_at = Some(note.created_at - 1);
+        let note_id = note.id;
+        let as_of = note.created_at + 1;
+        assert!(runtime
+            .backend()
+            .notes()
+            .expect("comm notes")
+            .try_insert_note(note)
+            .await
+            .expect("seed note"));
+        let attachments = runtime.core().attachments().expect("main attachments");
+        assert!(attachments
+            .try_insert_attachment(Attachment::from_new(
+                note_id,
+                AttachmentSubstrate::Note,
+                NewAttachment {
+                    role: "quarantine-original".into(),
+                    content_ref,
+                    media_type: None,
+                    size_bytes: None,
+                },
+                as_of,
+            ))
+            .await
+            .expect("seed original owner"));
+        runtime
+            .sql()
+            .writer()
+            .await
+            .expect("comm writer")
+            .execute_script(
+                "CREATE TRIGGER fail_note_deleted_event BEFORE INSERT ON events \
+                 WHEN NEW.kind = 'note_deleted' \
+                 BEGIN SELECT RAISE(ABORT, 'injected delete event failure'); END;"
+                    .into(),
+            )
+            .await
+            .expect("install post-commit fault");
+
+        let error = super::handle_cleanup_expired_quarantine(
+            &runtime,
+            &token,
+            json!({
+                "channel_kind": "email",
+                "channel_slug": "",
+                "mode": "legacy_slugless",
+                "as_of_micros": as_of,
+            }),
+            std::time::Duration::ZERO,
+        )
+        .await
+        .expect_err("original post-commit error must surface");
+        let khive_runtime::RuntimeError::Khive(original) = error.refusal_source() else {
+            panic!("cleanup replaced the typed delete error: {error:?}");
+        };
+        let details = original.details().expect("post-commit error details");
+        assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+        assert_eq!(details.get("operation"), Some("delete_note"));
+        assert_eq!(details.get("record_id"), Some(note_id.to_string().as_str()));
+        assert!(
+            details
+                .get("post_commit_degradations")
+                .is_some_and(|stages| stages.contains("injected delete event failure")),
+            "{error}"
+        );
+        assert!(runtime
+            .notes(&token)
+            .expect("comm notes")
+            .get_note_including_deleted(note_id)
+            .await
+            .expect("note lookup")
+            .is_none());
+        assert!(attachments
+            .get_attachment(note_id, "quarantine-original")
+            .await
+            .expect("main owner lookup")
+            .is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn inbox_query_crossing_deadline_requeries_after_publish() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4244,6 +4723,7 @@ mod tests {
             &runtime,
             &signal,
             Some(&capability),
+            &Ok(None),
             &token,
             body.clone(),
             std::time::Duration::from_secs(14 * 24 * 60 * 60),
@@ -4261,6 +4741,7 @@ mod tests {
             &runtime,
             &signal,
             Some(&capability),
+            &Ok(None),
             &token,
             body,
             std::time::Duration::from_secs(14 * 24 * 60 * 60),
@@ -4346,6 +4827,7 @@ mod tests {
             &runtime,
             &signal,
             Some(&capability),
+            &Ok(None),
             &token,
             body.clone(),
             std::time::Duration::from_secs(14 * 24 * 60 * 60),
@@ -4377,6 +4859,7 @@ mod tests {
                         &runtime,
                         &signal,
                         Some(&capability),
+                        &Ok(None),
                         &token,
                         body,
                         std::time::Duration::from_secs(14 * 24 * 60 * 60),

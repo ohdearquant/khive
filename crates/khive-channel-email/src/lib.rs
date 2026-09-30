@@ -30,9 +30,10 @@
 //!
 //! | Variable | Default | Description |
 //! |---|---|---|
-//! | `KHIVE_EMAIL_DEFAULT_ACTOR` | `local` | Actor for fresh inbound email with no thread match. Set to `channel:email` to opt into a separate mailbox. The anonymous `local` caller cannot read that mailbox; configure `[actor].id = "channel:email"` and `[actor].mailbox_readers` on the serving process, then have a listed actor call `comm.inbox(mailbox_actor="channel:email")`. |
+//! | `KHIVE_EMAIL_DEFAULT_ACTOR` | `channel:email` | Actor for fresh inbound email with no thread match. The anonymous `local` caller cannot read this mailbox; configure `[actor].id = "channel:email"` and `[actor].mailbox_readers` on the serving process, then have a listed actor call `comm.inbox(mailbox_actor="channel:email")`. Set the variable to `local` to retain the previous shared inbox routing. |
 //! | `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` | maintainer address | Comma-separated allowlist of recipient addresses the outbox loop may deliver to; defaults to the single maintainer address |
 //! | `KHIVE_EMAIL_INGEST_NAMESPACE` | `local` | Namespace used when persisting inbound and outbound messages |
+//! | `KHIVE_EMAIL_MESSAGE_ID_HISTORICAL_DOMAINS` | empty | Comma-separated former sending domains whose own-note UUID Message-IDs remain valid after a mailbox-domain change |
 
 pub(crate) mod auth_results;
 pub mod backoff;

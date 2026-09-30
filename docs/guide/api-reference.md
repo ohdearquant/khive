@@ -26,7 +26,7 @@ An always-machine-readable copy of this page is at
 | `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 5     | `KHIVE_PACKS=kg,session`                   | Yes                 |
+| `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
@@ -502,7 +502,7 @@ singleton `create`; a successful response includes `warnings` when embedding act
 | `content`      | string          | no       | Notes only (body text).                                                           |
 | `salience`     | number          | no       | Notes only, 0.0–1.0.                                                              |
 | `decay_factor` | number          | no       | Notes only, >= 0.                                                                 |
-| `relation`     | string          | no       | Edges only, one of the 17 canonical relations.                                    |
+| `relation`     | string          | no       | Edges only, one of the 19 canonical relations.                                    |
 | `weight`       | number          | no       | Edges only, 0.0–1.0.                                                              |
 | `properties`   | object          | no       | Shallow-merged in.                                                                |
 | `tags`         | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
@@ -764,14 +764,14 @@ canonicalization. A live match retains its row ID and creation time while
 replacing weight and metadata. A soft-deleted match is refused unless the
 caller explicitly opts into restoration.
 
-| Param       | Type   | Required | Notes                                                                                                                                                                                                                                                                     |
-| ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source_id` | uuid   | yes      | Source node.                                                                                                                                                                                                                                                              |
-| `target_id` | uuid   | yes      | Target node.                                                                                                                                                                                                                                                              |
-| `relation`  | string | yes      | One of the 17 canonical relations: `contains`\|`part_of`\|`instance_of`\|`extends`\|`variant_of`\|`introduced_by`\|`supersedes`\|`derived_from`\|`precedes`\|`depends_on`\|`enables`\|`implements`\|`competes_with`\|`composed_with`\|`annotates`\|`supports`\|`refutes`. |
-| `weight`    | number | no       | Default 1.0. 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.                                                                                                                                                                                                         |
-| `metadata`  | object | no       | Edge metadata. On a live natural-key match this replaces the prior metadata object; it is not merged.                                                                                                                                                                     |
-| `resurrect` | bool   | no       | Default `false`. Set `true` to restore a soft-deleted natural-key edge; omission never clears `deleted_at`.                                                                                                                                                               |
+| Param       | Type   | Required | Notes                                                                                                                                                                                                                                                                                               |
+| ----------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source_id` | uuid   | yes      | Source node.                                                                                                                                                                                                                                                                                        |
+| `target_id` | uuid   | yes      | Target node.                                                                                                                                                                                                                                                                                        |
+| `relation`  | string | yes      | One of the 19 canonical relations: `contains`\|`part_of`\|`instance_of`\|`links_to`\|`located_in`\|`extends`\|`variant_of`\|`introduced_by`\|`supersedes`\|`derived_from`\|`precedes`\|`depends_on`\|`enables`\|`implements`\|`competes_with`\|`composed_with`\|`annotates`\|`supports`\|`refutes`. |
+| `weight`    | number | no       | Default 1.0. 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.                                                                                                                                                                                                                                   |
+| `metadata`  | object | no       | Edge metadata. On a live natural-key match this replaces the prior metadata object; it is not merged.                                                                                                                                                                                               |
+| `resurrect` | bool   | no       | Default `false`. Set `true` to restore a soft-deleted natural-key edge; omission never clears `deleted_at`.                                                                                                                                                                                         |
 
 ```
 request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"extends\")")
@@ -1087,12 +1087,27 @@ request(ops="scan(content=\"api_key=sk-...\")")
 
 ### `db_diagnostics` — Assertive
 
-Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for the
-main database: build and process identity, the checkpoint counters, a single PASSIVE checkpoint probe, the
-`-wal` sidecar file size, page-level database size composition, and a WAL-pin holder census.
+Report reader/writer contention, graph-edge integrity, and WAL/checkpoint diagnostics for
+all database files already opened by this server. The existing top-level fields still describe
+main: build and process identity, checkpoint counters, a PASSIVE checkpoint probe, the `-wal`
+sidecar file size, page-level database size composition, and a WAL-pin holder census.
 Takes no parameters.
 
-Every report includes `process` alongside `build`:
+`databases` is an array with one entry per canonical database file (or distinct in-memory
+pool), main first. Each entry has
+`backend_names` (all configured names that share the file), canonical `path`, `diagnostics`
+(the same field set as the existing top-level report), and `error`. Successful entries have
+`error: null`; a failed inspection has `diagnostics: null` and an error string while other files
+still report. If main itself fails, its error remains in the first entry and the root contains
+only `databases` because there is no valid primary report to flatten. The list uses only pools
+opened at startup; it does not open an unserved path or create a missing database file.
+
+The top-level process-lifetime `note_search_ann_route_total` and
+`note_search_fallback_route_total` counters distinguish warm-graph searches from
+the exact sqlite-vec fallback. Unlike pool-scoped contention counters, these
+totals do not reset when a database pool is reopened.
+
+Every successful per-file report includes `process` alongside `build`:
 
 ```json
 {
@@ -1115,9 +1130,14 @@ restarts: PIDs can be reused, and two processes can start within the same second
 
 `pool_generation` starts at 1 in each process and increments whenever the main pool is
 reconstructed. Additional handles to the same pool and secondary-pool construction do not
-advance it. Reader counters and writer acquisition/task counters belong to that main pool;
-compare `(pid, started_at, pool_generation)` and start a fresh counter window whenever the
-triple changes. Checkpoint counters remain process-global. Point-in-time gauges and
+advance it. The root reader and writer counters belong to main; compare
+`(pid, started_at, pool_generation)` to identify its counter window. Within `databases`, reader
+and writer counters belong to the entry's pool. A secondary pool can be reconstructed without
+advancing the main `pool_generation`; its canonical `path` and process identity also stay the
+same. The report has no per-secondary generation field, so it cannot identify that
+reconstruction directly. A decrease in a cumulative secondary-pool counter indicates a new
+observation window. Checkpoint counters and audit failure
+counters remain process-global. Point-in-time gauges and
 consecutive-failure counts can also decrease during normal operation.
 
 `reader_contention` is scoped to the main `ConnectionPool` and resets only when that pool is
@@ -2584,7 +2604,7 @@ roll back the already-recorded knowledge judgment.
 
 ---
 
-## `session` pack — 5 verbs
+## `session` pack — 7 verbs
 
 Cross-provider agent-session continuity records. Optional; load with
 `KHIVE_PACKS=kg,session`.
@@ -2667,6 +2687,20 @@ authenticated connection identity.
 
 The `namespace` and `account` fields are not parameters. The [identity and scope contract](../../crates/khive-pack-session/docs/api/adr117a-identity.md)
 specifies the scoped key, migration, and search result identity.
+
+### `session.stats` — Assertive
+
+Report database-wide row counts and allocated bytes for session mirror tables,
+plus database-file and WAL sizes. Requires SQLite `dbstat`. See the
+[maintenance contract](../../crates/khive-pack-session/docs/api/session-maintenance.md).
+
+### `session.vacuum` — Commissive
+
+Run explicit SQLite compaction. The result reports `ok: true` once VACUUM
+commits. Before/after byte and page figures are returned when the post-commit
+read succeeds; if the request read deadline expires during VACUUM, the after
+figures are `null` with `post_vacuum_metrics_status:
+"unavailable_after_commit"`. See the [maintenance contract](../../crates/khive-pack-session/docs/api/session-maintenance.md).
 
 ---
 

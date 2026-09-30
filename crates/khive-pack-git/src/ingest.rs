@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as AsyncCommand;
 use uuid::Uuid;
@@ -28,6 +28,10 @@ use crate::hook;
 use crate::refs;
 use crate::source::remote_url_to_slug;
 use crate::sql::sql;
+use khive_runtime::process_retry::{
+    spawn_retrying_executable_busy, spawn_retrying_executable_busy_async,
+    EXECUTABLE_BUSY_BACKOFF_MS,
+};
 
 #[cfg(test)]
 #[path = "commit_text_tests.rs"]
@@ -43,7 +47,6 @@ const GH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const GH_STDOUT_LIMIT: usize = 32 * 1024 * 1024;
 const GH_STDERR_LIMIT: usize = 64 * 1024;
 const ORIGIN_STDOUT_LIMIT: usize = 16 * 1024;
-const EXECUTABLE_BUSY_BACKOFF_MS: [u64; 3] = [5, 20, 50];
 
 #[derive(Debug, PartialEq, Eq)]
 enum IngestCommandError {
@@ -92,23 +95,6 @@ async fn read_command_pipe(
     Ok(bytes)
 }
 
-/// A just-written executable may remain busy briefly when another fork still
-/// holds a write descriptor. Retry only that transient spawn error; retain
-/// the ordinary classification for every other failure.
-async fn spawn_retrying_executable_busy<T>(
-    mut spawn: impl FnMut() -> std::io::Result<T>,
-) -> std::io::Result<T> {
-    for delay_ms in EXECUTABLE_BUSY_BACKOFF_MS {
-        match spawn() {
-            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            }
-            outcome => return outcome,
-        }
-    }
-    spawn()
-}
-
 async fn run_ingest_command(
     mut command: AsyncCommand,
     timeout: Duration,
@@ -119,15 +105,16 @@ async fn run_ingest_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let mut child = spawn_retrying_executable_busy(|| command.spawn())
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                IngestCommandError::NotFound
-            } else {
-                IngestCommandError::CouldNotStart
-            }
-        })?;
+    let mut child =
+        spawn_retrying_executable_busy_async(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+            .await
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    IngestCommandError::NotFound
+                } else {
+                    IngestCommandError::CouldNotStart
+                }
+            })?;
     let stdout = child.stdout.take().ok_or(IngestCommandError::Io)?;
     let stderr = child.stderr.take().ok_or(IngestCommandError::Io)?;
     tokio::time::timeout(timeout, async {
@@ -1270,8 +1257,9 @@ mod gh_command_tests {
     use std::time::Duration;
 
     use super::{
-        gh_json_with_command, probe_gh_repository_with_command, spawn_retrying_executable_busy,
-        GhProbeError, IngestCommandError, OriginIdentity,
+        gh_json_with_command, probe_gh_repository_with_command,
+        spawn_retrying_executable_busy_async as spawn_retrying_executable_busy, GhProbeError,
+        IngestCommandError, OriginIdentity, EXECUTABLE_BUSY_BACKOFF_MS,
     };
 
     fn executable(dir: &Path, body: &str) -> PathBuf {
@@ -1284,7 +1272,7 @@ mod gh_command_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn busy_executable_spawn_retries_only_within_its_budget() {
         let mut attempts = 0;
-        let value = spawn_retrying_executable_busy(|| {
+        let value = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || {
             attempts += 1;
             if attempts < 3 {
                 Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
@@ -1297,7 +1285,7 @@ mod gh_command_tests {
         assert_eq!((value, attempts), (17, 3));
 
         let mut denied_attempts = 0;
-        let denied = spawn_retrying_executable_busy(|| {
+        let denied = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || {
             denied_attempts += 1;
             Err::<(), _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         })
@@ -1307,7 +1295,7 @@ mod gh_command_tests {
         assert_eq!(denied_attempts, 1);
 
         let mut exhausted_attempts = 0;
-        let exhausted = spawn_retrying_executable_busy(|| {
+        let exhausted = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || {
             exhausted_attempts += 1;
             Err::<(), _>(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
         })
@@ -1598,8 +1586,9 @@ mod gh_command_tests {
     }
 }
 
-/// Look up an existing `commit` note by its `properties.sha` (natural-key
-/// idempotence — dedupe before create).
+/// Look up an existing `commit` note by its `properties.sha`. New ingests use
+/// a note key to arbitrate concurrent creates, but older notes had no key.
+/// Detect legacy duplicates rather than selecting an arbitrary holder.
 async fn find_commit_by_sha(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1607,8 +1596,8 @@ async fn find_commit_by_sha(
 ) -> Result<Option<Uuid>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let row = r
-        .query_row(SqlStatement {
+    let rows = r
+        .query_all(SqlStatement {
             sql: sql!("commits_by_sha_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
@@ -1618,7 +1607,43 @@ async fn find_commit_by_sha(
         })
         .await
         .map_err(anyhow::Error::new)?;
-    Ok(row.and_then(|r| row_uuid(&r)))
+    if rows.len() > 1 {
+        bail!("multiple live commit notes hold SHA {sha}; reconcile legacy duplicates before advancing an ingest checkpoint");
+    }
+    rows.first()
+        .map(|row| {
+            row_uuid(row)
+                .ok_or_else(|| anyhow!("stored commit note has an invalid ID for SHA {sha}"))
+        })
+        .transpose()
+}
+
+fn is_note_key_conflict(error: &RuntimeError) -> bool {
+    matches!(error.refusal_source(), RuntimeError::Khive(error)
+        if error.details().and_then(|details| details.get("reason")) == Some("key_conflict"))
+}
+
+async fn missing_commit_annotation_specs(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    commit_id: Uuid,
+    annotates: &BTreeSet<String>,
+) -> Result<Vec<LinkSpec>> {
+    let existing_targets = commit_annotation_targets(runtime, token, commit_id).await?;
+    Ok(annotates
+        .iter()
+        .map(|target| Uuid::parse_str(target).expect("annotation target is a UUID"))
+        .filter(|target| !existing_targets.contains(target))
+        .map(|target_id| LinkSpec {
+            namespace: None,
+            source_id: commit_id,
+            target_id,
+            relation: EdgeRelation::Annotates,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        })
+        .collect())
 }
 
 /// Include tombstones: a deleted annotation is a deliberate curation choice,
@@ -2089,11 +2114,16 @@ fn walk_commits(
         None => snapshot_head.to_string(),
     });
     args.push("--".into());
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(&args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+        .and_then(|child| child.wait_with_output())
         .context("spawning git log")?;
     if !output.status.success() {
         return Err(anyhow::Error::new(GitLogError {
@@ -2136,12 +2166,16 @@ fn walk_commits(
         writeln!(input, "{sha}").context("writing cat-file request list")?;
     }
     input.seek(SeekFrom::Start(0))?;
-    let objects = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(["cat-file", "--batch"])
         .stdin(Stdio::from(input))
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let objects = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+        .and_then(|child| child.wait_with_output())
         .context("spawning git cat-file --batch")?;
     if !objects.status.success() {
         return Err(anyhow::Error::new(GitLogError {
@@ -2352,7 +2386,8 @@ fn touched_files(repo: &Path, page_shas: &[String]) -> Result<HashMap<String, Ve
     const SHAS_PER_COMMAND: usize = 256;
     let mut files_by_sha = HashMap::new();
     for shas in page_shas.chunks(SHAS_PER_COMMAND) {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(repo)
             .arg("log")
@@ -2367,8 +2402,13 @@ fn touched_files(repo: &Path, page_shas: &[String]) -> Result<HashMap<String, Ve
             .arg(format!("--pretty=format:/{RECORD_SEP}%H"))
             .args(shas)
             .arg("--")
-            .output()
-            .context("spawning git log --name-only")?;
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output =
+            spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+                .and_then(|child| child.wait_with_output())
+                .context("spawning git log --name-only")?;
         if !output.status.success() {
             return Err(anyhow::Error::new(GitLogError {
                 phase: GitLogPhase::TouchedFiles,
@@ -2565,11 +2605,16 @@ struct CommitSnapshot {
 /// Resolve the ref without peeling objects so missing-promisor recovery still
 /// runs through the classified git-log boundary. Never retarget a retry to HEAD.
 fn resolve_commit_head(repo: &Path) -> Result<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(["rev-parse", "--verify", "HEAD"])
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+        .and_then(|child| child.wait_with_output())
         .context("resolving commit snapshot HEAD")?;
     let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || !is_commit_oid(&head) {
@@ -3031,21 +3076,8 @@ async fn ingest_commits(
             // skips note creation, but still adds this project's missing
             // annotations before advancing its checkpoint. Existing live
             // edges may have curated fields; tombstones stay deleted.
-            let existing_targets = commit_annotation_targets(runtime, token, existing).await?;
-            let links = annotates
-                .iter()
-                .map(|target| Uuid::parse_str(target).expect("annotation target is a UUID"))
-                .filter(|target| !existing_targets.contains(target))
-                .map(|target_id| LinkSpec {
-                    namespace: None,
-                    source_id: existing,
-                    target_id,
-                    relation: EdgeRelation::Annotates,
-                    weight: 1.0,
-                    metadata: None,
-                    resurrect: false,
-                })
-                .collect();
+            let links =
+                missing_commit_annotation_specs(runtime, token, existing, &annotates).await?;
             if let Err(error) = runtime.link_many(token, links).await {
                 record_write_failure(report, "link", "commit", c.sha.clone(), error);
                 stall_cursor(&mut cursor_stalled, report);
@@ -3080,70 +3112,145 @@ async fn ingest_commits(
 
         let mut create_request = json!({
             "kind": "commit",
+            "key": format!("git.commit:{}", c.sha),
             "name": name,
             "content": content,
             "properties": properties,
-            "annotates": annotates.into_iter().collect::<Vec<_>>(),
+            "annotates": annotates.iter().cloned().collect::<Vec<_>>(),
         });
         if let Some(head) = embedding_head {
             create_request["embedding_content"] = json!(head);
         }
 
-        match crate::dispatch_from_token(registry, token, "create", create_request).await {
+        // The keyed note path finishes embedding and annotations before its
+        // single publication transaction. A competing pass may win the key
+        // after our initial SHA lookup; both exact replay and key conflict
+        // then reuse only the committed winner, including this project's
+        // missing annotations, before acknowledging the checkpoint.
+        let (id, created) = match crate::dispatch_from_token(
+            registry,
+            token,
+            "create",
+            create_request,
+        )
+        .await
+        {
             Ok(v) => {
-                report.commits_ingested += 1;
-                if embedding_head.is_some() {
-                    report.commit_embeddings_truncated += 1;
-                }
-                if let Some(id) = v
+                let Some(id) = v
                     .get("id")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .and_then(|s| Uuid::parse_str(s).ok())
-                {
-                    local_sha_to_id.insert(c.sha.clone(), id);
-                    new_records.push(NewRecordForRef {
-                        id,
-                        text: content.clone(),
-                    });
-                    // Parent -> child `precedes` edges (ADR-088 Amendment 1
-                    // ingest enrichment). Fail-open: an unresolved or
-                    // failing parent link is skipped/warned, never aborts
-                    // the pass.
-                    for parent_sha in &c.parents {
-                        let parent_id = match local_sha_to_id.get(parent_sha).copied() {
-                            Some(pid) => Some(pid),
-                            None => find_commit_by_sha(runtime, token, parent_sha).await?,
-                        };
-                        let Some(parent_id) = parent_id else {
-                            continue;
-                        };
-                        if parent_id == id {
-                            continue;
-                        }
-                        match crate::dispatch_from_token(
-                            registry,
-                            token,
-                            "link",
-                            json!({
-                                    "source_id": parent_id.to_string(),
-                                    "target_id": id.to_string(),
-                                    "relation": "precedes",
-                            }),
-                        )
-                        .await
-                        {
-                            Ok(_) => report.parent_edges_created += 1,
-                            Err(e) => report.warnings.push(format!(
-                                "linking parent {parent_sha} -> {} precedes: {e}",
-                                c.sha
-                            )),
-                        }
-                    }
-                }
+                else {
+                    record_write_failure(
+                        report,
+                        "create",
+                        "commit",
+                        c.sha.clone(),
+                        RuntimeError::Internal("create commit returned no valid id".into()),
+                    );
+                    stall_cursor(&mut cursor_stalled, report);
+                    continue;
+                };
+                let Some(created) = v.get("created").and_then(Value::as_bool) else {
+                    record_write_failure(
+                        report,
+                        "create",
+                        "commit",
+                        c.sha.clone(),
+                        RuntimeError::Internal(
+                            "keyed create commit returned no created flag".into(),
+                        ),
+                    );
+                    stall_cursor(&mut cursor_stalled, report);
+                    continue;
+                };
+                (id, created)
             }
-            Err(e) => {
-                record_write_failure(report, "create", "commit", c.sha.clone(), e);
+            Err(error) if is_note_key_conflict(&error) => {
+                let Some(id) = find_commit_by_sha(runtime, token, &c.sha).await? else {
+                    let key = format!("git.commit:{}", c.sha);
+                    let holder = runtime
+                        .get_note_by_key(token, &key, Some("commit"), false)
+                        .await;
+                    let failure = match holder {
+                            Ok(note) => {
+                                let holder_sha = note
+                                    .properties
+                                    .as_ref()
+                                    .and_then(|properties| properties.get("sha"))
+                                    .and_then(Value::as_str)
+                                    .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+                                    .unwrap_or("<missing or malformed>");
+                                RuntimeError::Internal(format!(
+                                    "git commit key {key:?} is held by note {} kind {} properties.sha {holder_sha:?}; expected SHA {}",
+                                    note.id, note.kind, c.sha
+                                ))
+                            }
+                            Err(lookup_error) => RuntimeError::Internal(format!(
+                                "git commit key {key:?} conflicted but holder lookup failed: {lookup_error}; create error: {error}"
+                            )),
+                        };
+                    record_write_failure(report, "create", "commit", c.sha.clone(), failure);
+                    stall_cursor(&mut cursor_stalled, report);
+                    continue;
+                };
+                (id, false)
+            }
+            Err(error) => {
+                record_write_failure(report, "create", "commit", c.sha.clone(), error);
                 stall_cursor(&mut cursor_stalled, report);
+                continue;
+            }
+        };
+        if !created {
+            let links = missing_commit_annotation_specs(runtime, token, id, &annotates).await?;
+            if let Err(error) = runtime.link_many(token, links).await {
+                record_write_failure(report, "link", "commit", c.sha.clone(), error);
+                stall_cursor(&mut cursor_stalled, report);
+                continue;
+            }
+            local_sha_to_id.insert(c.sha.clone(), id);
+            report.commits_skipped_existing += 1;
+        } else {
+            report.commits_ingested += 1;
+            if embedding_head.is_some() {
+                report.commit_embeddings_truncated += 1;
+            }
+            local_sha_to_id.insert(c.sha.clone(), id);
+            new_records.push(NewRecordForRef {
+                id,
+                text: content.clone(),
+            });
+            // Parent -> child `precedes` edges are best-effort enrichment.
+            for parent_sha in &c.parents {
+                let parent_id = match local_sha_to_id.get(parent_sha).copied() {
+                    Some(pid) => Some(pid),
+                    None => find_commit_by_sha(runtime, token, parent_sha).await?,
+                };
+                let Some(parent_id) = parent_id else {
+                    continue;
+                };
+                if parent_id == id {
+                    continue;
+                }
+                match crate::dispatch_from_token(
+                    registry,
+                    token,
+                    "link",
+                    json!({
+                        "source_id": parent_id.to_string(),
+                        "target_id": id.to_string(),
+                        "relation": "precedes",
+                    }),
+                )
+                .await
+                {
+                    Ok(_) => report.parent_edges_created += 1,
+                    Err(e) => report.warnings.push(format!(
+                        "linking parent {parent_sha} -> {} precedes: {e}",
+                        c.sha
+                    )),
+                }
             }
         }
         if !cursor_stalled {
@@ -3240,14 +3347,16 @@ fn last_sha_of(since: &Option<String>) -> Option<&str> {
 /// that is the correct reading: the walked source does not contain the
 /// history that advanced the cursor.
 fn is_ancestor_of_head(repo: &Path, sha: &str) -> bool {
-    Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo)
         .args(["merge-base", "--is-ancestor", sha, "HEAD"])
         // This predicate consumes only status; diagnostics have no reader.
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::null());
+    spawn_retrying_executable_busy(&EXECUTABLE_BUSY_BACKOFF_MS, || command.spawn())
+        .and_then(|mut child| child.wait())
         .map(|s| s.success())
         .unwrap_or(false)
 }

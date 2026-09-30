@@ -2,7 +2,9 @@
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
-/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent). See
+/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent).
+/// The builtins-only outbound-due index belongs to a numbered core migration.
+/// Supported writers maintain its strict stored deadline key. See
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.
@@ -536,7 +538,14 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
                 name: "channel_slug",
                 param_type: "string",
                 required: true,
-                description: "Exact channel credential slug owning the quarantine notes.",
+                description: "Exact channel credential slug, or an empty string only in legacy_slugless mode.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "mode",
+                param_type: "string",
+                required: false,
+                description: "Internal cleanup selector: channel (default) or legacy_slugless for one kind's historical blank-slug partition.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

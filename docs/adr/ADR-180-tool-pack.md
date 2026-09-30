@@ -575,3 +575,112 @@ and linked to.
   code fix.
 
 Refs: #3307, #3308.
+
+## Amendment 6 (2026-09-29): policy checks leave ordered decision receipts
+
+**Status: Proposed; this amendment requires hash sign-off before the dependent
+implementation merges.**
+
+`tool.check` answers a policy question, but a caller cannot distinguish a gate
+refusal from a policy decision by counting generic dispatch audit rows. The
+ADR-018 gate already appends an `Audit` event when it refuses a read-classified
+verb before its handler runs (`crates/khive-runtime/src/pack.rs`, the denied
+dispatch branch around lines 3221–3247). It also appends a generic `Audit` row
+after an allowed dispatch (the same file around lines 3550–3595). Those rows
+remain untouched. A policy decision needs a separate typed event kind.
+
+1. Once either `tool.check` or the `exec.run` policy preflight has computed a
+   decision, the shared tool-policy seam appends exactly one event of kind
+   `tool_check_decided`, verb `tool.check`, substrate `event`, and the caller's
+   namespace and authenticated actor. Its typed data is `{actor, tool,
+   registered, decision, source, id, scope, caller_verb}`. `actor` is the actor
+   whose use was evaluated, which may differ from the authenticated event
+   actor; `id` is the deciding grant or policy row id, or null for a default;
+   `caller_verb` is `tool.check` or `exec.run`. `scope` is null when the
+   evaluation supplies none, including current `exec.run` preflight. The
+   event outcome is `success` when evaluation completed, even if the policy
+   decision was `deny` or `ask`; readers use `data.decision` for that result.
+   The existing response shape does not change. A failed event append prevents a
+   successful decision response or an allowed exec preflight. Because the
+   receipt copies `actor` and `tool` into the namespace event log, both strings
+   pass the ADR-115 credential gate (`secret_gate::check_at`) before the
+   decision is computed; a credential-shaped value is refused with the
+   secret-detected error, names the field, and leaves no receipt.
+2. A gate refusal of `tool.check` or `exec.run` never reaches the policy seam
+   and leaves zero `tool_check_decided` events. The generic `Audit` event for
+   that refusal may still exist. Other policy probes (`tool.suggest`,
+   `tool.describe`, and `tool.request`) do not emit this kind; they are not
+   invocations of the two named decision paths. The receipt records the
+   decision having been taken, not a mutation of the policy or graph
+   substrates, so `tool.check` remains assertive under ADR-025.
+3. The caller reads `list(kind="event", event_kinds=["tool_check_decided"],
+   verb="tool.check", actor=<authenticated actor>, since=<microseconds>)`.
+   The current `event_kinds` wire field maps to `EventFilter.kinds`
+   (`crates/khive-pack-kg/src/handler_defs.rs` and
+   `crates/khive-pack-kg/src/handlers/common.rs`). The list returns newest
+   first by `(created_at DESC, event_id DESC)` as ADR-022 specifies, and the
+   `since` predicate is strictly `created_at > since`. The event list has no
+   insertion-sequence cursor: the list verb's `after` cursor covers entities,
+   notes and edges only, and no verb exposes a sequence for the events table. A `(created_at, event_id)` high-water mark is therefore
+   not a lossless cursor, for two reasons. `created_at` is stamped when the
+   event is constructed, before the append waits for the writer, so a row can
+   become visible after a row with a later timestamp has been read
+   (ADR-171 rejects a timestamp cursor for the same reason). And event ids are
+   random UUIDs, so a row appended after the cursor was saved that shares the
+   cursor's microsecond can sort below the cursor's id. A caller that discards
+   rows at or below its saved `(created_at, event_id)` loses both.
+
+   This amendment chooses option (b), latency-independent recovery: the
+   catch-up procedure keeps ids instead of advancing a timestamp cursor.
+   Before the first target action, the caller samples the event clock in
+   microseconds and stores a fixed `floor=max(sample-1, 0)`; the subtraction
+   includes a receipt stamped in the sample's microsecond because `since` is
+   exclusive. For the entire observation horizon, each poll requests
+   `since=floor`, pages until `has_more` is false, and processes only ids not
+   already in `seen`. It retains every processed id in `seen` for that horizon.
+   Paging newest first can repeat a row when an event lands between offset
+   pages; `seen` absorbs the repeat, and another poll from the same floor
+   catches a displaced row once concurrent writes settle. Rows recovered late
+   are delivered late; a reader that needs replay order sorts by
+   `(created_at, event_id)`, which orders same-microsecond rows stably but
+   makes no claim about their insertion order.
+
+   An implementation may first scan a recent `W`-microsecond lookback to
+   report prompt arrivals, but it must complete the fixed-floor re-read before
+   claiming a poll is complete. `W` is a scan-lag optimization, never a receipt
+   eligibility cutoff. A receipt with stored `created_at > floor` remains
+   eligible whenever its append becomes visible.
+   The writer admission deadline bounds only queue admission; it does not bound the
+   accepted job's wait for completion. This procedure rescans all live rows
+   since the floor on every poll and retains all their ids, so time and state
+   grow with the observation horizon. It is suitable for a finite assertion
+   interval, not a perpetual bounded cursor. Its recovery guarantee applies
+   only while receipts remain live under the ADR-168 archive policy below;
+   archival can remove an unread row. A perpetual bounded reader requires a
+   separately specified insertion-order cursor and retention/acknowledgment
+   contract, which this event list does not expose.
+4. `tool_check_decided` is `age_archivable`, the same ADR-168 class as
+   `RecallExecuted`, `RerankExecuted`, and `SearchExecuted` (Table A rows
+   10–12). It is pure decision telemetry without a graph referent. An
+   archive horizon is disclosed under ADR-168; a live list does not promise
+   indefinite retention.
+
+Acceptance: a credential-shaped `actor` or `tool` is refused and no stored
+event carries it; a gate refusal yields no decision-kind row after the cursor; an
+allowed `tool.check` yields exactly one with the evaluated actor and tool;
+deny-then-allow and allow-then-deny checks yield distinguishable decision
+sequences when ordered by `(created_at, event_id)`; `exec.run` preflight yields
+the same data with `caller_verb="exec.run"`. A row appended after the cursor
+was saved is returned by a subsequent fixed-floor poll even when it shares the
+cursor's microsecond with a lower id. In a delayed-visibility fixture, a
+constructed receipt remains invisible for longer than a short `W` and carries
+a timestamp over 60 seconds behind the newest receipt; releasing its append
+returns it on the next fixed-floor poll. The fixture blocks before
+`append_event`, modeling queue visibility delay without claiming to test
+actual writer admission or reply timing. Polling drains every page and retains
+`seen` ids for the full observation horizon. An append failure surfaces an
+explicit storage error rather than a successful decision without a receipt. Removing
+the shared emission call, emitting before the gate, or dropping `caller_verb`
+must turn the corresponding acceptance arm red.
+
+Refs: #2687, ADR-004, ADR-018, ADR-022, ADR-025, ADR-168, ADR-181.

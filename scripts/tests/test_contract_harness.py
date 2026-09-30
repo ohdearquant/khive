@@ -27,6 +27,11 @@ from contract_harness import OwnedContractStore
 REAL_POPEN = subprocess.Popen
 
 
+def timing_instrumented():
+    """Match the Rust timing helper: presence, including an empty value."""
+    return "LLVM_PROFILE_FILE" in os.environ
+
+
 class OwnedChildren:
     """Serialize process admission with terminal watchdog expiration."""
 
@@ -162,22 +167,29 @@ class HarnessTests(unittest.TestCase):
         # The watchdog bounds coverage runs while ownership checks remain active.
         envelope = exchange + worker + 2 * reap + max(exchange, reap, worker,
                                                        scheduling_floor)
-        if "LLVM_PROFILE_FILE" not in os.environ:
+        if not timing_instrumented():
             self.assertLess(elapsed, envelope,
                             f"{phase} exceeded completion envelope {envelope:g}s")
 
     @contextmanager
-    def adapter(self, kind, store, mode="normal", timeout=0.3, reap_timeout=None):
+    def adapter(self, kind, store, mode="normal", timeout=0.3, reap_timeout=None,
+                startup_timeout=None, initialize_delay=None):
         env = dict(os.environ, FAKE_LOG=str(self.log), FAKE_MODE=mode)
+        if initialize_delay is not None:
+            env["FAKE_INITIALIZE_DELAY"] = str(initialize_delay)
+        init_budget = timeout if startup_timeout is None else startup_timeout
         if kind == "pytest":
-            with KhiveMcpSession(binary=self.fake, store=store, env=env, timeout=timeout,
+            with KhiveMcpSession(binary=self.fake, store=store, env=env, timeout=init_budget,
                                  reap_timeout=reap_timeout) as session:
+                # The request phase starts only after initialize has succeeded.
+                session._transport.timeout = timeout
                 yield session.tools_list
         else:
             with mock.patch.object(legacy, "BINARY", str(self.fake)):
-                proc = legacy._start_server(store, env=env, timeout=timeout,
+                proc = legacy._start_server(store, env=env, timeout=init_budget,
                                             reap_timeout=reap_timeout)
                 try:
+                    proc.contract_transport.timeout = timeout
                     def request():
                         legacy._send(proc, "tools/list", {})
                         return legacy._recv(proc)["result"]["tools"]
@@ -296,13 +308,17 @@ class HarnessTests(unittest.TestCase):
                     self.assert_reaped()
 
     def test_stalled_request_is_bounded_and_reaped(self):
+        # Initialize is setup; the stalled request remains a 0.25s contract.
+        # A cold fake-server start has its own readiness budget on every runner.
         exchange_budget = 0.25
+        startup_budget = 2.0
         reap_budget = exchange_budget
         for kind in ("legacy", "pytest"):
             for mode in ("request_silent", "request_partial", "request_noise"):
                 with self.subTest(kind=kind, mode=mode), OwnedContractStore() as store:
                     with self.adapter(kind, store, mode, timeout=exchange_budget,
-                                      reap_timeout=reap_budget) as request:
+                                      reap_timeout=reap_budget,
+                                      startup_timeout=startup_budget) as request:
                         start = time.monotonic()
                         with self.assertRaises(Exception) as error:
                             request()
@@ -312,6 +328,22 @@ class HarnessTests(unittest.TestCase):
                                                         exchange=exchange_budget, reap=reap_budget)
                         self.assert_protocol_stage(mode)
                         self.assert_reaped()
+
+    def test_delayed_initialize_does_not_consume_request_stall_budget(self):
+        for kind in ("legacy", "pytest"):
+            with self.subTest(kind=kind), OwnedContractStore() as store:
+                with self.adapter(kind, store, "request_partial", timeout=0.25,
+                                  reap_timeout=0.25, startup_timeout=2.0,
+                                  initialize_delay=0.4) as request:
+                    started = time.monotonic()
+                    with self.assertRaises(Exception) as error:
+                        request()
+                    self.assertIn("MCP exchange exceeded 0.25s", str(error.exception))
+                    self.assert_completion_envelope(time.monotonic() - started,
+                                                    phase="request after delayed initialize",
+                                                    exchange=0.25, reap=0.25)
+                    self.assert_protocol_stage("request_partial")
+                    self.assert_reaped()
 
     def test_initialize_error_is_reaped(self):
         for kind in ("legacy", "pytest"):
@@ -551,6 +583,7 @@ with open(os.environ['FAKE_LOG'], 'a') as log:
     log.write(json.dumps({'pid': os.getpid(), 'argv': args, 'env': dict(os.environ),
                          'config': pathlib.Path(config).read_text() if config and pathlib.Path(config).exists() else ''}) + '\n')
 mode = os.environ.get('FAKE_MODE', 'normal')
+initialize_delay = float(os.environ.get('FAKE_INITIALIZE_DELAY', '0'))
 def stage(name):
     with open(os.environ['FAKE_LOG'], 'a') as log:
         log.write(json.dumps({'pid': os.getpid(), 'stage': name}) + '\n')
@@ -560,6 +593,8 @@ for line in sys.stdin:
     if 'id' not in request:
         continue
     phase = 'initialize' if request['method'] == 'initialize' else 'request'
+    if phase == 'initialize' and initialize_delay:
+        time.sleep(initialize_delay)
     if mode == phase + '_silent':
         stage(mode)
         time.sleep(60)

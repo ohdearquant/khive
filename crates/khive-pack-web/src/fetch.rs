@@ -19,6 +19,7 @@
 //! `page`/`resource` row.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -50,8 +51,43 @@ const INLINE_RAW_BODY_LIMIT: u64 = (INLINE_BODY_BUDGET / 4 * 3) as u64;
 /// Response headers echoed to the caller and recorded in the receipt: a
 /// response header set is attacker-controlled, so only this allow-listed
 /// subset is ever surfaced.
-const ALLOWED_RESPONSE_HEADERS: &[&str] =
-    &["content-type", "content-length", "last-modified", "etag"];
+const ALLOWED_RESPONSE_HEADERS: &[&str] = &[
+    "content-type",
+    "content-length",
+    "last-modified",
+    "etag",
+    "vary",
+    "content-language",
+];
+
+/// Preserve every Vary field line. A non-UTF-8 line becomes JSON null rather
+/// than disappearing: refresh must treat that stored selector as unreplayable.
+pub(crate) fn vary_value(headers: &reqwest::header::HeaderMap) -> Option<Value> {
+    let values: Vec<Value> = headers
+        .get_all("vary")
+        .iter()
+        .map(|value| value.to_str().map_or(Value::Null, |text| json!(text)))
+        .collect();
+    (!values.is_empty()).then_some(Value::Array(values))
+}
+
+/// Content-Language is a list field; combine repeated valid lines in order.
+/// An invalid supplied value clears the interpretable cached language rather
+/// than silently retaining an older language from a different response.
+pub(crate) fn content_language_value(headers: &reqwest::header::HeaderMap) -> Option<Value> {
+    let values: Vec<_> = headers.get_all("content-language").iter().collect();
+    if values.is_empty() {
+        return None;
+    }
+    let mut text = Vec::with_capacity(values.len());
+    for value in values {
+        let Ok(value) = value.to_str() else {
+            return Some(Value::Null);
+        };
+        text.push(value.trim());
+    }
+    Some(json!(text.join(", ")))
+}
 
 pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> Value {
     let mut out = serde_json::Map::new();
@@ -61,6 +97,12 @@ pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> V
                 out.insert((*name).to_string(), Value::String(text.to_string()));
             }
         }
+    }
+    if let Some(vary) = vary_value(headers) {
+        out.insert("vary".to_string(), vary);
+    }
+    if let Some(language) = content_language_value(headers) {
+        out.insert("content-language".to_string(), language);
     }
     let links: Vec<&str> = headers
         .get_all("link")
@@ -73,7 +115,14 @@ pub(crate) fn extract_allowed_headers(headers: &reqwest::header::HeaderMap) -> V
     Value::Object(out)
 }
 
-const NEGOTIATION_HEADERS: &[&str] = &["accept", "accept-language"];
+/// The fetch path never offers a content coding and never decodes one: every
+/// body it hands on is the identity representation or the request is refused.
+pub(crate) const FIXED_ACCEPT_ENCODING: &str = "identity";
+/// The value earlier versions recorded when the client offered gzip. A stored
+/// request map carrying it is valid for negotiation replay, but its body must
+/// be replaced by an unconditional identity GET before validators can be sent.
+pub(crate) const LEGACY_ACCEPT_ENCODING: &str = "gzip";
+const NEGOTIATION_HEADERS: &[&str] = &["accept", "accept-language", "accept-encoding"];
 
 /// Keep only representation negotiation, never credentials or conditional
 /// validators. Lists retain repeated header values in their sent order.
@@ -88,43 +137,155 @@ pub(crate) fn negotiation_headers(headers: &[(String, String)]) -> BTreeMap<Stri
     selected
 }
 
+/// `run_one_hop` sends this header on every hop. The egress allowlist does not
+/// permit callers to set Accept-Encoding. Record that fixed client choice
+/// alongside the fields passed explicitly to `run_one_hop`.
+pub(crate) fn recorded_negotiation_headers(
+    headers: &[(String, String)],
+) -> BTreeMap<String, Vec<String>> {
+    let mut selected = negotiation_headers(headers);
+    selected.insert(
+        "accept-encoding".to_string(),
+        vec![FIXED_ACCEPT_ENCODING.to_string()],
+    );
+    selected
+}
+
 pub(crate) fn stored_negotiation_headers(
     properties: &Value,
 ) -> Result<Vec<(String, String)>, RuntimeError> {
+    let stored = properties
+        .get("request_headers")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "stored request negotiation is missing or invalid".to_string(),
+            )
+        })?;
+    if stored
+        .keys()
+        .any(|name| !NEGOTIATION_HEADERS.contains(&name.as_str()))
+    {
+        return Err(RuntimeError::InvalidInput(
+            "stored request negotiation contains an unknown header".to_string(),
+        ));
+    }
     let mut headers = Vec::new();
     for name in NEGOTIATION_HEADERS {
-        if let Some(value) = properties
-            .get("request_headers")
-            .and_then(|headers| headers.get(*name))
-        {
+        if let Some(value) = stored.get(*name) {
             let values: Vec<String> = serde_json::from_value(value.clone()).map_err(|error| {
                 RuntimeError::InvalidInput(format!("stored {name} negotiation is invalid: {error}"))
             })?;
+            if values.is_empty()
+                || values.iter().any(|value| {
+                    value.trim().is_empty()
+                        || reqwest::header::HeaderValue::from_str(value).is_err()
+                })
+            {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "stored {name} negotiation has no valid header value"
+                )));
+            }
+            if *name == "accept-encoding" {
+                if values.len() != 1
+                    || (values[0] != FIXED_ACCEPT_ENCODING && values[0] != LEGACY_ACCEPT_ENCODING)
+                {
+                    return Err(RuntimeError::InvalidInput(
+                        "stored accept-encoding differs from the fixed client value".to_string(),
+                    ));
+                }
+                headers.push(((*name).to_string(), FIXED_ACCEPT_ENCODING.to_string()));
+                continue;
+            }
             headers.extend(values.into_iter().map(|value| ((*name).to_string(), value)));
         }
     }
     Ok(headers)
 }
 
-/// Bind negotiation to the exact entity revision produced by this body settlement.
-pub(crate) async fn persist_negotiation_headers(
+/// Bind response selection and request negotiation to this GET body revision.
+pub(crate) async fn persist_get_context(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     settled: &SettledContent,
     headers: &[(String, String)],
+    response_headers: &reqwest::header::HeaderMap,
 ) -> Result<(), RuntimeError> {
-    let selected = negotiation_headers(headers);
-    let stored = match &settled.entity.properties {
-        Some(properties) => stored_negotiation_headers(properties)?,
-        None => Vec::new(),
-    };
-    if negotiation_headers(&stored) != selected {
+    persist_selection_context(
+        runtime,
+        token,
+        settled,
+        recorded_negotiation_headers(headers),
+        response_headers,
+    )
+    .await
+}
+
+/// Disk ingest has no HTTP request, so it must not claim the client's fixed
+/// Accept-Encoding was sent. It still binds the observed-empty Vary context
+/// to the newly stored body.
+pub(crate) async fn persist_disk_context(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    settled: &SettledContent,
+) -> Result<(), RuntimeError> {
+    persist_selection_context(
+        runtime,
+        token,
+        settled,
+        BTreeMap::new(),
+        &reqwest::header::HeaderMap::new(),
+    )
+    .await
+}
+
+async fn persist_selection_context(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    settled: &SettledContent,
+    selected: BTreeMap<String, Vec<String>>,
+    response_headers: &reqwest::header::HeaderMap,
+) -> Result<(), RuntimeError> {
+    let stored = settled
+        .entity
+        .properties
+        .as_ref()
+        .map(stored_negotiation_headers)
+        .transpose()
+        .ok()
+        .flatten()
+        .map(|headers| negotiation_headers(&headers));
+    let vary = vary_value(response_headers).unwrap_or_else(|| json!([]));
+    let content_language = content_language_value(response_headers).unwrap_or(Value::Null);
+    let mut patch = serde_json::Map::new();
+    if stored != Some(selected.clone()) {
+        patch.insert("request_headers".to_string(), json!(selected));
+    }
+    if settled
+        .entity
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("vary"))
+        != Some(&vary)
+    {
+        patch.insert("vary".to_string(), vary);
+    }
+    if settled
+        .entity
+        .properties
+        .as_ref()
+        .and_then(|p| p.get("content_language"))
+        != Some(&content_language)
+    {
+        patch.insert("content_language".to_string(), content_language);
+    }
+    if !patch.is_empty() {
         runtime
             .update_entity_if_unchanged(
                 token,
                 &settled.entity,
                 EntityPatch {
-                    properties: Some(json!({"request_headers": selected})),
+                    properties: Some(Value::Object(patch)),
                     ..Default::default()
                 },
                 &[],
@@ -191,8 +352,20 @@ pub(crate) async fn run_one_hop(
         .into());
     }
     let want_body = method == reqwest::Method::GET;
-    let mut request = client.request(method, url.clone());
+    // The requested representation is fixed for every hop, including HEAD and
+    // redirects: identity, sent explicitly so no origin is invited to compress.
+    let mut request = client
+        .request(method, url.clone())
+        .header(reqwest::header::ACCEPT_ENCODING, FIXED_ACCEPT_ENCODING);
     for (name, value) in headers {
+        if name.eq_ignore_ascii_case("accept-encoding") {
+            if value != FIXED_ACCEPT_ENCODING {
+                return Err(RuntimeError::InvalidInput(
+                    "request accept-encoding differs from the fixed client value".to_string(),
+                ));
+            }
+            continue;
+        }
         request = request.header(name.as_str(), value.as_str());
     }
     let hop = async {
@@ -214,6 +387,13 @@ pub(crate) async fn run_one_hop(
         };
         let body =
             if want_body && redirect_to.is_none() {
+                // No client decodes a content coding, so a body that names one
+                // would reach the byte cap as undecoded bytes. Refuse it
+                // before any body byte is read. A 204 or 304 has no content
+                // to mislabel.
+                if !matches!(status, 204 | 304) {
+                    refuse_content_encoding(&response_headers)?;
+                }
                 let mut response = response;
                 let mut buffer: Vec<u8> = Vec::new();
                 let mut truncated = false;
@@ -248,6 +428,30 @@ pub(crate) async fn run_one_hop(
         Ok(result) => result,
         Err(_) => Err(Refusal::new("response_too_slow", "response exceeded the time bound").into()),
     }
+}
+
+/// Refuse any `Content-Encoding` other than `identity`. Every listed coding
+/// must be identity; an unreadable value is refused as well.
+fn refuse_content_encoding(headers: &reqwest::header::HeaderMap) -> Result<(), RuntimeError> {
+    for value in headers.get_all(reqwest::header::CONTENT_ENCODING) {
+        let text = value.to_str().ok();
+        let coding = text.unwrap_or("<non-text value>");
+        let identity_only = text.is_some_and(|text| {
+            text.split(',')
+                .map(str::trim)
+                .all(|token| token.is_empty() || token.eq_ignore_ascii_case("identity"))
+        });
+        if !identity_only {
+            return Err(Refusal::new(
+                "unsupported_content_encoding",
+                format!(
+                    "the response declares content-encoding {coding:?}; only identity is accepted"
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 struct CredentialAttachment {
@@ -312,7 +516,7 @@ async fn run_fetch(
                 "method_not_allowed",
                 format!("method {other:?} is refused; only GET and HEAD are permitted"),
             )
-            .into())
+            .into());
         }
     };
     let url = Url::parse(&params.url)
@@ -444,14 +648,49 @@ pub(crate) async fn run_hop_chain_with_clients<F>(
     clients: &egress::PinnedClients,
     resolver: &dyn Resolver,
     cfg: &WebSectionConfig,
+    url: Url,
+    method: reqwest::Method,
+    max_bytes: u64,
+    deadline: Instant,
+    headers_for_hop: F,
+) -> Result<(HopOutcome, Vec<RedirectHop>), RuntimeError>
+where
+    F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+{
+    let (outcome, redirect_hops, ()) = run_hop_chain_with_clients_observed(
+        clients,
+        resolver,
+        cfg,
+        url,
+        method,
+        max_bytes,
+        deadline,
+        headers_for_hop,
+        |_| async { Ok(()) },
+    )
+    .await?;
+    Ok((outcome, redirect_hops))
+}
+
+/// Observe each hop immediately before sending it. The returned observation
+/// belongs to the terminal request, including when that request followed a
+/// redirect; callers can use it as an optimistic-write guard at settlement.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_hop_chain_with_clients_observed<F, O, Fut, T>(
+    clients: &egress::PinnedClients,
+    resolver: &dyn Resolver,
+    cfg: &WebSectionConfig,
     mut url: Url,
     method: reqwest::Method,
     max_bytes: u64,
     deadline: Instant,
     mut headers_for_hop: F,
-) -> Result<(HopOutcome, Vec<RedirectHop>), RuntimeError>
+    mut before_request: O,
+) -> Result<(HopOutcome, Vec<RedirectHop>, T), RuntimeError>
 where
     F: FnMut(&Url) -> Result<Vec<(String, String)>, RuntimeError>,
+    O: FnMut(Url) -> Fut,
+    Fut: Future<Output = Result<T, RuntimeError>>,
 {
     let mut redirects = 0u32;
     let mut redirect_hops: Vec<RedirectHop> = Vec::new();
@@ -466,6 +705,7 @@ where
             .to_string();
         let addr = egress::resolve_and_pin_before(resolver, &host, deadline).await?;
         let client = clients.for_checked_address(&url, addr)?;
+        let request_observation = before_request(url.clone()).await?;
 
         let outcome = run_one_hop(
             &client,
@@ -489,7 +729,7 @@ where
                 url = next.clone();
                 continue;
             }
-            None => return Ok((outcome, redirect_hops)),
+            None => return Ok((outcome, redirect_hops, request_observation)),
         }
     }
 }
@@ -619,6 +859,42 @@ pub(crate) async fn root_body(
         .map_err(|error| RuntimeError::Internal(format!("body attachment write failed: {error}")))
 }
 
+/// An entity's `content_ref` is projected from the graph backend's local
+/// attachment table. The body root may instead live on canonical main, so a
+/// snapshot returned before `root_body` cannot be forged into the one that a
+/// guarded metadata update will read. Keep the graph row's own revision and
+/// body reference stable, then use its actual projection for that guard.
+pub(crate) async fn entity_after_body_root(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    patched: &khive_storage::Entity,
+    content_ref: &str,
+) -> Result<khive_storage::Entity, RuntimeError> {
+    let conflict = || {
+        RuntimeError::Khive(khive_types::KhiveError::conflict(
+            "web body row changed while its content attachment was rooted",
+        ))
+    };
+    let current = runtime
+        .entities(token)?
+        .get_entity(patched.id)
+        .await?
+        .ok_or_else(conflict)?;
+    if current.namespace != patched.namespace
+        || current.deleted_at.is_some()
+        || current.version != patched.version
+        || current
+            .properties
+            .as_ref()
+            .and_then(|properties| properties.get("blob_ref"))
+            .and_then(Value::as_str)
+            != Some(content_ref)
+    {
+        return Err(conflict());
+    }
+    Ok(current)
+}
+
 /// Mint (if absent), blob-store the body, and patch one page/resource
 /// entity's full row: identity resolve, `site contains {page|resource}`
 /// link (arm29: minted before the blob put, so a failing store still leaves
@@ -634,16 +910,7 @@ pub(crate) struct SettledContent {
     pub content_ref: Option<String>,
     pub bytes: u64,
     pub truncated: bool,
-    entity: Entity,
-}
-
-pub(crate) enum ContentBody {
-    Received(Vec<u8>, bool),
-    Stored {
-        content_ref: ContentRef,
-        bytes: u64,
-        truncated: bool,
-    },
+    pub(crate) entity: Entity,
 }
 
 pub(crate) fn representation_patch(
@@ -665,6 +932,10 @@ pub(crate) fn representation_patch(
         "fetched_at": chrono::Utc::now().to_rfc3339(),
         "etag": etag,
         "last_modified": last_modified,
+        // Unknown until a GET's exact response Vary is bound to this body.
+        // A stale or failed metadata patch cannot make validators replayable.
+        "vary": [null],
+        "content_language": null,
     })
 }
 
@@ -678,30 +949,6 @@ pub(crate) async fn settle_content(
     etag: Option<&str>,
     last_modified: Option<&str>,
     body: Option<(Vec<u8>, bool)>,
-) -> Result<SettledContent, RuntimeError> {
-    settle_content_body(
-        runtime,
-        token,
-        url,
-        content_type,
-        status,
-        etag,
-        last_modified,
-        body.map(|(bytes, truncated)| ContentBody::Received(bytes, truncated)),
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn settle_content_body(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    url: &Url,
-    content_type: Option<&str>,
-    status: u16,
-    etag: Option<&str>,
-    last_modified: Option<&str>,
-    body: Option<ContentBody>,
 ) -> Result<SettledContent, RuntimeError> {
     let request_url = identity::request_url(url.clone());
     let canonical = identity::canonicalize(request_url.clone());
@@ -747,17 +994,12 @@ pub(crate) async fn settle_content_body(
     let no_body = body.is_none();
     let (typed_ref, bytes, truncated) = match body {
         None => (None, 0u64, false),
-        Some(ContentBody::Received(buffer, truncated)) => {
+        Some((buffer, truncated)) => {
             let store = crate::blob_store(runtime)?;
             let len = buffer.len() as u64;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             (Some(content_ref), len, truncated)
         }
-        Some(ContentBody::Stored {
-            content_ref,
-            bytes,
-            truncated,
-        }) => (Some(content_ref), bytes, truncated),
     };
     let content_ref = typed_ref.as_ref().map(ToString::to_string);
 
@@ -788,11 +1030,7 @@ pub(crate) async fn settle_content_body(
             bytes,
         )
         .await?;
-        // `content_ref` is a read-only projection of the content attachment.
-        // The entity returned by `patch` predates that attachment write, so
-        // bring its snapshot up to the settled body before the guarded
-        // negotiation patch compares it with the stored row.
-        entity.content_ref = content_ref.clone();
+        entity = entity_after_body_root(runtime, token, &entity, typed_ref.as_str()).await?;
     }
 
     Ok(SettledContent {
@@ -879,7 +1117,7 @@ pub(crate) async fn settle_with_request_headers(
         .await?;
         // HEAD cannot replace the request context of a cached GET body.
         if method_name == "GET" {
-            persist_negotiation_headers(runtime, token, &settled, request_headers).await?;
+            persist_get_context(runtime, token, &settled, request_headers, headers).await?;
         }
         if !entities_touched.contains(&settled.id) {
             entities_touched.push(settled.id);
@@ -915,7 +1153,7 @@ pub(crate) async fn settle_with_request_headers(
         "final_url": final_url.to_string(),
         "status": status,
         "headers": response_headers_json,
-        "request_headers": negotiation_headers(request_headers),
+        "request_headers": recorded_negotiation_headers(request_headers),
         "bytes": bytes,
         "truncated": truncated,
         "content_ref": content_ref,
@@ -1303,7 +1541,6 @@ mod tests {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
-            .gzip(true)
             .build()
             .expect("plain client builds")
     }
@@ -1948,10 +2185,10 @@ mod tests {
         assert_eq!(after.properties.unwrap(), head_properties);
     }
 
-    // arm 19: a gzip response whose decompressed size exceeds the byte
-    // bound stores truncated at exactly the bound.
+    // arm 19: a gzip response is refused by name; the compressed bytes never
+    // reach the caller, whatever the byte bound.
     #[tokio::test]
-    async fn arm19_gzip_response_truncates_after_decompression_to_the_bound() {
+    async fn arm19_gzip_response_is_refused_not_passed_through() {
         let plaintext = vec![b'z'; 10_000];
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         {
@@ -1964,7 +2201,6 @@ mod tests {
             "fixture must actually compress"
         );
 
-        let max_bytes = 100u64;
         let response = http_response(
             200,
             "OK",
@@ -1974,53 +2210,20 @@ mod tests {
         let (port, _hits) = spawn_once(response).await;
         let url = local_url(port, "/gz");
         let client = plain_client(Duration::from_secs(5));
-        let outcome = run_one_hop(
+        let error = run_one_hop(
             &client,
             &url,
             reqwest::Method::GET,
             &[],
-            max_bytes,
+            100,
             Instant::now() + Duration::from_secs(5),
         )
         .await
-        .expect("hop succeeds");
-        let (buffer, truncated) = outcome.body.clone().expect("GET body");
+        .expect_err("a content-encoded response must be refused");
         assert!(
-            truncated,
-            "decompressed body exceeds max_bytes and must truncate"
+            error.to_string().contains("unsupported_content_encoding"),
+            "{error}"
         );
-        assert_eq!(buffer.len() as u64, max_bytes);
-        assert!(buffer.iter().all(|&b| b == b'z'));
-
-        let (runtime, token, _dir) = test_runtime().await;
-        let reply = settle(
-            &runtime,
-            &token,
-            "GET",
-            &outcome.final_url,
-            outcome.status,
-            &outcome.headers,
-            Some((buffer.clone(), truncated)),
-            &[],
-            true,
-        )
-        .await
-        .expect("settle stores the truncated decompressed prefix");
-        assert_eq!(reply["truncated"], true);
-        assert_eq!(reply["bytes"], max_bytes);
-        let content_ref = reply["content_ref"].as_str().unwrap().to_string();
-        let store = crate::blob_store(&runtime).unwrap();
-        let content_ref_parsed = ContentRef::from_hex(&content_ref).unwrap();
-        let size = store
-            .size(&content_ref_parsed)
-            .await
-            .unwrap()
-            .expect("object exists");
-        assert!(
-            size <= max_bytes,
-            "stored object must be no larger than the bound"
-        );
-        assert_eq!(size, max_bytes);
     }
 
     // arm 21: a redirect whose second hop is outside the credential's host
@@ -2424,6 +2627,87 @@ mod tests {
             text.contains("accept: application/vnd.khive+json"),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn plain_and_pinned_clients_send_fixed_accept_encoding() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        let captured = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..6 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut buffer = [0; 1024];
+                    let count = stream.read(&mut buffer).await.expect("read request");
+                    assert!(count > 0 && bytes.len() < 16_384);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                requests.push(String::from_utf8(bytes).expect("ASCII request headers"));
+                stream
+                    .write_all(&http_response(200, "OK", &[], b""))
+                    .await
+                    .expect("respond");
+                stream.shutdown().await.expect("shutdown");
+            }
+            requests
+        });
+        let plain = plain_client(Duration::from_secs(5));
+        let pinned = egress::pinned_client(
+            "encoding.example",
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        )
+        .expect("pinned client builds");
+        for (client, url, method) in [
+            (&plain, local_url(port, "/plain"), reqwest::Method::GET),
+            (
+                &pinned,
+                Url::parse(&format!("http://encoding.example:{port}/pinned-get")).unwrap(),
+                reqwest::Method::GET,
+            ),
+            (
+                &pinned,
+                Url::parse(&format!("http://encoding.example:{port}/pinned-head")).unwrap(),
+                reqwest::Method::HEAD,
+            ),
+        ] {
+            // The built client alone offers no content coding ...
+            client
+                .request(method.clone(), url.clone())
+                .send()
+                .await
+                .expect("built client sends request");
+            // ... and the hop sends the fixed identity value, once.
+            run_one_hop(
+                client,
+                &url,
+                method,
+                &[],
+                1_000,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .expect("hop succeeds");
+        }
+        for (index, request) in captured
+            .await
+            .expect("captured requests")
+            .iter()
+            .enumerate()
+        {
+            let offered: Vec<&str> = request
+                .lines()
+                .filter(|line| line.to_ascii_lowercase().starts_with("accept-encoding:"))
+                .map(|line| line.split_once(':').unwrap().1.trim())
+                .collect();
+            let expected: &[&str] = if index % 2 == 0 { &[] } else { &["identity"] };
+            assert_eq!(
+                offered, expected,
+                "request {index} must offer no compression: {request}"
+            );
+        }
     }
 
     // The redirect hop cap refuses once already at the cap (the

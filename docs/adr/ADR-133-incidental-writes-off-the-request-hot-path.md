@@ -702,7 +702,7 @@ measured undercount over that redesign.
 
 ## Amendment 2 (2026-09-01): Extending Amendment 1's Verb Set to Operational Reads
 
-**Status**: Proposed.
+**Status**: Accepted (2026-09-28).
 
 Amendment 1's exception to D2 and D4/INV-1 was scoped to the eleven verbs on
 `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`. ADR-103 Amendment 4 extends that list with eight
@@ -729,6 +729,13 @@ The exception's enumerated verb set is authoritative in ADR-103 Amendment 4, whi
 the extended census test to assert list-to-enumeration equality and per-entry handler resolution —
 so a branch widening the constant without a signed amendment fails the census rather than widening
 this exception silently.
+
+As built (2026-09-28): the eight verbs' review was re-derived at `fe272269` with two instruments,
+recorded in ADR-103 Amendment 4, and all eight remain eligible. The list-to-enumeration equality
+this paragraph relies on is superseded: the allowlist is the census-tested set of
+`(owning pack, verb)` pairs, 61 entries at `fe272269`, guarded by
+`admission_degrade_safe_assertive_census_matches_live_pack_sources`
+(`crates/khive-runtime/src/pack.rs:6064`). The exception's rules above are unchanged.
 
 ## Amendment 3 (2026-09-08): The obligation error carries the domain disposition, and a post-dispatch obligation error is never retry permission
 

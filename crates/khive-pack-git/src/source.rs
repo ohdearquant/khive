@@ -10,7 +10,7 @@
 //! `git.digest` call used.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// A digest source, resolved from the `git.digest` verb's `source` argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,13 +387,21 @@ pub(crate) fn redact_repo_url(url: &str) -> String {
 async fn local_origin_remote_url(canonical_repo_path: &Path) -> Option<String> {
     let path = canonical_repo_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let out = Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(&path)
             .args(["remote", "get-url", "origin"])
             .env("GIT_TERMINAL_PROMPT", "0")
-            .output()
-            .ok()?;
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let out = khive_runtime::process_retry::spawn_retrying_executable_busy(
+            &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
+            || command.spawn(),
+        )
+        .and_then(|child| child.wait_with_output())
+        .ok()?;
         if !out.status.success() {
             return None;
         }

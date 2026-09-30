@@ -144,6 +144,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-116](ADR-116-memory-ann-generation-coherence.md)                   | Durable Per-Model Generation Coherence for the Memory ANN Warm Path                                        |
 | [ADR-117](ADR-117-session-continuity-search.md)                         | Session Continuity — Cross-Session Search and Remote Ingestion                                             |
 | [ADR-117a](ADR-117a-session-identity-tenant-isolation.md)               | Session Identity and Tenant Isolation                                                                      |
+| [ADR-117b](ADR-117b-session-deletion-retention.md)                      | Session Mirror Deletion and Storage-Cap Retention                                                          |
 | [ADR-118](ADR-118-fresh-tail-recall-visibility.md)                      | Fresh-Tail Exact Leg — Read-Your-Writes Visibility for Vector Recall                                       |
 | [ADR-119](ADR-119-daemon-component-supervision.md)                      | Host-Supervised Daemon Components Beside the Verb Plane                                                    |
 | [ADR-120](ADR-120-khive-flow-control-flow-envelope.md)                  | Khive Flow — A Bounded Control-Flow Envelope in the Request DSL                                            |
@@ -222,6 +223,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-193](ADR-193-charter-runs.md)                                      | Charter Runs — Procedural Actions Admitted Only on Recorded Evidence                                       |
 | [ADR-194](ADR-194-sqlite-wal-extent-ceiling.md)                         | Bounded SQLite WAL Extent Ceiling Under a Pinned Reader                                                    |
 | [ADR-195](ADR-195-comm-actor-trust-classes.md)                          | Actor Trust Classes and Per-Pair Message Policy for comm                                                   |
+| [ADR-196](ADR-196-located-in-relation.md)                               | The `located_in` Relation                                                                                  |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -239,8 +241,8 @@ Supporting documents are exhibits cited by an ADR. They are not ADRs, carry no A
 ## Closed Taxonomies — Quick Reference
 
 - **Entity kinds**: 8 shared base kinds in `khive_types` (`concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`) plus KG pack-side `resource` governance for actionable knowledge resources (ADR-001, ADR-048)
-- **Edge relations (17 in 9 categories)** (ADR-002, extended by ADR-055):
-  - Structure: `contains`, `part_of`, `instance_of`
+- **Edge relations (19 in 9 categories)** (ADR-002, extended by ADR-055, ADR-191 and ADR-196):
+  - Structure: `contains`, `part_of`, `instance_of`, `links_to`, `located_in`
   - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
   - Provenance: `derived_from`
   - Temporal: `precedes`
@@ -276,7 +278,6 @@ Amendments to accepted records:
 - [ADR-061 Amendment 1](ADR-061-pack-extensible-by-id-resolution.md#amendment-1-unsupported-generic-mutation-of-pack-private-records) (2026-09-14): unsupported generic mutation of pack-private records.
 - [ADR-087 Amendment 1](ADR-087-workspace-mirror.md#amendment-1-2026-07-15-self-standing-content-convention-blob-backed-binaries-durability-separation) (2026-07-15): self-standing content convention, blob-backed binaries, durability separation.
 - [ADR-088 Amendment 1, operational rider](ADR-088-amendment-1-git-digest.md#proposed-operational-rider-persisted-cursor-inspection-2026-09-10) (2026-09-10): persisted cursor inspection. Its heading marks it Proposed; it has no separate status line.
-- [ADR-103 Amendment 4](ADR-103-resource-attribution-model.md#amendment-4-2026-09-01-extending-the-admission-degrade-allowlist-to-operational-read-verbs) (2026-09-01): extending the admission-degrade allowlist to operational read verbs.
 - [ADR-104 Amendment 1](ADR-104-posterior-serving-recall.md#amendment-1-2026-07-12-prior-preserving-evidence-decay-for-per-entity-posteriors) (2026-07-12): prior-preserving evidence decay for per-entity posteriors.
 - [ADR-105 Appendix A](ADR-105-cross-node-comm-transport.md#appendix-a-2026-09-23----node-wire-protocol-version-1) (2026-09-23): node wire protocol, version 1, proposed as part of the 2026-09-14 amendment.
 - [ADR-119 Amendment 6](ADR-119-daemon-component-supervision.md#amendment-6-cancellation-during-inbound-transport-reads-2026-09-14) (2026-09-14): cancellation during inbound transport reads.
@@ -286,6 +287,6 @@ Amendments to accepted records:
 
 Amendments inside records whose own status is Proposed:
 
-- [ADR-133 Amendment 2](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-2-2026-09-01-extending-amendment-1s-verb-set-to-operational-reads) (2026-09-01) and [Amendment 3](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-3-2026-09-08-the-obligation-error-carries-the-domain-disposition-and-a-post-dispatch-obligation-error-is-never-retry-permission) (2026-09-08).
+- [ADR-133 Amendment 3](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-3-2026-09-08-the-obligation-error-carries-the-domain-disposition-and-a-post-dispatch-obligation-error-is-never-retry-permission) (2026-09-08).
 - [ADR-137 Amendment 1](ADR-137-tailnet-wire-transport.md#amendment-1-wire-contract-closure-before-the-first-consumer): wire-contract closure before the first consumer.
 - [ADR-172 Amendment 2](ADR-172-versioned-notes-compare-and-set.md#amendment-2-2026-09-08-a-head-note-kind-for-keyed-documents-the-document-kind-as-a-tag-embed-and-the-in-transaction-arm) (2026-09-08), [Amendment 3](ADR-172-versioned-notes-compare-and-set.md#amendment-3-2026-09-09-ordered-fence-lists) (2026-09-09), [Amendment 4](ADR-172-versioned-notes-compare-and-set.md#amendment-4-2026-09-11-absence-as-a-fence-predicate) (2026-09-11) and [Amendment 5](ADR-172-versioned-notes-compare-and-set.md#amendment-5-2026-09-14-an-accepted-fenced-write-always-mints-a-version-the-no-op-answer-is-for-unfenced-updates-only) (2026-09-14).
