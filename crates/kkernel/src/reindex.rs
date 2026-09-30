@@ -28,7 +28,7 @@ use khive_storage::error::StorageError;
 use khive_storage::note::Note;
 use khive_storage::types::VectorRecord;
 use khive_storage::VectorStore;
-use khive_types::SubstrateKind;
+use khive_types::{Pack, SubstrateKind};
 
 // ─── progress bar ─────────────────────────────────────────────────────────────
 
@@ -152,8 +152,9 @@ pub struct ReindexArgs {
     #[arg(long = "config", env = "KHIVE_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// Embedding model for entities/notes. When omitted, fans out to ALL
-    /// registered models. (Knowledge always uses the default embedder.)
+    /// Embedding model for entities/notes. When omitted, entities use all
+    /// registered models and notes use their kind's embedding policy.
+    /// Knowledge always uses the default embedder.
     #[arg(long)]
     pub model: Option<String>,
 
@@ -553,8 +554,8 @@ async fn filter_unembedded(
     }
 }
 
-/// Re-embed entities, notes, and the knowledge corpus, fanning out across every
-/// configured embedding engine. Engines, db path, and config are resolved with
+/// Re-embed entities, notes, and the knowledge corpus using each substrate's
+/// embedding policy. Engines, db path, and config are resolved with
 /// the same precedence as `kkernel mcp` so reindex writes the SAME vectors the
 /// MCP server serves recall from. Fails closed on any partial failure unless
 /// `--best-effort` is set.
@@ -596,6 +597,13 @@ async fn run_reindex_with_setup(
     let resolved_ns = cfg.default_namespace.clone();
     let rt = open_validated_reindex_backend(cfg, validated_target.as_ref())?;
     runtime_setup(&rt)?;
+    // Reindex does not construct a verb registry, so install the comm pack's
+    // declared policy on this runtime just as MCP boot does for selected packs.
+    if rt.config().packs.iter().any(|pack| pack == "comm") {
+        rt.install_note_embedding_policies(
+            <khive_pack_comm::CommPack as Pack>::NOTE_EMBEDDING_POLICIES,
+        );
+    }
     let token = rt
         .authorize(resolved_ns)
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -609,9 +617,8 @@ async fn run_reindex_with_setup(
 
     let rebuild_fts = args.rebuild_fts;
 
-    // Explicit --model targets a single engine; otherwise fan out to ALL
-    // registered engines, matching the runtime's multi-model write path so a
-    // reindex reproduces exactly what create/update would have embedded.
+    // Explicit --model targets a single engine; otherwise entities fan out to
+    // all registered engines and notes follow their kind's installed policy.
     // Only needed for the entity/note pass (knowledge uses the default embedder).
     //
     // When no embedding model is configured, model_names is empty: the embedding
@@ -735,18 +742,27 @@ async fn run_reindex_with_setup(
                     .filter(|note| note_has_embedding_text(note))
                     .count()
             } else {
-                let mut staged = Vec::with_capacity(n);
+                let mut staged_by_kind: BTreeMap<String, Vec<(Uuid, String)>> = BTreeMap::new();
                 for note in &batch {
                     if note_has_embedding_text(note) {
-                        staged.push((note.id, note_embedding_text(note)));
+                        staged_by_kind
+                            .entry(note.kind.clone())
+                            .or_default()
+                            .push((note.id, note_embedding_text(note)));
                     }
                 }
 
-                if !staged.is_empty() {
+                let embeddable = staged_by_kind.values().map(Vec::len).sum();
+                for (kind, staged) in staged_by_kind {
+                    let eligible_models = if args.model.as_deref().is_some_and(|s| !s.is_empty()) {
+                        model_names.clone()
+                    } else {
+                        rt.embedding_models_for_note_kind(&kind)
+                    };
                     errors_skipped += embed_and_store_batch(
                         &rt,
                         &token,
-                        &model_names,
+                        &eligible_models,
                         &ns_str,
                         &staged,
                         SubstrateKind::Note,
@@ -756,7 +772,7 @@ async fn run_reindex_with_setup(
                     )
                     .await;
                 }
-                staged.len()
+                embeddable
             };
             notes_processed += embeddable as u64;
 
@@ -1525,6 +1541,116 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn reindex_respects_message_policy_and_explicit_model_override() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().expect("reindex fixture");
+        let db_path = dir.path().join("reindex.db");
+        let config = dir.path().join("khive.toml");
+        std::fs::write(
+            &config,
+            r#"
+[[engines]]
+name = "primary"
+model = "bge-small-en-v1.5"
+default = true
+
+[[engines]]
+name = "secondary"
+model = "paraphrase"
+default = false
+"#,
+        )
+        .expect("write two-engine config");
+
+        let resolve_config = |no_embed| {
+            resolve_runtime_config(RuntimeConfigInputs {
+                db: db_path.to_str(),
+                config: Some(&config),
+                namespace: Namespace::local(),
+                namespace_explicit: true,
+                actor_explicit: false,
+                no_embed,
+                packs: None,
+                brain_profile: None,
+            })
+            .expect("resolve reindex config")
+        };
+
+        let (message_id, observation_id) = {
+            let rt = KhiveRuntime::new(resolve_config(true)).expect("seed runtime");
+            let token = rt.authorize(Namespace::local()).expect("authorize");
+            let notes = rt.notes(&token).expect("note store");
+            let message = Note::new("local", "message", "message body for reindex");
+            let observation = Note::new("local", "observation", "observation body for reindex");
+            let ids = (message.id, observation.id);
+            notes.upsert_note(message).await.expect("seed message");
+            notes
+                .upsert_note(observation)
+                .await
+                .expect("seed observation");
+            ids
+        };
+
+        let args = |model: Option<String>| ReindexArgs {
+            db: Some(db_path.to_str().unwrap().to_owned()),
+            config: Some(config.clone()),
+            model,
+            batch_size: 100,
+            keep_existing: true,
+            namespace: Some("local".into()),
+            knowledge_only: false,
+            no_knowledge: true,
+            best_effort: false,
+            no_sections: false,
+            sections_only: false,
+            rebuild_fts: false,
+            human: false,
+        };
+
+        run_reindex_offline(args(None))
+            .await
+            .expect("policy-based reindex");
+
+        let rt = KhiveRuntime::new(resolve_config(false)).expect("verify runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let primary = rt.default_embedder_name().to_owned();
+        let secondary = rt
+            .registered_embedding_model_names()
+            .into_iter()
+            .find(|model| model != &primary)
+            .expect("secondary model");
+        let primary_rows = rt
+            .vectors_for_model(&token, &primary)
+            .expect("primary vectors")
+            .batch_exists(&[message_id, observation_id], "local")
+            .await
+            .expect("primary rows");
+        assert!(primary_rows.contains(&message_id));
+        assert!(primary_rows.contains(&observation_id));
+        let secondary_vectors = rt
+            .vectors_for_model(&token, &secondary)
+            .expect("secondary vectors");
+        let secondary_rows = secondary_vectors
+            .batch_exists(&[message_id, observation_id], "local")
+            .await
+            .expect("secondary rows");
+        assert!(!secondary_rows.contains(&message_id));
+        assert!(secondary_rows.contains(&observation_id));
+
+        run_reindex_offline(args(Some(secondary.clone())))
+            .await
+            .expect("explicit model reindex");
+        let overridden_rows = secondary_vectors
+            .batch_exists(&[message_id], "local")
+            .await
+            .expect("secondary rows after override");
+        assert!(overridden_rows.contains(&message_id));
     }
 
     fn write_empty_test_config(dir: &std::path::Path) -> PathBuf {

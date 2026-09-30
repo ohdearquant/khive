@@ -1,5 +1,5 @@
 //! Atomic multi-note write primitive: commits a set of notes — each with its
-//! FTS document and every registered embedding model's vector row — in ONE
+//! FTS document and its kind-selected embedding model rows — in ONE
 //! writer transaction, instead of one `create_note` call per note.
 //!
 //! Built for `khive-pack-comm`'s `dual_write_message` (outbound + inbound
@@ -14,7 +14,7 @@
 //! # Embed-first
 //!
 //! Embedding is slow compute (network/model calls). Every distinct content's
-//! embeddings, across every registered model, are computed **before** any
+//! embeddings, across the selected models, are computed **before** any
 //! transaction opens — the writer is held only for synchronous DML, exactly
 //! like the rest of the ADR-099 atomic-unit machinery
 //! (`atomic_plan`/`atomic_runner`).
@@ -408,7 +408,7 @@ pub(crate) async fn prepare_atomic_note_requests(
             runtime.resolve_embedding_model(Some(model))?;
             vec![model.to_owned()]
         } else {
-            runtime.registered_embedding_model_names()
+            runtime.embedding_models_for_note_kind(request.spec.kind)
         };
         let mut indices = Vec::with_capacity(models.len());
         for model in models {

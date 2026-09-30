@@ -75,6 +75,14 @@ fn fixture() -> String {
     .join("\n")
 }
 
+fn warning_record() -> Value {
+    fixture()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("fixture line"))
+        .find(|record| record["message"]["code"]["code"] == "clippy::needless_borrow")
+        .expect("warning record")
+}
+
 fn provenance() -> ClippyProvenance<'static> {
     ClippyProvenance {
         repo: "example",
@@ -183,6 +191,102 @@ fn fingerprint_survives_unrelated_lines_added_elsewhere() {
     let replay = ingest_clippy_json_lines(fixture.as_bytes(), provenance(), options())
         .expect("exact replay");
     assert_eq!(first.notes[0].id, replay.notes[0].id);
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_backslash_filename_does_not_alias_slash_path() {
+    let mut backslash = warning_record();
+    backslash["message"]["spans"][0]["file_name"] = json!(r"src/a\b.rs");
+    let mut slash = warning_record();
+    slash["message"]["spans"][0]["file_name"] = json!("src/a/b.rs");
+    let input = [backslash.to_string(), slash.to_string()].join("\n");
+
+    let batch = ingest_clippy_json_lines(input.as_bytes(), provenance(), options())
+        .expect("distinct Unix filenames");
+    assert_eq!(batch.notes.len(), 2);
+    assert_eq!(
+        properties(&batch.notes[0])["evidence"][0]["path"],
+        r"src/a\b.rs"
+    );
+    assert_eq!(
+        properties(&batch.notes[1])["evidence"][0]["path"],
+        "src/a/b.rs"
+    );
+    assert_ne!(
+        properties(&batch.notes[0])["finding_id"],
+        properties(&batch.notes[1])["finding_id"]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_backslash_separator_normalizes_to_slash() {
+    let mut record = warning_record();
+    record["message"]["spans"][0]["file_name"] = json!(r"src\a\b.rs");
+    let batch = ingest_clippy_json_lines(record.to_string().as_bytes(), provenance(), options())
+        .expect("Windows native separators");
+    assert_eq!(batch.notes.len(), 1);
+    assert_eq!(
+        properties(&batch.notes[0])["evidence"][0]["path"],
+        "src/a/b.rs"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_drive_relative_and_stream_paths_are_refused() {
+    for path in ["C:../outside.rs", "C:foo.rs", r"src\lib.rs:stream"] {
+        let mut record = warning_record();
+        record["message"]["spans"][0]["file_name"] = json!(path);
+        let error =
+            ingest_clippy_json_lines(record.to_string().as_bytes(), provenance(), options())
+                .expect_err("Windows colon path must be refused");
+        assert!(
+            error.to_string().contains("relative repository path"),
+            "{path}: {error}"
+        );
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unix_colon_filename_is_preserved() {
+    let mut record = warning_record();
+    record["message"]["spans"][0]["file_name"] = json!("src/a:b.rs");
+    let batch = ingest_clippy_json_lines(record.to_string().as_bytes(), provenance(), options())
+        .expect("colon is legal in a Unix filename");
+    assert_eq!(
+        properties(&batch.notes[0])["evidence"][0]["path"],
+        "src/a:b.rs"
+    );
+}
+
+#[test]
+fn repeated_lint_occurrences_get_distinct_order_independent_fingerprints() {
+    let first = warning_record();
+    let mut later = first.clone();
+    later["message"]["spans"][0]["line_start"] = json!(44);
+    later["message"]["spans"][0]["line_end"] = json!(44);
+    let input = [first.to_string(), later.to_string(), first.to_string()].join("\n");
+    let batch = ingest_clippy_json_lines(input.as_bytes(), provenance(), options())
+        .expect("repeated lint positions");
+    assert_eq!(
+        batch.notes.len(),
+        2,
+        "exact duplicate records still collapse"
+    );
+    let first_id = &properties(&batch.notes[0])["finding_id"];
+    let later_id = &properties(&batch.notes[1])["finding_id"];
+    assert_ne!(first_id, later_id);
+    assert_eq!(properties(&batch.notes[0])["evidence"][0]["line"], 12);
+    assert_eq!(properties(&batch.notes[1])["evidence"][0]["line"], 44);
+
+    let reversed = [later.to_string(), first.to_string()].join("\n");
+    let reversed = ingest_clippy_json_lines(reversed.as_bytes(), provenance(), options())
+        .expect("reordered lint records");
+    assert_eq!(&properties(&reversed.notes[0])["finding_id"], later_id);
+    assert_eq!(&properties(&reversed.notes[1])["finding_id"], first_id);
 }
 
 #[test]
