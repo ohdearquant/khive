@@ -10,10 +10,11 @@ mod extract;
 mod fetch;
 #[cfg(test)]
 mod fhcrc_probe_tests;
-mod identity;
+pub mod identity;
 mod ingest;
 mod namespace;
 mod pack;
+pub mod producer;
 mod receipt;
 mod refresh;
 mod search;
