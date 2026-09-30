@@ -1173,12 +1173,15 @@ upload that was progressing normally is lost.
    `KHIVE_BLOB_UPLOAD_IDLE_SECS`, default 3600 seconds (`uploads.rs:56`). The sweeper ticks every
    `KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS`, default 600 seconds, and its first tick comes one interval after
    daemon start (`uploads.rs:57`, `crates/khive-mcp/src/components.rs:172-192`). The bind and the orphan
-   collector never remove a staged file. A root holding an abandoned upload younger than the bound refuses
-   the bind on that boot, and the first boot after the sweeper has removed the file can bind it. The
-   expiry pass itself is not yet limited to abandoned uploads: `sweep_uploads` removes any id-named file
-   older than the sweeping process's own bound with no owner check (`blob_uploads.rs:385-447`), so on a
-   root shared by two daemons with different bounds it can remove the other daemon's open upload, a gap
-   this amendment does not close and #3643 tracks.
+   collector never remove a staged file. A root holding an abandoned upload that the expiry path has not yet
+   removed refuses the bind on that boot, and the first boot after the expiry path has removed the file can
+   bind it. The expiry pass described above is not yet limited to abandoned uploads: `sweep_uploads` removes
+   any id-named file older than the sweeping process's own bound with no owner check
+   (`blob_uploads.rs:385-447`), so on a root shared by two daemons with different bounds it can remove the
+   other daemon's open upload. This amendment does not close that gap. [ADR-173](ADR-173-blob-chunked-upload.md)
+   Amendment 1 specifies the fix, per-upload leases that each sweeper times on its own clock, and #3643
+   tracks its implementation. Once that amendment is in force, its lease rule is the expiry rule this
+   clause refers to and takes precedence over the modification-time comparison described here.
 4. **An upload begin cannot land inside the bind.** Item 8 says the emptiness check runs "under database GC
    ownership and the root write lock". That sentence keeps the check itself apart from any upload begin,
    because `begin_upload` takes the root write lock: the store's per-root mutex and the
@@ -1209,10 +1212,15 @@ emptiness check fails the one-object control" stands, and entry (a) is its count
   staged file keeps its bytes and modification time, and the upload accepts its next part and commits, with
   `blob.get` returning the whole object. A mutant whose emptiness check skips `.uploads` binds the root and
   fails this entry.
-- **(b) Abandoned upload control.** The same root, with the staged file aged past
-  `KHIVE_BLOB_UPLOAD_IDLE_SECS` and no live upload record, refuses the bind on one boot and leaves the file
-  in place. One expiry pass removes the file. The next boot binds the root with the pending ID, verified
-  marker and single completing transaction that Amendment 1's empty-root entry requires.
+- **(b) Abandoned upload control.** The same root, holding a staged file whose upload has no live record in
+  any daemon, refuses the bind on every boot while the file is present and leaves the file in place. The
+  bind never removes the file; the upload expiry path does, under the expiry rule clause 3 names for the root: today
+  its modification time compared with `KHIVE_BLOB_UPLOAD_IDLE_SECS`, and once
+  [ADR-173](ADR-173-blob-chunked-upload.md) Amendment 1 is in force, that amendment's lease rule. This entry
+  does not fix when the file expires. The first boot after the expiry path has removed it binds the root
+  with the pending ID, verified marker and single completing transaction that the empty-root entry of this
+  record's Amendment 1 requires. A bind that removes the staged file to make the root empty fails this
+  entry.
 - **(c) Sweeps leave open uploads alone.** On a bound root with one open upload, a transactional sweep in
   dry-run mode and another in live mode each leave the staged file with its bytes and modification time,
   count it in no counter, and the upload then commits. The test
