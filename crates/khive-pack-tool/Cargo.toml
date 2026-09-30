@@ -28,5 +28,7 @@ blake3 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["fault-injection"] }
 khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
-khive-db = { version = "0.9.0", path = "../khive-db" }
+khive-db = { version = "0.9.0", path = "../khive-db", features = ["test-support"] }
 khive-gate = { version = "0.9.0", path = "../khive-gate" }
+tempfile = { workspace = true }
+serial_test = { workspace = true }
