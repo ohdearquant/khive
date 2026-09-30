@@ -234,6 +234,23 @@ fn channel_loop_plan(server: &KhiveMcpServer, args: &Args) -> crate::server::Cha
     }
 }
 
+/// Name the reason inbound polling was refused when the comm runtime is
+/// writable but the blob pack's runtime is not. Comm's own read-only refusal is
+/// reported by the callers' skip line; this is the blob counterpart.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn log_inbound_refused_for_read_only_blob(
+    channel_kind: &str,
+    admission: crate::server::ChannelLoopAdmission,
+) {
+    if admission.inbound_blocked_by_read_only_blob {
+        tracing::error!(
+            channel = channel_kind,
+            "{channel_kind} inbound polling not started: the blob pack runtime is read-only, so \
+             quarantined originals cannot be stored; assign the blob pack a writable backend"
+        );
+    }
+}
+
 /// Handle for the ADR-091 Amendment 2 Plank A session sweep task. Dropping
 /// the sender alone is NOT a sufficient shutdown contract (minor, ADR-091
 /// Amendment 2): the sweep task's own clean-shutdown heartbeat
@@ -379,6 +396,7 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
         tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
         return;
     }
+    log_inbound_refused_for_read_only_blob("email", admission);
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
             "email channel loops: skipped (assigned comm runtime does not admit writes)"
@@ -763,6 +781,7 @@ async fn ensure_channel_quarantine_storage(
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
 async fn quarantine_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -771,6 +790,7 @@ async fn quarantine_channel_ingest_failure(
     default_inbound_actor: Option<&str>,
     envelope: &khive_channel::ChannelEnvelope,
     classification: khive_runtime::ChannelIngestFailureClass,
+    retention_limit: Option<usize>,
 ) -> Result<(), khive_runtime::RuntimeError> {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
@@ -787,17 +807,39 @@ async fn quarantine_channel_ingest_failure(
         .map(|replay| (replay.bytes.as_slice(), replay.notification_to.as_str()))
         .unwrap_or_else(|| (envelope.content.as_bytes(), envelope.to.as_str()));
 
-    let put = registry
-        .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
-        .await?;
-    let content_ref = put
-        .get("content_ref")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            khive_runtime::RuntimeError::Internal(
-                "blob.put returned no string content_ref for channel quarantine".to_string(),
-            )
-        })?;
+    // The same retention bound as the poller's own quarantine path: past it
+    // the message is still recorded, without its original bytes. An error
+    // reading the count holds progress through the caller.
+    let content_ref = if quarantine_original_may_be_retained(
+        registry,
+        ingest_namespace,
+        retention_limit,
+    )
+    .await?
+    {
+        let put = registry
+            .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
+            .await?;
+        Some(
+            put.get("content_ref")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    khive_runtime::RuntimeError::Internal(
+                        "blob.put returned no string content_ref for channel quarantine"
+                            .to_string(),
+                    )
+                })?
+                .to_string(),
+        )
+    } else {
+        tracing::warn!(
+            channel = channel_kind,
+            external_id,
+            limit = retention_limit,
+            "quarantine retention limit reached; recording the refused message without its original bytes"
+        );
+        None
+    };
 
     // Quarantine sender prefix invariant: the sender retains the originating
     // channel prefix because prefix-keyed consumers depend on it for alert
@@ -808,22 +850,33 @@ async fn quarantine_channel_ingest_failure(
         "quarantine sender prefix invariant: prefix-keyed consumers require the channel prefix"
     );
 
+    let mut metadata = json!({
+        "quarantined": "true",
+        "quarantine_classification": classification.name(),
+        "quarantine_reason": classification.reason(),
+        "quarantine_external_id": external_id,
+    });
+    let content = match &content_ref {
+        Some(content_ref) => {
+            metadata["quarantine_content_ref"] = json!(content_ref);
+            "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference."
+        }
+        None => {
+            metadata["quarantine_original_retained"] = json!("false");
+            metadata["quarantine_original_not_retained_reason"] = json!("retention-limit");
+            "Inbound channel message quarantined. Its original bytes were not stored because the quarantine retention limit was reached."
+        }
+    };
     let mut params = json!({
         "namespace": ingest_namespace,
         "from": quarantine_sender,
         "to": notification_to,
-        "content": "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference.",
+        "content": content,
         "channel_kind": channel_kind,
         "channel_slug": channel_slug,
         "external_id": external_id,
         "correlation_external_id": envelope.correlation_external_id.clone(),
-        "metadata": {
-            "quarantined": "true",
-            "quarantine_classification": classification.name(),
-            "quarantine_reason": classification.reason(),
-            "quarantine_external_id": external_id,
-            "quarantine_content_ref": content_ref,
-        },
+        "metadata": metadata,
     });
     if let Some(actor) = default_inbound_actor {
         params["default_inbound_actor"] = json!(actor);
@@ -834,6 +887,7 @@ async fn quarantine_channel_ingest_failure(
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
 async fn handle_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -842,6 +896,7 @@ async fn handle_channel_ingest_failure(
     envelope: &khive_channel::ChannelEnvelope,
     error: &khive_runtime::RuntimeError,
     unknown_attempts: &mut std::collections::HashMap<String, u8>,
+    retention_limit: Option<usize>,
 ) -> bool {
     let (channel_kind, channel_slug) = channel;
     let classification = error.channel_ingest_failure_class();
@@ -872,6 +927,7 @@ async fn handle_channel_ingest_failure(
                 default_inbound_actor,
                 envelope,
                 classification,
+                retention_limit,
             )
             .await
             {
@@ -957,6 +1013,41 @@ async fn channel_cycle_wait(
     }
 }
 
+/// Whether one more quarantined original may be stored before it is published.
+///
+/// The bound is the number of live quarantine records in the ingest namespace
+/// (`comm.health`'s `quarantined_count`), so it survives restarts and shrinks
+/// as expired records are cleaned up. Records stored without an original count
+/// too, which keeps the bound conservative. `None` applies no bound.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn quarantine_original_may_be_retained(
+    registry: &khive_runtime::VerbRegistry,
+    ingest_namespace: &str,
+    limit: Option<usize>,
+) -> Result<bool, khive_runtime::RuntimeError> {
+    let Some(limit) = limit else {
+        return Ok(true);
+    };
+    if limit == 0 {
+        return Ok(false);
+    }
+    let health = registry
+        .dispatch(
+            "comm.health",
+            serde_json::json!({"namespace": ingest_namespace}),
+        )
+        .await?;
+    let live = health
+        .get("quarantined_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            khive_runtime::RuntimeError::Internal(
+                "comm.health returned no numeric quarantined_count".to_string(),
+            )
+        })?;
+    Ok(live < limit as u64)
+}
+
 /// Background task that polls all registered channels every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
@@ -980,6 +1071,7 @@ async fn channel_poll_loop(
     default_inbound_actor: String,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    use base64::Engine as _;
     use chrono::{DateTime, Utc};
     use khive_channel_email::{is_backoff_eligible, ImapBackoff};
     use serde_json::json;
@@ -1168,6 +1260,92 @@ async fn channel_poll_loop(
                         .collect();
                     let mut page_fully_ingested = true;
                     for env in page.envelopes {
+                        let mut metadata = env.metadata.clone();
+                        if kind == "email"
+                            && metadata.get("quarantined").map(String::as_str) == Some("true")
+                        {
+                            let Some(replay) = env.quarantine_replay.as_ref() else {
+                                tracing::warn!(
+                                    channel = kind,
+                                    external_id = env.external_id.as_deref(),
+                                    "quarantined email has no original-byte replay; holding channel progress"
+                                );
+                                page_fully_ingested = false;
+                                continue;
+                            };
+                            let retain_original = match quarantine_original_may_be_retained(
+                                &registry,
+                                &ingest_namespace,
+                                channel.quarantine_retention_limit(),
+                            )
+                            .await
+                            {
+                                Ok(retain) => retain,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        channel = kind,
+                                        external_id = env.external_id.as_deref(),
+                                        %error,
+                                        "could not read the retained quarantine count; holding channel progress"
+                                    );
+                                    page_fully_ingested = false;
+                                    continue;
+                                }
+                            };
+                            if !retain_original {
+                                tracing::warn!(
+                                    channel = kind,
+                                    external_id = env.external_id.as_deref(),
+                                    limit = channel.quarantine_retention_limit(),
+                                    "quarantine retention limit reached; recording the message without its original bytes"
+                                );
+                                metadata.insert(
+                                    "quarantine_original_retained".to_string(),
+                                    "false".to_string(),
+                                );
+                                metadata.insert(
+                                    "quarantine_original_not_retained_reason".to_string(),
+                                    "retention-limit".to_string(),
+                                );
+                            } else {
+                                let put = registry
+                                    .dispatch(
+                                        "blob.put",
+                                        json!({
+                                            "bytes": base64::engine::general_purpose::STANDARD
+                                                .encode(&replay.bytes)
+                                        }),
+                                    )
+                                    .await;
+                                let content_ref = match put {
+                                    Ok(result) => {
+                                        match result.get("content_ref").and_then(|v| v.as_str()) {
+                                            Some(content_ref) => content_ref.to_string(),
+                                            None => {
+                                                tracing::warn!(
+                                            channel = kind,
+                                            external_id = env.external_id.as_deref(),
+                                            "blob.put returned no quarantine content reference; holding channel progress"
+                                        );
+                                                page_fully_ingested = false;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            channel = kind,
+                                            external_id = env.external_id.as_deref(),
+                                            %error,
+                                            "failed to publish quarantined email original; holding channel progress"
+                                        );
+                                        page_fully_ingested = false;
+                                        continue;
+                                    }
+                                };
+                                metadata.insert("quarantine_content_ref".to_string(), content_ref);
+                            }
+                        }
                         let params = json!({
                             "namespace": ingest_namespace,
                             "from": env.from.clone(),
@@ -1183,7 +1361,7 @@ async fn channel_poll_loop(
                             "default_inbound_actor": default_inbound_actor,
                             "wire_message_id": env.wire_message_id.clone(),
                             "wire_references": env.wire_references.clone(),
-                            "metadata": env.metadata.clone(),
+                            "metadata": metadata,
                         });
                         if let Err(error) = registry.dispatch("comm.ingest", params).await {
                             let handled = handle_channel_ingest_failure(
@@ -1194,6 +1372,7 @@ async fn channel_poll_loop(
                                 &env,
                                 &error,
                                 &mut unknown_ingest_attempts,
+                                channel.quarantine_retention_limit(),
                             )
                             .await;
                             if !handled {
@@ -1770,6 +1949,7 @@ fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) 
         tracing::info!("telegram channel loops: skipped (client role; daemon owns channel loops)");
         return;
     }
+    log_inbound_refused_for_read_only_blob("telegram", admission);
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
             "telegram channel loops: skipped (assigned comm runtime does not admit writes)"
@@ -2006,6 +2186,8 @@ async fn telegram_poll_loop(
                             &env,
                             &error,
                             &mut unknown_ingest_attempts,
+                            // The Telegram adapter declares no retention bound.
+                            None,
                         )
                         .await;
                         if !handled {
@@ -4149,6 +4331,7 @@ pub fn build_server_from_multi_backend_registry(
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let channel_loop_admission = crate::server::ChannelLoopAdmission::for_pack_runtimes(
         multi.per_pack_runtimes.get("comm").map(Arc::as_ref),
+        multi.per_pack_runtimes.get("blob").map(Arc::as_ref),
     );
     // The delivery loops scan, claim, and mark outbound `message` notes, so
     // they must hold the runtime that owns comm's rows — under a
@@ -9940,6 +10123,91 @@ region = "us-east-1"
         );
     }
 
+    /// The server built from a multi-backend registry reads admission from the
+    /// blob pack's own runtime: comm on a writable backend and blob on a
+    /// read-only one must not poll, and must still deliver outbound mail.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[tokio::test]
+    #[serial]
+    #[serial(config_ledger)]
+    async fn mixed_topology_refuses_inbound_polling_when_the_blob_backend_is_read_only() {
+        use clap::Parser;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-blob-admission.db");
+        let blob_path = dir.path().join("blob-admission.db");
+        let blob_root = dir.path().join("blob-objects");
+        let config_for = |blob_read_only: bool| KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                    wal_ceiling_bytes: None,
+                },
+                BackendConfig {
+                    name: "blob-store".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(blob_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: blob_read_only,
+                    wal_ceiling_bytes: None,
+                },
+            ],
+            packs: HashMap::from([(
+                "blob".to_string(),
+                PackConfig {
+                    backend: "blob-store".to_string(),
+                    no_embed: false,
+                },
+            )]),
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.to_string_lossy().into_owned()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let base_config = || {
+            let mut config = base_runtime_config_for_multi_backend();
+            config.packs = vec!["kg".to_string(), "comm".to_string(), "blob".to_string()];
+            config
+        };
+
+        let seeded =
+            build_registry_for_multi_backend_inner(base_config(), &config_for(false), None)
+                .await
+                .expect("seed exact-current snapshots");
+        drop(seeded);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&blob_path);
+        let daemon = Args::parse_from(["mcp", "--daemon"]);
+
+        let snapshot =
+            build_registry_for_multi_backend_inner(base_config(), &config_for(true), None)
+                .await
+                .expect("writable comm plus read-only blob topology");
+        let server = build_server_from_multi_backend_registry(snapshot, &config_for(true), None);
+        let admission = channel_loop_plan(&server, &daemon);
+        assert!(
+            !admission.inbound_poll,
+            "quarantined originals are published through the read-only blob runtime"
+        );
+        assert!(admission.inbound_blocked_by_read_only_blob);
+        assert!(
+            admission.outbound_delivery,
+            "outbound delivery runs on the writable comm runtime and does not use blob"
+        );
+    }
+
     /// RAII guard: redirects `HOME` and restores the prior value on drop.
     struct HomeGuard {
         original: Option<std::ffi::OsString>,
@@ -14588,6 +14856,89 @@ backend = "kg-backend"
             assert!(!admitted.outbound_delivery);
         }
 
+        /// Inbound polling publishes quarantined originals through `blob.put`, so
+        /// a writable comm runtime beside a read-only blob runtime must not poll:
+        /// every publish would fail, the cursor would hold, and the same message
+        /// would be retried forever.
+        #[test]
+        #[serial_test::serial(config_ledger)]
+        fn email_admission_refuses_inbound_polling_when_the_blob_runtime_is_read_only() {
+            use crate::server::ChannelLoopAdmission;
+            use std::sync::{Arc, Mutex};
+
+            #[derive(Clone, Default)]
+            struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for CapturedLog {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+                type Writer = CapturedLog;
+                fn make_writer(&'a self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("blob-read-only.db");
+            let config = RuntimeConfig {
+                db_path: Some(path),
+                packs: vec!["kg".to_string(), "blob".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+            KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            #[cfg(unix)]
+            freeze_snapshot_sidecars(config.db_path.as_ref().expect("db path"));
+            let read_only_blob =
+                KhiveRuntime::new_readonly(config).expect("read-only blob runtime");
+            assert!(read_only_blob.is_read_only());
+            let writable = KhiveRuntime::memory().expect("writable runtime");
+
+            let refused =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&writable), Some(&read_only_blob));
+            assert!(
+                !refused.inbound_poll,
+                "polling must not start against a read-only blob runtime"
+            );
+            assert!(refused.inbound_blocked_by_read_only_blob);
+            assert!(
+                refused.outbound_delivery,
+                "outbound delivery does not touch blob and stays admitted"
+            );
+
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                log_inbound_refused_for_read_only_blob("email", refused);
+            });
+            let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logged.contains("blob pack runtime is read-only"),
+                "the refusal must name the blob runtime: {logged}"
+            );
+
+            // Controls: a writable blob runtime, or no blob pack at all, leaves
+            // admission exactly as comm's own writability decides it.
+            let admitted =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&writable), Some(&writable));
+            assert!(admitted.inbound_poll && admitted.outbound_delivery);
+            assert!(!admitted.inbound_blocked_by_read_only_blob);
+            let no_blob = ChannelLoopAdmission::for_pack_runtimes(Some(&writable), None);
+            assert!(no_blob.inbound_poll && !no_blob.inbound_blocked_by_read_only_blob);
+            let comm_read_only =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&read_only_blob), Some(&writable));
+            assert!(!comm_read_only.inbound_poll && !comm_read_only.outbound_delivery);
+        }
+
         #[tokio::test]
         #[serial]
         async fn daemon_role_gate_spawns_without_panic() {
@@ -15022,6 +15373,18 @@ backend = "kg-backend"
 
         const SOURCE: &str = "imap+tls:h:993:m:INBOX";
 
+        /// The poller stores every quarantined email's original as one blob
+        /// before it commits the cursor, so the channel's accepted message
+        /// ceiling must fit one blob object. A larger ceiling admits a message
+        /// whose quarantine `blob.put` refuses on every poll.
+        #[test]
+        fn email_message_ceiling_fits_one_blob_object() {
+            assert_eq!(
+                khive_channel_email::config::MAX_IMAP_MESSAGE_BYTES as u64,
+                khive_storage::blob::MAX_BLOB_WHOLE_BYTES
+            );
+        }
+
         /// First `poll_page` call returns one message that ingests cleanly
         /// and one that permanently fails `comm.ingest` validation (empty
         /// content) -- simulating a partial-page ingest failure. Every
@@ -15338,12 +15701,12 @@ backend = "kg-backend"
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
-        struct ContentRefusalOnceChannel {
+        struct EmailOnceChannel {
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
         #[async_trait]
-        impl Channel for ContentRefusalOnceChannel {
+        impl Channel for EmailOnceChannel {
             fn kind(&self) -> &'static str {
                 "email"
             }
@@ -15550,6 +15913,448 @@ backend = "kg-backend"
         }
 
         #[tokio::test(start_paused = true)]
+        async fn first_time_email_quarantine_roots_exact_original_before_cursor_commit() {
+            const ORIGINAL_BYTES: &[u8] = b"From: forged@example.com\r\n\
+                To: maintainer@example.com\r\n\
+                X-Original: \xff\x00\r\n\
+                \r\n\
+                untrusted body\r\n";
+            const EXTERNAL_ID: &str = "imap:h:account:11:8";
+            let mut envelope = ChannelEnvelope::new(
+                "email:quarantine",
+                "email:maintainer@example.com",
+                "untrusted body",
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_legacy_external_id("imap:h:11:8")
+            .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
+            envelope
+                .metadata
+                .insert("quarantined".to_string(), "true".to_string());
+            envelope
+                .metadata
+                .insert("quarantine_reason".to_string(), "off-allowlist".to_string());
+            envelope.metadata.insert(
+                "quarantine_claimed_from".to_string(),
+                "forged@example.com".to_string(),
+            );
+
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(EmailOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first-time quarantine must attach its original and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let notes = inbox["items"].as_array().expect("message items");
+            assert_eq!(notes.len(), 1, "one first-time quarantine note");
+            let quarantined = &notes[0];
+            let props = &quarantined["properties"];
+            assert_eq!(props["external_id"], EXTERNAL_ID);
+            assert_eq!(props["from_actor"], "email:quarantine");
+            assert_eq!(props["quarantined"], "true");
+            assert_eq!(props["quarantine_reason"], "off-allowlist");
+            assert_eq!(props["quarantine_claimed_from"], "forged@example.com");
+            assert!(props.get("quarantine_classification").is_none());
+            let content_ref = props["quarantine_content_ref"]
+                .as_str()
+                .expect("first-time quarantine original reference");
+            let note_id = quarantined["id"]
+                .as_str()
+                .expect("quarantine note id")
+                .parse::<uuid::Uuid>()
+                .expect("quarantine note UUID");
+            let owner = runtime
+                .attachments()
+                .expect("main attachment store")
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .expect("original must be rooted before cursor commit");
+            assert_eq!(owner.substrate, khive_storage::AttachmentSubstrate::Note);
+            assert_eq!(owner.content_ref.as_str(), content_ref);
+            let fetched = registry
+                .dispatch("blob.get", json!({"content_ref": content_ref}))
+                .await
+                .expect("quarantine original must be retrievable");
+            let original = BASE64
+                .decode(fetched["bytes"].as_str().expect("base64 original bytes"))
+                .expect("valid base64 original bytes");
+            assert_eq!(original, ORIGINAL_BYTES);
+        }
+
+        /// One page of pre-built envelopes, delivered once, from a channel that
+        /// declares a quarantine retention limit.
+        struct EmailBatchChannel {
+            envelopes: Mutex<Vec<ChannelEnvelope>>,
+            limit: Option<usize>,
+        }
+
+        #[async_trait]
+        impl Channel for EmailBatchChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            fn quarantine_retention_limit(&self) -> Option<usize> {
+                self.limit
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                _since: DateTime<Utc>,
+                _checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                let envelopes = std::mem::take(&mut *self.envelopes.lock().unwrap());
+                let next_checkpoint = (!envelopes.is_empty()).then(|| ChannelCheckpoint {
+                    source: SOURCE.to_string(),
+                    generation: 11,
+                    high_water: Some(7),
+                });
+                Ok(ChannelPollPage {
+                    envelopes,
+                    next_checkpoint,
+                })
+            }
+        }
+
+        /// Published blob objects under `dir`: files named by a 64-hex digest.
+        fn count_files(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir)
+                .expect("read blob directory")
+                .map(|entry| entry.expect("directory entry").path())
+                .map(|path| {
+                    if path.is_dir() {
+                        return count_files(&path);
+                    }
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    usize::from(name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+                })
+                .sum()
+        }
+
+        /// Poll three distinct quarantined emails through the real poll loop
+        /// under `limit`. Returns each stored note's properties in external-id
+        /// order, plus the number of objects the blob store ended up holding.
+        async fn poll_three_quarantined_emails(
+            limit: Option<usize>,
+        ) -> (Vec<serde_json::Value>, usize) {
+            let envelopes = (1..=3)
+                .map(|n| {
+                    let mut envelope = ChannelEnvelope::new(
+                        "email:quarantine",
+                        "email:maintainer@example.com",
+                        format!("untrusted body {n}"),
+                    )
+                    .with_external_id(format!("imap:h:account:11:{n}"))
+                    .with_quarantine_replay(
+                        format!("raw original number {n}").into_bytes(),
+                        "email:maintainer@example.com",
+                    );
+                    envelope
+                        .metadata
+                        .insert("quarantined".to_string(), "true".to_string());
+                    envelope
+                        .metadata
+                        .insert("quarantine_reason".to_string(), "off-allowlist".to_string());
+                    envelope
+                })
+                .collect();
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(EmailBatchChannel {
+                envelopes: Mutex::new(envelopes),
+                limit,
+            }));
+
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "every quarantined message must be recorded and the cursor must advance"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let mut properties: Vec<serde_json::Value> = inbox["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .map(|note| note["properties"].clone())
+                .collect();
+            properties.sort_by_key(|props| props["external_id"].as_str().map(str::to_string));
+            (properties, count_files(blob_dir.path()))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn quarantine_originals_stop_at_the_retention_limit_but_every_record_is_kept() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(2)).await;
+            assert_eq!(notes.len(), 3, "every quarantined message is recorded");
+            for retained in &notes[..2] {
+                assert!(
+                    retained["quarantine_content_ref"].is_string(),
+                    "below the limit the original is retained: {retained}"
+                );
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            let omitted = &notes[2];
+            assert_eq!(omitted["quarantined"], "true");
+            assert_eq!(omitted["external_id"], "imap:h:account:11:3");
+            assert!(
+                omitted.get("quarantine_content_ref").is_none(),
+                "past the limit no original is published: {omitted}"
+            );
+            assert_eq!(omitted["quarantine_original_retained"], "false");
+            assert_eq!(
+                omitted["quarantine_original_not_retained_reason"],
+                "retention-limit"
+            );
+            assert_eq!(
+                stored_objects, 2,
+                "blob.put ran only for the two originals under the limit"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn quarantine_originals_are_all_retained_below_the_retention_limit() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(10)).await;
+            assert_eq!(notes.len(), 3);
+            for retained in &notes {
+                assert!(retained["quarantine_content_ref"].is_string());
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            assert_eq!(stored_objects, 3);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_zero_retention_limit_stores_no_originals() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(0)).await;
+            assert_eq!(notes.len(), 3);
+            for omitted in &notes {
+                assert!(omitted.get("quarantine_content_ref").is_none());
+                assert_eq!(omitted["quarantine_original_retained"], "false");
+            }
+            assert_eq!(stored_objects, 0);
+        }
+
+        /// Quarantine three messages that `comm.ingest` refused, through the
+        /// ingest-failure path, under `limit`. Returns the stored message
+        /// properties sorted by external id and the number of blob objects.
+        async fn quarantine_three_refused_messages(
+            limit: Option<usize>,
+        ) -> (Vec<serde_json::Value>, usize) {
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            for index in 1..=3u32 {
+                let envelope = ChannelEnvelope::new(
+                    "email:maintainer@example.com",
+                    "email:mailbox@example.com",
+                    "refused body",
+                )
+                .with_external_id(format!("imap:h:refused:11:{index}"))
+                .with_quarantine_replay(
+                    format!("original message {index}").into_bytes(),
+                    "email:maintainer@example.com",
+                );
+                quarantine_channel_ingest_failure(
+                    &registry,
+                    "test-ns",
+                    "email",
+                    "email",
+                    Some("actor:test"),
+                    &envelope,
+                    khive_runtime::ChannelIngestFailureClass::Permanent {
+                        reason: "SecretDetected",
+                    },
+                    limit,
+                )
+                .await
+                .expect("a refused message is always recorded");
+            }
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let mut properties: Vec<serde_json::Value> = inbox["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .map(|note| note["properties"].clone())
+                .collect();
+            properties.sort_by_key(|props| props["external_id"].as_str().map(str::to_string));
+            (properties, count_files(blob_dir.path()))
+        }
+
+        #[tokio::test]
+        async fn refused_message_originals_stop_at_the_retention_limit_but_every_record_is_kept() {
+            let (notes, stored_objects) = quarantine_three_refused_messages(Some(2)).await;
+            assert_eq!(notes.len(), 3, "every refused message is recorded");
+            for retained in &notes[..2] {
+                assert!(
+                    retained["quarantine_content_ref"].is_string(),
+                    "below the limit the original is retained: {retained}"
+                );
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            let omitted = &notes[2];
+            assert_eq!(omitted["quarantined"], "true");
+            assert_eq!(omitted["external_id"], "imap:h:refused:11:3");
+            assert!(
+                omitted.get("quarantine_content_ref").is_none(),
+                "past the limit no original is published: {omitted}"
+            );
+            assert_eq!(omitted["quarantine_original_retained"], "false");
+            assert_eq!(
+                omitted["quarantine_original_not_retained_reason"],
+                "retention-limit"
+            );
+            assert_eq!(
+                stored_objects, 2,
+                "blob.put ran only for the two originals under the limit"
+            );
+        }
+
+        #[tokio::test]
+        async fn refused_message_originals_are_unbounded_without_a_limit() {
+            let (notes, stored_objects) = quarantine_three_refused_messages(None).await;
+            assert_eq!(notes.len(), 3);
+            for retained in &notes {
+                assert!(retained["quarantine_content_ref"].is_string());
+            }
+            assert_eq!(stored_objects, 3);
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn content_refusal_stores_exact_replay_and_ingests_body_free_quarantine() {
             const EXTERNAL_ID: &str = "imap:h:11:7";
             const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
@@ -15568,7 +16373,7 @@ backend = "kg-backend"
             .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
 
             let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(ContentRefusalOnceChannel {
+            ch_registry.register(Arc::new(EmailOnceChannel {
                 envelope: Mutex::new(Some(envelope)),
             }));
 
@@ -15737,6 +16542,7 @@ backend = "kg-backend"
                 khive_runtime::ChannelIngestFailureClass::Permanent {
                     reason: "SecretDetected",
                 },
+                None,
             )
             .await
             .expect("duplicate quarantine repairs its missing blob owner");
@@ -15829,7 +16635,7 @@ backend = "kg-backend"
             ));
 
             let mut channels = ChannelRegistry::new();
-            channels.register(Arc::new(ContentRefusalOnceChannel {
+            channels.register(Arc::new(EmailOnceChannel {
                 envelope: Mutex::new(Some(envelope)),
             }));
             let task = tokio::spawn(channel_poll_loop(

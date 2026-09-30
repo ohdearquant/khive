@@ -262,7 +262,7 @@ async fn unfetched_targets_preserve_request_query_for_future_fetch() {
         }
         let canonical = crate::identity::canonicalize(target.clone());
         let id = crate::identity::document_id(
-            crate::identity::site_id(&canonical),
+            crate::identity::site_id(&khive_types::Namespace::local(), &canonical),
             &crate::identity::path_and_query(&canonical),
         );
         let entity = runtime

@@ -11,7 +11,7 @@ test("uses one keyboard path across the showcase, review views, and history rows
   await page.keyboard.type("KG review");
   await expect(page.getByRole("option", { name: /KG review/i })).toBeVisible();
   await page.keyboard.press("Enter");
-  await expect(page).toHaveURL(/\/review\/?$/);
+  await expect.poll(() => new URL(page.url()).pathname).toBe("/review");
 
   await page.keyboard.press("Control+K");
   await expect(page.getByRole("dialog", { name: "Review commands" }))
@@ -51,19 +51,19 @@ test("switching to KG review keeps imported decisions and conversation state in 
   await page.getByRole("button", { name: "Request changes" }).click();
   await expect(page.getByText("Local decision: changes requested")).toBeVisible();
 
-  await page.getByRole("button", { name: /^Activity/i }).first().click();
   await page.getByRole("textbox", { name: "Review comment" }).fill("Saved local note");
   await page.getByRole("button", { name: "Add local note" }).click();
   await page.getByRole("textbox", { name: "Review comment" }).fill("Draft survives a view switch");
+  await page.getByRole("tab", { name: /^Activity/i }).click();
+  await expect(page.locator("[data-review-activity-timeline]")).toBeVisible();
   await page.keyboard.press("Control+K");
   await page.getByRole("combobox", { name: "Search review commands" }).fill("KG review");
   await page.keyboard.press("Enter");
 
-  await expect(page).toHaveURL(/\/review\/?$/);
+  await expect.poll(() => new URL(page.url()).pathname).toBe("/review");
   await expect(page.locator(".review-surface")).toHaveAttribute("aria-label", "Changes");
   await expect(page.getByText("Imported bundle · no writes")).toBeVisible();
   await expect(page.getByText("Local decision: changes requested")).toBeVisible();
-  await page.getByRole("button", { name: /^Activity/i }).first().click();
   await expect(page.getByText("Saved local note")).toBeVisible();
   await expect(page.getByRole("textbox", { name: "Review comment" }))
     .toHaveValue("Draft survives a view switch");
@@ -74,7 +74,7 @@ test("switching to KG review keeps imported decisions and conversation state in 
   await expect(crossSurface).toBeDisabled();
   await expect(crossSurface).toContainText("Unavailable while this review has unsaved local state.");
   await page.keyboard.press("Enter");
-  await expect(page).toHaveURL(/\/review\/?$/);
+  await expect.poll(() => new URL(page.url()).pathname).toBe("/review");
   await expect(page.getByRole("textbox", { name: "Review comment" }))
     .toHaveValue("Draft survives a view switch");
 });
