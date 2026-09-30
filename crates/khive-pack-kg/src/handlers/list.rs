@@ -583,7 +583,13 @@ impl KgPack {
                 }
                 let requested = p.limit.unwrap_or(20);
                 let limit = effective_list_limit(requested, NOTE_LIST_CAP);
-                let filter = super::note_list::note_filter(&p, kind_filter.as_deref())?;
+                let mut filter = super::note_list::note_filter(&p, kind_filter.as_deref())?;
+                if matches!(kind_filter.as_deref(), None | Some("message")) {
+                    // The mailbox partition runs in the store, so the scan
+                    // window below holds only rows this caller may see and a
+                    // cursor taken from it can never name a hidden message.
+                    filter.mailbox = Some(mailbox_view.note_scope(token));
+                }
                 if p.key_prefix.is_some() {
                     return super::note_list::list_keyed_notes(
                         runtime,
@@ -630,7 +636,9 @@ impl KgPack {
                             }
                             for note in page {
                                 scanned = scanned.saturating_add(1);
-                                last_scanned = Some(note.id);
+                                if mailbox_view.permits_message_note(token, &note) {
+                                    last_scanned = Some(note.id);
+                                }
                                 if note_matches_list_filters(&note, &p, token, &mailbox_view) {
                                     collected.push(note);
                                     if collected.len() >= target {

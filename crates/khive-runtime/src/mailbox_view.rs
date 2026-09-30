@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use khive_gate::{check_with_mailbox_policy, mailbox_read_owner};
-use khive_storage::note::Note;
+use khive_storage::note::{Note, NoteMailboxScope};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -18,6 +18,20 @@ pub struct MailboxView {
 }
 
 impl MailboxView {
+    fn legacy_local(&self, token: &NamespaceToken) -> bool {
+        !self.delegated && token.actor().is_anonymous() && token.actor().id == "local"
+    }
+
+    /// The same partition as [`Self::permits_message_note`], in the form a
+    /// note store applies inside its query so a scan window never holds rows
+    /// this view hides.
+    pub fn note_scope(&self, token: &NamespaceToken) -> NoteMailboxScope {
+        NoteMailboxScope {
+            actor_id: self.actor_id.clone(),
+            legacy_local: self.legacy_local(token),
+        }
+    }
+
     /// The same actor partitions as Comm's inbox and sent views. Generic note
     /// listing applies this before its own page limit, including for broad
     /// kind=note reads that encounter a message row.
@@ -31,8 +45,7 @@ impl MailboxView {
                 .and_then(|value| value.get(key))
                 .and_then(Value::as_str)
         };
-        let legacy_local =
-            !self.delegated && token.actor().is_anonymous() && token.actor().id == "local";
+        let legacy_local = self.legacy_local(token);
         match text("direction") {
             Some("inbound") => {
                 text("to_actor") == Some(self.actor_id.as_str())

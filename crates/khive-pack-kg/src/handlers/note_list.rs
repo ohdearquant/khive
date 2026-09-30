@@ -163,7 +163,9 @@ pub(super) async fn list_keyed_notes(
         }
         for note in page {
             scanned += 1;
-            last_scanned = Some(NoteKeyCursor::from(&note));
+            if view.permits_message_note(token, &note) {
+                last_scanned = Some(NoteKeyCursor::from(&note));
+            }
             if note_matches_list_filters(&note, p, token, view) {
                 if skip > 0 {
                     skip -= 1;
