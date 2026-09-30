@@ -8,7 +8,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
-use khive_db::{ConnectionPool, StorageBackend, WalCeilingPolicy};
+use khive_db::{ConnectionPool, StorageBackend};
 #[cfg(test)]
 use khive_gate::AllowAllGate;
 use khive_gate::GateRequest;
@@ -26,19 +26,6 @@ use crate::config::{
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::note_search_ann::NoteSearchAnnProvider;
 use crate::pack::KindHook;
-
-/// Preserve a configured ceiling for read-only reporting while ensuring a
-/// directly constructed config cannot silently drop a nonzero effective value.
-fn direct_wal_ceiling_policy(config: &RuntimeConfig) -> WalCeilingPolicy {
-    WalCeilingPolicy {
-        bytes: if config.wal_ceiling_configured_bytes == 0 {
-            config.wal_ceiling_bytes
-        } else {
-            config.wal_ceiling_configured_bytes
-        },
-        source: config.wal_ceiling_source,
-    }
-}
 
 #[cfg(all(test, target_os = "macos"))]
 const IN_PROCESS_TEST_NOFILE_LIMIT: libc::rlim_t = 4096;
@@ -418,7 +405,7 @@ impl KhiveRuntime {
     /// [`from_backend`](Self::from_backend) seam is likewise only for an
     /// already-prepared backend.
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let wal_ceiling = direct_wal_ceiling_policy(&config);
+        let wal_ceiling = config.wal_ceiling_policy();
         Self::new_with_file_backend(config, |path| {
             StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, None, wal_ceiling)
         })
@@ -427,7 +414,7 @@ impl KhiveRuntime {
     /// Construct a fixture runtime with a small concurrent reader pool.
     #[cfg(any(test, feature = "test-internals"))]
     pub fn new_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let wal_ceiling = direct_wal_ceiling_policy(&config);
+        let wal_ceiling = config.wal_ceiling_policy();
         Self::new_with_file_backend(config, |path| {
             StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, Some(2), wal_ceiling)
         })
@@ -482,7 +469,7 @@ impl KhiveRuntime {
     /// or configured-model registration writes are attempted. A `None` path
     /// retains the historical ephemeral in-memory behavior for tests.
     pub fn new_readonly(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let wal_ceiling = direct_wal_ceiling_policy(&config);
+        let wal_ceiling = config.wal_ceiling_policy();
         Self::new_readonly_with_file_backend(config, |path| {
             StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
                 path,
@@ -495,7 +482,7 @@ impl KhiveRuntime {
     /// Construct a read-only fixture runtime with a small reader pool.
     #[cfg(any(test, feature = "test-internals"))]
     pub fn new_readonly_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let wal_ceiling = direct_wal_ceiling_policy(&config);
+        let wal_ceiling = config.wal_ceiling_policy();
         Self::new_readonly_with_file_backend(config, |path| {
             StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
                 path,

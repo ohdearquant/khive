@@ -546,6 +546,23 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// The WAL ceiling policy this config asks its implicit main backend to
+    /// open with. Preserves a configured ceiling for read-only reporting while
+    /// ensuring a directly constructed config cannot silently drop a nonzero
+    /// effective value: when the configured value is zero, the effective
+    /// `wal_ceiling_bytes` is used. Every opener of the implicit main backend
+    /// resolves the ceiling through this one method.
+    pub fn wal_ceiling_policy(&self) -> khive_db::WalCeilingPolicy {
+        khive_db::WalCeilingPolicy {
+            bytes: if self.wal_ceiling_configured_bytes == 0 {
+                self.wal_ceiling_bytes
+            } else {
+                self.wal_ceiling_configured_bytes
+            },
+            source: self.wal_ceiling_source,
+        }
+    }
+
     /// Return the shipped pack set used when no CLI, environment, or
     /// configuration-file selection is present.
     pub fn built_in_packs() -> Vec<String> {

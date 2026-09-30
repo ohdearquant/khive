@@ -4191,18 +4191,15 @@ fn open_single_backend(
     } else {
         BackendKind::Memory
     };
-    let resolved = khive_runtime::resolve_wal_ceiling(
-        Some(config.wal_ceiling_configured_bytes),
+    let wal_ceiling = config.wal_ceiling_policy();
+    khive_runtime::resolve_wal_ceiling(
+        Some(wal_ceiling.bytes),
         None,
         BackendId::MAIN,
         kind,
         true,
         false,
     )?;
-    let wal_ceiling = khive_db::WalCeilingPolicy {
-        bytes: resolved.configured_bytes,
-        source: config.wal_ceiling_source,
-    };
     let backend = match &config.db_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -4515,6 +4512,12 @@ pub fn resolved_wal_ceiling_disclosure(
         } else {
             "disabled"
         };
+        // A backend name is operator-supplied text, so it takes the runtime's
+        // log-text path: credential shapes are masked, and control, format and
+        // line/paragraph separator characters (newline, escape sequences, bidi
+        // overrides) are escaped so a name cannot start a forged log line or
+        // drive the terminal.
+        let name = khive_runtime::secret_gate::bounded_masked_log_text(name);
         format!(
             "{name}: configured_bytes={configured} effective_bytes={effective} source={source} enabled={} status={status}",
             effective > 0
@@ -5188,6 +5191,187 @@ mod tests {
             resolved_wal_ceiling_disclosure(&config, &[backend]),
             "wal_ceiling: archive: configured_bytes=8192 effective_bytes=0 source=backend_field enabled=false status=read_only_not_enforced"
         );
+    }
+
+    #[test]
+    fn wal_ceiling_disclosure_escapes_log_unsafe_characters_in_backend_names() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        let disclose = |name: &str| {
+            let backend = BackendConfig {
+                name: name.into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+                cache_mb: None,
+                journal_mode: None,
+                wal_ceiling_bytes: None,
+                served_kinds: None,
+                read_only: false,
+            };
+            resolved_wal_ceiling_disclosure(&config, &[backend])
+        };
+
+        // One arm per category: Cc newline and ESC, Cf bidi override, Zl, Zp.
+        for (raw, escaped) in [
+            ('\n', "\\u{000a}"),
+            ('\u{1b}', "\\u{001b}"),
+            ('\u{202e}', "\\u{202e}"),
+            ('\u{2028}', "\\u{2028}"),
+            ('\u{2029}', "\\u{2029}"),
+        ] {
+            let line = disclose(&format!("arch{raw}ive"));
+            assert!(
+                !line.contains(raw),
+                "U+{:04X} must not reach the startup line raw; got {line:?}",
+                raw as u32
+            );
+            assert!(
+                line.starts_with(&format!(
+                    "wal_ceiling: arch{escaped}ive: configured_bytes=0"
+                )),
+                "U+{:04X} is escaped and the rest of the name is kept; got {line:?}",
+                raw as u32
+            );
+        }
+
+        // Accented and CJK names are ordinary text and print unchanged.
+        assert!(
+            disclose("archivé字").starts_with("wal_ceiling: archivé字: configured_bytes=0"),
+            "non-ASCII letters must be kept"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_disclosure_masks_credentials_in_backend_names() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        let disclose = |name: &str| {
+            let backend = BackendConfig {
+                name: name.into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+                cache_mb: None,
+                journal_mode: None,
+                wal_ceiling_bytes: None,
+                served_kinds: None,
+                read_only: false,
+            };
+            resolved_wal_ceiling_disclosure(&config, &[backend])
+        };
+
+        // A credential pasted into a backend name is masked like any other log text.
+        let password = "S3cr3tP4ss";
+        let line = disclose(&format!(
+            "{}://dbuser:{password}@db.example.com:5432/archive",
+            "postgresql"
+        ));
+        assert!(
+            !line.contains(password),
+            "a credential in a backend name must not reach the startup line; got {line:?}"
+        );
+    }
+
+    #[test]
+    fn named_backend_ceiling_identity_agrees_with_the_opener_resolution() {
+        // The named-backend opener resolves from the backend field and the
+        // environment snapshot only, never from `wal_ceiling_bytes`. The
+        // fingerprint must therefore also report a disabled ceiling here.
+        let dir = tempfile::tempdir().expect("named backend ceiling tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("main.db")),
+            packs: vec!["kg".to_string()],
+            wal_ceiling_bytes: 1 << 20,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_env_raw: None,
+            ..RuntimeConfig::no_embeddings()
+        };
+        let backend = |name: &str| BackendConfig {
+            name: name.into(),
+            kind: BackendKind::Sqlite,
+            path: Some(dir.path().join(format!("{name}.db"))),
+            cache_mb: None,
+            journal_mode: None,
+            wal_ceiling_bytes: None,
+            served_kinds: None,
+            read_only: false,
+        };
+        let topology = KhiveConfig {
+            backends: vec![backend("archive"), backend("main")],
+            ..KhiveConfig::default()
+        };
+
+        for declared in &topology.backends {
+            let policy = wal_ceiling_policy_for_backend(&config, declared)
+                .expect("resolve named backend ceiling");
+            assert_eq!(
+                policy.bytes, 0,
+                "the opener enables no ceiling for backend {}",
+                declared.name
+            );
+        }
+        let config_id = crate::server::compute_config_id(&config, Some(&topology));
+        let topology_part = &config_id[config_id.find(";backends=[").expect("topology present")..];
+        assert!(
+            !topology_part.contains("wal_ceiling_bytes"),
+            "the fingerprint must agree with the opener for named backends; got {topology_part}"
+        );
+    }
+
+    #[test]
+    fn single_backend_opener_uses_effective_ceiling_when_configured_value_is_zero() {
+        // An enabled ceiling that this build cannot yet enforce refuses to
+        // open, so a refusal naming the ceiling proves the opener applied it;
+        // a silently dropped ceiling would open successfully.
+        const CEILING: u64 = 1 << 20;
+        let dir = tempfile::tempdir().expect("single backend ceiling tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("single.db")),
+            wal_ceiling_bytes: CEILING,
+            wal_ceiling_configured_bytes: 0,
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        let host_error = open_single_backend(&config, Some(2))
+            .err()
+            .expect("the host opener must not drop an enabled effective ceiling");
+        assert!(
+            matches!(
+                host_error.downcast_ref::<khive_db::SqliteError>(),
+                Some(khive_db::SqliteError::WalCapacityUnavailable { bytes, .. })
+                    if *bytes == CEILING
+            ),
+            "host opener refusal must name the effective ceiling; got {host_error:#}"
+        );
+
+        let runtime_dir = tempfile::tempdir().expect("runtime ceiling tempdir");
+        let runtime_error = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(runtime_dir.path().join("runtime.db")),
+            ..config.clone()
+        })
+        .err()
+        .expect("the runtime constructor must not drop an enabled effective ceiling");
+        assert!(
+            matches!(
+                &runtime_error,
+                khive_runtime::RuntimeError::Sqlite(
+                    khive_db::SqliteError::WalCapacityUnavailable { bytes, .. }
+                ) if *bytes == CEILING
+            ),
+            "runtime refusal must name the same ceiling; got {runtime_error:?}"
+        );
+
+        // A disabled ceiling still opens on the same path.
+        let disabled = RuntimeConfig {
+            db_path: Some(dir.path().join("disabled.db")),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            ..config
+        };
+        open_single_backend(&disabled, Some(2)).expect("a disabled ceiling opens");
     }
 
     #[test]
