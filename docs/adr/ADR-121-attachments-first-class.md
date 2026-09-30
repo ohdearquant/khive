@@ -1126,7 +1126,7 @@ stated, in the change that adds them. This row set does not cover them.
 
 ## Amendment 6 (2026-09-29): staged uploads count as root content
 
-**Status: Proposed (2026-09-29).** This amendment changes Amendment 1 in three places and nothing else in it:
+**Status: Accepted (2026-09-30).** This amendment changes Amendment 1 in three places and nothing else in it:
 item 8's sentence that defines an empty root, "no blob objects and no root ownership marker of any owner";
 item 8's fresh bind, which now holds its locks through the completing transaction; and item 7's writer
 rules, to which it adds the binding check `begin_upload` makes before it stages a file. It adds acceptance
