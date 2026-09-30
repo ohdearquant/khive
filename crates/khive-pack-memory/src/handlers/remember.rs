@@ -117,6 +117,8 @@ impl MemoryPack {
 
         let annotates_target = annotates.first().copied();
 
+        let mut embedding_truncation =
+            khive_runtime::retrieval::EmbeddingTruncationReport::default();
         let (note, keyed_edge_id, replayed) = if let Some(key) = p.key.as_deref() {
             create_keyed_memory(
                 &self.runtime,
@@ -133,9 +135,12 @@ impl MemoryPack {
             )
             .await?
         } else {
-            let note = self
+            // The report-returning variant keeps a truncated embedding input
+            // from failing the call after the memory is committed, which would
+            // skip the ANN generation bump below.
+            let (note, truncation) = self
                 .runtime
-                .create_note_with_decay_for_embedding_model(
+                .create_note_with_decay_for_embedding_model_and_report(
                     write_token,
                     "memory",
                     None,
@@ -147,6 +152,7 @@ impl MemoryPack {
                     p.embedding_model.as_deref(),
                 )
                 .await?;
+            embedding_truncation = truncation;
             (note, None, false)
         };
 
@@ -226,6 +232,10 @@ impl MemoryPack {
         }
         if replayed {
             response["replayed"] = json!(true);
+        }
+        if embedding_truncation.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
         to_json(&response)
     }

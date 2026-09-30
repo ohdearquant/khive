@@ -23,6 +23,21 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
+fn add_embedding_truncation_warning(
+    response: &mut Value,
+    report: &khive_runtime::retrieval::EmbeddingTruncationReport,
+) {
+    if !report.any_truncated() {
+        return;
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "warnings".to_string(),
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        );
+    }
+}
+
 /// Resolve a raw id string to a full UUID.
 ///
 /// Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix.
@@ -739,12 +754,16 @@ pub(crate) async fn handle_remind(
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
 
-    let note = runtime
-        .create_note(
+    // The report-returning variant keeps a truncated embedding input from
+    // failing the call after the note is committed: the staged event must
+    // still be activated, and the truncation is disclosed in the response.
+    let (note, embedding_truncation) = runtime
+        .create_note_with_embedding_content_and_report(
             token,
             "scheduled_event",
             None,
             &p.content,
+            None,
             None,
             Some(properties.clone()),
             Vec::new(),
@@ -752,14 +771,16 @@ pub(crate) async fn handle_remind(
         .await?;
     activate_with_creator_provenance(runtime, token, &note, properties, "remind").await?;
 
-    Ok(json!({
+    let mut response = json!({
         "id": short_id(note.id),
         "full_id": note.id.as_hyphenated().to_string(),
         "event_type": "remind",
         "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "pending",
-    }))
+    });
+    add_embedding_truncation_warning(&mut response, &embedding_truncation);
+    Ok(response)
 }
 
 /// `schedule` — schedule a future verb dispatch.
@@ -814,12 +835,15 @@ pub(crate) async fn handle_schedule(
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
 
-    let note = runtime
-        .create_note(
+    // See `handle_remind`: activation must follow a committed note even when
+    // its embedding input was truncated.
+    let (note, embedding_truncation) = runtime
+        .create_note_with_embedding_content_and_report(
             token,
             "scheduled_event",
             None,
             &p.action,
+            None,
             None,
             Some(properties.clone()),
             Vec::new(),
@@ -827,14 +851,16 @@ pub(crate) async fn handle_schedule(
         .await?;
     activate_with_creator_provenance(runtime, token, &note, properties, "schedule").await?;
 
-    Ok(json!({
+    let mut response = json!({
         "id": short_id(note.id),
         "full_id": note.id.as_hyphenated().to_string(),
         "event_type": "schedule",
         "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "pending",
-    }))
+    });
+    add_embedding_truncation_warning(&mut response, &embedding_truncation);
+    Ok(response)
 }
 
 /// `agenda` — list upcoming scheduled events.

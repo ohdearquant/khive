@@ -79,7 +79,7 @@ pub(crate) async fn handle_ingest(
     let content_ref = blob_store.put(raw).await?;
     drop(preprocessing_permit);
 
-    let (asset, created) = find_or_create_visual_asset(
+    let (asset, created, embedding_truncation) = find_or_create_visual_asset(
         &core,
         token,
         &content_ref,
@@ -99,7 +99,7 @@ pub(crate) async fn handle_ingest(
     .await?;
     index_embedding(pack.runtime(), token, &descriptor, asset.id, &embedding).await?;
 
-    Ok(json!({
+    let mut response = json!({
         "asset_id": asset.id.to_string(),
         "content_ref": content_ref.to_string(),
         "created": created,
@@ -107,7 +107,11 @@ pub(crate) async fn handle_ingest(
         "descriptor": descriptor,
         "experimental": true,
         "embedding": embedding,
-    }))
+    });
+    if embedding_truncation.any_truncated() {
+        response["warnings"] = json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+    }
+    Ok(response)
 }
 
 pub(crate) async fn handle_search(
@@ -501,20 +505,30 @@ async fn find_or_create_visual_asset(
     caption: Option<&str>,
     prepared: &PreparedRaster,
     original_len: usize,
-) -> Result<(Entity, bool), RuntimeError> {
+) -> Result<
+    (
+        Entity,
+        bool,
+        khive_runtime::retrieval::EmbeddingTruncationReport,
+    ),
+    RuntimeError,
+> {
     let bytes = content_ref.as_str().as_bytes();
     let stripe = usize::from(hex_nibble(bytes[0])) * 16 + usize::from(hex_nibble(bytes[1]));
     let _guard = INGEST_CONTENT_LOCKS[stripe].lock().await;
     if let Some(asset) = find_visual_asset(runtime, token, content_ref).await? {
-        return Ok((asset, false));
+        return Ok((asset, false, Default::default()));
     }
 
     let default_name = format!("asset-{}", &content_ref.as_str()[..12]);
     let size_bytes = u64::try_from(original_len).map_err(|_| {
         RuntimeError::Internal("moodboard visual asset size exceeds u64".to_string())
     })?;
-    let asset = runtime
-        .create_entity_with_attachments(
+    // The report-returning variant keeps a truncated caption embedding from
+    // failing the call after the asset is committed, which would skip the
+    // visual embedding index the ingest verb promises.
+    let (asset, embedding_truncation) = runtime
+        .create_entity_with_attachments_and_report(
             token,
             "artifact",
             Some("visual_asset"),
@@ -530,7 +544,7 @@ async fn find_or_create_visual_asset(
             }],
         )
         .await?;
-    Ok((asset, true))
+    Ok((asset, true, embedding_truncation))
 }
 
 fn hex_nibble(byte: u8) -> u8 {
@@ -1374,7 +1388,7 @@ mod tests {
             original_height: 32,
         };
         let core = pack.runtime().core();
-        let (query, _) = find_or_create_visual_asset(
+        let (query, _, _) = find_or_create_visual_asset(
             &core,
             &token,
             &query_ref,
@@ -1385,7 +1399,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (candidate, _) = find_or_create_visual_asset(
+        let (candidate, _, _) = find_or_create_visual_asset(
             &core,
             &token,
             &candidate_ref,
@@ -1602,5 +1616,88 @@ mod tests {
         let (first, second) = (first.unwrap(), second.unwrap());
         assert_eq!(first.0.id, second.0.id);
         assert_ne!(first.1, second.1, "exactly one caller creates the entity");
+    }
+
+    struct TruncationEmbeddingService;
+
+    #[async_trait]
+    impl lattice_embed::EmbeddingService for TruncationEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "moodboard-truncation-test"
+        }
+    }
+
+    struct TruncationEmbedderProvider;
+
+    #[async_trait]
+    impl khive_runtime::EmbedderProvider for TruncationEmbedderProvider {
+        fn name(&self) -> &str {
+            "moodboard-truncation-test"
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn build(&self) -> Result<Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(Arc::new(TruncationEmbeddingService))
+        }
+    }
+
+    #[tokio::test]
+    async fn over_budget_caption_creates_asset_and_reports_truncation() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        runtime.register_embedder(TruncationEmbedderProvider);
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let root = tempfile::tempdir().unwrap();
+        let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).unwrap());
+        runtime
+            .install_blob_store(blob_store.clone())
+            .expect("install blob store");
+        let content_ref = blob_store
+            .put(b"long caption bytes".to_vec())
+            .await
+            .unwrap();
+        let prepared = PreparedRaster {
+            inference_png: Vec::new(),
+            media_type: "image/png",
+            original_width: 32,
+            original_height: 32,
+        };
+        let caption = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+
+        let (asset, created, truncation) = find_or_create_visual_asset(
+            &runtime,
+            &token,
+            &content_ref,
+            Some("long-caption"),
+            Some(&caption),
+            &prepared,
+            18,
+        )
+        .await
+        .expect("an over-budget caption must not fail after the asset is committed");
+
+        assert!(created);
+        assert!(truncation.any_truncated(), "{truncation:?}");
+        assert_eq!(
+            find_visual_asset(&runtime, &token, &content_ref)
+                .await
+                .unwrap()
+                .map(|found| found.id),
+            Some(asset.id)
+        );
     }
 }

@@ -7149,3 +7149,37 @@ async fn bulk_create_refuses_a_memory_note_item_in_both_modes() {
         "only the best-effort sibling may be stored: {observations}"
     );
 }
+
+/// A memory whose content exceeds the embedder input budget is stored, and the
+/// response discloses the truncation instead of failing after the commit.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn remember_over_embedding_budget_succeeds_and_discloses_truncation() {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new("truncation-enc", 4, 0.9));
+    let registry = make_registry(rt);
+
+    let content = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+    let result = registry
+        .dispatch("memory.remember", json!({ "content": content }))
+        .await
+        .expect("an over-budget memory must not fail after commit");
+
+    assert_eq!(
+        result["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "remember must disclose the truncated embedding input: {result}"
+    );
+    let note_id = result["id"].as_str().expect("note id present");
+    let stored = registry
+        .dispatch("get", json!({ "id": note_id }))
+        .await
+        .expect("the committed memory must be readable");
+    assert_eq!(stored["id"], json!(note_id));
+}
