@@ -549,6 +549,12 @@ fn resolve_imports(
                 continue;
             };
             for (name, binding) in glob_names(&source, modules) {
+                // A module's own child module is an item of that module, and
+                // an item shadows a glob import of the same name. A block's
+                // glob import still shadows the enclosing module's items.
+                if current_module.is_none() && child_module(module_id, &name, modules).is_some() {
+                    continue;
+                }
                 bindings.entry(name).or_insert(binding);
             }
         }
@@ -2080,6 +2086,52 @@ fn module_paths_to_reexported_note_sql_are_reported() {
     assert!(relative[0]
         .evidence
         .contains("SQL constant NOTE_UPSERT_SQL"));
+}
+
+// A module's own child module shadows a module of the same name that a glob
+// import brings in, so the path resolves through the child.
+#[test]
+fn a_child_module_shadows_a_glob_imported_module_of_the_same_name() {
+    let sources = |writer_children: &str| {
+        let mut sources: Vec<(String, String)> = vec![
+            ("sample/src/lib.rs".into(), "mod other; mod writer;".into()),
+            ("sample/src/other.rs".into(), "pub mod db;".into()),
+            (
+                "sample/src/other/db.rs".into(),
+                "pub const MERGE_SQL: &str = \"SELECT 1\";".into(),
+            ),
+            (
+                "sample/src/writer.rs".into(),
+                format!(
+                    "use crate::other::*; {writer_children}
+                     fn write(conn: &Connection) {{ conn.prepare_cached(db::MERGE_SQL); }}"
+                ),
+            ),
+        ];
+        if !writer_children.is_empty() {
+            sources.push((
+                "sample/src/writer/db.rs".into(),
+                "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;".into(),
+            ));
+        }
+        sources
+    };
+
+    let shadowed = scan_sources(&sources("mod db;")).unwrap();
+    assert_eq!(
+        shadowed.len(),
+        1,
+        "child module shadows the glob: {shadowed:?}"
+    );
+    assert_eq!(shadowed[0].key, "sample/src/writer.rs::write");
+    assert!(shadowed[0]
+        .evidence
+        .contains("SQL constant NOTE_UPSERT_SQL"));
+
+    // Control: with no child of that name the glob-imported module is the
+    // one Rust resolves, and its constant is unrelated.
+    let through_glob = scan_sources(&sources("")).unwrap();
+    assert!(through_glob.is_empty(), "{through_glob:?}");
 }
 
 // Each fixture names `MERGE_SQL` through a module path that Rust resolves to
