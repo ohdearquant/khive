@@ -199,7 +199,7 @@ fn vary_is_replayable(vary: &Value, headers: &[(String, String)]) -> bool {
 }
 
 /// A 304's new Vary describes the request that actually reached the origin.
-/// The client fixes gzip on that wire request even for a legacy body whose
+/// The client fixes identity on that wire request even for a legacy body whose
 /// stored map predates the encoding field. The cached-body gate above still
 /// requires an explicit stored selector before sending a later validator.
 fn vary_is_represented_on_wire(vary: &Value, headers: &[(String, String)]) -> bool {
@@ -215,12 +215,27 @@ fn vary_is_represented_on_wire(vary: &Value, headers: &[(String, String)]) -> bo
     vary_is_replayable(vary, &effective)
 }
 
+fn stored_legacy_gzip_body(properties: &Value) -> bool {
+    properties
+        .pointer("/request_headers/accept-encoding")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values.len() == 1 && values[0].as_str() == Some(crate::fetch::LEGACY_ACCEPT_ENCODING)
+        })
+}
+
 fn conditional_headers_for_hop(
     properties: &Value,
     original_url: &Url,
     current_url: &Url,
     first_hop: bool,
 ) -> Vec<(String, String)> {
+    // A legacy gzip-negotiated body may have passed through the old decoder.
+    // Replaying its selector as identity does not make its cached bytes an
+    // identity representation. Fetch a body under identity before validating.
+    if stored_legacy_gzip_body(properties) {
+        return Vec::new();
+    }
     let Ok(negotiation) = crate::fetch::stored_negotiation_headers(properties) else {
         return Vec::new();
     };
@@ -822,8 +837,18 @@ async fn settle_refresh_from_snapshot(
                 &response_content_ref,
                 outcome.status,
                 &outcome.headers,
-                (!redirect_hops.is_empty() && final_id != id && body_present)
-                    .then_some(request_headers),
+                ((!redirect_hops.is_empty() && final_id != id && body_present)
+                    || (redirect_hops.is_empty()
+                        && outcome.status == 200
+                        && body_present
+                        && source_snapshot
+                            .properties
+                            .as_ref()
+                            .is_some_and(|properties| {
+                                stored_legacy_gzip_body(properties)
+                                    && crate::fetch::stored_negotiation_headers(properties).is_ok()
+                            })))
+                .then_some(request_headers),
             )
             .await?
         }
@@ -1434,7 +1459,7 @@ mod tests {
                 "status": 200,
                 "vary": [],
                 "content_language": null,
-                "request_headers": {"accept-encoding": ["gzip"]}
+                "request_headers": {"accept-encoding": ["identity"]}
             }),
         )
         .await
