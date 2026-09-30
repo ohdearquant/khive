@@ -1,10 +1,12 @@
 "use client";
 
-import { Copy, Search, X } from "@/icons";
+import { useRouter } from "next/navigation";
+import { Copy, Download, Search, X } from "@/icons";
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import styles from "@/components/showcase/repository-command-palette.module.css";
+import { APP_COMMAND_COPY, APP_NAVIGATION_COMMANDS } from "@/lib/app-commands";
 import { findRepositoryModules } from "@/lib/repository-brief";
 import type { RepoBundle, RepoModule, ViewId } from "@/lib/repo-bundle";
 import { REPOSITORY_VIEW_IDS } from "@/lib/repository-location";
@@ -31,9 +33,25 @@ type PaletteCommand =
     kind: "action";
     label: "Copy investigation link";
     detail: "Copy the current repository, snapshot, module, and view.";
-  }>;
+  }>
+  | Readonly<{
+    id: "action:copy-cli" | "action:download-review";
+    kind: "review-action";
+    label: string;
+    detail: string;
+  }>
+  | Readonly<{
+    id: string;
+    kind: "review-view";
+    label: string;
+    detail: string;
+    view: string;
+  }>
+  | (typeof APP_NAVIGATION_COMMANDS)[number];
 
-export type RepositoryCommandPaletteProps = Readonly<{
+type RepositoryPaletteProps = Readonly<{
+  surface?: "repository";
+  triggerClassName?: string;
   bundle: RepoBundle;
   activeView: ViewId;
   selectedModuleId: string | null;
@@ -42,19 +60,29 @@ export type RepositoryCommandPaletteProps = Readonly<{
   onCopyLink: () => void | Promise<void>;
 }>;
 
+type ReviewPaletteProps = Readonly<{
+  surface: "review";
+  triggerClassName?: string;
+  views: readonly Readonly<{ id: string; label: string }>[];
+  activeReviewView: string;
+  onSelectReviewView: (view: string) => void;
+  hasUnsavedReviewState: boolean;
+  onCopyCli?: () => void | Promise<void>;
+  onDownloadReview: () => void;
+  downloadSubject?: "bundle" | "report";
+}>;
+
+export type RepositoryCommandPaletteProps =
+  | RepositoryPaletteProps
+  | ReviewPaletteProps;
+
 function includesQuery(command: PaletteCommand, query: string): boolean {
   const haystack = `${command.label} ${command.detail}`.toLowerCase();
   return query.split(/\s+/u).every((token) => haystack.includes(token));
 }
 
-export function RepositoryCommandPalette({
-  bundle,
-  activeView,
-  selectedModuleId,
-  onSelectModule,
-  onSelectView,
-  onCopyLink,
-}: RepositoryCommandPaletteProps) {
+export function RepositoryCommandPalette(props: RepositoryCommandPaletteProps) {
+  const router = useRouter();
   const [open, setOpen] = useState(false);
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
   const [query, setQuery] = useState("");
@@ -69,6 +97,44 @@ export function RepositoryCommandPalette({
 
   const commands = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
+    if (props.surface === "review") {
+      const views: PaletteCommand[] = props.views.map((view) => ({
+        id: `review-view:${view.id}`,
+        kind: "review-view" as const,
+        label: view.label,
+        detail: APP_COMMAND_COPY.reviewViewDetail,
+        view: view.id,
+      }));
+      const actions: PaletteCommand[] = [
+        ...(props.onCopyCli ? [{
+          id: "action:copy-cli" as const,
+          kind: "review-action" as const,
+          label: APP_COMMAND_COPY.copyCli,
+          detail: APP_COMMAND_COPY.copyCliDetail,
+        }] : []),
+        {
+          id: "action:download-review",
+          kind: "review-action",
+          label: props.downloadSubject === "report"
+            ? APP_COMMAND_COPY.downloadReport
+            : APP_COMMAND_COPY.download,
+          detail: props.downloadSubject === "report"
+            ? APP_COMMAND_COPY.downloadReportDetail
+            : APP_COMMAND_COPY.downloadDetail,
+        },
+      ];
+      const navigation = APP_NAVIGATION_COMMANDS.map((command) =>
+        command.href === "/" && props.hasUnsavedReviewState
+          ? { ...command, detail: APP_COMMAND_COPY.reviewStateRouteBlocked }
+          : command.href === "/review" && props.activeReviewView === "core-report"
+          ? { ...command, detail: APP_COMMAND_COPY.reviewReportCurrentView }
+          : command
+      );
+      return [...navigation, ...views, ...actions].filter(
+        (command) => !normalizedQuery || includesQuery(command, normalizedQuery),
+      );
+    }
+    const { bundle } = props;
     const viewCommands: PaletteCommand[] = REPOSITORY_VIEW_IDS.map((view) => {
       const capability = bundle.capability.views[view];
       const availability = capability.status === "unavailable"
@@ -108,26 +174,29 @@ export function RepositoryCommandPalette({
         includesQuery(copyCommand, normalizedQuery)
       ? [copyCommand]
       : [];
-    return [...viewCommands, ...moduleCommands, ...actionCommands];
-  }, [bundle, query]);
-  const modulePage = bundle.graph.modules;
-  const moduleLabel = bundle.capability.labels.node_types.module.toLowerCase();
-  const moduleTotal = modulePage.total_count.status === "available"
-    ? modulePage.total_count.value
-    : null;
-  const moduleSearchScope = `${modulePage.items.length}${
-    moduleTotal != null && moduleTotal !== modulePage.items.length
-      ? ` of ${moduleTotal}`
-      : ""
-  } captured ${moduleLabel} records · ${
-    modulePage.disclosure.status === "complete" &&
-      !modulePage.truncated &&
-      modulePage.next_cursor == null
-      ? "complete"
-      : modulePage.disclosure.status === "unavailable"
-      ? bundle.capability.labels.unavailable
-      : bundle.capability.labels.truncated
-  }${modulePage.disclosure.reason ? `: ${modulePage.disclosure.reason}` : ""}`;
+    return [...viewCommands, ...moduleCommands, ...APP_NAVIGATION_COMMANDS, ...actionCommands]
+      .filter((command) => !normalizedQuery || includesQuery(command, normalizedQuery));
+  }, [props, query]);
+  const moduleSearchScope = props.surface === "review" ? null : (() => {
+    const modulePage = props.bundle.graph.modules;
+    const moduleLabel = props.bundle.capability.labels.node_types.module.toLowerCase();
+    const moduleTotal = modulePage.total_count.status === "available"
+      ? modulePage.total_count.value
+      : null;
+    return `${modulePage.items.length}${
+      moduleTotal != null && moduleTotal !== modulePage.items.length
+        ? ` of ${moduleTotal}`
+        : ""
+    } captured ${moduleLabel} records · ${
+      modulePage.disclosure.status === "complete" &&
+        !modulePage.truncated &&
+        modulePage.next_cursor == null
+        ? "complete"
+        : modulePage.disclosure.status === "unavailable"
+        ? props.bundle.capability.labels.unavailable
+        : props.bundle.capability.labels.truncated
+    }${modulePage.disclosure.reason ? `: ${modulePage.disclosure.reason}` : ""}`;
+  })();
 
   function openPalette(source?: HTMLElement | null) {
     returnFocusRef.current = source ??
@@ -155,17 +224,39 @@ export function RepositoryCommandPalette({
     }
   }
 
+  function isUnavailableNavigation(command: PaletteCommand): boolean {
+    if (command.kind !== "navigation" || props.surface !== "review") return false;
+    return (command.href === "/" && props.hasUnsavedReviewState) ||
+      (command.href === "/review" && props.activeReviewView === "core-report");
+  }
+
   function execute(command: PaletteCommand | undefined) {
-    if (!command) return;
-    if (command.kind === "view") {
+    if (!command || isUnavailableNavigation(command)) return;
+    if (command.kind === "navigation") {
       closePalette(false);
-      onSelectView(command.view);
-    } else if (command.kind === "module") {
+      if (command.href === "/review" && props.surface === "review") {
+        props.onSelectReviewView("changes");
+      } else if (command.href === "/" && props.surface !== "review") {
+        props.onSelectView("structure_graph");
+      } else {
+        router.push(command.href);
+      }
+    } else if (command.kind === "review-view" && props.surface === "review") {
       closePalette(false);
-      onSelectModule(command.module.id);
-    } else {
+      props.onSelectReviewView(command.view);
+    } else if (command.kind === "view" && props.surface !== "review") {
+      closePalette(false);
+      props.onSelectView(command.view);
+    } else if (command.kind === "module" && props.surface !== "review") {
+      closePalette(false);
+      props.onSelectModule(command.module.id);
+    } else if (command.kind === "action" && props.surface !== "review") {
       closePalette();
-      void onCopyLink();
+      void props.onCopyLink();
+    } else if (command.kind === "review-action" && props.surface === "review") {
+      closePalette();
+      if (command.id === "action:copy-cli") void props.onCopyCli?.();
+      else props.onDownloadReview();
     }
   }
 
@@ -193,12 +284,15 @@ export function RepositoryCommandPalette({
     if (open) inputRef.current?.focus();
   }, [open]);
 
-  const safeHighlightedIndex = commands.length
-    ? Math.min(highlightedIndex, commands.length - 1)
-    : 0;
+  const actionableIndices = commands.flatMap((command, index) =>
+    isUnavailableNavigation(command) ? [] : [index]
+  );
+  const safeHighlightedIndex = actionableIndices.includes(highlightedIndex)
+    ? highlightedIndex
+    : actionableIndices[0] ?? -1;
 
   useEffect(() => {
-    if (!open || commands.length === 0) return;
+    if (!open || safeHighlightedIndex < 0) return;
     optionRefs.current[safeHighlightedIndex]?.scrollIntoView?.({
       block: "nearest",
     });
@@ -208,19 +302,27 @@ export function RepositoryCommandPalette({
     if (event.key === "ArrowDown") {
       event.preventDefault();
       setHighlightedIndex((index) =>
-        commands.length ? (index + 1) % commands.length : 0
+        actionableIndices.length
+          ? actionableIndices[(actionableIndices.indexOf(index) + 1) % actionableIndices.length]
+          : -1
       );
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
       setHighlightedIndex((index) =>
-        commands.length ? (index - 1 + commands.length) % commands.length : 0
+        actionableIndices.length
+          ? actionableIndices[
+            actionableIndices.indexOf(index) < 0
+              ? actionableIndices.length - 1
+              : (actionableIndices.indexOf(index) - 1 + actionableIndices.length) % actionableIndices.length
+          ]
+          : -1
       );
     } else if (event.key === "Home") {
       event.preventDefault();
-      setHighlightedIndex(0);
+      setHighlightedIndex(actionableIndices[0] ?? -1);
     } else if (event.key === "End") {
       event.preventDefault();
-      setHighlightedIndex(Math.max(0, commands.length - 1));
+      setHighlightedIndex(actionableIndices.at(-1) ?? -1);
     } else if (event.key === "Enter") {
       event.preventDefault();
       execute(commands[safeHighlightedIndex]);
@@ -238,13 +340,15 @@ export function RepositoryCommandPalette({
     }
   }
 
-  const highlightedCommand = commands[safeHighlightedIndex];
+  const highlightedCommand = safeHighlightedIndex < 0
+    ? undefined
+    : commands[safeHighlightedIndex];
   return (
     <>
       <button
         ref={triggerRef}
         type="button"
-        className={styles.trigger}
+        className={`${styles.trigger} ${props.triggerClassName ?? ""}`.trim()}
         aria-label="Open command palette"
         aria-keyshortcuts="Meta+K Control+K"
         onClick={(event) => openPalette(event.currentTarget)}
@@ -271,8 +375,12 @@ export function RepositoryCommandPalette({
             >
               <header className={styles.header}>
                 <div>
-                  <span className={styles.eyebrow}>Repository navigation</span>
-                  <h2 id={dialogTitleId}>Repository commands</h2>
+                  <span className={styles.eyebrow}>
+                    {props.surface === "review" ? APP_COMMAND_COPY.reviewNavigation : "Repository navigation"}
+                  </span>
+                  <h2 id={dialogTitleId}>
+                    {props.surface === "review" ? APP_COMMAND_COPY.reviewCommands : "Repository commands"}
+                  </h2>
                 </div>
                 <button
                   ref={closeRef}
@@ -287,12 +395,12 @@ export function RepositoryCommandPalette({
               <label className={styles.search}>
                 <Search aria-hidden="true" />
                 <span className="visually-hidden">
-                  Search repository commands
+                  {props.surface === "review" ? APP_COMMAND_COPY.reviewSearch : "Search repository commands"}
                 </span>
                 <input
                   ref={inputRef}
                   role="combobox"
-                  aria-label="Search repository commands"
+                  aria-label={props.surface === "review" ? APP_COMMAND_COPY.reviewSearch : "Search repository commands"}
                   aria-expanded="true"
                   aria-controls={listboxId}
                   aria-activedescendant={highlightedCommand
@@ -300,7 +408,7 @@ export function RepositoryCommandPalette({
                     : undefined}
                   autoComplete="off"
                   value={query}
-                  placeholder="Jump to a module, view, or action"
+                  placeholder={props.surface === "review" ? APP_COMMAND_COPY.reviewPlaceholder : "Jump to a module, view, or action"}
                   onChange={(event) => {
                     setQuery(event.target.value);
                     setHighlightedIndex(0);
@@ -318,13 +426,18 @@ export function RepositoryCommandPalette({
                 id={listboxId}
                 className={styles.results}
                 role="listbox"
-                aria-label="Repository command results"
+                aria-label={props.surface === "review" ? APP_COMMAND_COPY.reviewResults : "Repository command results"}
               >
                 {commands.map((command, index) => {
-                  const current = command.kind === "view"
-                    ? command.view === activeView
-                    : command.kind === "module"
-                    ? command.module.id === selectedModuleId
+                  const unavailable = isUnavailableNavigation(command);
+                  const current = command.kind === "view" && props.surface !== "review"
+                    ? command.view === props.activeView
+                    : command.kind === "module" && props.surface !== "review"
+                    ? command.module.id === props.selectedModuleId
+                    : command.kind === "review-view" && props.surface === "review"
+                    ? command.view === props.activeReviewView
+                    : command.kind === "navigation"
+                    ? command.href === (props.surface === "review" ? "/review" : "/")
                     : false;
                   return (
                     <button
@@ -336,18 +449,26 @@ export function RepositoryCommandPalette({
                       type="button"
                       role="option"
                       tabIndex={-1}
-                      aria-selected={index === safeHighlightedIndex}
+                      aria-selected={!unavailable && index === safeHighlightedIndex}
+                      aria-disabled={unavailable || undefined}
+                      disabled={unavailable}
                       className={styles.result}
-                      data-highlighted={index === safeHighlightedIndex ||
+                      data-highlighted={!unavailable && index === safeHighlightedIndex ||
                         undefined}
-                      onMouseMove={() => setHighlightedIndex(index)}
+                      onMouseMove={() => {
+                        if (!unavailable) setHighlightedIndex(index);
+                      }}
                       onClick={() => execute(command)}
                     >
                       <span className={styles.resultIcon} aria-hidden="true">
-                        {command.kind === "action"
+                        {command.kind === "review-action" && command.id === "action:download-review"
+                          ? <Download />
+                          : command.kind === "action" || command.kind === "review-action"
                           ? <Copy />
                           : command.kind === "module"
                           ? "M"
+                          : command.kind === "navigation"
+                          ? "N"
                           : "V"}
                       </span>
                       <span className={styles.resultCopy}>
@@ -362,7 +483,9 @@ export function RepositoryCommandPalette({
                 })}
                 {commands.length === 0 && (
                   <p className={styles.empty}>
-                    No repository command matches this query.
+                    {props.surface === "review"
+                      ? APP_COMMAND_COPY.noMatches
+                      : "No repository command matches this query."}
                   </p>
                 )}
               </div>
@@ -374,8 +497,10 @@ export function RepositoryCommandPalette({
                 <span>
                   <kbd>↵</kbd> Open
                 </span>
-                <span>Up to {MODULE_RESULT_LIMIT} module matches</span>
-                <span className={styles.scope}>{moduleSearchScope}</span>
+                {moduleSearchScope && <>
+                  <span>Up to {MODULE_RESULT_LIMIT} module matches</span>
+                  <span className={styles.scope}>{moduleSearchScope}</span>
+                </>}
               </footer>
             </div>
           </div>

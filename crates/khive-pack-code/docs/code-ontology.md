@@ -105,14 +105,17 @@ URIs, `?` query syntax, and relative paths are refused during parameter validati
 or target filesystem probes. Missing and non-file targets are refused with
 `RuntimeError::InvalidInput` naming the path before the target runtime is constructed. A deliberately
 pre-created empty dedicated file may initialize and migrate. Omitting `db` still creates the default
-`<path>/.khive/code-map.db` when needed. This preflight protects against path typos; it does not pin
-an inode or prevent concurrent unlink/replacement between the check and SQLite open. Both explicit
+`<path>/.khive/code-map.db` when needed. This path-level courtesy preflight protects against path
+typos; it does not pin an inode or prevent concurrent unlink/replacement between the check and
+SQLite open. Both explicit
 and default targets are checked against every production database this process knows: the default
 anchor, its runtime database, every declared backend, each adjacent events database, and their
 SQLite companions. A declared backend reached through a symlink protects companions beside both
-the declared name and its physical database. Target symlinks are checked at their destination,
-including a dangling default-map link. Existing files are compared by file identity to catch hard
-links; missing members use normalized paths. An unrelated database unknown to this process is
+the declared name and its physical database. A target's final-component symlink is refused,
+including a dangling default-map link or a link to an otherwise dedicated map. Symlinks in parent
+directories retain the existing normalized path and identity checks. Existing files are compared by
+file identity to catch hard links; missing members use normalized paths. An unrelated database
+unknown to this process is
 outside this preflight fence.
 
 The dedicated map is an ordinary khive database, not a private code-pack format. Every

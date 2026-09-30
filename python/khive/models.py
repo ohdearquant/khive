@@ -24,11 +24,13 @@ T = TypeVar("T")
 
 
 class EdgeRelation(str, Enum):
-    """The closed edge ontology (ADR-002 base 15 + ADR-055 epistemic 2)."""
+    """The closed edge ontology (ADR-002, with ADR-055, ADR-191 and ADR-196)."""
 
     contains = "contains"
     part_of = "part_of"
     instance_of = "instance_of"
+    links_to = "links_to"
+    located_in = "located_in"
     extends = "extends"
     variant_of = "variant_of"
     introduced_by = "introduced_by"

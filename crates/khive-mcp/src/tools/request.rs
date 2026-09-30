@@ -30,8 +30,8 @@ pub struct RequestParams {
 
     /// Presentation mode for the response.
     ///
-    /// - `"agent"` (default): token-efficient — short UUIDs, compact timestamps,
-    ///   empty fields dropped.
+    /// - `"agent"` (default): short UUIDs, exact UTC timestamps with
+    ///   relative labels on list rows, empty fields dropped.
     /// - `"verbose"`: full canonical shape, no transformation.
     /// - `"human"`: delegated to CLI layer (same as verbose at runtime level).
     ///

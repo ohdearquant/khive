@@ -442,12 +442,31 @@ fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRunti
     runtime.filter(|runtime| !runtime.is_read_only())
 }
 
+#[cfg(all(test, feature = "channel-email"))]
+thread_local! {
+    static EMAIL_POLL_TEST_CHANNEL: std::cell::RefCell<Option<std::sync::Arc<dyn khive_channel::Channel>>> =
+        const { std::cell::RefCell::new(None) };
+    static EMAIL_POLL_TEST_SHUTDOWN: std::cell::RefCell<Option<tokio_util::sync::CancellationToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "channel-email")]
+fn email_poll_shutdown_token(
+    process_shutdown: tokio_util::sync::CancellationToken,
+) -> tokio_util::sync::CancellationToken {
+    #[cfg(test)]
+    let process_shutdown = EMAIL_POLL_TEST_SHUTDOWN
+        .with(|token| token.borrow_mut().take())
+        .unwrap_or(process_shutdown);
+    process_shutdown
+}
+
+#[cfg(feature = "channel-email")]
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
 /// warning and returns on incomplete config. Only call this with the
 /// role-and-runtime admission returned by [`channel_loop_plan`] — use
 /// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
-#[cfg(feature = "channel-email")]
 fn spawn_email_channel_loops(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
@@ -461,6 +480,10 @@ fn spawn_email_channel_loops(
             let email_ch = Arc::new(email_ch);
             let mut ch_registry = ChannelRegistry::new();
             let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
+            #[cfg(test)]
+            let dyn_ch = EMAIL_POLL_TEST_CHANNEL
+                .with(|channel| channel.borrow_mut().take())
+                .unwrap_or(dyn_ch);
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
@@ -484,6 +507,8 @@ fn spawn_email_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
+                    let poll_shutdown =
+                        email_poll_shutdown_token(khive_runtime::daemon_shutdown_token());
                     khive_runtime::track_named_background_task("email_channel_poll", async move {
                         if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
                         {
@@ -498,7 +523,7 @@ fn spawn_email_channel_loops(
                             verb_reg_poll,
                             ingest_ns_clone,
                             default_actor_clone,
-                            khive_runtime::daemon_shutdown_token(),
+                            poll_shutdown,
                         )
                         .await;
                     });
@@ -2303,14 +2328,224 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BackendAliasIdentity {
+    /// An existing file can have several distinct canonical hard-link paths.
+    #[cfg(any(unix, windows))]
+    File(FileIdentity),
+    /// A not-yet-created file has only a resolved path to compare.
+    Path(PathBuf),
+}
+
+fn backend_alias_identity(
+    backend_name: &str,
+    canonical: &std::path::Path,
+) -> anyhow::Result<BackendAliasIdentity> {
+    #[cfg(any(unix, windows))]
+    {
+        match khive_db::file_identity::database_file_identity(canonical) {
+            Ok(identity) => Ok(BackendAliasIdentity::File(identity)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+            }
+            Err(error) => anyhow::bail!(
+                "backend {backend_name}: cannot inspect database identity at {}: {error}",
+                canonical.display()
+            ),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = backend_name;
+        Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+    }
+}
+
+/// Read the identity that SQLite's pool pinned during open. A second pathname
+/// stat alone can agree with the pre-open stat after an A→B→A replacement,
+/// while SQLite actually holds B.
+fn opened_backend_alias_identity(
+    backend: &StorageBackend,
+    canonical: &std::path::Path,
+) -> anyhow::Result<BackendAliasIdentity> {
+    #[cfg(any(unix, windows))]
+    {
+        let identity = backend
+            .pool()
+            .opened_file_identity_record()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "file-backed backend {} has no opened SQLite file identity",
+                    canonical.display()
+                )
+            })?;
+        Ok(BackendAliasIdentity::File(identity))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = backend;
+        Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+    }
+}
+
+fn snapshot_matches_opened_backend(
+    snapshot: &BackendAliasIdentity,
+    opened: &BackendAliasIdentity,
+) -> bool {
+    #[cfg(any(unix, windows))]
+    {
+        // An absent first-open path has no file identity to compare yet.
+        matches!(snapshot, BackendAliasIdentity::Path(_)) || snapshot == opened
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        snapshot == opened
+    }
+}
+
+/// Bind a configured file identity to the database actually opened by SQLite.
+/// The opener is injectable only so the path-replacement window can be tested
+/// deterministically; production passes `open_backend` unchanged.
+fn open_backend_bound_to_alias_identity_with<F>(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    snapshot: &BackendAliasIdentity,
+    canonical: &std::path::Path,
+    opener: F,
+) -> anyhow::Result<(StorageBackend, BackendAliasIdentity)>
+where
+    F: FnOnce(&BackendConfig, Option<usize>) -> anyhow::Result<StorageBackend>,
+{
+    let backend = opener(cfg, max_readers)?;
+    let opened = opened_backend_alias_identity(&backend, canonical)?;
+    let at_path = backend_alias_identity(&cfg.name, canonical)?;
+    let configured_now = canonical_backend_path(cfg)?
+        .map(|path| backend_alias_identity(&cfg.name, &path))
+        .transpose()?;
+    if opened != at_path
+        || configured_now.as_ref() != Some(&opened)
+        || !snapshot_matches_opened_backend(snapshot, &opened)
+    {
+        anyhow::bail!(
+            "backend {}: database identity changed between topology snapshot and SQLite open \
+             at {}: snapshot={snapshot:?}, opened={opened:?}, path_now={at_path:?}, \
+             configured_now={configured_now:?}",
+            cfg.name,
+            canonical.display()
+        );
+    }
+    Ok((backend, opened))
+}
+
+fn verify_reused_backend_alias_identity(
+    cfg: &BackendConfig,
+    snapshot: &BackendAliasIdentity,
+    canonical: &std::path::Path,
+    existing: &StorageBackend,
+) -> anyhow::Result<()> {
+    let opened = opened_backend_alias_identity(existing, canonical)?;
+    let at_path = backend_alias_identity(&cfg.name, canonical)?;
+    let configured_now = canonical_backend_path(cfg)?
+        .map(|path| backend_alias_identity(&cfg.name, &path))
+        .transpose()?;
+    if at_path != opened
+        || configured_now.as_ref() != Some(&opened)
+        || !snapshot_matches_opened_backend(snapshot, &at_path)
+    {
+        anyhow::bail!(
+            "backend {}: alias identity changed before cached backend reuse at {}: \
+             snapshot={snapshot:?}, opened={opened:?}, path_now={at_path:?}, \
+             configured_now={configured_now:?}",
+            cfg.name,
+            canonical.display()
+        );
+    }
+    Ok(())
+}
+
+/// Open the entire declared topology against one pre-open snapshot. The
+/// injectable opener makes the snapshot→SQLite-open race executable without a
+/// scheduler or global hook; production passes `open_backend` directly.
+fn open_effective_backends_with<F>(
+    effective_backends: &[BackendConfig],
+    max_readers: Option<usize>,
+    mut opener: F,
+) -> anyhow::Result<HashMap<String, Arc<StorageBackend>>>
+where
+    F: FnMut(&BackendConfig, Option<usize>) -> anyhow::Result<StorageBackend>,
+{
+    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
+    let identities = effective_backends
+        .iter()
+        .map(|cfg| {
+            canonical_backend_path(cfg)?.map_or(Ok(None), |canonical| {
+                backend_alias_identity(&cfg.name, &canonical)
+                    .map(|identity| Some((identity, canonical)))
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut identity_to_backend: HashMap<BackendAliasIdentity, Arc<StorageBackend>> =
+        HashMap::new();
+    for (backend_cfg, identity) in effective_backends.iter().zip(identities) {
+        if let Some((ref key, ref canon)) = identity {
+            if let Some(existing) = identity_to_backend.get(key) {
+                verify_reused_backend_alias_identity(backend_cfg, key, canon, existing)?;
+                if existing.is_read_only() != backend_cfg.read_only {
+                    anyhow::bail!(
+                        "backend {} aliases {} but declares read_only={} while the same \
+                         physical database was already opened with read_only={}; every alias \
+                         of one database must use the same access mode",
+                        backend_cfg.name,
+                        canon.display(),
+                        backend_cfg.read_only,
+                        existing.is_read_only(),
+                    );
+                }
+                backends.insert(backend_cfg.name.clone(), existing.clone());
+                continue;
+            }
+        }
+        let (backend, opened_key) = if let Some((ref key, ref canon)) = identity {
+            let (backend, opened) = open_backend_bound_to_alias_identity_with(
+                backend_cfg,
+                max_readers,
+                key,
+                canon,
+                &mut opener,
+            )?;
+            (backend, Some(opened))
+        } else {
+            (opener(backend_cfg, max_readers)?, None)
+        };
+        let arc = Arc::new(backend);
+        if let (Some((snapshot, _)), Some(opened)) = (identity, opened_key) {
+            if identity_to_backend.contains_key(&opened) {
+                anyhow::bail!(
+                    "backend {}: opened database identity was already cached under another \
+                     configured path; refusing duplicate pool after topology changed",
+                    backend_cfg.name
+                );
+            }
+            identity_to_backend.insert(opened, arc.clone());
+            if matches!(&snapshot, BackendAliasIdentity::Path(_)) {
+                identity_to_backend.insert(snapshot, arc.clone());
+            }
+        }
+        backends.insert(backend_cfg.name.clone(), arc);
+    }
+    Ok(backends)
+}
+
 /// Reject conflicting access modes without opening any configured database.
 pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
-    let mut physical_sqlite: HashMap<std::path::PathBuf, (&str, bool)> = HashMap::new();
+    let mut physical_sqlite: HashMap<BackendAliasIdentity, (&str, bool)> = HashMap::new();
     for backend in backends {
         let Some(canonical) = canonical_backend_path(backend)? else {
             continue;
         };
-        if let Some((first_name, first_read_only)) = physical_sqlite.get(&canonical) {
+        let identity = backend_alias_identity(&backend.name, &canonical)?;
+
+        if let Some((first_name, first_read_only)) = physical_sqlite.get(&identity) {
             if *first_read_only != backend.read_only {
                 anyhow::bail!(
                     "backend {} aliases {} (already declared by backend {}) but declares \
@@ -2324,7 +2559,7 @@ pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> any
                 );
             }
         } else {
-            physical_sqlite.insert(canonical, (&backend.name, backend.read_only));
+            physical_sqlite.insert(identity, (&backend.name, backend.read_only));
         }
     }
     Ok(())
@@ -2620,29 +2855,20 @@ pub fn reject_conflicting_db_override_with_source(
 /// Filesystem identity of a reindex target, captured so a symlink retargeted
 /// or a file replaced in place between validation and open can be told apart
 /// from the declared file validation actually checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
+#[cfg(any(unix, windows))]
+type FileIdentity = khive_db::file_identity::DatabaseFileIdentity;
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity;
 
 fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let meta = std::fs::metadata(path).ok()?;
-        Some(FileIdentity {
-            device: meta.dev(),
-            inode: meta.ino(),
-        })
+        khive_db::file_identity::database_file_identity(path).ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        // The standard library exposes no stable file-identity accessor off
-        // unix (the Windows volume-serial and file-index accessors are
-        // unstable), so the pre-open re-check degrades to path-level
-        // validation there. This crate's non-unix lane is compile-checked
-        // only.
         let _ = path;
         None
     }
@@ -2680,7 +2906,7 @@ pub fn capture_existing_database_target(
         path.display()
     );
     let identity = file_identity(&path);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     anyhow::ensure!(
         identity.is_some(),
         "cannot capture database identity for {}",
@@ -2697,12 +2923,10 @@ pub fn capture_existing_database_target(
 /// to the same canonical (already symlink-free) path, so pinning the open to
 /// `target.path` defeats that redirect by construction; a declared file
 /// replaced in place (e.g. another database renamed over it) keeps the same
-/// path string but changes `(device, inode)`, which this call catches.
+/// path string but changes its physical file identity, which this call catches.
 ///
-/// The gap this does not close: a parent directory replaced in the sliver of
-/// time between this call returning and the underlying SQLite `open()`
-/// syscall. No API the sqlite binding used here exposes reaches an
-/// already-open file descriptor's identity, so that final window stays open.
+/// This pre-open check alone cannot close a replacement window between its
+/// return and the underlying SQLite `open()` syscall.
 pub fn reverify_reindex_target_identity(target: &ValidatedReindexTarget) -> anyhow::Result<()> {
     let observed = file_identity(&target.path);
     if observed != target.identity {
@@ -2992,38 +3216,12 @@ async fn prepare_configured_storage_topology(
         }
     }
 
-    // Open each declared backend, deduplicating SQLite backends by canonical
-    // path (ADR-028 §8). Schema preparation is deliberately deferred until
-    // after main is identified: every distinct secondary must be inventoried
-    // before main can atomically enable attachment-only GC at V21.
-    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
-    let mut path_to_backend: HashMap<std::path::PathBuf, Arc<StorageBackend>> = HashMap::new();
-    for backend_cfg in &effective_backends {
-        let canonical = canonical_backend_path(backend_cfg)?;
-        if let Some(ref canon) = canonical {
-            if let Some(existing) = path_to_backend.get(canon) {
-                if existing.is_read_only() != backend_cfg.read_only {
-                    anyhow::bail!(
-                        "backend {} aliases {} but declares read_only={} while the same \
-                         physical database was already opened with read_only={}; every alias \
-                         of one database must use the same access mode",
-                        backend_cfg.name,
-                        canon.display(),
-                        backend_cfg.read_only,
-                        existing.is_read_only(),
-                    );
-                }
-                backends.insert(backend_cfg.name.clone(), existing.clone());
-                continue;
-            }
-        }
-        let backend = open_backend(backend_cfg, max_readers)?;
-        let arc = Arc::new(backend);
-        if let Some(canon) = canonical {
-            path_to_backend.insert(canon, arc.clone());
-        }
-        backends.insert(backend_cfg.name.clone(), arc);
-    }
+    // Open each declared backend, deduplicating SQLite backends by physical
+    // file identity (or canonical path before creation; ADR-028 §8). Schema
+    // preparation is deferred until after main is identified: every distinct
+    // secondary must be inventoried before main can atomically enable
+    // attachment-only GC at V21.
+    let backends = open_effective_backends_with(&effective_backends, max_readers, open_backend)?;
 
     let main_backend = backends
         .get(BackendId::MAIN)
@@ -4293,6 +4491,7 @@ fn build_pack_runtime(
     let rt = KhiveRuntime::from_backend(backend, rt_config)
         .with_declared_backend_db_paths(declared_backend_db_paths)
         .with_diagnostic_backends(diagnostic_backends)
+        .with_diagnostic_observer_from(main_runtime)
         .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
@@ -9595,6 +9794,376 @@ region = "us-east-1"
         assert!(message.contains("read_only"), "{message}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_backend_aliases_must_agree_on_access_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("main.db");
+        let hard_link = dir.path().join("archive.db");
+        std::fs::write(&database, b"").unwrap();
+        std::fs::hard_link(&database, &hard_link).unwrap();
+
+        let mut config = duplicate_sqlite_path_config(&database);
+        config.backends[1].path = Some(hard_link);
+        config.backends[1].read_only = true;
+        let error = validate_effective_backend_alias_modes(&config.backends)
+            .expect_err("hard links to one database cannot have conflicting modes");
+        let message = error.to_string();
+        assert!(message.contains("same physical database"), "{message}");
+        assert!(message.contains("read_only"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn hard_linked_backend_aliases_share_one_open_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("main.db");
+        let hard_link = dir.path().join("archive.db");
+        rusqlite::Connection::open(&database).unwrap();
+        std::fs::hard_link(&database, &hard_link).unwrap();
+
+        let mut config = duplicate_sqlite_path_config(&database);
+        config.backends[1].path = Some(hard_link);
+        let topology = prepare_configured_storage_topology(
+            base_runtime_config_for_multi_backend(),
+            &config,
+            None,
+            StorageTopologyPurpose::Serving,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &topology.backends["main"],
+            &topology.backends["alias"]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_snapshot_to_open_aba_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for (path, marker) in [(&main, "original"), (&replacement, "replacement")] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch(&format!("CREATE TABLE {marker} (id INTEGER)"))
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let mut opened_alias = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                let staged_replacement = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged_replacement).unwrap();
+                std::fs::rename(&staged_replacement, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                opened_main = true;
+                assert_eq!(file_identity(&main), Some(replacement_identity));
+                let staged_original = dir.path().join("staged-original.db");
+                std::fs::hard_link(&alias, &staged_original).unwrap();
+                std::fs::rename(&staged_original, &main).unwrap();
+                Ok(backend)
+            } else {
+                opened_alias = true;
+                open_backend(cfg, max_readers)
+            }
+        })
+        .err()
+        .expect("the opened replacement must not be cached under the original inode");
+        assert!(opened_main);
+        assert!(
+            !opened_alias,
+            "reject before alias routing or schema preparation"
+        );
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        let message = error.to_string();
+        assert!(message.contains("identity changed"), "{message}");
+        assert!(message.contains("opened="), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_snapshot_to_open_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                let staged = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                assert_eq!(
+                    backend.pool().opened_file_identity_record(),
+                    Some(replacement_identity)
+                );
+                opened_main = true;
+                Ok(backend)
+            } else {
+                panic!("reject before looking up or opening the hard-link alias")
+            }
+        })
+        .err()
+        .expect("the opened replacement must not inherit the old topology snapshot");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backend_alias_snapshot_rejects_same_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            if cfg.name == "main" {
+                std::fs::remove_file(&main).unwrap();
+                std::fs::hard_link(&replacement, &main).unwrap();
+                let backend = open_backend(cfg, max_readers)?;
+                assert_eq!(
+                    backend.pool().opened_file_identity_record(),
+                    Some(replacement_identity)
+                );
+                opened_main = true;
+                Ok(backend)
+            } else {
+                panic!("reject before cached alias reuse")
+            }
+        })
+        .err()
+        .expect("a read-only legacy database replacement must fail before alias routing");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_path_swap_after_sqlite_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                assert_eq!(file_identity(&main), Some(original_identity));
+                assert_eq!(
+                    backend.pool().opened_file_identity_record(),
+                    Some(original_identity)
+                );
+                opened_main = true;
+                let staged = dir.path().join("staged-replacement.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &main).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("the path replacement after SQLite open must fail before alias reuse");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_hard_link_alias_rechecks_path_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                let staged = dir.path().join("staged-alias.db");
+                std::fs::hard_link(&replacement, &staged).unwrap();
+                std::fs::rename(&staged, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("changed alias must not reuse the cached original backend");
+        assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        assert!(error.to_string().contains("before cached backend reuse"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_symlink_alias_rechecks_configured_target_before_reuse() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        symlink(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&replacement, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("retargeted symlink must not reuse the cached original backend");
+        assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        let message = error.to_string();
+        assert!(message.contains("before cached backend reuse"), "{message}");
+        assert!(message.contains("configured_now="), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_rechecks_configured_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        symlink(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[0].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
+            opened_count += 1;
+            let backend = open_backend(cfg, max_readers)?;
+            if cfg.name == "main" {
+                std::fs::remove_file(&alias).unwrap();
+                symlink(&replacement, &alias).unwrap();
+            }
+            Ok(backend)
+        })
+        .err()
+        .expect("retargeted configured path must fail before caching the opened backend");
+        assert_eq!(opened_count, 1, "reject before opening the next backend");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        let message = error.to_string();
+        assert!(
+            message.contains("between topology snapshot and SQLite open"),
+            "{message}"
+        );
+        assert!(message.contains("configured_now="), "{message}");
+    }
+
     /// Regression for #720: changing `HOME` after runtime-config resolution but
     /// before multi-backend registry construction must not change the database
     /// anchor used by the consistency guard.
@@ -13017,17 +13586,30 @@ backend = "kg-backend"
     #[cfg(feature = "channel-email")]
     mod spawn_email_channel_loops_tests {
         use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use std::sync::{Arc, Mutex};
 
-        const EMAIL_ENV_VARS: [&str; 9] = [
+        const EMAIL_ENV_VARS: &[&str] = &[
             "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_SMTP_PORT",
             "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_IMAP_PORT",
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
             "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAILBOX",
             "KHIVE_EMAIL_MAINTAINER_ADDRESS",
             "KHIVE_EMAIL_AUTHSERV_ID",
             "KHIVE_EMAIL_PASSWORD",
             "KHIVE_EMAIL_OAUTH_TENANT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
+            "KHIVE_EMAIL_QUARANTINE_STORE",
+            "KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS",
+            "KHIVE_EMAIL_INGEST_NAMESPACE",
+            "KHIVE_EMAIL_DEFAULT_ACTOR",
         ];
 
         /// RAII guard: snapshots each `KHIVE_EMAIL_*` var's current value, clears it,
@@ -13059,6 +13641,158 @@ backend = "kg-backend"
                     }
                 }
             }
+        }
+
+        struct OneMessageEmailChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for OneMessageEmailChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(self.envelope.lock().unwrap().take().into_iter().collect())
+            }
+        }
+
+        #[test]
+        fn email_poll_shutdown_override_survives_cancelled_process_token() {
+            let cancelled_process = tokio_util::sync::CancellationToken::new();
+            cancelled_process.cancel();
+            let isolated = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(isolated.clone());
+            });
+
+            let selected = email_poll_shutdown_token(cancelled_process);
+            assert!(!selected.is_cancelled());
+            selected.cancel();
+            assert!(isolated.is_cancelled());
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial]
+        async fn production_email_spawn_routes_unset_default_actor_to_channel_mailbox() {
+            let _env_guard = EmailEnvGuard::clear();
+            std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_USERNAME", "mailbox@example.com");
+            std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+            std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.example.com");
+            std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+            assert!(std::env::var_os("KHIVE_EMAIL_DEFAULT_ACTOR").is_none());
+            khive_channel_email::EmailChannel::from_env().expect("email config takes the Ok arm");
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let blob_dir = tempfile::tempdir().expect("blob directory");
+            runtime
+                .install_blob_store(Arc::new(
+                    khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                        .expect("blob store"),
+                ))
+                .expect("install quarantine blob store");
+            let server = KhiveMcpServer::with_packs(
+                runtime,
+                &["kg".to_string(), "comm".to_string(), "blob".to_string()],
+            )
+            .expect("server builds with comm and blob storage");
+            let registry = server.verb_registry_clone();
+            let mut admission = server.channel_loop_admission();
+            assert!(
+                admission.inbound_poll,
+                "writable comm runtime admits polling"
+            );
+            admission.outbound_delivery = false;
+
+            // Replace the transport and process-global shutdown token. The
+            // real spawn path still resolves the actor, starts
+            // channel_poll_loop, and dispatches comm.ingest.
+            let test_shutdown = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(test_shutdown.clone());
+            });
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Arc::new(OneMessageEmailChannel {
+                    envelope: Mutex::new(Some(
+                        ChannelEnvelope::new(
+                            "email:sender@example.com",
+                            "email:mailbox@example.com",
+                            "production actor wiring",
+                        )
+                        .with_external_id("email-production-default-actor"),
+                    )),
+                }));
+            });
+            spawn_email_channel_loops(&server, admission);
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed fake transport"
+                );
+            });
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed test-scoped shutdown token"
+                );
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let message = loop {
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                tokio::task::yield_now().await;
+                let channel_inbox = registry
+                    .dispatch_with_identity(
+                        "comm.inbox",
+                        serde_json::json!({"status": "all"}),
+                        Some(khive_runtime::RequestIdentity {
+                            namespace: "local".to_string(),
+                            actor_id: Some("channel:email".to_string()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .expect("channel actor reads its own inbox");
+                if let Some(message) = channel_inbox["messages"]
+                    .as_array()
+                    .expect("channel inbox messages")
+                    .iter()
+                    .find(|message| message["content"] == "production actor wiring")
+                {
+                    break message.clone();
+                }
+                let local_inbox = registry
+                    .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                    .await
+                    .expect("local actor reads its own inbox");
+                assert!(
+                    !local_inbox["messages"]
+                        .as_array()
+                        .expect("local inbox messages")
+                        .iter()
+                        .any(|message| message["content"] == "production actor wiring"),
+                    "the production poll must not pass local as comm.ingest's default actor"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "production polling did not ingest its test message within 30s"
+                );
+            };
+            assert_eq!(message["properties"]["to_actor"], "channel:email");
+            test_shutdown.cancel();
         }
 
         #[tokio::test]

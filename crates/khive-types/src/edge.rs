@@ -8,14 +8,15 @@ use core::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// The 9 structural categories that group the 18 canonical edge relations.
+/// The 9 structural categories that group the 19 canonical edge relations.
 ///
 /// Exposed via [`EdgeRelation::category`] for query planners and UI rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EdgeCategory {
-    /// Composition and reference: `contains`, `part_of`, `instance_of`, `links_to`
+    /// Composition, reference and location: `contains`, `part_of`, `instance_of`, `links_to`,
+    /// `located_in`
     Structure,
     /// Intellectual lineage: `extends`, `variant_of`, `introduced_by`, `supersedes`
     Derivation,
@@ -35,7 +36,7 @@ pub enum EdgeCategory {
     Epistemic,
 }
 
-/// Closed set of 18 canonical edge relations.
+/// Closed set of 19 canonical edge relations.
 ///
 /// No `Default` — every edge requires an explicit relation.
 /// Wire format: snake_case strings (e.g. `"part_of"`, `"introduced_by"`).
@@ -48,6 +49,7 @@ pub enum EdgeRelation {
     PartOf,
     InstanceOf,
     LinksTo,
+    LocatedIn,
     // Derivation
     Extends,
     VariantOf,
@@ -73,12 +75,13 @@ pub enum EdgeRelation {
 }
 
 impl EdgeRelation {
-    /// All 18 canonical relations in ontology-table order.
-    pub const ALL: [Self; 18] = [
+    /// All 19 canonical relations in ontology-table order.
+    pub const ALL: [Self; 19] = [
         Self::Contains,
         Self::PartOf,
         Self::InstanceOf,
         Self::LinksTo,
+        Self::LocatedIn,
         Self::Extends,
         Self::VariantOf,
         Self::IntroducedBy,
@@ -95,12 +98,13 @@ impl EdgeRelation {
         Self::Refutes,
     ];
 
-    /// Valid snake_case names for all 18 canonical relations.
+    /// Valid snake_case names for all 19 canonical relations.
     pub const VALID_NAMES: &'static [&'static str] = &[
         "contains",
         "part_of",
         "instance_of",
         "links_to",
+        "located_in",
         "extends",
         "variant_of",
         "introduced_by",
@@ -125,7 +129,7 @@ impl EdgeRelation {
     /// The category this relation belongs to.
     pub const fn category(&self) -> EdgeCategory {
         match self {
-            Self::Contains | Self::PartOf | Self::InstanceOf | Self::LinksTo => {
+            Self::Contains | Self::PartOf | Self::InstanceOf | Self::LinksTo | Self::LocatedIn => {
                 EdgeCategory::Structure
             }
             Self::Extends | Self::VariantOf | Self::IntroducedBy | Self::Supersedes => {
@@ -148,6 +152,7 @@ impl EdgeRelation {
             Self::PartOf => "part_of",
             Self::InstanceOf => "instance_of",
             Self::LinksTo => "links_to",
+            Self::LocatedIn => "located_in",
             Self::Extends => "extends",
             Self::VariantOf => "variant_of",
             Self::IntroducedBy => "introduced_by",
@@ -177,7 +182,7 @@ impl FromStr for EdgeRelation {
 
     /// Parse a string into an `EdgeRelation`.
     ///
-    /// Accepts the 18 canonical relation names (case-insensitive, with hyphens
+    /// Accepts the 19 canonical relation names (case-insensitive, with hyphens
     /// normalised to underscores) and also squashed forms that omit the separator
     /// (e.g. `"partof"`, `"derivedfrom"`).  The squashed forms exist for ergonomic
     /// DSL entry; they are **not** stored on the wire, which always uses the
@@ -203,6 +208,7 @@ impl FromStr for EdgeRelation {
             "part_of" | "partof" => Ok(Self::PartOf),
             "instance_of" | "instanceof" => Ok(Self::InstanceOf),
             "links_to" | "linksto" => Ok(Self::LinksTo),
+            "located_in" | "locatedin" => Ok(Self::LocatedIn),
             "extends" => Ok(Self::Extends),
             "variant_of" | "variantof" => Ok(Self::VariantOf),
             "introduced_by" | "introducedby" => Ok(Self::IntroducedBy),
@@ -232,8 +238,8 @@ mod tests {
     use alloc::string::ToString;
 
     #[test]
-    fn all_has_eighteen_variants() {
-        assert_eq!(EdgeRelation::ALL.len(), 18);
+    fn all_has_nineteen_variants() {
+        assert_eq!(EdgeRelation::ALL.len(), 19);
     }
 
     #[test]
@@ -315,7 +321,7 @@ mod tests {
             "error should list derived_from"
         );
         assert!(msg.contains("precedes"), "error should list precedes");
-        assert!(msg.contains("annotates"), "error should list all 18");
+        assert!(msg.contains("annotates"), "error should list all 19");
     }
 
     #[test]
@@ -335,6 +341,7 @@ mod tests {
         assert_eq!(EdgeRelation::PartOf.category(), EdgeCategory::Structure);
         assert_eq!(EdgeRelation::InstanceOf.category(), EdgeCategory::Structure);
         assert_eq!(EdgeRelation::LinksTo.category(), EdgeCategory::Structure);
+        assert_eq!(EdgeRelation::LocatedIn.category(), EdgeCategory::Structure);
 
         assert_eq!(EdgeRelation::Extends.category(), EdgeCategory::Derivation);
         assert_eq!(EdgeRelation::VariantOf.category(), EdgeCategory::Derivation);
@@ -406,6 +413,24 @@ mod tests {
     }
 
     #[test]
+    fn from_str_located_in() {
+        assert_eq!(
+            "located_in".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::LocatedIn
+        );
+        assert_eq!(
+            "located-in".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::LocatedIn
+        );
+        assert_eq!(
+            "locatedin".parse::<EdgeRelation>().unwrap(),
+            EdgeRelation::LocatedIn
+        );
+        assert_eq!(EdgeRelation::LocatedIn.to_string(), "located_in");
+        assert_eq!(EdgeRelation::LocatedIn.category(), EdgeCategory::Structure);
+    }
+
+    #[test]
     fn is_symmetric_only_for_lateral_peer_relations() {
         assert!(EdgeRelation::CompetesWith.is_symmetric());
         assert!(EdgeRelation::ComposedWith.is_symmetric());
@@ -414,6 +439,7 @@ mod tests {
         assert!(!EdgeRelation::Precedes.is_symmetric());
         assert!(!EdgeRelation::Extends.is_symmetric());
         assert!(!EdgeRelation::LinksTo.is_symmetric());
+        assert!(!EdgeRelation::LocatedIn.is_symmetric());
     }
 
     #[test]

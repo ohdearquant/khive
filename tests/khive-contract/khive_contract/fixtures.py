@@ -43,7 +43,7 @@ NOTE_KINDS: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
-# Edge relation ontology (ADR-002 base 15 + ADR-055 epistemic 2 = 17 total)
+# Edge relation ontology (ADR-002 base 15 + ADR-055 epistemic 2 + ADR-191 links_to + ADR-196 located_in = 19 total)
 # Source of truth: crates/khive-types/src/edge.rs EdgeRelation::VALID_NAMES
 # ---------------------------------------------------------------------------
 
@@ -53,6 +53,8 @@ EDGE_RELATIONS: frozenset[str] = frozenset(
         "contains",
         "part_of",
         "instance_of",
+        "links_to",
+        "located_in",
         # Derivation
         "extends",
         "variant_of",
