@@ -3219,15 +3219,35 @@ pub(crate) async fn fresh_tail_serving(
             // above `s`. A filesystem commit-record read (no DB access)
             // decides whether re-resolution is possible before this
             // snapshot's floor fallback is needed.
-            let resolved_new_s = ann_segment_dir(rt, model)
-                .and_then(|dir| {
-                    read_commit_info(&dir).ok().flatten().and_then(|info| {
-                        info.last_applied_seq
-                            .and_then(|base_seq| effective_persisted_state(&dir, base_seq).ok())
-                            .map(|(seq, _)| seq)
-                    })
-                })
-                .filter(|new_s| *new_s >= m);
+            let persisted = match ann_segment_dir(rt, model) {
+                None => Ok(None),
+                Some(dir) => match read_commit_info(&dir) {
+                    Err(e) => Err(e.to_string()),
+                    Ok(info) => match info.and_then(|info| info.last_applied_seq) {
+                        None => Ok(None),
+                        Some(base_seq) => {
+                            effective_persisted_state(&dir, base_seq).map(|(seq, _)| Some(seq))
+                        }
+                    },
+                },
+            };
+            let resolved_new_s = match persisted {
+                Ok(seq) => seq.filter(|new_s| *new_s >= m),
+                Err(e) => {
+                    // An unreadable commit record or delta HEAD does not show
+                    // that no newer segment exists. Compaction through `m`
+                    // means a published state covered `m`, so a write it
+                    // removed is in neither the stale candidates nor the log
+                    // above `m`: no floored tail can complete them.
+                    end_read_snapshot(reader.as_mut()).await;
+                    tracing::warn!(error = %e, model, "fresh-tail: persisted segment state read failed; dropping stale ANN candidates");
+                    bump_generation(ann, key).await;
+                    return FreshTailOutcome::Replace(
+                        Vec::new(),
+                        Some("fresh-tail: persisted segment state read failed; dropped stale candidates"),
+                    );
+                }
+            };
             return match resolved_new_s {
                 Some(new_s) => {
                     end_read_snapshot(reader.as_mut()).await;
@@ -3399,11 +3419,16 @@ async fn fresh_tail_reresolve(
     let FreshTailSearch { query, k, route } = search;
     let mut expected_s = new_s;
     for round in 1..=FRESH_TAIL_RERESOLVE_MAX_ROUNDS {
+        // Every failure below that cannot produce re-resolved candidates drops
+        // the stale ones: the caller chose re-resolution because compaction
+        // passed their watermark, so a write it removed is in neither the
+        // stale candidates nor the log above the registry minimum.
         let Some(dir) = ann_segment_dir(rt, model) else {
             bump_generation(ann, key).await;
-            return FreshTailOutcome::Skipped(SkipReason::bare(
-                "fresh-tail: re-resolved segment directory unavailable",
-            ));
+            return FreshTailOutcome::Replace(
+                Vec::new(),
+                Some("fresh-tail: re-resolved segment directory unavailable; dropped stale candidates"),
+            );
         };
         let bridge = match AnnBridge::load(&dir) {
             Ok(b) => b,
@@ -3426,12 +3451,12 @@ async fn fresh_tail_reresolve(
         let candidates = match bridge.search_with_route(query, k, route) {
             Ok(hits) => hits,
             Err(e) => {
-                tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; skipping exact leg");
+                tracing::warn!(error = %e, model, "fresh-tail: re-resolved segment search failed; dropping stale ANN candidates");
                 bump_generation(ann, key).await;
-                return FreshTailOutcome::Skipped(SkipReason::with_error(
-                    "fresh-tail: re-resolved segment search failed",
-                    e,
-                ));
+                return FreshTailOutcome::Replace(
+                    Vec::new(),
+                    Some("fresh-tail: re-resolved segment search failed; dropped stale candidates"),
+                );
             }
         };
         // This load served only the current query; force re-adoption so the
@@ -4325,7 +4350,7 @@ mod tests {
     /// that genuinely has nothing further to say.
     #[test]
     fn skip_reason_without_an_error_renders_the_bare_label() {
-        const LABEL: &str = "fresh-tail: re-resolved segment directory unavailable";
+        const LABEL: &str = "note-search ANN consumer is not active in tail snapshot";
         let reason = SkipReason::bare(LABEL);
         assert_eq!(reason.detail(), None);
         assert_eq!(reason.label(), LABEL);
@@ -7546,6 +7571,234 @@ mod tests {
             current_generation(&ann, &key).await > generation_before,
             "the drop must force re-adoption so a future query gets a fresh bridge"
         );
+    }
+
+    /// A persisted base at `s1` plus a peer's delta checkpoint over it, with
+    /// the registry raised to the delta watermark and the log compacted
+    /// through it: this process's bridge stays pinned at `s1`, and the write
+    /// inside the delta is gone from the retained log.
+    struct CompactedPeerDelta {
+        rt: TestRuntime,
+        ann: SharedAnn,
+        key: AnnKey,
+        s1: u64,
+        delta_s: u64,
+        inside: Uuid,
+        dir: std::path::PathBuf,
+    }
+
+    async fn compacted_peer_delta(model: &str, dims: usize) -> CompactedPeerDelta {
+        let rt = test_runtime_with_hash_embedder(model, dims);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..3u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("compacted peer delta seed note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create seed note");
+        }
+        let ann = new_shared();
+        let key = AnnKey::from_token(model);
+        ensure_ann_for_model(&rt, &token, &ann, model)
+            .await
+            .expect("warm");
+        let s1 = bridge_applied_seq(&ann, &key)
+            .await
+            .expect("bridge watermark after initial warm");
+        let inside = rt
+            .create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                "compacted peer delta note inside the published delta",
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create delta note")
+            .id;
+
+        let dir = ann_segment_dir(&rt, model).expect("segment dir (file-backed test runtime)");
+        let mut peer_bridge = AnnBridge::load(&dir).expect("load persisted segment");
+        let (ops, delta_s) = fetch_final_tail(&rt, model, s1, None)
+            .await
+            .expect("fetch tail for peer replay");
+        assert!(
+            delta_s > s1,
+            "sanity: the delta must cover a write above s1"
+        );
+        let raw_count = ops.len() as u64;
+        peer_bridge
+            .apply_final_ops(ops.clone(), delta_s)
+            .expect("apply peer replay");
+        peer_bridge.record_delta_batch(ops, delta_s, raw_count);
+        assert!(
+            !peer_bridge.needs_full_compaction(),
+            "sanity: the peer checkpoint must publish a delta, not a full segment"
+        );
+        delta::write(&dir, &peer_bridge).expect("publish peer delta");
+        raise_watermark(&rt, model, delta_s)
+            .await
+            .expect("raise registry watermark to the delta watermark");
+        compact_log(&rt, model).await.expect("compact log");
+        let (retained, _) = fetch_final_tail(&rt, model, s1, None)
+            .await
+            .expect("fetch the retained log above the bridge watermark");
+        assert!(
+            !retained.iter().any(|(id, _)| *id == inside),
+            "precondition: the write inside the delta is gone from the retained \
+             log, so no tail can restore it, got: {retained:?}"
+        );
+        CompactedPeerDelta {
+            rt,
+            ann,
+            key,
+            s1,
+            delta_s,
+            inside,
+            dir,
+        }
+    }
+
+    /// Assert the leg dropped the stale candidates with `expected_reason` and
+    /// forced re-adoption.
+    async fn assert_dropped_stale_candidates(
+        outcome: FreshTailOutcome,
+        expected_reason: &'static str,
+        fixture: &CompactedPeerDelta,
+        generation_before: u64,
+    ) {
+        match outcome {
+            FreshTailOutcome::Replace(candidates, reason) => {
+                assert!(
+                    candidates.is_empty(),
+                    "the stale candidates must be dropped, got: {candidates:?}"
+                );
+                assert_eq!(
+                    reason,
+                    Some(expected_reason),
+                    "the drop must disclose its failure site"
+                );
+            }
+            FreshTailOutcome::Ops(ops) => panic!(
+                "a floored tail cannot restore write {} compacted into the delta; \
+                 merging it would serve the stale candidates: {ops:?}",
+                fixture.inside
+            ),
+            FreshTailOutcome::Skipped(reason) => {
+                panic!("a skip serves the stale candidates unmerged: {reason}")
+            }
+        }
+        assert!(
+            current_generation(&fixture.ann, &fixture.key).await > generation_before,
+            "the drop must force re-adoption so a future query gets a fresh bridge"
+        );
+    }
+
+    /// The mismatch preflight reads the base commit record and the delta HEAD
+    /// to decide whether a newer segment exists. A HEAD it cannot read is not
+    /// evidence that none does: the leg must drop the stale candidates, never
+    /// floor them at the registry minimum and serve them as healthy.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_drops_stale_candidates_when_the_delta_head_cannot_be_read() {
+        const MODEL: &str = "adr118-reresolve-unreadable-delta-head-test-model";
+        const DIMS: usize = 8;
+        let fixture = compacted_peer_delta(MODEL, DIMS).await;
+        let base_seq = read_commit_info(&fixture.dir)
+            .expect("read base commit")
+            .and_then(|info| info.last_applied_seq)
+            .expect("base watermark");
+        assert_eq!(
+            effective_persisted_state(&fixture.dir, base_seq)
+                .expect("control: the intact HEAD reads")
+                .0,
+            fixture.delta_s,
+            "control: the intact HEAD promises the delta watermark"
+        );
+
+        std::fs::write(fixture.dir.join(delta::HEAD_FILE), b"not a delta head")
+            .expect("overwrite the delta HEAD");
+        assert!(
+            effective_persisted_state(&fixture.dir, base_seq).is_err(),
+            "precondition: the preflight's delta HEAD read must fail"
+        );
+
+        let generation_before = current_generation(&fixture.ann, &fixture.key).await;
+        let query = fnv_to_vec("compacted peer delta note inside the published delta", DIMS);
+        let outcome = fresh_tail_leg(
+            &fixture.rt,
+            &fixture.ann,
+            &fixture.key,
+            MODEL,
+            &query,
+            10,
+            Some(fixture.s1),
+        )
+        .await;
+        assert_dropped_stale_candidates(
+            outcome,
+            "fresh-tail: persisted segment state read failed; dropped stale candidates",
+            &fixture,
+            generation_before,
+        )
+        .await;
+    }
+
+    /// Re-resolution loads an intact newer segment but its search fails. The
+    /// stale candidates still miss the write compacted into the delta, so the
+    /// leg must drop them rather than skip and serve them.
+    #[tokio::test]
+    #[serial(adr118_fresh_tail)]
+    async fn fresh_tail_leg_drops_stale_candidates_when_the_re_resolved_search_fails() {
+        const MODEL: &str = "adr118-reresolve-search-failure-test-model";
+        const DIMS: usize = 8;
+        let fixture = compacted_peer_delta(MODEL, DIMS).await;
+        let reloaded = AnnBridge::load(&fixture.dir).expect("control: the intact chain loads");
+        assert_eq!(
+            reloaded.index.last_applied_seq(),
+            Some(fixture.delta_s),
+            "control: re-resolution would load the delta watermark"
+        );
+        // A query whose width differs from the index makes the re-resolved
+        // search fail after the load succeeds.
+        let query = vec![0.5_f32; DIMS + 1];
+        assert!(
+            reloaded
+                .search_with_route(&query, 10, AnnScoreRoute::Memory)
+                .is_err(),
+            "precondition: the re-resolved search must fail for this query"
+        );
+
+        let generation_before = current_generation(&fixture.ann, &fixture.key).await;
+        let outcome = fresh_tail_leg(
+            &fixture.rt,
+            &fixture.ann,
+            &fixture.key,
+            MODEL,
+            &query,
+            10,
+            Some(fixture.s1),
+        )
+        .await;
+        assert_dropped_stale_candidates(
+            outcome,
+            "fresh-tail: re-resolved segment search failed; dropped stale candidates",
+            &fixture,
+            generation_before,
+        )
+        .await;
     }
 
     /// A re-resolution that loses its post-search SQL leg must return a reasoned `Replace`, not `None` or a stale-resurrecting `Skipped`.

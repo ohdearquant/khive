@@ -301,7 +301,11 @@ minimum `m` exceeds the bridge's watermark `s`, the log may no longer retain eve
   snapshot's floor fallback is even needed. If one exists, `fresh_tail_reresolve` handles it
   (below). If not, the leg floors the scan at the same-snapshot registry minimum instead of
   dropping the leg — a coherent `(old candidates, registry minimum)` pair — and forces
-  re-adoption (`bump_generation`) so a future query gets a fresh bridge.
+  re-adoption (`bump_generation`) so a future query gets a fresh bridge. A commit record or
+  delta HEAD that cannot be read is not evidence that no newer segment exists: compaction
+  through `m` means a published state covered `m`, so a write it removed is in neither the
+  old candidates nor the log above `m`. That case drops the old candidates with a disclosed
+  `Replace` and forces re-adoption instead of flooring.
 
 ### Re-resolution convergence (`fresh_tail_reresolve`)
 
@@ -331,9 +335,11 @@ not being provably retained in the log.
 The preflight reads only the delta HEAD, not the chunk chain it names, so a valid HEAD can
 promise a watermark the segment load then refuses to deliver (a missing or corrupt chunk).
 A write compacted into that chain is then in neither the caller's candidates nor the log
-above the registry minimum, so no tail can complete the stale set. Any load failure inside
-`fresh_tail_reresolve` therefore drops the stale candidates with a disclosed `Replace` and
-forces re-adoption, rather than skipping, which would serve them with no tail at all.
+above the registry minimum, so no tail can complete the stale set. Any failure inside
+`fresh_tail_reresolve` that leaves it without re-resolved candidates (the segment directory
+unavailable, the load rejected, or the search failed) therefore drops the stale candidates
+with a disclosed `Replace` and forces re-adoption, rather than skipping, which would serve
+them with no tail at all.
 
 ### Outcome disclosure contract
 
@@ -349,7 +355,9 @@ disclosure — so no exceptional class is silently treated as healthy:
   `Some(..)` when the re-resolved candidates are served _without_ their fresh-tail merge
   (a reader/snapshot/registry/tail-fetch failure after re-resolution) — the candidate set is
   still coherent, but read-your-writes visibility was lost, and the caller must disclose
-  that. `None` means the full `(candidates, tail)` pair was assembled — no degradation.
+  that. An empty candidate list with a `reason` drops the caller's stale set when
+  re-resolution was required but could not produce candidates. `None` means the full
+  `(candidates, tail)` pair was assembled — no degradation.
 - **`Skipped(reason)`** — the leg sat out the query entirely (disabled, unregistered
   consumer, or an unrecoverable read failure); the caller's prior candidates are unaffected,
   but the non-empty `reason` must still be disclosed. `reason` is a failure-site label plus,
