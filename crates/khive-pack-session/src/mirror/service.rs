@@ -369,8 +369,9 @@ mod config_tests {
     #[test]
     fn pinned_export_file_replaced_by_symlink_is_not_rescheduled() {
         let root = tempfile::TempDir::new().expect("configured root");
+        let root_path = std::fs::canonicalize(root.path()).expect("physical configured root");
         let outside = tempfile::TempDir::new().expect("outside root");
-        let export = root.path().join("conversations.json");
+        let export = root_path.join("conversations.json");
         let outside_export = outside.path().join("conversations.json");
         std::fs::write(&export, "[]").expect("configured export");
         std::fs::write(&outside_export, "[{}]").expect("outside export");
@@ -390,12 +391,16 @@ mod config_tests {
             .get(&export)
             .is_some_and(|dir| dir.pinned));
         assert!(discovery.schedule_files().is_empty());
-        assert!(super::ingest::open_source_file_beneath(root.path(), &export, None).is_err());
+        assert!(super::ingest::open_source_file_beneath(&root_path, &export, None).is_err());
     }
 
     #[cfg(unix)]
     #[test]
     fn initial_probe_refuses_a_linked_configured_root_ancestor() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("QUALIFIED SKIP: a non-root-owned ancestor fixture requires a non-root test process");
+            return;
+        }
         let temp = tempfile::TempDir::new().expect("fixture directory");
         let fixture = std::fs::canonicalize(temp.path()).expect("fixture anchor");
         let inside = fixture.join("inside");
@@ -426,6 +431,10 @@ mod config_tests {
     #[cfg(unix)]
     #[test]
     fn initial_probe_refuses_a_root_ancestor_substituted_after_discovery() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("QUALIFIED SKIP: a non-root-owned ancestor fixture requires a non-root test process");
+            return;
+        }
         use std::sync::{Arc, Barrier};
 
         let temp = tempfile::TempDir::new().expect("fixture directory");

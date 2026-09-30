@@ -196,8 +196,8 @@ fn open_source_file(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-/// Open a scheduled source through its configured directory, refusing linked
-/// ancestors as well as a linked final file. Each directory handle pins the
+/// Open a scheduled source through its configured directory, refusing untrusted
+/// ancestor links and a linked final file. Each directory handle pins the
 /// component used by the next handle-relative open, so replacing a parent during the walk
 /// cannot redirect the remaining components outside `root`.
 #[derive(Clone, Copy)]
@@ -207,54 +207,170 @@ pub(crate) struct TrustedSource<'a> {
 }
 
 /// Prove the configured root through native directory handles before its
-/// identity can become the first probe's witness. Absolute paths start at `/`;
-/// relative paths start at the process's opened current directory. No pathname
-/// canonicalization may turn a linked component into an accepted root.
+/// identity can become the first probe's witness. Root-owned ancestor links,
+/// such as macOS `/tmp`, resolve through those handles; the final root component
+/// still refuses every link. No pathname canonicalization admits a root.
 #[cfg(unix)]
 fn open_source_root(root: &Path) -> std::io::Result<Vec<std::fs::File>> {
-    use std::ffi::{CString, OsStr};
+    use std::ffi::{CString, OsStr, OsString};
     use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Component;
 
-    let anchor = if root.is_absolute() { "/" } else { "." };
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    let mut pinned_directories = vec![options.open(anchor)?];
-    for component in root.components() {
-        let name = match component {
-            Component::RootDir | Component::CurDir => continue,
-            Component::ParentDir => OsStr::new(".."),
-            Component::Normal(name) => name,
-            Component::Prefix(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "mirror source root contains an unsupported path prefix",
-                ));
-            }
-        };
+    fn open_anchor(absolute: bool) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.open(if absolute { "/" } else { "." })
+    }
+
+    fn walk_components(
+        pinned_directories: &mut Vec<std::fs::File>,
+        path: &Path,
+        allow_final_link: bool,
+        remaining_links: &mut u32,
+    ) -> std::io::Result<()> {
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::ParentDir => OsStr::new(".."),
+                Component::Normal(name) => name,
+                Component::Prefix(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "mirror source root contains an unsupported path prefix",
+                    ));
+                }
+            };
+            open_component(
+                pinned_directories,
+                name,
+                allow_final_link || components.peek().is_some(),
+                remaining_links,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn open_component(
+        pinned_directories: &mut Vec<std::fs::File>,
+        name: &OsStr,
+        allow_root_owned_link: bool,
+        remaining_links: &mut u32,
+    ) -> std::io::Result<()> {
         let name = CString::new(name.as_bytes()).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "mirror source root contains a NUL byte",
             )
         })?;
-        let parent = pinned_directories.last().expect("root anchor is retained");
+        let parent_fd = pinned_directories
+            .last()
+            .expect("root anchor is retained")
+            .as_raw_fd();
         let fd = unsafe {
             libc::openat(
-                parent.as_raw_fd(),
+                parent_fd,
                 name.as_ptr(),
                 libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
             )
         };
-        if fd < 0 {
+        if fd >= 0 {
+            pinned_directories.push(unsafe { std::fs::File::from_raw_fd(fd) });
+            return Ok(());
+        }
+        let open_error = std::io::Error::last_os_error();
+        if !allow_root_owned_link {
+            return Err(open_error);
+        }
+        if !matches!(
+            open_error.raw_os_error(),
+            Some(libc::ELOOP) | Some(libc::ENOTDIR)
+        ) {
+            return Err(open_error);
+        }
+        let mut link_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent_fd,
+                name.as_ptr(),
+                link_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
             return Err(std::io::Error::last_os_error());
         }
-        pinned_directories.push(unsafe { std::fs::File::from_raw_fd(fd) });
+        let link_stat = unsafe { link_stat.assume_init() };
+        if link_stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            return Err(open_error);
+        }
+        if link_stat.st_uid != 0 {
+            return Err(std::io::Error::other(
+                "mirror source root has a non-root-owned ancestor symlink",
+            ));
+        }
+        if *remaining_links == 0 {
+            return Err(std::io::Error::other(
+                "mirror source root exceeds the ancestor symlink limit",
+            ));
+        }
+        *remaining_links -= 1;
+        let mut target = vec![0u8; libc::PATH_MAX as usize];
+        let length = unsafe {
+            libc::readlinkat(
+                parent_fd,
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if length < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if length == 0 || length as usize == target.len() {
+            return Err(std::io::Error::other(
+                "mirror source root ancestor symlink target is empty or too long",
+            ));
+        }
+        target.truncate(length as usize);
+        let mut after = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent_fd,
+                name.as_ptr(),
+                after.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let after = unsafe { after.assume_init() };
+        if after.st_dev != link_stat.st_dev
+            || after.st_ino != link_stat.st_ino
+            || after.st_mode != link_stat.st_mode
+            || after.st_uid != link_stat.st_uid
+        {
+            return Err(std::io::Error::other(
+                "mirror source root ancestor symlink changed while resolving",
+            ));
+        }
+        let target = PathBuf::from(OsString::from_vec(target));
+        if target.is_absolute() {
+            pinned_directories.push(open_anchor(true)?);
+        }
+        walk_components(pinned_directories, &target, true, remaining_links)
     }
+
+    let mut pinned_directories = vec![open_anchor(root.is_absolute())?];
+    // Match walpin's bounded root-owned ancestor resolution, retaining every
+    // handle until the source leaf opens.
+    let mut remaining_links = 8;
+    walk_components(&mut pinned_directories, root, false, &mut remaining_links)?;
     Ok(pinned_directories)
 }
 
@@ -1999,9 +2115,155 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn source_root_opens_beneath_a_root_owned_system_ancestor_symlink() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut fixture = None;
+        for parent in [PathBuf::from("/tmp"), std::env::temp_dir()] {
+            let mut has_root_owned_link = false;
+            let mut all_links_root_owned = true;
+            for ancestor in parent.ancestors() {
+                let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
+                    all_links_root_owned = false;
+                    break;
+                };
+                if metadata.file_type().is_symlink() {
+                    has_root_owned_link = true;
+                    all_links_root_owned &= metadata.uid() == 0;
+                }
+            }
+            if !has_root_owned_link || !all_links_root_owned {
+                continue;
+            }
+            if let Ok(temp) = TempDir::new_in(&parent) {
+                assert!(
+                    temp.path().starts_with(&parent),
+                    "fixture retains the system ancestor spelling"
+                );
+                fixture = Some(temp);
+                break;
+            }
+        }
+        let Some(temp) = fixture else {
+            eprintln!("QUALIFIED SKIP: no writable temporary base beneath a root-owned system ancestor symlink; run on macOS /tmp or /var/folders");
+            return;
+        };
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).expect("configured root");
+        let source = root.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("source fixture");
+        let physical_source = std::fs::canonicalize(&source).expect("physical source fixture");
+        let expected_identity =
+            file_identity(&std::fs::File::open(&physical_source).expect("physical source"))
+                .expect("physical source identity");
+        let physical_root = std::fs::canonicalize(&root).expect("physical root fixture");
+        let expected_root_identity =
+            file_identity(&std::fs::File::open(&physical_root).expect("physical root"))
+                .expect("physical root identity");
+
+        let (opened, directories) =
+            open_source_file_beneath(&root, &source, None).expect("root-owned ancestor admission");
+        assert_eq!(
+            file_identity(&opened).expect("opened identity"),
+            expected_identity
+        );
+        assert_eq!(directories, vec![expected_root_identity]);
+        let (reopened, _) = open_source_file_beneath(&root, &source, Some(&directories))
+            .expect("checked source reopen through system ancestor");
+        assert_eq!(
+            file_identity(&reopened).expect("reopened identity"),
+            expected_identity
+        );
+        assert_eq!(
+            std::fs::read(&physical_source).expect("unchanged source"),
+            b"inside\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_refuses_a_non_root_owned_ancestor_symlink() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("fixture outside source tree");
+        let fixture = std::fs::canonicalize(temp.path()).expect("physical fixture anchor");
+        let protected = fixture.join("protected");
+        let root = protected.join("exports");
+        std::fs::create_dir_all(&root).expect("protected fixture root");
+        let source = root.join("source.jsonl");
+        std::fs::write(&source, b"protected\n").expect("protected source");
+        let before = std::fs::metadata(&source).expect("protected metadata before");
+        let (original, original_directories) =
+            open_source_file_beneath(&root, &source, None).expect("ordinary root admission");
+        let original_identity = file_identity(&original).expect("protected source identity");
+        let ancestor = fixture.join("linked");
+        std::os::unix::fs::symlink(&protected, &ancestor).expect("non-root fixture ancestor link");
+        if std::fs::symlink_metadata(&ancestor)
+            .expect("link ownership")
+            .uid()
+            == 0
+        {
+            eprintln!("QUALIFIED SKIP: the test-created ancestor symlink is root-owned; run this refusal and its control as a non-root user");
+            return;
+        }
+        let linked_root = ancestor.join("exports");
+        let linked_source = linked_root.join("source.jsonl");
+        assert!(
+            open_source_file_beneath(&linked_root, &linked_source, None).is_err(),
+            "a non-root-owned ancestor link must refuse before admitting a root identity"
+        );
+        let (reopened, directories) =
+            open_source_file_beneath(&root, &source, None).expect("ordinary root remains usable");
+        assert_eq!(
+            file_identity(&reopened).expect("reopened identity"),
+            original_identity
+        );
+        assert_eq!(directories, original_directories);
+        let after = std::fs::metadata(&source).expect("protected metadata after");
+        assert_eq!(
+            std::fs::read(&source).expect("protected bytes after"),
+            b"protected\n"
+        );
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after.modified().expect("mtime after"),
+            before.modified().expect("mtime before")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_refuses_its_leaf_symlink() {
+        let temp = TempDir::new().expect("fixture outside source tree");
+        let fixture = std::fs::canonicalize(temp.path()).expect("physical fixture anchor");
+        let root = fixture.join("root");
+        std::fs::create_dir(&root).expect("ordinary source root");
+        let source = root.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("source fixture");
+        let linked_root = fixture.join("linked-root");
+        std::os::unix::fs::symlink(&root, &linked_root).expect("configured-root leaf link");
+        assert!(
+            open_source_file_beneath(&linked_root, &linked_root.join("source.jsonl"), None)
+                .is_err()
+        );
+        let (opened, _) = open_source_file_beneath(&root, &source, None).expect("ordinary root");
+        assert_eq!(
+            file_identity(&opened).expect("opened identity"),
+            file_identity(&std::fs::File::open(&source).expect("source handle"))
+                .expect("source identity")
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("unchanged source"),
+            b"inside\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn source_root_keeps_absolute_relative_empty_and_parent_directory_semantics() {
-        let cwd = std::env::current_dir().expect("current directory");
-        let dir = TempDir::new_in(&cwd).expect("fixture beneath current directory");
+        let cwd = std::fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("physical current directory");
+        let dir = TempDir::new().expect("fixture outside source tree");
         let absolute_fixture = std::fs::canonicalize(dir.path()).expect("fixture directory");
         let absolute_root = absolute_fixture.join("root");
         std::fs::create_dir(&absolute_root).expect("source root");
@@ -2009,7 +2271,20 @@ mod tests {
         std::fs::write(&source, b"inside\n").expect("source fixture");
         let identity = file_identity(&std::fs::File::open(&source).expect("source handle"))
             .expect("source identity");
-        let relative_fixture = PathBuf::from(dir.path().file_name().expect("fixture name"));
+        let mut cwd_components = cwd.components().peekable();
+        let mut fixture_components = absolute_fixture.components().peekable();
+        while cwd_components.peek().is_some() && cwd_components.peek() == fixture_components.peek()
+        {
+            cwd_components.next();
+            fixture_components.next();
+        }
+        let mut relative_fixture = PathBuf::new();
+        for _ in cwd_components {
+            relative_fixture.push("..");
+        }
+        for component in fixture_components {
+            relative_fixture.push(component.as_os_str());
+        }
         let relative_root = relative_fixture.join("root");
 
         for root in [
@@ -2027,14 +2302,15 @@ mod tests {
             assert_eq!(file_identity(&file).expect("reopened identity"), identity);
         }
 
+        let cwd_identity = file_identity(&std::fs::File::open(&cwd).expect("current directory"))
+            .expect("current-directory identity");
         for root in [Path::new(""), Path::new(".")] {
-            let path = root.join(&relative_fixture).join("root/source.jsonl");
-            let (file, directories) =
-                open_source_file_beneath(root, &path, None).expect("current-directory root probe");
-            assert_eq!(file_identity(&file).expect("opened identity"), identity);
-            let (file, _) = open_source_file_beneath(root, &path, Some(&directories))
-                .expect("current-directory source reopen");
-            assert_eq!(file_identity(&file).expect("reopened identity"), identity);
+            let directories = open_source_root(root).expect("current-directory root probe");
+            assert_eq!(directories.len(), 1);
+            assert_eq!(
+                file_identity(&directories[0]).expect("root identity"),
+                cwd_identity
+            );
         }
 
         let filesystem_root = open_source_root(Path::new("/")).expect("filesystem root");
