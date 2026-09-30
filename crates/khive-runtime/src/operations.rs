@@ -11,6 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
+use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, EdgeUpsertDisposition,
@@ -4410,7 +4411,7 @@ impl KhiveRuntime {
         }
 
         // Best-effort vector embedding: log and continue on failure.
-        let embed_model_names = self.registered_embedding_model_names();
+        let embed_model_names = self.embedding_models_for_note_kind(kind);
         for model_name in &embed_model_names {
             match self
                 .embed_document_with_model_outcome_for_token(
@@ -4596,18 +4597,7 @@ impl KhiveRuntime {
         let embed_model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
-            // Fan out to ALL registered models — includes both lattice models
-            // from RuntimeConfig and any custom providers added via
-            // register_embedder(). Gate on the registry, not
-            // config().embedding_model, so that custom-only runtimes (no
-            // lattice model in config) also fan out.
-            let names = self.registered_embedding_model_names();
-            if names.is_empty() {
-                // No models configured at all — skip vector embedding.
-                vec![]
-            } else {
-                names
-            }
+            self.embedding_models_for_note_kind(kind)
         };
 
         // FTS step — compensate note row on failure.
@@ -4646,7 +4636,7 @@ impl KhiveRuntime {
         // Vector embedding + insert step — compensate note row + FTS doc on failure.
         // Multi-model vector embedding:
         //   - explicit embedding_model → single model (existing behaviour)
-        //   - None + any models registered → ALL registered models in parallel
+        //   - None → the note kind's declared model policy
         //   - None + no models configured → skip (text-only)
         // The effective text sent to every embedder: the caller-supplied
         // capped override when present, otherwise the full stored content.
@@ -7819,6 +7809,61 @@ impl KhiveRuntime {
                 .await?;
         }
         Ok(outcome.rows)
+    }
+
+    /// Create a historical commit-to-project annotation without replacing a
+    /// curated edge or reviving a tombstone. The store rechecks the exact live
+    /// commit SHA and project under its writer transaction; only a newly
+    /// inserted edge produces the ordinary LinkCreated lifecycle event.
+    pub async fn link_commit_annotation_if_absent(
+        &self,
+        token: &NamespaceToken,
+        commit_id: Uuid,
+        project_id: Uuid,
+        guard: CommitAnnotationGuard,
+    ) -> RuntimeResult<CommitAnnotationInsertOutcome> {
+        if !matches!(guard.expected_sha.len(), 40 | 64)
+            || !guard
+                .expected_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "expected full commit SHA".into(),
+            ));
+        }
+        let edge = self
+            .build_edge(
+                token,
+                &LinkSpec {
+                    namespace: None,
+                    source_id: commit_id,
+                    target_id: project_id,
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                },
+            )
+            .await?;
+        let result = self
+            .graph(token)?
+            .insert_commit_annotation_if_absent(edge, guard)
+            .await?;
+        if let CommitAnnotationInsertOutcome::Created(edge) = &result {
+            self.append_link_mutation_event(
+                token,
+                &EdgeUpsertResult {
+                    edge: edge.clone(),
+                    disposition: EdgeUpsertDisposition::Created,
+                    previous: None,
+                },
+                EdgeEndpointKind::Note,
+                EdgeEndpointKind::Entity,
+            )
+            .await?;
+        }
+        Ok(result)
     }
 
     /// Create a batch of entities atomically.

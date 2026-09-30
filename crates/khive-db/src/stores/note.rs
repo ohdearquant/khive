@@ -1,5 +1,6 @@
 //! SQL-backed `NoteStore` implementation.
 
+pub mod recipient;
 pub mod transport;
 
 use std::collections::HashSet;

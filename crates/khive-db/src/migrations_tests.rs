@@ -37,8 +37,14 @@ fn migrate_through(conn: &mut Connection, through_version: u32) {
         .filter(|migration| migration.version <= through_version)
     {
         let tx = conn.transaction().expect("begin historical migration");
-        tx.execute_batch(migration.up)
-            .expect("apply historical migration body");
+        // V44's columns and backfill run in Rust before its index body, as in
+        // the migration runner.
+        if migration.version == 44 {
+            migrate_outbound_due_key(&tx).expect("apply historical migration body");
+        } else {
+            tx.execute_batch(migration.up)
+                .expect("apply historical migration body");
+        }
         tx.execute(
             "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
             rusqlite::params![migration.version, migration.name],
@@ -2068,7 +2074,7 @@ async fn v43_upgrade_preserves_v42_vector_as_unknown_provenance() {
         )
         .expect("write historical vector");
         assert_eq!(
-            run_migrations(&mut conn).expect("upgrade through V43"),
+            run_migrations(&mut conn).expect("upgrade to the latest version"),
             latest_schema_version()
         );
         assert!(table_exists(&conn, "vector_provenance"));
@@ -5299,5 +5305,56 @@ fn sender_transport_migration_fresh_and_previous_tail() {
             .unwrap();
         assert_eq!(foreign_keys, 0, "transport rows must outlive note history");
         run_migrations(&mut conn).unwrap();
+    }
+}
+
+#[test]
+fn recipient_transport_migration_fresh_and_previous_tail() {
+    for previous in [0, RECIPIENT_TRANSPORT_VERSION - 1] {
+        let mut conn = open_memory();
+        if previous != 0 {
+            migrate_through(&mut conn, previous);
+        }
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+        for table in [
+            "comm_recipient_replay",
+            "comm_recipient_quarantine",
+            "comm_ack_work",
+        ] {
+            assert!(table_exists(&conn, table));
+        }
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM _schema_migrations WHERE version = ?1",
+                [RECIPIENT_TRANSPORT_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "recipient_transport");
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+        conn.execute(
+            "INSERT INTO comm_recipient_replay \
+             (sender_agent_id, logical_message_id, recipient_agent_id, recipient_actor, \
+              note_id, disposition, created_at) \
+             VALUES ('sender', 'message', 'recipient', 'lambda:recipient', \
+                     'note', 'stored', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM _schema_migrations WHERE version = ?1",
+            [RECIPIENT_TRANSPORT_VERSION],
+        )
+        .unwrap();
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+        let replay_rows: i64 = conn
+            .query_row("SELECT count(*) FROM comm_recipient_replay", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            replay_rows, 1,
+            "replaying V45 must preserve recipient state"
+        );
     }
 }

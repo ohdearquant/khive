@@ -2051,9 +2051,10 @@ impl KhiveRuntime {
         Ok(report)
     }
 
-    /// Re-upsert FTS5 document and vector(s) for the note across all registered models.
+    /// Re-upsert FTS5 and kind-eligible vectors, removing excluded-model rows.
     ///
-    /// Best-effort for vectors: mirrors reindex_entity's warn-and-continue policy.
+    /// Excluded-model cleanup is revision-guarded and fail-closed. Embedding
+    /// eligible models remains best-effort like entity reindexing.
     pub(crate) async fn reindex_note(
         &self,
         token: &NamespaceToken,
@@ -2085,7 +2086,77 @@ impl KhiveRuntime {
             return Ok(crate::retrieval::EmbeddingTruncationReport::default());
         }
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
-        for model_name in embedding_plan.model_names() {
+        let selected_models = self.embedding_models_for_note_kind(&note.kind);
+        // A kind policy can narrow after an earlier revision wrote vectors to
+        // every model. Remove those stale rows from every excluded table in
+        // the captured plan, under the same note-revision fence as FTS writes.
+        for model_name in embedding_plan
+            .model_names()
+            .iter()
+            .filter(|name| !selected_models.contains(*name))
+        {
+            // The vector table is created lazily. A missing table has no old
+            // row to remove, but preparing it also makes the guarded DML safe.
+            self.vectors_for_model(token, model_name)?;
+            let table = format!("vec_{}", crate::config::sanitize_key(model_name));
+            let model_key = table
+                .strip_prefix("vec_")
+                .expect("runtime vector tables use the vec_ prefix");
+            let subject = note.id.to_string();
+            // A selected and an excluded model may sanitize to the same table
+            // key. Check the stored model before touching either row or sidecar.
+            let statements = vec![
+                SqlStatement {
+                    sql: format!(
+                        "INSERT INTO ann_write_log \
+                     (namespace, embedding_model, kind, field, subject_id, op) \
+                     SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                     FROM {table} WHERE subject_id=?1 AND namespace=?2 AND embedding_model=?3"
+                    ),
+                    params: vec![
+                        SqlValue::Text(subject.clone()),
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("note-reindex-excluded-log-delete".into()),
+                },
+                SqlStatement {
+                    sql: format!(
+                        "DELETE FROM vector_provenance \
+                         WHERE model_key=?1 AND subject_id=?2 \
+                         AND EXISTS (SELECT 1 FROM {table} \
+                                     WHERE subject_id=?2 AND namespace=?3 AND embedding_model=?4)"
+                    ),
+                    params: vec![
+                        SqlValue::Text(model_key.to_string()),
+                        SqlValue::Text(subject.clone()),
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("note-reindex-excluded-provenance-delete".into()),
+                },
+                SqlStatement {
+                    sql: format!(
+                        "DELETE FROM {table} \
+                         WHERE subject_id=?1 AND namespace=?2 AND embedding_model=?3"
+                    ),
+                    params: vec![
+                        SqlValue::Text(subject),
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("note-reindex-excluded-vector-delete".into()),
+                },
+            ];
+            if !self.apply_note_index_revision(note, statements).await? {
+                return Ok(report);
+            }
+        }
+        for model_name in embedding_plan
+            .model_names()
+            .iter()
+            .filter(|name| selected_models.contains(*name))
+        {
             match self
                 .embed_document_with_model_outcome_for_token(
                     token,
@@ -13739,6 +13810,367 @@ mod tests {
             0,
             "a provider registered after plan capture must not join survivor reindex"
         );
+    }
+
+    #[tokio::test]
+    async fn note_reindex_removes_stale_vectors_from_every_excluded_plan_model() {
+        use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, RuntimeConfig};
+        use khive_storage::types::VectorSearchRequest;
+        use lattice_embed::EmbeddingModel;
+
+        let primary = EmbeddingModel::AllMiniLmL6V2;
+        let primary_name = primary.to_string();
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(primary),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let tok = NamespaceToken::local();
+        rt.register_embedder(MergeTestVecProvider::new(
+            &primary_name,
+            primary.dimensions(),
+        ));
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            rt.register_embedder(MergeTestVecProvider::new(model, 4));
+        }
+
+        let note = Note::new(
+            "local",
+            "message",
+            "message content once indexed everywhere",
+        );
+        rt.notes(&tok)
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        rt.reindex_note(&tok, &note).await.unwrap();
+        for model in [
+            primary_name.as_str(),
+            "excluded-reindex-a",
+            "excluded-reindex-b",
+        ] {
+            assert_eq!(
+                rt.vectors_for_model(&tok, model)
+                    .unwrap()
+                    .count()
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            let hits = rt
+                .vectors_for_model(&tok, model)
+                .unwrap()
+                .search(VectorSearchRequest {
+                    query_vectors: vec![vec![1.0_f32; 4]],
+                    top_k: 10,
+                    namespace: Some("local".into()),
+                    kind: Some(SubstrateKind::Note),
+                    embedding_model: Some(model.into()),
+                    filter: None,
+                    backend_hints: None,
+                })
+                .await
+                .unwrap();
+            assert!(hits.iter().any(|hit| hit.subject_id == note.id));
+        }
+        // Reindex writes raw vectors without a sidecar. Seed historical
+        // provenance with a mismatched namespace: its primary key is only
+        // (model_key, subject_id), so cleanup must not require a namespace match.
+        let mut writer = rt.sql().writer().await.unwrap();
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            let inserted = writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO vector_provenance \
+                          (model_key, subject_id, namespace, embedding_digest) \
+                          VALUES (?1, ?2, ?3, ?4)"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(crate::config::sanitize_key(model)),
+                        SqlValue::Text(note.id.to_string()),
+                        SqlValue::Text("old-namespace".into()),
+                        SqlValue::Text("0".repeat(64)),
+                    ],
+                    label: Some("test-excluded-reindex-seed-stale-provenance".into()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(inserted, 1);
+        }
+        drop(writer);
+
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }]);
+        let changed = rt
+            .update_note(
+                &tok,
+                note.id,
+                NotePatch {
+                    content: Some("changed message content after policy narrowing".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(changed.content, note.content);
+        assert!(changed.version > note.version);
+        assert_eq!(
+            rt.text_for_notes(&tok)
+                .unwrap()
+                .get_document("local", note.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            changed.content
+        );
+
+        assert_eq!(
+            rt.vectors_for_model(&tok, &primary_name)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1,
+            "eligible default-space vector must survive"
+        );
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            let hits = rt
+                .vectors_for_model(&tok, model)
+                .unwrap()
+                .search(VectorSearchRequest {
+                    query_vectors: vec![vec![1.0_f32; 4]],
+                    top_k: 10,
+                    namespace: Some("local".into()),
+                    kind: Some(SubstrateKind::Note),
+                    embedding_model: Some(model.into()),
+                    filter: None,
+                    backend_hints: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                hits.iter().all(|hit| hit.subject_id != note.id),
+                "named-model search must not return a stale message from {model}"
+            );
+            assert_eq!(
+                rt.vectors_for_model(&tok, model)
+                    .unwrap()
+                    .count()
+                    .await
+                    .unwrap(),
+                0,
+                "reindex must remove a stale row from {model}"
+            );
+        }
+        let mut reader = rt.sql().reader().await.unwrap();
+        let deletes = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log \
+                      WHERE subject_id=?1 AND op='delete' AND \
+                      embedding_model IN ('excluded-reindex-a', 'excluded-reindex-b')"
+                    .into(),
+                params: vec![SqlValue::Text(note.id.to_string())],
+                label: Some("test-excluded-reindex-delete-log".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(deletes, Some(SqlValue::Integer(2))));
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            let sidecar = reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM vector_provenance \
+                          WHERE model_key=?1 AND subject_id=?2"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(crate::config::sanitize_key(model)),
+                        SqlValue::Text(note.id.to_string()),
+                    ],
+                    label: Some("test-excluded-reindex-sidecar-clear".into()),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(sidecar, Some(SqlValue::Integer(0))));
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_model_key_collision_preserves_default_vector_on_embed_failure() {
+        use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, RuntimeConfig};
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct FailingProvider {
+            name: String,
+            dimensions: usize,
+            attempts: Arc<AtomicUsize>,
+        }
+
+        struct FailingService(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl EmbeddingService for FailingService {
+            async fn embed(
+                &self,
+                _texts: &[String],
+                _model: EmbeddingModel,
+            ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(EmbedError::InferenceFailed(
+                    "injected default embed failure".into(),
+                ))
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "failing-default-vector"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::embedder_registry::EmbedderProvider for FailingProvider {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            fn dimensions(&self) -> usize {
+                self.dimensions
+            }
+
+            async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+                Ok(Arc::new(FailingService(Arc::clone(&self.attempts))))
+            }
+        }
+
+        let primary = EmbeddingModel::AllMiniLmL6V2;
+        let primary_name = primary.to_string();
+        let excluded_name = "all.minilm.l6.v2";
+        assert_eq!(
+            crate::config::sanitize_key(&primary_name),
+            crate::config::sanitize_key(excluded_name)
+        );
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(primary),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let tok = NamespaceToken::local();
+        rt.register_embedder(MergeTestVecProvider::new(
+            &primary_name,
+            primary.dimensions(),
+        ));
+        let note = Note::new("local", "message", "message before policy narrowing");
+        rt.notes(&tok)
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        rt.reindex_note(&tok, &note).await.unwrap();
+        assert_eq!(
+            rt.vectors_for_model(&tok, &primary_name)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1,
+            "fixture must seed the default vector before the failing update"
+        );
+
+        let model_key = crate::config::sanitize_key(&primary_name);
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO vector_provenance \
+                      (model_key, subject_id, namespace, embedding_digest) \
+                      VALUES (?1, ?2, ?3, ?4)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(model_key.clone()),
+                    SqlValue::Text(note.id.to_string()),
+                    SqlValue::Text("local".into()),
+                    SqlValue::Text("0".repeat(64)),
+                ],
+                label: Some("test-colliding-excluded-seed-provenance".into()),
+            })
+            .await
+            .unwrap();
+        drop(writer);
+
+        rt.register_embedder(MergeTestVecProvider::new(
+            excluded_name,
+            primary.dimensions(),
+        ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        rt.register_embedder(FailingProvider {
+            name: primary_name.clone(),
+            dimensions: primary.dimensions(),
+            attempts: Arc::clone(&attempts),
+        });
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }]);
+
+        rt.update_note(
+            &tok,
+            note.id,
+            NotePatch {
+                content: Some("message after policy narrowing".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("best-effort default embed failure does not fail note update");
+        assert!(attempts.load(Ordering::SeqCst) > 0);
+
+        let table = format!("vec_{model_key}");
+        let mut reader = rt.sql().reader().await.unwrap();
+        let retained_model = reader
+            .query_scalar(SqlStatement {
+                sql: format!(
+                    "SELECT embedding_model FROM {table} WHERE subject_id=?1 AND namespace=?2"
+                ),
+                params: vec![
+                    SqlValue::Text(note.id.to_string()),
+                    SqlValue::Text("local".into()),
+                ],
+                label: Some("test-colliding-excluded-default-retained".into()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(retained_model.as_ref(), Some(SqlValue::Text(model)) if model == &primary_name),
+            "default vector row was lost or replaced: {retained_model:?}"
+        );
+        let provenance = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM vector_provenance \
+                      WHERE model_key=?1 AND subject_id=?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(model_key),
+                    SqlValue::Text(note.id.to_string()),
+                ],
+                label: Some("test-colliding-excluded-provenance-retained".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(provenance, Some(SqlValue::Integer(1))));
     }
 
     /// merge_entity must delete from_id vectors from ALL registered model tables.

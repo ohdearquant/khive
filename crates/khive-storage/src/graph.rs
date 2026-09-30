@@ -15,6 +15,36 @@ use crate::types::{
     SeekCursor, SeekPage, SortOrder, StorageResult, TraversalRequest,
 };
 
+/// The exact persisted cursor row observed by the reconciliation preview.
+#[derive(Clone, Debug)]
+pub struct CommitAnnotationCursorValue {
+    pub value: Vec<u8>,
+    pub updated_at: i64,
+}
+
+/// Preconditions carried from the selected repository and preview into the
+/// graph store's writer transaction.
+#[derive(Clone, Debug)]
+pub struct CommitAnnotationGuard {
+    pub expected_sha: String,
+    pub source_identity: String,
+    pub commits: CommitAnnotationCursorValue,
+    pub checkpoint: CommitAnnotationCursorValue,
+}
+
+/// Result of a create-only historical commit-to-project annotation attempt.
+/// The store decides this under its writer transaction; a caller-side preview
+/// is never authority to replace or resurrect an edge.
+#[derive(Clone, Debug)]
+pub enum CommitAnnotationInsertOutcome {
+    Created(Edge),
+    ExistingLive,
+    Tombstoned,
+    SourceChanged,
+    TargetChanged,
+    CursorChanged,
+}
+
 /// Directed edge CRUD and graph traversal over the knowledge graph.
 #[async_trait]
 pub trait GraphStore: Send + Sync + 'static {
@@ -72,6 +102,23 @@ pub trait GraphStore: Send + Sync + 'static {
             capability: StorageCapability::Graph,
             operation: "insert_edge_if_absent".into(),
             message: "this backend does not implement conditional edge insert".into(),
+        })
+    }
+    /// Create an `annotates` edge only while its source is a live `commit`
+    /// note in `edge.namespace` with the exact SHA, its target is the live
+    /// project for the selected source, the paired commit cursor rows still
+    /// match the preview, and no row of the edge's natural key exists,
+    /// including a tombstone. All checks and the insert occur in one writer
+    /// transaction. Existing rows are immutable.
+    async fn insert_commit_annotation_if_absent(
+        &self,
+        _edge: Edge,
+        _guard: CommitAnnotationGuard,
+    ) -> StorageResult<CommitAnnotationInsertOutcome> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "insert_commit_annotation_if_absent".into(),
+            message: "this backend does not implement guarded commit annotation insert".into(),
         })
     }
     /// Insert or update a batch of edges.
