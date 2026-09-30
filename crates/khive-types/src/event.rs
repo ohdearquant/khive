@@ -62,7 +62,7 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 40 typed event variants produced by the verb dispatch path
+/// Discriminant for the 41 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -77,6 +77,8 @@ pub enum EventKind {
     RerankExecuted,
     /// A `search` verb was executed.
     SearchExecuted,
+    /// A tool-use policy decision was computed by tool.check or exec.run.
+    ToolCheckDecided,
     /// A new directed edge was created between two nodes.
     LinkCreated,
     /// A new entity was created.
@@ -152,12 +154,13 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// All 40 event kind variants in declaration order.
-    pub const ALL: [Self; 40] = [
+    /// All 41 event kind variants in declaration order.
+    pub const ALL: [Self; 41] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
         Self::SearchExecuted,
+        Self::ToolCheckDecided,
         Self::LinkCreated,
         Self::EntityCreated,
         Self::EntityUpdated,
@@ -203,6 +206,7 @@ impl EventKind {
             Self::RecallExecuted => "recall_executed",
             Self::RerankExecuted => "rerank_executed",
             Self::SearchExecuted => "search_executed",
+            Self::ToolCheckDecided => "tool_check_decided",
             Self::LinkCreated => "link_created",
             Self::EntityCreated => "entity_created",
             Self::EntityUpdated => "entity_updated",
@@ -254,6 +258,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "recall_executed",
     "rerank_executed",
     "search_executed",
+    "tool_check_decided",
     "link_created",
     "entity_created",
     "entity_updated",
@@ -301,6 +306,7 @@ impl core::str::FromStr for EventKind {
             "recall_executed" => Ok(Self::RecallExecuted),
             "rerank_executed" => Ok(Self::RerankExecuted),
             "search_executed" => Ok(Self::SearchExecuted),
+            "tool_check_decided" => Ok(Self::ToolCheckDecided),
             "link_created" => Ok(Self::LinkCreated),
             "entity_created" => Ok(Self::EntityCreated),
             "entity_updated" => Ok(Self::EntityUpdated),
@@ -375,6 +381,8 @@ pub enum EventPayload {
     Json(String),
     /// Structured payload for a rerank pass event.
     RerankExecuted(RerankExecutedPayload),
+    /// Structured payload for a tool-use policy decision.
+    ToolCheckDecided(ToolCheckDecidedPayload),
     /// Structured payload for a proposal-created event (requires `serde` feature).
     #[cfg(feature = "serde")]
     ProposalCreated(ProposalCreatedPayload),
@@ -390,6 +398,20 @@ impl Default for EventPayload {
     fn default() -> Self {
         Self::Json("{}".into())
     }
+}
+
+/// The decision computed for one tool-use policy check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ToolCheckDecidedPayload {
+    pub actor: String,
+    pub tool: String,
+    pub registered: bool,
+    pub decision: String,
+    pub source: String,
+    pub id: Option<String>,
+    pub scope: Option<String>,
+    pub caller_verb: String,
 }
 
 /// Payload for a rerank pass event, recording per-candidate scores.

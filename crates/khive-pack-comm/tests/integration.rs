@@ -3576,6 +3576,10 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         "schema plan must declare idx_comm_message_outbound_ref; got: {combined}"
     );
     assert!(
+        !combined.contains("idx_comm_message_outbound_due"),
+        "the function-backed channel deadline index must be installed by a numbered core migration"
+    );
+    assert!(
         combined.contains("CREATE INDEX IF NOT EXISTS"),
         "schema plan DDL must be idempotent; got: {combined}"
     );

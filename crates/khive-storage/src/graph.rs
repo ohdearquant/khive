@@ -41,6 +41,23 @@ pub trait GraphStore: Send + Sync + 'static {
         })
     }
 
+    /// Like `latest_annotating_note`, but also require one exact top-level
+    /// string property before selecting the newest candidate.
+    async fn latest_annotating_note_with_property(
+        &self,
+        _node_id: Uuid,
+        _kind: &str,
+        _tag: &str,
+        _property_key: &str,
+        _property_value: &str,
+    ) -> StorageResult<Option<(Uuid, i64)>> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "latest_annotating_note_with_property".into(),
+            message: "this backend does not implement latest matching annotation lookup".into(),
+        })
+    }
+
     /// Insert or update a single edge.
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
     /// Insert an edge only when neither its id nor natural key already

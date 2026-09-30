@@ -2176,6 +2176,15 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        if note.properties.as_ref().is_some_and(|properties| {
+            properties
+                .as_object()
+                .is_some_and(|map| map.contains_key(crate::secret_gate::RESERVED_WEB_RECEIPT_KEY))
+        }) {
+            return Err(RuntimeError::InvalidInput(
+                "web receipt notes are immutable through generic update".into(),
+            ));
+        }
         // The stored row as read. A no-op answers with this, not with the
         // patched snapshot: the patch may differ from the row in ways the
         // no-op decision ignores (tag order), and nothing was written.
@@ -2567,7 +2576,7 @@ impl KhiveRuntime {
     /// Non-wire outbox scan for the channel delivery loops.
     ///
     /// Fetches live `message` notes matching the SQL-side pending predicate
-    /// newest-first (`created_at DESC, id ASC`), bounded by an internal scan
+    /// newest-first (`created_at DESC, id ASC`), bounded by an internal page
     /// cap. Direction, `delivered_at`, terminal `delivery` state, the optional
     /// `to_actor` channel prefix, and `next_attempt_at` are filtered by SQLite
     /// before the page bound. Pending means `delivered_at`
@@ -2578,12 +2587,10 @@ impl KhiveRuntime {
     ///
     /// The channel prefix has to be in the statement, not applied to the
     /// fetched page: every actor-to-actor outbound row matches the pending
-    /// predicate forever (nothing marks those delivered), so that population
-    /// outgrows any scan cap and a page-then-filter scan never reaches a
-    /// channel's rows once enough other rows sort ahead of them. The prefix
-    /// renders as an index range served by
-    /// `idx_comm_message_outbound_recipient`, and the newest-first order
-    /// means due rows are returned in the same order as the prior scan.
+    /// predicate forever (nothing marks those delivered). A full `name:`
+    /// channel prefix also supplies an indexed bucket equality, followed by
+    /// an indexed deadline bound; arbitrary partial prefixes retain the
+    /// recipient range. The final newest-first sort preserves delivery order.
     /// This lives on the runtime rather than going through the wire registry
     /// for the same reason as
     /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
@@ -2653,7 +2660,7 @@ impl KhiveRuntime {
         limit: u32,
         slug_filter: OutboxSlugFilter<'_>,
     ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
-        const MAX_SCAN_TOTAL: u32 = 10_000;
+        const MAX_PAGE_TOTAL: u32 = 10_000;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -2695,9 +2702,17 @@ impl KhiveRuntime {
             },
         ];
         if let Some(prefix) = to_prefix {
+            let op = if prefix
+                .strip_suffix(':')
+                .is_some_and(|head| !head.is_empty() && !head.contains(':'))
+            {
+                FilterOp::TextColonPrefixBucketIndexed
+            } else {
+                FilterOp::TextStartsWithIndexed
+            };
             property_filters.push(PropertyFilter {
                 json_path: "$.to_actor".to_string(),
-                op: FilterOp::TextStartsWithIndexed,
+                op,
                 value: SqlValue::Text(prefix.to_string()),
             });
         }
@@ -2725,7 +2740,7 @@ impl KhiveRuntime {
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit: limit.min(MAX_SCAN_TOTAL),
+                    limit: limit.min(MAX_PAGE_TOTAL),
                     offset: 0,
                 },
             )
@@ -4737,6 +4752,7 @@ fn merge_note_sql(
     let props_str = merged_props
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let (due_key, due_source) = khive_db::stores::note::note_due_key_values(&merged_props);
 
     // The loop always runs so a dry-run reports a predictive `edges_rewired`
     // count instead of zero (mirrors the entity merge path).
@@ -4955,6 +4971,8 @@ fn merge_note_sql(
                 now,
                 into_note.deleted_at,
                 &into_note.key,
+                &due_key,
+                &due_source,
             ])?;
 
         let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
@@ -5991,6 +6009,16 @@ mod tests {
                 serde_json::json!({"direction": "outbound", "to_actor": "email:deleted"}),
                 Some(100),
             ),
+            make_note(
+                99,
+                serde_json::json!({"direction": "outbound", "to_actor": "emailx:not-this-channel"}),
+                None,
+            ),
+            make_note(
+                98,
+                serde_json::json!({"direction": "outbound", "to_actor": 42}),
+                None,
+            ),
         ];
         for note in &notes {
             store.upsert_note(note.clone()).await.expect("seed note");
@@ -6022,6 +6050,17 @@ mod tests {
         assert_eq!(
             actual_ids, expected_ids,
             "filtered scan changed answer or order"
+        );
+        let channel_ids: Vec<_> = rt
+            .list_undelivered_outbound_messages_for_channel(&tok, "email:", "primary", true, 200)
+            .await
+            .expect("channel scan succeeds")
+            .into_iter()
+            .map(|note| note.id)
+            .collect();
+        assert_eq!(
+            channel_ids, expected_ids,
+            "legacy channel pass changed answer or order"
         );
     }
 
@@ -6134,6 +6173,15 @@ mod tests {
             hits.iter().map(|note| note.id).collect::<Vec<_>>(),
             vec![due_id],
             "a due row behind {FUTURE_RETRIES} deferred rows remains deliverable"
+        );
+        let channel_hits = rt
+            .list_undelivered_outbound_messages_for_channel(&tok, "email:", "primary", true, 1)
+            .await
+            .expect("channel scan succeeds");
+        assert_eq!(
+            channel_hits.iter().map(|note| note.id).collect::<Vec<_>>(),
+            vec![due_id],
+            "the delivery pass must reach an older due row behind deferred retries"
         );
     }
 
