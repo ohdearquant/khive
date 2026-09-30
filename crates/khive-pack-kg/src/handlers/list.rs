@@ -602,10 +602,12 @@ impl KgPack {
                     )
                     .await;
                 }
-                let has_note_filter = p.tags.as_ref().is_some_and(|tags| !tags.is_empty())
-                    || message_filters
-                    || kind_filter.is_none()
-                    || kind_filter.as_deref() == Some("message");
+                // The mailbox partition is already in `filter`, so a list with no
+                // row-level filter keeps the store's own offset and cursor. The
+                // capped scan below would stop at MAX_SCAN_TOTAL and leave rows
+                // past it unreachable by offset.
+                let has_note_filter =
+                    p.tags.as_ref().is_some_and(|tags| !tags.is_empty()) || message_filters;
                 const PAGE_SIZE: u32 = 200;
                 const MAX_SCAN_TOTAL: u32 = 10_000;
 
@@ -675,9 +677,12 @@ impl KgPack {
                             !has_more_match && raw_more && scanned >= MAX_SCAN_TOTAL,
                         )
                     } else {
-                        let (notes, next_after) = runtime
+                        let (mut notes, next_after) = runtime
                             .list_notes_filtered_after(token, filter.clone(), after, limit)
                             .await?;
+                        // The store applied the same partition; this only
+                        // omits a row if the two ever disagree.
+                        notes.retain(|note| mailbox_view.permits_message_note(token, note));
                         (notes, next_after, false)
                     };
 
@@ -785,7 +790,9 @@ impl KgPack {
                 } else {
                     notes
                         .iter()
-                        .filter(|n| n.deleted_at.is_none())
+                        .filter(|n| {
+                            n.deleted_at.is_none() && mailbox_view.permits_message_note(token, n)
+                        })
                         .take(limit as usize)
                         .map(|n| {
                             parse_note_content(

@@ -36,43 +36,53 @@ impl MailboxView {
     /// listing applies this before its own page limit, including for broad
     /// kind=note reads that encounter a message row.
     pub fn permits_message_note(&self, token: &NamespaceToken, note: &Note) -> bool {
-        if note.kind != "message" {
-            return true;
-        }
-        let properties = note.properties.as_ref();
-        let text = |key: &str| -> Option<&str> {
-            properties
-                .and_then(|value| value.get(key))
-                .and_then(Value::as_str)
-        };
-        let legacy_local = self.legacy_local(token);
-        match text("direction") {
-            Some("inbound") => {
-                text("to_actor") == Some(self.actor_id.as_str())
-                    || (legacy_local
-                        && properties
-                            .and_then(|p| p.get("to_actor"))
-                            .is_none_or(Value::is_null))
-            }
-            Some("outbound") => {
-                text("from_actor") == Some(self.actor_id.as_str())
-                    || (legacy_local
-                        && properties
-                            .and_then(|p| p.get("from_actor"))
-                            .is_none_or(Value::is_null))
-            }
-            // Pre-v1 local rows can lack all routing fields. Named callers
-            // never inherit that unattributed pool.
-            None => {
-                legacy_local
+        permits_message_note(&self.actor_id, self.legacy_local(token), note)
+    }
+
+    /// [`Self::permits_message_note`] for a view already reduced to its
+    /// store-side [`NoteMailboxScope`], so a caller-supplied cursor or key
+    /// anchor is judged by the same rule as the rows the scope admits.
+    pub fn scope_permits_message_note(scope: &NoteMailboxScope, note: &Note) -> bool {
+        permits_message_note(&scope.actor_id, scope.legacy_local, note)
+    }
+}
+
+fn permits_message_note(actor_id: &str, legacy_local: bool, note: &Note) -> bool {
+    if note.kind != "message" {
+        return true;
+    }
+    let properties = note.properties.as_ref();
+    let text = |key: &str| -> Option<&str> {
+        properties
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+    };
+    match text("direction") {
+        Some("inbound") => {
+            text("to_actor") == Some(actor_id)
+                || (legacy_local
                     && properties
-                        .and_then(|p| p.get("direction"))
-                        .is_none_or(Value::is_null)
-                    && text("from_actor").is_none()
-                    && text("to_actor").is_none()
-            }
-            _ => false,
+                        .and_then(|p| p.get("to_actor"))
+                        .is_none_or(Value::is_null))
         }
+        Some("outbound") => {
+            text("from_actor") == Some(actor_id)
+                || (legacy_local
+                    && properties
+                        .and_then(|p| p.get("from_actor"))
+                        .is_none_or(Value::is_null))
+        }
+        // Pre-v1 local rows can lack all routing fields. Named callers
+        // never inherit that unattributed pool.
+        None => {
+            legacy_local
+                && properties
+                    .and_then(|p| p.get("direction"))
+                    .is_none_or(Value::is_null)
+                && text("from_actor").is_none()
+                && text("to_actor").is_none()
+        }
+        _ => false,
     }
 }
 

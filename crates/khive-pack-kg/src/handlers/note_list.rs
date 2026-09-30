@@ -133,7 +133,13 @@ pub(super) async fn list_keyed_notes(
     let mut boundary = match p.after_key.as_deref() {
         Some(key) => Some(NoteKeyCursor::from(
             &runtime
-                .get_note_by_key(token, key, filter.kind.as_deref(), true)
+                .get_note_by_key_in_scope(
+                    token,
+                    key,
+                    filter.kind.as_deref(),
+                    true,
+                    filter.mailbox.as_ref(),
+                )
                 .await?,
         )),
         None => p.after.as_deref().map(decode_cursor).transpose()?.flatten(),

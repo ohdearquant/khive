@@ -230,3 +230,142 @@ async fn store_mailbox_scope_matches_row_level_rule() {
         );
     }
 }
+
+async fn offset_page(
+    registry: &VerbRegistry,
+    kind: &str,
+    offset: usize,
+    limit: usize,
+    hidden: &HashSet<String>,
+) -> (usize, bool) {
+    let page = registry
+        .dispatch(
+            "list",
+            json!({"kind": kind, "offset": offset, "limit": limit}),
+        )
+        .await
+        .expect("list page");
+    let rows = page["items"].as_array().expect("items array");
+    for row in rows {
+        let id = row["id"].as_str().expect("row id");
+        assert!(!hidden.contains(id), "hidden row returned: {id}");
+    }
+    (rows.len(), page["has_more"].as_bool().expect("has_more"))
+}
+
+/// Rows past the scan ceiling stay reachable by offset. The partition runs in
+/// the store, so a list with no row-level filter pages by the store's offset.
+#[tokio::test]
+async fn offset_list_reaches_rows_past_the_scan_ceiling() {
+    const VISIBLE: usize = 10_005;
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let store = rt.notes(&token).expect("note store");
+    let base = 1_700_000_000_000_000i64;
+    let mut hidden_ids = HashSet::new();
+    let mut batch = Vec::with_capacity(1000);
+    for i in 0..VISIBLE {
+        let time = base + i as i64;
+        batch.push(visible_message(time, false));
+        if i % 500 == 0 {
+            let note = hidden_message(i, time, false);
+            hidden_ids.insert(note.id.to_string());
+            batch.push(note);
+        }
+        if batch.len() >= 1000 {
+            store
+                .upsert_notes(std::mem::take(&mut batch))
+                .await
+                .expect("upsert batch");
+        }
+    }
+    store.upsert_notes(batch).await.expect("upsert tail");
+    let reg = registry(&rt);
+    // A kg-only registry cannot resolve kind="message"; the generic note list
+    // takes the same paging branch as an explicit message list.
+    assert_eq!(
+        offset_page(&reg, "note", 9_990, 5, &hidden_ids).await,
+        (5, true),
+        "offset=9990"
+    );
+    assert_eq!(
+        offset_page(&reg, "note", 10_000, 20, &hidden_ids).await,
+        (5, false),
+        "offset=10000"
+    );
+    assert_eq!(
+        offset_page(&reg, "note", VISIBLE, 20, &hidden_ids).await,
+        (0, false),
+        "offset past the end"
+    );
+}
+
+async fn list_refusal(registry: &VerbRegistry, args: Value) -> String {
+    format!(
+        "{:?}",
+        registry
+            .dispatch("list", args)
+            .await
+            .expect_err("list refuses the anchor")
+    )
+}
+
+/// A caller-supplied anchor naming a message this mailbox hides answers
+/// exactly as an anchor naming nothing does, so neither `after` nor
+/// `after_key` probes for another actor's mail.
+#[tokio::test]
+async fn hidden_anchor_answers_as_a_missing_one() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let store = rt.notes(&token).expect("note store");
+    let base = 1_700_000_000_000_000i64;
+    let hidden = hidden_message(1, base, true);
+    let visible = visible_message(base + 1, true);
+    // An observation sharing a hidden message's key. Counted together, the
+    // two rows refuse as ambiguous and the refusal names the message kind.
+    let hidden_twin = hidden_message(0, base, true);
+    let mut twin = Note::new("local", "observation", "twin");
+    twin.key = hidden_twin.key.clone();
+    let hidden_id = hidden.id.to_string();
+    let visible_id = visible.id.to_string();
+    let missing_id = Note::new("local", "message", "never stored").id.to_string();
+    store
+        .upsert_notes(vec![hidden, visible, hidden_twin, twin])
+        .await
+        .expect("seed");
+    let reg = registry(&rt);
+
+    reg.dispatch(
+        "list",
+        json!({"kind": "note", "after": visible_id, "limit": 5}),
+    )
+    .await
+    .expect("a visible anchor pages");
+    let hidden_err = list_refusal(
+        &reg,
+        json!({"kind": "note", "after": hidden_id, "limit": 5}),
+    )
+    .await;
+    let missing_err = list_refusal(
+        &reg,
+        json!({"kind": "note", "after": missing_id, "limit": 5}),
+    )
+    .await;
+    assert_eq!(
+        hidden_err.replace(&hidden_id, "<id>"),
+        missing_err.replace(&missing_id, "<id>"),
+        "after"
+    );
+
+    let keyed = |key: &str| json!({"kind": "note", "key_prefix": "", "after_key": key, "limit": 5});
+    let hidden_err = list_refusal(&reg, keyed("hidden/00001")).await;
+    let missing_err = list_refusal(&reg, keyed("hidden/99999")).await;
+    assert_eq!(
+        hidden_err.replace("hidden/00001", "<key>"),
+        missing_err.replace("hidden/99999", "<key>"),
+        "after_key"
+    );
+    reg.dispatch("list", keyed("hidden/00000"))
+        .await
+        .expect("a key shared with a hidden message resolves to the visible row");
+}
