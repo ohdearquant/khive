@@ -2506,6 +2506,7 @@ dependencies = [
  "khive-score",
  "khive-storage",
  "khive-types",
+ "lattice-embed",
  "rusqlite",
  "serde",
  "serde_json",
