@@ -9,6 +9,7 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
+use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
     EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal,
@@ -1574,6 +1575,106 @@ fn edge_by_natural_key_including_deleted(
     .optional()
 }
 
+/// The predicate and insert are one DML statement inside the caller's writer
+/// transaction. The follow-up probes classify an unsuccessful insert under
+/// that same transaction, so no racing curation can turn a tombstone into a
+/// repairable gap or change the note identity after its check.
+fn conditional_commit_annotation_insert(
+    conn: &rusqlite::Connection,
+    edge: Edge,
+    guard: &CommitAnnotationGuard,
+) -> Result<CommitAnnotationInsertOutcome, rusqlite::Error> {
+    // This connection is inside BEGIN IMMEDIATE on both writer paths. Check
+    // the pack-owned cursor rows here, then bind the result into the core-only
+    // INSERT: no other writer can change them between this probe and the DML.
+    let cursor_matches: bool = conn.query_row(
+        "SELECT (SELECT EXISTS(SELECT 1 FROM git_mirror_cursor \
+                 WHERE project_id=?1 AND kind='commits' \
+                 AND typeof(cursor_value)='text' \
+                 AND CAST(cursor_value AS BLOB)=?2 AND updated_at=?3)) \
+              AND (SELECT EXISTS(SELECT 1 FROM git_mirror_cursor \
+                 WHERE project_id=?1 AND kind='commits_checkpoint' \
+                 AND typeof(cursor_value)='text' \
+                 AND CAST(cursor_value AS BLOB)=?4 AND updated_at=?5))",
+        rusqlite::params![
+            edge.target_id.to_string(),
+            guard.commits.value,
+            guard.commits.updated_at,
+            guard.checkpoint.value,
+            guard.checkpoint.updated_at,
+        ],
+        |row| row.get(0),
+    )?;
+    let metadata = edge
+        .metadata
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let affected = conn.execute(
+        include_str!("../../sql/commit-annotation-insert.sql"),
+        rusqlite::params![
+            edge.namespace,
+            Uuid::from(edge.id).to_string(),
+            edge.source_id.to_string(),
+            edge.target_id.to_string(),
+            edge.weight,
+            edge.created_at.timestamp_micros(),
+            edge.updated_at.timestamp_micros(),
+            metadata,
+            guard.expected_sha,
+            guard.source_identity,
+            cursor_matches,
+        ],
+    )?;
+    if affected == 1 {
+        return Ok(CommitAnnotationInsertOutcome::Created(edge));
+    }
+    let source_live: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1 AND namespace=?2 \
+         AND kind='commit' AND deleted_at IS NULL \
+         AND json_type(properties, '$.sha')='text' \
+         AND json_extract(properties, '$.sha')=?3 COLLATE BINARY \
+         AND (SELECT COUNT(*) FROM notes WHERE namespace=?2 AND kind='commit' \
+              AND json_type(properties, '$.sha')='text' \
+              AND json_extract(properties, '$.sha')=?3 COLLATE BINARY)=1)",
+        rusqlite::params![
+            edge.source_id.to_string(),
+            edge.namespace,
+            guard.expected_sha
+        ],
+        |row| row.get(0),
+    )?;
+    if !source_live {
+        return Ok(CommitAnnotationInsertOutcome::SourceChanged);
+    }
+    let target_live: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entities WHERE id=?1 AND namespace=?2 \
+         AND kind='project' AND deleted_at IS NULL \
+         AND json_type(properties, '$.repo_slug')='text' \
+         AND json_extract(properties, '$.repo_slug')=?3 COLLATE BINARY)",
+        rusqlite::params![
+            edge.target_id.to_string(),
+            edge.namespace,
+            guard.source_identity
+        ],
+        |row| row.get(0),
+    )?;
+    if !target_live {
+        return Ok(CommitAnnotationInsertOutcome::TargetChanged);
+    }
+    if !cursor_matches {
+        return Ok(CommitAnnotationInsertOutcome::CursorChanged);
+    }
+    match edge_by_natural_key_including_deleted(conn, &edge)? {
+        Some(existing) if existing.deleted_at.is_some() => {
+            Ok(CommitAnnotationInsertOutcome::Tombstoned)
+        }
+        Some(_) => Ok(CommitAnnotationInsertOutcome::ExistingLive),
+        None => Err(rusqlite::Error::QueryReturnedNoRows),
+    }
+}
+
 /// Apply one replacement-style upsert and derive its disposition/preimage on
 /// the same write connection. Callers keep this inside one write transaction.
 fn observed_edge_upsert(
@@ -2109,6 +2210,48 @@ impl GraphStore for SqlGraphStore {
             let mut stmt = conn.prepare(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             Ok(stmt.raw_execute()? > 0)
+        })
+        .await
+    }
+
+    async fn insert_commit_annotation_if_absent(
+        &self,
+        edge: Edge,
+        guard: CommitAnnotationGuard,
+    ) -> Result<CommitAnnotationInsertOutcome, StorageError> {
+        const OP: &str = "insert_commit_annotation_if_absent";
+        if edge.relation != EdgeRelation::Annotates || edge.deleted_at.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Graph,
+                operation: OP.into(),
+                message: "expected a live annotates edge".into(),
+            });
+        }
+        if let Some(writer_task) = self.current_writer_task(OP)? {
+            return writer_task
+                .send_bounded(move |conn| {
+                    conditional_commit_annotation_insert(conn, edge, &guard)
+                        .map_err(|error| map_err(error, OP))
+                })
+                .await;
+        }
+        let origin = self.pool.origin();
+        self.with_writer(OP, move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register_scoped(Some(OP.to_string()), origin);
+            let outcome = match conditional_commit_annotation_insert(conn, edge, &guard) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            };
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+            Ok(outcome)
         })
         .await
     }
