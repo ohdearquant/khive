@@ -550,9 +550,15 @@ fn resolve_imports(
             };
             for (name, binding) in glob_names(&source, modules) {
                 // A module's own child module is an item of that module, and
-                // an item shadows a glob import of the same name. A block's
+                // an item shadows a glob import of the same name in the same
+                // namespace. A child module lives in the type namespace, so it
+                // shadows a glob-imported module but never a glob-imported
+                // constant, which a value position still reaches. A block's
                 // glob import still shadows the enclosing module's items.
-                if current_module.is_none() && child_module(module_id, &name, modules).is_some() {
+                if current_module.is_none()
+                    && matches!(binding, Binding::Module(_))
+                    && child_module(module_id, &name, modules).is_some()
+                {
                     continue;
                 }
                 bindings.entry(name).or_insert(binding);
@@ -2098,7 +2104,7 @@ fn a_child_module_shadows_a_glob_imported_module_of_the_same_name() {
             ("sample/src/other.rs".into(), "pub mod db;".into()),
             (
                 "sample/src/other/db.rs".into(),
-                "pub const MERGE_SQL: &str = \"SELECT 1\";".into(),
+                "pub use khive_db::stores::note::NOTE_INSERT_IF_ABSENT_SQL as MERGE_SQL;".into(),
             ),
             (
                 "sample/src/writer.rs".into(),
@@ -2127,11 +2133,55 @@ fn a_child_module_shadows_a_glob_imported_module_of_the_same_name() {
     assert!(shadowed[0]
         .evidence
         .contains("SQL constant NOTE_UPSERT_SQL"));
+    assert!(!shadowed[0].evidence.contains("NOTE_INSERT_IF_ABSENT_SQL"));
 
     // Control: with no child of that name the glob-imported module is the
-    // one Rust resolves, and its constant is unrelated.
+    // one Rust resolves, so the route reaches its constant instead.
     let through_glob = scan_sources(&sources("")).unwrap();
-    assert!(through_glob.is_empty(), "{through_glob:?}");
+    assert_eq!(
+        through_glob.len(),
+        1,
+        "the glob is followed: {through_glob:?}"
+    );
+    assert!(through_glob[0]
+        .evidence
+        .contains("SQL constant NOTE_INSERT_IF_ABSENT_SQL"));
+}
+
+// A child module lives in the type namespace, so it does not shadow a constant
+// of the same name that a glob import brings into the value namespace.
+#[test]
+fn a_child_module_does_not_shadow_a_glob_imported_constant_of_the_same_name() {
+    let sources = |writer_children: &str| {
+        let mut sources: Vec<(String, String)> = vec![
+            ("sample/src/lib.rs".into(), "mod other; mod writer;".into()),
+            (
+                "sample/src/other.rs".into(),
+                "pub use khive_db::stores::note::NOTE_UPSERT_SQL as merge;".into(),
+            ),
+            (
+                "sample/src/writer.rs".into(),
+                format!(
+                    "use crate::other::*; {writer_children}
+                     fn write(conn: &Connection) {{ conn.prepare_cached(merge); }}"
+                ),
+            ),
+        ];
+        if !writer_children.is_empty() {
+            sources.push((
+                "sample/src/writer/merge.rs".into(),
+                "pub fn unrelated() {}".into(),
+            ));
+        }
+        sources
+    };
+
+    for children in ["mod merge;", ""] {
+        let routes = scan_sources(&sources(children)).unwrap();
+        assert_eq!(routes.len(), 1, "children {children:?}: {routes:?}");
+        assert_eq!(routes[0].key, "sample/src/writer.rs::write");
+        assert!(routes[0].evidence.contains("SQL constant NOTE_UPSERT_SQL"));
+    }
 }
 
 // Each fixture names `MERGE_SQL` through a module path that Rust resolves to
