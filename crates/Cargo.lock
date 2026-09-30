@@ -2552,6 +2552,7 @@ dependencies = [
  "chrono",
  "inventory",
  "khive-db",
+ "khive-gate",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",
