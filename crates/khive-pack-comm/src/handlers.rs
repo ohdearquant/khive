@@ -2220,6 +2220,196 @@ fn duplicate_ingest_ack(duplicate: &Note, external_id: Option<&str>) -> Value {
     ack
 }
 
+/// A duplicate quarantine must prove replay ownership before acknowledgement.
+/// This applies equally to the account key and its one-release legacy IMAP key.
+#[allow(clippy::too_many_arguments)]
+async fn repair_duplicate_quarantine(
+    runtime: &KhiveRuntime,
+    ns: &str,
+    duplicate: &Note,
+    attachment: Option<&NewAttachment>,
+    channel_kind: Option<&str>,
+    channel_slug: Option<&str>,
+    retention: std::time::Duration,
+    extend_retention: bool,
+) -> Result<(), RuntimeError> {
+    let Some(attachment) = attachment else {
+        return Ok(());
+    };
+    let stored_ref = duplicate
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("quarantine_content_ref"));
+    let needs_ref_backfill = stored_ref.is_none();
+    if stored_ref.is_some_and(|value| value.as_str() != Some(attachment.content_ref.as_str())) {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: duplicate quarantine external_id holds different original bytes".to_string(),
+        ));
+    }
+    if needs_ref_backfill
+        && !duplicate.properties.as_ref().is_some_and(|properties| {
+            matches!(properties.get("quarantined"), Some(Value::Bool(true)))
+                || properties.get("quarantined").and_then(Value::as_str) == Some("true")
+        })
+    {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: duplicate without an original reference is not quarantined".to_string(),
+        ));
+    }
+    let stored_channel_kind = duplicate
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("channel_kind"))
+        .and_then(Value::as_str);
+    let stored_channel_slug = duplicate
+        .properties
+        .as_ref()
+        .and_then(|properties| properties.get("channel_slug"))
+        .and_then(Value::as_str);
+    if stored_channel_kind != channel_kind
+        || stored_channel_slug.is_some_and(|slug| Some(slug) != channel_slug)
+    {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: duplicate quarantine channel identity disagrees with replay".to_string(),
+        ));
+    }
+    if needs_ref_backfill && (stored_channel_kind.is_none() || channel_slug.is_none()) {
+        return Err(RuntimeError::InvalidInput(
+            "ingest: duplicate quarantine needs channel identity to attach original bytes"
+                .to_string(),
+        ));
+    }
+    // Compute the replay grace before installing the owner, so an
+    // unrepresentable deadline cannot leave a partially repaired row.
+    // A current-key replay extends retention. A legacy-key row with no
+    // deadline at all also gets one, because the repair makes it the owner of
+    // the original bytes and no cleanup selector reaches a slugged row whose
+    // expiry is NULL. A legacy row that already has a deadline keeps it.
+    let install_deadline = extend_retention || duplicate.expires_at.is_none();
+    let replay_deadline =
+        if install_deadline && stored_channel_kind.is_some() && channel_slug.is_some() {
+            let grace_us = i64::try_from(retention.as_micros()).map_err(|_| {
+                RuntimeError::InvalidInput(
+                    "ingest: quarantine replay retention exceeds i64 microseconds".into(),
+                )
+            })?;
+            Some(
+                Utc::now()
+                    .timestamp_micros()
+                    .checked_add(grace_us)
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput(
+                            "ingest: quarantine replay expiry exceeds i64 microseconds".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+    let store = runtime.core().attachments()?;
+    match store
+        .get_attachment(duplicate.id, "quarantine-original")
+        .await?
+    {
+        Some(existing) if existing.content_ref == attachment.content_ref => {}
+        Some(_) => {
+            return Err(RuntimeError::Internal(
+                "ingest: duplicate quarantine attachment disagrees with note metadata".to_string(),
+            ));
+        }
+        None => {
+            // Retry/backfill an older metadata-only quarantine.
+            // A failed owner write keeps the channel cursor stalled.
+            let blob = runtime.blob_store().ok_or_else(|| {
+                RuntimeError::Unconfigured(
+                    "ingest: quarantine replay requires a BlobStore".to_string(),
+                )
+            })?;
+            if !blob.exists(&attachment.content_ref).await? {
+                return Err(RuntimeError::InvalidInput(
+                    "ingest: duplicate quarantine original is not published".to_string(),
+                ));
+            }
+            #[cfg(test)]
+            race_seam::pause_after_quarantine_role_read().await;
+            if !store
+                .try_insert_attachment(Attachment::from_new(
+                    duplicate.id,
+                    AttachmentSubstrate::Note,
+                    (*attachment).clone(),
+                    duplicate.created_at,
+                ))
+                .await?
+            {
+                // A writer installed the role after our first read.
+                // A matching reference is an idempotent replay; a
+                // different one must not be acknowledged as repaired.
+                let current = store
+                    .get_attachment(duplicate.id, "quarantine-original")
+                    .await?;
+                if !matches!(current, Some(ref existing)
+                    if existing.substrate == AttachmentSubstrate::Note
+                        && existing.content_ref == attachment.content_ref)
+                {
+                    return Err(RuntimeError::Internal(
+                        "ingest: duplicate quarantine attachment changed during repair".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    if let (Some(channel_kind), Some(channel_slug)) = (stored_channel_kind, channel_slug) {
+        if needs_ref_backfill || replay_deadline.is_some() {
+            // The duplicate lookup has already matched the exact channel kind
+            // and slug. Repair a pre-attachment quarantine's ContentRef before
+            // acknowledging it, and install or extend retention for a
+            // current-key replay or a row with no deadline. A concurrent
+            // identity change cannot redirect cleanup.
+            let sql = runtime.sql();
+            let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
+            let repaired = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET \
+                      properties = json_set(properties, '$.channel_slug', ?5, \
+                                            '$.quarantine_content_ref', ?3), \
+                      expires_at = CASE WHEN ?6 IS NULL THEN expires_at \
+                        WHEN expires_at IS NULL OR expires_at < ?6 \
+                        THEN ?6 ELSE expires_at END, \
+                      updated_at = MAX(updated_at, ?7) \
+                      WHERE id = ?1 AND namespace = ?2 AND kind = 'message' \
+                        AND deleted_at IS NULL \
+                        AND (json_type(properties, '$.quarantine_content_ref') IS NULL \
+                             OR json_extract(properties, '$.quarantine_content_ref') = ?3) \
+                        AND json_extract(properties, '$.channel_kind') = ?4 \
+                        AND (json_type(properties, '$.channel_slug') IS NULL \
+                             OR (json_type(properties, '$.channel_slug') = 'text' \
+                                 AND json_extract(properties, '$.channel_slug') = ?5)) \
+                        AND (json_extract(properties, '$.quarantined') = 'true' \
+                             OR json_type(properties, '$.quarantined') = 'true')"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(duplicate.id.as_hyphenated().to_string()),
+                        SqlValue::Text(ns.to_string()),
+                        SqlValue::Text(attachment.content_ref.to_string()),
+                        SqlValue::Text(channel_kind.to_string()),
+                        SqlValue::Text(channel_slug.to_string()),
+                        replay_deadline.map_or(SqlValue::Null, SqlValue::Integer),
+                        SqlValue::Integer(Utc::now().timestamp_micros()),
+                    ],
+                    label: Some("comm_quarantine_duplicate_retention_repair".into()),
+                })
+                .await
+                .map_err(RuntimeError::Storage)?;
+            if repaired != 1 {
+                return Err(RuntimeError::InvalidInput(
+                    "ingest: duplicate quarantine changed during retention repair".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Match the same channel-scoped key enforced by the durable external-ID index.
 /// An absent channel field occupies the empty index partition; transport-owned
 /// fields on a validated ingest are non-empty and compared exactly.
@@ -2349,24 +2539,42 @@ pub(crate) async fn handle_ingest(
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
 
-    // A legacy IMAP lookup can return a duplicate before the quarantine
-    // attachment repair below. The channel adapters never combine these two
-    // flows, so reject a synthetic combined request instead of acknowledging
-    // a quarantine replay without inspecting its original-byte owner.
-    let legacy_quarantine_overlap = p.legacy_external_id.is_some()
-        && p.metadata.as_ref().is_some_and(|metadata| {
-            metadata
-                .keys()
-                .any(|key| key == "quarantined" || key.starts_with("quarantine_"))
-        });
-    if legacy_quarantine_overlap {
-        return Err(RuntimeError::InvalidInput(
-            "ingest: legacy_external_id cannot be combined with quarantine metadata".into(),
-        ));
-    }
+    // Parse quarantine replay ownership before either dedup path can acknowledge it.
+    // Adapter metadata is merged below without replacing these keys.
+    let is_quarantined = p.metadata.as_ref().is_some_and(|metadata| {
+        matches!(metadata.get("quarantined"), Some(Value::Bool(true)))
+            || metadata.get("quarantined").and_then(Value::as_str) == Some("true")
+    });
+    let quarantine_attachment = if is_quarantined {
+        match p
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("quarantine_content_ref"))
+        {
+            None => None,
+            Some(Value::String(raw)) => Some(NewAttachment {
+                role: "quarantine-original".to_string(),
+                content_ref: ContentRef::from_hex(raw).map_err(|error| {
+                    RuntimeError::InvalidInput(format!(
+                        "ingest: invalid quarantine_content_ref: {error}"
+                    ))
+                })?,
+                media_type: None,
+                size_bytes: None,
+            }),
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "ingest: quarantine_content_ref must be a ContentRef string".to_string(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
-    // One-release IMAP migration: read the pre-account key but never rewrite
-    // its stored row. The old key was shared across accounts on one host, so
+    // One-release IMAP migration: read the pre-account key and keep its stored
+    // external_id; a quarantine replay may only repair ownership and retention
+    // on the row. The old key was shared across accounts on one host, so
     // the lookup MUST include the credential slug; an old row for account A
     // must not suppress account B's first delivery of the same UID.
     if let Some(ref old_id) = p.legacy_external_id {
@@ -2398,6 +2606,17 @@ pub(crate) async fn handle_ingest(
             )
             .await?;
         if let Some(duplicate) = new_page.items.first() {
+            repair_duplicate_quarantine(
+                runtime,
+                ns,
+                duplicate,
+                quarantine_attachment.as_ref(),
+                p.channel_kind.as_deref(),
+                p.channel_slug.as_deref(),
+                quarantine_retention,
+                true,
+            )
+            .await?;
             return Ok(duplicate_ingest_ack(duplicate, p.external_id.as_deref()));
         }
         let old_filter = NoteFilter {
@@ -2437,6 +2656,17 @@ pub(crate) async fn handle_ingest(
             )
             .await?;
         if let Some(duplicate) = old_page.items.first() {
+            repair_duplicate_quarantine(
+                runtime,
+                ns,
+                duplicate,
+                quarantine_attachment.as_ref(),
+                p.channel_kind.as_deref(),
+                p.channel_slug.as_deref(),
+                quarantine_retention,
+                false,
+            )
+            .await?;
             return Ok(duplicate_ingest_ack(duplicate, p.external_id.as_deref()));
         }
     }
@@ -2658,35 +2888,6 @@ pub(crate) async fn handle_ingest(
         }
     }
 
-    // The original bytes are this quarantine message's own binary content.
-    // A metadata-only ContentRef is invisible to blob GC, so pass its role to
-    // the note store for one transaction with the new note. Other inbound
-    // messages and quarantines without replay bytes keep their old behavior.
-    let is_quarantined = matches!(props.get("quarantined"), Some(Value::Bool(true)))
-        || props.get("quarantined").and_then(Value::as_str) == Some("true");
-    let quarantine_attachment = if is_quarantined {
-        match props.get("quarantine_content_ref") {
-            None => None,
-            Some(Value::String(raw)) => Some(NewAttachment {
-                role: "quarantine-original".to_string(),
-                content_ref: ContentRef::from_hex(raw).map_err(|error| {
-                    RuntimeError::InvalidInput(format!(
-                        "ingest: invalid quarantine_content_ref: {error}"
-                    ))
-                })?,
-                media_type: None,
-                size_bytes: None,
-            }),
-            Some(_) => {
-                return Err(RuntimeError::InvalidInput(
-                    "ingest: quarantine_content_ref must be a ContentRef string".to_string(),
-                ));
-            }
-        }
-    } else {
-        None
-    };
-
     let created = if let Some(attachment) = quarantine_attachment.clone() {
         runtime
             .try_create_note_as_trusted_ingest_with_attachment(
@@ -2745,166 +2946,17 @@ pub(crate) async fn handle_ingest(
                     "comm.ingest: duplicate external_id {external_id:?} has no existing row"
                 ))
             })?;
-            if let Some(attachment) = quarantine_attachment {
-                let stored_ref = duplicate
-                    .properties
-                    .as_ref()
-                    .and_then(|properties| properties.get("quarantine_content_ref"))
-                    .and_then(Value::as_str);
-                if stored_ref != Some(attachment.content_ref.as_str()) {
-                    return Err(RuntimeError::InvalidInput(
-                        "ingest: duplicate quarantine external_id holds different original bytes"
-                            .to_string(),
-                    ));
-                }
-                let stored_channel_kind = duplicate
-                    .properties
-                    .as_ref()
-                    .and_then(|properties| properties.get("channel_kind"))
-                    .and_then(Value::as_str);
-                let stored_channel_slug = duplicate
-                    .properties
-                    .as_ref()
-                    .and_then(|properties| properties.get("channel_slug"))
-                    .and_then(Value::as_str);
-                if stored_channel_kind != p.channel_kind.as_deref()
-                    || stored_channel_slug
-                        .is_some_and(|slug| Some(slug) != p.channel_slug.as_deref())
-                {
-                    return Err(RuntimeError::InvalidInput(
-                        "ingest: duplicate quarantine channel identity disagrees with replay"
-                            .to_string(),
-                    ));
-                }
-                // Compute the replay grace before installing the owner, so an
-                // unrepresentable deadline cannot leave a partially repaired row.
-                let replay_deadline = if stored_channel_kind.is_some() && p.channel_slug.is_some() {
-                    let grace_us =
-                        i64::try_from(quarantine_retention.as_micros()).map_err(|_| {
-                            RuntimeError::InvalidInput(
-                                "ingest: quarantine replay retention exceeds i64 microseconds"
-                                    .into(),
-                            )
-                        })?;
-                    Some(
-                        Utc::now()
-                            .timestamp_micros()
-                            .checked_add(grace_us)
-                            .ok_or_else(|| {
-                                RuntimeError::InvalidInput(
-                                    "ingest: quarantine replay expiry exceeds i64 microseconds"
-                                        .into(),
-                                )
-                            })?,
-                    )
-                } else {
-                    None
-                };
-                let store = runtime.core().attachments()?;
-                match store
-                    .get_attachment(duplicate.id, "quarantine-original")
-                    .await?
-                {
-                    Some(existing) if existing.content_ref == attachment.content_ref => {}
-                    Some(_) => {
-                        return Err(RuntimeError::Internal(
-                            "ingest: duplicate quarantine attachment disagrees with note metadata"
-                                .to_string(),
-                        ));
-                    }
-                    None => {
-                        // Retry/backfill an older metadata-only quarantine.
-                        // A failed owner write keeps the channel cursor stalled.
-                        let blob = runtime.blob_store().ok_or_else(|| {
-                            RuntimeError::Unconfigured(
-                                "ingest: quarantine replay requires a BlobStore".to_string(),
-                            )
-                        })?;
-                        if !blob.exists(&attachment.content_ref).await? {
-                            return Err(RuntimeError::InvalidInput(
-                                "ingest: duplicate quarantine original is not published"
-                                    .to_string(),
-                            ));
-                        }
-                        #[cfg(test)]
-                        race_seam::pause_after_quarantine_role_read().await;
-                        if !store
-                            .try_insert_attachment(Attachment::from_new(
-                                duplicate.id,
-                                AttachmentSubstrate::Note,
-                                attachment.clone(),
-                                duplicate.created_at,
-                            ))
-                            .await?
-                        {
-                            // A writer installed the role after our first read.
-                            // A matching reference is an idempotent replay; a
-                            // different one must not be acknowledged as repaired.
-                            let current = store
-                                .get_attachment(duplicate.id, "quarantine-original")
-                                .await?;
-                            if !matches!(current, Some(ref existing)
-                                if existing.substrate == AttachmentSubstrate::Note
-                                    && existing.content_ref == attachment.content_ref)
-                            {
-                                return Err(RuntimeError::Internal(
-                                    "ingest: duplicate quarantine attachment changed during repair"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
-                if let (Some(channel_kind), Some(channel_slug), Some(deadline)) = (
-                    stored_channel_kind,
-                    p.channel_slug.as_deref(),
-                    replay_deadline,
-                ) {
-                    // The duplicate lookup has already matched the exact
-                    // channel kind and slug. This guarded write installs or
-                    // extends its retention deadline; a concurrent identity
-                    // change cannot redirect cleanup to another channel.
-                    // Later deadlines are retained.
-                    let sql = runtime.sql();
-                    let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-                    let repaired = writer
-                        .execute(SqlStatement {
-                            sql: "UPDATE notes SET \
-                                  properties = json_set(properties, '$.channel_slug', ?5), \
-                                  expires_at = CASE WHEN expires_at IS NULL OR expires_at < ?6 \
-                                    THEN ?6 ELSE expires_at END, \
-                                  updated_at = MAX(updated_at, ?7) \
-                                  WHERE id = ?1 AND namespace = ?2 AND kind = 'message' \
-                                    AND deleted_at IS NULL \
-                                    AND json_extract(properties, '$.quarantine_content_ref') = ?3 \
-                                    AND json_extract(properties, '$.channel_kind') = ?4 \
-                                    AND (json_type(properties, '$.channel_slug') IS NULL \
-                                         OR (json_type(properties, '$.channel_slug') = 'text' \
-                                             AND json_extract(properties, '$.channel_slug') = ?5)) \
-                                    AND (json_extract(properties, '$.quarantined') = 'true' \
-                                         OR json_type(properties, '$.quarantined') = 'true')"
-                                .into(),
-                            params: vec![
-                                SqlValue::Text(duplicate.id.as_hyphenated().to_string()),
-                                SqlValue::Text(ns.to_string()),
-                                SqlValue::Text(attachment.content_ref.to_string()),
-                                SqlValue::Text(channel_kind.to_string()),
-                                SqlValue::Text(channel_slug.to_string()),
-                                SqlValue::Integer(deadline),
-                                SqlValue::Integer(Utc::now().timestamp_micros()),
-                            ],
-                            label: Some("comm_quarantine_duplicate_retention_repair".into()),
-                        })
-                        .await
-                        .map_err(RuntimeError::Storage)?;
-                    if repaired != 1 {
-                        return Err(RuntimeError::InvalidInput(
-                            "ingest: duplicate quarantine changed during retention repair"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
+            repair_duplicate_quarantine(
+                runtime,
+                ns,
+                duplicate,
+                quarantine_attachment.as_ref(),
+                p.channel_kind.as_deref(),
+                p.channel_slug.as_deref(),
+                quarantine_retention,
+                true,
+            )
+            .await?;
             return Ok(duplicate_ingest_ack(duplicate, p.external_id.as_deref()));
         }
     };
@@ -4904,6 +4956,156 @@ mod tests {
                 .expect("stored attachment"),
             Some(competing),
             "the competing writer's role must survive the replay"
+        );
+    }
+
+    /// A pre-retention row stored under the legacy IMAP key has a channel slug
+    /// and no `expires_at`. Replaying its quarantined message attaches the
+    /// original bytes to that row, so cleanup must be able to select the row
+    /// once retention elapses and release the attachment with it.
+    #[tokio::test]
+    async fn legacy_key_quarantine_replay_installs_a_deadline_that_cleanup_selects() {
+        use std::sync::Arc;
+
+        use khive_runtime::Namespace;
+        use khive_storage::{BlobStore as _, Note};
+
+        let retention = std::time::Duration::from_secs(14 * 24 * 60 * 60);
+        let runtime = super::KhiveRuntime::memory().expect("in-memory runtime");
+        let blob_root = tempfile::tempdir().expect("blob root");
+        let blob_store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+                .expect("blob store"),
+        );
+        let original_ref = blob_store
+            .put(b"legacy quarantine original".to_vec())
+            .await
+            .expect("publish original");
+        runtime
+            .install_blob_store(blob_store)
+            .expect("install blob store");
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let old_id = "imap:mail.example.com:17:legacy-retention";
+        let new_id = "imap:mail.example.com:a@example.com:17:legacy-retention";
+
+        // Plant the pre-retention row directly: matching slug, no deadline,
+        // no attachment.
+        let legacy_thread = uuid::Uuid::new_v4().as_hyphenated().to_string();
+        let legacy = Note::new("local", "message", "legacy quarantine").with_properties(json!({
+            "external_id": old_id,
+            "direction": "inbound",
+            "thread_id": legacy_thread,
+            "channel_kind": "email",
+            "channel_slug": "a@example.com",
+            "quarantined": true,
+        }));
+        assert!(legacy.expires_at.is_none(), "fixture must have no deadline");
+        let note_id = legacy.id;
+        assert!(runtime
+            .backend()
+            .notes()
+            .expect("backend notes")
+            .try_insert_note(legacy)
+            .await
+            .expect("seed legacy row"));
+
+        let signal = crate::inbox_signal::InboxSignal::new();
+        let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
+        let replay_started = chrono::Utc::now().timestamp_micros();
+        let ack = super::handle_ingest(
+            &runtime,
+            &signal,
+            Some(&capability),
+            &Ok(None),
+            &token,
+            json!({
+                "from": "email:quarantine", "to": "local",
+                "content": "replayed quarantine", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": new_id,
+                "legacy_external_id": old_id,
+                "metadata": {
+                    "quarantined": true,
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+            retention,
+        )
+        .await
+        .expect("legacy-key replay");
+        assert_eq!(ack["deduplicated"], true);
+        assert_eq!(ack["thread_id"], legacy_thread);
+        assert_eq!(
+            runtime
+                .notes(&token)
+                .expect("note store")
+                .count_notes("local", Some("message"))
+                .await
+                .unwrap(),
+            1,
+            "the replay must repair the legacy row, not create a second one"
+        );
+
+        let attachments = runtime.core().attachments().expect("attachment store");
+        assert_eq!(
+            attachments
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .expect("repair roots the original")
+                .content_ref,
+            original_ref
+        );
+        let notes = runtime.notes(&token).expect("note store");
+        let repaired = notes
+            .get_note(note_id)
+            .await
+            .expect("row lookup")
+            .expect("legacy row retained");
+        let deadline = repaired
+            .expires_at
+            .expect("the repair must give the owning row a deadline");
+        let retention_us = i64::try_from(retention.as_micros()).unwrap();
+        assert!(
+            deadline >= replay_started + retention_us,
+            "deadline {deadline} must be replay time plus retention"
+        );
+
+        let cleanup = |as_of: i64| {
+            super::handle_cleanup_expired_quarantine(
+                &runtime,
+                &token,
+                json!({
+                    "channel_kind": "email",
+                    "channel_slug": "a@example.com",
+                    "as_of_micros": as_of,
+                }),
+                retention,
+            )
+        };
+        assert_eq!(
+            cleanup(replay_started).await.expect("early cleanup")["deleted"],
+            0,
+            "an unexpired row and its attachment must survive"
+        );
+        assert!(notes.get_note(note_id).await.unwrap().is_some());
+
+        assert_eq!(
+            cleanup(deadline + 1).await.expect("expired cleanup")["deleted"],
+            1,
+            "cleanup must select the repaired legacy row once retention elapses"
+        );
+        assert!(notes
+            .get_note_including_deleted(note_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            attachments
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .is_none(),
+            "hard deletion must release the original's owner"
         );
     }
 

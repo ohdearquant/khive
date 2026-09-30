@@ -33,3 +33,6 @@ rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+khive-pack-comm = { version = "0.9.0", path = "../khive-pack-comm" }
+khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
