@@ -7,8 +7,10 @@
 //! body blob, representation properties, and a `web.receipt` observation.
 //! The caller is responsible for acquiring the response and for the egress
 //! policy of that acquisition. The supplied body must be the identity-coded
-//! bytes that `web.fetch` would store; declared non-identity content codings
-//! are refused before any row is written.
+//! bytes that `web.fetch` would store: a GET capture with content and a
+//! declared non-identity content coding is refused before any row is written,
+//! as are 1xx and 304 statuses. A HEAD or an empty 204 stores no content, so
+//! its declared coding is not checked, as in `web.fetch`.
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -130,8 +132,9 @@ pub struct Redirect {
 
 /// An already-obtained HTTP representation to persist as a web capture.
 ///
-/// `GET` requires body bytes, including an empty vector for a bodyless 204 or
-/// 304 response. `HEAD` requires `body = None` and `truncated = false`.
+/// `GET` requires body bytes, and exactly an empty vector for a 204 response.
+/// `HEAD` requires `body = None` and `truncated = false`. An interim 1xx
+/// status and a 304 are refused: neither carries a representation to store.
 /// `truncated` describes a caller-enforced byte ceiling on the identity body.
 #[derive(Clone, Debug)]
 pub struct Capture {
@@ -202,10 +205,30 @@ pub async fn store_capture(
             "invalid HTTP status".to_string(),
         ));
     }
+    if capture.status < 200 {
+        return Err(RuntimeError::InvalidInput(
+            "capture status must be a final response, not an interim 1xx".to_string(),
+        ));
+    }
+    // A 304 validates a representation the caller already holds instead of
+    // carrying one. Settling it as a capture would replace the stored body
+    // with an empty one, so revalidation stays with `web.refresh`.
+    if capture.status == 304 {
+        return Err(RuntimeError::InvalidInput(
+            "a 304 capture carries no representation; revalidate with web.refresh".to_string(),
+        ));
+    }
     match (capture.method, capture.body.as_ref(), capture.truncated) {
         (CaptureMethod::Get, None, _) => {
             return Err(RuntimeError::InvalidInput(
                 "GET capture requires body bytes".to_string(),
+            ));
+        }
+        (CaptureMethod::Get, Some(body), truncated)
+            if capture.status == 204 && (!body.is_empty() || truncated) =>
+        {
+            return Err(RuntimeError::InvalidInput(
+                "a 204 capture cannot carry body bytes or truncation".to_string(),
             ));
         }
         (CaptureMethod::Head, Some(_), _) | (CaptureMethod::Head, None, true) => {
@@ -242,7 +265,9 @@ pub async fn store_capture(
         ));
     }
     let headers = capture.headers.into_header_map()?;
-    if capture.method == CaptureMethod::Get && !matches!(capture.status, 204 | 304) {
+    // Only an empty 204 skips the coding check, as in `web.fetch`: it has no
+    // content to mislabel.
+    if capture.method == CaptureMethod::Get && capture.status != 204 {
         fetch::refuse_content_encoding(&headers)?;
     }
     let selection = capture.selection.into_pairs()?;

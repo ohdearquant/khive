@@ -245,3 +245,95 @@ async fn declared_compressed_body_is_refused_before_minting() {
         .unwrap()
         .is_none());
 }
+
+async fn document_properties(
+    runtime: &KhiveRuntime,
+    token: &khive_runtime::NamespaceToken,
+    document: Uuid,
+) -> Option<Value> {
+    runtime
+        .entities(token)
+        .unwrap()
+        .get_entity(document)
+        .await
+        .unwrap()
+        .and_then(|row| row.properties)
+}
+
+#[tokio::test]
+async fn not_modified_capture_is_refused_and_keeps_the_stored_body() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://example.test/cached").unwrap();
+    let body = b"<html><body>cached page</body></html>".to_vec();
+    let mut capture = Capture::get(url.clone(), 200, body);
+    capture.headers.content_type = Some("text/html".to_string());
+    let reply = producer::store_capture(&runtime, &token, capture)
+        .await
+        .unwrap();
+    let document = Uuid::parse_str(reply["id"].as_str().unwrap()).unwrap();
+    let stored = document_properties(&runtime, &token, document).await;
+    assert!(stored.as_ref().is_some_and(|p| p["status"] == 200));
+
+    let mut not_modified = Capture::get(url, 304, Vec::new());
+    not_modified.headers.content_type = Some("text/html".to_string());
+    let error = producer::store_capture(&runtime, &token, not_modified)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("a 304 capture carries no representation"));
+    assert_eq!(
+        document_properties(&runtime, &token, document).await,
+        stored
+    );
+}
+
+#[tokio::test]
+async fn bodied_no_content_capture_is_refused_before_minting() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://example.test/no-content").unwrap();
+    let mut capture = Capture::get(url.clone(), 204, b"encoded".to_vec());
+    capture.headers.content_type = Some("text/html".to_string());
+    capture.headers.content_encoding = vec!["gzip".to_string()];
+    let error = producer::store_capture(&runtime, &token, capture)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("a 204 capture cannot carry body bytes"));
+    let site = identity::site_id(&identity::canonicalize(url));
+    assert!(runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(site)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn empty_no_content_capture_skips_the_coding_check_like_fetch() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://example.test/empty").unwrap();
+    let mut capture = Capture::get(url, 204, Vec::new());
+    capture.headers.content_encoding = vec!["gzip".to_string()];
+    let reply = producer::store_capture(&runtime, &token, capture)
+        .await
+        .unwrap();
+    assert_eq!(reply["bytes"], 0);
+}
+
+#[tokio::test]
+async fn interim_status_capture_is_refused() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://example.test/interim").unwrap();
+    for capture in [
+        Capture::get(url.clone(), 101, Vec::new()),
+        Capture::head(url.clone(), 100),
+    ] {
+        let error = producer::store_capture(&runtime, &token, capture)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not an interim 1xx"));
+    }
+}
