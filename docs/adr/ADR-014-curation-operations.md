@@ -798,7 +798,7 @@ of destroyed rows is such a class.
 
 ## Amendment 6: Link mutation and lifecycle event commit together (#3675)
 
-**Status**: Proposed (2026-09-30)
+**Status**: Accepted (2026-09-30)
 
 This amendment qualifies this record's "Audit trail via events" section for the four link
 paths below. It retains the accepted natural-key replacement, explicit resurrection,
@@ -888,7 +888,7 @@ outside these four runtime paths do not gain automatic lifecycle events.
 
 ### Alternatives considered
 
-- Keep the separate append and reconcile missing events later: rejected; this amendment chooses one source-backend commit boundary for the mutation and its event.
+- Keep the separate append and reconcile missing events later: rejected. Reconciliation needs a detector for mutations whose event never landed and an event-identity rule that tells a re-appended event from a duplicate, and with both in place it still gives only eventual agreement between a mutation and its event, a weaker invariant than one source-backend commit boundary.
 
 ### Acceptance and controls
 
