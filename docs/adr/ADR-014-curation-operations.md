@@ -802,9 +802,7 @@ of destroyed rows is such a class.
 
 This amendment qualifies this record's "Audit trail via events" section for the four link
 paths below. It retains the accepted natural-key replacement, explicit resurrection,
-transaction-observed disposition and event payload rules. Until this amendment is accepted,
-the existing accepted clauses remain in force; this Proposed section does not authorize a
-dependent implementation to merge.
+transaction-observed disposition and event payload rules.
 
 ### Context
 
