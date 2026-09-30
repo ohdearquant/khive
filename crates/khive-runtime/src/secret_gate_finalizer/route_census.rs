@@ -368,25 +368,22 @@ fn import_target(
     }
     .or_else(|| {
         qualified_target(path, module_id, modules, &|first| {
-            import_scope_module(first, known, current_module)
+            import_scope_binding(first, known, current_module)
         })
     })
 }
 
-/// The module that a leading path segment names through the imports in
+/// The binding that a leading path segment names through the imports in
 /// scope. The nearest scope that binds the name decides, as in Rust.
-fn import_scope_module(
+fn import_scope_binding(
     first: &str,
     known: &SqlBindings,
     current_module: Option<&SqlBindings>,
-) -> Option<ModuleId> {
-    match std::iter::once(known)
+) -> Option<Binding> {
+    std::iter::once(known)
         .chain(current_module)
         .find_map(|scope| scope.get(first))
-    {
-        Some(Binding::Module(module)) => Some(module.clone()),
-        _ => None,
-    }
+        .cloned()
 }
 
 fn child_module(parent: &ModuleId, name: &str, modules: &ModuleBindings) -> Option<ModuleId> {
@@ -416,12 +413,13 @@ fn crate_root(name: &str, modules: &ModuleBindings) -> Option<ModuleId> {
 /// The scanned module a path prefix names, or `None` when the prefix leaves
 /// the scanned sources. A leading plain name resolves as Rust resolves it:
 /// through an import in scope, then a child module, then a workspace crate.
+/// A name the scope binds to anything but a module ends the lookup there.
 /// Each later segment follows a child module or a re-exported module alias.
 fn resolve_module(
     prefix: &[String],
     current: &ModuleId,
     modules: &ModuleBindings,
-    in_scope: &dyn Fn(&str) -> Option<ModuleId>,
+    in_scope: &dyn Fn(&str) -> Option<Binding>,
 ) -> Option<ModuleId> {
     let Some((first, rest)) = prefix.split_first() else {
         return Some(current.clone());
@@ -446,9 +444,15 @@ fn resolve_module(
             (parent, &prefix[depth..])
         }
         name => (
-            in_scope(name)
-                .or_else(|| child_module(current, name, modules))
-                .or_else(|| crate_root(name, modules))?,
+            match in_scope(name) {
+                Some(Binding::Module(module)) => module,
+                // A name bound in scope to anything else hides child modules
+                // and workspace crates of the same name.
+                Some(_) => return None,
+                None => {
+                    child_module(current, name, modules).or_else(|| crate_root(name, modules))?
+                }
+            },
             rest,
         ),
     };
@@ -468,12 +472,20 @@ fn qualified_target(
     path: &[String],
     current: &ModuleId,
     modules: &ModuleBindings,
-    in_scope: &dyn Fn(&str) -> Option<ModuleId>,
+    in_scope: &dyn Fn(&str) -> Option<Binding>,
 ) -> Option<Binding> {
     let (name, prefix) = path.split_last()?;
     let module = resolve_module(prefix, current, modules, in_scope)?;
     resolved(modules.get(&module).and_then(|bindings| bindings.get(name)))
         .or_else(|| child_module(&module, name, modules).map(Binding::Module))
+        // `use khive_db;` names the workspace crate itself.
+        .or_else(|| {
+            prefix
+                .is_empty()
+                .then(|| crate_root(name, modules))
+                .flatten()
+                .map(Binding::Module)
+        })
 }
 
 /// The names a glob import of `module` brings: its resolved imports, glob
@@ -533,7 +545,7 @@ fn resolve_imports(
         // glob imports, so a glob only fills the names left unbound.
         for (_, path) in imports.iter().filter(|(name, _)| name == GLOB_IMPORT) {
             let Some(source) = resolve_module(path, module_id, modules, &|first| {
-                import_scope_module(first, &known, current_module)
+                import_scope_binding(first, &known, current_module)
             }) else {
                 continue;
             };
@@ -634,19 +646,15 @@ impl<'modules> SourceCollector<'modules> {
         site.evidence.insert(evidence);
     }
 
-    /// The module that a leading path segment names through the imports in
+    /// The binding that a leading path segment names through the imports in
     /// scope. Pattern bindings live in the value namespace and never shadow it.
-    fn scoped_module(&self, first: &str) -> Option<ModuleId> {
-        match self
-            .bindings
+    fn scoped_binding(&self, first: &str) -> Option<Binding> {
+        self.bindings
             .iter()
             .rev()
             .filter_map(|scope| scope.get(first))
             .find(|binding| **binding != Binding::Local)
-        {
-            Some(Binding::Module(module)) => Some(module.clone()),
-            _ => None,
-        }
+            .cloned()
     }
 
     fn record_sql(&mut self, literal: &str) {
@@ -879,7 +887,7 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
                         .map(|part| part.ident.to_string())
                         .collect::<Vec<_>>();
                     qualified_target(&path, &self.module_id, self.modules, &|first| {
-                        self.scoped_module(first)
+                        self.scoped_binding(first)
                     })
                 };
                 if let Some(Binding::Constant(constant)) = binding {
@@ -1937,7 +1945,7 @@ fn module_paths_to_reexported_note_sql_are_reported() {
     )];
     // (description, writer source, extra sample files)
     type Case<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)]);
-    let cases: [Case; 9] = [
+    let cases: [Case; 11] = [
         (
             "renamed module import",
             "use crate::sql_alias as db;
@@ -1991,6 +1999,18 @@ fn module_paths_to_reexported_note_sql_are_reported() {
             "workspace crate",
             "fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
             &other_crate,
+        ),
+        (
+            "workspace crate imported by name",
+            "use dbx;
+             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
+            &other_crate,
+        ),
+        (
+            "unrenamed self import",
+            "use crate::sql_alias::{self};
+             fn write(conn: &Connection) { conn.prepare_cached(sql_alias::MERGE_SQL); }",
+            &[],
         ),
     ];
     for (form, writer, extra) in cases {
@@ -2056,6 +2076,32 @@ fn module_paths_to_unrelated_names_are_not_reported() {
     ] {
         let sites = scan_sources(&module_path_sources(writer, &[])).unwrap();
         assert!(sites.is_empty(), "{form}: {sites:?}");
+    }
+
+    // A name imported from outside the scanned sources hides a workspace crate
+    // of the same name, in an expression path and in an import path alike.
+    let other_crate = [(
+        "dbx/src/lib.rs",
+        "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;",
+    )];
+    for (form, writer) in [
+        (
+            "expression path",
+            "use std::collections::HashMap as dbx;
+             fn write(conn: &Connection) { conn.prepare_cached(dbx::MERGE_SQL); }",
+        ),
+        (
+            "import path",
+            "use std::collections::HashMap as dbx;
+             use dbx::MERGE_SQL as merge;
+             fn write(conn: &Connection) { conn.prepare_cached(merge); }",
+        ),
+    ] {
+        let sites = scan_sources(&module_path_sources(writer, &other_crate)).unwrap();
+        assert!(
+            sites.is_empty(),
+            "import hides a workspace crate, {form}: {sites:?}"
+        );
     }
 }
 
