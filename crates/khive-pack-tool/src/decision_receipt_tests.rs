@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use khive_gate::{Gate, GateDecision, GateError, GateRequest};
 use khive_pack_kg::KgPack;
@@ -31,13 +32,19 @@ struct Fixture {
 impl Fixture {
     fn new(deny_check: bool) -> Self {
         let runtime = KhiveRuntime::memory().expect("memory runtime");
+        Self::with_runtime(runtime, deny_check, true)
+    }
+
+    fn with_runtime(runtime: KhiveRuntime, deny_check: bool, audit: bool) -> Self {
         let token = runtime
             .authorize(Namespace::parse("local").expect("test namespace"))
             .expect("namespace token");
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(runtime.clone()));
         builder.register(crate::ToolPack::new(runtime.clone()));
-        builder.with_event_store(runtime.events(&token).expect("event store"));
+        if audit {
+            builder.with_event_store(runtime.events(&token).expect("event store"));
+        }
         if deny_check {
             builder.with_gate(Arc::new(DenyCheckGate));
         }
@@ -451,6 +458,134 @@ async fn receipt_visible_after_the_old_window_is_recovered() {
     release.send(()).expect("release pending append");
     pending_append.await.expect("delayed append task");
     assert_eq!(poller.poll(&fixture).await, vec![delayed]);
+    assert!(poller.poll(&fixture).await.is_empty());
+}
+
+/// The receipt append enters the real file-backed event writer's queue while
+/// another write occupies its only drain slot. The older timestamp survives
+/// a poll that has already seen a later-stamped receipt.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn queued_decision_receipt_is_recovered_after_the_poll_window() {
+    let dir = tempfile::tempdir().expect("temporary database directory");
+    let backend = Arc::new(
+        khive_db::StorageBackend::sqlite_for_test_with_journal_mode(
+            dir.path().join("decision-receipt-admission.db"),
+            true,
+            Duration::from_secs(5),
+        )
+        .expect("file-backed writer queue"),
+    );
+    backend.prepare_core_schema().expect("core schema");
+    let runtime =
+        KhiveRuntime::from_backend(backend, khive_runtime::RuntimeConfig::no_embeddings());
+    // Keep list polls read-only while the writer is intentionally occupied.
+    let fixture = Fixture::with_runtime(runtime, false, false);
+    let writer = fixture
+        .runtime
+        .backend()
+        .pool()
+        .writer_task_handle()
+        .expect("writer task lookup")
+        .expect("file-backed event writes must use a writer task");
+
+    let window = Duration::from_millis(20);
+    let delayed_id = Uuid::new_v4();
+    let delayed_at = now_micros();
+    let delayed = receipt(&fixture, delayed_id, delayed_at);
+    let mut poller = DecisionPoller::new(delayed_at.saturating_sub(1));
+
+    tokio::time::sleep(window + Duration::from_millis(10)).await;
+    let newer_id = Uuid::new_v4();
+    let newer_at = now_micros();
+    assert!(
+        newer_at - delayed_at > i64::try_from(window.as_micros()).expect("window fits i64"),
+        "the delayed receipt must be older than the newest row minus the poll window"
+    );
+    append_receipt(&fixture, newer_id, newer_at).await;
+    assert_eq!(poller.poll(&fixture).await, vec![newer_id]);
+    // Mutation control: a since floor advanced to newest_at - window now
+    // excludes delayed_at, so the post-release assertion below must fail.
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    // The update commits before parking the drain slot, leaving WAL readers
+    // and the list verb's idempotent schema check free to run during the wait.
+    let occupier = {
+        let writer = writer.clone();
+        tokio::spawn(async move {
+            writer
+                .send_top_level(move |conn| {
+                    let changed = conn
+                        .execute(
+                            "UPDATE events SET duration_us = duration_us + 1 WHERE id = ?1",
+                            [newer_id.to_string()],
+                        )
+                        .expect("occupier updates the visible receipt");
+                    assert_eq!(changed, 1);
+                    started_tx.send(()).expect("signal occupied writer slot");
+                    release_rx.blocking_recv().expect("release writer slot");
+                    Ok::<(), khive_storage::StorageError>(())
+                })
+                .await
+        })
+    };
+    started_rx
+        .await
+        .expect("writer must enter the occupied slot");
+
+    let events = fixture.runtime.events(&fixture.token).expect("event store");
+    let pending_append = tokio::spawn(async move { events.append_event(delayed).await });
+    let queue_deadline = Instant::now() + Duration::from_secs(5);
+    while writer.queue_depth() == 0 && Instant::now() < queue_deadline {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        writer.queue_depth() >= 1,
+        "the delayed receipt must enter the event writer's queue"
+    );
+    assert!(
+        delayed_at < now_micros(),
+        "created_at must have been stamped before writer admission"
+    );
+    let queued_since = Instant::now();
+    tokio::time::sleep(window + Duration::from_millis(10)).await;
+    assert!(
+        queued_since.elapsed() > window,
+        "the receipt must wait in the writer queue longer than the poll window"
+    );
+    assert!(writer.queue_depth() >= 1, "the receipt is still queued");
+    assert!(
+        !pending_append.is_finished(),
+        "the receipt has not appended"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), poller.poll(&fixture))
+            .await
+            .expect("the read poll must finish while the writer is occupied")
+            .is_empty(),
+        "the poll during writer admission must not see the delayed receipt"
+    );
+
+    release_tx.send(()).expect("release occupied writer slot");
+    occupier
+        .await
+        .expect("occupier task")
+        .expect("occupier write");
+    pending_append
+        .await
+        .expect("receipt task")
+        .expect("receipt append");
+    let stored = fixture
+        .runtime
+        .events(&fixture.token)
+        .expect("event store")
+        .get_event(delayed_id)
+        .await
+        .expect("stored receipt read")
+        .expect("stored receipt");
+    assert_eq!(stored.created_at, delayed_at);
+    assert_eq!(poller.poll(&fixture).await, vec![delayed_id]);
     assert!(poller.poll(&fixture).await.is_empty());
 }
 

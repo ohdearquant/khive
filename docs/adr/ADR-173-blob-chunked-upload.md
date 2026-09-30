@@ -266,7 +266,7 @@ uploads that survive a daemon restart, and a dedup flag on the result.
 
 ## Amendment 1 (2026-09-29): per-upload leases on a shared filesystem root
 
-**Status: Proposed (2026-09-29).** This amendment specifies the fix for the shared-root expiry gap in
+**Status: Accepted (2026-09-29).** This amendment specifies the fix for the shared-root expiry gap in
 [#3643](https://github.com/ohdearquant/khive/issues/3643). It amends §2, §3b, §4 and Acceptance
 5–6 as follows, and adds the seven Acceptance arms at its end. Today a filesystem sweep
 compares every staged file's mtime with the
