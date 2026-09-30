@@ -7,11 +7,13 @@
 consumes this accepted role-keyed desired state, makes the canonical main backend the sole
 attachment/GC-liveness authority, and specifies a two-release GC-compatibility/deployment gate plus
 a boot-gated two-stage cutover rather than extending legacy `entities.content_ref`; and by its own
-Amendment 1 below (proposed), which specifies a gated attachment orphan sweep in the daemon,
+Amendment 1 below (accepted 2026-09-25), which specifies a gated attachment orphan sweep in the daemon,
 adds the dry-run `blob.sweep` verb and puts on-demand deletion in the admin CLI; Amendment 2 below
-(accepted, binding only with Amendment 1), which names the issues Amendment 1 item 7 answers and the blob
-writer census population; and Amendment 3 below (proposed), which ships a read-only report of attachment
-rows whose record was not found and states what any code that removes such rows must first supply.\
+(accepted 2026-09-25, binding only with Amendment 1), which names the issues Amendment 1 item 7
+answers and the blob writer census population; Amendment 3 below (accepted 2026-09-26), which ships a
+read-only report of attachment rows whose record was not found and states what any code that removes
+such rows must first supply; and Amendments 4 and 5 below (both accepted 2026-09-28), which record
+the reviewed core-schema epochs for blob GC.\
 **Depends on**:
 
 - [ADR-111](ADR-111-blob-store.md) — BlobStore (the content-addressed storage capability,

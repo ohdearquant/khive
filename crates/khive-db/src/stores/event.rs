@@ -332,7 +332,7 @@ fn insert_event_with_observations(
     let target_str = event.target_id.map(|u| u.to_string());
     let session_str = event.session_id.map(|u| u.to_string());
     let aggregate_str = event.aggregate_id.map(|u| u.to_string());
-    let profile_state_version = event.profile_state_version.map(|v| v as i64);
+    let profile_state_version = profile_state_version_to_sql(event)?;
 
     conn.execute(
         "INSERT INTO events \
@@ -493,6 +493,7 @@ fn idempotent_batch_dml(
 ) -> Result<IdempotentEventBatchResult, rusqlite::Error> {
     let mut rows = Vec::with_capacity(events.len());
     for event in events {
+        validate_operation_pair(event)?;
         match fetch_event_by_id(conn, event.id)? {
             None => {
                 insert_event_with_observations(conn, event)?;
@@ -532,7 +533,7 @@ pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusql
     let target_str = event.target_id.map(|u| u.to_string());
     let session_str = event.session_id.map(|u| u.to_string());
     let aggregate_str = event.aggregate_id.map(|u| u.to_string());
-    let profile_state_version = event.profile_state_version.map(|v| v as i64);
+    let profile_state_version = profile_state_version_to_sql(event)?;
 
     let mut statements = vec![SqlStatement {
         sql: "INSERT INTO events \
@@ -595,7 +596,21 @@ fn validate_operation_pair(event: &Event) -> Result<(), rusqlite::Error> {
             "event operation attribution must be present or absent together".into(),
         ));
     }
+    profile_state_version_to_sql(event)?;
     Ok(())
+}
+
+fn profile_state_version_to_sql(event: &Event) -> Result<Option<i64>, rusqlite::Error> {
+    event
+        .profile_state_version
+        .map(|version| {
+            i64::try_from(version).map_err(|_| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    format!("profile_state_version {version} exceeds i64::MAX").into(),
+                )
+            })
+        })
+        .transpose()
 }
 
 /// Build commit-time warning inserts for lineage-sensitive incident edges
@@ -889,30 +904,30 @@ fn decode_recall_observations(event: &Event) -> Result<Vec<EventObservation>, ru
 }
 
 /// `SearchExecuted.result_kind` identifies which substrate owns every UUID in
-/// the candidate and selected lists. Rejecting missing or unknown values keeps
-/// the append-only projection from persisting an untyped reference.
+/// the candidate and selected lists. A missing key is the historical note
+/// shape under ADR-041 A3; present unknown or non-string values are invalid.
 fn decode_search_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
-    let referent_kind = match event
-        .payload
-        .get("result_kind")
-        .and_then(|value| value.as_str())
-    {
-        Some("entity") => ReferentKind::Entity,
-        Some("note") => ReferentKind::Note,
-        Some(_) => {
+    if event.payload.as_object().is_none() {
+        return Err(invalid_payload(event.kind, "payload", "expected object"));
+    }
+    let referent_kind = match event.payload.get("result_kind") {
+        Some(serde_json::Value::String(kind)) if kind == "entity" => ReferentKind::Entity,
+        Some(serde_json::Value::String(kind)) if kind == "note" => ReferentKind::Note,
+        Some(serde_json::Value::String(_)) => {
             return Err(invalid_payload(
                 event.kind,
                 "result_kind",
                 "expected \"entity\" or \"note\"",
             ));
         }
-        None => {
+        Some(_) => {
             return Err(invalid_payload(
                 event.kind,
                 "result_kind",
                 "expected string \"entity\" or \"note\"",
             ));
         }
+        None => ReferentKind::Note,
     };
     let mut rows = decode_candidate_observations(event, referent_kind)?;
     let selected = payload_uuid_array_opt(event, "selected")?.unwrap_or_default();

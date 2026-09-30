@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
-use khive_score::{cmp_desc_then_id, try_score_from_distance, DeterministicScore, ScoreError};
+use khive_score::{cmp_desc_then_id, try_cosine_score_with_f32_tolerance, DeterministicScore};
 use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteErrorClass, BatchWriteRetryability, BatchWriteSummary, IndexRebuildScope,
@@ -19,7 +19,7 @@ use khive_storage::types::{
 use khive_storage::StorageResult;
 use khive_storage::VectorStore;
 use khive_storage::{ContentRef, StorageCapability};
-use khive_types::{DistanceMetric, SubstrateKind};
+use khive_types::SubstrateKind;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -215,23 +215,10 @@ fn non_finite_vector_error(op: &'static str, idx: usize, value: f32) -> StorageE
 /// Normalize only that f32-scale boundary roundoff, then route through the
 /// strict canonical f32 score contract.
 fn sqlite_cosine_score(distance: f64) -> Result<DeterministicScore, rusqlite::Error> {
-    const BOUNDARY_EPSILON: f64 = 8.0 * f32::EPSILON as f64;
-
     let conversion_error = |error| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Real, Box::new(error))
     };
-    if !distance.is_finite() {
-        return Err(conversion_error(ScoreError::NonFiniteDistance));
-    }
-    if !(-BOUNDARY_EPSILON..=2.0 + BOUNDARY_EPSILON).contains(&distance) {
-        return Err(conversion_error(ScoreError::InvalidDistanceRange {
-            metric_name: "Cosine",
-            dist_bits: (distance as f32).to_bits(),
-        }));
-    }
-
-    try_score_from_distance(distance.clamp(0.0, 2.0) as f32, DistanceMetric::Cosine)
-        .map_err(conversion_error)
+    try_cosine_score_with_f32_tolerance(distance).map_err(conversion_error)
 }
 
 #[cfg(test)]
@@ -1081,6 +1068,10 @@ fn orphan_sweep_dml(
 #[path = "orphan_sweep_dml_tests.rs"]
 mod orphan_sweep_dml_tests;
 
+#[cfg(all(test, feature = "vectors"))]
+#[path = "vector_read_tests.rs"]
+mod vector_read_tests;
+
 #[async_trait]
 impl VectorStore for SqliteVecStore {
     async fn insert(
@@ -1666,6 +1657,68 @@ impl VectorStore for SqliteVecStore {
         .await
     }
 
+    async fn get_vectors(
+        &self,
+        ids: &[Uuid],
+        namespace: &str,
+        field: &str,
+    ) -> StorageResult<std::collections::HashMap<Uuid, Vec<f32>>> {
+        if ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let table = self.table_name.clone();
+        let namespace = namespace.to_owned();
+        let field = field.to_owned();
+        let model = self.embedding_model.clone();
+        let dims = self.dimensions;
+        let ids = ids.to_vec();
+
+        self.with_reader("vec_get_vectors", move |conn| {
+            // The vec0 subject_id primary key constrains each lookup before
+            // metadata filtering, so the work is bounded by ids.len().
+            let sql = format!(
+                "SELECT embedding FROM {table} WHERE subject_id = ?1 \
+                 AND namespace = ?2 AND field = ?3 AND embedding_model = ?4"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let mut found = std::collections::HashMap::with_capacity(ids.len());
+            for id in ids {
+                let blob: Option<Vec<u8>> = stmt
+                    .query_row(
+                        rusqlite::params![id.to_string(), &namespace, &field, &model],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(blob) = blob {
+                    if blob.len() != dims * std::mem::size_of::<f32>() {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "stored vector has {} bytes, expected {}",
+                                    blob.len(),
+                                    dims * std::mem::size_of::<f32>()
+                                ),
+                            )),
+                        ));
+                    }
+                    let vector = blob
+                        .chunks_exact(std::mem::size_of::<f32>())
+                        // Inserts bind f32_slice_as_bytes, which writes native-endian
+                        // f32 bytes. Decode with the same layout on every target.
+                        .map(|bytes| f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                        .collect();
+                    found.insert(id, vector);
+                }
+            }
+            Ok(found)
+        })
+        .await
+    }
+
     async fn orphan_sweep(&self, config: &OrphanSweepConfig) -> StorageResult<OrphanSweepResult> {
         let table = self.table_name.clone();
 
@@ -1784,6 +1837,7 @@ impl VectorStore for SqliteVecStore {
             supports_quantization: false,
             supports_update: false,
             supports_orphan_sweep: true,
+            supports_vector_read: true,
             // sqlite-vec uses subject_id as PRIMARY KEY — only one vector per
             // subject per namespace is stored. Callers must use a single canonical
             // field (e.g. "content") and are not permitted to store both

@@ -525,6 +525,51 @@ async fn a3_predispatch_refusals_leave_real_stats_unchanged() {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
+async fn wire_subhandler_refusal_covers_chains_batches_and_bracketed_units() {
+    let fixture = Fixture::new();
+    let refusal = "permission denied for verb \"hidden\": verb 'hidden' is an internal \
+                   subhandler and cannot be invoked via the MCP request surface";
+    for (ops, hidden_index, aborted_index) in [
+        ("stats() | hidden()", 1, None),
+        ("hidden() | stats()", 0, Some(1)),
+        ("[stats(), hidden()]", 1, None),
+        (
+            r#"[{"tool":"stats","args":{}},{"tool":"hidden","args":{}}]"#,
+            1,
+            None,
+        ),
+        ("[stats() | hidden(), stats()]", 1, None),
+        ("[hidden() | stats(), stats()]", 0, Some(1)),
+    ] {
+        let before = fixture.stats().await;
+        let response = fixture.request(ops).await;
+        let entries = response["results"].as_array().expect("result entries");
+        let hidden = &entries[hidden_index];
+        assert_eq!(hidden["ok"], false, "{ops}: {response}");
+        assert_eq!(hidden["error"]["message"], refusal, "{ops}: {response}");
+        assert_eq!(
+            hidden["error"]["domain_disposition"], "not_committed",
+            "{ops}: {response}"
+        );
+        assert_eq!(hidden["domain_disposition"], "not_committed");
+        assert_ne!(hidden["aborted"], true, "guard must refuse the named leaf");
+        for (index, entry) in entries.iter().enumerate() {
+            if index == hidden_index {
+                continue;
+            }
+            if Some(index) == aborted_index {
+                assert_eq!(entry["aborted"], true, "{ops}: {response}");
+                assert_eq!(entry["domain_disposition"], "not_committed");
+            } else {
+                assert_eq!(entry["ok"], true, "{ops}: {response}");
+            }
+        }
+        assert_eq!(fixture.stats().await, before, "{ops}: {response}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn a3_handler_errors_and_nested_child_refusal_remain_unknown() {
     let fixture = Fixture::new();
     for ops in [

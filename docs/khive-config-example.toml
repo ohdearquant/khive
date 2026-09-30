@@ -321,8 +321,8 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_EMAIL_MAINTAINER_ADDRESS=you@example.com
 #                                Required. Comma-separated allowlist of senders whose inbound mail
 #                                is accepted; the first entry is primary.
-#   KHIVE_EMAIL_DEFAULT_ACTOR=local           Actor for new inbound mail with no thread match.
-#                                Set to channel:email to opt into a separate mailbox.
+#   KHIVE_EMAIL_DEFAULT_ACTOR=channel:email  Actor for new inbound mail with no thread match.
+#                                This is the default; set local to retain prior shared inbox routing.
 #                                Anonymous local cannot read it; configure [actor].mailbox_readers
 #                                on the channel:email serving process and read with
 #                                comm.inbox(mailbox_actor="channel:email").

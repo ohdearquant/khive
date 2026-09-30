@@ -624,6 +624,63 @@ The body concordance checks fail closed when a capture changes during hydration 
 
 **Refs.** #3448; ADR-191 Amendment 5; [RFC 9110 §12.5.5](https://www.rfc-editor.org/rfc/rfc9110.html#section-12.5.5); [RFC 9111 §4.1](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.1) and [§4.3.4](https://www.rfc-editor.org/rfc/rfc9111.html#section-4.3.4).
 
+## Amendment 8 (2026-09-29): web requests ask for identity encoding and refuse any declared content coding
+
+**Status: Proposed (2026-09-29).**
+
+**Context.** The web pack's HTTP client used to send `Accept-Encoding: gzip` and decode the response before the byte bound was applied. ADR-175 A1.2 rule 5 gave the reason: a small compressed response can expand without limit, so a bound on the encoded stream bounds nothing the caller sees. The decoding was done by the `compression-codecs` crate, which `reqwest` reaches through its `gzip` feature. In `compression-codecs` releases through at least 0.4.43 (the parser reads the same in 0.4.38, 0.4.41 and 0.4.42; this workspace locked 0.4.42) the gzip header parser takes the parsed header state before it reads the header-CRC (FHCRC) flag. The flag therefore always reads as unset, and the two header-CRC bytes go to the inflater as compressed data. A response whose gzip header sets that flag can then decode into bytes that are not the origin's content, or fail to decode, depending on other header fields. In the first case the client reports no error, so the pack would store those bytes under a content digest and a receipt as if the origin had sent them. The requirement behind rule 5 stands: the byte bound must limit what the caller receives. This amendment meets it without a decoder. Nothing is decoded, so the bytes read are the bytes the origin sent.
+
+**Supersedes.** Line numbers are those of the two files when this amendment was written. ADR-175 and the earlier text of this record are not edited; the sentences below are replaced as described.
+
+- ADR-191 D3, line 119: "decompressed byte and wall-clock ceilings". The byte ceiling counts bytes as received (Decision 4).
+- ADR-191 Amendment 3, lines 429 to 433: "Everywhere else `size` counts decompressed bytes the pack read (ADR-175 A1.2 rule 5)" and "the fetch client removes it from responses it decompresses". `size` counts bytes as received, the client decompresses nothing, and a response with a content coding is refused. Amendment 3's decision is unchanged: a HEAD receipt records no digest and no size, because an advertised `Content-Length` is the origin's claim and `size` records bytes the pack read.
+- ADR-191 Amendment 7, lines 604, 611, 612, 620 and 622: "The HTTP client fixes `Accept-Encoding: gzip` on each request", "`Accept-Encoding` is fixed to `gzip` by the client on every request", "The fixed `Accept-Encoding: gzip` counts as represented on the wire", and the two later mentions of the fixed `gzip` value. The fixed value is `identity`. Decision 5 states what happens to a stored `gzip` value; its narrow source-map exception follows below.
+- ADR-191 Amendment 5 Decision 1 and Amendment 7 Decision 3 say refresh never replaces the source body's negotiation map. Decision 5 makes one exception: after a valid legacy `gzip` map's unconditional identity GET returns a 200 body, refresh binds the negotiation actually sent to that replacement body. Other source maps retain the earlier rule.
+- ADR-175 A1.2 rule 5, lines 315 to 318: "The time bound covers the whole read, including redirects and decompression. The byte bound is on decompressed bytes ... decoding stops at the bound". The time bound covers the whole read, including redirects. The byte bound is on bytes as received.
+- ADR-175 A1.3, line 353: "decompressed response-byte bounds". Search has the same byte bound as fetch, on bytes as received.
+- ADR-175 acceptance arm 19, lines 435 and 436: "A compressed response whose decompressed size exceeds the byte bound is stored truncated". The refusal in Decision 3 replaces this arm.
+- ADR-175 acceptance arm 26, line 455: "an over-byte decompressed response". The arm applies to an over-byte response as received.
+
+**Decision.**
+
+1. Every request the web pack sends carries `Accept-Encoding: identity`. This covers `web.fetch`, `web.refresh`, `web.search` and the URL sources of `web.ingest`, which fetch through `web.fetch`. It applies on every hop, including redirects and HEAD. A caller cannot supply another value.
+2. The HTTP client decodes nothing. The `gzip` feature of `reqwest` is removed from `khive-pack-web`, so no decoder is compiled in, and the `async-compression`, `compression-codecs` and `compression-core` packages no longer appear in `Cargo.lock`.
+3. A GET response that declares any content coding other than `identity` is refused with the error `unsupported_content_encoding`, before any body byte is read. Every `Content-Encoding` field line must list only `identity`, matched without regard to letter case and ignoring whitespace at either end of a member and empty list members. A field line that cannot be read as text is refused. The refusal names the declared value. The check does not apply where no body is read or no content exists: a redirect that carries a `Location` the client can follow, a HEAD response, and a 204 or 304 response. A body that declares no coding is never decoded, whatever its first bytes look like.
+4. The byte bound counts bytes as received. `max_bytes` and the operator ceiling limit the bytes read from the connection, with no decoding step between the connection and the bound. A response longer than the bound is still stored truncated with `truncated: true`, as ADR-175 A1.2 rule 5 says. `size`, `bytes` and the content digest describe the bytes stored.
+5. A new persisted GET records `accept-encoding: ["identity"]` in its stored request map (Amendment 5 D1, Amendment 7 D2). A stored map that records the earlier value `["gzip"]` stays valid for negotiation replay, but its cached body may have passed through the old decoder. Its next refresh sends `identity` **without any conditional validator**, even when `Vary: Accept-Encoding` is represented. A bodyless 304 in response to that unconditional request is refused and cannot mark the old body current. When a valid legacy map's unconditional identity GET returns a 200 body, refresh binds the negotiation actually sent, including `["identity"]`, to that body even if its digest matches the old body. A complete replacement body may then be validated on later refreshes under the normal `Vary` and completeness gates. A failed or bodyless request does not rewrite the old map; malformed legacy maps remain unreplayable and are not repaired by refresh. Any other stored `accept-encoding` value, or more than one value, is not replayable, as before.
+
+**Alternatives considered.**
+
+- Keep requesting gzip until the decoder is corrected. A decoded body is stored under a digest and read later as the origin's content, so a decoder defect changes stored data with no error. Identity costs only the bandwidth that compression saved.
+- Accept a coded response and store its bytes undecoded. The stored object would not be the representation that the receipt's content type describes, and every reader would have to know to decode it. A refusal states the condition at the point it occurs.
+- Refuse only `gzip`. The client decodes no coding, so a body labelled with any other coding would reach the byte bound as undecoded bytes in the same way.
+- Send the legacy body's validator while changing its request coding to identity. A 304 carries no replacement body and cannot establish that bytes decoded under the old client are the identity representation.
+
+**Consequences and acceptance.** An origin that answers a request for identity with a coded body is refused with `unsupported_content_encoding`, where before the pack decoded that body. Compressible responses cost more bytes on the wire. Bodies stored by earlier fetches are unchanged until an unconditional identity GET replaces them; a legacy `gzip` request map remains readable but cannot authorize a 304. The controls are in `crates/khive-pack-web/src/`:
+
+- `fhcrc_probe_tests.rs`:
+  - `gzip_streams_with_a_header_crc_are_refused_across_mtimes_and_caps`: gzip streams that set the header-CRC flag, with a correct and with a wrong header CRC, across every low mtime byte value, values that set each higher byte, and four byte caps (1, 1300, the plaintext length, and one more than it), are each refused as `unsupported_content_encoding`, and the request offered `Accept-Encoding: identity` alone. Two controls inside it must fail on their own inputs: a decode error is not accepted as the named refusal, and a request offering `gzip` fails the identity assertion.
+  - `plain_gzip_without_a_header_crc_is_refused`: the same scan for streams that do not set the flag.
+  - `every_declared_content_coding_is_refused`: `gzip`, `GZIP`, `x-gzip`, `br`, `deflate`, `zstd`, `compress`, `aes128gcm`, and lists such as `identity, gzip` and `identity,identity,br`.
+  - `identity_responses_return_the_exact_plaintext_prefix_at_each_cap`: a response with no `Content-Encoding`, with `identity` in either letter case, or with an empty value returns the received bytes cut at the cap, with `truncated` set exactly when the body is longer than the cap. Gzip bytes served as identity come back undecoded.
+  - `head_response_declaring_gzip_is_not_refused`: a HEAD response is accepted without a body-decoder refusal.
+  - `not_modified_response_declaring_gzip_is_not_refused`: a 304 response is accepted at the fetch hop because no body is read; refresh still applies its own validator gate.
+  - `no_content_response_declaring_gzip_is_not_refused`: a 204 response is accepted without a body-decoder refusal.
+  - `redirect_declaring_gzip_is_returned_and_followed_to_the_identity_response`: a followable redirect is returned and followed; its terminal identity response is read without decoding.
+  - `redirect_without_a_location_declaring_gzip_is_refused`: a redirect that cannot be followed is refused before its declared coded body is read.
+- `fetch.rs`:
+  - `arm19_gzip_response_is_refused_not_passed_through`, formerly `arm19_gzip_response_truncates_after_decompression_to_the_bound`: a gzip response is refused by name and no compressed byte reaches the caller.
+  - `plain_and_pinned_clients_send_fixed_accept_encoding`: the built clients alone offer no coding, and `run_one_hop` sends `identity` exactly once on each GET and HEAD hop.
+- `refresh_metadata_tests.rs`:
+  - `stored_gzip_encoding_map_replays_identity_without_validators`: a stored map recording `["gzip"]` sends `identity` with no validator.
+  - `legacy_gzip_body_requires_identity_get_before_validation`: an unsolicited 304 cannot bless the old body, a subsequent GET body records the identity map, and only then may a later refresh send its validator. A control that restores validator sending for the legacy map must fail this arm.
+  - `legacy_map_304_represents_wire_identity_but_next_refresh_is_unconditional`, formerly `legacy_map_304_represents_wire_gzip_but_next_refresh_is_unconditional`.
+  - `vary_gate_requires_every_stored_selector_and_value`: a stored `["br"]` value is not replayable.
+  - `vary_accept_encoding_with_fixed_record_sends_validator`: a stored `["identity"]` value sends its validator.
+  - The assertions on recorded `request_headers` in this file, and in `a5_literal_http_served_tree_parity_id_and_edge_set_equality_with_disk_ingest` in `ingest.rs`, expect `identity`.
+
+**Refs.** #3587; ADR-175 Amendment 1 (A1.2 rule 5, A1.3, acceptance arms 19 and 26); ADR-191 D3 and Amendments 3, 5 and 7; the gzip header parser in `compression-codecs` through at least 0.4.43 (`src/gzip/header.rs`).
+
 ## Amendment 9 (2026-09-29): web receipt provenance and the legacy chain boundary
 
 **Status**: Proposed; pending Leo sign-off.
