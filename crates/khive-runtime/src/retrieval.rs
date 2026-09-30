@@ -232,7 +232,7 @@ impl KhiveRuntime {
     /// own a single model implicitly).
     ///
     /// Applies no instruction prefix (generic role). Use
-    /// [`Self::embed_document_with_model`] / [`Self::embed_query_with_model`] for
+    /// [`Self::embed_document_with_model_outcome`] / [`Self::embed_query_with_model`] for
     /// instruction-tuned models where the asymmetric prefix matters.
     ///
     /// Returns `UnknownModel` if `model_name` is not in the embedder registry.
