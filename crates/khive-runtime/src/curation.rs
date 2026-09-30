@@ -1336,7 +1336,8 @@ impl KhiveRuntime {
         ))
     }
 
-    pub async fn update_entity(
+    #[cfg(test)]
+    pub(crate) async fn update_entity(
         &self,
         token: &NamespaceToken,
         id: Uuid,
@@ -2350,7 +2351,8 @@ impl KhiveRuntime {
     }
 
     /// Patch-style note update.
-    pub async fn update_note(
+    #[cfg(test)]
+    pub(crate) async fn update_note(
         &self,
         token: &NamespaceToken,
         id: Uuid,

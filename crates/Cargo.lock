@@ -2218,6 +2218,7 @@ dependencies = [
  "khive-runtime",
  "khive-storage",
  "khive-types",
+ "lattice-embed",
  "lattice-fann",
  "serde",
  "serde_json",

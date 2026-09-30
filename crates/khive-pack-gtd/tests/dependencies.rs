@@ -2236,7 +2236,7 @@ async fn resolve_primary_rejects_visible_only_entity() {
 
     let tok_foreign = rt.authorize(ns_foreign.clone()).unwrap();
     let foreign_entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_foreign,
             "concept",
             None,
@@ -2246,6 +2246,7 @@ async fn resolve_primary_rejects_visible_only_entity() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .unwrap();
 
     let tok_vis = rt

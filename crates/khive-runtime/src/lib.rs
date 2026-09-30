@@ -79,7 +79,7 @@ pub use agent_lifecycle::{
     apply_transition, spawn_fingerprint, AgentRecord, AgentState, IllegalTransition,
     TerminalReason, Transition, Trigger,
 };
-pub use atomic_message::{create_notes_atomic, create_notes_atomic_with_report, AtomicNoteSpec};
+pub use atomic_message::{create_notes_atomic_with_report, AtomicNoteSpec};
 pub use atomic_plan::{
     AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan,
     GtdCompletePlan, GtdTransitionPlan, LinkPlan, MergePlan, PlanPredicate, PlanStatement,

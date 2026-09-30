@@ -266,7 +266,7 @@ impl KhiveRuntime {
     /// the embedding model config.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
-    pub async fn embed_document_with_model(
+    pub(crate) async fn embed_document_with_model(
         &self,
         model_name: &str,
         text: &str,

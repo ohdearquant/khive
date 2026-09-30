@@ -683,12 +683,13 @@ async fn completion_events_distinguish_build_from_coalesced_incremental_ops() {
 
     const FINAL_TEXT: &str = "coalesced final embedding for the same memory";
     for text in ["intermediate embedding replaced before warm", FINAL_TEXT] {
-        rt.update_note(
+        rt.update_note_with_embedding_report(
             &token,
             ids[0],
             khive_runtime::NotePatch::new(None, Some(text.into()), None, None, None),
         )
         .await
+        .map(|(row, _report)| row)
         .expect("update one subject twice");
         bump_generation(&ann, &key).await;
     }
@@ -731,12 +732,13 @@ async fn checkpoint_consolidates_updates_and_deletes_with_correct_uuid_mapping()
         (ids[1], "updated second retained memory"),
     ];
     for (id, text) in updates {
-        rt.update_note(
+        rt.update_note_with_embedding_report(
             &token,
             id,
             khive_runtime::NotePatch::new(None, Some(text.into()), None, None, None),
         )
         .await
+        .map(|(row, _report)| row)
         .expect("update retained note");
     }
     // Two final deletes leave holes even if the updates reused tombstoned slots.

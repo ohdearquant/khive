@@ -15,12 +15,13 @@ async fn repeated_subject_updates_count_raw_rows_toward_checkpoint() {
             format!("raw-row threshold intermediate value {cycle}"),
             final_text.clone(),
         ] {
-            rt.update_note(
+            rt.update_note_with_embedding_report(
                 &token,
                 ids[0],
                 khive_runtime::NotePatch::new(None, Some(text), None, None, None),
             )
             .await
+            .map(|(row, _report)| row)
             .expect("update the same memory twice before warming");
             bump_generation(&ann, &key).await;
         }

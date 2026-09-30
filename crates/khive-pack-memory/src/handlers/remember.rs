@@ -377,8 +377,17 @@ mod tests {
         let registry = builder.build().expect("registry");
 
         let source = rt
-            .create_entity(&token, "concept", None, "replay source", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "replay source",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(row, _report)| row)
             .expect("source entity");
         let args = serde_json::json!({
             "content": "replayed memory answers from the store",

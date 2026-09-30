@@ -1785,7 +1785,8 @@ impl KhiveRuntime {
     // namespace token — refactoring into a builder would add indirection without reducing
     // caller complexity; this signature mirrors the MCP verb surface directly.
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_entity(
+    #[cfg(test)]
+    pub(crate) async fn create_entity(
         &self,
         token: &NamespaceToken,
         kind: &str,

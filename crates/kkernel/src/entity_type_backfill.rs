@@ -509,7 +509,7 @@ mod tests {
         let tok = runtime.authorize(Namespace::local()).unwrap();
 
         let invalid = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &tok,
                 "workspace",
                 None,
@@ -519,9 +519,10 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let error = runtime
-            .update_entity(
+            .update_entity_with_embedding_report(
                 &tok,
                 invalid.id,
                 EntityPatch {
@@ -530,6 +531,7 @@ mod tests {
                 },
             )
             .await
+            .map(|(row, _report)| row)
             .expect_err(
                 "compose_registry must install the workspace KindHook onto this runtime, \
                  refusing an update that leaves properties.schema_version missing",
@@ -540,7 +542,7 @@ mod tests {
         );
 
         let valid = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &tok,
                 "workspace",
                 None,
@@ -550,9 +552,10 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let updated = runtime
-            .update_entity(
+            .update_entity_with_embedding_report(
                 &tok,
                 valid.id,
                 EntityPatch {
@@ -561,6 +564,7 @@ mod tests {
                 },
             )
             .await
+            .map(|(row, _report)| row)
             .expect("a workspace entity carrying a valid schema_version must update freely");
         assert_eq!(updated.name, "Renamed Valid Workspace");
     }

@@ -95,8 +95,9 @@ pub(crate) async fn get_or_create(
         return Ok((winner, false));
     }
 
-    let entity = runtime
-        .update_entity(
+    // This shared helper has no single verb response in which to return an embedding warning.
+    let (entity, _embedding_report) = runtime
+        .update_entity_with_embedding_report(
             token,
             id,
             EntityPatch {
@@ -121,8 +122,9 @@ pub(crate) async fn patch(
     entity_type: Option<&str>,
     properties: Value,
 ) -> Result<Entity, RuntimeError> {
-    runtime
-        .update_entity(
+    // This shared helper has no single verb response in which to return an embedding warning.
+    let (entity, _embedding_report) = runtime
+        .update_entity_with_embedding_report(
             token,
             id,
             EntityPatch {
@@ -131,7 +133,8 @@ pub(crate) async fn patch(
                 ..Default::default()
             },
         )
-        .await
+        .await?;
+    Ok(entity)
 }
 
 #[cfg(test)]

@@ -81,7 +81,7 @@ async fn atomic_updates_deny_restricted_actor_without_domain_changes_and_allow_w
     let mut ids = Vec::new();
     for name in ["Atomic policy first", "Atomic policy second"] {
         let entity = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "concept",
                 None,
@@ -91,6 +91,7 @@ async fn atomic_updates_deny_restricted_actor_without_domain_changes_and_allow_w
                 vec!["before".to_owned()],
             )
             .await
+            .map(|(row, _report)| row)
             .expect("seed existing entity");
         ids.push(entity.id);
     }
