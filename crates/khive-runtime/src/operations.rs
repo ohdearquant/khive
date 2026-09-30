@@ -164,6 +164,42 @@ fn legacy_post_commit_result<T>(
     .into())
 }
 
+pub(crate) fn legacy_post_commit_result_with_embedding<T>(
+    operation: &'static str,
+    id: Uuid,
+    value: T,
+    embedding: crate::retrieval::EmbeddingTruncationReport,
+    degradations: Vec<PostCommitDegradation>,
+) -> RuntimeResult<T> {
+    if !embedding.any_truncated() {
+        return legacy_post_commit_result(operation, id, value, degradations);
+    }
+    let failures = serde_json::Value::Array(
+        degradations
+            .iter()
+            .map(|failure| {
+                serde_json::json!({"stage": failure.stage, "error": failure.error.as_str()})
+            })
+            .collect(),
+    );
+    Err(KhiveError::internal(format!(
+        "{operation} committed record {id}, but embedding input was truncated; do not retry the mutation; reconcile by record_id"
+    ))
+    .with_details(khive_types::Details::new_owned([
+        ("reason", "embedding_input_truncated".to_string()),
+        ("operation", operation.to_string()),
+        ("record_id", id.to_string()),
+        ("committed", "true".to_string()),
+        ("retryable", "false".to_string()),
+        (
+            "embedding_truncation_report",
+            serde_json::json!(embedding).to_string(),
+        ),
+        ("post_commit_degradations", failures.to_string()),
+    ]))
+    .into())
+}
+
 // Test-only fault-injection state; see docs/operations.md#fault-injection-static-state.
 #[cfg(test)]
 std::thread_local! {
@@ -1820,6 +1856,9 @@ impl KhiveRuntime {
     /// hard-deletes the entity and its attachments together if a later indexing
     /// step fails. Published bytes remain recoverable by the BlobStore grace-period
     /// orphan policy when any post-publication step fails.
+    /// A bounded embedding returns a non-retryable error carrying the committed
+    /// entity ID and truncation report; use the report-aware variant to receive
+    /// the entity and report together.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_entity_with_attachments(
         &self,
@@ -1832,6 +1871,76 @@ impl KhiveRuntime {
         tags: Vec<String>,
         attachments: Vec<NewAttachment>,
     ) -> RuntimeResult<Entity> {
+        let (entity, embedding, degradations) = self
+            .create_entity_with_attachments_inner(
+                token,
+                kind,
+                entity_type,
+                name,
+                description,
+                properties,
+                tags,
+                attachments,
+            )
+            .await?;
+        legacy_post_commit_result_with_embedding(
+            "create_entity_with_attachments",
+            entity.id,
+            entity,
+            embedding,
+            degradations,
+        )
+    }
+
+    /// Create an entity with attachments and retain embedding truncation accounting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_entity_with_attachments_and_report(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<serde_json::Value>,
+        tags: Vec<String>,
+        attachments: Vec<NewAttachment>,
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        let (entity, embedding, degradations) = self
+            .create_entity_with_attachments_inner(
+                token,
+                kind,
+                entity_type,
+                name,
+                description,
+                properties,
+                tags,
+                attachments,
+            )
+            .await?;
+        legacy_post_commit_result(
+            "create_entity_with_attachments_and_report",
+            entity.id,
+            (entity, embedding),
+            degradations,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_entity_with_attachments_inner(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        entity_type: Option<&str>,
+        name: &str,
+        description: Option<&str>,
+        properties: Option<serde_json::Value>,
+        tags: Vec<String>,
+        attachments: Vec<NewAttachment>,
+    ) -> RuntimeResult<(
+        Entity,
+        crate::retrieval::EmbeddingTruncationReport,
+        Vec<PostCommitDegradation>,
+    )> {
         // Attachment rows are the process-wide BlobStore's liveness authority.
         // Validate placement before existence probes or any record write: pack
         // runtimes bound to a secondary backend must explicitly call `core()`.
@@ -1860,7 +1969,7 @@ impl KhiveRuntime {
             }
         }
         let validated_type = self.validate_entity_type_for_kind(kind, entity_type)?;
-        let (entity, _, degradations) = self
+        let (entity, embedding, degradations) = self
             .create_entity_with_embedding_report_inner(
                 token,
                 kind,
@@ -1872,12 +1981,7 @@ impl KhiveRuntime {
                 attachments,
             )
             .await?;
-        legacy_post_commit_result(
-            "create_entity_with_attachments",
-            entity.id,
-            entity,
-            degradations,
-        )
+        Ok((entity, embedding, degradations))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3928,6 +4032,10 @@ impl KhiveRuntime {
     ///   `SubstrateKind::Note`.
     /// - For each UUID in `annotates`, creates an `EdgeRelation::Annotates` edge from
     ///   the note to that target.
+    ///
+    /// A bounded embedding returns a non-retryable error carrying the committed
+    /// note ID and truncation report. The report-aware embedding-content variant
+    /// accepts `None` to retain the same default input selection.
     // REASON: note creation requires kind, name, content, salience, properties, annotates,
     // and namespace token — mirrors the MCP verb surface; a builder would not reduce
     // caller complexity for pack handler callers.
@@ -3942,12 +4050,18 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        let (note, _, degradations) = self
+        let (note, embedding, degradations) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
             )
             .await?;
-        legacy_post_commit_result("create_note", note.id, note, degradations)
+        legacy_post_commit_result_with_embedding(
+            "create_note",
+            note.id,
+            note,
+            embedding,
+            degradations,
+        )
     }
 
     /// Like [`Self::create_note`], but lets the caller supply a smaller text
@@ -3972,7 +4086,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        let (note, _, degradations) = self
+        let (note, embedding, degradations) = self
             .create_note_inner(
                 token,
                 kind,
@@ -3986,10 +4100,11 @@ impl KhiveRuntime {
                 None,
             )
             .await?;
-        legacy_post_commit_result(
+        legacy_post_commit_result_with_embedding(
             "create_note_with_embedding_content",
             note.id,
             note,
+            embedding,
             degradations,
         )
     }
@@ -4089,6 +4204,33 @@ impl KhiveRuntime {
         .await
     }
 
+    /// Create a note with decay and retain embedding truncation accounting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_decay_and_report(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: Option<f64>,
+        decay_factor: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
+        self.create_note_with_decay_for_embedding_model_and_report(
+            token,
+            kind,
+            name,
+            content,
+            salience,
+            decay_factor,
+            properties,
+            annotates,
+            None,
+        )
+        .await
+    }
+
     /// Like [`Self::create_note_with_decay`] but targets a specific embedding model.
     // REASON: adds an embedding_model parameter to the decay variant; the full parameter
     // set is required for correct MCP verb routing and cannot be collapsed without
@@ -4106,7 +4248,44 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
-        let (note, _, degradations) = self
+        let (note, embedding, degradations) = self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                None,
+                salience,
+                Some(decay_factor),
+                properties,
+                annotates,
+                embedding_model,
+            )
+            .await?;
+        legacy_post_commit_result_with_embedding(
+            "create_note_with_decay_for_embedding_model",
+            note.id,
+            note,
+            embedding,
+            degradations,
+        )
+    }
+
+    /// Create a note with decay for a named model and retain embedding truncation accounting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_decay_for_embedding_model_and_report(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: Option<f64>,
+        decay_factor: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+        embedding_model: Option<&str>,
+    ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
+        let (note, embedding, degradations) = self
             .create_note_inner(
                 token,
                 kind,
@@ -4121,9 +4300,9 @@ impl KhiveRuntime {
             )
             .await?;
         legacy_post_commit_result(
-            "create_note_with_decay_for_embedding_model",
+            "create_note_with_decay_for_embedding_model_and_report",
             note.id,
-            note,
+            (note, embedding),
             degradations,
         )
     }
@@ -18372,7 +18551,7 @@ mod tests {
             let rt = std::sync::Arc::clone(&rt);
             let ctx = ctx.clone();
             tokio::spawn(crate::usage::scope(ctx, async move {
-                rt.embed_document_with_model("abort-count-parked", "abort count body")
+                rt.embed_document_with_model_outcome("abort-count-parked", "abort count body")
                     .await
             }))
         };
@@ -20282,6 +20461,30 @@ mod tests {
         }
     }
 
+    fn assert_embedding_truncation_after_commit(error: RuntimeError, operation: &str) -> Uuid {
+        let RuntimeError::Khive(domain) = error.refusal_source() else {
+            panic!("legacy caller lost its typed truncation signal: {error:?}");
+        };
+        let details = domain.details().expect("truncation details");
+        assert_eq!(details.get("reason"), Some("embedding_input_truncated"));
+        assert_eq!(details.get("operation"), Some(operation));
+        assert_eq!(details.get("committed"), Some("true"));
+        assert_eq!(details.get("retryable"), Some("false"));
+        let report: crate::retrieval::EmbeddingTruncationReport = serde_json::from_str(
+            details
+                .get("embedding_truncation_report")
+                .expect("truncation report"),
+        )
+        .expect("valid report");
+        assert_eq!(report.truncated, 1);
+        assert!(report.discarded_bytes > 0);
+        details
+            .get("record_id")
+            .expect("committed record id")
+            .parse()
+            .expect("canonical committed id")
+    }
+
     #[tokio::test]
     async fn create_bounds_embedding_input_without_truncating_stored_content() {
         let rt = rt();
@@ -20294,14 +20497,15 @@ mod tests {
         });
 
         let content = format!("{}\u{1f980}tail", "a".repeat(MAX_TEXT_BYTES - 1));
-        let note = rt
+        let error = rt
             .create_note(&tok, "observation", None, &content, None, None, vec![])
             .await
-            .expect("over-length note create must succeed");
+            .expect_err("legacy note create must disclose truncation");
+        let note_id = assert_embedding_truncation_after_commit(error, "create_note");
         let fetched = rt
             .notes(&tok)
             .unwrap()
-            .get_note(note.id)
+            .get_note(note_id)
             .await
             .unwrap()
             .expect("created note must be retrievable");
@@ -20322,6 +20526,23 @@ mod tests {
         assert_eq!(vector_info.dimensions, 4);
         assert_eq!(vector_info.entry_count, 1);
 
+        let (reported_note, report) = rt
+            .create_note_with_embedding_content_and_report(
+                &tok,
+                "observation",
+                None,
+                &content,
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("report-aware note create succeeds");
+        assert_eq!(reported_note.content, content);
+        assert_eq!(report.truncated, 1);
+        assert!(report.discarded_bytes > 0);
+
         captured.lock().unwrap().clear();
         rt.reindex_note(&tok, &fetched)
             .await
@@ -20329,10 +20550,19 @@ mod tests {
         assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_BYTES - 1);
 
         captured.lock().unwrap().clear();
-        rt.embed_document_batch_with_model("strict-length-test", std::slice::from_ref(&content))
-            .await
-            .expect("batch reindex seam must bound stored content");
+        rt.embed_document_batch_with_model_outcomes(
+            "strict-length-test",
+            std::slice::from_ref(&content),
+        )
+        .await
+        .expect("report-aware batch embedding must retain outcomes");
         assert_eq!(captured.lock().unwrap()[0].len(), MAX_TEXT_BYTES - 1);
+        assert!(rt
+            .embed_document_batch_with_model("strict-length-test", std::slice::from_ref(&content))
+            .await
+            .expect_err("legacy batch embedding must disclose truncation")
+            .to_string()
+            .contains("embedding input truncated"));
 
         let normal = "normal byte-identical embedding input";
         rt.create_note(&tok, "observation", None, normal, None, None, vec![])
@@ -20352,6 +20582,45 @@ mod tests {
         )
         .await
         .expect("over-length entity create must succeed");
+    }
+
+    #[tokio::test]
+    async fn default_document_embedding_discloses_truncation() {
+        let model = EmbeddingModel::AllMiniLmL6V2;
+        let rt = KhiveRuntime::new(crate::RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(model),
+            packs: vec!["kg".to_string()],
+            ..crate::RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: model.to_string(),
+            dims: 4,
+            captured: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let content = "x".repeat(MAX_TEXT_BYTES + 1);
+        let outcome = rt.embed_document_outcome(&content).await.unwrap();
+        assert!(outcome.truncated);
+        assert_eq!(outcome.source_bytes, content.len());
+        assert!(rt
+            .embed_document(&content)
+            .await
+            .expect_err("legacy document embedding must disclose truncation")
+            .to_string()
+            .contains("embedding input truncated"));
+        assert!(
+            rt.embed_document_batch_outcomes(std::slice::from_ref(&content))
+                .await
+                .unwrap()[0]
+                .truncated
+        );
+        assert!(rt
+            .embed_document_batch(&[content])
+            .await
+            .expect_err("default batch embedding must disclose truncation")
+            .to_string()
+            .contains("embedding input truncated"));
     }
 
     #[tokio::test]
@@ -20385,6 +20654,133 @@ mod tests {
             vec!["full content, no override".to_string()],
             "with no override the embedder must see the full content"
         );
+    }
+
+    #[tokio::test]
+    async fn note_create_variants_disclose_truncated_embedding() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "strict-length-test".into(),
+            dims: 4,
+            captured: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let content = "x".repeat(MAX_TEXT_BYTES + 1);
+
+        let error = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                &content,
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("legacy override variant must disclose truncation");
+        assert_embedding_truncation_after_commit(error, "create_note_with_embedding_content");
+
+        let error = rt
+            .create_note_with_decay(&tok, "observation", None, &content, None, 0.5, None, vec![])
+            .await
+            .expect_err("legacy decay variant must disclose truncation");
+        assert_embedding_truncation_after_commit(
+            error,
+            "create_note_with_decay_for_embedding_model",
+        );
+
+        let (note, report) = rt
+            .create_note_with_decay_and_report(
+                &tok,
+                "observation",
+                None,
+                &content,
+                None,
+                0.5,
+                None,
+                vec![],
+            )
+            .await
+            .expect("report-aware decay variant succeeds");
+        assert_eq!(note.content, content);
+        assert_eq!(report.truncated, 1);
+    }
+
+    #[tokio::test]
+    async fn guarded_entity_update_discloses_truncated_embedding() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "strict-length-test".into(),
+            dims: 4,
+            captured: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let description = "d".repeat(MAX_TEXT_BYTES + 1);
+        let legacy = rt
+            .create_entity_with_embedding_report(
+                &tok,
+                "concept",
+                None,
+                "legacy",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap()
+            .0;
+        let error = rt
+            .update_entity_if_unchanged(
+                &tok,
+                &legacy,
+                crate::curation::EntityPatch {
+                    description: Some(Some(description.clone())),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await
+            .expect_err("legacy guarded update must disclose truncation");
+        let committed_id =
+            assert_embedding_truncation_after_commit(error, "update_entity_if_unchanged");
+        assert_eq!(committed_id, legacy.id);
+        assert_eq!(
+            rt.get_entity(&tok, committed_id)
+                .await
+                .unwrap()
+                .description
+                .as_deref(),
+            Some(description.as_str())
+        );
+
+        let reported = rt
+            .create_entity_with_embedding_report(
+                &tok,
+                "concept",
+                None,
+                "reported",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap()
+            .0;
+        let (_, report) = rt
+            .update_entity_if_unchanged_with_embedding_report(
+                &tok,
+                &reported,
+                crate::curation::EntityPatch {
+                    description: Some(Some(description)),
+                    ..Default::default()
+                },
+                &[],
+            )
+            .await
+            .expect("report-aware guarded update succeeds");
+        assert_eq!(report.truncated, 1);
     }
 
     #[tokio::test]
@@ -20886,6 +21282,65 @@ mod tests {
         assert_eq!(attachments[0].content_ref, content_ref);
         assert_eq!(attachments[1].role, "fann-network");
         assert_eq!(attachments[1].content_ref, network_ref);
+    }
+
+    #[tokio::test]
+    async fn create_entity_with_attachments_discloses_truncated_embedding() {
+        use khive_db::stores::blob::FsBlobStore;
+        use khive_storage::BlobStore as _;
+
+        let runtime = rt();
+        let token = NamespaceToken::local();
+        runtime.register_embedder(CapturingVecProvider {
+            provider_name: "strict-length-test".into(),
+            dims: 4,
+            captured: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let blob_dir = tempfile::tempdir().unwrap();
+        let blob_store = Arc::new(FsBlobStore::new(blob_dir.path().to_path_buf(), 0).unwrap());
+        let content_ref = blob_store.put(b"bundle".to_vec()).await.unwrap();
+        runtime.install_blob_store(blob_store).unwrap();
+        let attachment = NewAttachment {
+            role: "content".to_string(),
+            content_ref,
+            media_type: None,
+            size_bytes: Some(6),
+        };
+        let description = "d".repeat(MAX_TEXT_BYTES + 1);
+
+        let (reported, report) = runtime
+            .create_entity_with_attachments_and_report(
+                &token,
+                "artifact",
+                None,
+                "reported artifact",
+                Some(&description),
+                None,
+                vec![],
+                vec![attachment.clone()],
+            )
+            .await
+            .expect("report-aware attachment create succeeds");
+        assert_eq!(reported.description.as_deref(), Some(description.as_str()));
+        assert_eq!(report.truncated, 1);
+        assert!(report.discarded_bytes > 0);
+
+        let error = runtime
+            .create_entity_with_attachments(
+                &token,
+                "artifact",
+                None,
+                "legacy artifact",
+                Some(&description),
+                None,
+                vec![],
+                vec![attachment],
+            )
+            .await
+            .expect_err("legacy attachment create must disclose truncation");
+        let id = assert_embedding_truncation_after_commit(error, "create_entity_with_attachments");
+        let stored = runtime.get_entity(&token, id).await.unwrap();
+        assert_eq!(stored.description.as_deref(), Some(description.as_str()));
     }
 
     #[tokio::test]

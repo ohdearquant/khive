@@ -1,47 +1,26 @@
-//! Source census for runtime methods that discard embedding outcomes.
+//! Compile-time census of the known public runtime embedding disclosure seams.
+//! The legacy-return behavior is exercised with oversized inputs in the runtime
+//! unit tests; this list does not purport to discover future methods.
+
+use khive_runtime::KhiveRuntime;
 
 #[test]
-fn no_public_embedding_outcome_discards() {
-    let wrappers = [
-        ("create_entity", include_str!("../src/operations.rs")),
-        ("update_entity", include_str!("../src/curation.rs")),
-        ("update_note", include_str!("../src/curation.rs")),
-        (
-            "embed_document_with_model",
-            include_str!("../src/retrieval.rs"),
-        ),
-        (
-            "create_notes_atomic",
-            include_str!("../src/atomic_message.rs"),
-        ),
-    ];
-    for (name, source) in wrappers {
-        assert!(
-            !source.contains(&format!("pub async fn {name}(")),
-            "{name} must not be a public wrapper that discards embedding outcomes"
-        );
-    }
-
-    let mut public_uses = String::new();
-    let mut collecting = false;
-    for line in include_str!("../src/lib.rs").lines() {
-        if line.trim_start().starts_with("pub use ") {
-            collecting = true;
-        }
-        if collecting {
-            public_uses.push_str(line);
-            public_uses.push(' ');
-            if line.contains(';') {
-                collecting = false;
-            }
-        }
-    }
-    for (name, _) in wrappers {
-        assert!(
-            !public_uses
-                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .any(|token| token == name),
-            "{name} must not be publicly re-exported"
-        );
-    }
+fn known_public_embedding_disclosure_surfaces_exist() {
+    let _ = KhiveRuntime::embed_document;
+    let _ = KhiveRuntime::embed_document_outcome;
+    let _ = KhiveRuntime::embed_document_batch;
+    let _ = KhiveRuntime::embed_document_batch_outcomes;
+    let _ = KhiveRuntime::embed_document_batch_with_model;
+    let _ = KhiveRuntime::embed_document_batch_with_model_outcomes;
+    let _ = KhiveRuntime::create_entity_with_attachments;
+    let _ = KhiveRuntime::create_entity_with_attachments_and_report;
+    let _ = KhiveRuntime::update_entity_if_unchanged;
+    let _ = KhiveRuntime::update_entity_if_unchanged_with_embedding_report;
+    let _ = KhiveRuntime::create_note;
+    let _ = KhiveRuntime::create_note_with_embedding_content;
+    let _ = KhiveRuntime::create_note_with_embedding_content_and_report;
+    let _ = KhiveRuntime::create_note_with_decay;
+    let _ = KhiveRuntime::create_note_with_decay_and_report;
+    let _ = KhiveRuntime::create_note_with_decay_for_embedding_model;
+    let _ = KhiveRuntime::create_note_with_decay_for_embedding_model_and_report;
 }

@@ -1387,6 +1387,8 @@ impl KhiveRuntime {
     /// Property removals apply after the normal merge and preserve all other keys.
     /// Missing keys alone are a no-op; reserved runtime-owned keys cannot be removed.
     /// A changed, deleted, or missing entity returns a conflict without writing.
+    /// A bounded embedding returns a non-retryable error with the committed ID
+    /// and truncation report; use the report-aware variant to retain the record.
     pub async fn update_entity_if_unchanged(
         &self,
         token: &NamespaceToken,
@@ -1394,6 +1396,31 @@ impl KhiveRuntime {
         patch: EntityPatch,
         remove_properties: &[&str],
     ) -> RuntimeResult<Entity> {
+        let (entity, embedding) = self
+            .update_entity_if_unchanged_with_embedding_report(
+                token,
+                expected,
+                patch,
+                remove_properties,
+            )
+            .await?;
+        crate::operations::legacy_post_commit_result_with_embedding(
+            "update_entity_if_unchanged",
+            entity.id,
+            entity,
+            embedding,
+            Vec::new(),
+        )
+    }
+
+    /// Apply a guarded admin patch and retain embedding truncation accounting.
+    pub async fn update_entity_if_unchanged_with_embedding_report(
+        &self,
+        token: &NamespaceToken,
+        expected: &Entity,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_guarded_entity_update(
                 token,
@@ -1404,20 +1431,21 @@ impl KhiveRuntime {
             )
             .await?;
         if changed_fields.is_empty() {
-            return Ok(entity);
-        }
-        Ok(self
-            .persist_prepared_entity_update(
-                token,
+            return Ok((
                 entity,
-                reindex_required,
-                changed_fields,
-                expected_updated_at,
-                expected_deleted_at,
-                None,
-            )
-            .await?
-            .0)
+                crate::retrieval::EmbeddingTruncationReport::default(),
+            ));
+        }
+        self.persist_prepared_entity_update(
+            token,
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]

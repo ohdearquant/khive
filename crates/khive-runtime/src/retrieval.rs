@@ -266,17 +266,6 @@ impl KhiveRuntime {
     /// the embedding model config.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
-    pub(crate) async fn embed_document_with_model(
-        &self,
-        model_name: &str,
-        text: &str,
-    ) -> RuntimeResult<Vec<f32>> {
-        Ok(self
-            .embed_document_with_model_outcome_inner(None, model_name, text)
-            .await?
-            .vector)
-    }
-
     pub async fn embed_document_with_model_outcome(
         &self,
         model_name: &str,
@@ -393,16 +382,34 @@ impl KhiveRuntime {
 
     /// Embed a document for indexing using the configured default model.
     ///
-    /// Delegates to [`Self::embed_document_with_model`]. Use for entity/note
+    /// Delegates to [`Self::embed_document_outcome`]. Use for entity/note
     /// create and reindex paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    /// Returns an error if the input is bounded; use the outcome method to
+    /// inspect the vector together with the truncation metadata.
     pub async fn embed_document(&self, text: &str) -> RuntimeResult<Vec<f32>> {
+        let outcome = self.embed_document_outcome(text).await?;
+        if outcome.truncated {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding input truncated from {} to {} bytes; use embed_document_outcome to inspect the bounded vector",
+                outcome.source_bytes, outcome.embedded_bytes
+            )));
+        }
+        Ok(outcome.vector)
+    }
+
+    /// Embed a document with the default model and retain input-bounding metadata.
+    pub async fn embed_document_outcome(
+        &self,
+        text: &str,
+    ) -> RuntimeResult<DocumentEmbeddingOutcome> {
         let model_name = self.default_embedder_name();
         if model_name.is_empty() {
             return Err(RuntimeError::Unconfigured("embedding_model".into()));
         }
-        self.embed_document_with_model(model_name, text).await
+        self.embed_document_with_model_outcome(model_name, text)
+            .await
     }
 
     /// Embed a query for retrieval using the configured default model.
@@ -477,10 +484,12 @@ impl KhiveRuntime {
     /// A mixed batch is bounded into one ordered owned batch so truncation never
     /// fragments one provider batch into sequential singleton inference calls.
     ///
-    /// **Reindex caveat**: see [`Self::embed_document_with_model`] — the same
+    /// **Reindex caveat**: see [`Self::embed_document_with_model_outcome`] — the same
     /// incomparability applies to batch-indexed vectors when switching models.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
+    /// Returns an error when any input is bounded; use the outcomes method to
+    /// retain the bounded vectors and per-document byte counts.
     pub async fn embed_document_batch_with_model(
         &self,
         model_name: &str,
@@ -489,12 +498,20 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        Ok(self
+        let outcomes = self
             .embed_document_batch_with_model_outcomes(model_name, texts)
-            .await?
-            .into_iter()
-            .map(|outcome| outcome.vector)
-            .collect())
+            .await?;
+        let mut report = EmbeddingTruncationReport::default();
+        for outcome in &outcomes {
+            report.observe(outcome);
+        }
+        if report.any_truncated() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding input truncated for {} documents ({} discarded bytes); use embed_document_batch_with_model_outcomes to inspect the bounded vectors",
+                report.truncated, report.discarded_bytes
+            )));
+        }
+        Ok(outcomes.into_iter().map(|outcome| outcome.vector).collect())
     }
 
     pub async fn embed_document_batch_with_model_outcomes(
@@ -579,6 +596,8 @@ impl KhiveRuntime {
     /// bulk knowledge-atom and section indexing paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    /// Returns an error when any input is bounded; use
+    /// [`Self::embed_document_batch_outcomes`] to retain the bounded vectors.
     pub async fn embed_document_batch(&self, texts: &[String]) -> RuntimeResult<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -3072,9 +3091,10 @@ mod tests {
         let rt_ref = &rt;
         let (doc_emb, query_emb) = tokio::runtime::Runtime::new().unwrap().block_on(async {
             let d = rt_ref
-                .embed_document_with_model(&model.to_string(), &text)
+                .embed_document_with_model_outcome(&model.to_string(), &text)
                 .await
-                .unwrap();
+                .unwrap()
+                .vector;
             let q = rt_ref
                 .embed_query_with_model(&model.to_string(), &text)
                 .await
@@ -3107,9 +3127,10 @@ mod tests {
         let rt_ref = &rt;
         let (doc_emb, query_emb) = tokio::runtime::Runtime::new().unwrap().block_on(async {
             let d = rt_ref
-                .embed_document_with_model(&model.to_string(), &text)
+                .embed_document_with_model_outcome(&model.to_string(), &text)
                 .await
-                .unwrap();
+                .unwrap()
+                .vector;
             let q = rt_ref
                 .embed_query_with_model(&model.to_string(), &text)
                 .await
