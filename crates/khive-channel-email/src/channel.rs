@@ -546,6 +546,10 @@ impl Channel for EmailChannel {
         self.config.mailbox.clone()
     }
 
+    fn quarantine_retention_limit(&self) -> Option<usize> {
+        Some(self.config.quarantine_max_retained)
+    }
+
     async fn send(&self, envelope: ChannelEnvelope) -> Result<(), ChannelError> {
         let from = strip_kind_prefix(&envelope.from, "email");
         let to = strip_kind_prefix(&envelope.to, "email");
@@ -645,6 +649,7 @@ mod tests {
             maintainer_addresses: vec![MailAddress::parse(maintainer).unwrap()],
             trust_anchor: TrustAnchor::AuthservId(TEST_AUTHSERV_ID.to_string()),
             quarantine_store: true,
+            quarantine_max_retained: crate::config::DEFAULT_QUARANTINE_MAX_RETAINED,
         }
     }
 
@@ -773,6 +778,14 @@ mod tests {
     }
 
     // --- Basic trait ---
+
+    #[test]
+    fn channel_reports_its_configured_quarantine_retention_limit() {
+        let mut config = make_config("maintainer@example.com");
+        config.quarantine_max_retained = 7;
+        let ch = build_channel_from(config, vec![]);
+        assert_eq!(ch.quarantine_retention_limit(), Some(7));
+    }
 
     #[test]
     fn kind_is_email() {

@@ -1283,11 +1283,19 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
 /// rows. Neither loop may run unless that runtime can durably record its
 /// writes. The two decisions stay separate so a future topology can admit
 /// one direction without the other.
+///
+/// Inbound polling also publishes each quarantined message's original bytes
+/// through `blob.put`, so it needs the blob pack's runtime to accept writes as
+/// well. A blob runtime that cannot write would fail that publish on every
+/// poll, hold the cursor, and retry the same message forever; admission
+/// refuses it up front instead, and `inbound_blocked_by_read_only_blob`
+/// records that this was the reason so the refusal can be logged by name.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChannelLoopAdmission {
     pub(crate) inbound_poll: bool,
     pub(crate) outbound_delivery: bool,
+    pub(crate) inbound_blocked_by_read_only_blob: bool,
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
@@ -1298,14 +1306,22 @@ impl ChannelLoopAdmission {
         Self {
             inbound_poll: comm_loaded && writable,
             outbound_delivery: comm_loaded && writable,
+            inbound_blocked_by_read_only_blob: false,
         }
     }
 
-    pub(crate) fn for_pack_runtimes(comm: Option<&KhiveRuntime>) -> Self {
+    /// `blob` is `None` when the blob pack is not loaded; the poll task's own
+    /// storage readiness check reports that case.
+    pub(crate) fn for_pack_runtimes(
+        comm: Option<&KhiveRuntime>,
+        blob: Option<&KhiveRuntime>,
+    ) -> Self {
         let admitted = comm.is_some_and(|runtime| !runtime.is_read_only());
+        let blob_read_only = blob.is_some_and(KhiveRuntime::is_read_only);
         Self {
-            inbound_poll: admitted,
+            inbound_poll: admitted && !blob_read_only,
             outbound_delivery: admitted,
+            inbound_blocked_by_read_only_blob: admitted && blob_read_only,
         }
     }
 }
