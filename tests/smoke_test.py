@@ -271,12 +271,13 @@ def main():
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 140 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 142 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
-        # pack contributes five verbs: 4 agent-facing T1 verbs
+        # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
         # Visibility::Verb per ADR-083, and transcript search (ADR-117a), which
-        # stays unavailable until its required features are ready;
+        # stays unavailable until its required features are ready; stats and vacuum
+        # provide database-wide maintenance;
         # brain.register_adapter (#354), context
         # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
         # draft ADR Slice 1, the 18th kg-substrate bare verb), whoami (caller
@@ -307,10 +308,10 @@ def main():
         # exec nine (the tool registry with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 140, (
-            f"expected 140 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 142, (
+            f"expected 142 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
-            f"ADR-083 plus dependency-gated transcript search; "
+            f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; whoami is the 19th kg-substrate bare verb "

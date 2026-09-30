@@ -49,6 +49,7 @@ import {
   RelationMark,
 } from "@/components/ontology-mark";
 import { settleGraphLayout } from "@/lib/graph-layout";
+import { handleKeyboardRows } from "@/lib/keyboard-rows";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import { buildRepositoryBrief } from "@/lib/repository-brief";
 import { buildStructureCouplingLens } from "@/lib/structure-coupling-lens";
@@ -271,6 +272,8 @@ function ModuleInspectionControl({
     <button
       type="button"
       className={`repo-module-action ${className}`.trim()}
+      data-keyboard-row
+      aria-keyshortcuts="J K Enter"
       data-module-id={moduleId}
       aria-label={moduleInspectLabel(moduleById, moduleNode)}
       aria-controls="repository-module-inspector"
@@ -1127,6 +1130,8 @@ function StructureGraph({
                       <button
                         type="button"
                         className="repo-coupling-focus"
+                        data-keyboard-row
+                        aria-keyshortcuts="J K Enter"
                         aria-pressed={focusedPairKey === pair.key}
                         aria-label={`Focus coupling candidate between ${leftLabel} and ${rightLabel}`}
                         onClick={() => setFocusedPairKey(pair.key)}
@@ -1435,10 +1440,12 @@ function HistoryStructure({
             <h3>{labels.node_types.module}</h3>
             <p>{formatNumber(modules.length)}</p>
           </div>
-          <div className="repo-list">
+          <div className="repo-list" data-keyboard-list>
             {modules.map((module) => (
               <button
                 type="button"
+                data-keyboard-row
+                aria-keyshortcuts="J K Enter"
                 data-module-id={module.id}
                 aria-label={moduleInspectLabel(moduleById, module)}
                 aria-controls="repository-module-inspector"
@@ -1470,10 +1477,12 @@ function HistoryStructure({
             <h3>{labels.node_types.commit}</h3>
             <p>{formatNumber(commits.length)}</p>
           </div>
-          <div className="repo-list">
+          <div className="repo-list" data-keyboard-list>
             {commits.map((commit) => (
               <button
                 type="button"
+                data-keyboard-row
+                aria-keyshortcuts="J K Enter"
                 data-commit-id={commit.id}
                 aria-pressed={selectedCommitId === commit.id}
                 className={`repo-list-row ${selectedCommitId === commit.id ? "selected" : ""}`}
@@ -3424,6 +3433,7 @@ export function RepoShowcase({
       className="repo-overview"
       data-head-sha={snapshot.head_sha}
       data-analysis-source={analysisSource}
+      onKeyDown={handleKeyboardRows}
     >
       <header className="repo-overview-heading">
         <div className="repo-identity">
@@ -3549,6 +3559,7 @@ export function RepoShowcase({
       <div
         className="repo-dashboard"
         data-repository-dashboard
+        data-keyboard-scope
         id="repository-analysis-dashboard"
         ref={dashboardRef}
         role="region"

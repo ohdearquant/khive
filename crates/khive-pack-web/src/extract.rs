@@ -3057,6 +3057,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_unmarked_capture_extracts_without_receipt_or_header_links() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"<p>Legacy body without HTML links</p>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://legacy-capture.example.test/page",
+            "text/html",
+            body,
+        )
+        .await;
+        let page = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(page_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let reference = page.properties.as_ref().unwrap()["blob_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let legacy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "pre-upgrade web receipt",
+                None,
+                Some(json!({
+                    "tags": [crate::receipt::RECEIPT_TAG],
+                    "request": {
+                        "verb": "web.fetch",
+                        "content_ref": reference.clone(),
+                        "body_entity_id": page_id.to_string(),
+                        "headers": {"link": ["<https://legacy-capture.example.test/header>; rel=next"]},
+                    },
+                })),
+                vec![page_id],
+            )
+            .await
+            .unwrap();
+        crate::entities::patch(
+            &runtime,
+            &token,
+            page_id,
+            None,
+            json!({ "capture_receipt_id": legacy.id.to_string() }),
+        )
+        .await
+        .unwrap();
+        let page = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(page_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::receipt::capture_for_body(&runtime, &token, &page, &reference)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into()]),
+                link_limit: Some(10),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["links"]["edges_created"], 0);
+        let extraction_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(extraction_note.properties.unwrap()["request"]["capture_receipt_id"].is_null());
+        assert!(runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(legacy.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn extraction_uses_genuine_capture_behind_newer_tagged_decoy() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"<p>Captured body</p>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://owner.example.test/tagged-decoy",
+            "text/html",
+            body,
+        )
+        .await;
+        let (_reference, genuine) = capture_page(&runtime, &token, page_id, body, &[]).await;
+        let genuine_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(genuine)
+            .await
+            .unwrap()
+            .unwrap();
+        let decoy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "caller-written tagged decoy",
+                None,
+                Some(json!({"tags": [crate::receipt::RECEIPT_TAG]})),
+                vec![page_id],
+            )
+            .await
+            .unwrap();
+        let mut newer_decoy = decoy.clone();
+        newer_decoy.created_at = genuine_note.created_at + 1;
+        newer_decoy.updated_at = newer_decoy.created_at;
+        runtime
+            .backend()
+            .notes()
+            .unwrap()
+            .upsert_note(newer_decoy)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .latest_annotating_note(&token, page_id, "observation", crate::receipt::RECEIPT_TAG)
+                .await
+                .unwrap(),
+            Some(decoy.id)
+        );
+        crate::entities::patch(
+            &runtime,
+            &token,
+            page_id,
+            None,
+            json!({ "capture_receipt_id": null }),
+        )
+        .await
+        .unwrap();
+
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["text".into()]),
+                link_limit: None,
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        let extraction_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            extraction_note.properties.unwrap()["request"]["capture_receipt_id"],
+            genuine.to_string()
+        );
+    }
+
+    #[tokio::test]
     async fn extraction_refuses_property_and_content_attachment_mismatch_before_writes() {
         let (runtime, token, _dir) = test_runtime().await;
         let page_id = seed_page(

@@ -4,7 +4,7 @@
 
 ### Edge Ontology (ADR-002)
 
-- 17 closed edge relations (15 base relations plus 2 epistemic relations added by ADR-055);
+- 19 closed edge relations (15 base relations, 2 epistemic relations added by ADR-055, `links_to` added by ADR-191 and `located_in` added by ADR-196);
   endpoint contract enforced at the runtime layer in `operations.rs`
 - Symmetric relations (`competes_with`, `composed_with`) are stored with `source_uuid < target_uuid`
 - `annotates` is the only cross-substrate relation: source must be a note, target may be anything
@@ -229,7 +229,7 @@
 ### Verb Response Presentation (ADR-045)
 
 - `micros_to_iso` is the single conversion point from internal `i64` microsecond timestamps to ISO-8601
-- `Agent` mode: short UUIDs (8-char) except strict round-trip fields, relative timestamps within 24h, lifecycle nulls preserved, scores truncated to 3 sig-figs
+- `Agent` mode: short UUIDs (8-char) except strict round-trip fields, exact UTC timestamps with relative labels on list rows, lifecycle nulls preserved, scores truncated to 3 sig-figs
 - `Human` mode at the MCP layer is identical to `Verbose`; terminal formatting is applied by the CLI layer
 - `full_id`, `context_entity_id`, `thread_id`, `outbound_ref`, `parent_id`, `session_id`, and `project_id` are explicitly excluded from UUID shortening in Agent mode to preserve strict chaining, correlation, ancestry, filtering, and provenance handles
 - `memory.feedback` and `comm.delivered` are `AlwaysVerbose` because their generic `target_id` / `id` fields are exact strict-verb inputs

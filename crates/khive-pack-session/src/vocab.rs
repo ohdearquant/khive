@@ -77,8 +77,9 @@ pub(crate) static SESSION_SCHEMA_PLAN_STMTS: [&str; 10] = [
 
 /// Speech-act categories follow ADR-025: `session.store` is a Directive
 /// (requests storage of content); `session.list`, `session.resume`,
-/// `session.export`, and `session.search` are Assertive (retrieve state).
-pub(crate) static SESSION_HANDLERS: [HandlerDef; 5] = [
+/// `session.export`, `session.search`, and `session.stats` are Assertive
+/// (retrieve state); `session.vacuum` is Commissive (database maintenance).
+pub(crate) static SESSION_HANDLERS: [HandlerDef; 7] = [
     HandlerDef {
         name: "session.store",
         description: "Persist an agent-session record as a session note",
@@ -244,6 +245,20 @@ pub(crate) static SESSION_HANDLERS: [HandlerDef; 5] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
         ],
+    },
+    HandlerDef {
+        name: "session.stats",
+        description: "Report database-wide session table rows and allocated bytes, plus database file and WAL sizes",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[],
+    },
+    HandlerDef {
+        name: "session.vacuum",
+        description: "Reclaim unused SQLite pages and report database bytes before and after",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Commissive,
+        params: &[],
     },
 ];
 

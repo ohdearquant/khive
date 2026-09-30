@@ -424,64 +424,103 @@ mod tests {
     }
 
     #[test]
-    fn selected_snippet_vm_steps_ignore_other_matching_messages() {
+    fn search_sql_snippet_vm_steps_stay_bounded_as_matches_grow() {
         let mut conn = Connection::open_in_memory().expect("in-memory SQLite");
         conn.execute_batch(
-            "CREATE TABLE session_messages (mirror_rowid INTEGER PRIMARY KEY, text TEXT); \
+            "CREATE TABLE sessions ( \
+               namespace TEXT, source TEXT, provider_session_id TEXT, cwd TEXT, \
+               first_seen_at INTEGER, last_seen_at INTEGER, message_count INTEGER); \
+             CREATE TABLE session_messages ( \
+               mirror_rowid INTEGER PRIMARY KEY, namespace TEXT, source TEXT, \
+               session_id TEXT, created_at INTEGER, text TEXT); \
              CREATE VIRTUAL TABLE session_messages_fts USING \
                fts5(text, content='session_messages', content_rowid='mirror_rowid'); \
-             INSERT INTO session_messages VALUES (1, 'needle winner'); \
-             INSERT INTO session_messages_fts(rowid, text) VALUES (1, 'needle winner');",
+             INSERT INTO sessions VALUES ('local', 'codex', 'one', '/repo', 1, 1, 1000);",
         )
         .expect("FTS fixture");
 
-        fn steps(conn: &Connection, sql: &str) -> i32 {
-            let mut stmt = conn.prepare(sql).expect("snippet statement");
-            let snippet: String = stmt
-                .query_row(params!["\"needle\""], |row| row.get(0))
-                .expect("snippet result");
-            assert!(snippet.contains("[needle]"));
+        fn insert_matches(conn: &mut Connection, first: i64, last: i64) {
+            let tx = conn.transaction().expect("fixture transaction");
+            for rowid in first..=last {
+                tx.execute(
+                    "INSERT INTO session_messages VALUES \
+                     (?1, 'local', 'codex', 'one', ?1, 'needle message')",
+                    params![rowid],
+                )
+                .expect("mirror row");
+                tx.execute(
+                    "INSERT INTO session_messages_fts(rowid, text) \
+                     VALUES (?1, 'needle message')",
+                    params![rowid],
+                )
+                .expect("FTS row");
+            }
+            tx.commit().expect("commit matching messages");
+        }
+
+        fn search_steps(conn: &Connection, sql: &str) -> i32 {
+            let mut stmt = conn.prepare(sql).expect("SEARCH_SQL statement");
+            let mut rows = stmt
+                .query(params![
+                    "\"needle\"",
+                    "local",
+                    None::<&str>,
+                    None::<i64>,
+                    None::<&str>,
+                    1_i64,
+                ])
+                .expect("search query");
+            let mut sessions = 0;
+            while let Some(row) = rows.next().expect("search row") {
+                let snippets: String = row.get(7).expect("snippets JSON");
+                let snippets: Vec<String> = serde_json::from_str(&snippets).expect("snippet list");
+                assert_eq!(snippets.len(), 3, "the returned snippet limit stays fixed");
+                sessions += 1;
+            }
+            assert_eq!(sessions, 1, "fixture has one matching session");
+            drop(rows);
             stmt.get_status(StatementStatus::VmStep)
         }
 
-        let bounded = "SELECT snippet(session_messages_fts, 0, '[', ']', '…', 32) \
-                       FROM (SELECT 1 AS fts_rowid) AS c \
-                       CROSS JOIN session_messages_fts \
-                       WHERE session_messages_fts MATCH ?1 \
-                         AND session_messages_fts.rowid = c.fts_rowid";
-        let unbounded = "WITH hits AS MATERIALIZED ( \
-                           SELECT snippet(session_messages_fts, 0, '[', ']', '…', 32) AS snippet \
-                             FROM session_messages_fts WHERE session_messages_fts MATCH ?1 \
-                         ) SELECT max(snippet) FROM hits";
-        let small_bounded_steps = steps(&conn, bounded);
-        let small_unbounded_steps = steps(&conn, unbounded);
+        let snippet_call = "snippet(session_messages_fts, 0, '[', ']', '…', 32)";
+        assert_eq!(
+            SEARCH_SQL.matches(snippet_call).count(),
+            1,
+            "the measured statement has one snippet stage"
+        );
+        let literal_sql = SEARCH_SQL.replacen(snippet_call, "'fixed snippet'", 1);
 
-        let tx = conn.transaction().expect("fixture transaction");
-        for rowid in 2..=1001 {
-            tx.execute(
-                "INSERT INTO session_messages VALUES (?1, 'needle unrelated')",
-                params![rowid],
-            )
-            .expect("mirror row");
-            tx.execute(
-                "INSERT INTO session_messages_fts(rowid, text) VALUES (?1, 'needle unrelated')",
-                params![rowid],
-            )
-            .expect("FTS row");
-        }
-        tx.commit().expect("commit unrelated matches");
+        insert_matches(&mut conn, 1, 10);
+        let small_search_steps = search_steps(&conn, SEARCH_SQL);
+        let small_literal_steps = search_steps(&conn, &literal_sql);
+        insert_matches(&mut conn, 11, 1000);
+        let large_search_steps = search_steps(&conn, SEARCH_SQL);
+        let large_literal_steps = search_steps(&conn, &literal_sql);
 
-        let large_bounded_steps = steps(&conn, bounded);
-        let large_unbounded_steps = steps(&conn, unbounded);
+        let small_snippet_steps = small_search_steps - small_literal_steps;
+        let large_snippet_steps = large_search_steps - large_literal_steps;
         assert!(
-            large_bounded_steps <= small_bounded_steps + 64,
-            "one selected snippet must not visit unrelated FTS matches: \
-             {small_bounded_steps} -> {large_bounded_steps} VM steps"
+            large_search_steps > small_search_steps + 500,
+            "SEARCH_SQL must visit the additional matches: \
+             {small_search_steps} -> {large_search_steps} VM steps"
         );
         assert!(
-            large_unbounded_steps > small_unbounded_steps + 500,
-            "materializing snippets for every match must be a growing-work control: \
-             {small_unbounded_steps} -> {large_unbounded_steps} VM steps"
+            small_snippet_steps > 0 && large_snippet_steps > 0,
+            "the real snippet call must add VM work over a literal: \
+             small {small_search_steps} vs {small_literal_steps}, \
+             large {large_search_steps} vs {large_literal_steps} steps"
+        );
+        // Both statements rank the same matches. Only the selected snippet()
+        // calls differ, so three calls may add fixed work while 990 extra hits
+        // cannot add snippet work. The 128-step allowance covers fixed FTS
+        // setup differences; a late LIMIT computes 990 extra snippets and
+        // exceeds it even if each call adds just one VM opcode.
+        assert!(
+            large_snippet_steps <= small_snippet_steps + 128,
+            "SEARCH_SQL must bound snippet work to three rows as matches grow \
+             from 10 to 1000: full {small_search_steps} -> {large_search_steps}, \
+             literal {small_literal_steps} -> {large_literal_steps}, \
+             snippet delta {small_snippet_steps} -> {large_snippet_steps} VM steps"
         );
     }
 

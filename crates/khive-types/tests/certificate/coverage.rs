@@ -69,10 +69,14 @@ struct SystemRoleException {
 
 /// Relations admitted by passing the non-redundancy certificate.
 ///
-/// Empty today — `cites` is a worked-example in cites.rs, not yet a variant of
+/// `located_in` (ADR-196) is admitted here: its certificate module defeats all seven
+/// eliminators. `cites` is a worked example in cites.rs, not a variant of
 /// EdgeRelation::ALL. Add entries here only after EdgeRelation::ALL gains the
 /// variant and its certificate module passes all seven eliminators.
-const CERTIFIED_RELATIONS: &[CertifiedRelation] = &[];
+const CERTIFIED_RELATIONS: &[CertifiedRelation] = &[CertifiedRelation {
+    relation: "located_in",
+    fixtures: crate::located_in::FIXTURES,
+}];
 
 /// Relations in EdgeRelation::ALL kept by declared system role (ADR-076 §D1/§D3).
 ///

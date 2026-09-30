@@ -35,7 +35,7 @@ import {
   X,
   XCircle,
 } from "@/icons";
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
   edgeDirectionMark,
@@ -48,7 +48,9 @@ import {
   RelationMark,
 } from "@/components/ontology-mark";
 import { DataState } from "@/components/data-state";
+import { RepositoryCommandPalette } from "@/components/showcase/repository-command-palette";
 import { settleGraphLayout } from "@/lib/graph-layout";
+import { handleKeyboardRows } from "@/lib/keyboard-rows";
 import { edgeLegendFor, entityLegendFor } from "@/lib/ontology-legend";
 import {
   isReviewReport,
@@ -183,10 +185,12 @@ function Header({
   bundle,
   onImport,
   onDownload,
+  commandPalette,
 }: {
   bundle: ReviewBundle;
   onImport: () => void;
   onDownload: () => void;
+  commandPalette: ReactNode;
 }) {
   return (
     <header className="topbar">
@@ -199,11 +203,7 @@ function Header({
         <span className="brand-name">khive</span>
         <span className="brand-product">KG Studio</span>
       </div>
-      <div className="global-search" aria-label="Global search preview">
-        <Search aria-hidden="true" />
-        <span>Search this graph</span>
-        <kbd>⌘ K</kbd>
-      </div>
+      {commandPalette}
       <div className="topbar-actions">
         <button className="button quiet" type="button" onClick={onImport} aria-label="Import review bundle">
           <Upload aria-hidden="true" />
@@ -243,13 +243,15 @@ function Sidebar({ bundle, activeView, onView }: { bundle: ReviewBundle; activeV
         <ChevronDown aria-hidden="true" />
       </div>
 
-      <nav className="side-nav" aria-label="Review navigation">
+      <nav className="side-nav" aria-label="Review navigation" data-keyboard-list>
         <span className="side-label">Review</span>
         {navigation.map((item) => {
           const Icon = item.icon;
           return (
             <button
               key={item.id}
+              data-keyboard-row
+              aria-keyshortcuts="J K Enter"
               className={activeView === item.id ? "active" : ""}
               type="button"
               onClick={() => onView(item.id)}
@@ -348,10 +350,12 @@ function WorkspaceTabs({ activeView, onView, bundle }: { activeView: View; onVie
     { id: "activity", label: "Conversation", count: bundle.activity.items.length },
   ];
   return (
-    <div className="workspace-tabs" role="tablist" aria-label="Review views">
+    <div className="workspace-tabs" role="tablist" aria-label="Review views" data-keyboard-list>
       {tabs.map((tab) => (
         <button
           type="button"
+          data-keyboard-row
+          aria-keyshortcuts="J K Enter"
           role="tab"
           aria-selected={activeView === tab.id}
           className={activeView === tab.id ? "active" : ""}
@@ -406,7 +410,7 @@ function ChangeOntologyMark({ change }: { change: ReviewChange }) {
 function ChangeCard({ change, selected, onSelect }: { change: ReviewChange; selected: boolean; onSelect: () => void }) {
   return (
     <article className={`change-card ${change.change} ${selected ? "selected" : ""}`}>
-      <button className="change-summary" type="button" onClick={onSelect} aria-expanded={selected}>
+      <button className="change-summary" type="button" data-keyboard-row aria-keyshortcuts="J K Enter" onClick={onSelect} aria-expanded={selected}>
         <span className="change-sign" aria-hidden="true">
           {change.change === "added" ? "+" : change.change === "removed" ? "−" : "~"}
         </span>
@@ -466,7 +470,7 @@ function ChangesView({
         <span><i className="removed" /> {grouped.removed.length} removed</span>
         <span className="content-hash"><Box aria-hidden="true" /> {bundle.snapshot_identity.hash_status === "fixture" ? "Fixture KG" : "KG"} {displaySnapshotHash(bundle, 10)}</span>
       </div>
-      <div className="change-list">
+      <div className="change-list" data-keyboard-list>
         {filtered.map((change) => (
           <ChangeCard
             key={change.id}
@@ -658,6 +662,8 @@ function GraphView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () =>
               <li key={`${edge.id}-summary`}>
                 <button
                   type="button"
+                  data-keyboard-row
+                  aria-keyshortcuts="J K Enter"
                   className={selection.type === "edge" && edge.id === selection.id ? "selected" : ""}
                   aria-pressed={selection.type === "edge" && edge.id === selection.id}
                   onClick={() => selectEdge(edge.id)}
@@ -849,17 +855,21 @@ function RetrievalView({ bundle, onImport }: { bundle: ReviewBundle; onImport: (
   );
 }
 
-function ActivityView({ bundle, onImport }: { bundle: ReviewBundle; onImport: () => void }) {
-  const [draft, setDraft] = useState("");
-  const [localNotes, setLocalNotes] = useState<string[]>([]);
-
-  function addLocalNote() {
-    const note = draft.trim();
-    if (!note) return;
-    setLocalNotes((current) => [...current, note]);
-    setDraft("");
-  }
-
+function ActivityView({
+  bundle,
+  onImport,
+  draft,
+  onDraft,
+  localNotes,
+  onAddLocalNote,
+}: {
+  bundle: ReviewBundle;
+  onImport: () => void;
+  draft: string;
+  onDraft: (value: string) => void;
+  localNotes: readonly string[];
+  onAddLocalNote: () => void;
+}) {
   return (
     <div className="view-stack">
       <div className="surface-toolbar"><div><span className="eyebrow">Replayable review thread</span><h2>Conversation</h2></div></div>
@@ -892,7 +902,7 @@ function ActivityView({ bundle, onImport }: { bundle: ReviewBundle; onImport: ()
       <PageNotice page={bundle.activity} label="Conversation events" />
       <div className="comment-composer">
         <div className="avatar">Y</div>
-        <div><textarea aria-label="Review comment" value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Leave a review note…" /><div><span>Plain text · this session only</span><button className="button primary" type="button" disabled={!draft.trim()} onClick={addLocalNote}>Add local note</button></div></div>
+        <div><textarea aria-label="Review comment" value={draft} onChange={(event) => onDraft(event.target.value)} placeholder="Leave a review note…" /><div><span>Plain text · this session only</span><button className="button primary" type="button" disabled={!draft.trim()} onClick={onAddLocalNote}>Add local note</button></div></div>
       </div>
     </div>
   );
@@ -972,12 +982,20 @@ function ViewSurface({
   query,
   onQuery,
   onImport,
+  activityDraft,
+  onActivityDraft,
+  localNotes,
+  onAddLocalNote,
 }: {
   activeView: View;
   bundle: ReviewBundle;
   query: string;
   onQuery: (value: string) => void;
   onImport: () => void;
+  activityDraft: string;
+  onActivityDraft: (value: string) => void;
+  localNotes: readonly string[];
+  onAddLocalNote: () => void;
 }) {
   const unavailable =
     (activeView === "changes" && bundle.enrichment_status.semantic_changes === "unavailable") ||
@@ -999,7 +1017,7 @@ function ViewSurface({
   if (activeView === "checks") return <ChecksView bundle={bundle} onImport={onImport} />;
   if (activeView === "provenance") return <ProvenanceView bundle={bundle} onImport={onImport} />;
   if (activeView === "retrieval") return <RetrievalView bundle={bundle} onImport={onImport} />;
-  if (activeView === "activity") return <ActivityView bundle={bundle} onImport={onImport} />;
+  if (activeView === "activity") return <ActivityView bundle={bundle} onImport={onImport} draft={activityDraft} onDraft={onActivityDraft} localNotes={localNotes} onAddLocalNote={onAddLocalNote} />;
   return <ChangesView bundle={bundle} query={query} onQuery={onQuery} onImport={onImport} />;
 }
 
@@ -1037,18 +1055,23 @@ function CoreReviewStudio({
   onUseDemo: () => void;
 }) {
   return (
-    <div className="app-shell core-report-shell">
+    <div className="app-shell core-report-shell" onKeyDown={handleKeyboardRows}>
       <header className="topbar">
         <div className="brand-lockup">
           <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
           <span className="brand-name">khive</span>
           <span className="brand-product">KG Studio</span>
         </div>
-        <div className="global-search core-report-label">
-          <FileJson2 aria-hidden="true" />
-          <span>khive.review.v1 · headless report</span>
-          <kbd>read only</kbd>
-        </div>
+        <RepositoryCommandPalette
+          surface="review"
+          triggerClassName="global-search"
+          views={[]}
+          activeReviewView="core-report"
+          onSelectReviewView={() => undefined}
+          hasUnsavedReviewState
+          onDownloadReview={onDownload}
+          downloadSubject="report"
+        />
         <div className="topbar-actions">
           <button className="button quiet" type="button" onClick={onUseDemo} aria-label="Use demo review bundle"><Database aria-hidden="true" /><span className="mobile-action-label">Use demo</span></button>
           <button className="button quiet" type="button" onClick={onImport} aria-label="Import review report"><Upload aria-hidden="true" /><span className="mobile-action-label">Import</span></button>
@@ -1137,6 +1160,8 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
   const [query, setQuery] = useState("");
   const [reviewerFamily, setReviewerFamily] = useState(bundle.change_set.envelope.producer_model_family);
   const [decision, setDecision] = useState<ReviewDecision>("pending");
+  const [activityDraft, setActivityDraft] = useState("");
+  const [localNotes, setLocalNotes] = useState<string[]>([]);
   const [toast, setToast] = useState<Toast>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -1174,6 +1199,8 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
       });
       setReviewerFamily(parsed.change_set.envelope.producer_model_family);
       setDecision("pending");
+      setActivityDraft("");
+      setLocalNotes([]);
       setCoreReport(null);
       showToast({ tone: "success", message: `Loaded review bundle for ${parsed.repository.owner}/${parsed.repository.name}.` });
     } catch (error) {
@@ -1217,6 +1244,18 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
     });
   }
 
+  function addLocalNote() {
+    const note = activityDraft.trim();
+    if (!note) return;
+    setLocalNotes((current) => [...current, note]);
+    setActivityDraft("");
+  }
+
+  const hasUnsavedReviewState = coreReport !== null || bundle !== initialBundle ||
+    decision !== "pending" ||
+    reviewerFamily !== bundle.change_set.envelope.producer_model_family ||
+    activityDraft.trim().length > 0 || localNotes.length > 0;
+
   const filePicker = (
     <input
       ref={fileInput}
@@ -1243,8 +1282,27 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
   }
 
   return (
-    <div className="app-shell">
-      <Header bundle={bundle} onImport={() => fileInput.current?.click()} onDownload={downloadBundle} />
+    <div className="app-shell" onKeyDown={handleKeyboardRows}>
+      <Header
+        bundle={bundle}
+        onImport={() => fileInput.current?.click()}
+        onDownload={downloadBundle}
+        commandPalette={
+          <RepositoryCommandPalette
+            surface="review"
+            triggerClassName="global-search"
+            views={Object.entries(viewLabels).map(([id, label]) => ({ id, label }))}
+            activeReviewView={activeView}
+            hasUnsavedReviewState={hasUnsavedReviewState}
+            onSelectReviewView={(view) => {
+              setActiveView(view as View);
+              queueMicrotask(() => document.querySelector<HTMLElement>(".review-surface")?.focus());
+            }}
+            onCopyCli={copyCli}
+            onDownloadReview={downloadBundle}
+          />
+        }
+      />
       {filePicker}
       <button className="mobile-menu" type="button" onClick={() => setSidebarOpen((open) => !open)} aria-label="Toggle navigation"><Menu /></button>
       <div className="app-body">
@@ -1256,7 +1314,7 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
           <PullRequestHeader bundle={bundle} onCopy={() => void copyCli()} />
           <WorkspaceTabs activeView={activeView} onView={setActiveView} bundle={bundle} />
           <div className="review-layout">
-            <section className="review-surface" aria-label={viewLabels[activeView]}>
+            <section className="review-surface" aria-label={viewLabels[activeView]} data-keyboard-scope tabIndex={-1}>
               <ViewSurface
                 key={`${bundle.repository.owner}/${bundle.repository.name}#${bundle.pull_request.number}@${bundle.pull_request.head_sha}`}
                 activeView={activeView}
@@ -1264,6 +1322,10 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
                 query={query}
                 onQuery={setQuery}
                 onImport={() => fileInput.current?.click()}
+                activityDraft={activityDraft}
+                onActivityDraft={setActivityDraft}
+                localNotes={localNotes}
+                onAddLocalNote={addLocalNote}
               />
             </section>
             <ReviewRail

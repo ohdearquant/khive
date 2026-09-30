@@ -8,6 +8,11 @@ import { RepositoryCommandPalette } from "@/components/showcase/repository-comma
 import { parseRepoBundle, type RepoBundle } from "@/lib/repo-bundle";
 import { REPOSITORY_VIEW_IDS } from "@/lib/repository-location";
 
+type RepoPaletteProps = Extract<
+  React.ComponentProps<typeof RepositoryCommandPalette>,
+  { bundle: RepoBundle }
+>;
+
 const goldenPath = resolve(
   process.cwd(),
   "../../docs/schemas/examples/khive-repo-v1-khive.json",
@@ -18,11 +23,10 @@ function golden(): RepoBundle {
 }
 
 function renderPalette(
-  overrides: Partial<React.ComponentProps<typeof RepositoryCommandPalette>> =
-    {},
+  overrides: Partial<RepoPaletteProps> = {},
 ) {
   const bundle = golden();
-  const props: React.ComponentProps<typeof RepositoryCommandPalette> = {
+  const props: RepoPaletteProps = {
     bundle,
     activeView: "structure_graph",
     selectedModuleId: bundle.graph.modules.items[0]?.id ?? null,
@@ -206,6 +210,109 @@ describe("repository command palette", () => {
       ),
     )).toHaveTextContent(/Truncated.*module page reached its export bound/i);
     expect(screen.getByText(/Up to 8 module matches/i)).toBeVisible();
+  });
+
+  it("registers app navigation without exposing review decisions", async () => {
+    const user = userEvent.setup();
+    renderPalette();
+    await user.keyboard("{Control>}k{/Control}");
+
+    const dialog = screen.getByRole("dialog", { name: "Repository commands" });
+    expect(within(dialog).getByRole("option", { name: /Repository showcase/i }))
+      .toBeVisible();
+    expect(within(dialog).getByRole("option", { name: /KG review/i }))
+      .toBeVisible();
+    expect(within(dialog).queryByRole("option", { name: /Approve locally/i }))
+      .not.toBeInTheDocument();
+  });
+
+  it("switches the current repository surface to its default view without navigating", async () => {
+    const user = userEvent.setup();
+    const onSelectView = vi.fn();
+    renderPalette({ activeView: "scorecard", onSelectView });
+
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(
+      screen.getByRole("combobox", { name: "Search repository commands" }),
+      "Repository showcase",
+    );
+    await user.keyboard("{Enter}");
+
+    expect(onSelectView).toHaveBeenCalledOnce();
+    expect(onSelectView).toHaveBeenCalledWith("structure_graph");
+    expect(screen.queryByRole("dialog", { name: "Repository commands" }))
+      .not.toBeInTheDocument();
+  });
+
+  it("keeps the current review surface actionable and blocks cross-surface navigation with local state", async () => {
+    const user = userEvent.setup();
+    const onSelectReviewView = vi.fn();
+    render(
+      <div className="repo-shell">
+        <RepositoryCommandPalette
+          surface="review"
+          views={[{ id: "activity", label: "Activity" }]}
+          activeReviewView="activity"
+          onSelectReviewView={onSelectReviewView}
+          hasUnsavedReviewState
+          onDownloadReview={vi.fn()}
+        />
+      </div>,
+    );
+
+    await user.keyboard("{Control>}k{/Control}");
+    await user.type(
+      screen.getByRole("combobox", { name: "Search review commands" }),
+      "Repository showcase",
+    );
+    const blocked = screen.getByRole("option", { name: /Repository showcase/i });
+    expect(blocked).toBeDisabled();
+    expect(blocked).toHaveTextContent("Unavailable while this review has unsaved local state.");
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("dialog", { name: "Review commands" })).toBeVisible();
+
+    await user.clear(screen.getByRole("combobox", { name: "Search review commands" }));
+    await user.type(
+      screen.getByRole("combobox", { name: "Search review commands" }),
+      "KG review",
+    );
+    await user.keyboard("{Enter}");
+    expect(onSelectReviewView).toHaveBeenCalledOnce();
+    expect(onSelectReviewView).toHaveBeenCalledWith("changes");
+    expect(screen.queryByRole("dialog", { name: "Review commands" }))
+      .not.toBeInTheDocument();
+  });
+
+  it("marks KG review unavailable when an imported core report has no review tabs", async () => {
+    const user = userEvent.setup();
+    const onSelectReviewView = vi.fn();
+    render(
+      <div className="repo-shell">
+        <RepositoryCommandPalette
+          surface="review"
+          views={[]}
+          activeReviewView="core-report"
+          onSelectReviewView={onSelectReviewView}
+          hasUnsavedReviewState
+          onDownloadReview={vi.fn()}
+          downloadSubject="report"
+        />
+      </div>,
+    );
+
+    await user.keyboard("{Control>}k{/Control}");
+    const current = screen.getByRole("option", { name: /KG review/i });
+    expect(current).toBeDisabled();
+    expect(current).toHaveTextContent("Already viewing the imported report.");
+    await user.keyboard("{Home}");
+    expect(current).not.toHaveAttribute("aria-selected", "true");
+    await user.type(
+      screen.getByRole("combobox", { name: "Search review commands" }),
+      "KG review",
+    );
+    await user.keyboard("{Enter}");
+    expect(onSelectReviewView).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Review commands" })).toBeVisible();
   });
 
   it("does not claim complete module search coverage when a next page exists", async () => {
