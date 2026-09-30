@@ -217,15 +217,22 @@ impl KhiveRuntime {
             VerifiedInboundContent::Quarantine {
                 reason,
                 parsed_plaintext,
-            } => (
-                None,
-                RecipientDisposition::Quarantined,
-                Some(QuarantineRecord {
-                    reason,
-                    delivery_item,
-                    parsed_plaintext,
-                }),
-            ),
+            } => {
+                // ADR-105's credential fence also applies to retained plaintext.
+                // Refuse before the quarantine/replay/ack transaction can write.
+                if let Some(plaintext) = &parsed_plaintext {
+                    crate::secret_gate::check_json_at(plaintext, "quarantine", "parsed_plaintext")?;
+                }
+                (
+                    None,
+                    RecipientDisposition::Quarantined,
+                    Some(QuarantineRecord {
+                        reason,
+                        delivery_item,
+                        parsed_plaintext,
+                    }),
+                )
+            }
         };
         let result = recipient_store
             .commit(RecipientCommit {
