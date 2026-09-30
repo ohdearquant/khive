@@ -267,6 +267,7 @@ async fn run_refresh(
     resolver: &dyn Resolver,
     cfg: &khive_runtime::engine_config::WebSectionConfig,
     params: RefreshParams,
+    clients: &egress::PinnedClients,
 ) -> Result<Value, RuntimeError> {
     let entities = runtime.entities(token)?;
     let entity = entities.get_entity(params.id).await?.ok_or_else(|| {
@@ -317,35 +318,37 @@ async fn run_refresh(
     let original_url = url.clone();
     let mut first_hop = true;
     let mut first_observed_hop = true;
-    let (outcome, redirect_hops, terminal_request_snapshot) = crate::fetch::run_hop_chain_observed(
-        resolver,
-        cfg,
-        url,
-        reqwest::Method::GET,
-        max_bytes,
-        deadline,
-        |current_url| {
-            let initial = std::mem::take(&mut first_hop);
-            refresh_headers_for_hop(&properties, &original_url, current_url, initial)
-        },
-        |current_url| {
-            let initial = std::mem::take(&mut first_observed_hop);
-            async move {
-                // The original row was already read before the first request.
-                // Only redirected hops need a separate terminal-row snapshot.
-                if initial {
-                    return Ok(None);
+    let (outcome, redirect_hops, terminal_request_snapshot) =
+        crate::fetch::run_hop_chain_with_clients_observed(
+            clients,
+            resolver,
+            cfg,
+            url,
+            reqwest::Method::GET,
+            max_bytes,
+            deadline,
+            |current_url| {
+                let initial = std::mem::take(&mut first_hop);
+                refresh_headers_for_hop(&properties, &original_url, current_url, initial)
+            },
+            |current_url| {
+                let initial = std::mem::take(&mut first_observed_hop);
+                async move {
+                    // The original row was already read before the first request.
+                    // Only redirected hops need a separate terminal-row snapshot.
+                    if initial {
+                        return Ok(None);
+                    }
+                    let document_id = document_id_for_url(&current_url);
+                    let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
+                    if let Some(entity) = &snapshot {
+                        crate::entities::require_entity_namespace(token, entity)?;
+                    }
+                    Ok(snapshot)
                 }
-                let document_id = document_id_for_url(&current_url);
-                let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
-                if let Some(entity) = &snapshot {
-                    crate::entities::require_entity_namespace(token, entity)?;
-                }
-                Ok(snapshot)
-            }
-        },
-    )
-    .await?;
+            },
+        )
+        .await?;
 
     settle_refresh_from_snapshot(
         runtime,
@@ -940,6 +943,7 @@ impl WebPack {
             &SystemResolver,
             &self.runtime.config().web,
             params,
+            &egress::PinnedClients::default(),
         )
         .await
     }
@@ -1388,8 +1392,9 @@ mod tests {
             let cfg = Default::default();
             // Arm the watchdog after the stored-entity read completes and DNS
             // begins, so paused time cannot race the database's blocking task.
+            let clients = egress::PinnedClients::default();
             let error = tokio::select! {
-                result = run_refresh(&runtime, &token, &resolver, &cfg, params) => result.unwrap_err(),
+                result = run_refresh(&runtime, &token, &resolver, &cfg, params, &clients) => result.unwrap_err(),
                 () = async {
                     resolver.pending_started.notified().await;
                     tokio::time::sleep(Duration::from_secs(2)).await;
