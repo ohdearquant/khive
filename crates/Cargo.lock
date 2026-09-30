@@ -2559,6 +2559,8 @@ dependencies = [
  "khive-types",
  "serde",
  "serde_json",
+ "serial_test",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
