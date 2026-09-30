@@ -193,7 +193,7 @@ pub fn check_tags_at(tags: &[String], record: &str, field: &str) -> RuntimeResul
     locate(check_tags(tags), record, field)
 }
 
-// ─── Reserved property key (ADR-115 Amendment 1) ────────────────────────────
+// ─── Reserved property keys ──────────────────────────────────────────────────
 
 /// Top-level JSON property key reserved for runtime-owned exemption state.
 ///
@@ -206,6 +206,8 @@ pub fn check_tags_at(tags: &[String], record: &str, field: &str) -> RuntimeResul
 /// spelling nested inside an object *value* is ordinary content and remains
 /// subject to [`check_json`], never a posture mutation.
 pub const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
+pub const RESERVED_WEB_RECEIPT_KEY: &str = "khive:web_receipt";
+pub const WEB_RECEIPT_PROVENANCE_VALUE: &str = "v1";
 
 /// Reject a caller-supplied top-level `khive:secret_gate` property key.
 ///
@@ -215,9 +217,9 @@ pub const RESERVED_SECRET_GATE_KEY: &str = "khive:secret_gate";
 /// is absent, is not a JSON object, or does not name the reserved key at the
 /// top level.
 ///
-/// This is the one shared validator for the reservation rule (ADR-115
-/// Amendment 1 §3); every properties-bearing write path across every crate
-/// must call this instead of re-implementing the check.
+/// This is the shared validator for both the ADR-115 reservation and web
+/// receipt provenance. Every properties-bearing generic write path calls it
+/// before a merge or full-row replacement.
 pub fn reject_reserved_secret_gate_property(
     properties: Option<&serde_json::Value>,
 ) -> RuntimeResult<()> {
@@ -225,6 +227,12 @@ pub fn reject_reserved_secret_gate_property(
         if map.contains_key(RESERVED_SECRET_GATE_KEY) {
             return Err(RuntimeError::InvalidInput(format!(
                 "property key `{RESERVED_SECRET_GATE_KEY}` is runtime-owned and cannot be \
+                 created, replaced, merged, or removed by callers"
+            )));
+        }
+        if map.contains_key(RESERVED_WEB_RECEIPT_KEY) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "property key `{RESERVED_WEB_RECEIPT_KEY}` is web-pack-owned and cannot be \
                  created, replaced, merged, or removed by callers"
             )));
         }
@@ -4887,6 +4895,17 @@ mod tests {
             matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate") && msg.contains("runtime-owned")),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[test]
+    fn reject_reserved_web_receipt_provenance_in_generic_properties() {
+        for value in [serde_json::json!("v1"), serde_json::Value::Null] {
+            let props = serde_json::json!({"khive:web_receipt": value});
+            let error = reject_reserved_secret_gate_property(Some(&props)).unwrap_err();
+            assert!(
+                matches!(error, RuntimeError::InvalidInput(message) if message.contains("khive:web_receipt"))
+            );
+        }
     }
 
     #[test]
