@@ -110,11 +110,18 @@ fn registry() -> khive_runtime::VerbRegistry {
     builder.build().unwrap()
 }
 
-async fn message_count(registry: &khive_runtime::VerbRegistry) -> usize {
+/// Stored inbound rows belong to the poll loop's landing actor, so they are
+/// counted through that mailbox owner. `None` reads as the anonymous caller.
+async fn message_count(registry: &khive_runtime::VerbRegistry, actor_id: Option<&str>) -> usize {
     registry
-        .dispatch(
+        .dispatch_with_identity(
             "list",
             serde_json::json!({"namespace": "local", "kind": "message", "limit": 50}),
+            Some(khive_runtime::RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: actor_id.map(str::to_string),
+                ..Default::default()
+            }),
         )
         .await
         .unwrap()["items"]
@@ -171,7 +178,7 @@ async fn email_inflight_poll_cancels_without_committing_cursor_and_restart_inges
     cancel_and_join(token, task).await;
     assert_eq!(channel.calls.load(Ordering::SeqCst), 1);
     assert_eq!(channel.drops.load(Ordering::SeqCst), 1);
-    assert_eq!(message_count(&registry).await, 0);
+    assert_eq!(message_count(&registry, Some("actor:test")).await, 0);
     assert!(load_channel_cursor(&registry, channel.kind, channel.kind)
         .await
         .unwrap()
@@ -184,7 +191,7 @@ async fn email_inflight_poll_cancels_without_committing_cursor_and_restart_inges
     cancel_and_join(token, task).await;
     assert_eq!(channel.calls.load(Ordering::SeqCst), 3);
     assert_eq!(channel.drops.load(Ordering::SeqCst), 2);
-    assert_eq!(message_count(&registry).await, 1);
+    assert_eq!(message_count(&registry, Some("actor:test")).await, 1);
     assert_eq!(
         *channel.checkpoints.lock().unwrap(),
         vec![None, None, Some(1)],
@@ -223,7 +230,7 @@ async fn telegram_inflight_poll_cancels_without_ack_and_restart_ingests_once() {
     assert_eq!(channel.calls.load(Ordering::SeqCst), 1);
     assert_eq!(channel.drops.load(Ordering::SeqCst), 1);
     assert_eq!(channel.commits.load(Ordering::SeqCst), 0);
-    assert_eq!(message_count(&registry).await, 0);
+    assert_eq!(message_count(&registry, None).await, 0);
 
     channel.ready.store(true, Ordering::SeqCst);
     let token = CancellationToken::new();
@@ -233,5 +240,5 @@ async fn telegram_inflight_poll_cancels_without_ack_and_restart_ingests_once() {
     assert_eq!(channel.calls.load(Ordering::SeqCst), 3);
     assert_eq!(channel.drops.load(Ordering::SeqCst), 2);
     assert_eq!(channel.commits.load(Ordering::SeqCst), 1);
-    assert_eq!(message_count(&registry).await, 1);
+    assert_eq!(message_count(&registry, None).await, 1);
 }

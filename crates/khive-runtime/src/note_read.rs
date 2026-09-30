@@ -4,7 +4,7 @@ use khive_storage::note::{Note, NoteFilter};
 use khive_storage::{PageRequest, SeekCursor};
 use uuid::Uuid;
 
-use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
+use crate::{KhiveRuntime, MailboxView, NamespaceToken, RuntimeError, RuntimeResult};
 
 impl KhiveRuntime {
     pub async fn list_notes_filtered(
@@ -49,6 +49,16 @@ impl KhiveRuntime {
                     .await?
                     .ok_or_else(|| RuntimeError::NotFound(format!("note cursor {id}")))?;
                 Self::ensure_namespace_visible(&note.namespace, token)?;
+                // A cursor naming a message the mailbox scope hides answers
+                // exactly as a missing cursor does, so it is not an
+                // existence probe.
+                if filter
+                    .mailbox
+                    .as_ref()
+                    .is_some_and(|scope| !MailboxView::scope_permits_message_note(scope, &note))
+                {
+                    return Err(RuntimeError::NotFound(format!("note cursor {id}")));
+                }
                 let sequence = store.note_sequence(id).await?.ok_or_else(|| {
                     RuntimeError::Internal(format!(
                         "note cursor {id} has no insertion-sequence ledger row"

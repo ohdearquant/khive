@@ -1188,7 +1188,57 @@ fn build_note_filter_where(
         conditions.push(format!("created_at >= ?{}", params.len()));
     }
 
+    if let Some(scope) = &filter.mailbox {
+        conditions.push(mailbox_condition(scope, &mut params));
+    }
+
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
+}
+
+/// SQL form of the row-level mailbox rule for `message` rows. Every other kind
+/// passes. JSON `null`, a missing key and a missing `properties` blob all read
+/// as "absent", and a non-text routing field never equals the actor id: the
+/// row-level rule reads routing fields as strings, while `json_extract` renders
+/// an array or object as its JSON text, which an actor id can spell.
+fn mailbox_condition(
+    scope: &khive_storage::note::NoteMailboxScope,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> String {
+    params.push(Box::new(scope.actor_id.clone()));
+    let actor = format!("?{}", params.len());
+    let absent = |path: &str| {
+        let ty = json_type_expr(path);
+        format!("({ty} IS NULL OR {ty} = 'null')")
+    };
+    let not_text = |path: &str| format!("ifnull({}, '') != 'text'", json_type_expr(path));
+    let direction = json_extract_expr("$.direction");
+    let text_is_actor = |path: &str| {
+        format!(
+            "({} = 'text' AND {} = {actor})",
+            json_type_expr(path),
+            json_extract_expr(path)
+        )
+    };
+    let to = text_is_actor("$.to_actor");
+    let from = text_is_actor("$.from_actor");
+    let (inbound_legacy, outbound_legacy, unrouted) = if scope.legacy_local {
+        (
+            format!(" OR {}", absent("$.to_actor")),
+            format!(" OR {}", absent("$.from_actor")),
+            format!(
+                " OR ({} AND {} AND {})",
+                absent("$.direction"),
+                not_text("$.from_actor"),
+                not_text("$.to_actor")
+            ),
+        )
+    } else {
+        Default::default()
+    };
+    format!(
+        "(kind != 'message' OR ({direction} = 'inbound' AND ({to}{inbound_legacy})) \
+         OR ({direction} = 'outbound' AND ({from}{outbound_legacy})){unrouted})"
+    )
 }
 
 // ADR-187: match only compiler-emitted equality/IN terms that constrain every
