@@ -7,8 +7,9 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
+use khive_types::{EventKind, SubstrateKind, ToolCheckDecidedPayload};
 
 use crate::pin::{invalidating_registration, registration_snapshot, visible_registration};
 use crate::RegistryPin;
@@ -766,6 +767,77 @@ impl Decision {
             "side_effect": self.side_effect,
         })
     }
+}
+
+/// The two call sites that produce decision receipts.
+#[derive(Clone, Copy)]
+pub enum DecisionCaller {
+    ToolCheck,
+    ExecRun,
+}
+
+impl DecisionCaller {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::ToolCheck => "tool.check",
+            Self::ExecRun => "exec.run",
+        }
+    }
+}
+
+pub struct DecisionInvocation<'a> {
+    pub token: &'a NamespaceToken,
+    pub actor: &'a str,
+    pub tool: &'a str,
+    pub registered: bool,
+    pub caller: DecisionCaller,
+}
+
+/// Compute and persist one decision for either public caller. Other policy
+/// probes use `decide` directly and do not produce decision receipts.
+pub async fn decide_with_receipt(
+    rt: &KhiveRuntime,
+    invocation: DecisionInvocation<'_>,
+    side_effect: Option<&str>,
+    registration: Option<&RegistryPin>,
+) -> Result<Decision, RuntimeError> {
+    // The receipt copies both strings into the namespace event log, so they get
+    // the same credential refusal every other persisted write path applies.
+    let record = invocation.caller.verb();
+    secret_gate::check_at(invocation.actor, record, "actor")?;
+    secret_gate::check_at(invocation.tool, record, "tool")?;
+    let decision = decide(
+        rt,
+        invocation.token.namespace().as_str(),
+        invocation.actor,
+        invocation.tool,
+        side_effect,
+        registration,
+    )
+    .await?;
+    let payload = ToolCheckDecidedPayload {
+        actor: invocation.actor.to_string(),
+        tool: invocation.tool.to_string(),
+        registered: invocation.registered,
+        decision: decision.decision.clone(),
+        source: decision.source.clone(),
+        id: decision
+            .grant_id
+            .clone()
+            .or_else(|| decision.policy_id.clone()),
+        scope: None,
+        caller_verb: invocation.caller.verb().to_string(),
+    };
+    let event = khive_storage::Event::new(
+        invocation.token.namespace().as_str(),
+        "tool.check",
+        EventKind::ToolCheckDecided,
+        SubstrateKind::Event,
+        actor_label(invocation.token),
+    )
+    .with_payload(json!(payload));
+    rt.events(invocation.token)?.append_event(event).await?;
+    Ok(decision)
 }
 
 /// Resolution order: an active grant allows; otherwise the most specific
