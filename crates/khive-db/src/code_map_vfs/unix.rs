@@ -62,9 +62,13 @@ fn regular_observation(stat: &libc::stat) -> io::Result<Observed> {
             "code-map member has no directory link",
         ));
     }
+    // nlink_t is u16 on macOS and u64 on Linux, so the widening is a no-op on
+    // one of them.
+    #[allow(clippy::useless_conversion)]
+    let links = u64::from(stat.st_nlink);
     Ok(Observed {
         identity: identity(stat),
-        links: u64::from(stat.st_nlink),
+        links,
     })
 }
 

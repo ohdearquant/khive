@@ -608,7 +608,7 @@ impl PinnedParent {
                 std::ptr::null(),
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-                std::ptr::null(),
+                std::ptr::null_mut(),
             )
         };
         if root_handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
