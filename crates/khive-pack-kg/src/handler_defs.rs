@@ -540,7 +540,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         name: "stats",
         description: "Return aggregate KG substrate counts (entities, edges, notes). This verb does not accept `include_deleted`; counts cover \
                       live rows across caller-visible namespaces; count_scope repeats this scope \
-                      in the response. Includes an \
+                      in the response. When grouped entity reporting is available, entities_by_type is an optional \
+                      array of nullable entity_type/count pairs, with null first and counts summing to entities; \
+                      unavailable reporting omits it. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
                       know the true per-relation population before sampling, and an \
                       edges_by_endpoint_base breakdown (entity_entity, entity_note, note_entity, \

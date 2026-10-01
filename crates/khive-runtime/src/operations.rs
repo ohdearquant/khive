@@ -11,6 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
+use khive_storage::entity::EntityTypeCounts;
 use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::note::Note;
 use khive_storage::types::{
@@ -52,6 +53,56 @@ fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) ->
         ("merged_into", kept_id.to_string()),
     ]))
     .into()
+}
+
+/// The entity total and optional type report consumed together by `stats`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EntityStatsCounts {
+    pub entities: u64,
+    pub entities_by_type: Option<EntityTypeCounts>,
+}
+
+/// Count caller-visible live entities through one store. A supported breakdown
+/// supplies its own scalar total; only an unavailable report uses legacy counting.
+pub async fn entity_stats_counts(
+    store: &dyn khive_storage::EntityStore,
+    token: &NamespaceToken,
+) -> RuntimeResult<EntityStatsCounts> {
+    let namespaces: Vec<String> = token
+        .visible_namespaces()
+        .iter()
+        .map(|namespace| namespace.as_str().to_owned())
+        .collect();
+    match store.count_entities_by_type(&namespaces).await? {
+        Some(groups) => {
+            let entities = groups.iter().try_fold(0_u64, |total, (_, count)| {
+                total.checked_add(*count).ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "entity type counts exceed the scalar count range".into(),
+                    )
+                })
+            })?;
+            Ok(EntityStatsCounts {
+                entities,
+                entities_by_type: Some(groups),
+            })
+        }
+        None => {
+            let entities = store
+                .count_entities(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        namespaces,
+                        ..EntityFilter::default()
+                    },
+                )
+                .await?;
+            Ok(EntityStatsCounts {
+                entities,
+                entities_by_type: None,
+            })
+        }
+    }
 }
 
 /// Inputs for a store-owned entity identity. Unlike ordinary creation, a
@@ -6725,6 +6776,14 @@ impl KhiveRuntime {
             .entities(token)?
             .count_entities(token.namespace().as_str(), filter)
             .await?)
+    }
+
+    /// Return the coupled entity total and optional type counts for `stats`.
+    pub async fn entity_stats_counts(
+        &self,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<EntityStatsCounts> {
+        entity_stats_counts(self.entities(token)?.as_ref(), token).await
     }
 
     // ---- Edge CRUD operations ----
