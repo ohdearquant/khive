@@ -1503,7 +1503,7 @@ the census, and each one is listed in a follow-up issue.
 
 ## Amendment 6 (2026-09-30): fixed sets of literal property paths
 
-**Status**: Proposed.
+**Status**: Accepted (2026-10-01).
 
 Originating issue(s): #3629, #2057
 
