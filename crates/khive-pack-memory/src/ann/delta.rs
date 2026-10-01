@@ -26,6 +26,13 @@ const MIN_COMPACTION_OPS: usize = 5_000;
 // The retired chain is removed by following its links, so this budget bounds
 // only the sweep for crash leftovers (unpublished chunks and staging files).
 const ORPHAN_SCAN_BUDGET: usize = MIN_COMPACTION_OPS * 2;
+// Longest retired chain the cleanup walk will follow. The writer publishes one
+// chunk per checkpoint, each carrying at least one raw operation, and stops
+// publishing once the cumulative raw count reaches `compaction_limit`, so a
+// chain is shorter than that limit: under 5,000 chunks at the minimum policy,
+// and under 100,000 for a base of up to one million vectors. A longer chain is
+// left to the orphan sweep rather than collected in memory.
+const MAX_RETIRED_CHAIN: usize = 100_000;
 
 #[derive(Clone)]
 pub(super) struct DeltaBatch {
@@ -421,8 +428,14 @@ pub(super) fn write(dir: &Path, bridge: &AnnBridge) -> Result<DeltaPublication, 
 /// Chunk names on the chain HEAD currently names, newest first. Following the
 /// `previous` links costs one short read per chunk, independent of how many
 /// other entries the directory holds. The walk is best effort: it stops at a
-/// missing or malformed link and leaves the rest to the orphan sweep.
+/// missing or malformed link, at a link that revisits a chunk already on the
+/// walk, and after `MAX_RETIRED_CHAIN` chunks, and leaves the rest to the
+/// orphan sweep.
 fn retired_chain(dir: &Path) -> Vec<String> {
+    retired_chain_within(dir, MAX_RETIRED_CHAIN)
+}
+
+fn retired_chain_within(dir: &Path, max_chunks: usize) -> Vec<String> {
     let reader = match AuxiliarySidecarReader::open(dir) {
         Ok(reader) => reader,
         Err(error) => {
@@ -451,10 +464,27 @@ fn retired_chain(dir: &Path) -> Vec<String> {
     let Ok(raw_count) = read_u64(&head, &mut 72) else {
         return Vec::new();
     };
-    // Every chunk carries at least one raw operation, so HEAD's raw count
-    // bounds the walk even if a link were to loop.
+    // HEAD's checksum proves its integrity, not that its raw count is sane, and
+    // a chunk may link back to one already visited. Every chunk on the walk is
+    // therefore distinct and the walk is capped by `max_chunks` as well as by
+    // HEAD's raw count; neither a looping link nor a huge count can make it
+    // run or grow without bound.
     let mut names = Vec::new();
+    let mut visited = HashSet::new();
     while !nonce.is_nil() && (names.len() as u64) < raw_count {
+        if names.len() >= max_chunks {
+            tracing::warn!(
+                max_chunks,
+                "memory delta retired chain exceeds the walk bound; leaving the rest to the sweep"
+            );
+            break;
+        }
+        if !visited.insert(nonce) {
+            tracing::warn!(
+                "memory delta retired chain revisits a chunk; leaving the rest to the sweep"
+            );
+            break;
+        }
         let name = chunk_name(nonce);
         let link = match reader.read_prefix(&name, CHUNK_LINK_LEN) {
             Ok(Some(link)) => link,
@@ -728,6 +758,88 @@ mod tests {
             .filter(|name| dir.join(name).exists())
             .collect();
         assert!(left.is_empty(), "resumed cleanup must remove {left:?}");
+    }
+
+    /// A checksum-valid HEAD naming `nonce` with an arbitrary raw count.
+    fn head_with_count(nonce: Uuid, raw_count: u64) -> Vec<u8> {
+        let mut head = Vec::with_capacity(HEAD_LEN);
+        head.extend_from_slice(HEAD_MAGIC);
+        head.extend_from_slice(&[7u8; 32]);
+        head.extend_from_slice(nonce.as_bytes());
+        head.extend_from_slice(&1u64.to_le_bytes());
+        head.extend_from_slice(&2u64.to_le_bytes());
+        head.extend_from_slice(&raw_count.to_le_bytes());
+        let hash = checksum(&head, &[]);
+        head.extend_from_slice(&hash);
+        head
+    }
+
+    fn write_chunk_linking(dir: &Path, nonce: Uuid, previous: Uuid) {
+        let batch = DeltaBatch {
+            applied_seq: 2,
+            raw_count: 1,
+            ops: vec![(Uuid::new_v4(), None)],
+        };
+        fs::write(
+            dir.join(chunk_name(nonce)),
+            encode_chunk(&[7u8; 32], nonce, previous, &batch),
+        )
+        .expect("write linked chunk");
+    }
+
+    #[test]
+    fn retired_chain_stops_at_a_chunk_linked_to_itself() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let only = Uuid::from_u128(1);
+        write_chunk_linking(dir, only, only);
+        fs::write(dir.join(HEAD_FILE), head_with_count(only, u64::MAX)).expect("write HEAD");
+
+        assert_eq!(
+            retired_chain(dir),
+            vec![chunk_name(only)],
+            "a self-linked chunk is collected once and the walk ends"
+        );
+    }
+
+    #[test]
+    fn retired_chain_stops_when_two_chunks_link_to_each_other() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let (first, second) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        write_chunk_linking(dir, first, second);
+        write_chunk_linking(dir, second, first);
+        fs::write(dir.join(HEAD_FILE), head_with_count(first, u64::MAX)).expect("write HEAD");
+
+        assert_eq!(
+            retired_chain(dir),
+            vec![chunk_name(first), chunk_name(second)],
+            "each chunk of a cycle is collected once"
+        );
+    }
+
+    #[test]
+    fn retired_chain_returns_every_chunk_newest_first() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut expected = retired_six_chunk_chain(dir);
+        expected.reverse();
+
+        assert_eq!(retired_chain(dir), expected);
+    }
+
+    #[test]
+    fn retired_chain_stops_at_the_walk_bound() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut newest_first = retired_six_chunk_chain(dir);
+        newest_first.reverse();
+
+        assert_eq!(
+            retired_chain_within(dir, 3),
+            newest_first[..3].to_vec(),
+            "only the newest chunks within the bound are collected"
+        );
     }
 
     #[test]
