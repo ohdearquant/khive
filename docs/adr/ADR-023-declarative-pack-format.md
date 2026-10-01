@@ -995,3 +995,30 @@ A successful correction and its provenance must commit with the repair audit,
 or the row transaction must roll back. Inputs and SQL bindings are prepared
 outside the writer scope described in ADR-091 Amendment 20. This exception does
 not relax dispatch-by-kind or KindHook requirements for other operations.
+
+## Amendment: optional stats entity-type breakdown (2026-09-30)
+
+**Status: Accepted (2026-09-30).**
+Existing accepted decisions remain in force.
+
+When the selected entity store reports grouped counts through
+[ADR-005's provided capability](ADR-005-storage-capability-traits.md#amendment-optional-grouped-entity-counts-2026-09-30),
+`stats` adds `entities_by_type`, an array of objects with `entity_type` (JSON null or the exact raw
+string) and `count` (a nonnegative integer). It counts live rows across the caller-visible namespace
+set, under the existing `count_scope`. The null entry occurs exactly once, first, with count zero
+when no live untyped entity exists. Entries for observed non-null types follow in UTF-8 byte order.
+Raw labels are neither reserved nor sentinel-encoded: a real string label remains distinct from null.
+
+The scalar `entities` is the sum of the same grouped result that supplies the breakdown, without a
+second entity count read. An empty supported store therefore reports these entity fields:
+
+```json
+{"entities":0,"entities_by_type":[{"entity_type":null,"count":0}]}
+```
+
+When the provided capability returns `Ok(None)`, `stats` uses its existing scalar entity count path
+and omits `entities_by_type` entirely. Absence means the selected backend did not report grouped
+counts, not zero entities or an empty breakdown. This fallback preserves existing backend behavior;
+it does not turn a storage error into capability absence. Other stats fields retain their existing
+separate reads: the entity total/breakdown pair does not promise a snapshot of the whole response.
+No parameter, verb, taxonomy, or storage schema changes.
