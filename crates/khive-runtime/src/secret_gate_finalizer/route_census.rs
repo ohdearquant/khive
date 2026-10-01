@@ -95,6 +95,11 @@ const UNRESOLVED_CONSTANT: &str = "UNRESOLVED note SQL constant";
 // Evidence prefix for a path that resolves to a note SQL constant.
 const SQL_CONSTANT_EVIDENCE: &str = "SQL constant ";
 
+// Evidence prefix for a statement that writes a guarded table in a spelling the
+// census cannot classify. The census refuses it wherever it occurs, because a
+// spelling it cannot read is a route it cannot inventory.
+const UNCLASSIFIED_SQL: &str = "UNCLASSIFIED guarded-table SQL write";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DetectedClass {
     WholeObject,
@@ -213,51 +218,140 @@ fn literal_string(expr: &Expr) -> Option<String> {
     }
 }
 
-fn sql_target(literal: &str) -> Option<Substrate> {
+/// The guarded table that one word names, if any.
+fn guarded_table(word: &str) -> Option<Substrate> {
+    match word {
+        "ENTITIES" => Some(Substrate::Entity),
+        "NOTES" => Some(Substrate::Note),
+        _ => None,
+    }
+}
+
+/// Find the guarded table at the front of a write target. The flag says whether
+/// it was reached bare or through the `main` or `temp` schema, and the count is
+/// how many words the table and its schema took.
+fn guarded_head(head: &[&str]) -> Option<(Substrate, bool, usize)> {
+    if let Some(target) = head.first().copied().and_then(guarded_table) {
+        return Some((target, true, 1));
+    }
+    let target = head.get(1).copied().and_then(guarded_table)?;
+    Some((target, matches!(head[0], "MAIN" | "TEMP"), 2))
+}
+
+/// What may stand between an UPDATE's table and its SET: an optional alias and
+/// an optional index hint.
+fn update_tail_is_known(tail: &[&str]) -> bool {
+    let rest = match tail {
+        ["AS", _, rest @ ..] => rest,
+        [alias, rest @ ..] if !matches!(*alias, "INDEXED" | "NOT") => rest,
+        rest => rest,
+    };
+    matches!(rest, [] | ["NOT", "INDEXED"] | ["INDEXED", "BY", _])
+}
+
+/// A literal names one substrate, and entities win a tie as they always have.
+fn entity_first(targets: &[Substrate]) -> Option<Substrate> {
+    targets
+        .iter()
+        .copied()
+        .find(|target| *target == Substrate::Entity)
+        .or_else(|| targets.first().copied())
+}
+
+/// Read every insert, replace and update statement in a literal that targets a
+/// guarded table. The first value is the substrate of a statement the census
+/// classifies as a route. The second is the substrate of a statement that
+/// names a guarded table in a spelling the census cannot read: the census must
+/// refuse it, because a write it cannot classify is a route it cannot inventory.
+fn sql_write_shapes(literal: &str) -> (Option<Substrate>, Option<Substrate>) {
     // Match SQL tokens rather than keeping SQL-shaped matcher literals in this
     // census: other source censuses must not mistake those for writer sites.
-    let insert = "INSERT";
-    let update = "UPDATE";
-    let into = "INTO";
-    let or = "OR";
-    let ignore = "IGNORE";
-    let replace = "REPLACE";
-    let set = "SET";
-    let where_token = "WHERE";
-    let properties = "PROPERTIES";
-    let normalized = literal.to_ascii_uppercase();
-    let words = normalized
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+    // Comments are not SQL, so they are dropped before the words are read, and
+    // each parenthesis becomes a word of its own so that a column list is never
+    // read as part of the write target.
+    let spaced = sql_statements(literal)
+        .join(" ")
+        .to_ascii_uppercase()
+        .replace('(', " ( ");
+    let words = spaced
+        .split(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '('
+        })
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
-    for (table, target) in [("ENTITIES", Substrate::Entity), ("NOTES", Substrate::Note)] {
-        let plain_insert = words
-            .windows(3)
-            .any(|window| window[0] == insert && window[1] == into && window[2] == table);
-        let conflict_insert = words.windows(5).any(|window| {
-            window[0] == insert
-                && window[1] == or
-                && (window[2] == ignore || window[2] == replace)
-                && window[3] == into
-                && window[4] == table
-        });
-        let plain_replace = words
-            .windows(3)
-            .any(|window| window[0] == replace && window[1] == into && window[2] == table);
-        let properties_update = words.windows(3).enumerate().any(|(index, window)| {
-            window[0] == update
-                && window[1] == table
-                && window[2] == set
-                && words[index + 3..]
-                    .split(|word| *word == where_token)
-                    .next()
-                    .is_some_and(|set_clause| set_clause.contains(&properties))
-        });
-        if plain_insert || conflict_insert || plain_replace || properties_update {
-            return Some(target);
+    let mut routes = Vec::new();
+    let mut unclassified = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let mut at = index + 1;
+        match *word {
+            // REPLACE only starts a statement when INTO follows it.
+            "INSERT" | "REPLACE" => {
+                if *word == "INSERT" && words.get(at) == Some(&"OR") {
+                    at += 2;
+                }
+                if words.get(at) != Some(&"INTO") {
+                    continue;
+                }
+                let head = words[at + 1..]
+                    .iter()
+                    .copied()
+                    .take_while(|candidate| {
+                        !matches!(*candidate, "(" | "VALUES" | "SELECT" | "DEFAULT" | "WITH")
+                    })
+                    .take(4)
+                    .collect::<Vec<_>>();
+                match guarded_head(&head) {
+                    Some((target, true, _)) => routes.push(target),
+                    _ => unclassified.extend(head.iter().take(2).copied().find_map(guarded_table)),
+                }
+            }
+            "UPDATE" => {
+                if words.get(at) == Some(&"OR") {
+                    at += 2;
+                }
+                let rest = words.get(at..).unwrap_or_default();
+                let Some(set_at) = rest
+                    .iter()
+                    .position(|candidate| matches!(*candidate, "SET" | "("))
+                else {
+                    continue;
+                };
+                if rest[set_at] != "SET" {
+                    continue;
+                }
+                let head = &rest[..set_at];
+                let after_set = &rest[set_at + 1..];
+                // A trigger header names its table after ON, never directly
+                // after UPDATE, and no UPDATE target is longer than a schema,
+                // a table, an alias and an index hint.
+                if matches!(head.first().copied(), Some("ON" | "OF")) || head.len() > 7 {
+                    continue;
+                }
+                match guarded_head(head) {
+                    Some((target, true, used)) if update_tail_is_known(&head[used..]) => {
+                        let set_clause = after_set.split(|candidate| *candidate == "WHERE").next();
+                        if set_clause.is_some_and(|clause| clause.contains(&"PROPERTIES")) {
+                            routes.push(target);
+                        }
+                    }
+                    Some((target, _, _)) if after_set.contains(&"PROPERTIES") => {
+                        unclassified.push(target);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
-    None
+    (entity_first(&routes), entity_first(&unclassified))
+}
+
+fn sql_target(literal: &str) -> Option<Substrate> {
+    sql_write_shapes(literal).0
+}
+
+fn sql_unclassified_write(literal: &str) -> Option<Substrate> {
+    sql_write_shapes(literal).1
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -992,6 +1086,13 @@ impl<'modules> SourceCollector<'modules> {
                 .unwrap_or(DetectedClass::WholeObject);
             self.record(target, class, "SQL literal".into());
         }
+        if let Some(target) = sql_unclassified_write(literal) {
+            self.record(
+                target,
+                DetectedClass::WholeObject,
+                format!("{UNCLASSIFIED_SQL} {literal:?}"),
+            );
+        }
     }
 }
 
@@ -1460,14 +1561,19 @@ fn scan_migration_sources(sources: &[(String, String)]) -> Vec<Site> {
     let mut sites = Vec::new();
     for (path, sql) in sources {
         for (index, statement) in sql_statements(sql).iter().enumerate() {
-            if let Some(target) = sql_target(statement) {
+            let unclassified = sql_unclassified_write(statement);
+            if let Some(target) = sql_target(statement).or(unclassified) {
+                let mut evidence = BTreeSet::<String>::from(["migration SQL".into()]);
+                if unclassified.is_some() {
+                    evidence.insert(format!("{UNCLASSIFIED_SQL} {statement:?}"));
+                }
                 sites.push(Site {
                     key: format!("{path}::statement_{}", index + 1),
                     target,
                     route_class: RouteClass::Migration,
                     class: DetectedClass::WholeObject,
                     calls: BTreeSet::new(),
-                    evidence: BTreeSet::from(["migration SQL".into()]),
+                    evidence,
                 });
             }
         }
@@ -1924,6 +2030,16 @@ fn check_inventory(
         {
             failures.push(format!(
                 "{}: cannot tell whether this site reaches a note SQL constant ({evidence})",
+                site.key
+            ));
+        }
+        for evidence in site
+            .evidence
+            .iter()
+            .filter(|evidence| evidence.starts_with(UNCLASSIFIED_SQL))
+        {
+            failures.push(format!(
+                "{}: cannot classify this write to a guarded table ({evidence})",
                 site.key
             ));
         }
@@ -3237,6 +3353,192 @@ fn conservative_whole_object_rows_still_require_their_named_check() {
         };
         assert!(check_inventory(&sites, &[by_construction], 0).unwrap_err()
             .contains("whole-object write lacks its named check/callee"));
+    }
+}
+
+#[test]
+fn every_spelling_of_a_guarded_table_write_is_reported() {
+    for (sql, target) in [
+        (
+            "UPDATE main.notes SET properties = ?1 WHERE id = ?2",
+            Substrate::Note,
+        ),
+        (
+            "UPDATE temp.entities SET properties = ?1 WHERE id = ?2",
+            Substrate::Entity,
+        ),
+        (
+            "UPDATE OR IGNORE notes SET properties = ?1 WHERE id = ?2",
+            Substrate::Note,
+        ),
+        (
+            "UPDATE OR ABORT entities SET properties = ?1 WHERE id = ?2",
+            Substrate::Entity,
+        ),
+        (
+            "INSERT OR ABORT INTO notes (id, properties) VALUES (?1, ?2)",
+            Substrate::Note,
+        ),
+        (
+            "INSERT OR FAIL INTO entities (id, properties) VALUES (?1, ?2)",
+            Substrate::Entity,
+        ),
+        (
+            "INSERT OR ROLLBACK INTO notes (id, properties) VALUES (?1, ?2)",
+            Substrate::Note,
+        ),
+        (
+            "UPDATE notes AS n SET properties = ?1 WHERE n.id = ?2",
+            Substrate::Note,
+        ),
+        (
+            "UPDATE notes INDEXED BY idx SET properties = ?1 WHERE id = ?2",
+            Substrate::Note,
+        ),
+        (
+            "UPDATE /* c */ notes SET properties = ?1 WHERE id = ?2",
+            Substrate::Note,
+        ),
+        (
+            "INSERT INTO main.entities (id, properties) VALUES (?1, ?2)",
+            Substrate::Entity,
+        ),
+    ] {
+        assert_eq!(sql_target(sql), Some(target), "{sql}");
+        assert_eq!(sql_unclassified_write(sql), None, "{sql}");
+        let sites = synthetic_sql_sites(sql);
+        assert_eq!(sites.len(), 1, "{sql}: {sites:?}");
+        assert_eq!(sites[0].target, target, "{sql}");
+        assert!(
+            check_inventory(&sites, &[], 0)
+                .unwrap_err()
+                .contains("unmapped sample/src/lib.rs::write"),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_guarded_table_write_the_census_cannot_classify_is_refused() {
+    for (sql, target) in [
+        (
+            "UPDATE other.notes SET properties = ?1 WHERE id = ?2",
+            Substrate::Note,
+        ),
+        (
+            "UPDATE notes mystery tail SET properties = ?1 WHERE id = ?2",
+            Substrate::Note,
+        ),
+        (
+            "INSERT INTO other.entities (id, properties) VALUES (?1, ?2)",
+            Substrate::Entity,
+        ),
+        (
+            "INSERT OR REPLACE INTO other.notes (id, properties) VALUES (?1, ?2)",
+            Substrate::Note,
+        ),
+    ] {
+        assert_eq!(sql_target(sql), None, "{sql}");
+        assert_eq!(sql_unclassified_write(sql), Some(target), "{sql}");
+        let sites = synthetic_sql_sites(sql);
+        assert_eq!(sites.len(), 1, "{sql}: {sites:?}");
+        assert_eq!(sites[0].target, target, "{sql}");
+        let failure = check_inventory(&sites, &[], 0).unwrap_err();
+        assert!(
+            failure.contains(
+                "sample/src/lib.rs::write: cannot classify this write to a guarded table"
+            ),
+            "{sql}: {failure}"
+        );
+        assert!(failure.contains(&format!("{sql:?}")), "{sql}: {failure}");
+    }
+
+    // An inventory row that would otherwise accept the site cannot excuse a
+    // statement the census could not read, while the same write through a
+    // schema the census understands is accepted by that row.
+    let row = RouteInventoryEntry {
+        site: "sample/src/lib.rs::write",
+        ..*ROUTE_INVENTORY
+            .iter()
+            .find(|row| row.id == "pending.outcome")
+            .expect("pending outcome retains whole-object coverage")
+    };
+    let checked = |sql: &str| {
+        let source = format!(
+            "fn write() {{ check_fixed_path_whole_object_snapshot(snapshot); let statement = {sql:?}; }}"
+        );
+        scan_sources(&[("sample/src/lib.rs".into(), source)]).unwrap()
+    };
+    let understood = checked("UPDATE main.notes SET properties = ?1 WHERE id = ?2");
+    assert!(check_inventory(&understood, &[row], 0).is_ok());
+    let unreadable = checked("UPDATE other.notes SET properties = ?1 WHERE id = ?2");
+    let failure = check_inventory(&unreadable, &[row], 0).unwrap_err();
+    assert!(
+        failure.contains("cannot classify this write to a guarded table"),
+        "{failure}"
+    );
+    assert!(!failure.contains("unmapped"), "{failure}");
+}
+
+#[test]
+fn migration_sql_reports_every_guarded_write_spelling() {
+    for (statement, unclassified) in [
+        (
+            "UPDATE main.notes SET properties = '{}' WHERE id = 'fixture'",
+            false,
+        ),
+        (
+            "UPDATE /* c */ notes SET properties = '{}' WHERE id = 'fixture'",
+            false,
+        ),
+        (
+            "UPDATE notes AS n SET properties = '{}' WHERE n.id = 'fixture'",
+            false,
+        ),
+        (
+            "INSERT OR ABORT INTO temp.entities (id, properties) VALUES ('a', '{}')",
+            false,
+        ),
+        (
+            "UPDATE other.notes SET properties = '{}' WHERE id = 'fixture'",
+            true,
+        ),
+    ] {
+        let sites = scan_migration_sources(&[(
+            "khive-db/sql/999-census-fixture.sql".into(),
+            statement.into(),
+        )]);
+        assert_eq!(sites.len(), 1, "{statement}: {sites:?}");
+        assert_eq!(sites[0].route_class, RouteClass::Migration, "{statement}");
+        let failure = check_inventory(&sites, &[], 0).unwrap_err();
+        assert!(
+            failure.contains("unmapped khive-db/sql/999-census-fixture.sql::statement_1"),
+            "{statement}: {failure}"
+        );
+        assert_eq!(
+            failure.contains("cannot classify this write to a guarded table"),
+            unclassified,
+            "{statement}: {failure}"
+        );
+    }
+}
+
+#[test]
+fn guarded_table_statements_that_write_no_properties_are_not_routes() {
+    for sql in [
+        "UPDATE OR IGNORE notes SET key = ?1 WHERE id = ?2 AND namespace = ?3 \
+         AND kind = 'message' AND key IS NULL AND deleted_at IS NULL",
+        "UPDATE OR IGNORE notes SET key = ?1 WHERE id = ?2 AND namespace = ?3 \
+         AND kind = ?4 AND key IS NULL AND deleted_at IS NULL",
+        "UPDATE other.notes SET updated_at = ?1 WHERE id = ?2",
+        "INSERT INTO notes_seq (note_id) VALUES (?1)",
+        "INSERT INTO audit SELECT id FROM notes",
+        "CREATE TRIGGER guard BEFORE UPDATE OF content, properties ON notes \
+         FOR EACH ROW BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    ] {
+        assert_eq!(sql_target(sql), None, "{sql}");
+        assert_eq!(sql_unclassified_write(sql), None, "{sql}");
+        assert!(synthetic_sql_sites(sql).is_empty(), "{sql}");
     }
 }
 
