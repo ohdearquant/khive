@@ -204,14 +204,17 @@ the interleaved compaction test red.
 
 ## Amendment 2 (2026-09-29): sealed receipts and legacy keyed replay
 
-**Status**: Proposed for owner sign-off. This amendment combines the #3619
-visibility-token ruling with the #3549 pre-V45 keyed-replay ruling. It
-supersedes Amendment 1's public version-1 JSON receipt shape, refines its
-missing-receipt result, and narrows its coverage predicate to requested models
-that have a fence in the token. Amendment 1's durable per-model fences,
-zero-model distinction, bounded wait, and one-snapshot coverage proof remain in
-force. The joint cutover below supersedes the original receipt-first,
-fence-second implementation order.
+**Status**: Accepted (2026-10-01). This amendment combines the #3619
+visibility-token ruling with the #3549 pre-V46 (`memory_visibility_receipts`) keyed-replay
+ruling. It supersedes Amendment 1's public version-1 JSON receipt shape, refines its
+missing-receipt result, narrows its coverage predicate to requested models that have a fence in
+the token, and clarifies that the "original" per-model fences Amendment 1 returns on exact keyed
+replay of a moved memory are its current durable fences after the move's transactional updates.
+It also makes a namespace move refuse, with reason `memory_vector_left_behind`, when the move
+would carry a memory's receipt or fence to a target that does not receive that memory's vector
+rows. Amendment 1's durable per-model fences, zero-model distinction, bounded wait, and one-snapshot
+coverage proof remain in force, subject to that clarification. The joint cutover below
+supersedes the original receipt-first, fence-second implementation order.
 
 ### Confidentiality boundary and token contract
 
@@ -331,17 +334,54 @@ Once a key is retired, its ciphertext cannot be decrypted to classify expiry;
 an unknown ID still returns `visibility_key_unavailable`, without extending
 the token's 24-hour acceptance window.
 
+### Namespace moves and stored receipt fences
+
+A namespace move that actually re-writes a memory vector in its destination (a destination
+upsert) updates that model's durable receipt fence to the exact destination upsert sequence,
+captured from the upsert in the same
+move transaction. The receipt follows the note without breaking its composite foreign key.
+Only a vector actually written by that move may refresh its matching existing fence; an
+unrelated destination vector, a later database-wide maximum, or a replay itself cannot supply
+that sequence. The stored model set and explicit zero-model receipt are preserved.
+
+For a moved memory, “original fences” in the keyed replay rule means the current durable
+fences after these transactional move updates. The replay still writes no vector or log row.
+Its token names the destination namespace and proves either the exact destination row in
+its candidate snapshot or a published watermark covering that updated sequence. Before
+publication, a present destination row can prove the exact-tail arm; after log compaction,
+the covering watermark can prove the published arm.
+
+A move refuses, changing nothing, when it would carry a memory visibility receipt or fence into
+a target namespace that does not also receive the vector rows the source namespace holds for
+that memory. The refusal reason is `memory_vector_left_behind`. The rule is keyed on what the
+move carries, not on the shape of the move. ADR-189 specifies that every vector row moves with
+its subject; the move primitive as implemented carries vector rows only when every route names
+one target and reports them as left behind otherwise. Under that implementation a partitioning
+move refuses while the source holds vector rows for a memory note whose receipt or fence the
+move would carry. A single-target move, which carries the vector rows with the receipt, is
+unaffected, and so is a memory note that has no receipt or fence. A move primitive that carries
+each memory's vector rows to the target that receives its receipt does not meet the refusal
+condition. The refusal is decided before any row is written, so the source and every target stay
+as they were. Without it the destination would hold a receipt whose
+fence it can satisfy only through the published arm: a namespace-wide published watermark may
+already cover the original sequence while the vector remains in the source namespace and cannot
+be retrieved from the destination. The refusal keeps Arm A's rule that session recall never
+silently serves an uncovered state true by construction. Relaxing it, for example by returning
+a typed `freshness_unmet` for that model in the destination, needs a later amendment with its
+own proof.
+
 ### Missing durable receipt on exact keyed replay
 
 An exact keyed replay with a complete durable receipt returns its original
 per-model fences sealed as above, including the stored zero-model case. When
 the receipt is absent, the server must distinguish the original write epoch
 using durable provenance independent of that receipt. A row written before
-V45 (including one written under V44 and replayed after migration) has no
+V46 (`memory_visibility_receipts`), including one written under V45
+(`recipient_transport`) and replayed after migration, has no
 recoverable original fence: return terminal, non-retryable
 `freshness_unmet` with typed reason `legacy_receipt_absent`. A row originally
-written under V45 or later whose receipt is transiently unavailable returns
-retryable `freshness_unmet` with a distinct typed reason
+written under V46 (`memory_visibility_receipts`) or later whose receipt is transiently
+unavailable returns retryable `freshness_unmet` with a distinct typed reason
 `receipt_temporarily_unavailable`. Neither case writes a new vector, invents
 a sequence from `MAX(seq)`, or issues a token. Absence of a receipt alone,
 the database's current schema version, and wall-clock age are insufficient
@@ -369,9 +409,23 @@ through migration and replay.
 - Exact keyed replay under the current key proves the original fences with a
   fresh token issue time, without a new vector write or later inferred
   sequence.
-- A V44-written keyed row without a receipt replays terminal with
-  `legacy_receipt_absent`; a V45-written row with a transiently missing
-  receipt remains retryable. A present zero-model receipt is neither case.
+- A V45-written (`recipient_transport`) keyed row without a receipt replays terminal with
+  `legacy_receipt_absent`; a V46-written (`memory_visibility_receipts`) row with a
+  transiently missing receipt remains retryable. A present zero-model receipt is neither case.
+- A keyed memory moves from A to B in a move that carries its vector rows and replays in B
+  without another log append. Its receipt names the exact B upsert written by the move and
+  session recall finds the memory both before ANN consumes that present row and after
+  publication/compaction. A control that removes only the fence refresh must fail this
+  regression; zero-model receipts and unrelated destination vectors retain their existing
+  semantics.
+- A partitioning move whose source holds a vector for a fenced memory note, with the ANN
+  watermark already covering that memory's original write, refuses with
+  `memory_vector_left_behind` and leaves the source and every target unchanged: the note,
+  receipt, fences, and vector rows stay where they were and nothing is appended to the ANN write
+  log. That fixture must fail against a move implementation that carries receipts and fences
+  for every target but moves vector rows only for a single-target move, and a control that
+  removes only the refusal must turn it red. A partitioning move whose source holds vector rows
+  only for memory notes without a receipt or fence is not refused by this rule.
 - A session recall whose requested models include one absent from the token
   succeeds on the token models' coverage alone, applying no wait and no
   `freshness_unmet` entry to the absent model.
