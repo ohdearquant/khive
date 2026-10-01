@@ -1576,6 +1576,5 @@ The terminal-name collision and mixed resolved/unresolved reference controls rem
 obligations. Removing the quarantine inventory repair against the merged source must fail on
 both the new unmapped repair and the obsolete orphan. Real-path replay acceptance must also pass.
 
-This Proposed text, source classification and authored fixtures are not executed acceptance.
-The governing text requires final-head sign-off before dependent implementation merges; stamp
-activation remains subject to the existing finalizer gates.
+Source classification and authored fixtures are not executed acceptance; stamp activation
+remains subject to the existing finalizer gates.
