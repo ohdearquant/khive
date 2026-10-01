@@ -5662,7 +5662,7 @@ mod tests {
     fn named_backend_ceiling_identity_agrees_with_the_opener_resolution() {
         // The named-backend opener resolves from the backend field and the
         // environment snapshot only, never from `wal_ceiling_bytes`. The
-        // fingerprint must therefore also report a disabled ceiling here.
+        // fingerprint must therefore also encode a disabled ceiling here.
         let dir = tempfile::tempdir().expect("named backend ceiling tempdir");
         let config = RuntimeConfig {
             db_path: Some(dir.path().join("main.db")),
@@ -5698,9 +5698,15 @@ mod tests {
         }
         let config_id = crate::server::compute_config_id(&config, Some(&topology));
         let topology_part = &config_id[config_id.find(";backends=[").expect("topology present")..];
-        assert!(
-            !topology_part.contains("wal_ceiling_bytes"),
+        assert_eq!(
+            topology_part.matches(":wal_ceiling_bytes=0").count(),
+            topology.backends.len(),
             "the fingerprint must agree with the opener for named backends; got {topology_part}"
+        );
+        assert_eq!(
+            topology_part.matches("wal_ceiling_bytes=").count(),
+            topology.backends.len(),
+            "no named backend may encode a ceiling its opener does not enable; got {topology_part}"
         );
     }
 

@@ -1122,16 +1122,13 @@ fn format_served_kinds_suffix(served_kinds: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-/// Identity spelling of an effective WAL ceiling: empty when the ceiling is
-/// disabled, so a config without one keeps the byte-identical fingerprint it
-/// had before ceilings existed and stays compatible with a running daemon that
-/// predates them.
+/// Identity spelling of an effective WAL ceiling. The numeric value is always
+/// encoded, zero included: a disabled ceiling is an explicit policy that a
+/// daemon must be able to report, so a client with a disabled ceiling must not
+/// reuse a daemon built before ceilings existed. That daemon fingerprints
+/// differently and the client falls back to local dispatch until it restarts.
 fn wal_ceiling_identity_suffix(effective_bytes: u64) -> String {
-    if effective_bytes == 0 {
-        String::new()
-    } else {
-        format!(":wal_ceiling_bytes={effective_bytes}")
-    }
+    format!(":wal_ceiling_bytes={effective_bytes}")
 }
 
 /// Only the ceiling enforced by a writable SQLite backend participates in
@@ -11578,7 +11575,7 @@ mod tests {
         };
 
         let expected_suffix = format!(
-            ";backends=[main:Sqlite:{}];pack_backends=[kg=main]",
+            ";backends=[main:Sqlite:{}:wal_ceiling_bytes=0];pack_backends=[kg=main]",
             canonical_fingerprint_path(&main_path)
         );
         let config_id = compute_config_id(&runtime, Some(&topology));
@@ -11626,7 +11623,7 @@ mod tests {
         );
         assert_ne!(implicit_zero, implicit_nonzero);
         assert!(implicit_zero.contains(&format!(
-            "backend={:?};outbound=",
+            "backend={:?}:wal_ceiling_bytes=0;outbound=",
             default_runtime.backend_id
         )));
         assert!(implicit_nonzero.contains(&format!(
@@ -11704,23 +11701,27 @@ mod tests {
         let read_only_configured = compute_config_id(&default_runtime, Some(&read_only));
         assert_eq!(read_only_zero, read_only_configured);
         assert!(read_only_configured.contains(&format!(
-            "backend={:?}:read_only;outbound=",
+            "backend={:?}:read_only:wal_ceiling_bytes=0;outbound=",
             default_runtime.backend_id
         )));
-        assert!(read_only_configured.contains("main:Sqlite:"));
-        assert!(!read_only_configured.contains("wal_ceiling_bytes"));
+        assert!(read_only_configured.contains(&format!(
+            "main:Sqlite:{}:read_only:wal_ceiling_bytes=0",
+            canonical_fingerprint_path(&main_path)
+        )));
+        assert!(!read_only_configured.contains("wal_ceiling_bytes=8192"));
     }
 
-    /// A disabled ceiling contributes nothing to daemon identity, so the
-    /// fingerprint is byte-identical to the one computed before ceilings were
-    /// part of it and a still-running daemon of that build stays compatible.
+    /// A disabled ceiling is an explicit policy, so its zero value is part of
+    /// daemon identity for the implicit main backend and for every named
+    /// backend, in both topology spellings.
     #[test]
     #[serial_test::serial(config_ledger)]
-    fn config_id_disabled_wal_ceiling_keeps_prior_fingerprint_encoding() {
+    fn config_id_encodes_disabled_wal_ceiling_for_every_backend() {
         use khive_runtime::{BackendConfig, BackendKind, KhiveConfig, PackConfig};
 
         let dir = tempfile::tempdir().expect("WAL ceiling fingerprint tempdir");
         let main_path = dir.path().join("main.db");
+        let archive_path = dir.path().join("archive.db");
         let runtime = RuntimeConfig {
             db_path: Some(main_path.clone()),
             packs: vec!["kg".to_string()],
@@ -11728,21 +11729,26 @@ mod tests {
             wal_ceiling_configured_bytes: 0,
             ..RuntimeConfig::no_embeddings()
         };
+        let main_backend = format!(
+            "backend={:?}:wal_ceiling_bytes=0;outbound=",
+            runtime.backend_id
+        );
 
         let implicit = compute_config_id(&runtime, None);
         assert!(
-            implicit.contains(&format!("backend={:?};outbound=", runtime.backend_id)),
-            "disabled ceiling must leave the backend component untouched; got {implicit}"
+            implicit.contains(&main_backend),
+            "the implicit main backend must encode a disabled ceiling; got {implicit}"
         );
-        assert!(
-            !implicit.contains("wal_ceiling_bytes"),
-            "disabled ceiling must not appear in the fingerprint; got {implicit}"
+        assert_eq!(
+            implicit.matches("wal_ceiling_bytes=").count(),
+            1,
+            "an implicit topology has exactly one ceiling component; got {implicit}"
         );
 
-        let backend = |name: &str, path: std::path::PathBuf| BackendConfig {
+        let backend = |name: &str, path: Option<std::path::PathBuf>, kind| BackendConfig {
             name: name.to_string(),
-            kind: BackendKind::Sqlite,
-            path: Some(path),
+            kind,
+            path,
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
@@ -11757,33 +11763,144 @@ mod tests {
             },
         )]);
         let legacy = KhiveConfig {
-            backends: vec![backend("main", main_path.clone())],
+            backends: vec![
+                backend("main", Some(main_path.clone()), BackendKind::Sqlite),
+                backend("archive", Some(archive_path.clone()), BackendKind::Sqlite),
+            ],
             packs: packs.clone(),
             ..KhiveConfig::default()
         };
         let legacy_id = compute_config_id(&runtime, Some(&legacy));
+        assert!(legacy_id.contains(&main_backend), "{legacy_id}");
         assert!(
             legacy_id.ends_with(&format!(
-                ";backends=[main:Sqlite:{}];pack_backends=[kg=main]",
-                canonical_fingerprint_path(&main_path)
+                ";backends=[archive:Sqlite:{}:wal_ceiling_bytes=0,\
+                 main:Sqlite:{}:wal_ceiling_bytes=0];pack_backends=[kg=main]",
+                canonical_fingerprint_path(&archive_path),
+                canonical_fingerprint_path(&main_path),
             )),
-            "disabled ceiling must keep the legacy topology spelling; got {legacy_id}"
+            "every named backend must encode a disabled ceiling in topology order; got {legacy_id}"
         );
 
         // A name carrying reserved syntax takes the escaped encoding.
         let escaped = KhiveConfig {
-            backends: vec![backend("ma:in", main_path.clone())],
+            backends: vec![
+                backend("main", Some(main_path.clone()), BackendKind::Sqlite),
+                backend("ma:in", Some(archive_path.clone()), BackendKind::Sqlite),
+            ],
             packs: std::collections::HashMap::new(),
             ..KhiveConfig::default()
         };
         let escaped_id = compute_config_id(&runtime, Some(&escaped));
+        assert!(escaped_id.contains(&main_backend), "{escaped_id}");
         assert!(
-            escaped_id.contains(";backends=[v2|ma%3ain:Sqlite:") && escaped_id.contains(":w]"),
-            "disabled ceiling must keep the escaped topology spelling; got {escaped_id}"
+            escaped_id.contains(";backends=[v2|ma%3ain:Sqlite:"),
+            "a reserved-syntax name must take the escaped topology; got {escaped_id}"
         );
+        assert_eq!(
+            escaped_id.matches(":w:wal_ceiling_bytes=0").count(),
+            2,
+            "each escaped backend row must encode a disabled ceiling; got {escaped_id}"
+        );
+
+        // A backend that enforces no ceiling (memory, read-only) is zero, and
+        // encodes zero rather than being omitted, whatever value was written.
+        let mut memory = backend("main", None, BackendKind::Memory);
+        memory.wal_ceiling_bytes = Some(8192);
+        let mut read_only = backend("archive", Some(archive_path), BackendKind::Sqlite);
+        read_only.read_only = true;
+        read_only.wal_ceiling_bytes = Some(8192);
+        let unenforced = KhiveConfig {
+            backends: vec![memory, read_only],
+            ..KhiveConfig::default()
+        };
+        let unenforced_id = compute_config_id(&runtime, Some(&unenforced));
+        assert!(unenforced_id.contains(&main_backend), "{unenforced_id}");
         assert!(
-            !escaped_id.contains("wal_ceiling_bytes"),
-            "disabled ceiling must not appear in the escaped topology; got {escaped_id}"
+            !unenforced_id.contains("wal_ceiling_bytes=8192"),
+            "a ceiling no backend enforces must not appear; got {unenforced_id}"
+        );
+        assert_eq!(
+            unenforced_id.matches("wal_ceiling_bytes=0").count(),
+            3,
+            "the implicit main and both named rows must encode zero; got {unenforced_id}"
+        );
+    }
+
+    /// A disabled ceiling fingerprints identically whichever way it was
+    /// configured, and differs from any enabled value.
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn config_id_disabled_wal_ceiling_is_independent_of_its_source() {
+        use khive_runtime::{BackendConfig, BackendKind, KhiveConfig, WalCeilingSource};
+
+        let dir = tempfile::tempdir().expect("WAL ceiling fingerprint tempdir");
+        let main_path = dir.path().join("main.db");
+        let default_runtime = RuntimeConfig {
+            db_path: Some(main_path.clone()),
+            packs: vec!["kg".to_string()],
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_env_raw: None,
+            wal_ceiling_source: WalCeilingSource::Default,
+            ..RuntimeConfig::no_embeddings()
+        };
+        let env_zero_runtime = RuntimeConfig {
+            wal_ceiling_env_raw: Some("0".to_string()),
+            wal_ceiling_source: WalCeilingSource::Environment,
+            ..default_runtime.clone()
+        };
+        let env_enabled_runtime = RuntimeConfig {
+            wal_ceiling_bytes: 8192,
+            wal_ceiling_configured_bytes: 8192,
+            wal_ceiling_env_raw: Some("8192".to_string()),
+            wal_ceiling_source: WalCeilingSource::Environment,
+            ..default_runtime.clone()
+        };
+        let topology = |wal_ceiling_bytes| KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                wal_ceiling_bytes,
+                served_kinds: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        // Implicit main backend: default and environment zero agree.
+        let implicit_default = compute_config_id(&default_runtime, None);
+        assert_eq!(implicit_default, compute_config_id(&env_zero_runtime, None));
+        assert_ne!(
+            implicit_default,
+            compute_config_id(&env_enabled_runtime, None)
+        );
+
+        // Named backend: default, environment zero and a backend-field zero
+        // that overrides an enabled environment value all agree.
+        let named_default = compute_config_id(&default_runtime, Some(&topology(None)));
+        assert_eq!(
+            named_default,
+            compute_config_id(&env_zero_runtime, Some(&topology(None)))
+        );
+        assert_eq!(
+            named_default,
+            compute_config_id(&default_runtime, Some(&topology(Some(0))))
+        );
+        assert_eq!(
+            named_default,
+            compute_config_id(&env_enabled_runtime, Some(&topology(Some(0))))
+        );
+        assert_ne!(
+            named_default,
+            compute_config_id(&env_enabled_runtime, Some(&topology(None)))
+        );
+        assert_ne!(
+            named_default,
+            compute_config_id(&default_runtime, Some(&topology(Some(8192))))
         );
     }
 

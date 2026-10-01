@@ -95,7 +95,7 @@ pub enum ConfigError {
     #[error(
         "backends {first_backend:?} and {second_backend:?} name the same database at {} \
          but resolve different WAL ceilings ({first_bytes} and {second_bytes} bytes)",
-        path.display()
+        crate::secret_gate::bounded_masked_log_text(&path.to_string_lossy())
     )]
     WalCeilingAliasConflict {
         first_backend: String,
@@ -4852,6 +4852,27 @@ timezone = ""
             ),
             "expected InvalidDisplayTimezone, got {err:?}"
         );
+    }
+
+    #[test]
+    fn wal_ceiling_alias_conflict_escapes_control_characters_in_the_path() {
+        let error = ConfigError::WalCeilingAliasConflict {
+            first_backend: "main".to_string(),
+            second_backend: "alias".to_string(),
+            path: PathBuf::from("/data/line\nforged entry\x1b[31m/archive.db"),
+            first_bytes: 0,
+            second_bytes: 8192,
+        };
+        let text = error.to_string();
+        assert!(
+            !text.chars().any(|c| c == '\n' || c == '\x1b'),
+            "a configured path must not put raw control characters in the error text; got {text:?}"
+        );
+        assert!(
+            text.contains("line\\u{000a}forged entry\\u{001b}[31m/archive.db"),
+            "control characters must be escaped in place; got {text:?}"
+        );
+        assert!(text.contains("resolve different WAL ceilings (0 and 8192 bytes)"));
     }
     include!("engine_config_backend_batch_tests.rs");
 }
