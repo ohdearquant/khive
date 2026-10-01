@@ -31,7 +31,7 @@ types for proposals, events, and namespace isolation.
 | Module | Path | Purpose |
 |--------|------|---------|
 | `entity` | [src/entity.rs](../src/entity.rs) | Entity, EntityKind (8 closed kinds), Link, PropertyValue |
-| `edge` | [src/edge.rs](../src/edge.rs) | EdgeRelation (15 closed relations), EdgeCategory |
+| `edge` | [src/edge.rs](../src/edge.rs) | EdgeRelation (19 closed relations), EdgeCategory |
 | `note` | [src/note.rs](../src/note.rs) | Note, NoteStatus |
 | `event` | [src/event.rs](../src/event.rs) | Event, EventKind, EventPayload, proposal types |
 | `pack` | [src/pack.rs](../src/pack.rs) | Pack trait, HandlerDef, VerbCategory, endpoint rules |
@@ -86,15 +86,15 @@ types for proposals, events, and namespace isolation.
 
 ### Edge Ontology (ADR-002)
 
-- `EdgeRelation` is a closed enum with exactly 18 canonical relations (16 base
-  per ADR-002, including `links_to` added by ADR-191, + 2 epistemic
-  `supports`/`refutes` added by ADR-055).
+- `EdgeRelation` is a closed enum with exactly 19 canonical relations (17 base
+  per ADR-002, including `links_to` added by ADR-191 and `located_in` added by
+  ADR-196, + 2 epistemic `supports`/`refutes` added by ADR-055).
 - `EdgeRelation::ALL` lists them in ontology-table order.
 - Wire format is snake_case (e.g., `"part_of"`, `"introduced_by"`).
 - `FromStr` accepts canonical snake_case names, hyphen variants, and squashed
   forms (e.g., `"partof"`, `"derivedfrom"`) for ergonomic DSL entry. Squashed
   forms are not stored on the wire.
-- `EdgeCategory` groups the 18 relations into 9 structural categories for query
+- `EdgeCategory` groups the 19 relations into 9 structural categories for query
   planners and UI rendering.
 - Symmetric relations (`competes_with`, `composed_with`) are identified via
   `is_symmetric()`.

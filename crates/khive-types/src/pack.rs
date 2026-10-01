@@ -379,6 +379,21 @@ pub struct NoteKindSpec {
     pub lifecycle: NoteLifecycleSpec,
 }
 
+/// Which registered embedding spaces a note kind writes by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteEmbeddingPolicy {
+    #[default]
+    AllModels,
+    DefaultModel,
+}
+
+/// Pack-owned embedding policy for one declared note kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoteEmbeddingPolicySpec {
+    pub kind: &'static str,
+    pub policy: NoteEmbeddingPolicy,
+}
+
 /// SQLite storage type for a nullable pack-auxiliary column addition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackColumnAffinity {
@@ -495,6 +510,10 @@ pub trait Pack {
     /// these at boot time for introspection and future enforcement.  Defaults
     /// to empty so existing packs compile without changes.
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &[];
+
+    /// Write-time embedding policy for note kinds declared in `NOTE_KINDS`.
+    /// Unlisted kinds retain the all-model default.
+    const NOTE_EMBEDDING_POLICIES: &'static [NoteEmbeddingPolicySpec] = &[];
 
     /// Pack-auxiliary schema plan.
     ///

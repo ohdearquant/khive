@@ -17,6 +17,7 @@
 //! | `KHIVE_EMAIL_MAINTAINER_ADDRESS` | yes | — | Single authorized maintainer address |
 //! | `KHIVE_EMAIL_AUTHSERV_ID` | yes | — | `authserv-id` this deployment trusts in `Authentication-Results` headers (ADR-056 Amendment 2026-07-02) |
 //! | `KHIVE_EMAIL_QUARANTINE_STORE` | no | `true` | Store messages that fail the attribution gate (unattributed) instead of dropping them |
+//! | `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED` | no | `256` | Most live quarantine records that may hold a stored original message; further records are kept without the original and marked. `0` stores no originals |
 //!
 //! ## Auth variables
 //!

@@ -80,6 +80,7 @@ pub(crate) async fn prepare_note_create(
     };
     let mut prepared = prepare_atomic_notes(runtime, vec![spec], options).await?;
     let note = &prepared.notes[0];
+    crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
     let AtomicOpPlan::AddNote(plan) = &mut prepared.plans[0] else {
         return Err(RuntimeError::Internal(
             "expected prepared note creation".into(),

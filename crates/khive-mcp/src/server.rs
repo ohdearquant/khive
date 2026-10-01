@@ -38,7 +38,8 @@ use khive_request::{
 };
 use khive_runtime::daemon::DAEMON_LEXICAL_TIMEOUT_MARKER;
 use khive_runtime::presentation::{
-    prepare_format_value_with_note_content, render_format_with_note_content, NoteContentScope,
+    prepare_format_value_with_note_content, present_with_policy_at,
+    render_format_with_note_content, NoteContentScope, PresentationNow,
 };
 use khive_runtime::{
     present_with_policy, render_format, DispatchError, DomainDisposition,
@@ -1282,11 +1283,19 @@ fn build_verb_catalog(verbs: impl IntoIterator<Item = (String, String, String)>)
 /// rows. Neither loop may run unless that runtime can durably record its
 /// writes. The two decisions stay separate so a future topology can admit
 /// one direction without the other.
+///
+/// Inbound polling also publishes each quarantined message's original bytes
+/// through `blob.put`, so it needs the blob pack's runtime to accept writes as
+/// well. A blob runtime that cannot write would fail that publish on every
+/// poll, hold the cursor, and retry the same message forever; admission
+/// refuses it up front instead, and `inbound_blocked_by_read_only_blob`
+/// records that this was the reason so the refusal can be logged by name.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ChannelLoopAdmission {
     pub(crate) inbound_poll: bool,
     pub(crate) outbound_delivery: bool,
+    pub(crate) inbound_blocked_by_read_only_blob: bool,
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
@@ -1297,14 +1306,22 @@ impl ChannelLoopAdmission {
         Self {
             inbound_poll: comm_loaded && writable,
             outbound_delivery: comm_loaded && writable,
+            inbound_blocked_by_read_only_blob: false,
         }
     }
 
-    pub(crate) fn for_pack_runtimes(comm: Option<&KhiveRuntime>) -> Self {
+    /// `blob` is `None` when the blob pack is not loaded; the poll task's own
+    /// storage readiness check reports that case.
+    pub(crate) fn for_pack_runtimes(
+        comm: Option<&KhiveRuntime>,
+        blob: Option<&KhiveRuntime>,
+    ) -> Self {
         let admitted = comm.is_some_and(|runtime| !runtime.is_read_only());
+        let blob_read_only = blob.is_some_and(KhiveRuntime::is_read_only);
         Self {
-            inbound_poll: admitted,
+            inbound_poll: admitted && !blob_read_only,
             outbound_delivery: admitted,
+            inbound_blocked_by_read_only_blob: admitted && blob_read_only,
         }
     }
 }
@@ -1738,6 +1755,7 @@ impl KhiveMcpServer {
                 .map(str::to_string)
                 .collect(),
         );
+        runtime.install_note_embedding_policies(&registry.all_note_embedding_policies());
         registry.call_register_note_write_validators(&runtime);
         // #2943: install entity-kind update hooks so the generic entity
         // `update` path can re-run a pack's create-time invariant against
@@ -2437,11 +2455,7 @@ impl KhiveMcpServer {
         } else {
             usize::MAX
         };
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_secs()).ok())
-            .unwrap_or(0);
+        let now_unix = PresentationNow::from(chrono::Utc::now());
 
         // Resolve per-op presentation mode: per-op entry overrides batch default.
         let mode_for_op = |i: usize| -> PresentationMode {
@@ -2862,7 +2876,7 @@ impl KhiveMcpServer {
         presentation: PresentationMode,
         presentation_per_op: Option<Vec<Option<PresentationMode>>>,
         context: RunParsedContext<'_>,
-        now_unix: i64,
+        now_unix: PresentationNow,
     ) -> (Value, Vec<(usize, bool)>) {
         let RunParsedContext {
             enforce_response_budget,
@@ -3669,7 +3683,7 @@ fn present_ok_envelope_or_depth_error(
     tool: String,
     mut success: OpSuccess,
     mode: PresentationMode,
-    now_unix: i64,
+    now_unix: impl Into<PresentationNow>,
     policy: VerbPresentationPolicy,
     content_scope: NoteContentScope,
 ) -> Value {
@@ -3678,7 +3692,7 @@ fn present_ok_envelope_or_depth_error(
         return failure_entry(tool, depth_error_payload(""), DomainDisposition::Committed);
     }
     success.result = content_scope.protect(success.result, |value| {
-        present_with_policy(value, mode, now_unix, policy)
+        present_with_policy_at(value, mode, now_unix.into(), policy)
     });
     ok_envelope(tool, success)
 }
@@ -3729,14 +3743,14 @@ fn chain_aggregation_depth_reject(result_obj: Value) -> Result<Value, Value> {
 fn apply_presentation_to_result(
     mut result_obj: Value,
     mode: PresentationMode,
-    now_unix: i64,
+    now_unix: impl Into<PresentationNow>,
     policy: VerbPresentationPolicy,
     content_scope: NoteContentScope,
 ) -> Value {
     if result_obj.get("ok").and_then(Value::as_bool) == Some(true) {
         if let Some(result_field) = result_obj.get("result").cloned() {
             let presented = content_scope.protect(result_field, |value| {
-                present_with_policy(value, mode, now_unix, policy)
+                present_with_policy_at(value, mode, now_unix.into(), policy)
             });
             if let Some(obj) = result_obj.as_object_mut() {
                 obj.insert("result".to_string(), presented);
@@ -3751,22 +3765,8 @@ fn apply_presentation_to_result(
 fn request_read_timeout() -> std::time::Duration {
     static TIMEOUT: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
-        let configured = std::env::var("KHIVE_REQUEST_READ_TIMEOUT_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok());
-        let timeout = configured
-            .filter(|seconds| (1..=3_600).contains(seconds))
-            .map(std::time::Duration::from_secs)
-            .unwrap_or_else(|| {
-                if let Some(invalid) = configured {
-                    tracing::warn!(
-                        invalid,
-                        default = khive_storage::DEFAULT_REQUEST_READ_TIMEOUT_SECS,
-                        "KHIVE_REQUEST_READ_TIMEOUT_SECS must be in [1, 3600]"
-                    );
-                }
-                khive_storage::request_read_timeout_from_env()
-            });
+        // The storage resolver owns the accepted range and warns on a corrected value.
+        let timeout = khive_storage::request_read_timeout_from_env();
         khive_runtime::config_ledger::record_config_locked(
             "KHIVE_REQUEST_READ_TIMEOUT_SECS",
             timeout.as_secs().to_string(),
@@ -9239,6 +9239,7 @@ mod tests {
         .await;
     }
 
+    #[cfg(unix)]
     async fn dispatch_large_result_through_daemon(
         server: &KhiveMcpServer,
         ops: String,
@@ -9687,6 +9688,7 @@ mod tests {
         assert!(envelope["results"][0].get("result_omitted").is_none());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn daemon_dispatch_marks_oversized_read_result_reducible_and_not_retryable() {
@@ -9725,6 +9727,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_dispatch_marks_oversized_side_effecting_assertive_verb_non_retryable_and_executed(
     ) {
@@ -9764,6 +9767,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_dispatch_marks_oversized_write_result_non_retryable_and_executed() {
         let server = large_result_test_server();
@@ -9797,6 +9801,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn daemon_chain_reports_later_write_truthfully_after_earlier_frame_budget_omission() {
         let server = large_result_test_server();
@@ -10587,6 +10592,7 @@ mod tests {
         assert_eq!(omitted["error"]["recoverable"], json!("read_outcome"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
     async fn daemon_batch_keeps_rendered_result_when_compact_result_exceeds_frame() {
@@ -14566,7 +14572,6 @@ mod issue_2537_tests {
         });
         for tool in ["list", "stream.batch"] {
             let policy = server.registry.presentation_policy_for(tool);
-            let expected = if tool == "list" { "3m ago" } else { timestamp };
             let parallel = present_ok_envelope_or_depth_error(
                 tool.into(),
                 OpSuccess::complete(payload.clone()),
@@ -14584,7 +14589,10 @@ mod issue_2537_tests {
                 NoteContentScope::None,
             );
             for result in [parallel, chained] {
-                assert_eq!(result["result"]["results"][0]["updated_at"], expected);
+                assert_eq!(result["result"]["results"][0]["updated_at"], timestamp);
+                assert!(result["result"]["results"][0]
+                    .get("updated_at_relative")
+                    .is_none());
                 assert_eq!(result["result"]["results"][0]["id"], "aabbccdd");
             }
         }
@@ -14658,7 +14666,7 @@ mod issue_2537_tests {
                 VerbPresentationPolicy::StreamBatchReceipts,
                 NoteContentScope::None,
             )["result"]["results"][0]["error"]["details"]["updated_at"],
-            "2026-01-01T00:00"
+            "2026-01-01T00:00:00.123456Z"
         );
         fn nest(n: usize) -> Value {
             let mut v = json!(1);

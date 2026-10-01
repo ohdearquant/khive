@@ -107,6 +107,7 @@ mod tests {
             "comm.read(id=\"x\")",
             "memory.recall(query=\"x\")",
             "search(query=\"x\")",
+            "tool.check(tool=\"x\")",
             "[list(), search(query=\"x\")]",
             "comm.send(to=\"x\", content=\"x\")",
             "[stats(), comm.mark_read(ids=[])]",

@@ -501,6 +501,15 @@ pub(crate) struct PinnedClients {
 }
 
 impl PinnedClients {
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, url: &Url, checked_addr: IpAddr, client: reqwest::Client) {
+        self.clients.lock().unwrap().push_back((
+            url.origin().ascii_serialization(),
+            checked_addr,
+            client,
+        ));
+    }
+
     pub(crate) fn for_checked_address(
         &self,
         url: &Url,
@@ -550,11 +559,9 @@ pub fn pinned_client(host: &str, addr: IpAddr, port: u16) -> Result<reqwest::Cli
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         // run_one_hop owns the absolute request deadline and its refusal code.
-        // A1.2.5: the byte bound is on decompressed bytes — a small
-        // compressed response can expand without limit, so transparent
-        // decompression has to happen before the truncation loop ever sees
-        // a byte count.
-        .gzip(true)
+        // No decompression feature is compiled in and none is requested: the
+        // byte bound counts bytes as received, and run_one_hop refuses any
+        // response that declares a content coding.
         .resolve(host, SocketAddr::new(addr, port))
         .build()
         .map_err(|error| Refusal::new("internal_client_build_failed", error.to_string()))

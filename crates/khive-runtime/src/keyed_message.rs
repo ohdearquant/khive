@@ -41,6 +41,9 @@ pub async fn create_keyed_message_pair(
     }
     let mut prepared =
         prepare_atomic_notes(runtime, specs.into(), AtomicNoteOptions::default()).await?;
+    for note in &prepared.notes {
+        crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
+    }
     let outbound_id = prepared.notes[0].id;
     for (plan, note) in prepared.plans.iter_mut().zip(&prepared.notes) {
         let AtomicOpPlan::AddNote(plan) = plan else {

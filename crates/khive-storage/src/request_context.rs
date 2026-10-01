@@ -11,15 +11,51 @@ use crate::{StorageError, StorageResult};
 /// Default nonzero ceiling for request-owned read work, including compose.
 pub const DEFAULT_REQUEST_READ_TIMEOUT_SECS: u64 = 30;
 
-/// Resolve the operator-visible request-read ceiling. Invalid/zero values fail
-/// closed to the documented nonzero default rather than disabling the guard.
+/// Largest accepted request-read ceiling: one day, so a trusted local batch
+/// (a whole-archive ingest, a long serial model run) can hold one deadline.
+pub const MAX_REQUEST_READ_TIMEOUT_SECS: u64 = 86_400;
+
+/// Resolve the operator-visible request-read ceiling from
+/// `KHIVE_REQUEST_READ_TIMEOUT_SECS`.
+///
+/// Unset uses the default. A value above [`MAX_REQUEST_READ_TIMEOUT_SECS`] is
+/// clamped to it; zero or a non-integer uses the default, so the guard is never
+/// disabled. Either correction logs a warning the first time it is made in a
+/// process, naming the value that was set and the ceiling in force.
 pub fn request_read_timeout_from_env() -> Duration {
-    let seconds = std::env::var("KHIVE_REQUEST_READ_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| (1..=3_600).contains(seconds))
-        .unwrap_or(DEFAULT_REQUEST_READ_TIMEOUT_SECS);
+    let raw = std::env::var("KHIVE_REQUEST_READ_TIMEOUT_SECS").ok();
+    let (seconds, correction) = resolve_request_read_timeout_secs(raw.as_deref());
+    if let Some(correction) = correction {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                value = raw.as_deref().unwrap_or_default(),
+                ceiling_secs = seconds,
+                max_secs = MAX_REQUEST_READ_TIMEOUT_SECS,
+                "KHIVE_REQUEST_READ_TIMEOUT_SECS {correction}"
+            );
+        });
+    }
     Duration::from_secs(seconds)
+}
+
+/// The ceiling in seconds for a raw setting, and the correction applied when
+/// the setting was not used as written.
+fn resolve_request_read_timeout_secs(raw: Option<&str>) -> (u64, Option<&'static str>) {
+    let Some(raw) = raw else {
+        return (DEFAULT_REQUEST_READ_TIMEOUT_SECS, None);
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(seconds) if (1..=MAX_REQUEST_READ_TIMEOUT_SECS).contains(&seconds) => (seconds, None),
+        Ok(seconds) if seconds > MAX_REQUEST_READ_TIMEOUT_SECS => (
+            MAX_REQUEST_READ_TIMEOUT_SECS,
+            Some("is above the maximum; clamped to the maximum"),
+        ),
+        _ => (
+            DEFAULT_REQUEST_READ_TIMEOUT_SECS,
+            Some("is not a whole number of seconds from 1 to the maximum; using the default"),
+        ),
+    }
 }
 
 /// One absolute request deadline represented on async and blocking clocks.
@@ -329,6 +365,26 @@ async fn wait_for_receiver_set(receivers: Arc<[tokio::sync::watch::Receiver<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_ceiling_accepts_up_to_one_day_and_corrects_loudly_past_it() {
+        let cases: [(Option<&str>, u64, bool); 9] = [
+            (None, DEFAULT_REQUEST_READ_TIMEOUT_SECS, false),
+            (Some("1"), 1, false),
+            (Some("3600"), 3_600, false),
+            (Some("7200"), 7_200, false),
+            (Some("86400"), MAX_REQUEST_READ_TIMEOUT_SECS, false),
+            (Some("86401"), MAX_REQUEST_READ_TIMEOUT_SECS, true),
+            (Some("0"), DEFAULT_REQUEST_READ_TIMEOUT_SECS, true),
+            (Some("-5"), DEFAULT_REQUEST_READ_TIMEOUT_SECS, true),
+            (Some("two hours"), DEFAULT_REQUEST_READ_TIMEOUT_SECS, true),
+        ];
+        for (raw, seconds, corrected) in cases {
+            let (got, correction) = resolve_request_read_timeout_secs(raw);
+            assert_eq!(got, seconds, "ceiling for {raw:?}");
+            assert_eq!(correction.is_some(), corrected, "correction for {raw:?}");
+        }
+    }
 
     #[tokio::test]
     async fn nested_scopes_merge_cancellation_sources() {

@@ -1291,6 +1291,10 @@ impl KhiveRuntime {
             changed_fields.push("entity_type");
         }
 
+        // A patch may carry properties from the stored row into the full
+        // replacement. Validate the final object, including that carry.
+        crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
+
         if expected.is_some() && changed_fields.is_empty() {
             return Ok((
                 entity,
@@ -1430,6 +1434,9 @@ impl KhiveRuntime {
         expected_deleted_at: Option<i64>,
         expected_version: Option<i64>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        // This final whole-object replacement must reserve the complete
+        // candidate, even if a future caller bypasses the patch preparer.
+        crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
         let id = entity.id;
         let _ = self.entities(token)?;
         let next_version = entity
@@ -1766,7 +1773,7 @@ impl KhiveRuntime {
         // only the embedding re-insert needs an async step outside it.
         if !dry_run && !embedding_plan.is_empty() {
             match self
-                .reindex_entity_with_plan(token, &updated_entity, &embedding_plan)
+                .reindex_entity_with_plan(token, &updated_entity, &embedding_plan, None)
                 .await
             {
                 Ok(report) => summary.embedding_truncation = report,
@@ -1908,6 +1915,34 @@ impl KhiveRuntime {
         ]
     }
 
+    pub(crate) async fn publish_entity_vector_revision(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+        model_name: &str,
+        vector: &[f32],
+    ) -> RuntimeResult<bool> {
+        self.vectors_for_model(token, model_name)?;
+        let (storage_model, dimensions) = self.vector_model_metadata(model_name)?;
+        if let Some(index) = vector.iter().position(|value| !value.is_finite()) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "non-finite entity vector at index {index}"
+            )));
+        }
+        if vector.len() != dimensions {
+            return Err(RuntimeError::InvalidInput(format!(
+                "entity vector has {} dimensions; expected {dimensions}",
+                vector.len()
+            )));
+        }
+        let table = format!("vec_{}", crate::config::sanitize_key(&storage_model));
+        let statements =
+            Self::entity_vector_insert_statements(&table, entity, &storage_model, vector);
+        #[cfg(test)]
+        race_seam::pause_before_entity_vector_publish().await;
+        self.apply_entity_index_revision(entity, statements).await
+    }
+
     /// Re-upsert FTS5 document and vector(s) for the entity across all registered models.
     ///
     /// Uses `entity.namespace` — the authoritative namespace stored on the record — rather
@@ -1926,7 +1961,18 @@ impl KhiveRuntime {
         entity: &Entity,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         let embedding_plan = EmbeddingModelPlan::capture(self);
-        self.reindex_entity_with_plan(token, entity, &embedding_plan)
+        self.reindex_entity_with_plan(token, entity, &embedding_plan, None)
+            .await
+    }
+
+    pub(crate) async fn reindex_entity_with_precomputed(
+        &self,
+        token: &NamespaceToken,
+        entity: &Entity,
+        mut precomputed: HashMap<String, crate::retrieval::DocumentEmbeddingOutcome>,
+    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
+        let embedding_plan = EmbeddingModelPlan::capture(self);
+        self.reindex_entity_with_plan(token, entity, &embedding_plan, Some(&mut precomputed))
             .await
     }
 
@@ -1935,6 +1981,7 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         entity: &Entity,
         embedding_plan: &EmbeddingModelPlan,
+        mut precomputed: Option<&mut HashMap<String, crate::retrieval::DocumentEmbeddingOutcome>>,
     ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
         // Test-only fault seam: force the post-commit FTS leg to fail after a
         // merge or update has already persisted its entity row.
@@ -1965,75 +2012,30 @@ impl KhiveRuntime {
 
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
         for model_name in embedding_plan.model_names() {
-            match self
-                .embed_document_with_model_outcome_for_token(token, model_name, &embed_body)
-                .await
+            let embedding = match precomputed
+                .as_mut()
+                .and_then(|outcomes| outcomes.remove(model_name))
             {
+                Some(outcome) => Ok(outcome),
+                None => {
+                    self.embed_document_with_model_outcome_for_token(token, model_name, &embed_body)
+                        .await
+                }
+            };
+            match embedding {
                 Ok(outcome) => {
                     report.observe(&outcome);
-                    match self.vectors_for_model(token, model_name) {
-                        Ok(_) => {
-                            if let Some(index) =
-                                outcome.vector.iter().position(|value| !value.is_finite())
-                            {
-                                tracing::warn!(
-                                    model = model_name,
-                                    id = %entity.id,
-                                    index,
-                                    "reindex_entity: non-finite vector, skipping model"
-                                );
-                                continue;
-                            }
-                            let (storage_model, dimensions) = match self
-                                .vector_model_metadata(model_name)
-                            {
-                                Ok(metadata) => metadata,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        model = model_name,
-                                        id = %entity.id,
-                                        "reindex_entity: could not resolve vector model, skipping: {e}"
-                                    );
-                                    continue;
-                                }
-                            };
-                            if outcome.vector.len() != dimensions {
-                                tracing::warn!(
-                                    model = model_name,
-                                    id = %entity.id,
-                                    "reindex_entity: vector dimensions do not match model, skipping"
-                                );
-                                continue;
-                            }
-                            let table =
-                                format!("vec_{}", crate::config::sanitize_key(&storage_model));
-                            let statements = Self::entity_vector_insert_statements(
-                                &table,
-                                entity,
-                                &storage_model,
-                                &outcome.vector,
-                            );
-                            #[cfg(test)]
-                            race_seam::pause_before_entity_vector_publish().await;
-                            match self.apply_entity_index_revision(entity, statements).await {
-                                Ok(true) => {}
-                                Ok(false) => break,
-                                Err(e) => {
-                                    tracing::warn!(
-                                        model = model_name,
-                                        id = %entity.id,
-                                        "reindex_entity: vector insert failed, skipping model: {e}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                model = model_name,
-                                id = %entity.id,
-                                "reindex_entity: could not access vector store for model, skipping: {e}"
-                            );
-                        }
+                    match self
+                        .publish_entity_vector_revision(token, entity, model_name, &outcome.vector)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => tracing::warn!(
+                            model = model_name,
+                            id = %entity.id,
+                            "reindex_entity: vector insert failed, skipping model: {error}"
+                        ),
                     }
                 }
                 Err(e) => {
@@ -2049,9 +2051,10 @@ impl KhiveRuntime {
         Ok(report)
     }
 
-    /// Re-upsert FTS5 document and vector(s) for the note across all registered models.
+    /// Re-upsert FTS5 and kind-eligible vectors, removing excluded-model rows.
     ///
-    /// Best-effort for vectors: mirrors reindex_entity's warn-and-continue policy.
+    /// Excluded-model cleanup is revision-guarded and fail-closed. Embedding
+    /// eligible models remains best-effort like entity reindexing.
     pub(crate) async fn reindex_note(
         &self,
         token: &NamespaceToken,
@@ -2083,7 +2086,77 @@ impl KhiveRuntime {
             return Ok(crate::retrieval::EmbeddingTruncationReport::default());
         }
         let mut report = crate::retrieval::EmbeddingTruncationReport::default();
-        for model_name in embedding_plan.model_names() {
+        let selected_models = self.embedding_models_for_note_kind(&note.kind);
+        // A kind policy can narrow after an earlier revision wrote vectors to
+        // every model. Remove those stale rows from every excluded table in
+        // the captured plan, under the same note-revision fence as FTS writes.
+        for model_name in embedding_plan
+            .model_names()
+            .iter()
+            .filter(|name| !selected_models.contains(*name))
+        {
+            // The vector table is created lazily. A missing table has no old
+            // row to remove, but preparing it also makes the guarded DML safe.
+            self.vectors_for_model(token, model_name)?;
+            let table = format!("vec_{}", crate::config::sanitize_key(model_name));
+            let model_key = table
+                .strip_prefix("vec_")
+                .expect("runtime vector tables use the vec_ prefix");
+            let subject = note.id.to_string();
+            // A selected and an excluded model may sanitize to the same table
+            // key. Check the stored model before touching either row or sidecar.
+            let statements = vec![
+                SqlStatement {
+                    sql: format!(
+                        "INSERT INTO ann_write_log \
+                     (namespace, embedding_model, kind, field, subject_id, op) \
+                     SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+                     FROM {table} WHERE subject_id=?1 AND namespace=?2 AND embedding_model=?3"
+                    ),
+                    params: vec![
+                        SqlValue::Text(subject.clone()),
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("note-reindex-excluded-log-delete".into()),
+                },
+                SqlStatement {
+                    sql: format!(
+                        "DELETE FROM vector_provenance \
+                         WHERE model_key=?1 AND subject_id=?2 \
+                         AND EXISTS (SELECT 1 FROM {table} \
+                                     WHERE subject_id=?2 AND namespace=?3 AND embedding_model=?4)"
+                    ),
+                    params: vec![
+                        SqlValue::Text(model_key.to_string()),
+                        SqlValue::Text(subject.clone()),
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("note-reindex-excluded-provenance-delete".into()),
+                },
+                SqlStatement {
+                    sql: format!(
+                        "DELETE FROM {table} \
+                         WHERE subject_id=?1 AND namespace=?2 AND embedding_model=?3"
+                    ),
+                    params: vec![
+                        SqlValue::Text(subject),
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(model_name.clone()),
+                    ],
+                    label: Some("note-reindex-excluded-vector-delete".into()),
+                },
+            ];
+            if !self.apply_note_index_revision(note, statements).await? {
+                return Ok(report);
+            }
+        }
+        for model_name in embedding_plan
+            .model_names()
+            .iter()
+            .filter(|name| selected_models.contains(*name))
+        {
             match self
                 .embed_document_with_model_outcome_for_token(
                     token,
@@ -2152,6 +2225,15 @@ impl KhiveRuntime {
         mut note: khive_storage::note::Note,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool, bool)> {
+        if note.properties.as_ref().is_some_and(|properties| {
+            properties
+                .as_object()
+                .is_some_and(|map| map.contains_key(crate::secret_gate::RESERVED_WEB_RECEIPT_KEY))
+        }) {
+            return Err(RuntimeError::InvalidInput(
+                "web receipt notes are immutable through generic update".into(),
+            ));
+        }
         // The stored row as read. A no-op answers with this, not with the
         // patched snapshot: the patch may differ from the row in ways the
         // no-op decision ignores (tag order), and nothing was written.
@@ -2322,6 +2404,10 @@ impl KhiveRuntime {
         if let Some(status) = patch.kind_status {
             note.status = status;
         }
+
+        // The whole-note CAS persists the merged properties, including keys
+        // carried from the snapshot when the patch changes another field.
+        crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
 
         // JSON object key order is not meaningful to callers. Tags are also
         // set-like in every existing note reader, so their order is ignored
@@ -2542,7 +2628,7 @@ impl KhiveRuntime {
     /// Non-wire outbox scan for the channel delivery loops.
     ///
     /// Fetches live `message` notes matching the SQL-side pending predicate
-    /// newest-first (`created_at DESC, id ASC`), bounded by an internal scan
+    /// newest-first (`created_at DESC, id ASC`), bounded by an internal page
     /// cap. Direction, `delivered_at`, terminal `delivery` state, the optional
     /// `to_actor` channel prefix, and `next_attempt_at` are filtered by SQLite
     /// before the page bound. Pending means `delivered_at`
@@ -2553,12 +2639,10 @@ impl KhiveRuntime {
     ///
     /// The channel prefix has to be in the statement, not applied to the
     /// fetched page: every actor-to-actor outbound row matches the pending
-    /// predicate forever (nothing marks those delivered), so that population
-    /// outgrows any scan cap and a page-then-filter scan never reaches a
-    /// channel's rows once enough other rows sort ahead of them. The prefix
-    /// renders as an index range served by
-    /// `idx_comm_message_outbound_recipient`, and the newest-first order
-    /// means due rows are returned in the same order as the prior scan.
+    /// predicate forever (nothing marks those delivered). A full `name:`
+    /// channel prefix also supplies an indexed bucket equality, followed by
+    /// an indexed deadline bound; arbitrary partial prefixes retain the
+    /// recipient range. The final newest-first sort preserves delivery order.
     /// This lives on the runtime rather than going through the wire registry
     /// for the same reason as
     /// [`Self::claim_outbound_message_external_id`]: the delivery loop must
@@ -2628,7 +2712,7 @@ impl KhiveRuntime {
         limit: u32,
         slug_filter: OutboxSlugFilter<'_>,
     ) -> RuntimeResult<Vec<khive_storage::note::Note>> {
-        const MAX_SCAN_TOTAL: u32 = 10_000;
+        const MAX_PAGE_TOTAL: u32 = 10_000;
         if limit == 0 {
             return Ok(Vec::new());
         }
@@ -2670,9 +2754,17 @@ impl KhiveRuntime {
             },
         ];
         if let Some(prefix) = to_prefix {
+            let op = if prefix
+                .strip_suffix(':')
+                .is_some_and(|head| !head.is_empty() && !head.contains(':'))
+            {
+                FilterOp::TextColonPrefixBucketIndexed
+            } else {
+                FilterOp::TextStartsWithIndexed
+            };
             property_filters.push(PropertyFilter {
                 json_path: "$.to_actor".to_string(),
-                op: FilterOp::TextStartsWithIndexed,
+                op,
                 value: SqlValue::Text(prefix.to_string()),
             });
         }
@@ -2700,7 +2792,7 @@ impl KhiveRuntime {
                 token.namespace().as_str(),
                 &filter,
                 PageRequest {
-                    limit: limit.min(MAX_SCAN_TOTAL),
+                    limit: limit.min(MAX_PAGE_TOTAL),
                     offset: 0,
                 },
             )
@@ -2753,6 +2845,7 @@ impl KhiveRuntime {
         let expected_deleted_at = snapshot.deleted_at;
         let id = snapshot.id;
         snapshot.properties = Some(Value::Object(properties));
+        crate::secret_gate::reject_reserved_secret_gate_property(snapshot.properties.as_ref())?;
         snapshot.updated_at = chrono::Utc::now().timestamp_micros().max(
             expected_updated_at.checked_add(1).ok_or_else(|| {
                 RuntimeError::Internal(format!(
@@ -2787,6 +2880,7 @@ impl KhiveRuntime {
         let expected_deleted_at = snapshot.deleted_at;
         let id = snapshot.id;
         snapshot.properties = Some(Value::Object(properties));
+        crate::secret_gate::reject_reserved_secret_gate_property(snapshot.properties.as_ref())?;
         snapshot.updated_at = chrono::Utc::now().timestamp_micros().max(
             expected_updated_at.checked_add(1).ok_or_else(|| {
                 RuntimeError::Internal(format!("note {id} updated_at cannot advance"))
@@ -4712,6 +4806,7 @@ fn merge_note_sql(
     let props_str = merged_props
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let (due_key, due_source) = khive_db::stores::note::note_due_key_values(&merged_props);
 
     // The loop always runs so a dry-run reports a predictive `edges_rewired`
     // count instead of zero (mirrors the entity merge path).
@@ -4930,6 +5025,8 @@ fn merge_note_sql(
                 now,
                 into_note.deleted_at,
                 &into_note.key,
+                &due_key,
+                &due_source,
             ])?;
 
         let fts_map = khive_db::stores::text::rowid_map_table(&fts_table);
@@ -5966,6 +6063,16 @@ mod tests {
                 serde_json::json!({"direction": "outbound", "to_actor": "email:deleted"}),
                 Some(100),
             ),
+            make_note(
+                99,
+                serde_json::json!({"direction": "outbound", "to_actor": "emailx:not-this-channel"}),
+                None,
+            ),
+            make_note(
+                98,
+                serde_json::json!({"direction": "outbound", "to_actor": 42}),
+                None,
+            ),
         ];
         for note in &notes {
             store.upsert_note(note.clone()).await.expect("seed note");
@@ -5997,6 +6104,17 @@ mod tests {
         assert_eq!(
             actual_ids, expected_ids,
             "filtered scan changed answer or order"
+        );
+        let channel_ids: Vec<_> = rt
+            .list_undelivered_outbound_messages_for_channel(&tok, "email:", "primary", true, 200)
+            .await
+            .expect("channel scan succeeds")
+            .into_iter()
+            .map(|note| note.id)
+            .collect();
+        assert_eq!(
+            channel_ids, expected_ids,
+            "legacy channel pass changed answer or order"
         );
     }
 
@@ -6109,6 +6227,15 @@ mod tests {
             hits.iter().map(|note| note.id).collect::<Vec<_>>(),
             vec![due_id],
             "a due row behind {FUTURE_RETRIES} deferred rows remains deliverable"
+        );
+        let channel_hits = rt
+            .list_undelivered_outbound_messages_for_channel(&tok, "email:", "primary", true, 1)
+            .await
+            .expect("channel scan succeeds");
+        assert_eq!(
+            channel_hits.iter().map(|note| note.id).collect::<Vec<_>>(),
+            vec![due_id],
+            "the delivery pass must reach an older due row behind deferred retries"
         );
     }
 
@@ -13610,7 +13737,7 @@ mod tests {
         let embedding_plan = EmbeddingModelPlan::capture(&rt);
         rt.register_embedder(MergeTestVecProvider::new(LATE, DIMS));
 
-        rt.reindex_entity_with_plan(&tok, &entity, &embedding_plan)
+        rt.reindex_entity_with_plan(&tok, &entity, &embedding_plan, None)
             .await
             .expect("reindex entity with captured merge plan");
 
@@ -13683,6 +13810,367 @@ mod tests {
             0,
             "a provider registered after plan capture must not join survivor reindex"
         );
+    }
+
+    #[tokio::test]
+    async fn note_reindex_removes_stale_vectors_from_every_excluded_plan_model() {
+        use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, RuntimeConfig};
+        use khive_storage::types::VectorSearchRequest;
+        use lattice_embed::EmbeddingModel;
+
+        let primary = EmbeddingModel::AllMiniLmL6V2;
+        let primary_name = primary.to_string();
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(primary),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let tok = NamespaceToken::local();
+        rt.register_embedder(MergeTestVecProvider::new(
+            &primary_name,
+            primary.dimensions(),
+        ));
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            rt.register_embedder(MergeTestVecProvider::new(model, 4));
+        }
+
+        let note = Note::new(
+            "local",
+            "message",
+            "message content once indexed everywhere",
+        );
+        rt.notes(&tok)
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        rt.reindex_note(&tok, &note).await.unwrap();
+        for model in [
+            primary_name.as_str(),
+            "excluded-reindex-a",
+            "excluded-reindex-b",
+        ] {
+            assert_eq!(
+                rt.vectors_for_model(&tok, model)
+                    .unwrap()
+                    .count()
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            let hits = rt
+                .vectors_for_model(&tok, model)
+                .unwrap()
+                .search(VectorSearchRequest {
+                    query_vectors: vec![vec![1.0_f32; 4]],
+                    top_k: 10,
+                    namespace: Some("local".into()),
+                    kind: Some(SubstrateKind::Note),
+                    embedding_model: Some(model.into()),
+                    filter: None,
+                    backend_hints: None,
+                })
+                .await
+                .unwrap();
+            assert!(hits.iter().any(|hit| hit.subject_id == note.id));
+        }
+        // Reindex writes raw vectors without a sidecar. Seed historical
+        // provenance with a mismatched namespace: its primary key is only
+        // (model_key, subject_id), so cleanup must not require a namespace match.
+        let mut writer = rt.sql().writer().await.unwrap();
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            let inserted = writer
+                .execute(SqlStatement {
+                    sql: "INSERT INTO vector_provenance \
+                          (model_key, subject_id, namespace, embedding_digest) \
+                          VALUES (?1, ?2, ?3, ?4)"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(crate::config::sanitize_key(model)),
+                        SqlValue::Text(note.id.to_string()),
+                        SqlValue::Text("old-namespace".into()),
+                        SqlValue::Text("0".repeat(64)),
+                    ],
+                    label: Some("test-excluded-reindex-seed-stale-provenance".into()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(inserted, 1);
+        }
+        drop(writer);
+
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }]);
+        let changed = rt
+            .update_note(
+                &tok,
+                note.id,
+                NotePatch {
+                    content: Some("changed message content after policy narrowing".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(changed.content, note.content);
+        assert!(changed.version > note.version);
+        assert_eq!(
+            rt.text_for_notes(&tok)
+                .unwrap()
+                .get_document("local", note.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            changed.content
+        );
+
+        assert_eq!(
+            rt.vectors_for_model(&tok, &primary_name)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1,
+            "eligible default-space vector must survive"
+        );
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            let hits = rt
+                .vectors_for_model(&tok, model)
+                .unwrap()
+                .search(VectorSearchRequest {
+                    query_vectors: vec![vec![1.0_f32; 4]],
+                    top_k: 10,
+                    namespace: Some("local".into()),
+                    kind: Some(SubstrateKind::Note),
+                    embedding_model: Some(model.into()),
+                    filter: None,
+                    backend_hints: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                hits.iter().all(|hit| hit.subject_id != note.id),
+                "named-model search must not return a stale message from {model}"
+            );
+            assert_eq!(
+                rt.vectors_for_model(&tok, model)
+                    .unwrap()
+                    .count()
+                    .await
+                    .unwrap(),
+                0,
+                "reindex must remove a stale row from {model}"
+            );
+        }
+        let mut reader = rt.sql().reader().await.unwrap();
+        let deletes = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM ann_write_log \
+                      WHERE subject_id=?1 AND op='delete' AND \
+                      embedding_model IN ('excluded-reindex-a', 'excluded-reindex-b')"
+                    .into(),
+                params: vec![SqlValue::Text(note.id.to_string())],
+                label: Some("test-excluded-reindex-delete-log".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(deletes, Some(SqlValue::Integer(2))));
+        for model in ["excluded-reindex-a", "excluded-reindex-b"] {
+            let sidecar = reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM vector_provenance \
+                          WHERE model_key=?1 AND subject_id=?2"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(crate::config::sanitize_key(model)),
+                        SqlValue::Text(note.id.to_string()),
+                    ],
+                    label: Some("test-excluded-reindex-sidecar-clear".into()),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(sidecar, Some(SqlValue::Integer(0))));
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_model_key_collision_preserves_default_vector_on_embed_failure() {
+        use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, RuntimeConfig};
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        struct FailingProvider {
+            name: String,
+            dimensions: usize,
+            attempts: Arc<AtomicUsize>,
+        }
+
+        struct FailingService(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl EmbeddingService for FailingService {
+            async fn embed(
+                &self,
+                _texts: &[String],
+                _model: EmbeddingModel,
+            ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(EmbedError::InferenceFailed(
+                    "injected default embed failure".into(),
+                ))
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "failing-default-vector"
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl crate::embedder_registry::EmbedderProvider for FailingProvider {
+            fn name(&self) -> &str {
+                &self.name
+            }
+
+            fn dimensions(&self) -> usize {
+                self.dimensions
+            }
+
+            async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+                Ok(Arc::new(FailingService(Arc::clone(&self.attempts))))
+            }
+        }
+
+        let primary = EmbeddingModel::AllMiniLmL6V2;
+        let primary_name = primary.to_string();
+        let excluded_name = "all.minilm.l6.v2";
+        assert_eq!(
+            crate::config::sanitize_key(&primary_name),
+            crate::config::sanitize_key(excluded_name)
+        );
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(primary),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let tok = NamespaceToken::local();
+        rt.register_embedder(MergeTestVecProvider::new(
+            &primary_name,
+            primary.dimensions(),
+        ));
+        let note = Note::new("local", "message", "message before policy narrowing");
+        rt.notes(&tok)
+            .unwrap()
+            .upsert_note(note.clone())
+            .await
+            .unwrap();
+        rt.reindex_note(&tok, &note).await.unwrap();
+        assert_eq!(
+            rt.vectors_for_model(&tok, &primary_name)
+                .unwrap()
+                .count()
+                .await
+                .unwrap(),
+            1,
+            "fixture must seed the default vector before the failing update"
+        );
+
+        let model_key = crate::config::sanitize_key(&primary_name);
+        let mut writer = rt.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO vector_provenance \
+                      (model_key, subject_id, namespace, embedding_digest) \
+                      VALUES (?1, ?2, ?3, ?4)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(model_key.clone()),
+                    SqlValue::Text(note.id.to_string()),
+                    SqlValue::Text("local".into()),
+                    SqlValue::Text("0".repeat(64)),
+                ],
+                label: Some("test-colliding-excluded-seed-provenance".into()),
+            })
+            .await
+            .unwrap();
+        drop(writer);
+
+        rt.register_embedder(MergeTestVecProvider::new(
+            excluded_name,
+            primary.dimensions(),
+        ));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        rt.register_embedder(FailingProvider {
+            name: primary_name.clone(),
+            dimensions: primary.dimensions(),
+            attempts: Arc::clone(&attempts),
+        });
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }]);
+
+        rt.update_note(
+            &tok,
+            note.id,
+            NotePatch {
+                content: Some("message after policy narrowing".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("best-effort default embed failure does not fail note update");
+        assert!(attempts.load(Ordering::SeqCst) > 0);
+
+        let table = format!("vec_{model_key}");
+        let mut reader = rt.sql().reader().await.unwrap();
+        let retained_model = reader
+            .query_scalar(SqlStatement {
+                sql: format!(
+                    "SELECT embedding_model FROM {table} WHERE subject_id=?1 AND namespace=?2"
+                ),
+                params: vec![
+                    SqlValue::Text(note.id.to_string()),
+                    SqlValue::Text("local".into()),
+                ],
+                label: Some("test-colliding-excluded-default-retained".into()),
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(retained_model.as_ref(), Some(SqlValue::Text(model)) if model == &primary_name),
+            "default vector row was lost or replaced: {retained_model:?}"
+        );
+        let provenance = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM vector_provenance \
+                      WHERE model_key=?1 AND subject_id=?2"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(model_key),
+                    SqlValue::Text(note.id.to_string()),
+                ],
+                label: Some("test-colliding-excluded-provenance-retained".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(provenance, Some(SqlValue::Integer(1))));
     }
 
     /// merge_entity must delete from_id vectors from ALL registered model tables.
@@ -14902,6 +15390,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_property_replacements_refuse_carried_reserved_key() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let token = NamespaceToken::local();
+
+        for owner_path in [false, true] {
+            let mut note = outbound_message_note();
+            note.properties = Some(serde_json::json!({
+                "direction": "outbound",
+                "khive:secret_gate": "exempted:content-sha256-manifest-v1"
+            }));
+            let id = note.id;
+            rt.raw_notes(&token)
+                .unwrap()
+                .upsert_note(note)
+                .await
+                .unwrap();
+            let before = rt
+                .raw_notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let error = if owner_path {
+                rt.claim_outbound_message_external_id(&token, id, "<message@example.com>".into())
+                    .await
+                    .expect_err("owner claim must refuse the carried reserved key")
+            } else {
+                rt.mark_outbound_message_delivered(&token, id, "2026-09-28T00:00:00Z".into(), None)
+                    .await
+                    .expect_err("delivery outcome must refuse the carried reserved key")
+            };
+            assert!(
+                matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("khive:secret_gate")),
+                "unexpected error: {error:?}"
+            );
+            let after = rt
+                .raw_notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn update_entity_rejects_reserved_secret_gate_key() {
         let rt = rt();
         let tok = NamespaceToken::local();
@@ -14943,6 +15484,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unchanged.properties, Some(serde_json::json!({"k": "v"})));
+    }
+
+    #[tokio::test]
+    async fn persist_prepared_entity_update_rejects_reserved_final_object() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "reserved-final-object",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let mut prepared = entity.clone();
+        prepared.properties = Some(reserved_key_props());
+
+        let error = rt
+            .persist_prepared_entity_update(
+                &tok,
+                prepared,
+                false,
+                vec!["properties"],
+                entity.updated_at,
+                entity.deleted_at,
+                None,
+            )
+            .await
+            .expect_err("the persistence boundary must reject a reserved final property");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("khive:secret_gate")),
+            "unexpected error: {error:?}"
+        );
+        let unchanged = rt.get_entity(&tok, entity.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(unchanged).unwrap(),
+            serde_json::to_value(entity).unwrap()
+        );
+        assert!(entity_update_events(&rt, &tok).await.is_empty());
     }
 
     #[tokio::test]

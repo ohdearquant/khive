@@ -540,7 +540,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
         name: "stats",
         description: "Return aggregate KG substrate counts (entities, edges, notes). This verb does not accept `include_deleted`; counts cover \
                       live rows across caller-visible namespaces; count_scope repeats this scope \
-                      in the response. Includes an \
+                      in the response. When grouped entity reporting is available, entities_by_type is an optional \
+                      array of nullable entity_type/count pairs, with null first and counts summing to entities; \
+                      unavailable reporting omits it. Includes an \
                       edges_by_relation breakdown (relation name -> count) so full-graph audits \
                       know the true per-relation population before sampling, and an \
                       edges_by_endpoint_base breakdown (entity_entity, entity_note, note_entity, \
@@ -621,7 +623,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "relation",
                 param_type: "string",
                 required: false,
-                description: "New edge relation (edges only; any of the 18 canonical relations).",
+                description: "New edge relation (edges only; any of the 19 canonical relations).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -930,13 +932,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 // drift and only that test will say so. Pack extensions come from
                 // `KG_EDGE_RULES` in this crate's `pack.rs`. A crate path and an issue
                 // number cannot be acted on by the caller this text is published to.
-                description: "Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | links_to | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
+                description: "Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | links_to | located_in | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
                     Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair between two otherwise-valid endpoints is rejected with InvalidInput, and a missing endpoint returns NotFound — never silently accepted. \
                     Base entity->entity allowlist: \
                     contains: concept->concept, project->project, project->artifact, org->project, org->service. \
                     part_of: concept->concept, project->project, project->org. \
                     instance_of: *->concept (any source kind), service->project. \
                     links_to: document->document. \
+                    located_in: concept->concept. \
                     extends: concept->concept. variant_of: concept->concept, artifact->artifact. \
                     introduced_by: concept->document, concept->person, concept->org, artifact->document, project->document, service->document, document->person, document->org. \
                     derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact, document->document. \
@@ -1525,7 +1528,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                       reader checkout timeouts, active/peak/completed pooled checkouts and maximum \
                       completed hold time; aggregate and class-specific pooled/standalone/writer-task \
                       writer acquisitions, finite-wait pool timeouts, writer-task request failures and \
-                      their unknown-side-effects subset, swallowed best-effort audit \
+                      their unknown-side-effects subset, pool-scoped search_mechanism counters \
+                      (coordinator dispatches by backend and requested kind, plus post-fusion \
+                      note candidate hydration rows), swallowed best-effort audit \
                       append failures, additive audit-batch flush-failure/degraded-row/degraded \
                       counters (present once a runtime audit-batch control is wired; \
                       unavailable with a reason otherwise), build identity, duplicate edge-ID \

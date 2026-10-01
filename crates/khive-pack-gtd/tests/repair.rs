@@ -636,6 +636,44 @@ async fn repair_is_namespace_agnostic_and_retains_first_original_without_touchin
 }
 
 #[tokio::test]
+async fn repair_apply_refuses_a_carried_reserved_property() {
+    let (runtime, registry) = fixture().await;
+    let id = seed(
+        &runtime,
+        Seed {
+            properties: r#"{"status":"archived","archived_at":1772323200000,"khive:secret_gate":{"legacy":true}}"#.into(),
+            ..Seed::default()
+        },
+    )
+    .await;
+    let before = snapshot(&runtime, &id).await;
+
+    let error = registry
+        .dispatch(
+            "gtd.repair",
+            json!({"apply": true, "items": [
+                item(&id, "created_at", json!("0"), json!(CURRENT))
+            ]}),
+        )
+        .await
+        .expect_err("REPAIR_RESERVED_PROPERTY_MUST_REFUSE");
+    assert!(
+        matches!(&error, khive_runtime::RuntimeError::InvalidInput(_)),
+        "expected typed reservation refusal, got {error}"
+    );
+    assert!(error.to_string().contains("khive:secret_gate"), "{error}");
+    assert_eq!(
+        snapshot(&runtime, &id).await,
+        before,
+        "REPAIR_RESERVED_PROPERTY_PRESERVES_ROW"
+    );
+    assert!(
+        audit(&runtime, &id).await.is_empty(),
+        "REPAIR_RESERVED_PROPERTY_APPENDS_NO_AUDIT"
+    );
+}
+
+#[tokio::test]
 async fn repair_audit_failure_rolls_back_the_row_and_preserves_the_storage_error() {
     let (runtime, registry) = fixture().await;
     let earlier = seed(&runtime, Seed::default()).await;

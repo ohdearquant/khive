@@ -65,13 +65,15 @@ For each relationship you identified in the material:
 link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.0>)
 ```
 
-**17 relations** (closed — map to these, don't invent):
+**19 relations** (closed — map to these, don't invent):
 
 | Category       | Relation        | Direction              | When                      |
 | -------------- | --------------- | ---------------------- | ------------------------- |
 | Structure      | `contains`      | parent → child         | System has component      |
 | Structure      | `part_of`       | child → parent         | Inverse of contains       |
 | Structure      | `instance_of`   | specific → general     | X is a case of Y          |
+| Structure      | `links_to`      | document → document    | A document references another |
+| Structure      | `located_in`    | located → location     | Occupies without being a part (finding in an organ) |
 | Derivation     | `extends`       | child → parent         | Builds on, generalizes    |
 | Derivation     | `variant_of`    | variant → original     | Modified version          |
 | Derivation     | `introduced_by` | concept → paper/person/org | First described in    |

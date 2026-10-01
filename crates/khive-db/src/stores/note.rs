@@ -1,5 +1,6 @@
 //! SQL-backed `NoteStore` implementation.
 
+pub mod recipient;
 pub mod transport;
 
 use std::collections::HashSet;
@@ -75,8 +76,8 @@ pub fn note_key_prefix_successor(prefix: &str) -> Option<String> {
 /// `key` is likewise insert-only: updates cannot replace or clear its identity.
 pub const NOTE_UPSERT_SQL: &str = "INSERT INTO notes \
      (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-      properties, created_at, updated_at, deleted_at, key) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+      properties, created_at, updated_at, deleted_at, key, strict_due_key, due_source) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
      ON CONFLICT(id) DO UPDATE SET \
        namespace = excluded.namespace, \
        kind = excluded.kind, \
@@ -87,6 +88,8 @@ pub const NOTE_UPSERT_SQL: &str = "INSERT INTO notes \
        decay_factor = excluded.decay_factor, \
        expires_at = excluded.expires_at, \
        properties = excluded.properties, \
+       strict_due_key = excluded.strict_due_key, \
+       due_source = excluded.due_source, \
        updated_at = excluded.updated_at, \
        deleted_at = excluded.deleted_at";
 
@@ -100,8 +103,8 @@ pub const NOTE_UPSERT_SQL: &str = "INSERT INTO notes \
 /// answer to "did I insert it", which `DO UPDATE` cannot report.
 pub const NOTE_INSERT_IF_ABSENT_SQL: &str = "INSERT INTO notes \
      (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-      properties, created_at, updated_at, deleted_at, key) \
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+      properties, created_at, updated_at, deleted_at, key, strict_due_key, due_source) \
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
      ON CONFLICT(id) DO NOTHING";
 
 /// The exact statement this store's `insert_note_if_absent` issues.
@@ -117,16 +120,33 @@ pub fn note_insert_keyed_statement(note: &Note) -> SqlStatement {
     let mut statement = note_upsert_statement(note);
     statement.sql = "INSERT INTO notes \
         (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-         properties, created_at, updated_at, deleted_at, key) \
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14) \
+         properties, created_at, updated_at, deleted_at, key, strict_due_key, due_source) \
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
         ON CONFLICT(namespace,kind,key) WHERE key IS NOT NULL AND deleted_at IS NULL DO NOTHING"
         .into();
     statement.label = Some("note-keyed-create".into());
     statement
 }
 
+/// Compute a strict, order-preserving deadline key for supported note writers.
+/// Missing, non-text, and malformed values remain NULL and enter the index as
+/// conservative due candidates, where the strict read residual decides.
+pub fn note_due_key_values(
+    properties: &Option<serde_json::Value>,
+) -> (Option<Vec<u8>>, Option<String>) {
+    let source = properties
+        .as_ref()
+        .and_then(|value| value.get("next_attempt_at"))
+        .and_then(|value| value.as_str());
+    match source.and_then(|text| crate::pool::strict_rfc3339_key(text).map(|key| (key, text))) {
+        Some((key, source)) => (Some(key), Some(source.to_string())),
+        None => (None, None),
+    }
+}
+
 /// The exact true UPSERT this store's `upsert_note` issues.
 pub fn note_upsert_statement(note: &Note) -> SqlStatement {
+    let (due_key, due_source) = note_due_key_values(&note.properties);
     let properties_str = note
         .properties
         .as_ref()
@@ -169,6 +189,8 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
                 Some(key) => SqlValue::Text(key.clone()),
                 None => SqlValue::Null,
             },
+            due_key.map_or(SqlValue::Null, SqlValue::Blob),
+            due_source.map_or(SqlValue::Null, SqlValue::Text),
         ],
         label: Some("note-upsert".to_string()),
     }
@@ -185,6 +207,7 @@ pub fn note_replace_if_unchanged_statement(
     expected_updated_at: i64,
     expected_deleted_at: Option<i64>,
 ) -> SqlStatement {
+    let (due_key, due_source) = note_due_key_values(&note.properties);
     let properties_str = note
         .properties
         .as_ref()
@@ -193,7 +216,7 @@ pub fn note_replace_if_unchanged_statement(
         sql: "UPDATE notes SET \
                 namespace = ?1, kind = ?2, status = ?3, name = ?4, content = ?5, \
                 salience = ?6, decay_factor = ?7, expires_at = ?8, properties = ?9, \
-                updated_at = ?10, deleted_at = ?11 \
+                updated_at = ?10, deleted_at = ?11, strict_due_key = ?15, due_source = ?16 \
               WHERE id = ?12 AND updated_at = ?13 AND deleted_at IS ?14 \
                 AND ?10 > updated_at"
             .to_string(),
@@ -233,6 +256,8 @@ pub fn note_replace_if_unchanged_statement(
                 Some(value) => SqlValue::Integer(value),
                 None => SqlValue::Null,
             },
+            due_key.map_or(SqlValue::Null, SqlValue::Blob),
+            due_source.map_or(SqlValue::Null, SqlValue::Text),
         ],
         label: Some("note-replace-if-unchanged".to_string()),
     }
@@ -251,6 +276,7 @@ pub fn note_metadata_replace_if_unchanged_statement(
     statement.sql = "UPDATE notes SET status=?3, name=?4, salience=?6, decay_factor=?7, expires_at=?8, updated_at=?10 \
                      WHERE id=?12 AND updated_at=?13 AND deleted_at IS ?14 AND ?10 > updated_at \
                        AND namespace=?1 AND kind=?2 AND content=?5 AND properties IS ?9 AND deleted_at IS ?11".into();
+    statement.params.truncate(14);
     statement.label = Some("stream-note-metadata-cas".into());
     statement
 }
@@ -267,11 +293,13 @@ pub fn note_update_properties_statement(
     properties: &Option<serde_json::Value>,
     updated_at: i64,
 ) -> SqlStatement {
+    let (due_key, due_source) = note_due_key_values(properties);
     let properties_str = properties
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
     SqlStatement {
-        sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
+        sql: "UPDATE notes SET properties = ?1, updated_at = ?2, \
+              strict_due_key = ?4, due_source = ?5 \
               WHERE id = ?3 AND deleted_at IS NULL"
             .to_string(),
         params: vec![
@@ -281,6 +309,8 @@ pub fn note_update_properties_statement(
             },
             SqlValue::Integer(updated_at),
             SqlValue::Text(id.to_string()),
+            due_key.map_or(SqlValue::Null, SqlValue::Blob),
+            due_source.map_or(SqlValue::Null, SqlValue::Text),
         ],
         label: Some("note-update-properties".to_string()),
     }
@@ -311,10 +341,18 @@ pub fn note_set_property_statement(
         });
     }
     let path = format!("$.{}", serde_json::Value::String(key.to_string()));
+    let updating_due = key == "next_attempt_at";
+    let (due_key, due_source) = if updating_due {
+        note_due_key_values(&Some(serde_json::json!({"next_attempt_at": value})))
+    } else {
+        (None, None)
+    };
     Ok(SqlStatement {
         sql: "UPDATE notes \
               SET properties = json_set(COALESCE(properties, '{}'), ?1, json(?2)), \
-                  updated_at = ?3 \
+                  updated_at = ?3, \
+                  strict_due_key = CASE WHEN ?5 = 1 THEN ?6 ELSE strict_due_key END, \
+                  due_source = CASE WHEN ?5 = 1 THEN ?7 ELSE due_source END \
               WHERE id = ?4 AND deleted_at IS NULL \
                 AND (properties IS NULL OR json_type(properties) = 'object')"
             .to_string(),
@@ -323,6 +361,9 @@ pub fn note_set_property_statement(
             SqlValue::Text(value.to_string()),
             SqlValue::Integer(updated_at),
             SqlValue::Text(id.to_string()),
+            SqlValue::Integer(i64::from(updating_due)),
+            due_key.map_or(SqlValue::Null, SqlValue::Blob),
+            due_source.map_or(SqlValue::Null, SqlValue::Text),
         ],
         label: Some("note-set-property".to_string()),
     })
@@ -628,6 +669,7 @@ fn batch_upsert_notes(
             .properties
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let (due_key, due_source) = note_due_key_values(&note.properties);
 
         match stmt.execute(rusqlite::params![
             id_str,
@@ -644,6 +686,8 @@ fn batch_upsert_notes(
             note.updated_at,
             note.deleted_at,
             note.key,
+            due_key,
+            due_source,
         ]) {
             Ok(_) => {
                 assign_note_seq(conn, &id_str)?;
@@ -768,6 +812,21 @@ fn note_filter_page_order_clause(filter: &NoteFilter) -> String {
                 " ORDER BY {} {dir_str}, id {dir_str}",
                 json_extract_expr(path)
             )
+        }
+        // After ANALYZE, SQLite may choose the creation-order index to fill
+        // LIMIT and scan every future retry. The unary plus preserves the
+        // INTEGER timestamp order while making SQLite sort only due rows
+        // reached through the channel/deadline index.
+        None if filter
+            .property_filters
+            .iter()
+            .any(|property| matches!(&property.op, FilterOp::TextColonPrefixBucketIndexed))
+            && filter
+                .property_filters
+                .iter()
+                .any(|property| matches!(&property.op, FilterOp::Rfc3339LteOrInvalid)) =>
+        {
+            " ORDER BY +created_at DESC, id ASC".to_string()
         }
         // `id ASC` over the primary key is already the stable tiebreak for
         // notes sharing a creation timestamp.
@@ -917,18 +976,19 @@ fn build_note_filter_where(
                     "<="
                 };
                 params.push(Box::new(crate::pool::rfc3339_instant_key(instant)));
-                let key_expr = if matches!(&pf.op, FilterOp::Rfc3339LteOrInvalid) {
-                    format!("khive_rfc3339_strict_key({expr})")
-                } else {
-                    format!("khive_rfc3339_key({expr})")
-                };
                 if matches!(&pf.op, FilterOp::Rfc3339LteOrInvalid) {
+                    // Byte-for-byte match the built-in-only V44 expression
+                    // index. A raw properties edit invalidates due_source and
+                    // enters the empty-key candidate range; the strict read
+                    // residual below rejects its future/malformed distinction.
                     conditions.push(format!(
-                        "({key_expr} IS NULL OR {key_expr} <= ?{})",
-                        params.len()
+                        "CASE WHEN due_source = {expr} \
+                         THEN ifnull(strict_due_key, x'') ELSE x'' END <= ?{n} \
+                         AND ifnull(khive_rfc3339_strict_key({expr}), x'') <= ?{n}",
+                        n = params.len()
                     ));
                 } else {
-                    conditions.push(format!("{key_expr} {op} ?{}", params.len()));
+                    conditions.push(format!("khive_rfc3339_key({expr}) {op} ?{}", params.len()));
                 }
             }
             FilterOp::EqOrMissing => {
@@ -1049,6 +1109,27 @@ fn build_note_filter_where(
                     }
                 }
             }
+            FilterOp::TextColonPrefixBucketIndexed => {
+                let SqlValue::Text(prefix) = &pf.value else {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        "TextColonPrefixBucketIndexed takes a text prefix".into(),
+                    ));
+                };
+                if prefix
+                    .strip_suffix(':')
+                    .is_none_or(|head| head.is_empty() || head.contains(':'))
+                {
+                    return Err(rusqlite::Error::ToSqlConversionFailure(
+                        "TextColonPrefixBucketIndexed requires one trailing colon".into(),
+                    ));
+                }
+                let expr = json_extract_expr(&pf.json_path);
+                params.push(Box::new(prefix.clone()));
+                conditions.push(format!(
+                    "substr({expr}, 1, instr({expr}, ':')) = ?{}",
+                    params.len()
+                ));
+            }
             FilterOp::NotInOrMissing(values) => {
                 let expr = json_extract_expr(&pf.json_path);
                 if values.is_empty() {
@@ -1085,7 +1166,8 @@ fn build_note_filter_where(
                     | FilterOp::JsonTypeNeMissing
                     | FilterOp::In(_)
                     | FilterOp::NotInOrMissing(_)
-                    | FilterOp::TextStartsWithIndexed => {
+                    | FilterOp::TextStartsWithIndexed
+                    | FilterOp::TextColonPrefixBucketIndexed => {
                         unreachable!()
                     }
                     FilterOp::Rfc3339Valid
@@ -1106,7 +1188,57 @@ fn build_note_filter_where(
         conditions.push(format!("created_at >= ?{}", params.len()));
     }
 
+    if let Some(scope) = &filter.mailbox {
+        conditions.push(mailbox_condition(scope, &mut params));
+    }
+
     Ok((format!(" WHERE {}", conditions.join(" AND ")), params))
+}
+
+/// SQL form of the row-level mailbox rule for `message` rows. Every other kind
+/// passes. JSON `null`, a missing key and a missing `properties` blob all read
+/// as "absent", and a non-text routing field never equals the actor id: the
+/// row-level rule reads routing fields as strings, while `json_extract` renders
+/// an array or object as its JSON text, which an actor id can spell.
+fn mailbox_condition(
+    scope: &khive_storage::note::NoteMailboxScope,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+) -> String {
+    params.push(Box::new(scope.actor_id.clone()));
+    let actor = format!("?{}", params.len());
+    let absent = |path: &str| {
+        let ty = json_type_expr(path);
+        format!("({ty} IS NULL OR {ty} = 'null')")
+    };
+    let not_text = |path: &str| format!("ifnull({}, '') != 'text'", json_type_expr(path));
+    let direction = json_extract_expr("$.direction");
+    let text_is_actor = |path: &str| {
+        format!(
+            "({} = 'text' AND {} = {actor})",
+            json_type_expr(path),
+            json_extract_expr(path)
+        )
+    };
+    let to = text_is_actor("$.to_actor");
+    let from = text_is_actor("$.from_actor");
+    let (inbound_legacy, outbound_legacy, unrouted) = if scope.legacy_local {
+        (
+            format!(" OR {}", absent("$.to_actor")),
+            format!(" OR {}", absent("$.from_actor")),
+            format!(
+                " OR ({} AND {} AND {})",
+                absent("$.direction"),
+                not_text("$.from_actor"),
+                not_text("$.to_actor")
+            ),
+        )
+    } else {
+        Default::default()
+    };
+    format!(
+        "(kind != 'message' OR ({direction} = 'inbound' AND ({to}{inbound_legacy})) \
+         OR ({direction} = 'outbound' AND ({from}{outbound_legacy})){unrouted})"
+    )
 }
 
 // ADR-187: match only compiler-emitted equality/IN terms that constrain every
@@ -1310,21 +1442,41 @@ fn execute_filtered_note_property_patch(
     updated_at: i64,
 ) -> Result<usize, rusqlite::Error> {
     let (where_clause, mut params) = build_note_filter_where(namespace, filter)?;
+    let updating_due = json_path == "$.next_attempt_at";
+    let due_source = if updating_due {
+        serde_json::from_str::<serde_json::Value>(value_json)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+    } else {
+        None
+    };
+    let due_key = due_source
+        .as_deref()
+        .and_then(crate::pool::strict_rfc3339_key);
 
     let base = params.len();
     let sql = format!(
         "UPDATE notes SET properties = json_set(COALESCE(properties, '{{}}'), ?{p1}, json(?{p2})), \
-         updated_at = ?{p3} {where_clause} \
+         updated_at = ?{p3}, \
+         strict_due_key = CASE WHEN ?{p5} = 1 THEN ?{p6} ELSE strict_due_key END, \
+         due_source = CASE WHEN ?{p5} = 1 THEN ?{p7} ELSE due_source END \
+         {where_clause} \
          AND (properties IS NULL OR json_type(properties) = 'object') AND id = ?{p4}",
         p1 = base + 1,
         p2 = base + 2,
         p3 = base + 3,
         p4 = base + 4,
+        p5 = base + 5,
+        p6 = base + 6,
+        p7 = base + 7,
     );
     params.push(Box::new(json_path.to_string()));
     params.push(Box::new(value_json.to_string()));
     params.push(Box::new(updated_at));
     params.push(Box::new(id.to_string()));
+    params.push(Box::new(i64::from(updating_due)));
+    params.push(Box::new(due_key));
+    params.push(Box::new(due_source));
 
     let mut stmt = conn.prepare_cached(&sql)?;
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -1615,6 +1767,7 @@ impl NoteStore for SqlNoteStore {
             .properties
             .as_ref()
             .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let (due_key, due_source) = note_due_key_values(&note.properties);
 
         // Capture the durable dedup key for verification after a zero-row insert.
         let ext_id_opt: Option<String> = note
@@ -1643,8 +1796,8 @@ impl NoteStore for SqlNoteStore {
             let rows = conn.execute(
                 "INSERT OR IGNORE INTO notes \
                  (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                  properties, created_at, updated_at, deleted_at, key) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  properties, created_at, updated_at, deleted_at, key, strict_due_key, due_source) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     id_str,
                     namespace,
@@ -1660,6 +1813,8 @@ impl NoteStore for SqlNoteStore {
                     note.updated_at,
                     note.deleted_at,
                     note.key,
+                    due_key,
+                    due_source,
                 ],
             )?;
 

@@ -2,6 +2,136 @@ use super::*;
 use crate::{KhiveRuntime, NamespaceToken};
 use serde_json::json;
 
+fn assert_secret_gate_refusal(error: StorageError) {
+    assert!(
+        matches!(error, StorageError::InvalidInput { ref message, .. }
+            if message.contains("khive:secret_gate")),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn public_note_store_refuses_reserved_property_on_every_whole_object_route() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = NamespaceToken::local();
+    let store = runtime.notes(&token).unwrap();
+    let raw = runtime.raw_notes(&token).unwrap();
+    let mut existing = Note::new("local", "observation", "seeded by privileged store");
+    existing.properties = Some(json!({"khive:secret_gate": "legacy", "safe": 1}));
+    raw.upsert_note(existing.clone()).await.unwrap();
+    let before = raw.get_note(existing.id).await.unwrap().unwrap();
+
+    let mut fresh = Note::new("local", "observation", "new row");
+    fresh.properties = before.properties.clone();
+    assert_secret_gate_refusal(
+        store
+            .insert_note_if_absent(fresh.clone())
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(raw.get_note(fresh.id).await.unwrap(), None);
+    assert_secret_gate_refusal(store.try_insert_note(fresh.clone()).await.unwrap_err());
+    assert_eq!(raw.get_note(fresh.id).await.unwrap(), None);
+
+    let mut replacement = before.clone();
+    replacement.content = "unrelated edit".into();
+    replacement.properties = Some(json!({"safe": 2}));
+    assert_secret_gate_refusal(store.upsert_note(replacement.clone()).await.unwrap_err());
+    assert_secret_gate_refusal(
+        store
+            .replace_note_if_unchanged(replacement.clone(), before.updated_at, before.deleted_at)
+            .await
+            .unwrap_err(),
+    );
+    let ordinary = Note::new("local", "observation", "batch sibling");
+    assert_secret_gate_refusal(
+        store
+            .upsert_notes(vec![ordinary.clone(), replacement])
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(raw.get_note(ordinary.id).await.unwrap(), None);
+    assert_secret_gate_refusal(
+        store
+            .update_note_properties(before.id, Some(json!({"safe": 2})), before.updated_at + 1)
+            .await
+            .unwrap_err(),
+    );
+    assert_secret_gate_refusal(
+        store
+            .set_note_property(before.id, "safe", json!(2), before.updated_at + 1)
+            .await
+            .unwrap_err(),
+    );
+    assert_secret_gate_refusal(
+        store
+            .try_patch_note_property(
+                before.id,
+                "local",
+                &NoteFilter::default(),
+                "$.safe",
+                json!(2),
+                before.updated_at + 1,
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_secret_gate_refusal(
+        store
+            .patch_note_property_atomic(
+                vec![before.id],
+                "local",
+                &NoteFilter::default(),
+                "$.safe",
+                json!(2),
+                before.updated_at + 1,
+            )
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(raw.get_note(before.id).await.unwrap(), Some(before));
+}
+
+#[tokio::test]
+async fn public_note_store_cannot_forge_or_rewrite_web_receipt() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = NamespaceToken::local();
+    let store = runtime.notes(&token).unwrap();
+    let forged = Note::new("local", "observation", "forged").with_properties(json!({
+        "tags": ["web.receipt"],
+        "khive:web_receipt": "v1",
+        "request": {"verb": "web.fetch"},
+    }));
+    assert!(matches!(
+        store.upsert_note(forged).await,
+        Err(StorageError::InvalidInput { .. })
+    ));
+
+    let trusted = runtime
+        .create_web_receipt_note(&token, "web.fetch", json!({"verb": "web.fetch"}), vec![])
+        .await
+        .unwrap();
+    let mut rewritten = trusted.clone();
+    rewritten.properties.as_mut().unwrap()["request"]["verb"] = json!("web.refresh");
+    rewritten.updated_at += 1;
+    assert!(matches!(
+        store.upsert_note(rewritten).await,
+        Err(StorageError::InvalidInput { .. })
+    ));
+    assert!(matches!(
+        store
+            .set_note_property(
+                trusted.id,
+                "request",
+                json!({"verb": "web.refresh"}),
+                trusted.updated_at + 1,
+            )
+            .await,
+        Err(StorageError::InvalidInput { .. })
+    ));
+    assert_eq!(store.get_note(trusted.id).await.unwrap(), Some(trusted));
+}
+
 async fn seed_health(runtime: &KhiveRuntime, deleted: bool) -> Note {
     let token = NamespaceToken::local();
     let mut note = Note::new("local", "channel_health", "heartbeat state");

@@ -86,6 +86,29 @@ fn reject_if_forged_message_note(note: &Note, operation: &'static str) -> Storag
     })
 }
 
+fn has_web_receipt_provenance(note: &Note) -> bool {
+    note.properties.as_ref().is_some_and(|properties| {
+        properties
+            .as_object()
+            .is_some_and(|map| map.contains_key(crate::secret_gate::RESERVED_WEB_RECEIPT_KEY))
+    })
+}
+
+fn web_receipt_write_refused(operation: &'static str) -> StorageError {
+    StorageError::InvalidInput {
+        capability: StorageCapability::Notes,
+        operation: operation.into(),
+        message: "web receipt provenance and its receipt body are web-pack-owned; generic note writes cannot create or alter them".into(),
+    }
+}
+
+fn reject_forged_web_receipt_note(note: &Note, operation: &'static str) -> StorageResult<()> {
+    if has_web_receipt_provenance(note) {
+        return Err(web_receipt_write_refused(operation));
+    }
+    Ok(())
+}
+
 /// The property-patch seams cannot see the note's kind in their signatures,
 /// so they refuse the reserved keys unconditionally: no public-store caller
 /// legitimately patches transport-owned keys on any note kind (quarantine
@@ -144,6 +167,12 @@ fn reject_reserved_replacement_properties(
     properties: Option<&Value>,
     operation: &'static str,
 ) -> StorageResult<()> {
+    if properties
+        .and_then(Value::as_object)
+        .is_some_and(|map| map.contains_key(crate::secret_gate::RESERVED_WEB_RECEIPT_KEY))
+    {
+        return Err(web_receipt_write_refused(operation));
+    }
     let Some(key) = properties
         .and_then(Value::as_object)
         .and_then(transport_owned_message_property_named_in)
@@ -158,6 +187,19 @@ fn reject_reserved_replacement_properties(
              accessor; only the trusted channel-ingest path may establish quarantine disposition \
              and channel provenance"
         ),
+    })
+}
+
+fn reject_reserved_note_properties(
+    properties: Option<&Value>,
+    operation: &'static str,
+) -> StorageResult<()> {
+    crate::secret_gate::reject_reserved_secret_gate_property(properties).map_err(|error| {
+        StorageError::InvalidInput {
+            capability: StorageCapability::Notes,
+            operation: operation.into(),
+            message: error.to_string(),
+        }
     })
 }
 
@@ -196,6 +238,9 @@ fn reject_changed_identity_note(
     note: &Note,
     operation: &'static str,
 ) -> StorageResult<()> {
+    if has_web_receipt_provenance(existing) {
+        return Err(web_receipt_write_refused(operation));
+    }
     if existing.kind != "message"
         && !kind_owned_properties(&existing.kind).is_empty()
         && existing.kind != note.kind
@@ -236,7 +281,36 @@ impl PolicyEnforcingNoteStore {
         operation: &'static str,
     ) -> StorageResult<()> {
         if let Some(existing) = self.inner.get_note_including_deleted(note.id).await? {
+            reject_reserved_note_properties(existing.properties.as_ref(), operation)?;
             reject_changed_identity_note(&existing, note, operation)?;
+        }
+        Ok(())
+    }
+
+    async fn reject_web_receipt_mutation(
+        &self,
+        id: Uuid,
+        operation: &'static str,
+    ) -> StorageResult<()> {
+        if self
+            .inner
+            .get_note_including_deleted(id)
+            .await?
+            .as_ref()
+            .is_some_and(has_web_receipt_provenance)
+        {
+            return Err(web_receipt_write_refused(operation));
+        }
+        Ok(())
+    }
+
+    async fn reject_existing_secret_gate_property(
+        &self,
+        id: Uuid,
+        operation: &'static str,
+    ) -> StorageResult<()> {
+        if let Some(existing) = self.inner.get_note_including_deleted(id).await? {
+            reject_reserved_note_properties(existing.properties.as_ref(), operation)?;
         }
         Ok(())
     }
@@ -267,13 +341,17 @@ impl NoteStore for PolicyEnforcingNoteStore {
     }
 
     async fn upsert_note(&self, note: Note) -> StorageResult<()> {
+        reject_reserved_note_properties(note.properties.as_ref(), "upsert_note")?;
         reject_if_forged_message_note(&note, "upsert_note")?;
+        reject_forged_web_receipt_note(&note, "upsert_note")?;
         self.reject_identity_change(&note, "upsert_note").await?;
         self.inner.upsert_note(note).await
     }
 
     async fn insert_note_if_absent(&self, note: Note) -> StorageResult<bool> {
+        reject_reserved_note_properties(note.properties.as_ref(), "insert_note_if_absent")?;
         reject_if_forged_message_note(&note, "insert_note_if_absent")?;
+        reject_forged_web_receipt_note(&note, "insert_note_if_absent")?;
         self.inner.insert_note_if_absent(note).await
     }
 
@@ -283,7 +361,13 @@ impl NoteStore for PolicyEnforcingNoteStore {
         expected_updated_at: i64,
         expected_deleted_at: Option<i64>,
     ) -> StorageResult<bool> {
+        reject_reserved_note_properties(note.properties.as_ref(), "replace_note_if_unchanged")?;
         reject_if_forged_message_note(&note, "replace_note_if_unchanged")?;
+        if !has_web_receipt_provenance(&note) {
+            self.reject_web_receipt_mutation(note.id, "replace_note_if_unchanged")
+                .await?;
+        }
+        reject_forged_web_receipt_note(&note, "replace_note_if_unchanged")?;
         self.reject_identity_change(&note, "replace_note_if_unchanged")
             .await?;
         self.inner
@@ -293,7 +377,9 @@ impl NoteStore for PolicyEnforcingNoteStore {
 
     async fn upsert_notes(&self, notes: Vec<Note>) -> StorageResult<BatchWriteSummary> {
         for note in &notes {
+            reject_reserved_note_properties(note.properties.as_ref(), "upsert_notes")?;
             reject_if_forged_message_note(note, "upsert_notes")?;
+            reject_forged_web_receipt_note(note, "upsert_notes")?;
         }
         {
             // Validate every row before the batch write. Repeated IDs must also
@@ -329,8 +415,15 @@ impl NoteStore for PolicyEnforcingNoteStore {
         properties: Option<Value>,
         updated_at: i64,
     ) -> StorageResult<bool> {
+        reject_reserved_note_properties(properties.as_ref(), "update_note_properties")?;
         reject_reserved_replacement_properties(properties.as_ref(), "update_note_properties")?;
+        self.reject_web_receipt_mutation(id, "update_note_properties")
+            .await?;
         if let Some(existing) = self.inner.get_note_including_deleted(id).await? {
+            reject_reserved_note_properties(
+                existing.properties.as_ref(),
+                "update_note_properties",
+            )?;
             reject_changed_identity_properties(
                 &existing,
                 properties.as_ref(),
@@ -350,6 +443,10 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<bool> {
         reject_reserved_patch_target(key, "set_note_property")?;
+        self.reject_web_receipt_mutation(id, "set_note_property")
+            .await?;
+        self.reject_existing_secret_gate_property(id, "set_note_property")
+            .await?;
         self.inner
             .set_note_property(id, key, value, updated_at)
             .await
@@ -365,6 +462,10 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<bool> {
         reject_reserved_patch_target(json_path, "try_patch_note_property")?;
+        self.reject_web_receipt_mutation(id, "try_patch_note_property")
+            .await?;
+        self.reject_existing_secret_gate_property(id, "try_patch_note_property")
+            .await?;
         self.inner
             .try_patch_note_property(id, namespace, filter, json_path, value, updated_at)
             .await
@@ -380,6 +481,14 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<()> {
         reject_reserved_patch_target(json_path, "patch_note_property_atomic")?;
+        for id in &ids {
+            self.reject_web_receipt_mutation(*id, "patch_note_property_atomic")
+                .await?;
+        }
+        for id in &ids {
+            self.reject_existing_secret_gate_property(*id, "patch_note_property_atomic")
+                .await?;
+        }
         self.inner
             .patch_note_property_atomic(ids, namespace, filter, json_path, value, updated_at)
             .await
@@ -488,7 +597,9 @@ impl NoteStore for PolicyEnforcingNoteStore {
     }
 
     async fn try_insert_note(&self, note: Note) -> StorageResult<bool> {
+        reject_reserved_note_properties(note.properties.as_ref(), "try_insert_note")?;
         reject_if_forged_message_note(&note, "try_insert_note")?;
+        reject_forged_web_receipt_note(&note, "try_insert_note")?;
         self.inner.try_insert_note(note).await
     }
 

@@ -2,7 +2,9 @@
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
-/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent). See
+/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent).
+/// The builtins-only outbound-due index belongs to a numbered core migration.
+/// Supported writers maintain its strict stored deadline key. See
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.

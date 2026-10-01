@@ -11,6 +11,8 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
+use khive_storage::entity::EntityTypeCounts;
+use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::note::Note;
 use khive_storage::types::{
     DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, EdgeUpsertDisposition,
@@ -51,6 +53,56 @@ fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) ->
         ("merged_into", kept_id.to_string()),
     ]))
     .into()
+}
+
+/// The entity total and optional type report consumed together by `stats`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EntityStatsCounts {
+    pub entities: u64,
+    pub entities_by_type: Option<EntityTypeCounts>,
+}
+
+/// Count caller-visible live entities through one store. A supported breakdown
+/// supplies its own scalar total; only an unavailable report uses legacy counting.
+pub async fn entity_stats_counts(
+    store: &dyn khive_storage::EntityStore,
+    token: &NamespaceToken,
+) -> RuntimeResult<EntityStatsCounts> {
+    let namespaces: Vec<String> = token
+        .visible_namespaces()
+        .iter()
+        .map(|namespace| namespace.as_str().to_owned())
+        .collect();
+    match store.count_entities_by_type(&namespaces).await? {
+        Some(groups) => {
+            let entities = groups.iter().try_fold(0_u64, |total, (_, count)| {
+                total.checked_add(*count).ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "entity type counts exceed the scalar count range".into(),
+                    )
+                })
+            })?;
+            Ok(EntityStatsCounts {
+                entities,
+                entities_by_type: Some(groups),
+            })
+        }
+        None => {
+            let entities = store
+                .count_entities(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        namespaces,
+                        ..EntityFilter::default()
+                    },
+                )
+                .await?;
+            Ok(EntityStatsCounts {
+                entities,
+                entities_by_type: None,
+            })
+        }
+    }
 }
 
 /// Inputs for a store-owned entity identity. Unlike ordinary creation, a
@@ -1065,6 +1117,11 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     // depends_on); the endpoint pair is intentionally narrow (document only,
     // no service/concept targets — see ADR-191 D2/F10).
     ("document", EdgeRelation::LinksTo, "document"),
+    // ADR-002 amendment (ADR-196): location — the source occupies, or is
+    // manifested in, the target without being a constituent of it. The base
+    // contract is one row; packs and Subjects narrow it with typed endpoint
+    // rules for their own subtypes.
+    ("concept", EdgeRelation::LocatedIn, "concept"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -3365,17 +3422,55 @@ impl KhiveRuntime {
         kind: &str,
         tag: &str,
     ) -> RuntimeResult<Option<Uuid>> {
+        self.latest_annotating_note_inner(token, node_id, kind, tag, None)
+            .await
+    }
+
+    /// Select a latest annotation only after its exact top-level string
+    /// property has been checked by the bound store.
+    pub async fn latest_annotating_note_with_property(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        property_key: &str,
+        property_value: &str,
+    ) -> RuntimeResult<Option<Uuid>> {
+        self.latest_annotating_note_inner(
+            token,
+            node_id,
+            kind,
+            tag,
+            Some((property_key, property_value)),
+        )
+        .await
+    }
+
+    async fn latest_annotating_note_inner(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        required_property: Option<(&str, &str)>,
+    ) -> RuntimeResult<Option<Uuid>> {
         if !self.substrate_exists_in_ns(token, node_id).await? {
             return Ok(None);
         }
         let mut latest: Option<(Uuid, i64)> = None;
         for namespace in token.visible_namespaces() {
             let scoped = NamespaceToken::for_namespace(namespace.clone());
-            if let Some(candidate) = self
-                .graph(&scoped)?
-                .latest_annotating_note(node_id, kind, tag)
-                .await?
-            {
+            let graph = self.graph(&scoped)?;
+            let candidate = match required_property {
+                Some((key, value)) => {
+                    graph
+                        .latest_annotating_note_with_property(node_id, kind, tag, key, value)
+                        .await?
+                }
+                None => graph.latest_annotating_note(node_id, kind, tag).await?,
+            };
+            if let Some(candidate) = candidate {
                 if latest.is_none_or(|(id, created_at)| {
                     candidate.1 > created_at || (candidate.1 == created_at && candidate.0 < id)
                 }) {
@@ -3939,9 +4034,43 @@ impl KhiveRuntime {
         let (note, _, degradations) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
+                false,
             )
             .await?;
         legacy_post_commit_result("create_note", note.id, note, degradations)
+    }
+
+    /// Publish a network receipt with provenance that generic note writes
+    /// cannot supply. The web pack provides only the request record and the
+    /// annotation targets; this entry point fixes the note kind, tag, and
+    /// provenance before the first storage write.
+    pub async fn create_web_receipt_note(
+        &self,
+        token: &NamespaceToken,
+        summary: &str,
+        request: serde_json::Value,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<Note> {
+        let properties = serde_json::json!({
+            "tags": ["web.receipt"],
+            "request": request,
+        });
+        let (note, _, degradations) = self
+            .create_note_inner(
+                token,
+                "observation",
+                None,
+                summary,
+                None,
+                None,
+                None,
+                Some(properties),
+                annotates,
+                None,
+                true,
+            )
+            .await?;
+        legacy_post_commit_result("create_web_receipt_note", note.id, note, degradations)
     }
 
     /// Like [`Self::create_note`], but lets the caller supply a smaller text
@@ -3978,6 +4107,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4012,6 +4142,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4050,6 +4181,7 @@ impl KhiveRuntime {
             properties,
             annotates,
             None,
+            false,
         )
         .await
     }
@@ -4112,6 +4244,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 embedding_model,
+                false,
             )
             .await?;
         legacy_post_commit_result(
@@ -4329,7 +4462,7 @@ impl KhiveRuntime {
         }
 
         // Best-effort vector embedding: log and continue on failure.
-        let embed_model_names = self.registered_embedding_model_names();
+        let embed_model_names = self.embedding_models_for_note_kind(kind);
         for model_name in &embed_model_names {
             match self
                 .embed_document_with_model_outcome_for_token(
@@ -4399,6 +4532,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
+        web_receipt: bool,
     ) -> RuntimeResult<(
         Note,
         crate::retrieval::EmbeddingTruncationReport,
@@ -4410,8 +4544,20 @@ impl KhiveRuntime {
         // the generic `create` verb and direct Rust callers alike — stores the
         // same derived values. Runs before the secret gate so the gate scans
         // exactly what will be written.
-        let properties = self.derive_note_write_properties(kind, token, properties)?;
+        let mut properties = self.derive_note_write_properties(kind, token, properties)?;
         crate::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
+        if web_receipt {
+            let map = properties
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("web receipt properties are constructed as an object");
+            map.insert(
+                crate::secret_gate::RESERVED_WEB_RECEIPT_KEY.to_string(),
+                serde_json::Value::String(
+                    crate::secret_gate::WEB_RECEIPT_PROVENANCE_VALUE.to_string(),
+                ),
+            );
+        }
         // Secret gate: scan content, optional name, and structured properties.
         crate::secret_gate::check_at(content, "note", "content")?;
         if let Some(n) = name {
@@ -4487,7 +4633,12 @@ impl KhiveRuntime {
         if let Some(p) = properties {
             note = note.with_properties(p);
         }
-        self.notes(token)?.upsert_note(note.clone()).await?;
+        let notes = if web_receipt {
+            self.raw_notes(token)?
+        } else {
+            self.notes(token)?
+        };
+        notes.upsert_note(note.clone()).await?;
 
         // From here on, any error must compensate by removing the note row, its
         // FTS document, and any vector entries already inserted — the same
@@ -4497,18 +4648,7 @@ impl KhiveRuntime {
         let embed_model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
-            // Fan out to ALL registered models — includes both lattice models
-            // from RuntimeConfig and any custom providers added via
-            // register_embedder(). Gate on the registry, not
-            // config().embedding_model, so that custom-only runtimes (no
-            // lattice model in config) also fan out.
-            let names = self.registered_embedding_model_names();
-            if names.is_empty() {
-                // No models configured at all — skip vector embedding.
-                vec![]
-            } else {
-                names
-            }
+            self.embedding_models_for_note_kind(kind)
         };
 
         // FTS step — compensate note row on failure.
@@ -4547,7 +4687,7 @@ impl KhiveRuntime {
         // Vector embedding + insert step — compensate note row + FTS doc on failure.
         // Multi-model vector embedding:
         //   - explicit embedding_model → single model (existing behaviour)
-        //   - None + any models registered → ALL registered models in parallel
+        //   - None → the note kind's declared model policy
         //   - None + no models configured → skip (text-only)
         // The effective text sent to every embedder: the caller-supplied
         // capped override when present, otherwise the full stored content.
@@ -5170,9 +5310,11 @@ impl KhiveRuntime {
         // match `note_kind` are dropped post-fetch — they're a small set
         // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
+        let search_pool = self.backend().pool_arc();
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
+                search_pool.record_note_candidate_hydration_row();
                 if note.deleted_at.is_some() {
                     continue;
                 }
@@ -6636,6 +6778,14 @@ impl KhiveRuntime {
             .await?)
     }
 
+    /// Return the coupled entity total and optional type counts for `stats`.
+    pub async fn entity_stats_counts(
+        &self,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<EntityStatsCounts> {
+        entity_stats_counts(self.entities(token)?.as_ref(), token).await
+    }
+
     // ---- Edge CRUD operations ----
 
     /// Fetch a single edge by id.
@@ -7720,6 +7870,61 @@ impl KhiveRuntime {
         Ok(outcome.rows)
     }
 
+    /// Create a historical commit-to-project annotation without replacing a
+    /// curated edge or reviving a tombstone. The store rechecks the exact live
+    /// commit SHA and project under its writer transaction; only a newly
+    /// inserted edge produces the ordinary LinkCreated lifecycle event.
+    pub async fn link_commit_annotation_if_absent(
+        &self,
+        token: &NamespaceToken,
+        commit_id: Uuid,
+        project_id: Uuid,
+        guard: CommitAnnotationGuard,
+    ) -> RuntimeResult<CommitAnnotationInsertOutcome> {
+        if !matches!(guard.expected_sha.len(), 40 | 64)
+            || !guard
+                .expected_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(RuntimeError::InvalidInput(
+                "expected full commit SHA".into(),
+            ));
+        }
+        let edge = self
+            .build_edge(
+                token,
+                &LinkSpec {
+                    namespace: None,
+                    source_id: commit_id,
+                    target_id: project_id,
+                    relation: EdgeRelation::Annotates,
+                    weight: 1.0,
+                    metadata: None,
+                    resurrect: false,
+                },
+            )
+            .await?;
+        let result = self
+            .graph(token)?
+            .insert_commit_annotation_if_absent(edge, guard)
+            .await?;
+        if let CommitAnnotationInsertOutcome::Created(edge) = &result {
+            self.append_link_mutation_event(
+                token,
+                &EdgeUpsertResult {
+                    edge: edge.clone(),
+                    disposition: EdgeUpsertDisposition::Created,
+                    previous: None,
+                },
+                EdgeEndpointKind::Note,
+                EdgeEndpointKind::Entity,
+            )
+            .await?;
+        }
+        Ok(result)
+    }
+
     /// Create a batch of entities atomically.
     ///
     /// All specs are validated before any write. If ANY spec fails validation
@@ -7773,7 +7978,7 @@ impl KhiveRuntime {
             .iter()
             .enumerate()
             .map(|(index, entity)| {
-                let mut plan = bulk_entity_plan(entity);
+                let mut plan = bulk_entity_plan(entity)?;
                 if injected_failure_index == Some(index) {
                     // Keep the guarded row insert; replace its FTS pair with the fault.
                     plan.statements.truncate(1);
@@ -7788,9 +7993,9 @@ impl KhiveRuntime {
                         guard: None,
                     });
                 }
-                AtomicOpPlan::AddEntity(plan)
+                Ok(AtomicOpPlan::AddEntity(plan))
             })
-            .collect();
+            .collect::<RuntimeResult<Vec<_>>>()?;
 
         match run_atomic_unit(self.sql().as_ref(), plans).await {
             Ok(AtomicRunOutcome::Committed { .. }) => Ok(entities),
@@ -7867,7 +8072,7 @@ impl KhiveRuntime {
         let _ = self.entities(token)?;
         let _ = self.text(token)?;
 
-        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity));
+        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity)?);
         Ok((entity, plan))
     }
 
@@ -7929,7 +8134,8 @@ pub struct NoteCreateSpec {
     pub properties: Option<serde_json::Value>,
 }
 
-fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
+fn bulk_entity_plan(entity: &Entity) -> RuntimeResult<AddEntityPlan> {
+    crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
     let mut statements = vec![PlanStatement {
         statement: entity_upsert_statement(entity),
         guard: Some(AffectedRowGuard::exactly(1)),
@@ -7943,11 +8149,11 @@ fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
                 guard: None,
             }),
     );
-    AddEntityPlan {
+    Ok(AddEntityPlan {
         entity_id: entity.id,
         statements,
         post_commit: PostCommitEffect::None,
-    }
+    })
 }
 
 fn guarded_link_batch_failure(
@@ -19988,6 +20194,71 @@ mod tests {
         );
     }
 
+    // ── Location endpoint pair (ADR-196) ─────────────────────────────────────
+    // The base contract is one row, concept->concept; other base kinds are left
+    // to the first pack that emits them.
+
+    #[tokio::test]
+    async fn link_concept_located_in_concept_allowed_other_base_kinds_rejected() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let pneumonia = rt
+            .create_entity(&tok, "concept", None, "Pneumonia", None, None, vec![])
+            .await
+            .unwrap();
+        let lung = rt
+            .create_entity(&tok, "concept", None, "Lung", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(
+                &tok,
+                pneumonia.id,
+                lung.id,
+                EdgeRelation::LocatedIn,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "concept->concept located_in must be allowed by the ADR-196 \
+             endpoint amendment; got {result:?}"
+        );
+        let edge = result.unwrap();
+        assert_eq!(edge.relation, EdgeRelation::LocatedIn);
+        assert!(
+            edge.metadata.is_none(),
+            "located_in carries no governed metadata and infers none; got {:?}",
+            edge.metadata
+        );
+
+        let page = rt
+            .create_entity(&tok, "document", None, "Atlas page", None, None, vec![])
+            .await
+            .unwrap();
+        let concept_to_doc = rt
+            .link(
+                &tok,
+                pneumonia.id,
+                page.id,
+                EdgeRelation::LocatedIn,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            concept_to_doc
+                .to_string()
+                .contains("base endpoint allowlist"),
+            "concept->document located_in must be refused with the \
+             endpoint-contract error; got {concept_to_doc}"
+        );
+    }
+
     #[tokio::test]
     async fn link_org_introduced_by_document_rejected_direction_matters() {
         let rt = rt();
@@ -20703,6 +20974,80 @@ mod tests {
         assert!(
             matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_create_note_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let err = rt
+            .try_create_note(
+                &tok,
+                "observation",
+                None,
+                "reserved-key conditional note",
+                Some(reserved_key_props()),
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_web_receipt_writer_can_establish_provenance() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let forged = serde_json::json!({
+            "tags": ["web.receipt"],
+            "request": {"verb": "web.fetch"},
+            "khive:web_receipt": "v1",
+        });
+        let error = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "forged",
+                None,
+                Some(forged),
+                vec![],
+            )
+            .await
+            .expect_err("generic create must reject receipt provenance");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("khive:web_receipt"))
+        );
+
+        let receipt = rt
+            .create_web_receipt_note(
+                &tok,
+                "web.fetch",
+                serde_json::json!({"verb": "web.fetch"}),
+                vec![],
+            )
+            .await
+            .expect("web writer must publish provenance with its receipt");
+        assert_eq!(
+            receipt.properties.as_ref().unwrap()["khive:web_receipt"],
+            "v1"
+        );
+        let error = rt
+            .update_note(
+                &tok,
+                receipt.id,
+                crate::curation::NotePatch {
+                    properties: Some(serde_json::json!({"request": {"verb": "web.refresh"}})),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("generic update must not rewrite a trusted receipt");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(message) if message.contains("web receipt"))
         );
     }
 

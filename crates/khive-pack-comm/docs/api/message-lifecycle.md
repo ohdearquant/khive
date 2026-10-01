@@ -653,7 +653,14 @@ commits a `quarantine-original` note attachment with that same reference in the
 note's transaction. This attachment is the blob sweep's liveness root; metadata
 alone does not own stored bytes. A duplicate transport id repairs a missing
 attachment only when its stored reference matches the replayed bytes and the
-exact channel kind and slug match. A matching channel-scoped replay also
+exact channel kind and slug match. The one-release legacy IMAP lookup applies
+those same ownership checks before acknowledging a quarantined replay; the
+old-key note keeps its stored `external_id`; the lookup already matched its
+`channel_slug`, and the repair backfills a missing `quarantine_content_ref` and
+restores a missing matching attachment. When that old-key row has no `expires_at`, the
+repair also installs one from replay time plus configured retention, so the row
+that now owns the original bytes is selected by channel cleanup; an existing
+deadline on an old-key row is left as it is. A matching channel-scoped replay also
 installs a missing expiry deadline from replay time plus configured retention
 while preserving a later existing deadline. An older quarantine row without a
 slug occupies the empty channel partition under ADR-056 and cannot be claimed
@@ -676,6 +683,17 @@ an unexpired quarantine note and its attachment remain available. This follows
 a live note owns its attachment and hard deletion releases that ownership.
 Cleanup failure holds the channel poll and is reported as a failure, so it
 cannot produce a success heartbeat or advance transport progress.
+
+The number of quarantine records that hold an original is bounded per channel
+configuration (for email, `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED`, default 256; see the
+[IMAP connector notes](../../../khive-channel-email/docs/api/imap-connector.md)).
+Before publishing an original, whether the adapter quarantined the message or
+`comm.ingest` refused it, the poller reads `comm.health`'s
+`quarantined_count` for the ingest namespace. At the cap, `comm.ingest`
+receives the quarantine record without `quarantine_content_ref` and with
+`quarantine_original_retained: "false"` and
+`quarantine_original_not_retained_reason: "retention-limit"`, so no attachment is
+created and no blob is published. The record keeps the normal retention deadline.
 
 A future promote or release path would need to clear the expiry before the
 deadline; no such path exists today. Older quarantine notes without
@@ -738,19 +756,37 @@ predicate emitted by `build_note_filter_where`. A literal-value partial index
 planner sees different predicates and falls back to a table scan.
 `deleted_at IS NULL` is always present in filtered queries, so the partial
 condition is always satisfied and the index is eligible. `kind` is included
-as an indexed column so the `kind = ?N` predicate is covered. Statements are
-idempotent (`CREATE INDEX IF NOT EXISTS`).
+as an indexed column so the `kind = ?N` predicate is covered. The remaining
+pack statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
 
 `idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
 namespace, note kind, direction, sender actor, and `properties.outbound_ref`.
 
-`idx_comm_message_outbound_recipient` serves the channel delivery loops' outbox
-scan: a seek on direction plus a range on `properties.to_actor` (the channel
-prefix, `email:` or `telegram:`, rendered by `FilterOp::TextStartsWithIndexed`),
-then `created_at DESC, id ASC`. The prefix is in the statement because every
-actor-to-actor outbound row satisfies the pending predicate indefinitely, so a
-scan that pages first and filters the recipient afterwards stops reaching a
-channel's rows once enough other rows sort ahead of them.
+`idx_comm_message_outbound_recipient` serves outbox scans with arbitrary
+partial recipient prefixes: a seek on direction plus a range on
+`properties.to_actor` rendered by `FilterOp::TextStartsWithIndexed`, then
+`created_at DESC, id ASC`. The prefix belongs in the SQL statement because
+actor-to-actor outbound rows remain pending indefinitely; filtering them after
+the page would starve channel rows.
+
+`idx_comm_message_outbound_due` is installed by numbered core migration V44,
+not the pack schema plan. Supported note writers store a strict RFC 3339 UTC
+key and the source deadline text in the same write as `properties`. Its
+builtins-only expression compares that source with the current JSON property;
+if they differ, the row gets the empty BLOB key and enters the due candidates.
+The read path then applies a strict parser residual, so raw property edits
+cannot hide a newly due message or deliver a future one early. Raw SQLite
+connections need no application function to delete notes, check integrity, or
+vacuum. The index serves full colon-terminated channel prefixes.
+Its first-colon recipient bucket is an equality key ahead of the stored retry
+deadline, so a channel with many future retries and no due messages can seek
+past the backlog. Missing or malformed deadlines use the empty BLOB key and
+remain eligible. A full `name:` bucket exactly matches the corresponding
+recipient prefix; arbitrary partial prefixes use the recipient index above.
+The channel due page sorts by `+created_at DESC, id ASC`: `created_at` is an
+INTEGER timestamp, so this preserves the answer order while preventing an
+analyzed planner from walking the creation-order index through future retries
+to fill a small `LIMIT`.
 
 `idx_comm_quarantine_expiry` supports the daemon's bounded, channel-scoped
 expiry page by namespace, kind, channel identity, and expiry timestamp.

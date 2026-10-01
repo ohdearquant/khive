@@ -24,9 +24,10 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode, NoteKindSpec,
-    NoteLifecycleSpec, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef,
-    VerbCategory, VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
+    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode,
+    NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec,
+    PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
+    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -313,6 +314,11 @@ pub trait PackRuntime: Send + Sync {
     /// and future enforcement.  Defaults to empty so existing packs compile
     /// without changes.
     fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
+        &[]
+    }
+
+    /// Per-kind write-time embedding policy; unlisted kinds use every model.
+    fn note_embedding_policies(&self) -> &'static [NoteEmbeddingPolicySpec] {
         &[]
     }
 
@@ -2047,6 +2053,26 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 }
 
 impl VerbRegistry {
+    /// Select the owning pack's backend for a note-kind KG read. The caller
+    /// keeps its already-authorized token; this only selects storage.
+    pub fn kg_note_read_runtime_for_kind<'a>(
+        &'a self,
+        runtime: &'a KhiveRuntime,
+        kind: &str,
+    ) -> &'a KhiveRuntime {
+        let Some(resolver) = &self.kg_read_resolver else {
+            return runtime;
+        };
+        let Some(owner) = self
+            .packs
+            .iter()
+            .find(|pack| pack.note_kinds().contains(&kind))
+        else {
+            return runtime;
+        };
+        resolver.runtime_for_pack(owner.name())
+    }
+
     /// Resolve a KG entity/note handle across the configured backend inventory.
     ///
     /// The caller must supply its dispatch-authorized token. By-ID reads do not
@@ -2441,6 +2467,8 @@ impl VerbRegistry {
         ("session", "session.resume"),
         ("session", "session.export"),
         ("session", "session.search"),
+        // Fixed SQL reads and file metadata only; no domain or maintenance write.
+        ("session", "session.stats"),
         // tool (registry, grant and policy reads; tool.suggest runs the same
         // hybrid search as the kg search and context verbs above)
         ("tool", "tool.suggest"),
@@ -4196,6 +4224,14 @@ impl VerbRegistry {
             .collect()
     }
 
+    /// Collect pack-declared embedding policies for registered note kinds.
+    pub fn all_note_embedding_policies(&self) -> Vec<NoteEmbeddingPolicySpec> {
+        self.packs
+            .iter()
+            .flat_map(|pack| pack.note_embedding_policies().iter().copied())
+            .collect()
+    }
+
     /// All pack-contributed validation rules across registered packs.
     ///
     /// Returns references into the pack-owned `'static` slices — no allocation
@@ -4352,6 +4388,8 @@ impl VerbRegistry {
     ///   event with a freshly generated id and no natural key at all.
     /// - `telemetry.emit` can append a durable stream record with a fresh
     ///   identity and sequence, depending on the configured channel policy.
+    /// - `tool.check` appends a `tool_check_decided` receipt with a fresh
+    ///   event id for every evaluated decision (ADR-180 Amendment 6).
     ///
     /// The speech-act category alone cannot rule this out — it describes
     /// what the verb tells the *caller*, not what it schedules against
@@ -4359,7 +4397,7 @@ impl VerbRegistry {
     /// was made idempotent) is a correctness decision requiring the same
     /// scrutiny as the categorization itself.
     pub const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
-        &["memory.recall", "search", "telemetry.emit"];
+        &["memory.recall", "search", "telemetry.emit", "tool.check"];
 
     /// Whether a response lost to the daemon frame budget may be truthfully
     /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
@@ -6376,6 +6414,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn session_stats_admission_degrade_requires_trusted_session_owner() {
+        static HANDLERS: [HandlerDef; 2] = [
+            HandlerDef {
+                name: "session.stats",
+                description: "read session store statistics",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "session.vacuum",
+                description: "compact session store",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            },
+        ];
+
+        let pack = || CountingHandlersPack {
+            name: "session",
+            handlers: &HANDLERS,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut trusted = VerbRegistryBuilder::new();
+        trusted.register_trusted(pack());
+        let trusted = trusted.build().expect("trusted session registry");
+        assert!(trusted.admission_degrade_safe_probe("session.stats"));
+        assert!(!trusted.admission_degrade_safe_probe("session.vacuum"));
+
+        let mut untrusted = VerbRegistryBuilder::new();
+        untrusted.register(pack());
+        let untrusted = untrusted.build().expect("untrusted session registry");
+        assert!(!untrusted.admission_degrade_safe_probe("session.stats"));
+    }
+
+    #[test]
     fn verb_metadata_uses_build_time_index_across_packs() {
         static FIRST_HANDLERS: [HandlerDef; 2] = [
             HandlerDef {
@@ -6612,6 +6686,7 @@ pub(crate) mod tests {
             ("search", "/../khive-pack-kg/src/handler_defs.rs"),
             ("memory.recall", "/../khive-pack-memory/src/pack.rs"),
             ("telemetry.emit", "/../khive-pack-telemetry/src/pack.rs"),
+            ("tool.check", "/../khive-pack-tool/src/vocab.rs"),
         ];
         assert_eq!(
             sources.len(),

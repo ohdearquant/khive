@@ -565,7 +565,7 @@ mod tests {
 
         let origin = Url::parse("https://served.example.test").unwrap();
         let canonical_origin = identity::canonicalize(origin);
-        let site = identity::site_id(&canonical_origin);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical_origin);
         assert_eq!(reply["site"], site.to_string());
 
         let expected_index = identity::document_id(
@@ -925,11 +925,11 @@ mod tests {
         assert_eq!(sorted_ids(&disk_reply), sorted_ids(&crawl_reply));
         let http_graph = graph_snapshot(&http_runtime, &http_token).await;
         // Disk ingestion sent no HTTP request. The served GET sent the
-        // client's fixed gzip negotiation, so that one provenance field must
+        // client's fixed identity negotiation, so that one provenance field must
         // differ even though document identities, bodies and edges agree.
         for (graph, expected_context) in [
             (&disk_graph, json!({})),
-            (&http_graph, json!({"accept-encoding": ["gzip"]})),
+            (&http_graph, json!({"accept-encoding": ["identity"]})),
         ] {
             for entity in graph.0.as_array().unwrap() {
                 if entity["entity_type"] == "page" {
@@ -1028,8 +1028,10 @@ mod tests {
             "{error}"
         );
         let url = identity::canonicalize(Url::parse(origin).unwrap().join("a-large.bin").unwrap());
-        let large_id =
-            identity::document_id(identity::site_id(&url), &identity::path_and_query(&url));
+        let large_id = identity::document_id(
+            identity::site_id(&khive_types::Namespace::local(), &url),
+            &identity::path_and_query(&url),
+        );
         assert!(runtime
             .entities(&token)
             .unwrap()

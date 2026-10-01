@@ -85,6 +85,13 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
         1,
     ),
     (
+        "khive-runtime/src/curation.rs",
+        "reindex_note_with_plan",
+        "DELETE",
+        "{table}",
+        1,
+    ),
+    (
         "khive-db/src/namespace_move.rs",
         "move_vectors",
         "DELETE",
@@ -136,6 +143,15 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
         "ensure_fts_rowid_map_backfilled",
         "INSERT",
         "{state}",
+        1,
+    ),
+    // Database identity bootstrap writes one fixed metadata table, never a
+    // vec0 or note table. Keep the dynamic DML site visible to this census.
+    (
+        "khive-db/src/pool.rs",
+        "initialize_database_id",
+        "INSERT",
+        "main.{DATABASE_ID_TABLE}",
         1,
     ),
     (
@@ -485,7 +501,10 @@ fn dml_target(line: &str) -> Option<(&'static str, &str)> {
         ("UPDATE ", "UPDATE"),
     ] {
         if let Some(start) = upper.find(needle) {
-            if start > 0 && upper.as_bytes()[start - 1].is_ascii_alphanumeric() {
+            if start > 0
+                && (upper.as_bytes()[start - 1].is_ascii_alphanumeric()
+                    || upper.as_bytes()[start - 1] == b'_')
+            {
                 continue;
             }
             let after = line[start + needle.len()..].trim_start();
@@ -728,6 +747,16 @@ fn adr044_a4_census_detects_unlisted_dynamic_writer() {
 
     let interleaved = "fn before() {}\n#[cfg(test)]\nmod tests {\n    fn fixture() { sql!(\"DELETE FROM vec_fixture\"); }\n}\nfn after() { sql!(\"DELETE FROM vec_new WHERE subject_id=?1\"); }\n";
     assert_eq!(sites("new-crate/src/writer.rs", interleaved).len(), 1);
+}
+
+#[test]
+fn raw_vec0_writer_census_ignores_identifier_suffixes() {
+    // `properties_update {` in the route classifier is an identifier, not SQL.
+    assert!(dml_target("if plain_insert || conflict_insert || properties_update {").is_none());
+    assert_eq!(
+        dml_target("conn.execute(&format!(\"UPDATE {table} SET value=?1\"), [])"),
+        Some(("UPDATE", "{table}")),
+    );
 }
 
 #[test]

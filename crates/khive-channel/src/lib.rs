@@ -524,6 +524,15 @@ pub trait Channel: Send + Sync + 'static {
         true
     }
 
+    /// Most quarantine records that may hold a stored original message at once.
+    ///
+    /// Once the ingest namespace holds this many live quarantine records, the
+    /// poller still records each further quarantined message but does not
+    /// store its original bytes. `None`, the default, applies no bound.
+    fn quarantine_retention_limit(&self) -> Option<usize> {
+        None
+    }
+
     /// Send a single outbound message.
     ///
     /// Outbound write-back (reply routing from the KG note layer) is deferred
