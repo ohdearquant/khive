@@ -764,3 +764,29 @@ rollback and connection state are proven, never merely attempted. An ambiguous o
 preserves this ADR's existing outcome-unknown and connection-retirement contract instead of
 guessing at settlement. No completed commit, and no earlier committed unit within a multi-commit
 request, may be described as retryable work that never ran.
+
+## Amendment: optional grouped entity counts (2026-09-30)
+
+**Status: Accepted (2026-09-30).**
+Existing accepted decisions remain in force.
+
+`EntityStore` adds the provided method
+`count_entities_by_type(&self, namespaces: &[String]) -> StorageResult<Option<Vec<(Option<String>, u64)>>>`.
+Its default is `Ok(None)`, meaning grouped reporting is unavailable, not that the store is empty.
+Like the documented `Unsupported` default for `EntityStore::upsert_entity_with_attachments`
+and other optional operations, this reporting default need not compose required primitives.
+`Ok(None)` denotes ordinary capability absence so callers can retain scalar counts while errors
+from an implemented report remain errors. It adds no policy or required implementation method;
+existing implementors retain their scalar count behavior.
+
+`Some(groups)` reports complete, disjoint counts of live entities in exactly the supplied namespace
+set, from one backend read snapshot. Duplicate namespaces do not multiply counts; an empty set has
+no groups. Each observed raw `entity_type` occurs once, with SQL NULL represented by `None` and
+strings preserved exactly, independent of registered vocabulary. `SqlEntityStore` obtains these
+groups with one grouped SELECT over the full namespace set, rather than separate type, namespace,
+or scalar reads. The sum of these groups is the entity total from that snapshot.
+
+Only `Ok(None)` denotes unavailable reporting. A storage error remains an error. The `stats`
+consumer's legacy scalar fallback and omitted breakdown are defined by
+[ADR-023's stats amendment](ADR-023-declarative-pack-format.md#amendment-optional-stats-entity-type-breakdown-2026-09-30).
+No capability category, vocabulary validation, namespace authority, or backend placement rule changes.

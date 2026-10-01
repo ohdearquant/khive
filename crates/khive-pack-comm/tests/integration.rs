@@ -7,7 +7,7 @@ use khive_runtime::{
     AllowAllGate, BackendId, EmailMessageIdDomains, KhiveRuntime, Namespace, NamespaceToken,
     NotePatch, RequestIdentity, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
-use khive_storage::types::{SqlRow, SqlValue};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_storage::Note;
 use khive_types::{Pack, Visibility};
 
@@ -5076,6 +5076,83 @@ fn build_identity_registry(
     builder.with_actor_id(actor_id.map(str::to_string));
     let registry = builder.build().expect("actor registry builds");
     (registry, rt)
+}
+
+#[tokio::test]
+async fn generic_message_lists_keep_same_namespace_mailboxes_separate() {
+    let backend = shared_backend();
+    let (sender, _) = build_actor_registry(backend.clone(), "lambda:sender");
+    let (recipient, _) = build_actor_registry(backend.clone(), "lambda:recipient");
+    let (other, _) = build_actor_registry(backend, "lambda:other");
+
+    let public = other
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "observation", "content": "visible observation"}),
+        )
+        .await
+        .expect("other actor creates a non-message note");
+    let public_id = public["id"].as_str().expect("observation id");
+    let sent = sender
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:recipient",
+                "content": "private same-namespace message"
+            }),
+        )
+        .await
+        .expect("sender writes a dual-copy message");
+    let thread_prefix = &sent["full_id"].as_str().expect("outbound id")[..8];
+
+    for (actor, registry, expected_messages) in [
+        ("sender", &sender, 1),
+        ("recipient", &recipient, 1),
+        ("other", &other, 0),
+    ] {
+        let explicit = registry
+            .dispatch("list", serde_json::json!({"kind": "message", "limit": 10}))
+            .await
+            .expect("explicit message list");
+        assert_eq!(
+            list_items(&explicit).len(),
+            expected_messages,
+            "{actor}: {explicit}"
+        );
+    }
+
+    for args in [
+        serde_json::json!({"kind": "note", "limit": 1}),
+        serde_json::json!({"kind": "note", "limit": 1, "after": ""}),
+    ] {
+        let broad = other.dispatch("list", args).await.expect("broad note list");
+        let notes = broad["items"]
+            .as_array()
+            .or_else(|| broad["notes"].as_array())
+            .expect("note page");
+        assert_eq!(notes.len(), 1, "{broad}");
+        assert_eq!(notes[0]["id"], public_id, "{broad}");
+        assert!(!broad.to_string().contains("private same-namespace message"));
+    }
+
+    let hidden_prefix = other
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": thread_prefix}),
+        )
+        .await
+        .expect_err("a foreign thread prefix is outside this mailbox");
+    assert!(hidden_prefix
+        .to_string()
+        .contains("no message thread matches"));
+    let own_prefix = recipient
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": thread_prefix}),
+        )
+        .await
+        .expect("recipient resolves its thread prefix");
+    assert_eq!(list_items(&own_prefix).len(), 1, "{own_prefix}");
 }
 
 /// Actor A sends to actor B.
@@ -14854,6 +14931,62 @@ async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
         channels[0]["channel_slug"].as_str(),
         Some("recipient@example.com")
     );
+}
+
+/// Coordinate patches must fail before any sibling property or note revision changes (#2990).
+#[tokio::test]
+async fn heartbeat_refuses_carried_reserved_property_without_changing_row() {
+    let (registry, runtime) = build_registry_for_ns("local");
+    let heartbeat = serde_json::json!({
+        "namespace": "local",
+        "channel_kind": "email",
+        "channel_slug": "reserved@example.com",
+        "poll_interval_secs": 5,
+        "outcome": "success",
+    });
+    registry
+        .dispatch("comm.heartbeat", heartbeat.clone())
+        .await
+        .expect("seed heartbeat");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let rows = runtime
+        .list_notes(&token, Some("channel_health"), 10, 0)
+        .await
+        .expect("read heartbeat");
+    assert_eq!(rows.len(), 1);
+    let before = &rows[0];
+    let mut planted = before.properties.clone().expect("properties");
+    planted["khive:secret_gate"] = serde_json::json!({"legacy": true});
+    let mut writer = runtime.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+            params: vec![
+                SqlValue::Text(planted.to_string()),
+                SqlValue::Text(before.id.to_string()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("plant stored key");
+    drop(writer);
+
+    let error = registry
+        .dispatch("comm.heartbeat", heartbeat)
+        .await
+        .expect_err("carried reserved key must be refused");
+    assert!(
+        matches!(&error, khive_runtime::RuntimeError::InvalidInput(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("khive:secret_gate"), "{error}");
+    let after = runtime
+        .get_note_including_deleted(&token, before.id)
+        .await
+        .expect("read row")
+        .expect("heartbeat row");
+    assert_eq!(after.properties, Some(planted), "row changed");
+    assert_eq!(after.updated_at, before.updated_at, "revision changed");
 }
 
 /// Coordinate patches must fail before any sibling property or note revision changes (#2990).

@@ -346,8 +346,9 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 #   KHIVE_LOCK=~/.khive/khived.recovery.lock     Stale-daemon recovery lock file path.
 #   KHIVE_DRAIN_TIMEOUT_SECS=10  Seconds the daemon waits for in-flight requests before shutdown.
 #   KHIVE_REQUEST_READ_TIMEOUT_SECS=30
-#                                Absolute ceiling for request-owned reads and compose (1..=3600).
-#                                Zero, invalid, or out-of-range values use the nonzero default.
+#                                Absolute ceiling for request-owned reads and compose (1..=86400).
+#                                Above 86400 clamps to 86400; zero or a non-integer uses the
+#                                nonzero default. Either correction logs a warning.
 #   KHIVE_SQLITE_INTERRUPT_GRACE_MS=500
 #                                Read-interrupt settlement window in milliseconds (10..=5000).
 #                                Does not interrupt admitted writes.

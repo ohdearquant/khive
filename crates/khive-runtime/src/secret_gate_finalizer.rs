@@ -22,4 +22,6 @@ pub(crate) mod log_sink;
 pub(crate) mod manifest;
 pub(crate) mod matrix;
 pub(crate) mod outcome;
+#[cfg(test)]
+mod route_census;
 pub(crate) mod transaction;

@@ -634,6 +634,114 @@ async fn deleted_outbound_parent_falls_back_to_declared_kind() {
 }
 
 #[tokio::test]
+async fn policy_quarantine_plaintext_is_secret_gated_before_any_write() {
+    // Construct a synthetic detector fixture at runtime; never use a live credential.
+    let credential_shape = format!("{}{}", ["g", "h", "p", "_"].concat(), "A".repeat(36));
+    assert!(matches!(
+        crate::secret_gate::check(&credential_shape),
+        Err(RuntimeError::SecretDetected(_))
+    ));
+    let safe_plaintext = json!({
+        "v": 1,
+        "subject": null,
+        "body": "refused body",
+        "sent_at": "2026-09-01T12:34:56Z",
+        "properties": {"nested": [{"text": "safe metadata"}]},
+    });
+
+    for placement in ["body", "subject", "nested value", "nested key"] {
+        let (runtime, token, local, binding) = fixture();
+        let mut plaintext = safe_plaintext.clone();
+        match placement {
+            "body" | "subject" => plaintext[placement] = json!(credential_shape.clone()),
+            "nested value" => {
+                plaintext["properties"]["nested"][0]["text"] = json!(credential_shape.clone());
+            }
+            "nested key" => {
+                plaintext["properties"]["nested"][0]
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(credential_shape.clone(), json!("safe value"));
+            }
+            _ => unreachable!("fixed fixture placements"),
+        }
+        let item = b"{\"ciphertext\":\"opaque test payload\"}".to_vec();
+        let refused = runtime
+            .ingest_verified_recipient(
+                &token,
+                &local,
+                InboundReceiptTicket::new(binding.clone(), 1),
+                VerifiedInboundContent::Quarantine {
+                    reason: QuarantineReason::PolicyRejected,
+                    parsed_plaintext: Some(plaintext),
+                },
+                item.clone(),
+            )
+            .await;
+        let matched = match refused {
+            Err(RuntimeError::SecretDetected(matched)) => matched,
+            _ => panic!("credential-shaped quarantine plaintext must be refused: {placement}"),
+        };
+        assert_eq!(
+            matched.location.as_deref(),
+            Some("quarantine.parsed_plaintext")
+        );
+        for table in [
+            "notes",
+            "comm_recipient_quarantine",
+            "comm_recipient_replay",
+            "comm_ack_work",
+        ] {
+            assert_eq!(table_count(&runtime, table), 0, "{placement}: {table}");
+        }
+
+        // Reuse the exact ticket: refusal must not claim the message or its receipt.
+        let kept = runtime
+            .ingest_verified_recipient(
+                &token,
+                &local,
+                InboundReceiptTicket::new(binding, 1),
+                VerifiedInboundContent::Quarantine {
+                    reason: QuarantineReason::PolicyRejected,
+                    parsed_plaintext: Some(safe_plaintext.clone()),
+                },
+                item,
+            )
+            .await
+            .unwrap();
+        assert!(kept.created);
+        assert_eq!(kept.disposition, RecipientDisposition::Quarantined);
+        assert!(kept.note_id.is_none());
+        assert!(kept.note.is_none());
+        assert_eq!(table_count(&runtime, "notes"), 0);
+        for table in [
+            "comm_recipient_quarantine",
+            "comm_recipient_replay",
+            "comm_ack_work",
+        ] {
+            assert_eq!(table_count(&runtime, table), 1, "{placement}: {table}");
+        }
+        let (reason, stored): (String, String) = runtime
+            .backend()
+            .pool()
+            .writer()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT reason,parsed_plaintext FROM comm_recipient_quarantine",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, "policy_rejected");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
+            safe_plaintext
+        );
+    }
+}
+
+#[tokio::test]
 async fn quarantine_writes_no_message_note_and_keeps_the_item_verbatim() {
     let plaintext =
         json!({"v":1,"subject":null,"body":"refused body","sent_at":"2026-09-01T12:34:56Z"});

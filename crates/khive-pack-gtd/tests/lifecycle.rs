@@ -4,7 +4,62 @@ mod common;
 
 use common::{assign, pack, rt};
 use khive_runtime::Namespace;
+use khive_storage::types::{SqlStatement, SqlValue};
 use serde_json::json;
+
+#[tokio::test]
+async fn lifecycle_writes_refuse_a_carried_reserved_property() {
+    for (verb, args) in [
+        ("gtd.transition", json!({"status": "next"})),
+        ("gtd.complete", json!({"result": "done"})),
+    ] {
+        let runtime = rt();
+        let fixture = pack(runtime.clone());
+        let assigned = assign(&fixture, json!({"title": format!("reserved {verb}")})).await;
+        let id: uuid::Uuid = assigned["full_id"].as_str().unwrap().parse().unwrap();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let store = runtime.notes(&token).unwrap();
+        let before = store.get_note(id).await.unwrap().unwrap();
+        let mut stored_properties = before.properties.clone().unwrap();
+        stored_properties["khive:secret_gate"] = json!({"legacy": true});
+
+        let mut writer = runtime.sql().writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+                params: vec![
+                    SqlValue::Text(stored_properties.to_string()),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .unwrap();
+        drop(writer);
+
+        let mut args = args;
+        args["id"] = json!(id.to_string());
+        let error = fixture.dispatch(verb, args).await.expect_err(verb);
+        assert!(
+            matches!(&error, khive_runtime::RuntimeError::InvalidInput(_)),
+            "{verb}: expected typed reservation refusal, got {error}"
+        );
+        assert!(
+            error.to_string().contains("khive:secret_gate"),
+            "{verb}: {error}"
+        );
+        let after = store.get_note(id).await.unwrap().unwrap();
+        assert_eq!(
+            after.properties,
+            Some(stored_properties),
+            "{verb}: row changed"
+        );
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "{verb}: revision changed"
+        );
+    }
+}
 
 #[tokio::test]
 async fn complete_marks_task_done_and_is_idempotent_via_load_check() {

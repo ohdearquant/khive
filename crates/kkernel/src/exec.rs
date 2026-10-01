@@ -4342,40 +4342,24 @@ id = "lambda:fallback"
             "comm.send must succeed through the multi-backend fallback server: {send_resp}"
         );
 
-        // Re-open EACH backend file independently (fresh KhiveMcpServer, no
-        // shared state) and list `message` notes directly against it.
-        async fn count_messages(db_path: &std::path::Path) -> usize {
-            let cfg = RuntimeConfig {
-                db_path: Some(db_path.to_path_buf()),
-                embedding_model: None,
-                additional_embedding_models: vec![],
-                packs: vec!["kg".to_string(), "comm".to_string()],
-                ..RuntimeConfig::default()
-            };
-            let rt = KhiveRuntime::new(cfg).expect("runtime on backend file");
-            let probe = KhiveMcpServer::new(rt).expect("server on backend file");
-            let raw = probe
-                .dispatch_request_local(RequestParams {
-                    plan: None,
-                    ops: r#"list(kind="message")"#.to_string(),
-                    presentation: None,
-                    presentation_per_op: None,
-                    save_to: None,
-                    format: None,
-                    format_per_op: None,
-                    request_id: None,
-                })
-                .await
-                .expect("list must dispatch");
-            let resp: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
-            resp["results"][0]["result"]["items"]
-                .as_array()
-                .map(|a| a.len())
-                .unwrap_or(0)
+        // Inspect each physical file directly: list routing and mailbox
+        // filtering must not influence the backend-placement assertion.
+        fn count_messages(db_path: &std::path::Path) -> i64 {
+            let conn = rusqlite::Connection::open_with_flags(
+                db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("read-only connection to backend file");
+            conn.query_row(
+                "SELECT COUNT(*) FROM notes WHERE kind = 'message' AND content = ?1",
+                ["routed-via-secondary"],
+                |row| row.get(0),
+            )
+            .expect("count persisted message notes")
         }
 
-        let main_count = count_messages(&main_path).await;
-        let secondary_count = count_messages(&secondary_path).await;
+        let main_count = count_messages(&main_path);
+        let secondary_count = count_messages(&secondary_path);
 
         assert_eq!(
             main_count, 0,
