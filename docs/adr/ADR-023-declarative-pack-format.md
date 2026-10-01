@@ -1013,7 +1013,7 @@ The scalar `entities` is the sum of the same grouped result that supplies the br
 second entity count read. An empty supported store therefore reports these entity fields:
 
 ```json
-{"entities":0,"entities_by_type":[{"entity_type":null,"count":0}]}
+{ "entities": 0, "entities_by_type": [{ "entity_type": null, "count": 0 }] }
 ```
 
 When the provided capability returns `Ok(None)`, `stats` uses its existing scalar entity count path
