@@ -5070,6 +5070,83 @@ fn build_identity_registry(
     (registry, rt)
 }
 
+#[tokio::test]
+async fn generic_message_lists_keep_same_namespace_mailboxes_separate() {
+    let backend = shared_backend();
+    let (sender, _) = build_actor_registry(backend.clone(), "lambda:sender");
+    let (recipient, _) = build_actor_registry(backend.clone(), "lambda:recipient");
+    let (other, _) = build_actor_registry(backend, "lambda:other");
+
+    let public = other
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "observation", "content": "visible observation"}),
+        )
+        .await
+        .expect("other actor creates a non-message note");
+    let public_id = public["id"].as_str().expect("observation id");
+    let sent = sender
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:recipient",
+                "content": "private same-namespace message"
+            }),
+        )
+        .await
+        .expect("sender writes a dual-copy message");
+    let thread_prefix = &sent["full_id"].as_str().expect("outbound id")[..8];
+
+    for (actor, registry, expected_messages) in [
+        ("sender", &sender, 1),
+        ("recipient", &recipient, 1),
+        ("other", &other, 0),
+    ] {
+        let explicit = registry
+            .dispatch("list", serde_json::json!({"kind": "message", "limit": 10}))
+            .await
+            .expect("explicit message list");
+        assert_eq!(
+            list_items(&explicit).len(),
+            expected_messages,
+            "{actor}: {explicit}"
+        );
+    }
+
+    for args in [
+        serde_json::json!({"kind": "note", "limit": 1}),
+        serde_json::json!({"kind": "note", "limit": 1, "after": ""}),
+    ] {
+        let broad = other.dispatch("list", args).await.expect("broad note list");
+        let notes = broad["items"]
+            .as_array()
+            .or_else(|| broad["notes"].as_array())
+            .expect("note page");
+        assert_eq!(notes.len(), 1, "{broad}");
+        assert_eq!(notes[0]["id"], public_id, "{broad}");
+        assert!(!broad.to_string().contains("private same-namespace message"));
+    }
+
+    let hidden_prefix = other
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": thread_prefix}),
+        )
+        .await
+        .expect_err("a foreign thread prefix is outside this mailbox");
+    assert!(hidden_prefix
+        .to_string()
+        .contains("no message thread matches"));
+    let own_prefix = recipient
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": thread_prefix}),
+        )
+        .await
+        .expect("recipient resolves its thread prefix");
+    assert_eq!(list_items(&own_prefix).len(), 1, "{own_prefix}");
+}
+
 /// Actor A sends to actor B.
 #[tokio::test]
 async fn t_actor_inbox_filters_to_actor() {

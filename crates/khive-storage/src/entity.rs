@@ -144,6 +144,9 @@ pub struct EntityFilter {
     pub names_ci: Vec<String>,
 }
 
+/// Exact nullable stored entity types and their live row counts.
+pub type EntityTypeCounts = Vec<(Option<String>, u64)>;
+
 /// Entity CRUD operations over the entities substrate table.
 #[async_trait]
 pub trait EntityStore: Send + Sync + 'static {
@@ -245,6 +248,20 @@ pub trait EntityStore: Send + Sync + 'static {
     }
     /// Count entities in a namespace matching the given filter.
     async fn count_entities(&self, namespace: &str, filter: EntityFilter) -> StorageResult<u64>;
+    /// Report complete, disjoint live entity counts by exact stored type across
+    /// the supplied namespace set, from one backend read snapshot. Duplicate
+    /// namespaces count once; an empty set produces no groups. SQL NULL is
+    /// `None`, distinct from every string label. Ordering is unspecified.
+    ///
+    /// `Ok(None)` means this reporting capability is unavailable. It is not an
+    /// empty report or a storage failure; callers may retain their scalar count
+    /// and omit the breakdown. Errors from an implemented report propagate.
+    async fn count_entities_by_type(
+        &self,
+        _namespaces: &[String],
+    ) -> StorageResult<Option<EntityTypeCounts>> {
+        Ok(None)
+    }
     /// Fetch an entity by UUID regardless of soft-deletion state.
     ///
     /// Returns the entity row even when `deleted_at` is set. Callers use this
