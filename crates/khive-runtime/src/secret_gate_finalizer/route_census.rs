@@ -98,6 +98,28 @@ const SQL_CONSTANT_EVIDENCE: &str = "SQL constant ";
 enum DetectedClass {
     WholeObject,
     SingleKey(String),
+    FixedKeySet(BTreeSet<String>),
+}
+
+fn canonical_key_path(path: &str) -> Option<String> {
+    // Canonicalization sorts and deduplicates the set; labels remain byte-exact.
+    bare_top_level_path(path).then(|| path.to_owned())
+}
+
+fn detected_keys(class: &DetectedClass) -> Option<BTreeSet<String>> {
+    match class {
+        DetectedClass::WholeObject => None,
+        DetectedClass::SingleKey(path) => Some(BTreeSet::from([canonical_key_path(path)?])),
+        DetectedClass::FixedKeySet(paths) => Some(paths.clone()),
+    }
+}
+
+fn detected_key_class(paths: BTreeSet<String>) -> DetectedClass {
+    if paths.len() == 1 {
+        DetectedClass::SingleKey(paths.into_iter().next().expect("nonempty key set"))
+    } else {
+        DetectedClass::FixedKeySet(paths)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +136,19 @@ struct Site {
     class: DetectedClass,
     calls: BTreeSet<String>,
     evidence: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlConstantReference {
+    site: String,
+    constant: String,
+}
+
+struct ScannedSource {
+    sites: Vec<Site>,
+    /// Every expression path has an ordinal, whether or not it resolves. Both
+    /// passes visit the same AST, so a sibling reference cannot stand in for it.
+    constant_references: BTreeMap<usize, SqlConstantReference>,
 }
 
 fn attribute_name(attr: &Attribute) -> String {
@@ -224,34 +259,177 @@ fn sql_target(literal: &str) -> Option<Substrate> {
     None
 }
 
-/// Conservative SQL classification: only a single fixed, bare top-level
-/// `json_set` path in the SET clause can be reserved by construction. WHERE
-/// predicates may read other paths and do not change this classification.
-fn sql_single_key_path(literal: &str) -> Option<String> {
-    let normalized = literal
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase();
-    let set = normalized.split_once("set properties = json_set(")?.1;
-    let set = set.split(" where ").next()?;
-    if set.contains("json_remove(")
-        || set.contains("json_patch(")
-        || set.contains("json_insert(")
-        || set.contains("json_replace(")
-        || set.contains("json_set(")
+#[derive(Debug, PartialEq, Eq)]
+enum SqlToken {
+    Word(String),
+    String(String),
+    Symbol(char),
+}
+
+/// Tokenize the narrow SQL form the census can prove. Quoted identifiers and
+/// comments remain opaque rather than being mistaken for assignment syntax.
+fn sql_tokens(sql: &str) -> Option<Vec<SqlToken>> {
+    let mut tokens = Vec::new();
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == '\'' {
+            let mut value = String::new();
+            loop {
+                let next = chars.next()?;
+                if next == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                value.push(next);
+            }
+            tokens.push(SqlToken::String(value));
+        } else if ch.is_ascii_alphanumeric() || ch == '_' {
+            let mut word = String::from(ch);
+            while chars
+                .peek()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_')
+            {
+                word.push(chars.next()?);
+            }
+            tokens.push(SqlToken::Word(word.to_ascii_lowercase()));
+        } else if matches!(ch, '"' | '`' | '[' | ']')
+            || (ch == '-' && chars.peek() == Some(&'-'))
+            || (ch == '/' && chars.peek() == Some(&'*'))
+        {
+            return None;
+        } else {
+            tokens.push(SqlToken::Symbol(ch));
+        }
+    }
+    Some(tokens)
+}
+
+fn sql_word(token: &SqlToken, word: &str) -> bool {
+    matches!(token, SqlToken::Word(actual) if actual == word)
+}
+
+/// Split arguments or assignments only at their own parenthesis depth.
+fn sql_parts(tokens: &[SqlToken]) -> Option<Vec<&[SqlToken]>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            SqlToken::Symbol('(') => depth += 1,
+            SqlToken::Symbol(')') => depth = depth.checked_sub(1)?,
+            SqlToken::Symbol(',') if depth == 0 => {
+                parts.push(&tokens[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    parts.push(&tokens[start..]);
+    parts.iter().all(|part| !part.is_empty()).then_some(parts)
+}
+
+/// Only the first argument's transformations can widen the properties write.
+/// Path arguments have fixed positions: odd positions after json_set's input,
+/// and every argument after json_remove's input. Values and WHERE literals
+/// never contribute a key.
+fn sql_json_key_paths(tokens: &[SqlToken], paths: &mut BTreeSet<String>) -> Option<()> {
+    if tokens.len() == 1 && sql_word(&tokens[0], "properties") {
+        return Some(());
+    }
+    let [SqlToken::Word(function), SqlToken::Symbol('('), args @ .., SqlToken::Symbol(')')] =
+        tokens
+    else {
+        return None;
+    };
+    if !matches!(function.as_str(), "json_set" | "json_remove") {
+        return None;
+    }
+    let args = sql_parts(args)?;
+    let (input, changes) = args.split_first()?;
+    sql_json_key_paths(input, paths)?;
+    let path_args = if function == "json_set" {
+        if changes.is_empty() || changes.len() % 2 != 0 {
+            return None;
+        }
+        changes.iter().step_by(2).copied().collect::<Vec<_>>()
+    } else {
+        if changes.is_empty() {
+            return None;
+        }
+        changes.to_vec()
+    };
+    for arg in path_args {
+        let [SqlToken::String(path)] = arg else {
+            return None;
+        };
+        if !path.starts_with("$.") || !bare_top_level_path(path) {
+            return None;
+        }
+        paths.insert(path.clone());
+    }
+    Some(())
+}
+
+/// Prove the complete key set of one properties assignment in a plain UPDATE.
+/// Unknown inputs, dynamic paths and opaque transformations stay whole-object.
+fn sql_fixed_key_paths(literal: &str) -> Option<BTreeSet<String>> {
+    let tokens = sql_tokens(literal)?;
+    if tokens.len() < 4
+        || tokens.contains(&SqlToken::Symbol(';'))
+        || !sql_word(&tokens[0], "update")
+        || !(sql_word(&tokens[1], "notes") || sql_word(&tokens[1], "entities"))
+        || !sql_word(&tokens[2], "set")
     {
         return None;
     }
-    let paths = set
-        .split('\'')
-        .filter(|piece| piece.starts_with('$'))
-        .collect::<Vec<_>>();
-    if paths.len() == 1 && bare_top_level_path(paths[0]) {
-        Some(paths[0].to_owned())
-    } else {
-        None
+    let mut depth = 0usize;
+    let mut end = tokens.len();
+    for (index, token) in tokens.iter().enumerate().skip(3) {
+        match token {
+            SqlToken::Symbol('(') => depth += 1,
+            SqlToken::Symbol(')') => depth = depth.checked_sub(1)?,
+            SqlToken::Word(word) if word == "where" && depth == 0 => {
+                end = index;
+                break;
+            }
+            SqlToken::Symbol(';') => return None,
+            _ => {}
+        }
     }
+    let mut paths = None;
+    for assignment in sql_parts(&tokens[3..end])? {
+        let [SqlToken::Word(column), SqlToken::Symbol('='), expression @ ..] = assignment else {
+            return None;
+        };
+        if column == "properties" {
+            if paths.is_some() {
+                return None;
+            }
+            let mut keys = BTreeSet::new();
+            sql_json_key_paths(expression, &mut keys)?;
+            if keys.is_empty() {
+                return None;
+            }
+            paths = Some(keys);
+        }
+    }
+    paths
+}
+
+fn sql_single_key_path(literal: &str) -> Option<String> {
+    let paths = sql_fixed_key_paths(literal)?;
+    (paths.len() == 1)
+        .then(|| paths.into_iter().next())
+        .flatten()
 }
 
 fn macro_strings(tokens: TokenStream, strings: &mut Vec<String>) {
@@ -370,9 +548,6 @@ fn import_target(
     strict: bool,
 ) -> Option<Binding> {
     let (original, prefix) = path.split_last()?;
-    if NOTE_PROPERTY_SQL_CONSTANTS.contains(&original.as_str()) {
-        return Some(Binding::Constant(original.clone()));
-    }
     let lookup = |scope: &SqlBindings| resolved(scope.get(original));
     match prefix {
         [] => lookup(known).or_else(|| current_module.and_then(&lookup)),
@@ -520,7 +695,32 @@ fn qualified_target(
     strict: bool,
 ) -> Option<Binding> {
     let (name, prefix) = path.split_last()?;
-    let module = resolve_module(prefix, current, modules, in_scope, strict)?;
+    // Synthetic source populations may omit khive-db itself. Only its exact
+    // known origin path is recognized in that case, after honoring a type or
+    // opaque import at the head. A terminal name alone grants no identity.
+    let origin = prefix == ["khive_db", "stores", "note"]
+        && NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str());
+    let module = resolve_module(prefix, current, modules, in_scope, strict);
+    if module.is_none()
+        && origin
+        && crate_root("khive_db", modules).is_none()
+        && child_module(current, "khive_db", modules).is_none()
+    {
+        let head = in_scope("khive_db");
+        if head != Some(Binding::Type)
+            && !matches!(&head, Some(Binding::Module(_)))
+            && (!strict || (head != Some(Binding::Other) && in_scope(GLOB_IMPORT).is_none()))
+        {
+            return Some(Binding::Constant(name.clone()));
+        }
+    }
+    let module = module?;
+    if module.root == "khive-db/src/lib.rs"
+        && module.segments == ["stores", "note"]
+        && NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str())
+    {
+        return Some(Binding::Constant(name.clone()));
+    }
     resolved(modules.get(&module).and_then(|bindings| bindings.get(name)))
         .or_else(|| child_module(&module, name, modules).map(Binding::Module))
         // `use khive_db;` names the workspace crate itself.
@@ -721,6 +921,8 @@ struct SourceCollector<'modules> {
     module_id: ModuleId,
     modules: &'modules ModuleBindings,
     strict: bool,
+    path_ordinal: usize,
+    constant_references: BTreeMap<usize, SqlConstantReference>,
 }
 
 impl<'modules> SourceCollector<'modules> {
@@ -757,7 +959,13 @@ impl<'modules> SourceCollector<'modules> {
             site.evidence.insert("MIXED_ENTITY_AND_NOTE_TARGETS".into());
         }
         if site.class != class {
-            site.class = DetectedClass::WholeObject;
+            site.class = match (detected_keys(&site.class), detected_keys(&class)) {
+                (Some(mut existing), Some(additional)) => {
+                    existing.extend(additional);
+                    detected_key_class(existing)
+                }
+                _ => DetectedClass::WholeObject,
+            };
         }
         site.evidence.insert(evidence);
     }
@@ -778,8 +986,8 @@ impl<'modules> SourceCollector<'modules> {
             return;
         }
         if let Some(target) = sql_target(literal) {
-            let class = sql_single_key_path(literal)
-                .map(DetectedClass::SingleKey)
+            let class = sql_fixed_key_paths(literal)
+                .map(detected_key_class)
                 .unwrap_or(DetectedClass::WholeObject);
             self.record(target, class, "SQL literal".into());
         }
@@ -971,6 +1179,8 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
     }
 
     fn visit_expr_path(&mut self, expr: &'ast syn::ExprPath) {
+        let ordinal = self.path_ordinal;
+        self.path_ordinal += 1;
         if !self.path.starts_with("khive-db/") {
             if let Some(segment) = expr.path.segments.last() {
                 let name = segment.ident.to_string();
@@ -1005,8 +1215,6 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
                 };
                 let binding = if let Some(binding) = imported {
                     Some(binding.clone())
-                } else if NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str()) {
-                    Some(Binding::Constant(name.clone()))
                 } else {
                     let path = segments
                         .iter()
@@ -1021,6 +1229,13 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
                     )
                 };
                 if let Some(Binding::Constant(constant)) = binding {
+                    self.constant_references.insert(
+                        ordinal,
+                        SqlConstantReference {
+                            site: self.key(),
+                            constant: constant.clone(),
+                        },
+                    );
                     self.record(
                         Substrate::Note,
                         DetectedClass::WholeObject,
@@ -1127,7 +1342,7 @@ fn scan_source(
     module_id: ModuleId,
     modules: &ModuleBindings,
     strict: bool,
-) -> Result<Vec<Site>, syn::Error> {
+) -> Result<ScannedSource, syn::Error> {
     let file = syn::parse_file(source)?;
     let parents = module_parents(&module_id, modules);
     let bindings = use_bindings(
@@ -1152,9 +1367,14 @@ fn scan_source(
         module_id,
         modules,
         strict,
+        path_ordinal: 0,
+        constant_references: BTreeMap::new(),
     };
     collector.visit_file(&file);
-    Ok(collector.sites.into_values().collect())
+    Ok(ScannedSource {
+        sites: collector.sites.into_values().collect(),
+        constant_references: collector.constant_references,
+    })
 }
 
 fn sql_statements(sql: &str) -> Vec<String> {
@@ -1589,9 +1809,17 @@ fn index_module_bindings(
             // An import shadows a declaration of the same name only across
             // namespaces, so the import stays and the declaration fills in.
             for (name, binding) in traversal.declared.get(module_id).into_iter().flatten() {
-                bindings
-                    .entry(name.clone())
-                    .or_insert_with(|| binding.clone());
+                bindings.entry(name.clone()).or_insert_with(|| {
+                    if module_id.root == "khive-db/src/lib.rs"
+                        && module_id.segments == ["stores", "note"]
+                        && *binding == Binding::Value
+                        && NOTE_PROPERTY_SQL_CONSTANTS.contains(&name.as_str())
+                    {
+                        Binding::Constant(name.clone())
+                    } else {
+                        binding.clone()
+                    }
+                });
             }
             modules.insert(module_id.clone(), bindings);
         }
@@ -1610,6 +1838,7 @@ fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
     // would be a route if the name were a function and no route if it were a
     // type, so the census refuses it instead of choosing.
     let mut strict = BTreeMap::new();
+    let mut strict_references = BTreeMap::new();
     let mut lenient = Vec::new();
     for is_strict in [true, false] {
         let (modules, file_modules) = index_module_bindings(sources, &skipped, &roots, is_strict)?;
@@ -1621,40 +1850,48 @@ fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
                 .get(path)
                 .cloned()
                 .expect("indexed production source");
-            let sites = scan_source(path, source, module_id, &modules, is_strict)
+            let scanned = scan_source(path, source, module_id, &modules, is_strict)
                 .map_err(|error| format!("{path}: {error}"))?;
             if is_strict {
-                strict.extend(sites.into_iter().map(|site| (site.key.clone(), site)));
+                strict.extend(
+                    scanned
+                        .sites
+                        .into_iter()
+                        .map(|site| (site.key.clone(), site)),
+                );
+                strict_references.extend(
+                    scanned
+                        .constant_references
+                        .into_iter()
+                        .map(|(ordinal, reference)| ((path.clone(), ordinal), reference)),
+                );
             } else {
-                lenient.extend(sites);
+                lenient.push((path, scanned));
             }
         }
     }
-    for site in lenient {
-        let unproven = site
-            .evidence
-            .iter()
-            .filter_map(|evidence| evidence.strip_prefix(SQL_CONSTANT_EVIDENCE))
-            .filter(|constant| {
-                !strict.get(&site.key).is_some_and(|proven| {
-                    proven
-                        .evidence
-                        .contains(&format!("{SQL_CONSTANT_EVIDENCE}{constant}"))
+    for (path, scanned) in lenient {
+        let sites = scanned
+            .sites
+            .into_iter()
+            .map(|site| (site.key.clone(), site))
+            .collect::<BTreeMap<_, _>>();
+        for (ordinal, reference) in scanned.constant_references {
+            if strict_references.get(&(path.clone(), ordinal)) == Some(&reference) {
+                continue;
+            }
+            strict
+                .entry(reference.site.clone())
+                .or_insert_with(|| Site {
+                    evidence: BTreeSet::new(),
+                    ..sites
+                        .get(&reference.site)
+                        .expect("constant reference has a site")
+                        .clone()
                 })
-            })
-            .map(|constant| format!("{UNRESOLVED_CONSTANT} {constant}"))
-            .collect::<Vec<_>>();
-        if unproven.is_empty() {
-            continue;
+                .evidence
+                .insert(format!("{UNRESOLVED_CONSTANT} {}", reference.constant));
         }
-        strict
-            .entry(site.key.clone())
-            .or_insert_with(|| Site {
-                evidence: BTreeSet::new(),
-                ..site
-            })
-            .evidence
-            .extend(unproven);
     }
     // A map keyed by the site key is already in key order.
     Ok(strict.into_values().collect())
@@ -1719,7 +1956,8 @@ fn check_inventory(
         }
         match (&row.write_class, &site.class) {
             (WriteClass::SingleKey { key_path }, DetectedClass::SingleKey(actual))
-                if *key_path == actual.as_str() =>
+                if canonical_key_path(key_path).is_some()
+                    && canonical_key_path(key_path) == canonical_key_path(actual) =>
             {
                 if row.reservation != Reservation::ByConstruction {
                     failures.push(format!(
@@ -1728,7 +1966,26 @@ fn check_inventory(
                     ));
                 }
             }
-            (WriteClass::WholeObject, DetectedClass::WholeObject) => match row.reservation {
+            (WriteClass::FixedKeySet { key_paths }, detected)
+                if !key_paths.is_empty()
+                    && detected_keys(detected).is_some()
+                    && key_paths
+                        .iter()
+                        .map(|path| canonical_key_path(path))
+                        .collect::<Option<BTreeSet<_>>>()
+                        == detected_keys(detected) =>
+            {
+                if row.reservation != Reservation::ByConstruction {
+                    failures.push(format!(
+                        "{}: fixed-key-set route must be reserved by construction",
+                        site.key
+                    ));
+                }
+            }
+            (
+                WriteClass::WholeObject,
+                DetectedClass::WholeObject | DetectedClass::FixedKeySet(_),
+            ) => match row.reservation {
                 Reservation::NamedCheck { function, .. } if site.calls.contains(function) => {}
                 _ => failures.push(format!(
                     "{}: whole-object write lacks its named check/callee",
@@ -2021,7 +2278,15 @@ fn aliased_note_sql_constants_require_inventory_entries() {
 
     let glob = "use khive_db::stores::note::*;
         fn unlisted(conn: &Connection) { conn.prepare_cached(NOTE_UPSERT_SQL); }";
-    let sites = scan_sources(&[(path.into(), glob.into())]).unwrap();
+    let sites = scan_sources(&[
+        (path.into(), glob.into()),
+        (
+            "khive-db/src/lib.rs".into(),
+            "pub mod stores { pub mod note { pub const NOTE_UPSERT_SQL: &str = \"SELECT 1\"; } }"
+                .into(),
+        ),
+    ])
+    .unwrap();
     assert_eq!(sites.len(), 1);
     assert!(check_inventory(&sites, &[], 0)
         .unwrap_err()
@@ -2327,6 +2592,104 @@ const TY_CRATE: (&str, &str) = (
     "Ty/src/lib.rs",
     "pub use khive_db::stores::note::NOTE_UPSERT_SQL as MERGE_SQL;",
 );
+
+#[test]
+fn canonical_note_sql_names_on_scanned_types_are_not_routes() {
+    let route = RouteInventoryEntry {
+        site: "sample/src/writer.rs::write",
+        ..qualified_reexport_route()
+    };
+    for constant in NOTE_PROPERTY_SQL_CONSTANTS {
+        let associated =
+            format!("pub struct Ty; impl Ty {{ pub const {constant}: &str = \"SELECT 1\"; }}");
+        let type_source = [("sample/src/types.rs", associated.as_str())];
+        for (form, writer, extra) in [
+            (
+                "local type",
+                reserved_note_writer(&associated, &format!("Ty::{constant}")),
+                &[][..],
+            ),
+            (
+                "imported type",
+                reserved_note_writer("use crate::types::Ty;", &format!("Ty::{constant}")),
+                &type_source[..],
+            ),
+            (
+                "glob-imported type",
+                reserved_note_writer("use crate::types::*;", &format!("Ty::{constant}")),
+                &type_source[..],
+            ),
+            (
+                "type alias",
+                reserved_note_writer(
+                    &format!("{} type Ty = Base;", associated.replace("Ty", "Base")),
+                    &format!("Ty::{constant}"),
+                ),
+                &[][..],
+            ),
+        ] {
+            let sites = scan_sources(&module_path_sources(&writer, extra)).unwrap();
+            assert!(sites.is_empty(), "{constant}, {form}: {sites:?}");
+            assert!(check_inventory(&sites, &[route], 0)
+                .unwrap_err()
+                .contains("orphan route"));
+        }
+        let writer = reserved_note_writer("", &format!("khive_db::stores::note::{constant}"));
+        let sites = scan_sources(&module_path_sources(&writer, &[])).unwrap();
+        assert_eq!(sites.len(), 1, "known origin {constant}: {sites:?}");
+        assert!(check_inventory(&sites, &[route], 0).is_ok());
+
+        let local_module = format!(
+            "mod khive_db {{ pub mod stores {{ pub mod note {{ pub const {constant}: &str = \"SELECT 1\"; }} }} }}
+             fn read(conn: &Connection) {{ conn.prepare_cached(khive_db::stores::note::{constant}); }}"
+        );
+        let sites = scan_sources(&[("sample/src/lib.rs".into(), local_module)]).unwrap();
+        assert!(sites.is_empty(), "local module {constant}: {sites:?}");
+    }
+}
+
+#[test]
+fn each_note_sql_reference_requires_its_own_resolution() {
+    let route = RouteInventoryEntry {
+        site: "sample/src/writer.rs::write",
+        ..qualified_reexport_route()
+    };
+    for constant in NOTE_PROPERTY_SQL_CONSTANTS {
+        let extra = [(
+            "dbx/src/lib.rs",
+            format!("pub use khive_db::stores::note::{constant} as MERGE_SQL;"),
+        )];
+        let extra_refs = [(extra[0].0, extra[0].1.as_str())];
+        let resolved = "conn.prepare_cached(crate::sql_alias::MERGE_SQL);";
+        let unresolved = "{ use external::Ty as dbx; conn.prepare_cached(dbx::MERGE_SQL); }";
+        for (first, second) in [(resolved, unresolved), (unresolved, resolved)] {
+            let writer = format!(
+                "fn write(conn: &Connection) {{ reject_reserved_secret_gate_property(merged_props); {first} {second} }}"
+            );
+            let mut sources = module_path_sources(&writer, &extra_refs);
+            for (_, source) in &mut sources {
+                *source = source.replace("NOTE_UPSERT_SQL", constant);
+            }
+            let sites = scan_sources(&sources).unwrap();
+            assert_eq!(sites.len(), 1, "{constant}: {sites:?}");
+            assert!(sites[0]
+                .evidence
+                .contains(&format!("SQL constant {constant}")));
+            assert!(sites[0]
+                .evidence
+                .contains(&format!("{UNRESOLVED_CONSTANT} {constant}")));
+            assert!(check_inventory(&sites, &[route], 0)
+                .unwrap_err()
+                .contains("cannot tell whether this site reaches a note SQL constant"));
+        }
+        // Two independently resolved occurrences satisfy the same row.
+        let writer = format!(
+            "fn write(conn: &Connection) {{ reject_reserved_secret_gate_property(merged_props); {resolved} {resolved} }}"
+        );
+        let sites = scan_sources(&module_path_sources(&writer, &extra_refs)).unwrap();
+        assert!(check_inventory(&sites, &[route], 0).is_ok());
+    }
+}
 
 // A type lives in the module namespace, so an imported type hides a same-named
 // child module or workspace crate at the head of a path: `Ty::NAME` is the
@@ -2691,6 +3054,188 @@ fn module_paths_to_unrelated_names_are_not_reported() {
     ] {
         let sites = scan_sources(&module_path_sources(writer, &[])).unwrap();
         assert!(sites.is_empty(), "{form}: {sites:?}");
+    }
+}
+
+fn synthetic_fixed_key_route(key_paths: &'static [&'static str]) -> RouteInventoryEntry {
+    RouteInventoryEntry {
+        id: "synthetic.fixed-keys",
+        site: "sample/src/lib.rs::write",
+        write_class: WriteClass::FixedKeySet { key_paths },
+        reservation: Reservation::ByConstruction,
+        ..qualified_reexport_route()
+    }
+}
+
+fn synthetic_sql_sites(sql: &str) -> Vec<Site> {
+    scan_sources(&[(
+        "sample/src/lib.rs".into(),
+        format!("fn write() {{ let statement = {sql:?}; }}"),
+    )])
+    .unwrap()
+}
+
+#[test]
+fn fixed_key_sql_routes_require_the_complete_literal_key_set() {
+    let expected = BTreeSet::from([
+        "$.channel_slug".to_owned(),
+        "$.quarantine_content_ref".to_owned(),
+    ]);
+    let route = synthetic_fixed_key_route(&["$.quarantine_content_ref", "$.channel_slug"]);
+    for sql in [
+        "UPDATE notes SET properties = json_set(properties, '$.channel_slug', ?1, '$.quarantine_content_ref', ?2) WHERE id = ?3",
+        "UPDATE notes SET properties = json_set(properties, '$.quarantine_content_ref', '$.value_is_not_a_path', '$.channel_slug', ?2, '$.channel_slug', ?4), updated_at = MAX(updated_at, ?5) WHERE json_extract(properties, '$.predicate_is_not_a_write') = ?6",
+        "UPDATE notes SET properties = json_remove(properties, '$.channel_slug', '$.quarantine_content_ref') WHERE id = ?1",
+        "UPDATE notes SET properties = json_remove(json_set(properties, '$.channel_slug', ?1), '$.quarantine_content_ref') WHERE id = ?2",
+        "UPDATE notes SET properties = json_set(json_remove(properties, '$.quarantine_content_ref'), '$.channel_slug', ?1) WHERE id = ?2",
+        "UpDaTe notes SeT properties = JSON_SET ( properties , '$.channel_slug', CASE WHEN ?1 THEN json_extract(properties, '$.read_only') ELSE ?2 END, '$.quarantine_content_ref', ?3 ) WHERE id = ?4",
+    ] {
+        assert_eq!(sql_fixed_key_paths(sql), Some(expected.clone()), "{sql}");
+        let sites = synthetic_sql_sites(sql);
+        assert_eq!(sites.len(), 1, "{sql}: {sites:?}");
+        assert_eq!(sites[0].class, DetectedClass::FixedKeySet(expected.clone()), "{sql}");
+        assert!(check_inventory(&sites, &[route], 0).is_ok(), "{sql}");
+        for row in [
+            synthetic_fixed_key_route(&["$.channel_slug"]),
+            synthetic_fixed_key_route(&["$.channel_slug", "$.different"]),
+            synthetic_fixed_key_route(&["$.channel_slug", "$.quarantine_content_ref", "$.extra"]),
+            synthetic_fixed_key_route(&[]),
+        ] {
+            assert!(check_inventory(&sites, &[row], 0).unwrap_err().contains("write class"), "{sql}: {row:?}");
+        }
+        let unchecked = RouteInventoryEntry {
+            reservation: qualified_reexport_route().reservation,
+            ..route
+        };
+        assert!(check_inventory(&sites, &[unchecked], 0).unwrap_err()
+            .contains("fixed-key-set route must be reserved by construction"));
+    }
+
+    // A newly introduced third key is not covered by the two-key declaration.
+    let extra = synthetic_sql_sites("UPDATE notes SET properties = json_set(properties, '$.channel_slug', ?1, '$.quarantine_content_ref', ?2, '$.extra', ?3) WHERE id = ?4");
+    assert!(check_inventory(&extra, &[route], 0)
+        .unwrap_err()
+        .contains("write class"));
+
+    // A second statement in the same function also contributes its write key.
+    let source = "fn write() { let first = \"UPDATE notes SET properties = json_set(properties, '$.channel_slug', ?1) WHERE id = ?2\"; let second = \"UPDATE notes SET properties = json_remove(properties, '$.quarantine_content_ref') WHERE id = ?2\"; }";
+    let combined = scan_sources(&[("sample/src/lib.rs".into(), source.into())]).unwrap();
+    assert_eq!(combined[0].class, DetectedClass::FixedKeySet(expected));
+    assert!(check_inventory(&combined, &[route], 0).is_ok());
+}
+
+#[test]
+fn one_unique_literal_key_remains_a_single_key_and_preserves_case() {
+    for sql in [
+        "UPDATE notes SET properties = json_set(properties, '$.Foo', '$.value', '$.Foo', ?2) WHERE json_extract(properties, '$.where_only') = ?3",
+        "UPDATE notes SET properties = json_remove(properties, '$.Foo', '$.Foo') WHERE id = ?1",
+        "UPDATE notes SET properties = json_set(json_remove(properties, '$.Foo'), '$.Foo', ?1) WHERE id = ?2",
+    ] {
+        let sites = synthetic_sql_sites(sql);
+        assert_eq!(sites[0].class, DetectedClass::SingleKey("$.Foo".into()), "{sql}");
+        let single = RouteInventoryEntry {
+            write_class: WriteClass::SingleKey { key_path: "$.Foo" },
+            ..synthetic_fixed_key_route(&["$.Foo"])
+        };
+        assert!(check_inventory(&sites, &[single], 0).is_ok());
+        assert!(check_inventory(&sites, &[synthetic_fixed_key_route(&["$.Foo"])], 0).is_ok());
+        assert!(check_inventory(&sites, &[synthetic_fixed_key_route(&["$.foo"])], 0)
+            .unwrap_err().contains("write class"));
+        assert!(check_inventory(&sites, &[synthetic_fixed_key_route(&["Foo"])], 0)
+            .unwrap_err().contains("write class"));
+    }
+}
+
+#[test]
+fn uncertain_sql_key_sets_require_whole_object_reservation() {
+    let route = synthetic_fixed_key_route(&["$.safe", "$.other"]);
+    for expression in [
+        "json_set(properties, ?1, ?2)",
+        "json_set(properties, '$.' || ?1, ?2)",
+        "json_remove(properties, json_extract(?1, '$.path'))",
+        "json_set(properties, '$', ?1)",
+        "json_set(properties, '$.nested.key', ?1)",
+        "json_set(properties, '$.\"quoted\"', ?1)",
+        "json_remove(properties, '$[\"bracket\"]')",
+        "json_set(properties, '$.safe[0]', ?1)",
+        "json_set(properties, '$.safe-key', ?1)",
+        "json_set(properties, '', ?1)",
+        "json_set(properties, '$.safe', ?1, ?2, ?3)",
+        "json_remove(properties, '$.safe', ?1)",
+        "json_set(properties)",
+        "json_remove(properties)",
+        "properties",
+        "json_set(other_document, '$.safe', ?1)",
+        "json_set(coalesce(properties, '{}'), '$.safe', ?1)",
+        "json_set(json_patch(properties, ?1), '$.safe', ?2)",
+        "json_patch(properties, ?1)",
+        "json_insert(properties, '$.safe', ?1)",
+        "json_replace(properties, '$.safe', ?1)",
+        "json_set(properties, '$.safe', ?1) || ?2",
+    ] {
+        let sql = format!("UPDATE notes SET properties = {expression} WHERE id = ?9");
+        assert_eq!(sql_fixed_key_paths(&sql), None, "{sql}");
+        let sites = synthetic_sql_sites(&sql);
+        assert_eq!(sites[0].class, DetectedClass::WholeObject, "{sql}");
+        assert!(
+            check_inventory(&sites, &[route], 0)
+                .unwrap_err()
+                .contains("write class"),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "UPDATE notes SET properties = json_set(properties, '$.safe', ?1), properties = ?2 WHERE id = ?3",
+        "UPDATE notes SET properties = json_set(properties, '$.safe', ?1); UPDATE notes SET properties = ?2",
+        "UPDATE notes SET properties = json_set(properties, '$.safe', ?1) /* opaque */ WHERE id = ?2",
+    ] {
+        let sites = synthetic_sql_sites(sql);
+        assert_eq!(sites[0].class, DetectedClass::WholeObject, "{sql}");
+        assert!(check_inventory(&sites, &[route], 0).is_err(), "{sql}");
+    }
+    // An invalid declared path or empty set cannot match an opaque write.
+    let opaque = synthetic_sql_sites("UPDATE notes SET properties = ?1 WHERE id = ?2");
+    for row in [
+        synthetic_fixed_key_route(&[]),
+        synthetic_fixed_key_route(&["$.nested.key"]),
+    ] {
+        assert!(check_inventory(&opaque, &[row], 0)
+            .unwrap_err()
+            .contains("write class"));
+    }
+}
+
+#[test]
+fn conservative_whole_object_rows_still_require_their_named_check() {
+    let row = RouteInventoryEntry {
+        site: "sample/src/lib.rs::write",
+        ..*ROUTE_INVENTORY
+            .iter()
+            .find(|row| row.id == "pending.outcome")
+            .expect("pending outcome retains whole-object coverage")
+    };
+    assert_eq!(row.write_class, WriteClass::WholeObject);
+    for expression in [
+        "json_set(properties, '$.dispatch_receipt', json(?1), '$.lease_expires_at', ?2)",
+        "json_remove(json_set(properties, '$.status', 'pending'), '$.firing_at', '$.lease_expires_at')",
+    ] {
+        let sql = format!("UPDATE notes SET properties = {expression}, updated_at = ?3 WHERE id = ?4");
+        let checked = format!(
+            "fn write() {{ check_fixed_path_whole_object_snapshot(snapshot); let statement = {sql:?}; }}"
+        );
+        let sites = scan_sources(&[("sample/src/lib.rs".into(), checked.clone())]).unwrap();
+        assert!(matches!(sites[0].class, DetectedClass::FixedKeySet(_)));
+        assert!(check_inventory(&sites, &[row], 0).is_ok());
+        let unchecked = checked.replace("check_fixed_path_whole_object_snapshot(snapshot);", "");
+        let sites = scan_sources(&[("sample/src/lib.rs".into(), unchecked)]).unwrap();
+        assert!(check_inventory(&sites, &[row], 0).unwrap_err()
+            .contains("whole-object write lacks its named check/callee"));
+        let by_construction = RouteInventoryEntry {
+            reservation: Reservation::ByConstruction,
+            ..row
+        };
+        assert!(check_inventory(&sites, &[by_construction], 0).unwrap_err()
+            .contains("whole-object write lacks its named check/callee"));
     }
 }
 

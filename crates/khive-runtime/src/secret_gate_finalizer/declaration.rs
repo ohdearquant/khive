@@ -105,6 +105,7 @@ pub(crate) struct RouteInventoryEntry {
 pub(crate) enum WriteClass {
     WholeObject,
     SingleKey { key_path: &'static str },
+    FixedKeySet { key_paths: &'static [&'static str] },
     PrivilegedEscape,
 }
 
@@ -363,16 +364,16 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         acceptance: Acceptance::Test { path: "khive-pack-code/src/source_ingest.rs::code_entity_mutation_refuses_reserved_candidate_and_carried_properties" },
     },
     RouteInventoryEntry {
-        id: "comm.ingest.legacy_slug",
-        site: "khive-pack-comm/src/handlers.rs::handle_ingest",
+        id: "comm.ingest.quarantine_repair",
+        site: "khive-pack-comm/src/handlers.rs::repair_duplicate_quarantine",
         target: Substrate::Note,
-        write_class: WriteClass::SingleKey { key_path: "$.channel_slug" },
+        write_class: WriteClass::FixedKeySet { key_paths: &["$.channel_slug", "$.quarantine_content_ref"] },
         kind_policy: KindPolicy::SpecializedWriter,
         reservation: Reservation::ByConstruction,
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Missing,
+        acceptance: Acceptance::Test { path: "khive-pack-comm/src/handlers.rs::tests::legacy_key_quarantine_replay_installs_a_deadline_that_cleanup_selects" },
     },
     RouteInventoryEntry {
         id: "comm.reply.read",
@@ -750,7 +751,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
 
 /// Existing routes without a real-path acceptance test are explicit debt.
 #[allow(dead_code)]
-pub(crate) const PINNED_MISSING_ACCEPTANCE: usize = 9;
+pub(crate) const PINNED_MISSING_ACCEPTANCE: usize = 8;
 
 #[cfg(test)]
 mod tests {

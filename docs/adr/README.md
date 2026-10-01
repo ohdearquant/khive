@@ -280,6 +280,7 @@ Amendments to accepted records:
 - [ADR-088 Amendment 1, operational rider](ADR-088-amendment-1-git-digest.md#proposed-operational-rider-persisted-cursor-inspection-2026-09-10) (2026-09-10): persisted cursor inspection. Its heading marks it Proposed; it has no separate status line.
 - [ADR-104 Amendment 1](ADR-104-posterior-serving-recall.md#amendment-1-2026-07-12-prior-preserving-evidence-decay-for-per-entity-posteriors) (2026-07-12): prior-preserving evidence decay for per-entity posteriors.
 - [ADR-105 Appendix A](ADR-105-cross-node-comm-transport.md#appendix-a-2026-09-23----node-wire-protocol-version-1) (2026-09-23): node wire protocol, version 1, proposed as part of the 2026-09-14 amendment.
+- [ADR-115 Amendment 6](ADR-115-secret-gate-content-manifest-exemption.md#amendment-6-2026-09-30-fixed-sets-of-literal-property-paths) (2026-09-30): fixed sets of literal property paths.
 - [ADR-119 Amendment 6](ADR-119-daemon-component-supervision.md#amendment-6-cancellation-during-inbound-transport-reads-2026-09-14) (2026-09-14): cancellation during inbound transport reads.
 - [ADR-130 Amendment 5](ADR-130-search-response-completeness-and-ranking-evidence.md#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14) (2026-09-14): search limit disclosure at the MCP operation boundary.
 - [ADR-180 Amendment 2](ADR-180-tool-pack.md#amendment-2-2026-09-11-the-grant-digest-and-the-exec-receipt-canonicalize-by-the-same-function) (2026-09-11): the grant digest and the exec receipt canonicalize by the same function.
