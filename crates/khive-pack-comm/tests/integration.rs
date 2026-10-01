@@ -7,7 +7,7 @@ use khive_runtime::{
     AllowAllGate, BackendId, EmailMessageIdDomains, KhiveRuntime, Namespace, NamespaceToken,
     NotePatch, RequestIdentity, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
-use khive_storage::types::{SqlRow, SqlValue};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_storage::Note;
 use khive_types::{Pack, Visibility};
 
@@ -14915,6 +14915,62 @@ async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
         channels[0]["channel_slug"].as_str(),
         Some("recipient@example.com")
     );
+}
+
+/// Coordinate patches must fail before any sibling property or note revision changes (#2990).
+#[tokio::test]
+async fn heartbeat_refuses_carried_reserved_property_without_changing_row() {
+    let (registry, runtime) = build_registry_for_ns("local");
+    let heartbeat = serde_json::json!({
+        "namespace": "local",
+        "channel_kind": "email",
+        "channel_slug": "reserved@example.com",
+        "poll_interval_secs": 5,
+        "outcome": "success",
+    });
+    registry
+        .dispatch("comm.heartbeat", heartbeat.clone())
+        .await
+        .expect("seed heartbeat");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let rows = runtime
+        .list_notes(&token, Some("channel_health"), 10, 0)
+        .await
+        .expect("read heartbeat");
+    assert_eq!(rows.len(), 1);
+    let before = &rows[0];
+    let mut planted = before.properties.clone().expect("properties");
+    planted["khive:secret_gate"] = serde_json::json!({"legacy": true});
+    let mut writer = runtime.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+            params: vec![
+                SqlValue::Text(planted.to_string()),
+                SqlValue::Text(before.id.to_string()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("plant stored key");
+    drop(writer);
+
+    let error = registry
+        .dispatch("comm.heartbeat", heartbeat)
+        .await
+        .expect_err("carried reserved key must be refused");
+    assert!(
+        matches!(&error, khive_runtime::RuntimeError::InvalidInput(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("khive:secret_gate"), "{error}");
+    let after = runtime
+        .get_note_including_deleted(&token, before.id)
+        .await
+        .expect("read row")
+        .expect("heartbeat row");
+    assert_eq!(after.properties, Some(planted), "row changed");
+    assert_eq!(after.updated_at, before.updated_at, "revision changed");
 }
 
 /// Coordinate patches must fail before any sibling property or note revision changes (#2990).

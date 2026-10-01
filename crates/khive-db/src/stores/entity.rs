@@ -70,13 +70,6 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
     statement
 }
 
-/// Insert a new entity without replacing an existing live or deleted row.
-/// A competing ID causes a constraint error, so a prepared create cannot
-/// overwrite a row committed after its absence check.
-pub fn entity_insert_statement(entity: &Entity) -> SqlStatement {
-    entity_write_statement(entity, "INSERT", "entity-insert")
-}
-
 fn entity_write_statement(entity: &Entity, insert: &str, label: &str) -> SqlStatement {
     let properties_str = entity
         .properties

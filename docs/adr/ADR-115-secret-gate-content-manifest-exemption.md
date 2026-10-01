@@ -1441,3 +1441,140 @@ surface: during the reservation-only period, a direct-ingest or merge candidate 
 the reserved key outright rather than admitting it. A proposal's property-bearing changeset paths
 take the same reservation check independently of any kind-owned proposal-note refusal a pack
 registers under [ADR-017](ADR-017-pack-standard.md).
+
+## Amendment 5 (2026-09-28): the route inventory's population and its two write classes
+
+**Status**: Accepted (2026-09-28).
+
+Originating issue(s): #2057
+
+This amendment makes [Amendment 4](#amendment-4-2026-09-22-a-runtime-owned-admission-sequence-a-route-inventory-and-the-finalizers-transaction)'s
+route inventory checkable. It does not change the admission sequence, the reservation rule, the
+admission-capable enumeration, or the finalizer's scope; every route stays reservation-only.
+
+### Population
+
+The inventory's population is defined by the write primitives, not by where a check already runs.
+A properties-bearing write route is any production site that reaches the `entities` or `notes`
+properties through (a) an entity or note store write method, (b) a storage statement builder used
+outside the storage crate, or (c) SQL text naming either table's insert or update outside the
+storage crate. Test code is not a route: items under `#[cfg(test)]`, `#[test]` functions wherever
+they sit, and `tests/` and `benches/` targets. Every other site maps to exactly one inventory row.
+A test fails when a site has no row, and when a row names a site that no longer exists. The list of
+store write methods is itself checked against the store traits, so a new write method cannot sit
+outside it.
+
+Raw database administration and migration tooling, which Amendment 4 names as a privileged escape,
+are inventoried as privileged-escape rows that cite that sentence. They are never omitted.
+
+### Two write classes
+
+- **Whole-object writes** set the properties object as a whole: an upsert, a replace, or an update
+  of the `properties` column from a value the site built. The final object, after any merge that
+  carries stored properties forward, reaches the shared reservation check before the write. Stage 4
+  already counts carrying a stored property forward as a write, so a whole-object write that only
+  copies stored keys and adds fixed ones owes the same check. A stored row that already carries
+  the reserved key is refused with the reservation error, never stripped: stripping would change a
+  record's security posture as a side effect of an unrelated write.
+- **Single-key writes** set or remove exactly one top-level property named by a literal path whose
+  top-level segment is a bare identifier: ASCII letters, digits and underscore, not starting with a
+  digit, optionally after a `$` root and a `.` separator. The reserved key contains `:`, so no bare
+  identifier names it, and such a write cannot create, replace or remove it. The inventory records
+  these rows as reserved by construction and the census checks the literal at build time; the
+  public note-store patch guard applies the same bare-identifier rule at run time.
+
+Any other path spelling is a whole-object write for this purpose: a quoted label, a bracket form,
+the bare `$` root that replaces the whole object, or a path computed from input. This is the rule's
+falsifier. A single-key row whose path is not a bare-identifier literal is misclassified, and the
+census treats it as a whole-object write that owes the check.
+
+### Fields and acceptance
+
+Each row records its final stored target, kind-policy stage, reservation path (a named check, or
+reserved by construction), transaction owner, stamp capability, acceptance entry, and, where the
+route will bind to one, the finalizer entry-point family. Every family in the finalizer declaration
+is named by at least one row. Stamp capability stays reservation-only until the finalizer is wired;
+naming a family does not make a route admission-capable.
+
+A route repaired or first surfaced under this amendment ships with a test that enters its real path
+and observes the refusal. A route that already reached the reservation check before this amendment
+may carry a missing acceptance entry. The number of such rows is pinned, so a new missing entry fails
+the census, and each one is listed in a follow-up issue.
+
+## Amendment 6 (2026-09-30): fixed sets of literal property paths
+
+**Status**: Accepted (2026-10-01).
+
+Originating issue(s): #3629, #2057
+
+This amendment extends Amendment 5's source-side write classification to a fixed set of top-level
+property paths. It preserves that amendment's population, the reserved-key rule, transaction
+ownership and reservation-only stamp capability. It grants no content-manifest exemption or
+admission capability to a new route. Amendment 5 continues to govern whole-object writes and any
+path whose safety the census cannot establish.
+
+### Fixed-key sets and the one-member case
+
+A fixed-key-set write sets or removes a nonempty, statically known set of top-level properties.
+Every path is a literal whose top-level segment satisfies Amendment 5's bare-identifier rule:
+ASCII letters, digits or underscore, not starting with a digit, optionally following `$` and `.`.
+The reserved `khive:secret_gate` label contains `:`, so none of these literals addresses it.
+Every member owes that proof; one safe member does not excuse another unclassified member.
+
+The inventory declares the complete path set. The census extracts actual path arguments from the
+write primitive and compares that set exactly with the declaration. Path labels and case are
+preserved byte-for-byte; SQL keyword case is not property-label case. Duplicate occurrences may
+collapse to one member only after every occurrence has been classified. `SingleKey` remains the
+one-member representation of this rule; `FixedKeySet` represents sets with more than one unique
+member. An empty set is not a classified properties write.
+
+For SQL, the classified operations are fixed-path `json_set` and `json_remove` applied to the
+existing properties object. The census must identify their path argument positions, not infer
+paths from arbitrary string values, WHERE predicates or identifiers sharing a terminal name.
+If the expression is opaque, transforms the whole object, or combines a fixed setter/remover
+with an unclassified properties replacement, the complete write remains whole-object. An
+inventory declaration cannot override that result.
+
+An inventory row may conservatively retain `WholeObject` coverage of a proved fixed-key set only
+when its declared shared reservation check is actually observed on that write path. That row
+continues to owe the whole-object check; discovering literal paths does not replace it with
+reservation by construction. Removing that named check must fail the census. A `SingleKey` or
+`FixedKeySet` row still owes an exact match to the complete proved set and cannot use this
+conservative coverage rule.
+
+### Falsifiers and reservation ownership
+
+Any computed path, bracket or quoted-label spelling, the bare `$` root, or any member failing the
+bare-identifier rule reclassifies the complete write as whole-object. The ordinary shared
+reservation check is then required under Amendment 5; no fixed-key-set row can waive it. A
+mismatched, missing or extra declared member fails the closed census. A path whose source binding
+cannot be resolved is not proved safe by another resolved reference in the same function.
+
+A fixed-key-set route is reserved by construction and remains reservation-only. It cannot create,
+replace or remove the reserved stamp. The SQL operation may preserve unrelated stored properties;
+this amendment does not authorize a caller-built whole-object copy or change any writer's runtime
+behavior. Every row still records target, kind policy, transaction owner, stamp capability and
+real-path acceptance. The general privileged migration escape is unchanged.
+
+The duplicate quarantine repair is an application of this rule: its guarded message-note UPDATE
+sets exactly `$.channel_slug` and `$.quarantine_content_ref`; its other updated columns do not
+write properties. The inventory names the repair function and its existing legacy-replay
+acceptance path. An obsolete row for an ingest write that no longer exists must be retired rather
+than retained as an orphan or mapped to an unrelated checker.
+
+### Acceptance and activation
+
+Before this rule binds, acceptance must exercise safe single-member and multi-member sets and
+removals, duplicate-path handling, case-distinct labels, exact declared-set mismatch, and the
+computed/quoted/bracket/root/non-bare falsifiers. Each unprovable case must remain whole-object;
+it must fail an inventory row claiming reservation by construction. A must-DENY control must
+itself demonstrate that refusal, so a dead or permissive instrument cannot certify the newly
+accepted fixed-set population. The reader must assess coverage of that population, not merely
+count named fixtures.
+
+The terminal-name collision and mixed resolved/unresolved reference controls remain independent
+obligations. Removing the quarantine inventory repair against the merged source must fail on
+both the new unmapped repair and the obsolete orphan. Real-path replay acceptance must also pass.
+
+Source classification and authored fixtures are not executed acceptance; stamp activation
+remains subject to the existing finalizer gates.

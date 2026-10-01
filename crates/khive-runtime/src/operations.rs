@@ -7978,7 +7978,7 @@ impl KhiveRuntime {
             .iter()
             .enumerate()
             .map(|(index, entity)| {
-                let mut plan = bulk_entity_plan(entity);
+                let mut plan = bulk_entity_plan(entity)?;
                 if injected_failure_index == Some(index) {
                     // Keep the guarded row insert; replace its FTS pair with the fault.
                     plan.statements.truncate(1);
@@ -7993,9 +7993,9 @@ impl KhiveRuntime {
                         guard: None,
                     });
                 }
-                AtomicOpPlan::AddEntity(plan)
+                Ok(AtomicOpPlan::AddEntity(plan))
             })
-            .collect();
+            .collect::<RuntimeResult<Vec<_>>>()?;
 
         match run_atomic_unit(self.sql().as_ref(), plans).await {
             Ok(AtomicRunOutcome::Committed { .. }) => Ok(entities),
@@ -8072,7 +8072,7 @@ impl KhiveRuntime {
         let _ = self.entities(token)?;
         let _ = self.text(token)?;
 
-        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity));
+        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity)?);
         Ok((entity, plan))
     }
 
@@ -8134,7 +8134,8 @@ pub struct NoteCreateSpec {
     pub properties: Option<serde_json::Value>,
 }
 
-fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
+fn bulk_entity_plan(entity: &Entity) -> RuntimeResult<AddEntityPlan> {
+    crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
     let mut statements = vec![PlanStatement {
         statement: entity_upsert_statement(entity),
         guard: Some(AffectedRowGuard::exactly(1)),
@@ -8148,11 +8149,11 @@ fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
                 guard: None,
             }),
     );
-    AddEntityPlan {
+    Ok(AddEntityPlan {
         entity_id: entity.id,
         statements,
         post_commit: PostCommitEffect::None,
-    }
+    })
 }
 
 fn guarded_link_batch_failure(
@@ -20967,6 +20968,26 @@ mod tests {
                 None,
                 Some(reserved_key_props()),
                 vec![],
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_create_note_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let err = rt
+            .try_create_note(
+                &tok,
+                "observation",
+                None,
+                "reserved-key conditional note",
+                Some(reserved_key_props()),
             )
             .await
             .expect_err("caller-supplied reserved key must be rejected");
