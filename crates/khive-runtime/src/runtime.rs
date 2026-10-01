@@ -429,25 +429,47 @@ impl KhiveRuntime {
     /// [`from_backend`](Self::from_backend) seam is likewise only for an
     /// already-prepared backend.
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
-        Self::new_with_file_backend(config, |path| StorageBackend::sqlite(path))
+        Self::new_with_file_backend(config, true, |path| StorageBackend::sqlite(path))
+    }
+
+    /// Construct a dedicated code-map runtime. Every connection in its pool
+    /// selects the native handle-proving VFS before the first schema read or
+    /// migration. The caller prepares the omitted-db parent; an explicit
+    /// target receives no path transform or directory creation here.
+    pub fn new_code_map(
+        config: RuntimeConfig,
+        protected_main: Vec<std::path::PathBuf>,
+        protected_events: Vec<std::path::PathBuf>,
+    ) -> RuntimeResult<Self> {
+        if config.db_path.is_none() {
+            return Err(RuntimeError::InvalidInput(
+                "code-map runtime requires a guarded file-backed database".into(),
+            ));
+        }
+        Self::new_with_file_backend(config, false, move |path| {
+            StorageBackend::sqlite_code_map(path, &protected_main, &protected_events)
+        })
     }
 
     /// Construct a fixture runtime with a small concurrent reader pool.
     #[cfg(any(test, feature = "test-internals"))]
     pub fn new_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
-        Self::new_with_file_backend(config, |path| StorageBackend::sqlite_for_test(path))
+        Self::new_with_file_backend(config, true, |path| StorageBackend::sqlite_for_test(path))
     }
 
     fn new_with_file_backend(
         config: RuntimeConfig,
+        create_parent: bool,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
         #[cfg(all(test, target_os = "macos"))]
         ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {
             Some(path) => {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).ok();
+                if create_parent {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).ok();
+                    }
                 }
                 open_file(path)?
             }

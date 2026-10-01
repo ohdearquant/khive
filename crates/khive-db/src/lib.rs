@@ -7,6 +7,9 @@
 pub mod backend;
 /// Periodic WAL checkpoint task.
 pub mod checkpoint;
+// Kept internal while the code-map constructor and SQLite callback wiring land.
+#[allow(dead_code)]
+mod code_map_vfs;
 /// Read-only-by-intent database-integrity and WAL/checkpoint diagnostics.
 pub mod diagnostics;
 /// Error types for the SQLite layer.
