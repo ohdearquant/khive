@@ -327,17 +327,19 @@ fn sql_write_shapes(literal: &str) -> (Option<Substrate>, Option<Substrate>) {
                 if matches!(head.first().copied(), Some("ON" | "OF")) || head.len() > 7 {
                     continue;
                 }
+                // An update counts when PROPERTIES appears anywhere after SET.
+                // Cutting the SET clause at the first WHERE would miss a write
+                // that follows a subquery or a string containing that word, so
+                // an update that only reads properties is reported as well.
+                if !after_set.contains(&"PROPERTIES") {
+                    continue;
+                }
                 match guarded_head(head) {
                     Some((target, true, used)) if update_tail_is_known(&head[used..]) => {
-                        let set_clause = after_set.split(|candidate| *candidate == "WHERE").next();
-                        if set_clause.is_some_and(|clause| clause.contains(&"PROPERTIES")) {
-                            routes.push(target);
-                        }
+                        routes.push(target);
                     }
-                    Some((target, _, _)) if after_set.contains(&"PROPERTIES") => {
-                        unclassified.push(target);
-                    }
-                    _ => {}
+                    Some((target, _, _)) => unclassified.push(target),
+                    None => {}
                 }
             }
             _ => {}
@@ -3403,6 +3405,14 @@ fn every_spelling_of_a_guarded_table_write_is_reported() {
             "INSERT INTO main.entities (id, properties) VALUES (?1, ?2)",
             Substrate::Entity,
         ),
+        (
+            "UPDATE notes SET other = (SELECT 1 WHERE 0), properties = ?1 WHERE id = ?2",
+            Substrate::Note,
+        ),
+        (
+            "UPDATE entities SET kind = 'where', properties = ?1 WHERE id = ?2",
+            Substrate::Entity,
+        ),
     ] {
         assert_eq!(sql_target(sql), Some(target), "{sql}");
         assert_eq!(sql_unclassified_write(sql), None, "{sql}");
@@ -3540,6 +3550,16 @@ fn guarded_table_statements_that_write_no_properties_are_not_routes() {
         assert_eq!(sql_unclassified_write(sql), None, "{sql}");
         assert!(synthetic_sql_sites(sql).is_empty(), "{sql}");
     }
+}
+
+#[test]
+fn an_update_that_names_properties_after_set_is_reported_even_when_it_only_reads_them() {
+    let sql = "UPDATE notes SET key = ?1 WHERE id = ?2 AND properties IS NULL";
+    assert_eq!(sql_target(sql), Some(Substrate::Note), "{sql}");
+    assert_eq!(sql_unclassified_write(sql), None, "{sql}");
+    let sql = "UPDATE other.notes SET updated_at = ?1 WHERE properties IS NULL";
+    assert_eq!(sql_target(sql), None, "{sql}");
+    assert_eq!(sql_unclassified_write(sql), Some(Substrate::Note), "{sql}");
 }
 
 #[test]
