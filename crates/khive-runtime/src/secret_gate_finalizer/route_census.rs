@@ -46,6 +46,7 @@ const NON_PROPERTIES_STORE_METHODS: &[&str] = &[
     "entity_sequence",
     "query_entities_after",
     "count_entities",
+    "count_entities_by_type",
     "get_entity_including_deleted",
     "get_live_notes_by_key",
     "query_keyed_notes",
