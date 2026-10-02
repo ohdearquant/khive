@@ -880,6 +880,7 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
 /// A GraphStore backed by SQLite tables.
 pub struct SqlGraphStore {
     pool: Arc<ConnectionPool>,
+    index_repair: Option<super::index_repair::IndexRepairContext>,
     is_file_backed: bool,
     /// Default namespace for multi-record queries (ADR-007 PARAM-ONLY: used as a
     /// WHERE filter on `query_edges`/`neighbors`/`traverse`, never as an
@@ -910,10 +911,34 @@ impl SqlGraphStore {
 
         Self {
             pool,
+            index_repair: None,
             is_file_backed,
             namespace: namespace.into(),
             writer_task,
         }
+    }
+
+    pub(crate) fn with_index_repair(
+        mut self,
+        repair: super::index_repair::IndexRepairContext,
+    ) -> Self {
+        self.index_repair = Some(repair);
+        self
+    }
+
+    async fn with_indexed_reader<F, R>(&self, op: &'static str, read: F) -> Result<R, StorageError>
+    where
+        F: FnMut(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        super::index_repair::run_indexed_read(
+            Arc::clone(&self.pool),
+            self.index_repair.clone(),
+            StorageCapability::Graph,
+            op,
+            read,
+        )
+        .await
     }
 
     fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
@@ -2131,7 +2156,7 @@ impl GraphStore for SqlGraphStore {
         let node_id = node_id.to_string();
         let kind = kind.to_owned();
         let tag = tag.to_owned();
-        self.with_reader("latest_annotating_note", move |conn| {
+        self.with_indexed_reader("latest_annotating_note", move |conn| {
             conn.query_row(
                 LATEST_ANNOTATING_NOTE_SQL,
                 rusqlite::params![namespace, node_id, kind, tag],
@@ -2159,7 +2184,7 @@ impl GraphStore for SqlGraphStore {
         let tag = tag.to_owned();
         let property_key = property_key.to_owned();
         let property_value = property_value.to_owned();
-        self.with_reader("latest_annotating_note_with_property", move |conn| {
+        self.with_indexed_reader("latest_annotating_note_with_property", move |conn| {
             conn.query_row(
                 LATEST_ANNOTATING_NOTE_WITH_PROPERTY_SQL,
                 rusqlite::params![namespace, node_id, kind, tag, property_key, property_value],
@@ -3367,6 +3392,35 @@ impl GraphStore for SqlGraphStore {
             .filter(|root| distinct_roots.insert(*root))
             .collect::<Vec<_>>();
         let opts = request.options;
+        if self
+            .index_repair
+            .as_ref()
+            .is_some_and(super::index_repair::IndexRepairContext::is_writable)
+        {
+            // Prepare the actual indexed adjacency statements before BFS takes
+            // its long-lived reader. This preparation consumes no walk rows or
+            // query counters. A schema change during the walk remains its
+            // original typed failure; we never restart BFS or renew its budget.
+            let directions = match opts.direction {
+                Direction::Out => vec![Direction::Out],
+                Direction::In => vec![Direction::In],
+                Direction::Both => vec![Direction::Out, Direction::In],
+            };
+            let relation_count = opts.relations.as_ref().map_or(0, Vec::len);
+            let statements = directions
+                .into_iter()
+                .map(|direction| {
+                    traversal_neighbor_sql(direction, relation_count, opts.min_weight.is_some())
+                })
+                .collect::<Vec<_>>();
+            self.with_indexed_reader("traverse", move |conn| {
+                for sql in &statements {
+                    let _statement = conn.prepare(sql)?;
+                }
+                Ok(())
+            })
+            .await?;
+        }
         let include_roots = request.include_roots;
         let namespace = self.namespace.clone();
         let origin = self.pool.origin();
@@ -3448,3 +3502,7 @@ mod annotation_tests;
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "graph_index_repair_tests.rs"]
+mod index_repair_tests;

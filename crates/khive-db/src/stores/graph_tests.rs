@@ -119,6 +119,10 @@ pub(super) mod traverse_snapshot_seam {
         (reached_rx, proceed_tx)
     }
 
+    pub(crate) fn uninstall() {
+        *BARRIER.lock().unwrap() = None;
+    }
+
     pub(crate) fn hook(node_id: Uuid) {
         let barrier = {
             let mut slot = BARRIER.lock().unwrap();

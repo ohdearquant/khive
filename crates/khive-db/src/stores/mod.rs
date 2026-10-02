@@ -18,6 +18,7 @@ pub mod blob_s3;
 pub mod entity;
 pub mod event;
 pub mod graph;
+pub(crate) mod index_repair;
 pub mod note;
 pub mod sparse;
 pub mod text;

@@ -210,7 +210,7 @@ fn validate_vector_table_columns(
 }
 
 #[derive(Clone, Copy, Debug)]
-enum StoreSchemaKind {
+pub(crate) enum StoreSchemaKind {
     Entities,
     Graph,
     Notes,
@@ -219,16 +219,36 @@ enum StoreSchemaKind {
 }
 
 #[derive(Default)]
-struct StoreSchemaGate {
-    ready: AtomicBool,
+pub(crate) struct StoreSchemaGate {
+    pub(crate) ready: AtomicBool,
     #[cfg(test)]
-    attempts: AtomicUsize,
+    pub(crate) attempts: AtomicUsize,
+}
+
+impl StoreSchemaGate {
+    pub(crate) fn ensure(
+        &self,
+        conn: &rusqlite::Connection,
+        ensure: fn(&rusqlite::Connection) -> Result<(), rusqlite::Error>,
+    ) -> Result<(), rusqlite::Error> {
+        // A concurrent initializer or repair may have completed while this
+        // caller waited for the writer. Publish readiness only after success.
+        if self.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        ensure(conn)?;
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
 }
 
 /// Concrete storage backend providing capability traits.
 ///
 /// Capability schemas are initialized once per backend. An index removed by
-/// another process after initialization is recreated when this backend reopens.
+/// another process is repaired on the narrowly supported forced-index read paths. Other
+/// external schema changes may still require reopening the backend.
 pub struct StorageBackend {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
@@ -240,7 +260,7 @@ pub struct StorageBackend {
     /// #827). Also exposed via
     /// `notes_seq_repair_run_count` for regression tests.
     notes_seq_repair_runs: AtomicUsize,
-    store_schemas: [StoreSchemaGate; 5],
+    store_schemas: [Arc<StoreSchemaGate>; 5],
 }
 
 impl StorageBackend {
@@ -317,7 +337,7 @@ impl StorageBackend {
             is_file_backed: true,
             path: Some(resolved),
             notes_seq_repair_runs: AtomicUsize::new(0),
-            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
     }
 
@@ -376,7 +396,7 @@ impl StorageBackend {
             is_file_backed: true,
             path: Some(resolved),
             notes_seq_repair_runs: AtomicUsize::new(0),
-            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
     }
 
@@ -397,7 +417,7 @@ impl StorageBackend {
             is_file_backed: false,
             path: None,
             notes_seq_repair_runs: AtomicUsize::new(0),
-            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
     }
 
@@ -690,11 +710,18 @@ impl StorageBackend {
         }
         self.ensure_store_schema(StoreSchemaKind::Graph, graph::ensure_graph_schema)?;
 
-        Ok(Arc::new(graph::SqlGraphStore::new_scoped(
-            Arc::clone(&self.pool),
-            self.is_file_backed,
-            namespace.trim().to_string(),
-        )))
+        Ok(Arc::new(
+            graph::SqlGraphStore::new_scoped(
+                Arc::clone(&self.pool),
+                self.is_file_backed,
+                namespace.trim().to_string(),
+            )
+            .with_index_repair(crate::stores::index_repair::IndexRepairContext::new(
+                Arc::clone(&self.pool),
+                self.store_schemas.clone(),
+                crate::stores::index_repair::IndexReadKind::Graph,
+            )),
+        ))
     }
 
     fn ensure_store_schema(
@@ -719,16 +746,7 @@ impl StorageBackend {
         conn: &rusqlite::Connection,
         ensure: fn(&rusqlite::Connection) -> Result<(), rusqlite::Error>,
     ) -> Result<(), SqliteError> {
-        let gate = &self.store_schemas[kind as usize];
-        // Another first caller may have initialized this kind before this
-        // caller acquired the writer. Only successful batches publish readiness.
-        if gate.ready.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        #[cfg(test)]
-        gate.attempts.fetch_add(1, Ordering::Relaxed);
-        ensure(conn)?;
-        gate.ready.store(true, Ordering::Release);
+        self.store_schemas[kind as usize].ensure(conn, ensure)?;
         Ok(())
     }
 
@@ -790,10 +808,15 @@ impl StorageBackend {
             }
         }
 
-        Ok(Arc::new(note::SqlNoteStore::new(
-            Arc::clone(&self.pool),
-            self.is_file_backed,
-        )))
+        Ok(Arc::new(
+            note::SqlNoteStore::new(Arc::clone(&self.pool), self.is_file_backed).with_index_repair(
+                crate::stores::index_repair::IndexRepairContext::new(
+                    Arc::clone(&self.pool),
+                    self.store_schemas.clone(),
+                    crate::stores::index_repair::IndexReadKind::Notes,
+                ),
+            ),
+        ))
     }
 
     /// How many times the lazy `notes_seq` anti-join repair has actually
@@ -1304,6 +1327,10 @@ fn ann_root_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 #[path = "backend/store_accessor_tests.rs"]
 mod store_accessor_tests;
+
+#[cfg(test)]
+#[path = "backend/store_accessor_index_tests.rs"]
+mod store_accessor_index_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3187,7 +3214,7 @@ mod tests {
             is_file_backed: true,
             path: Some(path),
             notes_seq_repair_runs: AtomicUsize::new(0),
-            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         };
         (dir, backend)
     }
@@ -3279,7 +3306,7 @@ mod tests {
             is_file_backed: true,
             path: Some(path.clone()),
             notes_seq_repair_runs: AtomicUsize::new(0),
-            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         };
         let pool_b = ConnectionPool::new(cfg(path.clone())).expect("pool B should open");
         let backend_b = StorageBackend {
@@ -3287,7 +3314,7 @@ mod tests {
             is_file_backed: true,
             path: Some(path),
             notes_seq_repair_runs: AtomicUsize::new(0),
-            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         };
 
         let entities = backend_a
