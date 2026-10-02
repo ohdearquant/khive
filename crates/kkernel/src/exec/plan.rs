@@ -31,7 +31,7 @@ fn validate_args(args: &ExecArgs) -> Result<&str> {
 pub(super) async fn run(args: &ExecArgs) -> Result<Value> {
     use khive_mcp::serve::{
         normalize_redundant_db_override_with_source, resolve_runtime_config_with_db_anchor,
-        validate_declared_backend_access_modes, RuntimeConfigInputs,
+        validate_declared_backend_access_modes, validate_wal_ceiling_topology, RuntimeConfigInputs,
     };
     use khive_mcp::server::{compute_config_id, compute_config_id_with_storage_mode};
     use khive_runtime::daemon::{
@@ -73,6 +73,7 @@ pub(super) async fn run(args: &ExecArgs) -> Result<Value> {
     if !force_memory {
         validate_declared_backend_access_modes(&khive_cfg.backends)?;
     }
+    validate_wal_ceiling_topology(&cfg, &khive_cfg.backends, force_memory)?;
     let config_id = if force_memory {
         compute_config_id_with_storage_mode(&cfg, Some(&khive_cfg), false)
     } else {

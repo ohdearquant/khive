@@ -49,13 +49,15 @@ pub(super) struct KgTaxonomy {
 /// `crates/kkernel/docs/kg-rules.md#build_taxonomy--strict-actor-mode-exemption`
 /// for why this metadata-only path is exempt from that comm-boundary guard.
 pub(super) fn build_taxonomy() -> Result<KgTaxonomy> {
+    // Pack-registry metadata has no file-backed writer; ADR-194 allows this explicit opt-out.
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: khive_runtime::Namespace::parse("kkernel-validate")
             .unwrap_or_else(|_| khive_runtime::Namespace::local()),
         embedding_model: None,
         ..RuntimeConfig::default()
-    };
+    }
+    .for_metadata_registry();
     let runtime = KhiveRuntime::new(config).context("building taxonomy registry")?;
     let mut builder = VerbRegistryBuilder::new();
     let names: Vec<String> = PackRegistry::discovered_names()
@@ -93,13 +95,15 @@ pub(super) fn build_taxonomy() -> Result<KgTaxonomy> {
 /// rule class consults the same live data the `link`/`update` verbs enforce,
 /// never a hand-copied snapshot.
 fn build_pack_edge_rules() -> Result<Vec<EdgeEndpointRule>> {
+    // Pack-registry metadata has no file-backed writer; ADR-194 allows this explicit opt-out.
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: khive_runtime::Namespace::parse("kkernel-validate")
             .unwrap_or_else(|_| khive_runtime::Namespace::local()),
         embedding_model: None,
         ..RuntimeConfig::default()
-    };
+    }
+    .for_metadata_registry();
     let runtime = KhiveRuntime::new(config).context("building edge-rules registry")?;
     let mut builder = VerbRegistryBuilder::new();
     let names: Vec<String> = PackRegistry::discovered_names()
