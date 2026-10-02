@@ -1,10 +1,10 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Studio } from "@/components/studio";
 import { demoReviewFixture } from "@/lib/fixtures/demo-review";
-import { REVIEW_IMPORT_MAX_BYTES, type ReviewBundle, type ReviewReport } from "@/lib/review-bundle";
+import { parseReviewInput, REVIEW_IMPORT_MAX_BYTES, type ReviewBundle, type ReviewReport } from "@/lib/review-bundle";
 
 const zeroPageCases = [
   {
@@ -74,8 +74,22 @@ function cliReviewReport(): ReviewReport {
   };
 }
 
+function mockDownloads() {
+  class DownloadURL extends URL {
+    static createObjectURL = vi.fn<(value: Blob | MediaSource) => string>(() => "blob:review-download");
+    static revokeObjectURL = vi.fn<(url: string) => void>();
+  }
+  vi.stubGlobal("URL", DownloadURL);
+  const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+  return { createObjectURL: DownloadURL.createObjectURL, revokeObjectURL: DownloadURL.revokeObjectURL, click };
+}
+
 describe("KG Studio", () => {
   beforeEach(() => window.history.replaceState(null, "", "/review"));
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
 
   it("makes the no-write and unavailable capability boundary visible", () => {
     render(<Studio initialBundle={demoReviewFixture} />);
@@ -349,6 +363,85 @@ describe("KG Studio", () => {
     await user.upload(input!, oversized);
 
     expect(await screen.findByText(/exceeds the 2 MiB local import limit/i)).toBeVisible();
+  });
+
+  it.each(["bundle", "report"] as const)("warns without downloading a %s whose serialization throws", async (kind) => {
+    const user = userEvent.setup();
+    const downloads = mockDownloads();
+    const input = kind === "bundle" ? structuredClone(demoReviewFixture) : cliReviewReport();
+    const serialized = JSON.stringify(input);
+    const circular: { self?: unknown } = {};
+    circular.self = circular;
+    input.change_set.operations[0].after = {
+      ...input.change_set.operations[0].after,
+      download_serialization_fixture: circular,
+    };
+    const normalized = parseReviewInput(input);
+    expect(normalized.change_set.operations[0].after?.download_serialization_fixture).toBe(circular);
+    expect(() => JSON.stringify(normalized, null, 2)).toThrow(TypeError);
+
+    // JSON cannot encode a cycle; introduce it only at this fixture's parsed-input boundary.
+    const nativeParse = JSON.parse;
+    const parse = vi.spyOn(JSON, "parse").mockImplementation((text, reviver) =>
+      text === serialized ? input : nativeParse(text, reviver));
+    const imported = new File([serialized], `review-${kind}.json`, { type: "application/json" });
+    Object.defineProperty(imported, "text", { value: () => Promise.resolve(serialized) });
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
+    await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, imported);
+    expect(await screen.findByText(kind === "bundle" ? /Loaded review bundle/ : /Loaded a read-only khive CLI review report/)).toBeVisible();
+    expect(parse).toHaveBeenCalledWith(serialized);
+
+    const nativeStringify = JSON.stringify;
+    const stringify = vi.spyOn(JSON, "stringify");
+    await user.click(screen.getByRole("button", { name: kind === "bundle" ? "Download review bundle" : "Download review report" }));
+
+    const downloadCall = stringify.mock.calls.find(([value, replacer, space]) =>
+      replacer === null && space === 2 &&
+      (value as ReviewBundle | ReviewReport | undefined)?.change_set?.operations[0].after?.download_serialization_fixture === circular);
+    expect(downloadCall).toBeDefined();
+    expect(() => nativeStringify(downloadCall?.[0], null, 2)).toThrow(TypeError);
+    const warning = screen.getByText(/^Bundle download failed: .+/);
+    expect(warning).toBeVisible();
+    expect(warning.closest('[role="status"]')).toHaveClass("warning");
+    expect(downloads.createObjectURL).not.toHaveBeenCalled();
+    expect(downloads.click).not.toHaveBeenCalled();
+    expect(downloads.revokeObjectURL).not.toHaveBeenCalled();
+  });
+
+  it.each(["bundle", "report"] as const)("downloads a serializable %s with its original JSON content", async (kind) => {
+    const user = userEvent.setup();
+    const downloads = mockDownloads();
+    const input = kind === "bundle" ? demoReviewFixture : cliReviewReport();
+    const { container } = render(<Studio initialBundle={demoReviewFixture} />);
+    if (kind === "report") {
+      const serialized = JSON.stringify(input);
+      const imported = new File([serialized], "core-review.json", { type: "application/json" });
+      Object.defineProperty(imported, "text", { value: () => Promise.resolve(serialized) });
+      await user.upload(container.querySelector<HTMLInputElement>('input[type="file"]')!, imported);
+      expect(await screen.findByText(/Loaded a read-only khive CLI review report/)).toBeVisible();
+    }
+
+    await user.click(screen.getByRole("button", { name: kind === "bundle" ? "Download review bundle" : "Download review report" }));
+
+    expect(downloads.createObjectURL).toHaveBeenCalledTimes(1);
+    const blob = downloads.createObjectURL.mock.calls[0][0] as Blob;
+    expect(blob).toBeInstanceOf(Blob);
+    expect(blob.type).toBe("application/json");
+    const downloaded = await new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsText(blob);
+    });
+    expect(JSON.parse(downloaded)).toEqual(input);
+    expect(downloads.click).toHaveBeenCalledTimes(1);
+    expect(downloads.click.mock.contexts[0]).toHaveProperty("href", "blob:review-download");
+    expect(downloads.click.mock.contexts[0]).toHaveProperty("download", kind === "bundle"
+      ? `${demoReviewFixture.repository.name}-review-${demoReviewFixture.pull_request.number}.json`
+      : `${input.change_set.envelope.batch_id ?? "changeset"}-review.json`);
+    expect(downloads.revokeObjectURL).toHaveBeenCalledTimes(1);
+    expect(downloads.revokeObjectURL).toHaveBeenCalledWith("blob:review-download");
+    expect(screen.queryByText(/^Bundle download failed/)).not.toBeInTheDocument();
   });
 
   it("resets local conversation notes when the imported review identity changes", async () => {
