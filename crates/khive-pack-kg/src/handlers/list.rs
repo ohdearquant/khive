@@ -606,8 +606,7 @@ impl KgPack {
                 // row-level filter keeps the store's own offset and cursor. The
                 // capped scan below would stop at MAX_SCAN_TOTAL and leave rows
                 // past it unreachable by offset.
-                let has_note_filter =
-                    p.tags.as_ref().is_some_and(|tags| !tags.is_empty()) || message_filters;
+                let has_note_filter = message_filters;
                 const PAGE_SIZE: u32 = 200;
                 const MAX_SCAN_TOTAL: u32 = 10_000;
 
