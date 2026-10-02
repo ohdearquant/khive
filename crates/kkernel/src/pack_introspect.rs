@@ -73,13 +73,15 @@ pub struct PackInfo {
 /// strict-mode deployment. See `enforce_strict_actor_mode` in
 /// `crates/khive-mcp/src/serve.rs` for the authoritative boundary definition.
 fn build_registry() -> Result<(PackMetadataRegistry, KhiveRuntime)> {
+    // Pack-registry metadata has no file-backed writer; ADR-194 allows this explicit opt-out.
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: khive_runtime::Namespace::parse("kkernel-introspect")
             .unwrap_or_else(|_| khive_runtime::Namespace::local()),
         embedding_model: None,
         ..RuntimeConfig::default()
-    };
+    }
+    .for_metadata_registry();
     let runtime = KhiveRuntime::new(config).context("building introspection runtime")?;
     let mut builder = VerbRegistryBuilder::new();
     let names: Vec<String> = PackRegistry::discovered_names()

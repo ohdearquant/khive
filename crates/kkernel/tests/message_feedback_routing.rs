@@ -37,6 +37,7 @@ async fn fixture_with_gate(gate: khive_runtime::GateRef) -> Fixture {
                 path: Some(dir.path().join(format!("{name}.db"))),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             })
