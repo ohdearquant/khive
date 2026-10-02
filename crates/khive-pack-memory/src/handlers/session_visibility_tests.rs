@@ -477,3 +477,164 @@ async fn empty_fences_allow_text_only_session_recall() {
         "text-only session recall omitted the matching memory: {recalled:?}"
     );
 }
+
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication() {
+    use khive_db::namespace_move::{move_namespace, MoveRequest, MoveRoute, SubjectClass};
+
+    let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
+    backend.prepare_core_schema().expect("core schema");
+    let rt = KhiveRuntime::from_backend(backend.clone(), RuntimeConfig::no_embeddings());
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: 16,
+    });
+    let (registry, shared_ann) = registry_with_ann(&rt);
+    let source = "visibility-move-source";
+    let target = "visibility-move-target";
+    let identity = |namespace: &str| RequestIdentity {
+        namespace: namespace.to_owned(),
+        ..Default::default()
+    };
+    let remember_args = |namespace: &str| {
+        json!({
+            "content": CONTENT,
+            "memory_type": "semantic",
+            "namespace": namespace,
+            "key": "moved-visibility-key",
+        })
+    };
+    let target_session_request = |visibility_token: Value| {
+        let mut request = session_request(CONTENT, visibility_token);
+        request["namespace"] = json!(target);
+        request
+    };
+    let original = registry
+        .dispatch_with_identity(
+            "memory.remember",
+            remember_args(source),
+            Some(identity(source)),
+        )
+        .await
+        .expect("keyed source remember");
+    let old_seq = original["visibility_token"]["fences"][0]["ann_write_log_seq"]
+        .as_u64()
+        .expect("original write fence");
+    let destination_seq: i64 = {
+        let connection = backend.pool().writer().expect("move writer");
+        let request = MoveRequest::new(
+            source,
+            vec![MoveRoute {
+                class: SubjectClass::Note("memory".to_owned()),
+                target: target.to_owned(),
+            }],
+        );
+        connection.transaction(|conn| {
+            move_namespace(conn, &request).expect("move keyed memory and vector");
+            let seq = conn.query_row(
+                "SELECT seq FROM ann_write_log WHERE namespace = ?1 AND subject_id = ?2 \
+                 AND embedding_model = ?3 AND kind = 'note' AND field = 'note.content' AND op = 'upsert'",
+                [target, original["id"].as_str().unwrap(), MODEL],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(seq)
+        }).expect("move transaction")
+    };
+    assert!(u64::try_from(destination_seq).unwrap() > old_seq);
+    let log_rows_before_replay = {
+        let connection = backend.pool().reader().expect("log reader");
+        connection
+            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("log count")
+    };
+    let replay = registry
+        .dispatch_with_identity(
+            "memory.remember",
+            remember_args(target),
+            Some(identity(target)),
+        )
+        .await
+        .expect("exact keyed replay in destination");
+    assert_eq!(replay["id"], original["id"]);
+    assert_eq!(replay["replayed"], true);
+    let receipt = replay["visibility_token"].clone();
+    assert_eq!(receipt["namespace"], target);
+    assert_eq!(receipt["fences"][0]["ann_write_log_seq"], destination_seq);
+    {
+        let connection = backend.pool().reader().expect("replay log reader");
+        let log_rows_after_replay: i64 = connection
+            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| row.get(0))
+            .expect("post-replay log count");
+        assert_eq!(
+            log_rows_after_replay, log_rows_before_replay,
+            "replay writes no replacement log row"
+        );
+    }
+    let target_token = rt
+        .authorize(Namespace::parse(target).unwrap())
+        .expect("target token");
+    assert_eq!(
+        ann::bridge_applied_seq(&shared_ann, &AnnKey::from_token(MODEL)).await,
+        None
+    );
+    let unscoped = registry
+        .dispatch_with_identity(
+            "memory.recall",
+            session_request(CONTENT, receipt.clone()),
+            Some(identity(target)),
+        )
+        .await
+        .expect_err("an identity namespace alone does not widen default read visibility");
+    assert!(matches!(
+        unscoped,
+        RuntimeError::InvalidInput(ref message)
+            if message.contains("visibility_token namespace is not caller-visible")
+    ));
+    let recalled = registry
+        .dispatch_with_identity(
+            "memory.recall",
+            target_session_request(receipt.clone()),
+            Some(identity(target)),
+        )
+        .await
+        .expect("unapplied destination row proves its exact live tail snapshot");
+    assert!(contains_id(&recalled, &original["id"]));
+
+    ann::ensure_ann_for_model(&rt, &target_token, &shared_ann, MODEL)
+        .await
+        .expect("publish moved vector");
+    let applied = ann::bridge_applied_seq(&shared_ann, &AnnKey::from_token(MODEL))
+        .await
+        .expect("published watermark");
+    assert!(applied >= u64::try_from(destination_seq).unwrap());
+    ann::compact_log_for_test(&rt, MODEL)
+        .await
+        .expect("compact published move log");
+    {
+        let connection = backend.pool().reader().expect("compacted log reader");
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log WHERE seq = ?1",
+                [destination_seq],
+                |row| row.get(0),
+            )
+            .expect("compacted destination row count");
+        assert_eq!(
+            remaining, 0,
+            "post-publication arm must use the watermark proof"
+        );
+    }
+    let recalled = registry
+        .dispatch_with_identity(
+            "memory.recall",
+            target_session_request(receipt),
+            Some(identity(target)),
+        )
+        .await
+        .expect("published destination fence remains provable after compaction");
+    assert!(contains_id(&recalled, &original["id"]));
+}
