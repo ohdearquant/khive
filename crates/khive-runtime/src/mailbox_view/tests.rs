@@ -9,6 +9,10 @@ use crate::{
 
 fn config(gate: GateRef) -> RuntimeConfig {
     RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         telemetry: Default::default(),
         web: Default::default(),
         mounts: Vec::new(),

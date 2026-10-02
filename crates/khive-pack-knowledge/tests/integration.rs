@@ -2554,6 +2554,10 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
 
     let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
     let rt = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -2775,6 +2779,10 @@ async fn knowledge_index_persists_audited_bounded_prefixed_fingerprint() {
 
     let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
     let rt = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -5430,6 +5438,10 @@ mod kg_blend {
         pause: Option<Arc<EmbedPause>>,
     ) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -6165,6 +6177,10 @@ mod kg_blend {
 
         let calls = Arc::new(Mutex::new(0usize));
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -6589,6 +6605,10 @@ mod kg_blend {
 
     fn rt_with_failing_blend_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),

@@ -428,14 +428,20 @@ impl KhiveRuntime {
     /// application-assisted V21 cutover complete before serving. The
     /// [`from_backend`](Self::from_backend) seam is likewise only for an
     /// already-prepared backend.
-    pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
-        Self::new_with_file_backend(config, |path| StorageBackend::sqlite(path))
+    pub fn new(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
+        Self::new_with_file_backend(config, |path| {
+            StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, None, wal_ceiling)
+        })
     }
 
     /// Construct a fixture runtime with a small concurrent reader pool.
     #[cfg(any(test, feature = "test-internals"))]
-    pub fn new_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
-        Self::new_with_file_backend(config, |path| StorageBackend::sqlite_for_test(path))
+    pub fn new_for_test(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
+        Self::new_with_file_backend(config, |path| {
+            StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, Some(2), wal_ceiling)
+        })
     }
 
     fn new_with_file_backend(
@@ -451,7 +457,15 @@ impl KhiveRuntime {
                 }
                 open_file(path)?
             }
-            None => StorageBackend::memory()?,
+            None => {
+                if config.wal_ceiling_configured_bytes != 0 || config.wal_ceiling_bytes != 0 {
+                    return Err(khive_db::SqliteError::InvalidConfig(
+                        "nonzero wal_ceiling_bytes requires a file-backed SQLite backend".into(),
+                    )
+                    .into());
+                }
+                StorageBackend::memory()?
+            }
         };
         // Writable backends migrate before handlers touch the DB. A detected
         // read-only snapshot is validated at the current schema version without
@@ -478,15 +492,27 @@ impl KhiveRuntime {
     /// and must already be at this build's current schema version. No migrations
     /// or configured-model registration writes are attempted. A `None` path
     /// retains the historical ephemeral in-memory behavior for tests.
-    pub fn new_readonly(config: RuntimeConfig) -> RuntimeResult<Self> {
-        Self::new_readonly_with_file_backend(config, |path| StorageBackend::sqlite_read_only(path))
+    pub fn new_readonly(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        let wal_ceiling = config.resolve_wal_ceiling_policy(true)?;
+        Self::new_readonly_with_file_backend(config, |path| {
+            StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
+                path,
+                None,
+                wal_ceiling,
+            )
+        })
     }
 
     /// Construct a read-only fixture runtime with a small reader pool.
     #[cfg(any(test, feature = "test-internals"))]
-    pub fn new_readonly_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
+    pub fn new_readonly_for_test(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        let wal_ceiling = config.resolve_wal_ceiling_policy(true)?;
         Self::new_readonly_with_file_backend(config, |path| {
-            StorageBackend::sqlite_read_only_for_test(path)
+            StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
+                path,
+                Some(2),
+                wal_ceiling,
+            )
         })
     }
 
@@ -498,7 +524,15 @@ impl KhiveRuntime {
         ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {
             Some(path) => open_file(path)?,
-            None => StorageBackend::memory()?,
+            None => {
+                if config.wal_ceiling_configured_bytes != 0 || config.wal_ceiling_bytes != 0 {
+                    return Err(khive_db::SqliteError::InvalidConfig(
+                        "nonzero wal_ceiling_bytes requires a file-backed SQLite backend".into(),
+                    )
+                    .into());
+                }
+                StorageBackend::memory()?
+            }
         };
         backend.prepare_core_schema()?;
         Ok(Self::assemble_from_backend(Arc::new(backend), config))
@@ -2980,6 +3014,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: Some(path),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -3022,6 +3060,10 @@ mod tests {
                 socket_path: None,
             }),
             db_path: Some(dir.path().join("main.db")),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -3082,6 +3124,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -3100,6 +3146,24 @@ mod tests {
     }
 
     #[test]
+    fn direct_memory_runtime_rejects_nonzero_wal_ceiling() {
+        let config = RuntimeConfig {
+            db_path: None,
+            wal_ceiling_bytes: 4152,
+            wal_ceiling_configured_bytes: 4152,
+            ..RuntimeConfig::no_embeddings()
+        };
+        let error = match KhiveRuntime::new(config) {
+            Ok(_) => panic!("memory has no WAL extent"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            RuntimeError::Sqlite(khive_db::SqliteError::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
     fn file_runtime_creates_successfully() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
@@ -3112,6 +3176,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: Some(path.clone()),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("test").unwrap(),
             embedding_model: None,
@@ -3146,6 +3214,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: Some(path.clone()),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -3212,6 +3284,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: Some(path.clone()),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -3363,6 +3439,10 @@ mod tests {
             git_write: Default::default(),
             display_timezone: chrono_tz::Tz::UTC,
             db_path: Some(path.clone()),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -3607,6 +3687,10 @@ mod tests {
                 display_timezone: chrono_tz::Tz::UTC,
                 events_split: None,
                 db_path: Some(db_path),
+                wal_ceiling_bytes: 0,
+                wal_ceiling_configured_bytes: 0,
+                wal_ceiling_source: khive_db::WalCeilingSource::Default,
+                wal_ceiling_env_raw: None,
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
                 embedding_model: None,
@@ -3661,6 +3745,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -3950,6 +4038,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -3983,6 +4075,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
             embedding_model: None,
@@ -4024,6 +4120,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::parse("lambda:base").unwrap(),
             embedding_model: None,
@@ -4057,6 +4157,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -4108,6 +4212,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -4146,6 +4254,10 @@ mod tests {
             display_timezone: "Asia/Tokyo".parse().unwrap(),
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -4299,6 +4411,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -4383,6 +4499,10 @@ mod tests {
             display_timezone: chrono_tz::Tz::UTC,
             events_split: None,
             db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: khive_db::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
             blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -4528,6 +4648,10 @@ mod tests {
                 display_timezone: chrono_tz::Tz::UTC,
                 events_split: None,
                 db_path: None,
+                wal_ceiling_bytes: 0,
+                wal_ceiling_configured_bytes: 0,
+                wal_ceiling_source: khive_db::WalCeilingSource::Default,
+                wal_ceiling_env_raw: None,
                 blob_hydration_bytes: crate::DEFAULT_BLOB_HYDRATION_BYTES,
                 default_namespace: Namespace::local(),
                 embedding_model: None,

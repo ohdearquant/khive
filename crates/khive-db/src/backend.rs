@@ -12,7 +12,7 @@ use std::sync::Arc;
 use rusqlite::OptionalExtension;
 
 use crate::error::SqliteError;
-use crate::pool::{ConnectionPool, PoolConfig};
+use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy};
 use crate::sql_bridge::SqlBridge;
 use crate::stores::{agents, attachment, blob, entity, event, graph, note, sparse, text, vectors};
 
@@ -271,6 +271,23 @@ impl StorageBackend {
         Self::sqlite_with_pool_config(path, PoolConfig::default(), max_readers)
     }
 
+    /// Open a file-backed SQLite backend with its already-resolved WAL ceiling.
+    /// A nonzero policy fails closed until the WAL I/O limiter is installed.
+    pub fn sqlite_with_max_readers_and_wal_ceiling(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+        wal_ceiling: WalCeilingPolicy,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(
+            path,
+            PoolConfig {
+                wal_ceiling,
+                ..PoolConfig::default()
+            },
+            max_readers,
+        )
+    }
+
     fn sqlite_with_pool_config(
         path: impl AsRef<Path>,
         pool_config: PoolConfig,
@@ -326,6 +343,23 @@ impl StorageBackend {
         max_readers: Option<usize>,
     ) -> Result<Self, SqliteError> {
         Self::sqlite_read_only_with_pool_config(path, PoolConfig::default(), max_readers)
+    }
+
+    /// Open a read-only SQLite backend while retaining WAL ceiling
+    /// configuration for diagnostics. No writer policy is enforced.
+    pub fn sqlite_read_only_with_max_readers_and_wal_ceiling(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+        wal_ceiling: WalCeilingPolicy,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_read_only_with_pool_config(
+            path,
+            PoolConfig {
+                wal_ceiling,
+                ..PoolConfig::default()
+            },
+            max_readers,
+        )
     }
 
     fn sqlite_read_only_with_pool_config(

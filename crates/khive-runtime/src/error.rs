@@ -168,6 +168,9 @@ impl AuditObligationFailure {
 /// checkout that expires before SQLite executes.
 pub const WRITER_POOL_CHECKOUT_TIMEOUT_STAGE: &str = "writer_pool_checkout_timeout";
 
+/// Stable ADR-194 WAL capacity stages, shared with the SQLite error source.
+pub use khive_db::{SQLITE_WAL_CAPACITY_REFUSED_STAGE, SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE};
+
 /// Stable wire code/stage for a bounded write-queue enqueue that never
 /// accepted the request within its configured deadline (#1382, #1643).
 pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
