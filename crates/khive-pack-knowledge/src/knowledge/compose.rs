@@ -236,9 +236,28 @@ pub(super) fn score_sections(
 
 // ─── BM25 over candidate set ──────────────────────────────────────────────────
 
+#[derive(Clone, Copy)]
+enum Bm25Work {
+    TokenVisit,
+    FrequencyLookup,
+}
+
+struct Bm25Document {
+    length: usize,
+    frequencies: HashMap<String, usize>,
+}
+
 fn compute_bm25_scores(
     query_terms: &[String],
     sections: &[(&str, &str)],
+) -> Result<Vec<f32>, RuntimeError> {
+    compute_bm25_scores_observed(query_terms, sections, |_| {})
+}
+
+fn compute_bm25_scores_observed(
+    query_terms: &[String],
+    sections: &[(&str, &str)],
+    mut observe: impl FnMut(Bm25Work),
 ) -> Result<Vec<f32>, RuntimeError> {
     const K1: f32 = 1.5;
     const B: f32 = 0.75;
@@ -254,16 +273,36 @@ fn compute_bm25_scores(
         text.push_str(heading);
         text.push(' ');
         text.push_str(content);
-        docs.push(tokenize_checked(&text)?);
+        let tokens = tokenize_checked(&text)?;
+        let length = tokens.len();
+        let mut frequencies = HashMap::new();
+        for (index, token) in tokens.into_iter().enumerate() {
+            if index.is_multiple_of(4_096) {
+                khive_storage::ensure_request_read_active("knowledge.compose")?;
+            }
+            observe(Bm25Work::TokenVisit);
+            *frequencies.entry(token).or_insert(0usize) += 1;
+        }
+        docs.push(Bm25Document {
+            length,
+            frequencies,
+        });
     }
 
     let n = docs.len() as f32;
-    let avg_dl = docs.iter().map(|d| d.len() as f32).sum::<f32>() / n;
+    let avg_dl = docs.iter().map(|d| d.length as f32).sum::<f32>() / n;
 
     let mut scores = vec![0.0f32; docs.len()];
+    // Query occurrences retain their original addition order, including repeats.
     for term in query_terms {
         khive_storage::ensure_request_read_active("knowledge.compose")?;
-        let df = docs.iter().filter(|d| d.iter().any(|t| t == term)).count() as f32;
+        let df = docs
+            .iter()
+            .filter(|doc| {
+                observe(Bm25Work::FrequencyLookup);
+                doc.frequencies.contains_key(term)
+            })
+            .count() as f32;
         if df == 0.0 {
             continue;
         }
@@ -273,11 +312,12 @@ fn compute_bm25_scores(
             if i.is_multiple_of(64) {
                 khive_storage::ensure_request_read_active("knowledge.compose")?;
             }
-            let tf = doc.iter().filter(|t| *t == term).count() as f32;
+            observe(Bm25Work::FrequencyLookup);
+            let tf = doc.frequencies.get(term).copied().unwrap_or(0) as f32;
             if tf == 0.0 {
                 continue;
             }
-            let dl = doc.len() as f32;
+            let dl = doc.length as f32;
             let tf_norm = (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * dl / avg_dl));
             scores[i] += idf * tf_norm;
         }
@@ -285,6 +325,10 @@ fn compute_bm25_scores(
 
     Ok(scores)
 }
+
+#[cfg(test)]
+#[path = "compose_bm25_work_tests.rs"]
+mod bm25_work_tests;
 
 // ─── pure helpers ─────────────────────────────────────────────────────────────
 
