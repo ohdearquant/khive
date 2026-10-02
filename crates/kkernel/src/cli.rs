@@ -2570,4 +2570,5 @@ no_embed = true
         );
     }
     include!("cli_backend_batch_tests.rs");
+    include!("cli_file_identity_tests.rs");
 }
