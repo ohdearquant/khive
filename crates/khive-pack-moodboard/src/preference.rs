@@ -890,23 +890,102 @@ pub(crate) struct CalibrationProvenance {
     pub tie_balanced_error: f64,
 }
 
+#[derive(Clone, Copy)]
+enum TieBandWork {
+    SortComparison,
+    DedupComparison,
+    InputCheck,
+    MarginComparison,
+}
+
 fn calibrate_tie_band(tie_margins: &[f64], decisive_margins: &[f64]) -> (f64, f64) {
+    calibrate_tie_band_observed(tie_margins, decisive_margins, |_| {})
+}
+
+fn calibrate_tie_band_observed(
+    tie_margins: &[f64],
+    decisive_margins: &[f64],
+    mut observe: impl FnMut(TieBandWork),
+) -> (f64, f64) {
     let mut candidates = vec![0.0, 0.5];
     candidates.extend_from_slice(tie_margins);
     candidates.extend_from_slice(decisive_margins);
-    candidates.sort_by(f64::total_cmp);
-    candidates.dedup_by(|left, right| left.to_bits() == right.to_bits());
+    candidates.sort_by(|left, right| {
+        observe(TieBandWork::SortComparison);
+        left.total_cmp(right)
+    });
+    candidates.dedup_by(|left, right| {
+        observe(TieBandWork::DedupComparison);
+        left.to_bits() == right.to_bits()
+    });
+
+    let finite = tie_margins.iter().chain(decisive_margins).all(|margin| {
+        observe(TieBandWork::InputCheck);
+        margin.is_finite()
+    });
+    // Numeric comparisons with NaN do not form a prefix in total_cmp order.
+    if !finite {
+        return calibrate_tie_band_scanned(
+            &candidates,
+            tie_margins,
+            decisive_margins,
+            &mut observe,
+        );
+    }
+
+    let mut sorted_tie = tie_margins.to_vec();
+    let mut sorted_decisive = decisive_margins.to_vec();
+    sorted_tie.sort_by(|left, right| {
+        observe(TieBandWork::SortComparison);
+        left.total_cmp(right)
+    });
+    sorted_decisive.sort_by(|left, right| {
+        observe(TieBandWork::SortComparison);
+        left.total_cmp(right)
+    });
 
     let mut best = (f64::INFINITY, 0.0);
     for threshold in candidates {
+        let tie_prefix = sorted_tie.partition_point(|margin| {
+            observe(TieBandWork::MarginComparison);
+            *margin <= threshold
+        });
+        let decisive_prefix = sorted_decisive.partition_point(|margin| {
+            observe(TieBandWork::MarginComparison);
+            *margin <= threshold
+        });
+        let tie_false_negative = (tie_margins.len() - tie_prefix) as f64 / tie_margins.len() as f64;
+        let decisive_false_positive = decisive_prefix as f64 / decisive_margins.len() as f64;
+        let balanced_error = 0.5 * (tie_false_negative + decisive_false_positive);
+        if balanced_error < best.0 || (balanced_error == best.0 && threshold < best.1) {
+            best = (balanced_error, threshold);
+        }
+    }
+    (best.1, best.0)
+}
+
+fn calibrate_tie_band_scanned(
+    candidates: &[f64],
+    tie_margins: &[f64],
+    decisive_margins: &[f64],
+    observe: &mut impl FnMut(TieBandWork),
+) -> (f64, f64) {
+    let mut best = (f64::INFINITY, 0.0);
+    for &threshold in candidates {
         let tie_false_negative = tie_margins
             .iter()
-            .filter(|margin| **margin > threshold)
+            .filter(|margin| {
+                observe(TieBandWork::MarginComparison);
+                **margin > threshold
+            })
             .count() as f64
             / tie_margins.len() as f64;
         let decisive_false_positive = decisive_margins
             .iter()
-            .filter(|margin| **margin <= threshold)
+            .filter(|margin| {
+                observe(TieBandWork::MarginComparison);
+                **margin <= threshold
+            })
             .count() as f64
             / decisive_margins.len() as f64;
         let balanced_error = 0.5 * (tie_false_negative + decisive_false_positive);
@@ -916,6 +995,10 @@ fn calibrate_tie_band(tie_margins: &[f64], decisive_margins: &[f64]) -> (f64, f6
     }
     (best.1, best.0)
 }
+
+#[cfg(test)]
+#[path = "preference_tie_band_work_tests.rs"]
+mod tie_band_work_tests;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
