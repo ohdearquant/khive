@@ -4031,10 +4031,10 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        let (note, _, degradations) = self
+        let (note, _, degradations, _) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
-                false,
+                false, false,
             )
             .await?;
         legacy_post_commit_result("create_note", note.id, note, degradations)
@@ -4055,7 +4055,7 @@ impl KhiveRuntime {
             "tags": ["web.receipt"],
             "request": request,
         });
-        let (note, _, degradations) = self
+        let (note, _, degradations, _) = self
             .create_note_inner(
                 token,
                 "observation",
@@ -4067,6 +4067,7 @@ impl KhiveRuntime {
                 Some(properties),
                 annotates,
                 None,
+                false,
                 true,
             )
             .await?;
@@ -4095,7 +4096,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        let (note, _, degradations) = self
+        let (note, _, degradations, _) = self
             .create_note_inner(
                 token,
                 kind,
@@ -4107,6 +4108,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
                 false,
             )
             .await?;
@@ -4130,7 +4132,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
-        let (note, embedding, degradations) = self
+        let (note, embedding, degradations, _) = self
             .create_note_inner(
                 token,
                 kind,
@@ -4142,6 +4144,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
                 false,
             )
             .await?;
@@ -4170,20 +4173,23 @@ impl KhiveRuntime {
         crate::retrieval::EmbeddingTruncationReport,
         Vec<PostCommitDegradation>,
     )> {
-        self.create_note_inner(
-            token,
-            kind,
-            name,
-            content,
-            embedding_content,
-            salience,
-            None,
-            properties,
-            annotates,
-            None,
-            false,
-        )
-        .await
+        let (note, embedding, degradations, _) = self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                embedding_content,
+                salience,
+                None,
+                properties,
+                annotates,
+                None,
+                false,
+                false,
+            )
+            .await?;
+        Ok((note, embedding, degradations))
     }
 
     /// Like [`Self::create_note`] but also sets a non-zero decay factor on the note.
@@ -4232,7 +4238,7 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
-        let (note, _, degradations) = self
+        let (note, _, degradations, _) = self
             .create_note_inner(
                 token,
                 kind,
@@ -4245,12 +4251,53 @@ impl KhiveRuntime {
                 annotates,
                 embedding_model,
                 false,
+                false,
             )
             .await?;
         legacy_post_commit_result(
             "create_note_with_decay_for_embedding_model",
             note.id,
             note,
+            degradations,
+        )
+    }
+
+    /// Memory-pack receipt form of the decay create. Each returned sequence
+    /// was read inside the transaction that inserted that model's vector and
+    /// ANN upsert log row; a failed or version-rejected vector writes no fence.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_decay_for_embedding_model_with_visibility(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: Option<f64>,
+        decay_factor: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+        embedding_model: Option<&str>,
+    ) -> RuntimeResult<(Note, Vec<(String, u64)>)> {
+        let (note, _, degradations, fences) = self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                None,
+                salience,
+                Some(decay_factor),
+                properties,
+                annotates,
+                embedding_model,
+                true,
+                false,
+            )
+            .await?;
+        legacy_post_commit_result(
+            "create_note_with_decay_for_embedding_model_with_visibility",
+            note.id,
+            (note, fences),
             degradations,
         )
     }
@@ -4532,11 +4579,13 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
+        capture_visibility: bool,
         web_receipt: bool,
     ) -> RuntimeResult<(
         Note,
         crate::retrieval::EmbeddingTruncationReport,
         Vec<PostCommitDegradation>,
+        Vec<(String, u64)>,
     )> {
         self.validate_note_kind(kind)?;
         // Owned identity properties are derived from the authorization token
@@ -4697,6 +4746,7 @@ impl KhiveRuntime {
         let embed_text = embedding_content.unwrap_or(canonical_embed_text);
 
         let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
+        let mut vector_fences = Vec::with_capacity(embed_model_names.len());
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
@@ -4743,9 +4793,28 @@ impl KhiveRuntime {
             let single_model_result: RuntimeResult<()> = match vec_result {
                 Ok(outcome) => {
                     embedding_report.observe(&outcome);
-                    self.publish_note_vector_revision(token, &note, model_name, &outcome.vector)
-                        .await
-                        .map(|_| ())
+                    if capture_visibility {
+                        match self
+                            .publish_note_vector_revision_with_seq(
+                                token,
+                                &note,
+                                model_name,
+                                &outcome.vector,
+                            )
+                            .await
+                        {
+                            Ok(Some(seq)) => {
+                                vector_fences.push((model_name.clone(), seq));
+                                Ok(())
+                            }
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        self.publish_note_vector_revision(token, &note, model_name, &outcome.vector)
+                            .await
+                            .map(|_| ())
+                    }
                 }
                 Err(e) => Err(e),
             };
@@ -4794,9 +4863,24 @@ impl KhiveRuntime {
             // TODO(P2): parallelize vector inserts
             for (model_name, outcome) in embed_model_names.iter().zip(outcomes) {
                 embedding_report.observe(&outcome);
-                let insert_result = self
-                    .publish_note_vector_revision(token, &note, model_name, &outcome.vector)
-                    .await;
+                let insert_result = if capture_visibility {
+                    self.publish_note_vector_revision_with_seq(
+                        token,
+                        &note,
+                        model_name,
+                        &outcome.vector,
+                    )
+                    .await
+                    .map(|seq| {
+                        if let Some(seq) = seq {
+                            vector_fences.push((model_name.clone(), seq));
+                        }
+                    })
+                } else {
+                    self.publish_note_vector_revision(token, &note, model_name, &outcome.vector)
+                        .await
+                        .map(|_| ())
+                };
                 if let Err(e) = insert_result {
                     self.compensate_note_creation(&note).await;
                     return Err(e);
@@ -4937,7 +5021,8 @@ impl KhiveRuntime {
             );
         }
 
-        Ok((note, embedding_report, degradations))
+        vector_fences.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((note, embedding_report, degradations, vector_fences))
     }
 
     /// List notes visible to the token, optionally filtered by kind.

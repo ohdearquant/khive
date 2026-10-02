@@ -1102,3 +1102,398 @@ and normalization of canonical handler output stay open on #1355. They are not d
 The implementing change freezes its selectors, fixtures and individual mutants before it runs. A
 zero-test selection, a compile failure or a fixture that never reaches the presentation boundary is
 neither a baseline nor a mutation kill.
+
+## Amendment 10 (2026-09-30): opt-in single-operation acknowledgement views
+
+**Status: Proposed.**
+**Related issues:** #1798; #2138 describes a broader JSON-contract change that this amendment does not address.
+
+### Context and current behavior
+
+A successful acknowledgement can return both its outcome and context that the caller already
+selected. `comm.read(id=..., body=false)` returns the mark outcome plus message properties;
+a real `gtd.transition` returns the state change plus task title, priority, assignee and due
+fields. [ADR-019's response contract](ADR-019-gtd-pack.md#wire-shape) already specifies
+`transition` as a delta receipt with `id`, `from`, `to`, `transitioned`, `is_terminal` and
+`audit_persisted`. At source commit `83a478a8f917e56b7ea7a43cb9206019b4b70e34`, the real-transition
+builder also returns `full_id` and the task context above, including `due_timezone`; both
+`full_id` and the task context exceed the receipt as written. This amendment records the
+task-context drift and does not amend ADR-019 to authorize it. Those context fields are
+useful to current record-reading
+clients but need not accompany every acknowledgement view. `gtd.complete` already returns an eight-field receipt, including the
+completion instant and audit outcome; it does not return the task property bag.
+
+The current MCP response is compact JSON, including for a single operation. It retains the
+`results` array, each operation's `ok`, `tool`, `result` and usage metadata, and the outer
+`summary` and `status`. `format=json` keeps `result` a JSON value; `auto` and `table` render
+that value as text inside the same JSON envelope. A single object uses compact-JSON fallback,
+not the withdrawn key-value block of ADR-078 §3(b). The historical line count in #1798 is not
+a measurement of this current serializer.
+
+An acknowledgement is not necessarily one bit. Dispatch success does not establish that a
+best-effort message mark succeeded: `comm.read` can return inner `status: "failed"` or
+`"unknown"` with `read: false` or `null` and `mark_error`. A task transition can commit while
+`audit_persisted` is false. Bulk marks need counts and each item's outcome. Removing those
+fields would change what the caller can conclude.
+
+This amendment decides a bounded acknowledgement view, not a classification of every public
+verb. #2138's request to stop over-delivering in canonical JSON contracts is not addressed:
+handler conformance, listing, detail and diagnostic contracts, and the complete verb audit
+remain separate work. Amendment 9's exact UTC timestamps remain governing; the local-offset
+display proposal in #1798 is not adopted here. Of #1798, this amendment adopts only the
+removal of already-selected context from two acknowledgement views that a caller opts into.
+Its request to change the default Agent presentation, its collapsed single-operation envelope
+and its flat key-value rendering are not adopted, so a caller on the default Agent and JSON
+path sees no change. The implementing change does not close #1798.
+
+### Alternatives and recommended default
+
+| Alternative                                                                   | Change and blast radius                                                                                                                                                                                                                                                                                                                                                                        | Disposition                                                                                                                                                                                                 |
+| ----------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Presentation only: flatten the entire single-op Agent response                | Default Agent/JSON clients lose `results[0]`, `summary` and possibly transport metadata. Verbose could preserve the old wrapper, but an existing default client would need a new parser or an explicit mode change.                                                                                                                                                                            | Not selected. The wrapper conveys operation and transport outcomes and is consumed by existing clients.                                                                                                     |
+| Presentation only: a narrow acknowledgement view within the existing envelope | Only callers selecting effective Agent `auto` or `table` for the two eligible standalone cases below see fewer context fields. Canonical results and the default Agent/JSON envelope remain available.                                                                                                                                                                                         | Selected, with explicit omission markers.                                                                                                                                                                   |
+| Per-verb canonical wire conformance or revision                               | `gtd.transition` can conform to the already accepted ADR-019 delta receipt; it does not require a new schema. `comm.read(body=false)` would need a deliberate revision to ADR-040's existing properties promise. Removing handler fields affects JSON, Verbose, runtime/library consumers and tests; Verbose cannot restore them, and a separate detail read can observe a different snapshot. | Independent work. Transition conformance needs a compatibility plan for consumers of the current extra fields, not a new receipt design. The message-read canonical change needs its own contract decision. |
+| Both presentation and canonical wire changes                                  | Combines view migration with per-verb migration and must explain which removed fields Verbose can recover. Listing contracts and other acknowledgement candidates would add further decisions.                                                                                                                                                                                                 | Not selected for this bounded change.                                                                                                                                                                       |
+
+**Keep the built-in defaults: Agent presentation and JSON format.** Neither the defaults nor
+the outer envelope change. A caller wanting an acknowledgement view opts into `format=auto`
+or `format=table` with Agent presentation. Existing environment or configuration format
+selection still applies, so a deployment already defaulting to Auto is an affected view
+consumer. No new request parameter or presentation/format axis is introduced.
+
+For `gtd.transition`, the view is selected as an interim, opt-in compatibility step: it
+reduces displayed context while leaving existing JSON, Verbose and library consumers of the
+current handler untouched. Conforming that handler to ADR-019 remains necessary independent
+work; acceptance of this view neither fixes nor excuses the drift. If conformance removes the
+five context fields first while retaining every field this profile requires, `full_id`
+included, this profile removes nothing and adds no `view_omitted` marker. If the receipt also
+omits required `full_id`, the profile declines and takes the existing rendering path. The
+profile must not require the handler to retain those fields merely to produce a marker.
+
+ADR-078 Amendment 2 closes by identifying per-verb response contracts as the durable fix
+for listing verbosity: listings should project selection fields and acknowledgements should
+return acknowledgements.
+This amendment follows that boundary for its chosen view but does not claim to complete the
+canonical response-contract work or supersede that long-term direction.
+
+### Proposed decision
+
+**Eligibility comes from execution context, not payload resemblance.** The response boundary
+must know the resolved registered verb, validated request options and parsed execution mode.
+Only `ExecutionMode::Single` with one operation, a successful outer entry (`ok: true`),
+effective Agent presentation and effective Auto/Table format can select a profile. Per-op
+overrides are resolved first and `AlwaysVerbose` takes precedence. A `tool` string, a marker
+inside stored data, a similarly shaped JSON object or a custom handler using similar keys
+cannot select the profile. The required context is internal; it is not a caller-controlled
+result field and does not enter canonical handler output.
+
+A bare JSON-object operation (`{"tool":...,"args":...}`) parses as `ExecutionMode::Single`
+and is eligible when the other conditions above hold. A one-element JSON array parses as
+a batch and is ineligible.
+
+The two initial profiles are a closed set:
+
+| Registered operation and canonical outcome                                                                                                                                  | Fields removed by this amendment from the rendered root object      | Receipt retained under the existing presentation rules                                                                                                                                                                                                                        |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `comm.read` with the singular `id` form and validated `body=false`; root object has string `id` and `full_id`, `status: "success"`, `read: true` and an object `properties` | Only root `properties`                                              | Identity, inner status, read outcome and every other root field. No success is inferred from outer `ok`.                                                                                                                                                                      |
+| `gtd.transition` with a real transition; root object has string `id`, `full_id`, `from` and `to`, `transitioned: true`, and boolean `is_terminal` and `audit_persisted`     | Only root `assignee`, `due`, `due_timezone`, `priority` and `title` | Identity, original and resulting state, transition/terminal/audit outcomes, and every other root field or diagnostic. The eligible real-transition builder at this source emits no `note_recorded`, `note` or `reason`; those no-op fields belong to the excluded path below. |
+
+Title, priority, assignee and due fields are decision columns when choosing among tasks in
+an ADR-078 listing. Here the caller has already selected the task and requested the specific
+state change; those fields describe task context, while `from`, `to`, `transitioned`,
+`is_terminal` and `audit_persisted` establish the requested outcome. Their omission is confined
+to this acknowledgement view; task listings keep their existing decision-column rules.
+
+Check canonical outcome fields before presentation. Missing or incorrectly typed required
+fields, a preexisting root `view_omitted`, or a value whose ordinary Auto/Table shape selects
+a record array declines the new profile and takes the existing rendering path. A profile
+never repairs a result, invents a field, converts `false` to success, or changes handler
+validation. Unknown additional root fields remain on the ordinary presentation path; only
+the closed removal sets above may be removed by this amendment.
+
+For an eligible value, ordinary Agent presentation and ADR-078 View reductions run first.
+Remove the named root fields still present, then add `view_omitted`: a sorted array of JSON
+Pointer paths for exactly those fields newly removed, such as `["/properties"]` or
+`["/assignee","/due","/due_timezone","/priority","/title"]`. Do not add a marker if no field
+was newly removed. The marker describes this acknowledgement projection only; it does not
+enumerate preexisting Agent or View reductions such as `full_id` suppression. It is view
+metadata, not a stored or canonical receipt field. It is the one key an Agent view can carry
+that the canonical result does not: the subset example in Consequences (`present(agent).fields
+⊆ verbose.fields`) holds for JSON-format results and for every Auto/Table result except these
+two acknowledgement views. Serialize the remaining root object with the existing compact-JSON
+fallback and place that text in the entry's `result` string. Do not flatten the envelope or
+turn a receipt into prose such as "done".
+
+The following remain on their existing paths:
+
+- `comm.read` with omitted or true `body`, any `ids` form, `comm.mark_read`, and failed or
+  unknown mark outcomes. In particular, do not remove `mark_error`, reinterpret `read: null`
+  or drop per-item results or bulk counts under the new profile.
+- `gtd.transition` with `transitioned: false`, including its no-op explanation and any note
+  outcome. `gtd.complete` remains its existing receipt, with no new omission marker.
+- Explicit batches, including one-element bracket/JSON-array batches, chains, atomic units
+  and grouped requests. One successful item does not make a batch a standalone operation.
+- Other mutations, including `create`, `link`, `delete` and `restore`. Creation may report
+  related writes or deduplication hints; deletion/restoration may carry distinct outcomes
+  or degradation evidence. Those are not selected merely because they write. `link` is
+  already AlwaysVerbose. `brain.mark_turn` reports best-effort accounting, not a durable
+  delivery receipt, and gains no stronger meaning here.
+- AlwaysVerbose verbs, stream receipt policies, opt-in parsed-note bodies, list/cursor
+  envelopes, and whole-operation errors. Help, plan and `save_to` manifests are not
+  acknowledgement results and keep their contracts.
+
+No mutation, authorization, secret screening, persistence, audit, idempotency or delivery
+rule changes. Protected payloads that remain present keep Amendments 6 and 7's byte-exact
+rules; Amendment 9 continues to govern eligible timestamps. This projection can omit the
+whole acknowledged message's property context in the named view, but does not normalize or
+reinterpret that context or make it unavailable to JSON/Verbose consumers.
+
+### Modes, formats and envelope invariants
+
+| Effective presentation | JSON                                                                                               | Auto/Table                                                                                                      |
+| ---------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Agent                  | Existing Agent plus Machine reductions; result remains a JSON value; no acknowledgement projection | Existing Agent plus View reductions, then the eligible acknowledgement projection; result remains rendered text |
+| Verbose                | Canonical handler result                                                                           | Existing format rendering without this projection                                                               |
+| Human                  | Canonical result at the runtime boundary                                                           | Existing format rendering without this projection                                                               |
+
+The outer compact-JSON `results`/`summary`/`status` contract survives in every case. Preserve
+entry `ok`, `tool`, usage and other transport metadata, correlation fields and advisories
+outside `result`. An inner mark failure or an audit failure is not promoted to transport
+failure or erased. Per-op errors stay canonical. Frame fitting, depth limits, response
+budgets and explicit omission/refusal behavior retain their existing precedence; this view
+is not permission to bypass a response limit. If frame fitting replaces a projected entry
+with its pre-render compact form, that fallback entry carries no `view_omitted` marker.
+
+Canonical handler results remain the input to runtime/library callers and `$prev`
+substitution. Result sinks retain their existing presentation/export contract and never
+apply this projection; `save_to` writes before format rendering. The projection runs only
+on the final displayed copy after execution; it never changes a chain's value or writes
+`view_omitted` to the database. Local and daemon-backed MCP rendering must carry equivalent
+trusted selection context and produce the same view for the same completed operation.
+
+On acceptance, this is a narrow extension of this ADR's Scope and §6 policy mechanism for the
+two named views. It supersedes ADR-078 Amendment 2's fallback clause, "beyond those enumerated
+reductions the fallback is lossless by construction — no truncation, no elision, no
+reformatting." **Only** these eligible Agent Auto/Table acknowledgements gain the additional
+closed-set projection. It does not reinstate the withdrawn generic key-value renderer, change
+ADR-078 Amendment 3's Agent/JSON Machine contract, or change ADR-078 §8.4's outer envelope.
+All other shapes retain Amendment 2's fallback rule. It also qualifies ADR-040's `body=false`
+promise only at this opt-in rendered-view boundary: the canonical `comm.read` response still
+contains its properties. Acceptance does not authorize a canonical per-verb response
+migration. The change that records acceptance of this amendment also adds one line at ADR-078
+Amendment 2's fallback clause and one at ADR-040's `body=false` paragraph, each naming this
+amendment as the qualification. Until acceptance neither document changes.
+
+### Existing clients and migration boundary
+
+The following client and CLI anchors are pinned to source commit
+`ade26d19bf4c42a0d3e348cc4eab996146116071`:
+
+- `tests/smoke_test.py:93-136` (`_call_request_raw`, `call_verb`) requests JSON, parses the
+  MCP text as JSON, checks `results` and `summary`, and unwraps `results[0].result`.
+  Its one-element batch and default JSON
+  behavior remain unchanged.
+- `tests/khive-contract/khive_contract/client.py:167-203,352-435` (`KhiveMcpSession.__init__`,
+  `request`, `request_batch`, `verb`) defaults to Verbose,
+  interprets the same wrapper and unwraps single verbs through one-element batches. That
+  default and batching behavior remain unchanged. A caller using its raw request path
+  with a standalone Agent Auto/Table operation is a view consumer under the new rule.
+- `crates/kkernel/src/exec.rs:1941-1970` (`enforce_strict_batch_result`) derives strict-batch
+  failure behavior from the outer summary. Keeping that envelope avoids a parser migration
+  or a change to partial
+  failure detection. CLI presentation defaults are not changed. Inline CLI execution through
+  `run_exec_inline_with_forward`, whose `RequestParams` and dispatch are at `2514-2529`,
+  shares the request boundary and is in scope when the parsed request is eligible
+  Single/Agent/Auto or Single/Agent/Table. Ops-file dispatch in
+  `apply_ops_file_reader_with_response_transform_and_dispatch_mode` at `1411-1433` uses
+  the typed batch path and remains ineligible even with one operation: serial scheduling
+  does not change the batch execution mode.
+- Runtime/library consumers and `$prev` continue to receive canonical values. Existing
+  Agent/JSON record clients retain the current Machine path and strict identifiers.
+- A client already opting into Agent Auto/Table for a standalone operation may see fewer
+  context fields and the new `view_omitted` array inside the rendered result text. Such a
+  client must accept the declared acknowledgement view or select `format=json` for the
+  existing machine shape; `presentation=verbose, format=json` retains the canonical
+  escape hatch. Auto/Table are already text results, so the outer parser does not change.
+
+This is still an observable change for existing opted-in view consumers. The implementing
+change must document these exact two cases and the omission marker, and validate those
+consumer paths before enabling the profiles. It must not silently turn JSON record clients
+into view clients or claim that every acknowledgement is smaller.
+
+### Synthetic fixture sizes, not production measurements
+
+The following UTF-8 byte counts are of **three constructed JSON bodies**, modeled from
+source at commit `7f822459c7bb0cf6ff74a70a1491e33b15418113`. They are not captured MCP responses,
+a production sample, runtime-renderer verification, token measurements or latency results.
+The population measured and the population claimed are the same three fixture bodies below;
+no result is extrapolated to live stores or other verbs.
+
+| Synthetic fixture                                    | Canonical fixture body | Current Agent/JSON model | Current Agent/Auto model | Proposed Agent/Auto model |
+| ---------------------------------------------------- | ---------------------: | -----------------------: | -----------------------: | ------------------------: |
+| `comm.read(body=false)` success                      |                    436 |                      424 |                      409 |                       238 |
+| `gtd.transition` real transition with audit failure  |                    423 |                      423 |                      414 |                       362 |
+| `gtd.complete` with audit failure, unchanged control |                    343 |                      338 |                      313 |                       313 |
+
+Construction includes one `results` entry, `usage: {}`, and the compact outer summary/status.
+It excludes JSON-RPC and MCP content wrapping, daemon frames and optional correlation,
+configuration or advisory fields. The inner Auto result is JSON text, so its quotes are
+escaped again by the outer JSON serializer. The completion timestamp models Amendment 9's
+`+00:00` to `Z` conversion; the message's property timestamp is protected. The only modeled
+reductions are those exercised by these fixtures. Python's sorted, compact JSON encoder
+makes the fixture byte strings reproducible; it is not a substitute for the Rust renderer.
+
+Source anchors at that commit:
+
+- `crates/khive-pack-comm/src/params.rs:93-105` and `src/handlers.rs:1065-1097,1185-1204,1478-1530`:
+  singular/body selection, body inclusion and actual mark outcomes. The fixture's routing
+  property names are a six-key subset of the bag assembled at `src/handlers.rs:2840-2860`,
+  not a complete production property bag; `comm_schema_version`, `from`, `to`, `subject`
+  and optional routing metadata are not included in this synthetic fixture.
+- `crates/khive-pack-gtd/src/handlers.rs:1626-1635,1886-1909,1964-1978`: completion,
+  no-op and real-transition receipt shapes.
+- `crates/khive-runtime/src/presentation.rs:159-207,281-322,374-404`: JSON/View preparation,
+  root `full_id`/property dedup reductions and compact-JSON single-object fallback.
+- `crates/khive-mcp/src/server.rs:2417-2833,3624-3632,5442-5589,5912-5914`: envelope,
+  usage stamping, per-op result rendering and compact serialization. The `save_to`
+  branch at `5030-5157` returns its manifest before format rendering.
+
+The reproducer prints both counts and exact constructed bodies:
+
+```python
+import copy
+import json
+
+BASE = "7f822459c7bb0cf6ff74a70a1491e33b15418113"
+UUID = "01234567-89ab-4cde-8012-3456789abcde"
+identity = {"id": "01234567", "full_id": UUID}
+fixtures = {
+    "comm.read(body=false)": ("comm.read", {
+        **identity, "status": "success", "read": True,
+        "properties": {
+            "direction": "inbound", "read": True,
+            "from_actor": "fixture-source", "to_actor": "fixture-reader",
+            "thread_id": UUID, "sent_at": "2026-09-30T20:00:00+00:00",
+        },
+    }),
+    "gtd.transition(write)": ("gtd.transition", {
+        **identity, "transitioned": True, "from": "next", "to": "active",
+        "is_terminal": False, "audit_persisted": False,
+        "title": "Fixture task", "priority": "p2", "assignee": "fixture-worker",
+        "due": "2026-10-01T12:00:00Z", "due_timezone": "UTC",
+    }),
+    "gtd.complete": ("gtd.complete", {
+        **identity, "completed": True, "from": "active", "to": "done",
+        "completed_at": "2026-09-30T20:00:00+00:00",
+        "is_terminal": True, "audit_persisted": False,
+    }),
+}
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+def envelope(tool, result):
+    return {
+        "results": [{"ok": True, "tool": tool, "result": result, "usage": {}}],
+        "summary": {"total": 1, "succeeded": 1, "failed": 0, "aborted": 0},
+        "status": "success",
+    }
+
+def byte_length(value):
+    return len(encode(value).encode("utf-8"))
+
+rows = []
+for label, (tool, canonical) in fixtures.items():
+    # Model only these fixtures' source-governed transforms, not the Rust renderer.
+    agent = copy.deepcopy(canonical)
+    if tool == "gtd.complete":
+        agent["completed_at"] = agent["completed_at"].replace("+00:00", "Z")
+    if "properties" in agent:
+        agent["properties"] = {
+            key: value for key, value in agent["properties"].items()
+            if key not in agent or agent[key] != value
+        }
+    auto = copy.deepcopy(agent)
+    auto.pop("full_id", None)
+    projected = copy.deepcopy(auto)
+    drop = ["properties"] if tool == "comm.read" else (
+        ["assignee", "due", "due_timezone", "priority", "title"]
+        if tool == "gtd.transition" else []
+    )
+    removed = sorted("/" + key for key in drop if key in projected)
+    for key in drop:
+        projected.pop(key, None)
+    if removed:
+        projected["view_omitted"] = removed
+    # AUTO result text is a JSON string inside the compact outer JSON envelope.
+    values = {
+        "canonical_fixture_body": envelope(tool, canonical),
+        "current_agent_json_model_body": envelope(tool, agent),
+        "current_agent_auto_model_body": envelope(tool, encode(auto)),
+        "proposed_agent_auto_model_body": envelope(tool, encode(projected)),
+    }
+    rows.append({
+        "fixture": label, "base": BASE,
+        "bytes": {name: byte_length(value) for name, value in values.items()},
+        "bodies": {name: encode(value) for name, value in values.items()},
+    })
+print(json.dumps(rows, indent=2))
+```
+
+These counts support only a comparison of the named constructed bodies. Changing property
+content, omitted fields, metadata, identifier spelling or renderer behavior changes the
+counts. The unchanged completion control demonstrates why no universal savings percentage
+or default-format performance guarantee follows. Amendment 8's historical estimates remain
+estimates. Native rendering and client-path witnesses are required for an implementation;
+none is claimed by this fixture model.
+
+### Acceptance and mutation witnesses for the implementing change
+
+- **ACK-SELECT:** resolved Single/Agent/Auto and Single/Agent/Table requests select each
+  registered profile using validated options and canonical outcome fields, through both
+  DSL standalone operations and bare JSON-object operations. Default
+  `comm.read` body, body true, `ids`, `comm.mark_read`, a lookalike handler, malformed or
+  missing required fields, marker collisions and a record-array shape use the prior path.
+  Explicit one-element bracket and JSON-array batches, chains, atomic/grouped requests,
+  plan, help and sink manifests never select it. Selection must be exercised at the real
+  response boundary.
+  Production success handlers for the two verbs do not emit a root marker or record array;
+  exercise those defensive decline cases by fault-injecting the returned canonical value
+  before that same boundary. Register a separate lookalike handler to prove that payload
+  resemblance cannot grant eligibility. These are boundary fixtures, not claims that the
+  normal handlers produce those shapes.
+- **ACK-MATRIX:** cover all nine presentation/format combinations and per-op overrides.
+  Agent/JSON retains its prior JSON-value result and identifiers; only eligible effective
+  Agent Auto/Table receives the new rendered view. AlwaysVerbose wins. Transport metadata,
+  advisories, strict IDs, protected payloads, exact timestamps and budget behavior keep
+  their existing witnesses.
+- **ACK-OUTCOME:** successful singular reads and real transitions compact the named context
+  fields only; assert exact equality with the closed removal set for the fixture's present
+  fields. A real transition with `audit_persisted: false` still says false. No-op
+  `note_recorded`, `reason` and note outcomes remain on their excluded existing path;
+  no eligible real-transition fixture assumes they are produced. Failed/unknown marks keep the existing
+  outcome and diagnostics, without treating outer `ok` as mark success. No-op transitions,
+  completion receipts and bulk partial outcomes remain on their existing paths.
+- **ACK-OMISSION:** `view_omitted` lists only fields actually removed by this projection, in
+  sorted pointer order, with no marker if none was removed. Unknown root diagnostics survive
+  ordinary rendering; canonical marker collisions are never overwritten. A field-subset check
+  over an eligible view treats `view_omitted` as the single allowed extra key and fails on any
+  other.
+- **ACK-CLIENT:** exercise the current JSON wrapper consumers and strict-batch parser above,
+  plus a standalone Auto/Table consumer, with success and partial/degraded outcomes.
+  Demonstrate the documented JSON/Verbose escape hatch and that no outer schema changed.
+- **ACK-CANONICAL:** handler/library output, `$prev` and existing result sinks never acquire
+  the marker or lose fields through this projection. Matched local and daemon-backed
+  operations, including eligible inline CLI dispatch, select the same profile; response limits and whole errors remain governing.
+- **ACK-MUTATIONS:** named witnesses above must fail when a selected profile is removed;
+  selection trusts payload shape rather than registered execution context; JSON is
+  projected; an audit/mark outcome is erased or success is invented from outer `ok`;
+  the removal set is widened, including removing `from` while listing `/from` in the
+  marker; the omission marker is removed or lies about removed fields; a one-element batch
+  is projected; the outer wrapper is flattened; or a chain/result sink sees the marker.
+
+The implementing change freezes executable selectors, fixtures and individual reversible
+mutants before running them. A zero-test selection, compile failure or fixture that never
+reaches the presentation boundary is neither an accepted baseline nor a mutation witness.
+This Proposed text supplies a contract and a fixture model, not an executed implementation
+or an approval of dependent code.
