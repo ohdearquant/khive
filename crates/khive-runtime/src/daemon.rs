@@ -46,6 +46,198 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 8;
 
+/// ADR-049 Amendment 11's disclosed initial demand idle interval.
+pub const DEFAULT_DEMAND_IDLE_SECS: u64 = 1_800;
+
+/// A launch-time choice, never inferred from process ancestry or environment.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonLifetime {
+    Demand,
+    #[default]
+    Persistent,
+}
+
+/// Immutable daemon options. Existing entry points use persistent mode.
+#[derive(Debug, Clone, Copy)]
+pub struct DaemonOptions {
+    pub lifetime: DaemonLifetime,
+    pub idle_interval: std::time::Duration,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        Self {
+            lifetime: DaemonLifetime::Persistent,
+            idle_interval: std::time::Duration::from_secs(DEFAULT_DEMAND_IDLE_SECS),
+        }
+    }
+}
+
+/// Host-owned startup decisions disclosed by lifecycle diagnostics.
+#[derive(Debug, Clone, Default)]
+pub struct DaemonStartupReport {
+    pub skipped_components: Vec<String>,
+    /// A named unknown inventory or service obligation prevents retirement.
+    pub idle_ineligible_reasons: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonLifecyclePhase {
+    Serving,
+    Draining,
+    Stopped,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonShutdownReason {
+    Idle,
+    Signal,
+}
+
+/// Additive diagnostics for one daemon incarnation.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct DaemonLifecycleSnapshot {
+    pub lifetime: DaemonLifetime,
+    pub instance_generation: String,
+    pub effective_idle_interval_ms: u64,
+    pub phase: DaemonLifecyclePhase,
+    pub shutdown_reason: Option<DaemonShutdownReason>,
+    pub skipped_components: Vec<String>,
+    pub idle_ineligible_reasons: Vec<String>,
+    pub ordinary_requests: usize,
+    pub idle_blockers: Vec<String>,
+}
+
+#[cfg(unix)]
+struct DaemonLifecycle {
+    options: DaemonOptions,
+    state: std::sync::Mutex<DaemonLifecycleState>,
+}
+
+#[cfg(unix)]
+struct DaemonLifecycleState {
+    snapshot: DaemonLifecycleSnapshot,
+    last_request_completion: Option<tokio::time::Instant>,
+}
+
+#[cfg(unix)]
+impl DaemonLifecycle {
+    fn new(options: DaemonOptions, report: DaemonStartupReport) -> Self {
+        Self {
+            options,
+            state: std::sync::Mutex::new(DaemonLifecycleState {
+                snapshot: DaemonLifecycleSnapshot {
+                    lifetime: options.lifetime,
+                    instance_generation: uuid::Uuid::new_v4().to_string(),
+                    effective_idle_interval_ms: options
+                        .idle_interval
+                        .as_millis()
+                        .min(u128::from(u64::MAX))
+                        as u64,
+                    phase: DaemonLifecyclePhase::Serving,
+                    shutdown_reason: None,
+                    skipped_components: report.skipped_components,
+                    idle_ineligible_reasons: report.idle_ineligible_reasons,
+                    ordinary_requests: 0,
+                    idle_blockers: Vec::new(),
+                },
+                last_request_completion: None,
+            }),
+        }
+    }
+
+    fn snapshot(&self) -> DaemonLifecycleSnapshot {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
+            .clone()
+    }
+
+    fn ready(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .last_request_completion = Some(tokio::time::Instant::now());
+    }
+
+    fn admit(self: &Arc<Self>) -> Option<OrdinaryRequestGuard> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.snapshot.phase != DaemonLifecyclePhase::Serving {
+            return None;
+        }
+        state.snapshot.ordinary_requests += 1;
+        Some(OrdinaryRequestGuard(Arc::clone(self)))
+    }
+
+    /// The same mutex orders ordinary admission and the irreversible idle decision.
+    fn try_idle(&self, blockers: impl FnOnce() -> Vec<String>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.options.lifetime != DaemonLifetime::Demand
+            || state.snapshot.phase != DaemonLifecyclePhase::Serving
+            || state.snapshot.ordinary_requests != 0
+            || !state.snapshot.idle_ineligible_reasons.is_empty()
+            || state
+                .last_request_completion
+                .is_none_or(|last| last.elapsed() < self.options.idle_interval)
+        {
+            return false;
+        }
+        state.snapshot.idle_blockers = blockers();
+        if !state.snapshot.idle_blockers.is_empty() {
+            return false;
+        }
+        state.snapshot.phase = DaemonLifecyclePhase::Draining;
+        state.snapshot.shutdown_reason = Some(DaemonShutdownReason::Idle);
+        true
+    }
+
+    fn draining(&self, reason: DaemonShutdownReason) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.snapshot.phase != DaemonLifecyclePhase::Stopped {
+            state.snapshot.phase = DaemonLifecyclePhase::Draining;
+            state.snapshot.shutdown_reason = Some(reason);
+        }
+    }
+
+    fn stopped(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .snapshot
+            .phase = DaemonLifecyclePhase::Stopped;
+    }
+}
+
+#[cfg(unix)]
+struct OrdinaryRequestGuard(Arc<DaemonLifecycle>);
+
+#[cfg(unix)]
+impl Drop for OrdinaryRequestGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.snapshot.ordinary_requests -= 1;
+        // The guard covers response transport and cleanup, not just dispatch.
+        state.last_request_completion = Some(tokio::time::Instant::now());
+    }
+}
+
 /// Internal signal carried in a dispatch result until the daemon moves it to
 /// response-frame metadata. It must never be sent in `result`: older v8
 /// clients publish that string without inspecting its contents.
@@ -1064,6 +1256,9 @@ pub struct CheckpointStoreMetrics {
 /// gauges out, nothing in.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct MetricsSnapshot {
+    /// Launch mode and the current lifecycle of this daemon incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<DaemonLifecycleSnapshot>,
     /// Last-observed WAL page count from the periodic checkpoint tick.
     /// `None` when the checkpoint task has never ticked in this process
     /// (for example, an in-memory dispatcher with no pool, or a daemon that
@@ -1236,6 +1431,12 @@ where
 #[cfg(unix)]
 #[async_trait]
 pub trait DaemonDispatch: Clone + Send + Sync + 'static {
+    /// Named retained resources or unknown inventory that prevents idle exit.
+    /// An implementor must explicitly account for its resources before retiring.
+    fn idle_retirement_blockers(&self) -> Vec<String> {
+        vec!["dispatcher_resource_inventory_unknown".to_owned()]
+    }
+
     /// Describe syntax and loaded catalog membership without dispatching.
     fn plan(&self, ops: &str) -> String;
 
@@ -1487,6 +1688,52 @@ pub fn background_task_names() -> Vec<String> {
     out
 }
 
+#[cfg(unix)]
+fn idle_retirement_blockers<D: DaemonDispatch>(dispatcher: &D) -> Vec<String> {
+    let mut blockers = dispatcher.idle_retirement_blockers();
+    if !khive_storage::tx_registry::snapshot().is_empty() {
+        blockers.push("open_sql_transaction".to_owned());
+    }
+    blockers.extend(
+        active_phase_names()
+            .into_iter()
+            .map(|name| format!("active_phase:{name}")),
+    );
+    let count = background_task_count();
+    let names = background_task_names_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if names.values().sum::<usize>() != count {
+        blockers.push("tracked_worker_inventory_unsettled".to_owned());
+    }
+    // Only these inspected loops maintain replaceable caches/checkpoint state.
+    // Their tracked lifetime still participates in the final drain.
+    for name in names.keys() {
+        if !matches!(
+            *name,
+            "wal_checkpoint" | "memory_ann_rotation_watch" | "knowledge_ann_rotation_watch"
+        ) {
+            blockers.push(format!("unsettled_worker:{name}"));
+        }
+    }
+    blockers.sort();
+    blockers.dedup();
+    blockers
+}
+
+#[cfg(unix)]
+async fn wait_for_idle<D: DaemonDispatch>(dispatcher: &D, lifecycle: &DaemonLifecycle) {
+    if lifecycle.options.lifetime == DaemonLifetime::Persistent {
+        std::future::pending::<()>().await;
+    }
+    loop {
+        if lifecycle.try_idle(|| idle_retirement_blockers(dispatcher)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 struct BackgroundTaskGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
     name: &'static str,
@@ -1710,6 +1957,7 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
         .unwrap_or((None, None));
 
     MetricsSnapshot {
+        lifecycle: None,
         wal_pages: routine_wal.as_ref().map(|sample| sample.log_frames),
         wal_log_frames: routine_wal.as_ref().map(|sample| sample.log_frames),
         wal_checkpointed_frames: routine_wal
@@ -1746,6 +1994,21 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
             .as_ref()
             .map(|sample| sample.observed_at_unix_ms),
     }
+}
+
+#[cfg(unix)]
+async fn write_response_frame<W>(stream: &mut W, payload: &[u8]) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(INITIAL_FRAME_READ_TIMEOUT, write_frame(stream, payload))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon response write timed out",
+            )
+        })?
 }
 
 #[cfg(unix)]
@@ -1804,11 +2067,23 @@ fn plan_frame_companion(raw: &[u8]) -> Option<&'static str> {
 
 #[cfg(unix)]
 async fn handle_conn_with_shutdown<D: DaemonDispatch>(
-    mut stream: UnixStream,
+    stream: UnixStream,
     dispatcher: D,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     initial_frame_deadline: tokio::time::Instant,
 ) {
+    handle_conn_with_lifecycle(stream, dispatcher, shutdown, initial_frame_deadline, None).await;
+}
+
+#[cfg(unix)]
+async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
+    mut stream: UnixStream,
+    dispatcher: D,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    initial_frame_deadline: tokio::time::Instant,
+    lifecycle: Option<Arc<DaemonLifecycle>>,
+) {
+    let mut ordinary_admission = None;
     let production_shutdown = shutdown.is_some();
     // A handover is delivered over the probed connection. The production
     // listener enforces same-uid admission, and direct handler tests cannot
@@ -1859,7 +2134,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
                 request_id: None,
             };
             if let Ok(payload) = serde_json::to_vec(&response) {
-                if let Err(error) = write_frame(&mut stream, &payload).await {
+                if let Err(error) = write_response_frame(&mut stream, &payload).await {
                     tracing::debug!(%error, "failed to write plan envelope refusal");
                 }
             }
@@ -1981,7 +2256,15 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             served_config_id,
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
-            metrics: Some(build_metrics_snapshot(&dispatcher)),
+            metrics: Some({
+                let mut metrics = build_metrics_snapshot(&dispatcher);
+                metrics.lifecycle = lifecycle.as_ref().map(|state| {
+                    let mut snapshot = state.snapshot();
+                    snapshot.idle_blockers = idle_retirement_blockers(&dispatcher);
+                    snapshot
+                });
+                metrics
+            }),
             request_id: frame.request_id,
         }
     // There is no `frame.namespace != dispatcher.namespace()` reject here.
@@ -2043,6 +2326,31 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             request_id: frame.request_id,
         }
     } else {
+        if let Some(lifecycle) = &lifecycle {
+            ordinary_admission = lifecycle.admit();
+            if ordinary_admission.is_none() {
+                let refusal = DaemonResponseFrame {
+                    ok: false,
+                    result: None,
+                    error: Some("daemon is draining; request was not admitted".to_owned()),
+                    error_detail: Some(serde_json::json!({
+                        "kind": "runtime", "code": "daemon_draining",
+                        "domain_disposition": crate::DomainDisposition::NotCommitted.as_str(),
+                    })),
+                    request_id: frame.request_id,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some(dispatcher.config_id().to_owned()),
+                    version_mismatch: false,
+                    metrics: None,
+                };
+                if let Ok(payload) = serde_json::to_vec(&refusal) {
+                    let _ = write_response_frame(&mut peer_write, &payload).await;
+                }
+                return;
+            }
+        }
         // Build the per-request identity context from the frame so the
         // implementor mints the storage/gate token from the CALLER's
         // identity, not the dispatcher's own construction-baked scalars.
@@ -2191,12 +2499,12 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
                     request_id: resp.request_id,
                 };
                 if let Ok(err_payload) = serde_json::to_vec(&err_resp) {
-                    if let Err(e) = write_frame(&mut peer_write, &err_payload).await {
+                    if let Err(e) = write_response_frame(&mut peer_write, &err_payload).await {
                         tracing::debug!(error = %e, "failed to write oversized-response error frame");
                     }
                 }
             } else {
-                match write_frame(&mut peer_write, &payload).await {
+                match write_response_frame(&mut peer_write, &payload).await {
                     Ok(()) => handover_ack_written = true,
                     Err(e) => tracing::debug!(error = %e, "failed to write daemon response frame"),
                 }
@@ -2211,6 +2519,7 @@ async fn handle_conn_with_shutdown<D: DaemonDispatch>(
             tracing::error!(error = %std::io::Error::last_os_error(), "self-directed handover signal failed");
         }
     }
+    drop(ordinary_admission);
 }
 
 /// An accepted connection owns a drain slot from the accept loop until its
@@ -2265,7 +2574,14 @@ where
 #[cfg(unix)]
 pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
     let boot_guard = Some(acquire_daemon_boot_guard()?);
-    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false, |_| {}).await
+    run_daemon_with_boot_guard_inner(
+        dispatcher,
+        boot_guard,
+        false,
+        DaemonOptions::default(),
+        |_| DaemonStartupReport::default(),
+    )
+    .await
 }
 
 /// Run a real daemon server for an in-process multi-launch test.
@@ -2286,7 +2602,14 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 #[doc(hidden)]
 pub async fn run_daemon_in_process_test<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
     let boot_guard = Some(acquire_daemon_boot_guard()?);
-    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, true, |_| {}).await
+    run_daemon_with_boot_guard_inner(
+        dispatcher,
+        boot_guard,
+        true,
+        DaemonOptions::default(),
+        |_| DaemonStartupReport::default(),
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -2608,7 +2931,14 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     dispatcher: D,
     boot_guard: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
-    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false, |_| {}).await
+    run_daemon_with_boot_guard_inner(
+        dispatcher,
+        boot_guard,
+        false,
+        DaemonOptions::default(),
+        |_| DaemonStartupReport::default(),
+    )
+    .await
 }
 
 /// Run the daemon and start host-owned background work only after the socket
@@ -2626,7 +2956,35 @@ where
     D: DaemonDispatch,
     F: FnOnce(&D) + Send,
 {
-    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false, start).await
+    run_daemon_with_options_and_boot_guard_and_start(
+        dispatcher,
+        boot_guard,
+        DaemonOptions::default(),
+        |dispatcher| {
+            start(dispatcher);
+            DaemonStartupReport::default()
+        },
+    )
+    .await
+}
+
+/// Start with an explicit launch mode and collect the host's startup inventory.
+#[cfg(unix)]
+pub async fn run_daemon_with_options_and_boot_guard_and_start<D, F>(
+    dispatcher: D,
+    boot_guard: Option<std::fs::File>,
+    options: DaemonOptions,
+    start: F,
+) -> anyhow::Result<()>
+where
+    D: DaemonDispatch,
+    F: FnOnce(&D) -> DaemonStartupReport + Send,
+{
+    anyhow::ensure!(
+        !options.idle_interval.is_zero(),
+        "daemon idle interval must be positive"
+    );
+    run_daemon_with_boot_guard_inner(dispatcher, boot_guard, false, options, start).await
 }
 
 #[cfg(unix)]
@@ -2634,11 +2992,12 @@ async fn run_daemon_with_boot_guard_inner<D, F>(
     dispatcher: D,
     boot_guard: Option<std::fs::File>,
     allow_same_process_incumbent: bool,
+    options: DaemonOptions,
     start: F,
 ) -> anyhow::Result<()>
 where
     D: DaemonDispatch,
-    F: FnOnce(&D) + Send,
+    F: FnOnce(&D) -> DaemonStartupReport + Send,
 {
     // Cancel on every exit, including setup failure and unwinding from the
     // post-ownership startup callback. The guard precedes all fallible work
@@ -2784,7 +3143,7 @@ where
     // I bound" rather than trusting the path alone.
     let bound_identity = socket_identity(&sock);
 
-    start(&dispatcher);
+    let lifecycle = Arc::new(DaemonLifecycle::new(options, start(&dispatcher)));
 
     // Release the shared startup lock now that the listener is bound. The
     // locked PID file continues to identify this daemon through shutdown.
@@ -2799,7 +3158,7 @@ where
 
     {
         let warm = dispatcher.clone();
-        tokio::spawn(async move {
+        track_named_background_task("daemon_warmup", async move {
             warm.warm_all().await;
         });
     }
@@ -2864,11 +3223,13 @@ where
         }
         Ok::<(), std::io::Error>(())
     };
+    tokio::pin!(shutdown);
+    lifecycle.ready();
 
     // SAFETY: `geteuid` is always successful and takes no arguments.
     let daemon_euid = unsafe { libc::geteuid() } as u32;
 
-    tokio::select! {
+    let reason = tokio::select! {
         _ = async {
             let mut accept_error_backoff = None;
             let mut last_accept_error_log: Option<std::time::Instant> = None;
@@ -2918,12 +3279,14 @@ where
                         // credential check and connection-task scheduling.
                         let d = dispatcher.clone();
                         let shutdown = request_shutdown_rx.clone();
+                        let lifecycle = Arc::clone(&lifecycle);
                         let handle = spawn_connection_task(Arc::clone(&active), async move {
-                            handle_conn_with_shutdown(
+                            handle_conn_with_lifecycle(
                                 stream,
                                 d,
                                 Some(shutdown),
                                 initial_frame_deadline,
+                                Some(lifecycle),
                             )
                             .await;
                         });
@@ -2955,9 +3318,12 @@ where
                     }
                 }
             }
-        } => {}
-        result = shutdown => result?,
-    }
+        } => DaemonShutdownReason::Signal,
+        result = &mut shutdown => { result?; DaemonShutdownReason::Signal },
+        _ = wait_for_idle(&dispatcher, &lifecycle) => DaemonShutdownReason::Idle,
+    };
+
+    lifecycle.draining(reason);
 
     // A listening backlog is not admitted work. Close it before draining so
     // new clients cannot finish writing to a socket nobody will accept.
@@ -2970,14 +3336,28 @@ where
 
     // Per-run signal: read scopes stop promptly, admitted writes ignore it and
     // retain the rest of the configured drain window to commit or roll back.
-    let _ = request_shutdown_tx.send(true);
+    if reason == DaemonShutdownReason::Signal {
+        let _ = request_shutdown_tx.send(true);
+    }
 
     // Same ordering contract for ADR-119 daemon components: cancel before
     // drain, so each component's supervisor (itself a tracked task) can run
     // its bounded shutdown inside the drain wait.
     daemon_shutdown_token().cancel();
 
-    let drained = drain(&active).await;
+    let drained = if reason == DaemonShutdownReason::Idle {
+        tokio::select! {
+            _ = drain_for_idle(&active, drain_timeout()) => true,
+            result = &mut shutdown => {
+                result?;
+                lifecycle.draining(DaemonShutdownReason::Signal);
+                let _ = request_shutdown_tx.send(true);
+                drain(&active).await
+            }
+        }
+    } else {
+        drain(&active).await
+    };
     let tasks = {
         let mut retained = connection_tasks
             .lock()
@@ -3005,6 +3385,7 @@ where
             );
         }
     }
+    lifecycle.stopped();
     tracing::info!("khived stopped");
     Ok(())
 }
@@ -3354,6 +3735,22 @@ async fn pid_file_names_a_reachable_daemon(
 #[cfg(unix)]
 async fn drain(active: &std::sync::atomic::AtomicUsize) -> bool {
     drain_with_timeout(active, drain_timeout()).await
+}
+
+/// Voluntary retirement keeps admitted workers and rendezvous ownership alive.
+#[cfg(unix)]
+async fn drain_for_idle(active: &std::sync::atomic::AtomicUsize, timeout: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut warned = false;
+    while active.load(std::sync::atomic::Ordering::SeqCst) + background_task_count() != 0 {
+        if !warned && tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "idle drain interval elapsed; retaining workers and rendezvous until settled"
+            );
+            warned = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 #[cfg(unix)]
@@ -4717,8 +5114,391 @@ mod tests {
         }
     }
 
+    mod demand_retirement_tests {
+        use super::*;
+        use khive_storage::SqlAccess;
+
+        fn dispatcher(pool: Option<Arc<ConnectionPool>>) -> MockDispatch {
+            MockDispatch {
+                namespace: "local".to_owned(),
+                config_id: "idle-test".to_owned(),
+                dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                pool,
+                dispatch_err: None,
+            }
+        }
+
+        fn lifecycle(mode: DaemonLifetime) -> Arc<DaemonLifecycle> {
+            Arc::new(DaemonLifecycle::new(
+                DaemonOptions {
+                    lifetime: mode,
+                    idle_interval: std::time::Duration::from_secs(1),
+                },
+                DaemonStartupReport::default(),
+            ))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ordinary_cleanup_resets_idle_and_admission_is_one_way() {
+            let state = lifecycle(DaemonLifetime::Demand);
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            assert!(
+                !state.try_idle(Vec::new),
+                "readiness must precede the idle clock"
+            );
+            state.ready();
+            let request = state.admit().unwrap();
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            assert!(
+                !state.try_idle(Vec::new),
+                "admitted work must prevent retirement"
+            );
+            drop(request);
+            assert!(
+                !state.try_idle(Vec::new),
+                "cleanup starts a fresh idle interval"
+            );
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            assert!(state.try_idle(Vec::new));
+            assert!(
+                state.admit().is_none(),
+                "draining must refuse before dispatch"
+            );
+            assert!(!state.try_idle(Vec::new), "retirement cannot be repeated");
+            assert_eq!(
+                state.snapshot().shutdown_reason,
+                Some(DaemonShutdownReason::Idle)
+            );
+            state.stopped();
+            assert!(state.admit().is_none());
+        }
+
+        #[test]
+        fn concurrent_admission_and_idle_decision_choose_one_winner() {
+            for _ in 0..16 {
+                let state = Arc::new(DaemonLifecycle::new(
+                    DaemonOptions {
+                        lifetime: DaemonLifetime::Demand,
+                        idle_interval: std::time::Duration::from_nanos(1),
+                    },
+                    DaemonStartupReport::default(),
+                ));
+                state.ready();
+                let barrier = Arc::new(std::sync::Barrier::new(2));
+                let admitting_state = Arc::clone(&state);
+                let admitting_barrier = Arc::clone(&barrier);
+                let admission = std::thread::spawn(move || {
+                    admitting_barrier.wait();
+                    admitting_state.admit()
+                });
+                let retiring_state = Arc::clone(&state);
+                let retirement = std::thread::spawn(move || {
+                    barrier.wait();
+                    retiring_state.try_idle(Vec::new)
+                });
+                let admitted = admission.join().unwrap();
+                let retired = retirement.join().unwrap();
+                assert_ne!(
+                    admitted.is_some(),
+                    retired,
+                    "request admission and voluntary retirement cannot both win"
+                );
+                if retired {
+                    assert!(state.admit().is_none());
+                }
+                drop(admitted);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn named_service_obligations_and_unknown_resources_are_ineligible() {
+            let state = Arc::new(DaemonLifecycle::new(
+                DaemonOptions {
+                    lifetime: DaemonLifetime::Demand,
+                    idle_interval: std::time::Duration::from_secs(1),
+                },
+                DaemonStartupReport {
+                    skipped_components: vec!["schedule-tick".to_owned()],
+                    idle_ineligible_reasons: vec![
+                        "unclassified_component:external-service".to_owned()
+                    ],
+                },
+            ));
+            state.ready();
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            assert!(!state.try_idle(Vec::new));
+            assert_eq!(
+                state.snapshot().idle_ineligible_reasons,
+                vec!["unclassified_component:external-service"]
+            );
+            let unknown = CancellationAwareDispatch {
+                started: Arc::new(tokio::sync::Notify::new()),
+                cancellation_observed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                count_sql: None,
+            };
+            let clean = lifecycle(DaemonLifetime::Demand);
+            clean.ready();
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            assert!(!clean.try_idle(|| unknown.idle_retirement_blockers()));
+            assert_eq!(
+                clean.snapshot().idle_blockers,
+                vec!["dispatcher_resource_inventory_unknown"]
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial(background_tasks, tx_registry)]
+        async fn retained_raw_sql_writer_blocks_actual_idle_wait_and_persistent_stays() {
+            let dir = tempfile::tempdir().unwrap();
+            let pool = Arc::new(
+                ConnectionPool::new(khive_db::PoolConfig {
+                    path: Some(dir.path().join("retained.db")),
+                    write_queue_enabled: Some(false),
+                    write_routing_strict: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            let bridge = khive_db::SqlBridge::new(Arc::clone(&pool), true);
+            let writer = bridge.writer().await.unwrap();
+            assert!(
+                khive_storage::tx_registry::snapshot().is_empty(),
+                "this hold must be autocommit, not an open transaction"
+            );
+            let d = dispatcher(Some(Arc::clone(&pool)));
+            let demand = lifecycle(DaemonLifetime::Demand);
+            let persistent = lifecycle(DaemonLifetime::Persistent);
+            demand.ready();
+            persistent.ready();
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            let idle = wait_for_idle(&d, &demand);
+            tokio::pin!(idle);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(150), &mut idle)
+                    .await
+                    .is_err(),
+                "a genuine retained writer handle must prevent the actual idle arm"
+            );
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                wait_for_idle(&d, &persistent)
+            )
+            .await
+            .is_err());
+            drop(writer);
+            assert_eq!(pool.retirement_writer_holds(), 0);
+            tokio::time::timeout(std::time::Duration::from_secs(2), idle)
+                .await
+                .unwrap();
+            assert_eq!(demand.snapshot().phase, DaemonLifecyclePhase::Draining);
+            assert_eq!(persistent.snapshot().phase, DaemonLifecyclePhase::Serving);
+            let pooled = lifecycle(DaemonLifetime::Demand);
+            pooled.ready();
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            let pooled_guard = pool.writer().unwrap();
+            assert!(
+                !pooled.try_idle(|| idle_retirement_blockers(&d)),
+                "pooled writer hold must block retirement"
+            );
+            drop(pooled_guard);
+            assert!(pooled.try_idle(|| idle_retirement_blockers(&d)));
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial(background_tasks, tx_registry)]
+        async fn persistent_idle_wait_never_retires_after_writer_release() {
+            let dir = tempfile::tempdir().unwrap();
+            let pool = Arc::new(
+                ConnectionPool::new(khive_db::PoolConfig {
+                    path: Some(dir.path().join("persistent.db")),
+                    write_queue_enabled: Some(false),
+                    write_routing_strict: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            let bridge = khive_db::SqlBridge::new(Arc::clone(&pool), true);
+            let held = bridge.writer().await.unwrap();
+            let d = dispatcher(Some(pool));
+            let state = lifecycle(DaemonLifetime::Persistent);
+            state.ready();
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                wait_for_idle(&d, &state)
+            )
+            .await
+            .is_err());
+            drop(held);
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                wait_for_idle(&d, &state)
+            )
+            .await
+            .is_err());
+            assert_eq!(state.snapshot().phase, DaemonLifecyclePhase::Serving);
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial(background_tasks, tx_registry)]
+        async fn explicit_sql_reader_transaction_blocks_retirement_without_writer_hold() {
+            let dir = tempfile::tempdir().unwrap();
+            let pool = Arc::new(
+                ConnectionPool::new(khive_db::PoolConfig {
+                    path: Some(dir.path().join("reader.db")),
+                    write_queue_enabled: Some(false),
+                    write_routing_strict: false,
+                    ..Default::default()
+                })
+                .unwrap(),
+            );
+            let bridge = khive_db::SqlBridge::new(Arc::clone(&pool), true);
+            let mut reader = bridge.reader().await.unwrap();
+            reader
+                .query_all(khive_storage::SqlStatement {
+                    sql: "BEGIN DEFERRED".to_owned(),
+                    params: vec![],
+                    label: Some("idle-reader".to_owned()),
+                })
+                .await
+                .unwrap();
+            assert_eq!(pool.retirement_writer_holds(), 0);
+            let d = dispatcher(Some(pool));
+            let state = lifecycle(DaemonLifetime::Demand);
+            state.ready();
+            tokio::time::advance(std::time::Duration::from_secs(3)).await;
+            assert!(!state.try_idle(|| idle_retirement_blockers(&d)));
+            assert!(state
+                .snapshot()
+                .idle_blockers
+                .contains(&"open_sql_transaction".to_owned()));
+            drop(reader);
+            assert!(state.try_idle(|| idle_retirement_blockers(&d)));
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial(background_tasks, tx_registry)]
+        async fn unsettled_named_worker_blocks_idle_without_resetting_clock() {
+            let (release, pending) = tokio::sync::oneshot::channel::<()>();
+            let task = spawn_named_tracked_task("idle-test-worker", async move {
+                pending.await.unwrap();
+            });
+            let state = lifecycle(DaemonLifetime::Demand);
+            state.ready();
+            let d = dispatcher(None);
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            assert!(!state.try_idle(|| idle_retirement_blockers(&d)));
+            assert!(state
+                .snapshot()
+                .idle_blockers
+                .contains(&"unsettled_worker:idle-test-worker".to_owned()));
+            release.send(()).unwrap();
+            task.await.unwrap();
+            assert!(
+                state.try_idle(|| idle_retirement_blockers(&d)),
+                "maintenance completion must not reset ordinary activity"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial(background_tasks)]
+        async fn voluntary_drain_retains_pending_work_past_deadline() {
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (release, pending) = tokio::sync::oneshot::channel::<()>();
+            let task = spawn_connection_task(Arc::clone(&active), async move {
+                pending.await.unwrap();
+            });
+            let drain = drain_for_idle(&active, std::time::Duration::from_millis(10));
+            tokio::pin!(drain);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), &mut drain)
+                    .await
+                    .is_err(),
+                "voluntary timeout must retain admitted work"
+            );
+            assert!(!task.is_finished());
+            release.send(()).unwrap();
+            task.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stalled_response_transport_is_bounded() {
+            let (mut writer, _held_reader) = tokio::io::duplex(1);
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(35),
+                write_response_frame(&mut writer, b"bounded response"),
+            )
+            .await
+            .expect("the production response bound must fire before the fixture ceiling")
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn draining_handler_refuses_before_dispatch() {
+            let d = dispatcher(None);
+            let calls = Arc::clone(&d.dispatch_calls);
+            let state = lifecycle(DaemonLifetime::Demand);
+            state.ready();
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            assert!(state.try_idle(Vec::new));
+            // The lifecycle transition is already fixed. Real Unix socket
+            // readiness must not race the paused clock's automatic timeout jump.
+            tokio::time::resume();
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let handle = tokio::spawn(handle_conn_with_lifecycle(
+                server,
+                d,
+                None,
+                tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT,
+                Some(state),
+            ));
+            let mut frame = base_request_frame("idle-test");
+            frame.ops = "stats()".to_owned();
+            write_frame(&mut client, &serde_json::to_vec(&frame).unwrap())
+                .await
+                .unwrap();
+            let refusal: DaemonResponseFrame =
+                serde_json::from_slice(&read_frame(&mut client).await.unwrap()).unwrap();
+            assert!(!refusal.ok);
+            assert_eq!(refusal.error_detail.unwrap()["code"], "daemon_draining");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            handle.await.unwrap();
+        }
+
+        #[test]
+        fn lifecycle_metrics_are_additive_and_generation_is_stable() {
+            let state = lifecycle(DaemonLifetime::Demand);
+            let generation = state.snapshot().instance_generation;
+            let metrics = MetricsSnapshot {
+                lifecycle: Some(state.snapshot()),
+                ..Default::default()
+            };
+            let decoded: MetricsSnapshot =
+                serde_json::from_value(serde_json::to_value(metrics).unwrap()).unwrap();
+            assert_eq!(decoded.lifecycle.unwrap().instance_generation, generation);
+            let old = serde_json::to_value(MetricsSnapshot::default()).unwrap();
+            assert!(old.get("lifecycle").is_none());
+            assert!(serde_json::from_value::<MetricsSnapshot>(old)
+                .unwrap()
+                .lifecycle
+                .is_none());
+        }
+    }
+
     #[async_trait]
     impl DaemonDispatch for MockDispatch {
+        fn idle_retirement_blockers(&self) -> Vec<String> {
+            self.pool
+                .as_ref()
+                .filter(|pool| pool.retirement_writer_holds() != 0)
+                .map(|_| vec!["test_backend:held_writer".to_owned()])
+                .unwrap_or_default()
+        }
+
         fn plan(&self, ops: &str) -> String {
             khive_request::plan_request(ops, &Default::default()).to_string()
         }

@@ -1275,6 +1275,8 @@ mod tests {
             pack: Vec::new(),
             config: Some(config_path.clone()),
             daemon: false,
+            lifetime: None,
+            idle_timeout_secs: None,
             transport: None,
             bind: None,
             brain_profile: None,
