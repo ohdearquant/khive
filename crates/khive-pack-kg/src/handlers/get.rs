@@ -386,10 +386,10 @@ impl KgPack {
     ) -> Result<Option<Value>, RuntimeError> {
         let ns = token.namespace().as_str().to_owned();
 
-        let (sql_str, params) = if Uuid::from_str(raw_id).is_ok() {
+        let (sql_str, params) = if let Ok(id) = Uuid::from_str(raw_id) {
             (
                 sql!("proposals_find_by_id").to_string(),
-                vec![SqlValue::Text(raw_id.to_string()), SqlValue::Text(ns)],
+                vec![SqlValue::Text(id.to_string()), SqlValue::Text(ns)],
             )
         } else if raw_id.len() >= 8 && raw_id.chars().all(|c| c.is_ascii_hexdigit()) {
             let pattern = format!("{}%", hex_prefix_to_uuid_pattern(raw_id));
