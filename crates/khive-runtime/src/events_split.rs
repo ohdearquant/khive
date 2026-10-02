@@ -387,6 +387,11 @@ pub(crate) fn direct_backend_with_max_readers(
     read_only: bool,
     max_readers: Option<usize>,
 ) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
+    let mut config = crate::RuntimeConfig {
+        db_path: Some(db_path.to_path_buf()),
+        ..crate::RuntimeConfig::no_embeddings()
+    };
+    let wal_ceiling = config.resolve_wal_ceiling_policy(read_only)?;
     let mut registry = direct_backend_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -437,6 +442,16 @@ pub(crate) fn direct_backend_with_max_readers(
                 key.display()
             )));
         }
+        let existing_bytes = existing.pool().config().wal_ceiling.bytes;
+        if existing_bytes != wal_ceiling.bytes {
+            return Err(khive_db::SqliteError::InvalidConfig(format!(
+                "events database {} is already open with wal_ceiling_bytes={existing_bytes}; \
+                 requested {}; drain and restart before changing the WAL ceiling",
+                key.display(),
+                wal_ceiling.bytes
+            ))
+            .into());
+        }
         return Ok(Arc::clone(existing));
     }
     let db_path = key.as_path();
@@ -459,9 +474,13 @@ pub(crate) fn direct_backend_with_max_readers(
             .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     }
     let backend = Arc::new(if read_only {
-        StorageBackend::sqlite_read_only_with_max_readers(db_path, max_readers)?
+        StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
+            db_path,
+            max_readers,
+            wal_ceiling,
+        )?
     } else {
-        StorageBackend::sqlite_with_max_readers(db_path, max_readers)?
+        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(db_path, max_readers, wal_ceiling)?
     });
     registry.insert(key, (read_only, Arc::clone(&backend)));
     Ok(backend)
@@ -1046,6 +1065,11 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
 /// user's hands.
 #[cfg(unix)]
 pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Result<()> {
+    let mut config = crate::RuntimeConfig {
+        db_path: Some(db_path.to_path_buf()),
+        ..crate::RuntimeConfig::no_embeddings()
+    };
+    let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
     // The subcommand's `--db`/`--socket` arrive from argv and may be
     // relative; anchor them before anything derives a parent from them.
     let db_path = &absolutize(db_path);
@@ -1078,7 +1102,10 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // inodes. Sidecars SQLite creates from here on inherit the database
     // file's mode; the check after the open below opens nothing.
     let before_open = harden_events_db_sidecars(db_path)?;
-    let backend = Arc::new(StorageBackend::sqlite(db_path)?);
+    let backend = Arc::new(
+        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(db_path, None, wal_ceiling)
+            .map_err(crate::error::RuntimeError::from)?,
+    );
     // Ensure the schema once, loudly, before accepting traffic.
     backend.events()?;
     verify_events_db_owner_only_unopened(db_path, &before_open)?;
@@ -1116,6 +1143,9 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     tracing::info!(
         socket = %socket_path.display(),
         db = %db_path.display(),
+        wal_ceiling_configured_bytes = wal_ceiling.bytes,
+        wal_ceiling_effective_bytes = wal_ceiling.effective_bytes(backend.is_read_only()),
+        wal_ceiling_source = ?wal_ceiling.source,
         "events daemon listening"
     );
 
