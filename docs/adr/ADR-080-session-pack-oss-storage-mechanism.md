@@ -225,7 +225,30 @@ assigned backend is a read-only snapshot.
 parses complete lines, and advances the cursor to the last complete line boundary — with
 one exception added by §7, where a line already known to exceed the cap checkpoints a
 bounded discarded prefix mid-line. A file whose length has not grown past the cursor is
-skipped without being opened.
+skipped without being opened only while its stored file identity still matches and its length
+has not fallen below the cursor.
+
+Each cursor advance stores a nullable
+`file_identity` in the same row and transaction as its byte offset. The identity is stable
+across appends and changes when a new file replaces the path (device and inode on Unix; volume
+serial number and file id on Windows; file creation time only on targets with neither). A
+different identity or a file shorter than the
+stored offset restarts ingestion at byte zero. A legacy cursor with no identity also restarts
+from zero when backfill is enabled: its prefix was already eligible for ingestion, so the
+insert-once event keys make replay safe. With `KHIVE_MIRROR_BACKFILL=false`, a legacy cursor
+instead adopts and persists the observed identity at its existing offset when the file is not
+shorter than that offset. The pre-offset prefix may never have been ingested, and replaying it
+would import history the operator excluded. A legacy cursor whose file was replaced before the
+upgrade by one at least as long adopts the replacement and skips its first `<offset>` bytes; with
+no stored identity the replacement cannot be detected. Truncation still restarts from zero
+regardless of backfill. Subsequent unchanged polls use the new witness and retain the cheap
+length guard. The reader verifies that the opened file still has the identity observed by the
+service's metadata probe before it can advance the cursor.
+Regular-file checks and no-follow opens keep a symlinked transcript from making the mirror read a
+target outside its configured tree. A symlink supplied as a configured export root is refused once
+at discovery and is not polled; entries reached while walking a configured directory are also
+ignored when they are symlinks. A same-inode rewrite that grows beyond the old cursor remains
+indistinguishable from an append without reading and hashing previously consumed bytes.
 
 A single line is never buffered past a hard per-line byte cap (`MirrorLimits::max_line_bytes`,
 PACKSESSION-AUD-003): a complete line (terminated by `\n`) over the cap is skipped —
@@ -337,7 +360,8 @@ three indexes: `sessions` (one row per session or conversation: provider id, sou
 git branch, slug, message count, first/last seen), `session_messages` (one row per
 transcript event: uuid key, session id, per-session `seq`, parent uuid, sidechain flag,
 role, type, masked text, masked raw, timestamp), and `session_mirror_cursor` (one row per
-watched file: byte offset, session id, updated-at).
+watched file: byte offset, session id, updated-at, nullable file identity). The pack's
+nullable column-addition plan upgrades existing cursor tables without clearing their offsets.
 
 #### Invariants (normative for every source)
 
