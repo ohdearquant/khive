@@ -2065,7 +2065,10 @@ fn plan_frame_companion(raw: &[u8]) -> Option<&'static str> {
     .find(|field| value.get(*field).is_some())
 }
 
-#[cfg(unix)]
+#[cfg(all(
+    unix,
+    any(test, feature = "fault-injection", feature = "test-internals")
+))]
 async fn handle_conn_with_shutdown<D: DaemonDispatch>(
     stream: UnixStream,
     dispatcher: D,
