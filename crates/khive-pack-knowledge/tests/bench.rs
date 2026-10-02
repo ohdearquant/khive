@@ -26,6 +26,10 @@ use std::sync::Arc;
 
 fn rt_with_embedder() -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
