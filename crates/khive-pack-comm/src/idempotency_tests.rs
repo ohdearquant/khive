@@ -20,6 +20,10 @@ fn actor_registry(
     let runtime = KhiveRuntime::from_backend(
         backend,
         RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
