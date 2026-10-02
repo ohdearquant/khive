@@ -733,29 +733,34 @@ impl KhiveRuntime {
     ///
     /// `limit` caps the final returned list; internally pulls `limit * 4` candidates per path.
     ///
-    /// # Cross-namespace visibility (entity search — primary namespace only; deferred)
+    /// # Cross-namespace visibility (entity search — text leg: visible set; vector leg: primary)
     ///
-    /// Both the **FTS leg** and the **vector/ANN leg** of entity search (`hybrid_search`)
-    /// are restricted to the **primary namespace only**.
+    /// The two legs of entity search scope namespaces differently.
     ///
-    /// Rationale: each namespace owns a separate FTS table (`fts_entities_{ns}`)
-    /// and a separate ANN index instance. Cross-namespace entity-search fanout
-    /// requires iterating over every visible namespace's store, issuing parallel
-    /// search requests, and fusing the results: this is deferred.
+    /// **Text leg.** Entity full-text search is one shared table (`fts_entities`)
+    /// with a `namespace` column. The token's whole visible set (`visible_ns`) is
+    /// forwarded in `TextFilter.namespaces`, which the store applies as a
+    /// `namespace IN (...)` predicate, so one query returns text hits from every
+    /// visible namespace.
     ///
-    /// Note: this is distinct from `memory.recall`'s cross-namespace fanout, which
-    /// already iterates `visible_namespaces` across both the FTS and vector legs.
-    /// Entity search fanout is the remaining deferred piece; memory recall fanout
-    /// is not deferred.
+    /// **Vector leg.** The vector leg runs only when a query vector is supplied or
+    /// an embedding model is configured. It is an exact sqlite-vec search
+    /// (brute-force cosine, as in `knn`); no ANN index is involved. It issues a
+    /// single request scoped to the primary namespace, because a
+    /// `VectorSearchRequest` carries one namespace. Searching the visible set
+    /// would take one request per namespace and a merge of the per-namespace
+    /// lists; that fanout is not implemented for entities, so entity vector hits
+    /// come from the primary namespace only.
     ///
-    /// The `visible_ns` list is forwarded in the `TextFilter.namespaces` field,
-    /// which limits results to those namespaces within the primary store. Because
-    /// entities from extra namespaces live in their own FTS tables, this filter has
-    /// no cross-namespace effect today.
+    /// The fused candidates are then checked against the entity store with the
+    /// visible set, so an entity from an extra visible namespace is returned when
+    /// the text leg matched it, and is not returned on a vector-only match.
     ///
-    /// Callers with a multi-namespace visible set can READ cross-namespace entities
-    /// directly via `get_entity` / `resolve`, but `hybrid_search` returns only
-    /// primary-namespace hits until entity-search cross-namespace fanout ships.
+    /// This differs from `memory.recall`, whose vector leg already searches every
+    /// visible namespace.
+    ///
+    /// Callers can also read any visible entity directly via `get_entity` /
+    /// `resolve`.
     #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search(
         &self,
