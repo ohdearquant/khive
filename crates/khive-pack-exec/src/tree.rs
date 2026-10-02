@@ -318,9 +318,21 @@ struct PrefixWork {
     child_lookups: usize,
     #[cfg(test)]
     ordered_probes: usize,
+    #[cfg(test)]
+    copied_label_bytes: usize,
 }
 
 impl PrefixWork {
+    #[inline]
+    fn copied_label(&mut self, bytes: usize) {
+        #[cfg(test)]
+        {
+            self.copied_label_bytes += bytes;
+        }
+        #[cfg(not(test))]
+        let _ = (self, bytes);
+    }
+
     #[inline]
     fn comparison(&mut self, bytes: usize) {
         #[cfg(test)]
@@ -379,11 +391,22 @@ impl Default for PrefixIndex {
 
 impl PrefixIndex {
     fn first_parent<'a>(&self, path: &'a str, work: &mut PrefixWork) -> Option<&'a str> {
+        self.first_prefix(path, false, work)
+    }
+
+    fn first_prefix<'a>(
+        &self,
+        path: &'a str,
+        include_exact: bool,
+        work: &mut PrefixWork,
+    ) -> Option<&'a str> {
         let mut node = 0;
         let mut consumed = 0;
         loop {
             let remaining = &path[consumed..];
-            if self.nodes[node].entry && remaining.starts_with('/') {
+            if self.nodes[node].entry
+                && (remaining.starts_with('/') || (include_exact && remaining.is_empty()))
+            {
                 return Some(&path[..consumed]);
             }
             let first = remaining.chars().next()?;
@@ -409,6 +432,7 @@ impl PrefixIndex {
             };
             work.lookup();
             let Some(edge) = self.nodes[node].children.get(&first) else {
+                work.copied_label(remaining.len());
                 let child = self.nodes.len();
                 self.nodes.push(PrefixNode {
                     entry: true,
@@ -436,6 +460,7 @@ impl PrefixIndex {
                 .children
                 .remove(&first)
                 .expect("edge exists");
+            work.copied_label(edge.label.len() - common);
             let old_suffix = edge.label.split_off(common);
             let middle = self.nodes.len();
             let mut middle_node = PrefixNode::default();
@@ -453,6 +478,7 @@ impl PrefixIndex {
                 self.nodes[middle].entry = true;
             } else {
                 let suffix = &remaining[common..];
+                work.copied_label(suffix.len());
                 let child = self.nodes.len();
                 self.nodes.push(PrefixNode {
                     entry: true,
@@ -468,6 +494,56 @@ impl PrefixIndex {
             }
             return;
         }
+    }
+}
+
+/// Boolean output coverage over already validated declarations, independent of
+/// the manifest's file/directory collision policy.
+#[cfg(any(unix, test))]
+pub(crate) struct DeclaredCoverage {
+    prefixes: PrefixIndex,
+    #[cfg(test)]
+    work: crate::membership::MembershipWork,
+    #[cfg(test)]
+    pub(crate) declarations: Vec<String>,
+}
+
+#[cfg(any(unix, test))]
+impl DeclaredCoverage {
+    pub(crate) fn new(paths: &[String], work: crate::membership::MembershipWork) -> Self {
+        let mut ordered: Vec<&str> = paths.iter().map(String::as_str).collect();
+        // Insertion only affects representation, never the boolean predicate.
+        // A later split cannot copy an older suffix longer than its input.
+        ordered.sort_by_key(|path| path.len());
+        let mut prefixes = PrefixIndex::default();
+        let mut build = PrefixWork::default();
+        for path in ordered {
+            prefixes.insert(path, &mut build);
+        }
+        #[cfg(test)]
+        work.declared_build(
+            build.compared_bytes,
+            build.child_lookups,
+            build.copied_label_bytes,
+        );
+        #[cfg(not(test))]
+        let _ = work;
+        Self {
+            prefixes,
+            #[cfg(test)]
+            work,
+            #[cfg(test)]
+            declarations: paths.to_vec(),
+        }
+    }
+
+    pub(crate) fn covers(&self, path: &str) -> bool {
+        let mut query = PrefixWork::default();
+        let covered = self.prefixes.first_prefix(path, true, &mut query).is_some();
+        #[cfg(test)]
+        self.work
+            .declared_query(query.compared_bytes, query.child_lookups);
+        covered
     }
 }
 

@@ -7642,6 +7642,10 @@ mod tests {
 
         let texts = Arc::new(Mutex::new(Vec::new()));
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -7829,6 +7833,10 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(RoleAwareRecordingCalls::default()));
         let fail_query = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let runtime = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),

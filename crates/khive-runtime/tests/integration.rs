@@ -2205,6 +2205,10 @@ async fn file_backed_runtime_persists() {
 
     {
         let config = RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -2245,6 +2249,10 @@ async fn file_backed_runtime_persists() {
     // Re-open the same file
     {
         let config = RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -2881,6 +2889,10 @@ mod embedder_registry_tests {
 
     fn memory_rt_no_model() -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -3041,6 +3053,10 @@ mod embedder_registry_tests {
     async fn dual_embedding_regression_both_models_registered() {
         use khive_runtime::RuntimeConfig;
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),

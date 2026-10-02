@@ -74,6 +74,35 @@ pub enum ConfigError {
     #[error("backend {name:?}: `served_kinds` must not be empty when declared")]
     EmptyBackendServedKinds { name: String },
 
+    #[error("KHIVE_SQLITE_WAL_CEILING_BYTES must be an unsigned decimal byte count")]
+    InvalidWalCeilingEnvironment { value: String },
+
+    #[error(
+        "backend {name:?}: wal_ceiling_bytes {value} exceeds supported SQLite offset arithmetic"
+    )]
+    WalCeilingOffsetOverflow { name: String, value: u64 },
+
+    #[error(
+        "backend {name:?}: nonzero wal_ceiling_bytes {value} requires a file-backed SQLite backend"
+    )]
+    WalCeilingMemoryBackend { name: String, value: u64 },
+
+    #[error("backend {name:?}: nonzero wal_ceiling_bytes {value} requires SQLite WAL mode")]
+    WalCeilingNonWalBackend { name: String, value: u64 },
+
+    #[error(
+        "backends {first_backend:?} and {second_backend:?} name the same database at {} \
+         but resolve different WAL ceilings ({first_bytes} and {second_bytes} bytes)",
+        crate::secret_gate::bounded_masked_log_text(&path.to_string_lossy())
+    )]
+    WalCeilingAliasConflict {
+        first_backend: String,
+        second_backend: String,
+        path: PathBuf,
+        first_bytes: u64,
+        second_bytes: u64,
+    },
+
     #[error(
         "backend configuration leaves searchable substrate kinds {kinds:?} unserved; \
          defined backends: {defined}"
@@ -318,6 +347,86 @@ pub enum BackendKind {
     Memory,
 }
 
+/// The configured WAL ceiling and the writer policy actually enforced by a backend.
+///
+/// A read-only SQLite backend retains its configured value for reporting but
+/// has no writer policy, so `effective_bytes` is zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedWalCeiling {
+    /// Selected field, environment, or default value before read-only handling.
+    pub configured_bytes: u64,
+    /// Writer-enforced value; zero for a read-only backend.
+    pub effective_bytes: u64,
+    /// Origin of `configured_bytes`.
+    pub source: khive_db::WalCeilingSource,
+}
+
+/// Resolve the ceiling with backend-field precedence over the environment.
+///
+/// `env_value` is a construction-time snapshot supplied by the host. This
+/// function never reads process environment, so forwarding and backend opening
+/// can validate the same policy even when the environment later changes.
+pub fn resolve_wal_ceiling(
+    backend_field: Option<u64>,
+    env_value: Option<&str>,
+    backend_name: &str,
+    kind: BackendKind,
+    wal_mode: bool,
+    read_only: bool,
+) -> Result<ResolvedWalCeiling, ConfigError> {
+    if kind == BackendKind::Memory && backend_field.is_none() {
+        return Ok(ResolvedWalCeiling {
+            configured_bytes: 0,
+            effective_bytes: 0,
+            source: khive_db::WalCeilingSource::Default,
+        });
+    }
+    let (configured_bytes, source) = if let Some(bytes) = backend_field {
+        (bytes, khive_db::WalCeilingSource::BackendField)
+    } else if let Some(raw) = env_value {
+        if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ConfigError::InvalidWalCeilingEnvironment {
+                value: raw.to_owned(),
+            });
+        }
+        let bytes = raw
+            .parse::<u64>()
+            .map_err(|_| ConfigError::InvalidWalCeilingEnvironment {
+                value: raw.to_owned(),
+            })?;
+        (bytes, khive_db::WalCeilingSource::Environment)
+    } else {
+        (0, khive_db::WalCeilingSource::Default)
+    };
+
+    if configured_bytes != 0 {
+        if i64::try_from(configured_bytes).is_err() {
+            return Err(ConfigError::WalCeilingOffsetOverflow {
+                name: backend_name.to_owned(),
+                value: configured_bytes,
+            });
+        }
+        if kind == BackendKind::Memory {
+            return Err(ConfigError::WalCeilingMemoryBackend {
+                name: backend_name.to_owned(),
+                value: configured_bytes,
+            });
+        }
+        if !wal_mode {
+            return Err(ConfigError::WalCeilingNonWalBackend {
+                name: backend_name.to_owned(),
+                value: configured_bytes,
+            });
+        }
+    }
+
+    Ok(ResolvedWalCeiling {
+        configured_bytes,
+        effective_bytes: if read_only { 0 } else { configured_bytes },
+        source,
+    })
+}
+
 /// Configuration for a named storage backend.
 ///
 /// Corresponds to a `[[backends]]` entry in `khive.toml`.
@@ -358,6 +467,10 @@ pub struct BackendConfig {
     /// Open the backend read-only. Defaults to `false`.
     #[serde(default)]
     pub read_only: bool,
+    /// WAL extent ceiling in bytes. `None` inherits the environment setting;
+    /// zero disables the ceiling. Read-only backends retain the configured
+    /// value for reporting but enforce no writer policy.
+    pub wal_ceiling_bytes: Option<u64>,
 }
 
 /// Per-pack backend assignment.
@@ -1691,6 +1804,23 @@ impl KhiveConfig {
                     return Err(ConfigError::DuplicateBackendName {
                         name: backend.name.clone(),
                     });
+                }
+
+                // The field's static invariants are checked when the config
+                // file loads. The host resolves the environment fallback once
+                // for every effective backend before forwarding or opening it.
+                if backend.wal_ceiling_bytes.is_some() {
+                    resolve_wal_ceiling(
+                        backend.wal_ceiling_bytes,
+                        None,
+                        &backend.name,
+                        backend.kind.clone(),
+                        backend
+                            .journal_mode
+                            .as_deref()
+                            .is_none_or(|mode| mode.eq_ignore_ascii_case("wal")),
+                        backend.read_only,
+                    )?;
                 }
 
                 // Reject fields that are parsed but not yet implemented: silently
@@ -3194,6 +3324,126 @@ kind = "memory"
     }
 
     #[test]
+    fn memory_wal_policy_ignores_environment_but_keeps_its_own_field() {
+        for raw in ["8192", "abc"] {
+            let resolved = resolve_wal_ceiling(
+                None,
+                Some(raw),
+                "ephemeral",
+                BackendKind::Memory,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(resolved.configured_bytes, 0, "MEMORY_IGNORES_ENVIRONMENT");
+            assert_eq!(resolved.source, khive_db::WalCeilingSource::Default);
+            let error = resolve_wal_ceiling(
+                Some(8192),
+                Some(raw),
+                "ephemeral",
+                BackendKind::Memory,
+                true,
+                false,
+            )
+            .expect_err("DECLARED_MEMORY_FIELD_REFUSAL");
+            assert!(matches!(
+                error,
+                ConfigError::WalCeilingMemoryBackend { value: 8192, .. }
+            ));
+        }
+        let error = resolve_wal_ceiling(
+            None,
+            Some("credential-secret-marker"),
+            "file",
+            BackendKind::Sqlite,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "KHIVE_SQLITE_WAL_CEILING_BYTES must be an unsigned decimal byte count",
+            "RAW_WAL_ENVIRONMENT_NOT_ECHOED"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_nonzero_memory_backend_fails_config_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            "[[backends]]\nname = 'main'\nkind = 'memory'\nwal_ceiling_bytes = 4152\n",
+        );
+        let error = KhiveConfig::load(Some(&path)).expect_err("memory has no WAL extent");
+        assert!(matches!(
+            config_error_root(&error),
+            ConfigError::WalCeilingMemoryBackend { name, value }
+                if name == "main" && *value == 4152
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_nonzero_non_wal_backend_is_typed_error() {
+        let error =
+            resolve_wal_ceiling(Some(4152), None, "main", BackendKind::Sqlite, false, false)
+                .expect_err("non-WAL SQLite cannot enforce a WAL extent ceiling");
+        assert!(matches!(
+            error,
+            ConfigError::WalCeilingNonWalBackend { name, value }
+                if name == "main" && value == 4152
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_offset_overflow_fails_before_backend_kind() {
+        let overflow = i64::MAX as u64 + 1;
+        let error = resolve_wal_ceiling(
+            Some(overflow),
+            None,
+            "ephemeral",
+            BackendKind::Memory,
+            false,
+            false,
+        )
+        .expect_err("unsupported SQLite offset must fail before backend checks");
+        assert!(matches!(
+            error,
+            ConfigError::WalCeilingOffsetOverflow { name, value }
+                if name == "ephemeral" && value == overflow
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_field_precedes_environment_and_read_only_disables_enforcement() {
+        let resolved = resolve_wal_ceiling(
+            Some(4152),
+            Some("not-a-byte-count"),
+            "archive",
+            BackendKind::Sqlite,
+            true,
+            true,
+        )
+        .expect("higher-priority field makes lower-priority environment irrelevant");
+        assert_eq!(resolved.configured_bytes, 4152);
+        assert_eq!(resolved.effective_bytes, 0);
+        assert_eq!(resolved.source, khive_db::WalCeilingSource::BackendField);
+
+        let invalid = resolve_wal_ceiling(
+            None,
+            Some("not-a-byte-count"),
+            "archive",
+            BackendKind::Sqlite,
+            true,
+            false,
+        )
+        .expect_err("a selected malformed environment must fail closed");
+        assert!(matches!(
+            invalid,
+            ConfigError::InvalidWalCeilingEnvironment { .. }
+        ));
+    }
+
+    #[test]
     fn test_pack_backend_assignment_parses() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_toml(
@@ -4651,6 +4901,27 @@ timezone = ""
             ),
             "expected InvalidDisplayTimezone, got {err:?}"
         );
+    }
+
+    #[test]
+    fn wal_ceiling_alias_conflict_escapes_control_characters_in_the_path() {
+        let error = ConfigError::WalCeilingAliasConflict {
+            first_backend: "main".to_string(),
+            second_backend: "alias".to_string(),
+            path: PathBuf::from("/data/line\nforged entry\x1b[31m/archive.db"),
+            first_bytes: 0,
+            second_bytes: 8192,
+        };
+        let text = error.to_string();
+        assert!(
+            !text.chars().any(|c| c == '\n' || c == '\x1b'),
+            "a configured path must not put raw control characters in the error text; got {text:?}"
+        );
+        assert!(
+            text.contains("line\\u{000a}forged entry\\u{001b}[31m/archive.db"),
+            "control characters must be escaped in place; got {text:?}"
+        );
+        assert!(text.contains("resolve different WAL ceilings (0 and 8192 bytes)"));
     }
     include!("engine_config_backend_batch_tests.rs");
 }
