@@ -13,7 +13,9 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::embedder_registry::EmbedderProvider;
-use crate::keyed_memory::{create_keyed_memory, validate_memory_key, KeyedMemorySpec};
+use crate::keyed_memory::{
+    create_keyed_memory, create_keyed_memory_with_receipt, validate_memory_key, KeyedMemorySpec,
+};
 use crate::operations::{arm_fts_fail_scoped, arm_vector_fail_scoped};
 use crate::{KhiveRuntime, NamespaceToken, RuntimeError, RuntimeResult};
 
@@ -115,6 +117,8 @@ async fn assert_rows(runtime: &KhiveRuntime, token: &NamespaceToken, notes: i64,
         "SELECT COUNT(*) FROM fts_notes WHERE namespace = ?1",
         "SELECT COUNT(*) FROM fts_notes_rowids WHERE namespace = ?1",
         "SELECT COUNT(*) FROM ann_write_log WHERE namespace = ?1",
+        "SELECT COUNT(*) FROM memory_visibility_receipts WHERE namespace = ?1",
+        "SELECT COUNT(*) FROM memory_visibility_fences WHERE namespace = ?1",
     ] {
         assert_eq!(
             count(runtime, sql, vec![SqlValue::Text(namespace.into())]).await,
@@ -139,6 +143,207 @@ async fn assert_rows(runtime: &KhiveRuntime, token: &NamespaceToken, notes: i64,
         )
         .await,
         edges
+    );
+}
+
+#[tokio::test]
+async fn keyed_memory_without_models_replays_an_explicit_empty_receipt() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    runtime.install_kind_registry(vec![], vec!["memory".into()]);
+    let token = token(&runtime, "keyed-memory-zero-model-receipt");
+    let (first, _, replayed, fences) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("zero-model-key", "text-only keyed memory", None),
+    )
+    .await
+    .expect("first keyed write");
+    assert!(!replayed);
+    assert!(fences.is_empty());
+    assert_eq!(
+        count(
+            &runtime,
+            "SELECT model_count FROM memory_visibility_receipts WHERE namespace = ?1 AND note_id = ?2",
+            vec![
+                SqlValue::Text(token.namespace().as_str().into()),
+                SqlValue::Text(first.id.to_string()),
+            ],
+        )
+        .await,
+        0
+    );
+
+    let (second, _, was_replay, replay_fences) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("zero-model-key", "text-only keyed memory", None),
+    )
+    .await
+    .expect("exact replay");
+    assert_eq!(second.id, first.id);
+    assert!(was_replay);
+    assert!(replay_fences.is_empty());
+}
+
+#[tokio::test]
+async fn keyed_memory_replay_preserves_exact_vector_fence_after_log_compaction() {
+    let (runtime, token, _) = fixture("keyed-memory-visibility-replay").await;
+    let (first, _, replayed, fences) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec(
+            "visibility-key",
+            "distinctive keyed visibility memory",
+            None,
+        ),
+    )
+    .await
+    .expect("first keyed write");
+    assert!(!replayed);
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].0, MODEL);
+    let original_seq = count(
+        &runtime,
+        "SELECT seq FROM ann_write_log WHERE subject_id = ?1 AND embedding_model = ?2 AND op = 'upsert'",
+        vec![
+            SqlValue::Text(first.id.to_string()),
+            SqlValue::Text(MODEL.into()),
+        ],
+    )
+    .await;
+    assert_eq!(fences[0].1, original_seq as u64);
+
+    // A compacted log no longer identifies the original write. The receipt
+    // sidecar must keep the old sequence without writing a replacement row.
+    runtime
+        .sql()
+        .writer()
+        .await
+        .expect("writer")
+        .execute(SqlStatement {
+            sql: "DELETE FROM ann_write_log WHERE namespace = ?1 AND subject_id = ?2".into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().into()),
+                SqlValue::Text(first.id.to_string()),
+            ],
+            label: Some("test-compact-original-memory-log".into()),
+        })
+        .await
+        .expect("compact original log row");
+    let (second, _, was_replay, replay_fences) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec(
+            "visibility-key",
+            "distinctive keyed visibility memory",
+            None,
+        ),
+    )
+    .await
+    .expect("exact replay");
+    assert_eq!(second.id, first.id);
+    assert!(was_replay);
+    assert_eq!(replay_fences, fences);
+    assert_eq!(
+        count(
+            &runtime,
+            "SELECT COUNT(*) FROM ann_write_log WHERE namespace = ?1 AND subject_id = ?2",
+            vec![
+                SqlValue::Text(token.namespace().as_str().into()),
+                SqlValue::Text(first.id.to_string()),
+            ],
+        )
+        .await,
+        0,
+        "exact replay must not mint another vector log row"
+    );
+}
+
+#[tokio::test]
+async fn keyed_memory_replay_refuses_when_original_receipt_is_missing() {
+    let (runtime, token, _) = fixture("keyed-memory-missing-visibility-receipt").await;
+    let (first, _, _, _) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("missing-receipt-key", "memory with a lost receipt", None),
+    )
+    .await
+    .expect("first keyed write");
+    runtime
+        .sql()
+        .writer()
+        .await
+        .expect("writer")
+        .execute(SqlStatement {
+            sql: "DELETE FROM memory_visibility_receipts WHERE namespace = ?1 AND note_id = ?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().into()),
+                SqlValue::Text(first.id.to_string()),
+            ],
+            label: Some("test-remove-original-visibility-receipt".into()),
+        })
+        .await
+        .expect("remove receipt");
+
+    let error = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("missing-receipt-key", "memory with a lost receipt", None),
+    )
+    .await
+    .expect_err("replay cannot invent a newer fence");
+    let RuntimeError::Khive(error) = error else {
+        panic!("expected typed unmet receipt, got {error:?}");
+    };
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
+    assert_eq!(
+        error.details().and_then(|details| details.get("reason")),
+        Some("freshness_unmet")
+    );
+}
+
+#[tokio::test]
+async fn keyed_memory_replay_refuses_when_original_model_fence_is_missing() {
+    let (runtime, token, _) = fixture("keyed-memory-missing-model-fence").await;
+    let (first, _, _, _) = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("missing-fence-key", "memory with a lost model fence", None),
+    )
+    .await
+    .expect("first keyed write");
+    runtime
+        .sql()
+        .writer()
+        .await
+        .expect("writer")
+        .execute(SqlStatement {
+            sql: "DELETE FROM memory_visibility_fences WHERE namespace = ?1 AND note_id = ?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(token.namespace().as_str().into()),
+                SqlValue::Text(first.id.to_string()),
+            ],
+            label: Some("test-remove-original-model-fence".into()),
+        })
+        .await
+        .expect("remove model fence");
+
+    let error = create_keyed_memory_with_receipt(
+        &runtime,
+        &token,
+        spec("missing-fence-key", "memory with a lost model fence", None),
+    )
+    .await
+    .expect_err("replay cannot present a zero-model receipt for a model write");
+    let RuntimeError::Khive(error) = error else {
+        panic!("expected typed unmet receipt, got {error:?}");
+    };
+    assert_eq!(error.kind(), ErrorKind::Unavailable);
+    assert_eq!(
+        error.details().and_then(|details| details.get("reason")),
+        Some("freshness_unmet")
     );
 }
 
