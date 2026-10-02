@@ -1013,6 +1013,16 @@ fn orphan_sweep_dml(
             p = orphan_pred,
         );
         let mut select_stmt = conn.prepare(&select_sql)?;
+        // vec0 only selects its point plan for primary-key equality outside KNN,
+        // so the log insert and the delete each run once per victim id.
+        let log_sql = format!(
+            "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+             SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+             FROM {table} WHERE subject_id = ?1"
+        );
+        let mut log_stmt = conn.prepare(&log_sql)?;
+        let del_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
+        let mut delete_stmt = conn.prepare(&del_sql)?;
         let mut total: i64 = 0;
         let mut remaining = max_delete;
         while remaining > 0 {
@@ -1027,23 +1037,11 @@ fn orphan_sweep_dml(
                 break;
             }
 
-            let placeholders: String = (1..=victim_ids.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let in_clause = format!("subject_id IN ({placeholders})");
-            let params: Vec<&dyn rusqlite::ToSql> = victim_ids
-                .iter()
-                .map(|s| s as &dyn rusqlite::ToSql)
-                .collect();
-            let log_sql = format!(
-                "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
-                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
-                 FROM {table} WHERE {in_clause}"
-            );
-            conn.prepare_cached(&log_sql)?.execute(params.as_slice())?;
-            let del_sql = format!("DELETE FROM {t} WHERE {in_clause}", t = table);
-            total += conn.prepare_cached(&del_sql)?.execute(params.as_slice())? as i64;
+            for id in &victim_ids {
+                log_stmt.execute([id.as_str()])?;
+                total += delete_stmt.execute([id.as_str()])? as i64;
+            }
+            // The relational provenance sidecar keeps its bounded IN statement.
             delete_vector_provenance(conn, table, &victim_ids)?;
             remaining -= victim_ids.len() as i64;
         }
@@ -2326,6 +2324,115 @@ mod point_lookup_tests {
                 assert_eq!(actual, expected_remaining);
             }
             assert!(conn.is_autocommit(), "delete must finish its transaction");
+        }
+        assert_point_plans(&fixture.pool, &statements, "INSERT INTO ann_write_log ");
+        assert_point_plans(&fixture.pool, &statements, "DELETE FROM vec_point_lookup ");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_uses_point_plans_across_batches() {
+        let fixture = Fixture::new();
+        // Every ninth stored vector keeps a live entity. The rest are orphans,
+        // enough for one full 400-victim batch and a partial one.
+        let live: HashSet<String> = fixture
+            .stored
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 9 == 0)
+            .map(|(_, vector)| vector.id.to_string())
+            .collect();
+        {
+            let writer = fixture.pool.try_writer().expect("pool writer");
+            let conn = writer.conn();
+            conn.execute_batch(
+                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER); \
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER); \
+                 CREATE TABLE knowledge_atoms (id TEXT PRIMARY KEY, deleted_at INTEGER)",
+            )
+            .expect("create live-subject tables");
+            let mut insert = conn
+                .prepare("INSERT INTO entities (id, deleted_at) VALUES (?1, NULL)")
+                .expect("prepare live entity insert");
+            for id in &live {
+                insert.execute([id.as_str()]).expect("seed live entity");
+            }
+        }
+        let mut expected_log: Vec<_> = fixture
+            .stored
+            .iter()
+            .filter(|vector| !live.contains(&vector.id.to_string()))
+            .map(|vector| {
+                (
+                    vector.namespace.to_string(),
+                    vector.model.to_string(),
+                    vector.kind.to_string(),
+                    vector.field.to_string(),
+                    vector.id.to_string(),
+                    "delete".to_string(),
+                )
+            })
+            .collect();
+        expected_log.sort();
+        assert!(
+            expected_log.len() > 400,
+            "fixture must need more than one delete batch"
+        );
+        let capture = StatementCapture::new(Arc::clone(&fixture.pool));
+        let result = fixture
+            .store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![],
+                substrate_kinds: vec![],
+                max_delete: 1000,
+                dry_run: false,
+            })
+            .await
+            .expect("orphan sweep");
+        let statements = capture.finish();
+        assert_eq!(result.scanned as usize, fixture.stored.len());
+        assert_eq!(result.would_delete as usize, expected_log.len());
+        assert_eq!(result.deleted as usize, expected_log.len());
+        assert!(!result.max_delete_hit);
+        {
+            let writer = fixture.pool.try_writer().expect("pool writer");
+            let conn = writer.conn();
+            let mut log = conn
+                .prepare(
+                    "SELECT namespace, embedding_model, kind, field, subject_id, op \
+                     FROM ann_write_log",
+                )
+                .expect("read delete log");
+            let mut actual_log: Vec<(String, String, String, String, String, String)> = log
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .expect("query delete log")
+                .collect::<Result<_, _>>()
+                .expect("delete log rows");
+            actual_log.sort();
+            assert_eq!(actual_log, expected_log);
+            for sql in [
+                "SELECT subject_id FROM vec_point_lookup",
+                "SELECT subject_id FROM vector_provenance WHERE model_key = 'point_lookup'",
+            ] {
+                let actual: HashSet<String> = conn
+                    .prepare(sql)
+                    .expect("read surviving identities")
+                    .query_map([], |row| row.get(0))
+                    .expect("query surviving identities")
+                    .collect::<Result<_, _>>()
+                    .expect("surviving identities");
+                assert_eq!(actual, live);
+            }
+            assert!(conn.is_autocommit(), "sweep must finish its transaction");
         }
         assert_point_plans(&fixture.pool, &statements, "INSERT INTO ann_write_log ");
         assert_point_plans(&fixture.pool, &statements, "DELETE FROM vec_point_lookup ");
