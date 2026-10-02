@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use khive_db::StorageBackend;
+pub use khive_db::WalCeilingSource;
 use khive_gate::{ActorRef, AllowAllGate, GateRef};
 use khive_types::Namespace;
 use lattice_embed::EmbeddingModel;
@@ -323,6 +324,18 @@ pub struct RuntimeConfig {
     /// builders, which coordinate V21 before constructing runtimes. Tests and
     /// already-current single-backend callers may still use it directly.
     pub db_path: Option<std::path::PathBuf>,
+    /// The WAL ceiling applied to this runtime's implicit main backend.
+    /// Zero means disabled, including for a read-only backend that retains a
+    /// nonzero configured value only for operator reporting.
+    pub wal_ceiling_bytes: u64,
+    /// The configured value before read-only writer-policy suppression.
+    pub wal_ceiling_configured_bytes: u64,
+    /// Where the configured ceiling came from.
+    pub wal_ceiling_source: WalCeilingSource,
+    /// Construction-time snapshot of the environment fallback. The host uses
+    /// this same value to resolve every named backend before forwarding or
+    /// opening it, without rereading mutable process environment.
+    pub wal_ceiling_env_raw: Option<String>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
     /// Local embedding model. `None` alone does not disable embedding: setting
@@ -505,6 +518,11 @@ impl Default for RuntimeConfig {
             .filter(|s| !s.trim().is_empty());
         Self {
             db_path,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: WalCeilingSource::Default,
+            wal_ceiling_env_raw: std::env::var_os("KHIVE_SQLITE_WAL_CEILING_BYTES")
+                .map(|value| value.to_string_lossy().into_owned()),
             default_namespace: Namespace::local(),
             embedding_model,
             additional_embedding_models,
@@ -529,6 +547,67 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    /// The WAL ceiling policy this config asks its implicit main backend to
+    /// open with. Preserves a configured ceiling for read-only reporting while
+    /// ensuring a directly constructed config cannot silently drop a nonzero
+    /// effective value: when the configured value is zero, the effective
+    /// `wal_ceiling_bytes` is used. Host openers validate the captured
+    /// environment through [`Self::resolve_wal_ceiling_policy`] first.
+    pub fn wal_ceiling_policy(&self) -> khive_db::WalCeilingPolicy {
+        khive_db::WalCeilingPolicy {
+            bytes: if self.wal_ceiling_configured_bytes == 0 {
+                self.wal_ceiling_bytes
+            } else {
+                self.wal_ceiling_configured_bytes
+            },
+            source: self.wal_ceiling_source,
+        }
+    }
+
+    /// Resolve the implicit backend against the config's captured environment,
+    /// retaining configured bytes separately from a read-only writer policy.
+    pub fn resolve_wal_ceiling_policy(
+        &mut self,
+        read_only: bool,
+    ) -> RuntimeResult<khive_db::WalCeilingPolicy> {
+        let policy = self.wal_ceiling_policy();
+        let backend_field = match self.wal_ceiling_source {
+            WalCeilingSource::BackendField => Some(policy.bytes),
+            WalCeilingSource::Environment if self.wal_ceiling_env_raw.is_some() => None,
+            _ if policy.bytes != 0 => Some(policy.bytes),
+            _ => None,
+        };
+        let kind = if self.db_path.is_some() {
+            crate::BackendKind::Sqlite
+        } else {
+            crate::BackendKind::Memory
+        };
+        let resolved = crate::resolve_wal_ceiling(
+            backend_field,
+            self.wal_ceiling_env_raw.as_deref(),
+            self.backend_id.as_str(),
+            kind,
+            true,
+            read_only,
+        )
+        .map_err(|error| khive_db::SqliteError::InvalidConfig(error.to_string()))?;
+        self.wal_ceiling_configured_bytes = resolved.configured_bytes;
+        self.wal_ceiling_bytes = resolved.effective_bytes;
+        self.wal_ceiling_source = resolved.source;
+        Ok(self.wal_ceiling_policy())
+    }
+
+    /// Pack-registry discovery has no file-backed writer to govern.
+    pub fn for_metadata_registry(mut self) -> Self {
+        self.db_path = None;
+        self.wal_ceiling_bytes = 0;
+        self.wal_ceiling_configured_bytes = 0;
+        self.wal_ceiling_source = WalCeilingSource::BackendField;
+        self.embedding_model = None;
+        self.additional_embedding_models.clear();
+        self
+    }
+
     /// Return the shipped pack set used when no CLI, environment, or
     /// configuration-file selection is present.
     pub fn built_in_packs() -> Vec<String> {

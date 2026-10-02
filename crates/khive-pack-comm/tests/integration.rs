@@ -4082,6 +4082,10 @@ fn build_crossns_registry(
     allowed_outbound: Vec<Namespace>,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -5036,6 +5040,10 @@ fn build_identity_registry(
     actor_id: Option<&str>,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -5418,6 +5426,10 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
 
     let backend = shared_backend();
     let config = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -5540,6 +5552,10 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
 
     // An anonymous (unconfigured) caller on the same backend must NOT see B's message.
     let config_anon = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
