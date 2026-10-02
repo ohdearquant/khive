@@ -4710,7 +4710,11 @@ async fn context_returns_note_neighbours_and_names_their_substrate() {
     // The control: the neighbour walk itself sees all three. Any shortfall in
     // `context` below is therefore hydration and not the edges.
     let neighbours = pack
-        .handle_neighbors(&token, json!({"node_id": anchor.id, "direction": "both"}))
+        .handle_neighbors(
+            &token,
+            json!({"node_id": anchor.id, "direction": "both"}),
+            &registry,
+        )
         .await
         .expect("neighbors");
     assert_eq!(
@@ -4726,6 +4730,7 @@ async fn context_returns_note_neighbours_and_names_their_substrate() {
         .handle_context(
             &token,
             json!({"entity_ids": [anchor.id.to_string()], "hops": 1}),
+            &registry,
         )
         .await
         .expect("context");

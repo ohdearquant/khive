@@ -2,9 +2,89 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use khive_storage::types::{Direction, NeighborCursor, NeighborHit, NeighborQuery};
 use uuid::Uuid;
 
-use crate::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
+use crate::{KhiveRuntime, Namespace, NamespaceToken, Resolved, RuntimeError, VerbRegistry};
+
+/// Query options for a KG neighbor read whose origin may live on a pack backend.
+pub struct KgNeighborRead {
+    pub query: NeighborQuery,
+    pub after: Option<NeighborCursor>,
+    pub neighbor_kinds: Option<Vec<String>>,
+    pub enrich: bool,
+    /// Narrow graph selection to an already visible namespace while retaining
+    /// the caller token's identity and originating request metadata.
+    pub namespace: Option<Namespace>,
+}
+
+pub(crate) fn neighbor_read_namespaces<'a>(
+    token: &'a NamespaceToken,
+    namespace: Option<&'a Namespace>,
+) -> Result<&'a [Namespace], RuntimeError> {
+    match namespace {
+        Some(namespace) if token.visible_namespaces().contains(namespace) => {
+            Ok(std::slice::from_ref(namespace))
+        }
+        Some(_) => Err(RuntimeError::InvalidInput(
+            "KG neighbor namespace must already be visible to the caller".into(),
+        )),
+        None => Ok(token.visible_namespaces()),
+    }
+}
+
+impl VerbRegistry {
+    /// Resolve a live KG origin across configured backends before expanding
+    /// adjacency on the graph runtime with the original caller token.
+    pub async fn neighbors_for_kg_read(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        options: KgNeighborRead,
+    ) -> Result<Vec<NeighborHit>, RuntimeError> {
+        neighbor_read_namespaces(token, options.namespace.as_ref())?;
+        if self
+            .resolve_kg_read_by_id(runtime, token, node_id, false)
+            .await?
+            .is_none()
+            && !runtime.substrate_exists_by_id(token, node_id).await?
+        {
+            return Err(RuntimeError::NotFound(format!(
+                "neighbor anchor {node_id} not found"
+            )));
+        }
+        runtime
+            .neighbors_for_resolved_kg_read(token, node_id, options)
+            .await
+    }
+
+    /// The directed form of [`Self::neighbors_for_kg_read`], retaining stored
+    /// edge direction and the existing graph namespace selection.
+    pub async fn directed_neighbors_for_kg_read(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        query: NeighborQuery,
+        namespace: Option<&Namespace>,
+    ) -> Result<Vec<(NeighborHit, Direction)>, RuntimeError> {
+        neighbor_read_namespaces(token, namespace)?;
+        if self
+            .resolve_kg_read_by_id(runtime, token, node_id, false)
+            .await?
+            .is_none()
+            && !runtime.substrate_exists_by_id(token, node_id).await?
+        {
+            return Err(RuntimeError::NotFound(format!(
+                "neighbor anchor {node_id} not found"
+            )));
+        }
+        runtime
+            .directed_neighbors_for_resolved_kg_read(token, node_id, query, namespace)
+            .await
+    }
+}
 
 pub(crate) struct KgReadResolver {
     runtimes: Vec<KhiveRuntime>,
@@ -117,7 +197,141 @@ impl KgReadResolver {
 mod tests {
     use super::*;
     use crate::{BackendId, Namespace, RuntimeConfig};
+    use chrono::Utc;
+    use khive_storage::types::{Edge, LinkId};
     use khive_storage::{Entity, Note};
+
+    #[tokio::test]
+    async fn kg_neighbor_namespace_selection_is_narrowing_and_keeps_directed_self_loops() {
+        let project = Namespace::parse("project").unwrap();
+        let main = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            backend_id: BackendId::main(),
+            actor_id: Some("reader".into()),
+            visible_namespaces: vec![project.clone()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let token = main
+            .authorize_with_visibility(Namespace::local(), vec![project.clone()])
+            .unwrap();
+        let anchor = Entity::new("local", "concept", "namespace selector anchor");
+        let neighbor = Entity::new("project", "concept", "namespace selector neighbor");
+        for entity in [&anchor, &neighbor] {
+            main.entities(&token)
+                .unwrap()
+                .upsert_entity(entity.clone())
+                .await
+                .unwrap();
+        }
+        let self_loop = Uuid::new_v4();
+        for (namespace, id, source) in [
+            (Namespace::local(), self_loop, anchor.id),
+            (project.clone(), Uuid::new_v4(), neighbor.id),
+        ] {
+            let edge_token = main.authorize(namespace.clone()).unwrap();
+            let now = Utc::now();
+            main.graph(&edge_token)
+                .unwrap()
+                .upsert_edge(Edge {
+                    id: LinkId(id),
+                    namespace: namespace.to_string(),
+                    source_id: source,
+                    target_id: anchor.id,
+                    relation: khive_storage::EdgeRelation::Extends,
+                    weight: 1.0,
+                    created_at: now,
+                    updated_at: now,
+                    deleted_at: None,
+                    metadata: None,
+                    target_backend: None,
+                })
+                .await
+                .unwrap();
+        }
+        let registry = crate::VerbRegistryBuilder::new().build().unwrap();
+        let query = NeighborQuery {
+            direction: Direction::Both,
+            relations: None,
+            limit: Some(10),
+            min_weight: None,
+        };
+        let baseline = main
+            .neighbors_with_query_directed(&token, anchor.id, query.clone())
+            .await
+            .unwrap();
+        let full = registry
+            .directed_neighbors_for_kg_read(&main, &token, anchor.id, query.clone(), None)
+            .await
+            .unwrap();
+        let keys = |hits: &[(NeighborHit, Direction)]| {
+            hits.iter()
+                .map(|(hit, direction)| (hit.node_id, hit.edge_id, direction.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&full), keys(&baseline));
+        let local = registry
+            .directed_neighbors_for_kg_read(
+                &main,
+                &token,
+                anchor.id,
+                query.clone(),
+                Some(&Namespace::local()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(local.len(), 2);
+        assert_eq!(local[0].0.edge_id, self_loop);
+        assert_eq!(local[0].1, Direction::Out);
+        assert_eq!(local[1].1, Direction::In);
+        let project_hits = registry
+            .neighbors_for_kg_read(
+                &main,
+                &token,
+                anchor.id,
+                KgNeighborRead {
+                    query: query.clone(),
+                    after: None,
+                    neighbor_kinds: None,
+                    enrich: true,
+                    namespace: Some(project),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(project_hits.len(), 1);
+        assert_eq!(project_hits[0].node_id, neighbor.id);
+        let outside = Namespace::parse("outside").unwrap();
+        assert!(matches!(
+            registry
+                .directed_neighbors_for_kg_read(
+                    &main,
+                    &token,
+                    anchor.id,
+                    query.clone(),
+                    Some(&outside)
+                )
+                .await,
+            Err(RuntimeError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            registry
+                .neighbors_for_kg_read(
+                    &main,
+                    &token,
+                    anchor.id,
+                    KgNeighborRead {
+                        query,
+                        after: None,
+                        neighbor_kinds: None,
+                        enrich: true,
+                        namespace: Some(outside),
+                    },
+                )
+                .await,
+            Err(RuntimeError::InvalidInput(_))
+        ));
+    }
 
     fn runtime(name: &str) -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {

@@ -3536,7 +3536,7 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         node_id: Uuid,
-        mut query: NeighborQuery,
+        query: NeighborQuery,
         after: Option<NeighborCursor>,
         neighbor_kinds: Option<Vec<String>>,
         enrich: bool,
@@ -3549,10 +3549,45 @@ impl KhiveRuntime {
             )));
         }
 
+        self.neighbors_for_resolved_kg_read(
+            token,
+            node_id,
+            crate::KgNeighborRead {
+                query,
+                after,
+                neighbor_kinds,
+                enrich,
+                namespace: None,
+            },
+        )
+        .await
+    }
+
+    /// Expand an already resolved live KG origin on this runtime's graph.
+    ///
+    /// The caller must verify the origin's existence and apply any record-kind
+    /// read scope before calling. The original caller token is retained for
+    /// namespace selection and enrichment; an optional namespace may only
+    /// narrow its visible set. Like the ordinary neighbor read, resolution and
+    /// adjacency are separate reads rather than an atomic record snapshot.
+    pub async fn neighbors_for_resolved_kg_read(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        options: crate::KgNeighborRead,
+    ) -> RuntimeResult<Vec<NeighborHit>> {
+        let crate::KgNeighborRead {
+            mut query,
+            after,
+            neighbor_kinds,
+            enrich,
+            namespace,
+        } = options;
+        let namespaces = crate::kg_read::neighbor_read_namespaces(token, namespace.as_ref())?;
         query.direction =
             normalize_symmetric_direction(query.direction, query.relations.as_deref());
         let mut hits = Vec::new();
-        for ns in token.visible_namespaces() {
+        for ns in namespaces {
             let temp = NamespaceToken::for_namespace(ns.clone());
             let mut ns_hits = self
                 .graph(&temp)?
@@ -3669,8 +3704,20 @@ impl KhiveRuntime {
             )));
         }
 
+        self.directed_neighbors_for_resolved_kg_read(token, node_id, query, None)
+            .await
+    }
+
+    pub(crate) async fn directed_neighbors_for_resolved_kg_read(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        query: NeighborQuery,
+        namespace: Option<&crate::Namespace>,
+    ) -> RuntimeResult<Vec<(NeighborHit, Direction)>> {
+        let namespaces = crate::kg_read::neighbor_read_namespaces(token, namespace)?;
         let mut hits: Vec<DirectedNeighborHit> = Vec::new();
-        for ns in token.visible_namespaces() {
+        for ns in namespaces {
             let temp = NamespaceToken::for_namespace(ns.clone());
             let mut ns_hits = self
                 .graph(&temp)?
@@ -5396,11 +5443,18 @@ impl KhiveRuntime {
         // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
         let search_pool = self.backend().pool_arc();
+        let mailbox_view = crate::MailboxView {
+            actor_id: token.actor().id.clone(),
+            delegated: false,
+        };
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
                 search_pool.record_note_candidate_hydration_row();
                 if note.deleted_at.is_some() {
+                    continue;
+                }
+                if !mailbox_view.permits_message_note(token, &note) {
                     continue;
                 }
                 if let Some(want_kind) = note_kind {

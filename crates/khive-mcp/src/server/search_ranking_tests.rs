@@ -18,6 +18,20 @@ mod search_ranking_tests {
 
     #[async_trait::async_trait]
     impl CoordinatorService for RankingCoordinator {
+        async fn fan_out_search_scoped(
+            &self,
+            request: &ValidatedSearchRequest,
+            token: &khive_runtime::NamespaceToken,
+            _args: &Value,
+            extra_visible: &[Namespace],
+        ) -> Result<CoordSearchResult, RuntimeError> {
+            // Ranking rows in this fake are observations and have no mailbox
+            // routing. Concrete message scenarios cover the scoped service.
+            Ok(self
+                .fan_out_search(request, token.gate_namespace(), extra_visible)
+                .await)
+        }
+
         async fn locate(&self, _id: Uuid) -> Option<BackendId> {
             None
         }
