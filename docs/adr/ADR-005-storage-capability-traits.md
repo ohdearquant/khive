@@ -953,3 +953,169 @@ Acceptance requires storage, runtime and KG regression tests, each paired with a
 This Proposed amendment is a separately reviewable docs change. Acceptance binds the final amendment text before dependent #3701 trait, runtime and KG code merges; landing Proposed text alone is not adoption. Other Proposed amendments,
 accepted storage decisions and ADR-007 Rules 1/2 are not superseded. The separate
 memory provenance extension requires its own source/API and first-error decisions.
+
+## Amendment: shared streaming event cursor walk (2026-10-01)
+
+**Status: Proposed.** This additive runtime adapter concerns
+[#3709](https://github.com/ohdearquant/khive/issues/3709) and
+[#3729](https://github.com/ohdearquant/khive/issues/3729). It must be accepted before
+dependent implementation merges. Apart from the query_events ordering requirement
+below, the EventStore capability, namespace contract, dispatch Gate and event
+transport remain unchanged.
+
+### Runtime adapter over the existing capability
+
+Brain and moodboard currently implement the same timestamp cursor state machine.
+Move that mechanism into runtime, which already owns event-plane routing and the
+transport page cap. EventStore remains backend-neutral and receives no new
+required method. Packs continue to depend on runtime and storage traits, with no
+concrete SQLite dependency.
+
+Expose an event_walk module with this synchronous, infallible visitor adapter:
+
+```rust
+pub async fn walk_events_cursor(
+    store: &dyn EventStore,
+    filter: &EventFilter,
+    page_size: u32,
+    max_rows: u64,
+    visit: impl FnMut(Event) + Send,
+) -> Result<u64, EventWalkError>;
+```
+
+On success, the returned count equals the number of events passed to visit.
+A zero row budget issues no query and invokes no visitor. The helper adds no
+snapshot, total count, ordering key, authorization decision, hidden transaction
+or total-input ceiling. Each backend query retains existing reader admission,
+request cancellation and statement lifetime. The callback runs synchronously in
+delivery order; fallible or asynchronous callbacks require a separate contract.
+
+EventWalkError distinguishes the original storage error, a missing timestamp
+boundary during duplicate-page handling, a dense timestamp tie with its fetch
+limit, and an out-of-order fetched page. It does not choose a public RuntimeError
+or a pack-specific message. Brain retains its original storage-to-InvalidInput
+mapping and its brain messages; moodboard retains its original storage conversion
+and moodboard messages. Both callers map each mechanical variant explicitly,
+including the out-of-order-page variant.
+
+### Exact cursor behavior
+
+Every EventStore::query_events implementation must return rows ordered
+created_at DESC, id DESC. This is a trait requirement for every backend; the
+implementation change adds this same requirement to the trait's method doc.
+The cursor walk below is defined only under that order. A page in any other
+order is outside the contract, including a page returned through a forwarding
+or merged-store adapter.
+
+The adapter reproduces the existing collectors with one additional page-order
+check, including these edge cases:
+
+- Before any row of a fetched page is admitted, check that the complete page is
+  non-increasing by (created_at, id). If it is not, return the out-of-order-page
+  error and pass nothing from that page to the visitor. This check precedes
+  boundary deduplication and final-page budget clipping.
+- Clone the input filter for every query, replace only before, always use offset
+  zero and clamp the requested page size to 1 through the existing transport cap
+  of 4096. Keep all other namespace, actor, kind and time predicates.
+- Deliver fresh events in the backend's original order. Track UUIDs already
+  admitted at the current boundary timestamp; suppress only the same boundary
+  UUIDs when the timestamp is re-read.
+- Derive the boundary and UUID set from the complete fresh page before clipping
+  its final admitted prefix to the remaining row budget. Surplus rows are never
+  passed to the visitor. A short page ends the walk.
+- Advance the exclusive before bound to boundary + 1. At i64::MAX, keep the
+  previous cursor because no larger bound exists.
+- A full page containing only already-seen boundary rows doubles the fetch limit
+  with saturation, capped at 4096. A short duplicate page ends the walk.
+- At the cap, retain the original count query: clone the original filter and set
+  after to boundary.checked_sub(1).or(original_filter.after). If that count
+  equals the already-admitted count, advance before to the boundary and continue;
+  otherwise return the dense-tie error. A duplicate page before any boundary
+  returns the missing-boundary error. There is no point-read fallback.
+
+The walk consists of independent live reads. A count observed before or during
+the walk can differ from the delivered rows when concurrent writes occur.
+Preserve that behavior and each caller's current truncation/completeness handling;
+the returned admitted count does not certify a snapshot or an exhaustive result.
+
+### Pack adapters and ordered aggregation
+
+Moodboard remains a vector consumer through a collecting callback, retaining its
+existing judgment decoding and subsequent sorting. Bounded brain reads retain
+their audit/non-audit partition budgets and concatenation order. Exhaustive
+brain counts use a private accumulator directly and remove their Vec-returning
+production path; tests exercise the same streaming path that the handler uses.
+
+The accumulator preserves all response fields, marginal and optional cross maps,
+actor aliases, historical fallback fields, work-class precedence, omission of
+absent cost fields, empty requested cross maps, and page-scoped names on
+truncation. The 2,000,000-event exhaustive preflight limit is unchanged.
+
+Consume signed cost units in delivered order using the existing saturating_add.
+Signed saturating addition is not associative: MAX, 1, -1 in that order yields
+MAX - 1. Parallel page reductions, regrouping, or a SQL SUM are not substitutes
+for the ordered fold.
+
+Sharing actor-filter policy must preserve ADR-103's token-derived visibility,
+self identity, default aliases and fleet-reader allowlist. Telemetry continues to
+validate nonempty labels, its length bound and control characters before using
+the shared policy. Packs retain their existing error text and response labels;
+explicit scopes do not gain default-scope alias collapsing. This adapter grants
+no new actor or namespace access.
+
+### Retention boundary and acceptance
+
+For exhaustive brain aggregation, live handler memory comprises fetched pages,
+the current boundary UUID set and output accumulator maps, rather than all
+admitted Event payloads. Output-key cardinality and boundary UUID cardinality
+remain real costs. Backend and merged-store buffers are outside this handler
+claim; individual payload size is not bounded by this amendment. Moodboard's
+vector consumer does not gain a streaming memory claim.
+
+Acceptance requires regression tests for every cursor branch and caller-specific
+error mapping above, complete Event ID order for collectors, and complete
+response parity for aggregation. Include ties below, at and beyond 4096,
+i64 extrema, duplicate re-reads, final-page budget clipping, storage failures,
+count/walk divergence, and the signed saturation-order witness. Migrate all
+existing tests of the removed exhaustive Vec path onto the shipping visitor.
+
+Order conformance must cover differing timestamps, equal-timestamp UUID ties,
+and paginated output for every production EventStore implementation:
+
+- SqlEventStore has query_events_orders_by_created_at_then_id_desc in
+  crates/khive-db/src/stores/event_tests.rs. It currently checks the equal-timestamp
+  UUID tie; extend it to cover timestamp order and pagination.
+- AttributedEventStore delegates query_events unchanged to its inner store.
+  It needs attributed_query_events_preserves_created_at_then_id_desc to check
+  that delegation with an ordered backing store.
+- ForwardingEventStore returns the received page unchanged. It needs
+  forwarding_query_events_preserves_created_at_then_id_desc to check the
+  complete forwarded page order through the event transport.
+- SplitEventStore sorts its merged page by created_at DESC, id DESC before
+  applying the requested offset and limit. Its existing
+  split_store_routes_plain_to_legacy_idempotent_to_lane_and_merges_reads checks
+  membership, not order. It needs
+  split_query_events_orders_by_created_at_then_id_desc across both stores,
+  timestamp and UUID ties, and page boundaries.
+- The cursor walk's Store test double in
+  crates/khive-runtime/tests/event_cursor_walk.rs must return that order too.
+  It needs cursor_store_orders_by_created_at_then_id_desc to check its query
+  output.
+- AppendAfterCountStore in crates/khive-pack-brain/src/tests.rs delegates
+  query_events unchanged and must retain that order in the concurrent-boundary
+  fixture.
+- The implementation must include ascending_query_events_page_is_detected_or_refused
+  with a deliberately ascending page. The walk must return the out-of-order-page
+  error within a bounded number of queries and admit no row from that page; it
+  must never accept silent repeated delivery as successful traversal.
+
+A dedicated integration test binary must measure actual peak live allocation
+against increasing admitted populations with fixed output-key cardinality,
+separately accounting for boundary UUIDs and backend buffers. Without that
+executed evidence, no measured retention or speedup claim is accepted. Each
+load-bearing change has a compiling independent removal control whose named
+test fails when the corresponding behavior is removed.
+
+Acceptance applies to the final reviewed text and its conformant implementation.
+This proposal changes neither git.receipts pagination nor event-plane WAL
+configuration; those have separate contracts.
