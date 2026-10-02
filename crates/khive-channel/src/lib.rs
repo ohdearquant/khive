@@ -287,6 +287,43 @@ pub struct DeliveryReceipt {
     pub signature: Vec<u8>,
 }
 
+/// A receipt identifier that cannot enter the canonical signed input.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReceiptSigningError {
+    #[error("receipt agent identifier is not a canonical UUID")]
+    InvalidAgentId,
+}
+
+fn canonical_agent_id(value: &str) -> Result<Uuid, ReceiptSigningError> {
+    let id = Uuid::parse_str(value).map_err(|_| ReceiptSigningError::InvalidAgentId)?;
+    if id.to_string() != value {
+        return Err(ReceiptSigningError::InvalidAgentId);
+    }
+    Ok(id)
+}
+
+/// Canonical node wire protocol v1 receipt input (ADR-105 A.6.4).
+/// This constructs bytes only; it does not verify a signature or authorize a commit.
+pub fn receipt_signing_input(receipt: &DeliveryReceipt) -> Result<Vec<u8>, ReceiptSigningError> {
+    let binding = &receipt.binding;
+    let sender_agent_id = canonical_agent_id(&binding.sender_agent_id)?;
+    let recipient_agent_id = canonical_agent_id(&binding.recipient_agent_id)?;
+    let mut input = b"khive-node-v1/receipt\0".to_vec();
+    input.extend_from_slice(&binding.protocol_version.to_be_bytes());
+    input.extend_from_slice(binding.logical_message_id.as_bytes());
+    input.extend_from_slice(sender_agent_id.as_bytes());
+    input.extend_from_slice(recipient_agent_id.as_bytes());
+    input.extend_from_slice(binding.recipient_device_id.as_bytes());
+    input.extend_from_slice(&binding.recipient_key_epoch.to_be_bytes());
+    input.extend_from_slice(&binding.contact_generation.to_be_bytes());
+    input.extend_from_slice(binding.delivery_attempt_id.as_bytes());
+    input.push(match receipt.disposition {
+        ReceiptDisposition::Stored => 1,
+        ReceiptDisposition::Quarantined => 2,
+    });
+    Ok(input)
+}
+
 /// Result of a receipt-aware outbound submission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendOutcome {
