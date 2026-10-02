@@ -4608,6 +4608,10 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
 }
 
 #[cfg(test)]
+#[path = "source_ingest/owner_alias_tests.rs"]
+mod owner_alias_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use khive_db::StorageBackend;
