@@ -2575,6 +2575,55 @@ impl GraphStore for SqlGraphStore {
         Ok(result)
     }
 
+    async fn get_edge_read_outcomes(
+        &self,
+        ids: &[LinkId],
+    ) -> Result<Vec<Result<Option<Edge>, StorageError>>, StorageError> {
+        const CHUNK: usize = 900;
+        let mut outcomes = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let requested: Vec<String> =
+                chunk.iter().map(|id| Uuid::from(*id).to_string()).collect();
+            let expected = requested.len();
+            let rows = self
+                .with_reader("get_edge_read_outcomes", move |conn| {
+                    let requested_json = serde_json::to_string(&requested)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    let mut stmt = conn.prepare(
+                        "SELECT e.namespace, e.id, e.source_id, e.target_id, e.relation, e.weight, \
+                                e.created_at, e.updated_at, e.deleted_at, e.metadata, e.target_backend, \
+                                requested.key \
+                         FROM json_each(?1) AS requested \
+                         LEFT JOIN graph_edges AS e \
+                           ON e.id = requested.value AND e.deleted_at IS NULL \
+                         ORDER BY CAST(requested.key AS INTEGER) ASC",
+                    )?;
+                    let mut rows = stmt.query([requested_json])?;
+                    let mut outcomes = Vec::with_capacity(expected);
+                    while let Some(row) = rows.next()? {
+                        let ordinal: i64 = row.get(11)?;
+                        let ordinal =
+                            usize::try_from(ordinal).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                        if ordinal != outcomes.len() {
+                            return Err(rusqlite::Error::InvalidQuery);
+                        }
+                        let outcome = match row.get_ref(1)? {
+                            rusqlite::types::ValueRef::Null => Ok(None),
+                            _ => read_edge(row).map(Some).map_err(|e| map_err(e, "get_edge")),
+                        };
+                        outcomes.push(outcome);
+                    }
+                    if outcomes.len() != expected {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    Ok(outcomes)
+                })
+                .await?;
+            outcomes.extend(rows);
+        }
+        Ok(outcomes)
+    }
+
     async fn batch_neighbors(
         &self,
         sources: &[Uuid],

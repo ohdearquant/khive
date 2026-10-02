@@ -503,6 +503,24 @@ pub trait GraphStore: Send + Sync + 'static {
         }
         Ok(out)
     }
+    /// Read live edges in input order, retaining each row's decode outcome.
+    ///
+    /// The vector has exactly one entry per input, including duplicates and
+    /// missing/soft-deleted IDs (`Ok(None)`). An inner error belongs to that
+    /// input; an outer error is a statement/admission failure for the batch.
+    /// Callers must bound batches and select errors in their original order.
+    /// The default preserves backend support with point reads; SQLite batches.
+    async fn get_edge_read_outcomes(
+        &self,
+        ids: &[LinkId],
+    ) -> StorageResult<Vec<StorageResult<Option<Edge>>>> {
+        let mut outcomes = Vec::with_capacity(ids.len());
+        for &id in ids {
+            outcomes.push(self.get_edge(id).await);
+        }
+        Ok(outcomes)
+    }
+
     /// Return neighbors for multiple source nodes in a single round-trip,
     /// yielding `(source_id, hit)` pairs.
     ///
