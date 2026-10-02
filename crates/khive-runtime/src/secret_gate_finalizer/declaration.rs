@@ -509,7 +509,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.keyed_message",
-        site: "khive-runtime/src/keyed_message.rs::create_keyed_message_pair",
+        site: "khive-runtime/src/keyed_message.rs::create_keyed_message_pair_with_attachments",
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,

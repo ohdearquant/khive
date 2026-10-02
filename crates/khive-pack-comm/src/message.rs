@@ -53,6 +53,7 @@ pub(crate) const MESSAGE_PROJECTION_FIELDS: &[&str] = &[
     "outbound_ref",
     "sent_by_process",
     "idempotency_key",
+    "attachments",
 ];
 
 pub(crate) fn validate_message_projection_fields(
@@ -288,6 +289,7 @@ pub(crate) async fn dual_write_message(
         in_reply_to_message_id,
         references_chain,
         tags,
+        &[],
         None,
     )
     .await?;
@@ -316,6 +318,7 @@ pub(crate) async fn dual_write_message_with_identity(
     in_reply_to_message_id: Option<&str>,
     references_chain: Option<&str>,
     tags: Option<&[String]>,
+    attachments: &[khive_storage::NewAttachment],
     identity: Option<&crate::idempotency::MessageIdentity>,
 ) -> Result<MessageWrite, RuntimeError> {
     let recipient_ns_str = to.trim();
@@ -474,10 +477,11 @@ pub(crate) async fn dual_write_message_with_identity(
         },
     ];
     let (mut notes, embedding_truncation) = if let Some(identity) = identity {
-        match khive_runtime::keyed_message::create_keyed_message_pair(
+        match khive_runtime::keyed_message::create_keyed_message_pair_with_attachments(
             runtime,
             specs,
             &identity.physical_key(caller_token),
+            attachments,
         )
         .await
         .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
@@ -488,16 +492,22 @@ pub(crate) async fn dual_write_message_with_identity(
             } => (notes, embedding_truncation),
             khive_runtime::keyed_message::KeyedMessageWrite::Existing(holder) => {
                 return Ok(MessageWrite {
-                    outbound: identity.replay(runtime, caller_token, holder).await?,
+                    outbound: identity
+                        .replay(runtime, caller_token, holder, attachments)
+                        .await?,
                     embedding_truncation: Default::default(),
                     replayed: true,
                 });
             }
         }
     } else {
-        khive_runtime::create_notes_atomic_with_report(runtime, specs.into())
-            .await
-            .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
+        khive_runtime::atomic_message::create_notes_atomic_with_attachments(
+            runtime,
+            specs.into(),
+            attachments,
+        )
+        .await
+        .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
     };
     Ok(MessageWrite {
         outbound: notes.remove(0),

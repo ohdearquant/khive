@@ -8,6 +8,7 @@
 //! `delete`/`orphan_sweep` stay admin-only (ADR-111 §8) and are deliberately
 //! not verbs here.
 
+mod file_handlers;
 pub mod handlers;
 mod pack;
 pub mod uploads;

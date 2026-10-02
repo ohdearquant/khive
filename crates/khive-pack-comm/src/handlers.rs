@@ -362,12 +362,17 @@ pub(crate) async fn handle_send(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
+    let attachments =
+        crate::file_attachments::prepare(runtime, "comm.send", &to_actor, &p.attachments).await?;
     let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
-        json!({
-            "version": 1, "op": "send", "to": to_actor, "content": p.content,
-            "subject": p.subject, "thread_id": thread_id,
-            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": null,
-        })
+        crate::file_attachments::identify_request(
+            json!({
+                "version": 1, "op": "send", "to": to_actor, "content": p.content,
+                "subject": p.subject, "thread_id": thread_id,
+                "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": null,
+            }),
+            &p.attachments,
+        )
     })?;
     let MessageWrite {
         outbound: outbound_note,
@@ -388,6 +393,7 @@ pub(crate) async fn handle_send(
         None,
         None,
         p.tags.as_deref(),
+        &attachments,
         identity.as_ref(),
     )
     .await?;
@@ -755,6 +761,7 @@ pub(crate) async fn handle_inbox(
     let namespace = token.namespace().as_str();
     wait_for_inbox_response(inbox_signal, deadline, || {
         query_inbox_response(
+            runtime,
             store,
             namespace,
             &view,
@@ -823,6 +830,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn query_inbox_response(
+    runtime: &KhiveRuntime,
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
     view: &MailboxView,
@@ -915,6 +923,9 @@ async fn query_inbox_response(
     let has_more = messages.len() > limit;
     if has_more {
         messages.truncate(limit);
+    }
+    for message in &mut messages {
+        crate::file_attachments::enrich(runtime, message).await?;
     }
     let count = messages.len();
     // This is a mailbox-wide signal; page and status filters only shape `messages`.
@@ -1084,7 +1095,11 @@ pub(crate) async fn handle_read(
         )),
         (Some(raw), None) => {
             let (id, note) = validate_read_target(runtime, token, &raw).await?;
-            let message = include_body.then(|| read_message_fields(&note));
+            let message = if include_body {
+                Some(read_message_fields(runtime, &note).await?)
+            } else {
+                None
+            };
             let result = mark_read_target(runtime, token, id, note).await?;
             Ok(read_result_with_body(result, message))
         }
@@ -1155,7 +1170,11 @@ async fn mark_read_targets_best_effort(
     let mut results = Vec::with_capacity(targets.len());
     for (id, note) in targets {
         let original_properties = note.properties.clone();
-        let message = include_body.then(|| read_message_fields(&note));
+        let message = if include_body {
+            Some(read_message_fields(runtime, &note).await?)
+        } else {
+            None
+        };
         match mark_read_target(runtime, token, id, note).await {
             Ok(result) => results.push(read_result_with_body(result, message)),
             Err(error) => {
@@ -1182,16 +1201,18 @@ async fn mark_read_targets_best_effort(
     Ok(bulk_read_response(requested_count, results))
 }
 
-fn read_message_fields(note: &Note) -> Value {
+async fn read_message_fields(runtime: &KhiveRuntime, note: &Note) -> Result<Value, RuntimeError> {
     let message = note_to_message_json(note);
-    json!({
+    let attachments = crate::file_attachments::metadata(runtime, note.id).await?;
+    Ok(json!({
+        "attachments": attachments,
         "subject": message["subject"],
         "content": message["content"],
         "from": message["from"],
         "to": message["to"],
         "direction": message["direction"],
         "created_at": message["created_at"],
-    })
+    }))
 }
 
 fn read_result_with_body(mut result: Value, message: Option<Value>) -> Value {
@@ -1768,12 +1789,17 @@ pub(crate) async fn handle_reply(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
+    let attachments =
+        crate::file_attachments::prepare(runtime, "comm.reply", &reply_to, &p.attachments).await?;
     let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
-        json!({
-            "version": 1, "op": "reply", "to": reply_to, "content": p.content,
-            "subject": reply_subject_opt, "thread_id": thread_id,
-            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": id,
-        })
+        crate::file_attachments::identify_request(
+            json!({
+                "version": 1, "op": "reply", "to": reply_to, "content": p.content,
+                "subject": reply_subject_opt, "thread_id": thread_id,
+                "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": id,
+            }),
+            &p.attachments,
+        )
     })?;
     let MessageWrite {
         outbound: reply_note,
@@ -1794,6 +1820,7 @@ pub(crate) async fn handle_reply(
         in_reply_to_message_id.as_deref(),
         references_chain.as_deref(),
         p.tags.as_deref(),
+        &attachments,
         identity.as_ref(),
     )
     .await?;
@@ -2159,6 +2186,9 @@ pub(crate) async fn handle_thread(
         }
     });
     rows.truncate(limit);
+    for row in &mut rows {
+        crate::file_attachments::enrich(runtime, &mut row.json).await?;
+    }
     let count = rows.len();
     let messages: Vec<Value> = rows
         .into_iter()

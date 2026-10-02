@@ -31,6 +31,7 @@ mod error_projection;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
+pub mod file_policy;
 pub mod fusion;
 pub mod graph_traversal;
 pub mod input_schema;

@@ -737,7 +737,22 @@ async fn every_blob_verb_rejects_unknown_arguments_before_side_effects() {
         .unwrap();
     let id = upload["upload_id"].as_str().unwrap();
     let reference = existing["content_ref"].as_str().unwrap();
+    let import_path = dir.path().join("refused-import.bin");
+    let export_path = dir.path().join("refused-export.bin");
+    std::fs::write(&import_path, b"refused file import").unwrap();
+    assert!(std::fs::metadata(&import_path).unwrap().is_file());
+    assert!(!export_path.exists());
+    // File cases validate argument shape before confinement; transfer success
+    // is covered by the file-transfer round trip with isolated roots.
     let cases = [
+        (
+            "blob.import",
+            json!({"path": import_path, "media_type": null}),
+        ),
+        (
+            "blob.export",
+            json!({"content_ref": reference, "path": export_path}),
+        ),
         (
             "blob.put",
             json!({"bytes": BASE64.encode(b"refused object")}),
@@ -762,6 +777,8 @@ async fn every_blob_verb_rejects_unknown_arguments_before_side_effects() {
         "every registered verb needs a valid fixture"
     );
     for (verb, params) in [
+        ("blob.import", json!([import_path, null])),
+        ("blob.export", json!([reference, export_path])),
         ("blob.put", json!([BASE64.encode(b"refused object")])),
         ("blob.get", json!([reference, null])),
         ("blob.stat", json!([reference])),

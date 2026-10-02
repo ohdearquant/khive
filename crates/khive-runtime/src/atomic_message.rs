@@ -324,7 +324,19 @@ pub async fn create_notes_atomic_with_report(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
 ) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
+    create_notes_atomic_with_attachments(runtime, specs, &[]).await
+}
+
+/// Create notes and their role-keyed attachments in the same writer transaction.
+/// The existing note, FTS, vector and revision accounting is preserved.
+pub async fn create_notes_atomic_with_attachments(
+    runtime: &KhiveRuntime,
+    specs: Vec<AtomicNoteSpec<'_>>,
+    attachments: &[khive_storage::NewAttachment],
+) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
+    validate_note_attachments(runtime, attachments)?;
     let mut prepared = prepare_atomic_notes(runtime, specs, AtomicNoteOptions::default()).await?;
+    append_note_attachments(&mut prepared, attachments)?;
     match crate::atomic_runner::run_atomic_unit_with_note_versions(
         runtime.sql().as_ref(),
         prepared.plans,
@@ -354,6 +366,49 @@ pub async fn create_notes_atomic_with_report(
         ))),
         Err(e) => Err(RuntimeError::Storage(e.0)),
     }
+}
+
+pub(crate) fn validate_note_attachments(
+    runtime: &KhiveRuntime,
+    attachments: &[khive_storage::NewAttachment],
+) -> RuntimeResult<()> {
+    if !attachments.is_empty() {
+        // Note plans execute on runtime.sql(); attachment liveness belongs to
+        // main. Refuse a split placement before preparing any write.
+        runtime.attachments()?;
+    }
+    for attachment in attachments {
+        attachment.validate()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn append_note_attachments(
+    prepared: &mut PreparedAtomicNotes,
+    attachments: &[khive_storage::NewAttachment],
+) -> RuntimeResult<()> {
+    for (plan, note) in prepared.plans.iter_mut().zip(&prepared.notes) {
+        let AtomicOpPlan::AddNote(plan) = plan else {
+            return Err(RuntimeError::Internal(
+                "expected prepared attachment owner note".into(),
+            ));
+        };
+        for attachment in attachments {
+            let row = khive_storage::Attachment::from_new(
+                note.id,
+                khive_storage::AttachmentSubstrate::Note,
+                attachment.clone(),
+                note.created_at,
+            );
+            // Append after the note's complete index plan, preserving adjacent
+            // last_insert_rowid-dependent FTS statements and their counters.
+            plan.statements.push(PlanStatement {
+                statement: khive_db::stores::attachment::attachment_upsert_statement(&row)?,
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn prepare_atomic_notes(
