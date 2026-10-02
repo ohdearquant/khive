@@ -428,8 +428,8 @@ impl KhiveRuntime {
     /// application-assisted V21 cutover complete before serving. The
     /// [`from_backend`](Self::from_backend) seam is likewise only for an
     /// already-prepared backend.
-    pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let wal_ceiling = config.wal_ceiling_policy();
+    pub fn new(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
         Self::new_with_file_backend(config, |path| {
             StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, None, wal_ceiling)
         })
@@ -437,8 +437,8 @@ impl KhiveRuntime {
 
     /// Construct a fixture runtime with a small concurrent reader pool.
     #[cfg(any(test, feature = "test-internals"))]
-    pub fn new_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let wal_ceiling = config.wal_ceiling_policy();
+    pub fn new_for_test(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
         Self::new_with_file_backend(config, |path| {
             StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, Some(2), wal_ceiling)
         })
@@ -492,8 +492,8 @@ impl KhiveRuntime {
     /// and must already be at this build's current schema version. No migrations
     /// or configured-model registration writes are attempted. A `None` path
     /// retains the historical ephemeral in-memory behavior for tests.
-    pub fn new_readonly(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let wal_ceiling = config.wal_ceiling_policy();
+    pub fn new_readonly(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        let wal_ceiling = config.resolve_wal_ceiling_policy(true)?;
         Self::new_readonly_with_file_backend(config, |path| {
             StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
                 path,
@@ -505,8 +505,8 @@ impl KhiveRuntime {
 
     /// Construct a read-only fixture runtime with a small reader pool.
     #[cfg(any(test, feature = "test-internals"))]
-    pub fn new_readonly_for_test(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let wal_ceiling = config.wal_ceiling_policy();
+    pub fn new_readonly_for_test(mut config: RuntimeConfig) -> RuntimeResult<Self> {
+        let wal_ceiling = config.resolve_wal_ceiling_policy(true)?;
         Self::new_readonly_with_file_backend(config, |path| {
             StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
                 path,

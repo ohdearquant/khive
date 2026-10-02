@@ -2131,12 +2131,13 @@ fn report_mode_refusal(
 /// the disclosure is nonessential, so a closed or failing stderr must not
 /// become an exec failure (`eprintln!` panics on a failed stderr write).
 /// Disclosure only: no prompt, no refusal.
-fn disclose_resolved_database(cfg: &RuntimeConfig, khive_cfg: &KhiveConfig) {
+fn disclose_resolved_database(cfg: &RuntimeConfig, khive_cfg: &KhiveConfig, force_memory: bool) {
     use std::io::Write;
     let line =
         khive_mcp::serve::resolved_database_disclosure(cfg.db_path.as_deref(), &khive_cfg.backends);
     let _ = writeln!(std::io::stderr(), "{line}");
-    let wal_line = khive_mcp::serve::resolved_wal_ceiling_disclosure(cfg, &khive_cfg.backends);
+    let wal_line =
+        khive_mcp::serve::resolved_wal_ceiling_disclosure(cfg, &khive_cfg.backends, force_memory);
     let _ = writeln!(std::io::stderr(), "{wal_line}");
 }
 
@@ -2396,7 +2397,11 @@ async fn run_exec_inline_with_forward(
     }
     validate_wal_ceiling_topology(&cfg, &khive_cfg.backends, force_memory)?;
 
-    disclose_resolved_database(&cfg, &khive_cfg);
+    disclose_resolved_database(
+        &cfg,
+        &khive_cfg,
+        db_context.raw.as_deref() == Some(":memory:"),
+    );
     disclose_resolved_actor(&cfg);
 
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
@@ -2704,7 +2709,11 @@ async fn run_exec_ops_file(
         )?;
     }
 
-    disclose_resolved_database(&cfg, &khive_cfg);
+    disclose_resolved_database(
+        &cfg,
+        &khive_cfg,
+        db_context.raw.as_deref() == Some(":memory:"),
+    );
     disclose_resolved_actor(&cfg);
 
     if atomic {

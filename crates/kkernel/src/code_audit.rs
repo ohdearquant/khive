@@ -287,7 +287,17 @@ async fn generate_report(request: &AuditRequest) -> Result<AuditReport> {
     let policy_sha256 = hex_sha256(&policy_bytes);
     let query_bundle_sha256 = query_bundle_sha256();
 
-    let backend = StorageBackend::sqlite_read_only(&request.map_db).map_err(|e| {
+    let mut config = khive_runtime::RuntimeConfig {
+        db_path: Some(request.map_db.clone()),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let wal_ceiling = config.resolve_wal_ceiling_policy(true)?;
+    let backend = StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
+        &request.map_db,
+        None,
+        wal_ceiling,
+    )
+    .map_err(|e| {
         let msg = e.to_string();
         if msg.to_lowercase().contains("busy") || msg.to_lowercase().contains("locked") {
             anyhow::anyhow!("DB_BUSY: {msg}")
@@ -1305,6 +1315,46 @@ fn render_markdown(report: &AuditReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn report_file_open_validates_wal_environment() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("map.db");
+        let policy_path = root.path().join("policy.toml");
+        std::fs::write(&policy_path, "policy_version = 1\n[crate_ranks]\n").unwrap();
+        let seed = StorageBackend::sqlite(&db).unwrap();
+        seed.prepare_core_schema().unwrap();
+        drop(seed);
+        let before = std::fs::read(&db).unwrap();
+        let request = AuditRequest {
+            map_db: db.clone(),
+            policy_path,
+            as_of: DateTime::parse_from_rfc3339("2026-10-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            history_window_days: 180,
+            include_dev_dependencies: false,
+        };
+        std::env::set_var("KHIVE_SQLITE_WAL_CEILING_BYTES", "abc");
+        let error = generate_report(&request)
+            .await
+            .expect_err("AUDIT_INVALID_ENV");
+        assert!(
+            matches!(error.downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::Sqlite(khive_db::SqliteError::InvalidConfig(message))) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES"))
+        );
+        for raw in ["0", "8192"] {
+            std::env::set_var("KHIVE_SQLITE_WAL_CEILING_BYTES", raw);
+            let report = generate_report(&request)
+                .await
+                .expect("read-only ceiling is diagnostic");
+            assert_eq!(report.as_of, "2026-10-01T00:00:00+00:00");
+            assert!(!report.signals.is_empty());
+        }
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+    }
 
     use std::path::Path;
 

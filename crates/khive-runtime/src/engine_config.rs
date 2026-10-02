@@ -74,9 +74,7 @@ pub enum ConfigError {
     #[error("backend {name:?}: `served_kinds` must not be empty when declared")]
     EmptyBackendServedKinds { name: String },
 
-    #[error(
-        "KHIVE_SQLITE_WAL_CEILING_BYTES must be an unsigned decimal byte count, got {value:?}"
-    )]
+    #[error("KHIVE_SQLITE_WAL_CEILING_BYTES must be an unsigned decimal byte count")]
     InvalidWalCeilingEnvironment { value: String },
 
     #[error(
@@ -376,6 +374,13 @@ pub fn resolve_wal_ceiling(
     wal_mode: bool,
     read_only: bool,
 ) -> Result<ResolvedWalCeiling, ConfigError> {
+    if kind == BackendKind::Memory && backend_field.is_none() {
+        return Ok(ResolvedWalCeiling {
+            configured_bytes: 0,
+            effective_bytes: 0,
+            source: khive_db::WalCeilingSource::Default,
+        });
+    }
     let (configured_bytes, source) = if let Some(bytes) = backend_field {
         (bytes, khive_db::WalCeilingSource::BackendField)
     } else if let Some(raw) = env_value {
@@ -3316,6 +3321,50 @@ kind = "memory"
             .expect("file found");
         assert_eq!(cfg.backends.len(), 1);
         assert!(matches!(cfg.backends[0].kind, BackendKind::Memory));
+    }
+
+    #[test]
+    fn memory_wal_policy_ignores_environment_but_keeps_its_own_field() {
+        for raw in ["8192", "abc"] {
+            let resolved = resolve_wal_ceiling(
+                None,
+                Some(raw),
+                "ephemeral",
+                BackendKind::Memory,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(resolved.configured_bytes, 0, "MEMORY_IGNORES_ENVIRONMENT");
+            assert_eq!(resolved.source, khive_db::WalCeilingSource::Default);
+            let error = resolve_wal_ceiling(
+                Some(8192),
+                Some(raw),
+                "ephemeral",
+                BackendKind::Memory,
+                true,
+                false,
+            )
+            .expect_err("DECLARED_MEMORY_FIELD_REFUSAL");
+            assert!(matches!(
+                error,
+                ConfigError::WalCeilingMemoryBackend { value: 8192, .. }
+            ));
+        }
+        let error = resolve_wal_ceiling(
+            None,
+            Some("credential-secret-marker"),
+            "file",
+            BackendKind::Sqlite,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "KHIVE_SQLITE_WAL_CEILING_BYTES must be an unsigned decimal byte count",
+            "RAW_WAL_ENVIRONMENT_NOT_ECHOED"
+        );
     }
 
     #[test]

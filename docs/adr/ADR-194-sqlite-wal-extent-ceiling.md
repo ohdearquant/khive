@@ -165,8 +165,12 @@ Resolve `wal_ceiling_bytes` per writable SQLite backend from its `[[backends]]` 
 `KHIVE_SQLITE_WAL_CEILING_BYTES`, then **0 (disabled)**. A nonzero value must fit supported offset
 arithmetic (checked, not wrapping) and satisfy §4's reset-feasible minimum. Invalid, overflowing,
 unsupported, or below-minimum values are configuration errors, never fallback or silent clamping.
-Nonzero configuration on a memory or non-WAL backend is rejected; a read-only backend enforces no
-writer policy.
+A nonzero field declared on a memory backend, or nonzero configuration on a non-WAL backend, is
+rejected; environment ceilings do not apply to memory backends, and an explicit `--db :memory:`
+override clears inherited ceilings. A read-only backend enforces no writer policy.
+
+Metadata-only in-memory runtimes used solely to build pack registries explicitly opt out of the WAL
+ceiling; this exemption never applies to file openers.
 
 Zero disables the WAL ceiling independently of `disk_reserve_bytes`; the two knobs are unrelated and
 one being zero does not affect the other. Startup and diagnostics explicitly report disabled state.

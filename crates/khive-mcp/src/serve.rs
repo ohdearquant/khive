@@ -2450,6 +2450,7 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
                 BackendConfig {
                     kind: BackendKind::Memory,
                     path: None,
+                    wal_ceiling_bytes: None,
                     ..backend.clone()
                 }
             } else {
@@ -3258,7 +3259,12 @@ pub fn normalize_redundant_db_override_with_source(
         backends,
         config_source,
     )?;
-    if !force_memory {
+    if force_memory {
+        config.db_path = None;
+        config.wal_ceiling_bytes = 0;
+        config.wal_ceiling_configured_bytes = 0;
+        config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
+    } else {
         if let Some(main) = backends
             .iter()
             .find(|backend| backend.name == BackendId::MAIN)
@@ -4060,7 +4066,7 @@ async fn build_server_inner(
     // backends slice keeps the line truthful in multi-backend mode, where the
     // config-declared backend paths — not `config.db_path` — receive writes.
     tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
-    tracing::info!(target: "khive.boot", "{}", resolved_wal_ceiling_disclosure(&config, &khive_cfg.backends));
+    tracing::info!(target: "khive.boot", "{}", resolved_wal_ceiling_disclosure(&config, &khive_cfg.backends, args.db.as_deref() == Some(":memory:")));
 
     if khive_cfg.backends.is_empty() {
         let runtime =
@@ -4538,11 +4544,11 @@ pub async fn build_single_backend_runtime(
 }
 
 async fn build_single_backend_runtime_with_max_readers(
-    config: RuntimeConfig,
+    mut config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     max_readers: Option<usize>,
 ) -> anyhow::Result<KhiveRuntime> {
-    let backend = Arc::new(open_single_backend(&config, max_readers)?);
+    let backend = Arc::new(open_single_backend(&mut config, max_readers)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator =
@@ -4565,23 +4571,10 @@ async fn build_single_backend_runtime_with_max_readers(
 }
 
 fn open_single_backend(
-    config: &RuntimeConfig,
+    config: &mut RuntimeConfig,
     max_readers: Option<usize>,
 ) -> anyhow::Result<StorageBackend> {
-    let kind = if config.db_path.is_some() {
-        BackendKind::Sqlite
-    } else {
-        BackendKind::Memory
-    };
-    let wal_ceiling = config.wal_ceiling_policy();
-    khive_runtime::resolve_wal_ceiling(
-        Some(wal_ceiling.bytes),
-        None,
-        BackendId::MAIN,
-        kind,
-        true,
-        false,
-    )?;
+    let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
     let backend = match &config.db_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -4608,11 +4601,12 @@ async fn prepare_single_backend_for_schema_admin(
     config: &RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<Arc<StorageBackend>> {
-    let backend = Arc::new(open_single_backend(config, None)?);
+    let mut config = config.clone();
+    let backend = Arc::new(open_single_backend(&mut config, None)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator = if schema_admin_requires_blob_hydrator(Arc::clone(&backend)).await? {
-        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.as_ref())?
+        resolve_blob_hydrator_for_boot(&config, khive_cfg, backend.as_ref(), backend.as_ref())?
     } else {
         None
     };
@@ -4878,6 +4872,7 @@ pub fn resolved_database_disclosure(
 pub fn resolved_wal_ceiling_disclosure(
     config: &RuntimeConfig,
     backends: &[BackendConfig],
+    force_memory: bool,
 ) -> String {
     fn source_name(source: khive_runtime::WalCeilingSource) -> &'static str {
         match source {
@@ -4928,17 +4923,23 @@ pub fn resolved_wal_ceiling_disclosure(
         );
     }
 
-    let forced_memory = config.db_path.is_none();
     let mut rows = Vec::with_capacity(backends.len());
     for backend in backends {
-        let (configured, source) = match backend.wal_ceiling_bytes {
-            Some(bytes) => (bytes, khive_runtime::WalCeilingSource::BackendField),
-            None => (
-                config.wal_ceiling_configured_bytes,
-                config.wal_ceiling_source,
-            ),
+        let (configured, source) = if force_memory {
+            (0, khive_runtime::WalCeilingSource::Default)
+        } else {
+            match backend.wal_ceiling_bytes {
+                Some(bytes) => (bytes, khive_runtime::WalCeilingSource::BackendField),
+                None if backend.kind == BackendKind::Memory => {
+                    (0, khive_runtime::WalCeilingSource::Default)
+                }
+                None => (
+                    config.wal_ceiling_configured_bytes,
+                    config.wal_ceiling_source,
+                ),
+            }
         };
-        let memory = forced_memory || backend.kind == BackendKind::Memory;
+        let memory = force_memory || backend.kind == BackendKind::Memory;
         let read_only = backend.read_only;
         let effective = if memory || read_only { 0 } else { configured };
         rows.push(row(
@@ -5069,6 +5070,7 @@ pub fn resolve_runtime_config_with_db_anchor(
             no_embed_base,
             db_path_for_config.as_deref(),
             packs_overridden,
+            inputs.db == Some(":memory:"),
         )?
     } else {
         let base_config = RuntimeConfig {
@@ -5085,6 +5087,7 @@ pub fn resolve_runtime_config_with_db_anchor(
             base_config,
             db_path_for_config.as_deref(),
             packs_overridden,
+            inputs.db == Some(":memory:"),
         )?
     };
 
@@ -5264,6 +5267,7 @@ fn resolve_config(
     base: RuntimeConfig,
     db_path: Option<&std::path::Path>,
     packs_overridden: bool,
+    force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
@@ -5281,7 +5285,7 @@ fn resolve_config(
             }
 
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
-            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends)?;
+            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
             Ok(resolved)
         }
         None => {
@@ -5291,32 +5295,42 @@ fn resolve_config(
             } else {
                 runtime_config_from_khive_config(&env_cfg, base)
             };
-            resolve_runtime_wal_ceiling(&mut resolved, &[])?;
+            resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
             Ok(resolved)
         }
     }
 }
 
-/// Capture one policy snapshot before a forwarding client computes its daemon
+/// Validate the captured policy snapshot before a forwarding client computes its daemon
 /// identity. Backend field overrides are resolved from this same snapshot at
 /// the named-backend opener, so a later environment change cannot split the
 /// client fingerprint from the opened pool.
 fn resolve_runtime_wal_ceiling(
     config: &mut RuntimeConfig,
     backends: &[BackendConfig],
+    force_memory: bool,
 ) -> anyhow::Result<()> {
-    let env_raw = std::env::var_os("KHIVE_SQLITE_WAL_CEILING_BYTES")
-        .map(|value| value.to_string_lossy().into_owned());
+    if force_memory {
+        config.wal_ceiling_bytes = 0;
+        config.wal_ceiling_configured_bytes = 0;
+        config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
+        return validate_wal_ceiling_topology(config, backends, true);
+    }
+    let env_raw = config.wal_ceiling_env_raw.clone();
     let needs_fallback = backends.is_empty()
-        || backends
-            .iter()
-            .any(|backend| backend.wal_ceiling_bytes.is_none());
+        || backends.iter().any(|backend| {
+            backend.kind == BackendKind::Sqlite && backend.wal_ceiling_bytes.is_none()
+        });
     let fallback = if needs_fallback {
         khive_runtime::resolve_wal_ceiling(
             None,
             env_raw.as_deref(),
             BackendId::MAIN,
-            BackendKind::Sqlite,
+            if backends.is_empty() && config.db_path.is_none() {
+                BackendKind::Memory
+            } else {
+                BackendKind::Sqlite
+            },
             true,
             false,
         )?
@@ -5364,6 +5378,7 @@ fn resolve_actor_from_config(
     base: RuntimeConfig,
     db_path: Option<&std::path::Path>,
     packs_overridden: bool,
+    force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
@@ -5371,7 +5386,7 @@ fn resolve_actor_from_config(
         Some(khive_cfg) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
-            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends)?;
+            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
             Ok(RuntimeConfig {
                 embedding_model: None,
                 additional_embedding_models: vec![],
@@ -5380,7 +5395,7 @@ fn resolve_actor_from_config(
         }
         None => {
             let mut resolved = base;
-            resolve_runtime_wal_ceiling(&mut resolved, &[])?;
+            resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
             Ok(resolved)
         }
     }
@@ -5556,7 +5571,7 @@ mod tests {
             ..RuntimeConfig::default()
         };
         assert_eq!(
-            resolved_wal_ceiling_disclosure(&config, &[]),
+            resolved_wal_ceiling_disclosure(&config, &[], false),
             "wal_ceiling: main: configured_bytes=0 effective_bytes=0 source=default enabled=false status=disabled"
         );
 
@@ -5571,7 +5586,7 @@ mod tests {
             read_only: true,
         };
         assert_eq!(
-            resolved_wal_ceiling_disclosure(&config, &[backend]),
+            resolved_wal_ceiling_disclosure(&config, &[backend], false),
             "wal_ceiling: archive: configured_bytes=8192 effective_bytes=0 source=backend_field enabled=false status=read_only_not_enforced"
         );
     }
@@ -5593,7 +5608,7 @@ mod tests {
                 served_kinds: None,
                 read_only: false,
             };
-            resolved_wal_ceiling_disclosure(&config, &[backend])
+            resolved_wal_ceiling_disclosure(&config, &[backend], false)
         };
 
         // One arm per category: Cc newline and ESC, Cf bidi override, Zl, Zp.
@@ -5643,7 +5658,7 @@ mod tests {
                 served_kinds: None,
                 read_only: false,
             };
-            resolved_wal_ceiling_disclosure(&config, &[backend])
+            resolved_wal_ceiling_disclosure(&config, &[backend], false)
         };
 
         // A credential pasted into a backend name is masked like any other log text.
@@ -5717,14 +5732,14 @@ mod tests {
         // a silently dropped ceiling would open successfully.
         const CEILING: u64 = 1 << 20;
         let dir = tempfile::tempdir().expect("single backend ceiling tempdir");
-        let config = RuntimeConfig {
+        let mut config = RuntimeConfig {
             db_path: Some(dir.path().join("single.db")),
             wal_ceiling_bytes: CEILING,
             wal_ceiling_configured_bytes: 0,
             ..RuntimeConfig::no_embeddings()
         };
 
-        let host_error = open_single_backend(&config, Some(2))
+        let host_error = open_single_backend(&mut config, Some(2))
             .err()
             .expect("the host opener must not drop an enabled effective ceiling");
         assert!(
@@ -5754,13 +5769,13 @@ mod tests {
         );
 
         // A disabled ceiling still opens on the same path.
-        let disabled = RuntimeConfig {
+        let mut disabled = RuntimeConfig {
             db_path: Some(dir.path().join("disabled.db")),
             wal_ceiling_bytes: 0,
             wal_ceiling_configured_bytes: 0,
             ..config
         };
-        open_single_backend(&disabled, Some(2)).expect("a disabled ceiling opens");
+        open_single_backend(&mut disabled, Some(2)).expect("a disabled ceiling opens");
     }
 
     #[test]
@@ -10382,6 +10397,32 @@ region = "us-east-1"
     }
 
     #[test]
+    fn wal_disclosure_memory_main_does_not_disable_file_secondary() {
+        let config = RuntimeConfig {
+            db_path: None,
+            wal_ceiling_configured_bytes: 8192,
+            wal_ceiling_bytes: 8192,
+            wal_ceiling_source: khive_runtime::WalCeilingSource::Environment,
+            wal_ceiling_env_raw: Some("8192".into()),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let mut topology =
+            duplicate_sqlite_path_config(std::path::Path::new("unused-secondary.db"));
+        topology.backends[0].kind = BackendKind::Memory;
+        topology.backends[0].path = None;
+        let line = resolved_wal_ceiling_disclosure(&config, &topology.backends, false);
+        assert!(line.contains("alias: configured_bytes=8192 effective_bytes=8192 source=environment enabled=true status=enforced"), "SECONDARY_FILE_POLICY_DISCLOSURE: {line}");
+        assert!(line.contains("main: configured_bytes=0 effective_bytes=0 source=default enabled=false status=disabled"));
+        let forced = resolved_wal_ceiling_disclosure(&config, &topology.backends, true);
+        assert_eq!(
+            forced
+                .matches("effective_bytes=0 source=default enabled=false")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn wal_ceiling_aliases_reject_unequal_effective_limits_before_open() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("not-created.db");
@@ -10402,6 +10443,49 @@ region = "us-east-1"
         topology.backends[1].read_only = true;
         validate_wal_ceiling_topology(&runtime, &topology.backends, false)
             .expect("read-only aliases both enforce zero");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_missing_paths_share_identity_through_symlink_parent() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("wal-alias-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let database = real.join("not-created/deeper/database.db");
+        let relative = link
+            .strip_prefix(&cwd)
+            .unwrap()
+            .join("not-created/deeper/database.db");
+        for alias in [link.join("not-created/deeper/database.db"), relative] {
+            let mut topology = duplicate_sqlite_path_config(&database);
+            topology.backends[1].path = Some(alias);
+            topology.backends[0].wal_ceiling_bytes = Some(8192);
+            topology.backends[1].wal_ceiling_bytes = Some(16384);
+            let error = validate_wal_ceiling_topology(
+                &RuntimeConfig::no_embeddings(),
+                &topology.backends,
+                false,
+            )
+            .expect_err("MISSING_ALIAS_POLICY_CONFLICT");
+            assert!(matches!(
+                error.downcast_ref::<khive_runtime::ConfigError>(),
+                Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                    first_bytes: 8192,
+                    second_bytes: 16384,
+                    ..
+                })
+            ));
+            assert!(
+                !database.parent().unwrap().exists(),
+                "validation must not create missing path components"
+            );
+        }
     }
 
     #[cfg(unix)]
