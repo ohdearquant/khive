@@ -1007,6 +1007,7 @@ pub fn gtd_transition_statement(
             snapshot.updated_at
         )));
     }
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(new_props))?;
     let props_str = serde_json::to_string(new_props)
         .map_err(|e| RuntimeError::Internal(format!("serialize props: {e}")))?;
     Ok(SqlStatement {

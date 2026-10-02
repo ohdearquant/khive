@@ -1599,6 +1599,10 @@ async fn claim_pending_event(
     let receipt = claim.claimed_receipt();
     let receipt_json = serde_json::to_string(&receipt)
         .context("pending-events: serialize dispatch claim receipt")?;
+    let Some(snapshot) = current_note_properties_text(rt, namespace, id).await? else {
+        return Ok(None);
+    };
+    check_fixed_path_whole_object_snapshot(&snapshot)?;
     let mut writer = rt
         .sql()
         .writer()
@@ -1620,7 +1624,8 @@ async fn claim_pending_event(
                     AND kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
                     AND json_extract(properties, '$.status') = 'pending' \
-                    AND json_extract(properties, '$.trigger_at') = ?6"
+                    AND json_extract(properties, '$.trigger_at') = ?6 \
+                    AND properties = ?7"
                 .to_string(),
             params: vec![
                 SqlValue::Integer(updated_at),
@@ -1629,6 +1634,7 @@ async fn claim_pending_event(
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Text(expected_trigger_at.to_string()),
+                SqlValue::Text(snapshot),
             ],
             label: Some("pending_events_claim_firing".into()),
         })
@@ -1645,6 +1651,10 @@ async fn mark_dispatch_invoking(
     lease: DispatchLeaseConfig,
 ) -> Result<bool> {
     let now = Utc::now().timestamp_micros();
+    let Some(snapshot) = current_note_properties_text(rt, namespace, id).await? else {
+        return Ok(false);
+    };
+    check_fixed_path_whole_object_snapshot(&snapshot)?;
     let mut writer = rt
         .sql()
         .writer()
@@ -1667,7 +1677,8 @@ async fn mark_dispatch_invoking(
                     AND json_extract(properties, '$.status') = 'firing' \
                     AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5 \
                     AND json_extract(properties, '$.dispatch_receipt.invocation_id') = ?6 \
-                    AND json_extract(properties, '$.dispatch_receipt.state') = 'claimed'"
+                    AND json_extract(properties, '$.dispatch_receipt.state') = 'claimed' \
+                    AND properties = ?7"
                 .to_string(),
             params: vec![
                 SqlValue::Integer(now),
@@ -1676,6 +1687,7 @@ async fn mark_dispatch_invoking(
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(claim.firing_at),
                 SqlValue::Text(claim.invocation_id.to_string()),
+                SqlValue::Text(snapshot),
             ],
             label: Some("pending_events_mark_invoking".into()),
         })
@@ -1788,10 +1800,10 @@ async fn persist_dispatch_outcome(
     // Direct SQL write, bypassing the ordinary note-write path (and with it
     // curation.rs's write-time content scan) for durability reasons unique to
     // this seam. The dispatch already happened and the lease is already held
-    // by the time this runs, so a hard refusal here would not stop anything
+    // by the time this runs, so a hard credential-content refusal here would not stop anything
     // from occurring -- it would only lose the record of what did, leaving
     // the row `firing` forever and the occurrence permanently re-drainable.
-    // No caller can act on a refusal at this seam. Mask the handler-supplied
+    // No caller can act on a content-scan refusal at this seam. Mask the handler-supplied
     // failure content instead of blocking it, then run the same scan the
     // outbound-message path applies to `last_error` as a POST-MASK ASSERT on
     // exactly what is about to be embedded -- confirming the masker did its
@@ -1835,14 +1847,21 @@ async fn persist_dispatch_outcome(
     });
     let receipt_json = serde_json::to_string(&receipt)
         .context("pending-events: serialize dispatch outcome receipt")?;
-    let mut writer = rt
-        .sql()
-        .writer()
-        .await
-        .context("pending-events: open SQL writer for dispatch outcome")?;
-    let rows = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes \
+    // A lease renewal may win this exact-properties CAS; retry against its
+    // current object while the invocation identity remains guarded below.
+    for _ in 0..8 {
+        let Some(snapshot) = current_note_properties_text(rt, namespace, id).await? else {
+            return Ok(None);
+        };
+        check_fixed_path_whole_object_snapshot(&snapshot)?;
+        let mut writer = rt
+            .sql()
+            .writer()
+            .await
+            .context("pending-events: open SQL writer for dispatch outcome")?;
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes \
                   SET properties = json_set( \
                         properties, \
                         '$.dispatch_receipt', json(?1), \
@@ -1856,21 +1875,32 @@ async fn persist_dispatch_outcome(
                     AND json_extract(properties, '$.status') = 'firing' \
                     AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5 \
                     AND json_extract(properties, '$.dispatch_receipt.invocation_id') = ?6 \
-                    AND json_extract(properties, '$.dispatch_receipt.state') = 'invoking'"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(receipt_json),
-                SqlValue::Integer(completed_at),
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Integer(claim.firing_at),
-                SqlValue::Text(claim.invocation_id.to_string()),
-            ],
-            label: Some("pending_events_persist_dispatch_outcome".into()),
-        })
-        .await
-        .context("pending-events: persist dispatch outcome")?;
-    Ok((rows == 1).then_some(receipt))
+                    AND json_extract(properties, '$.dispatch_receipt.state') = 'invoking' \
+                    AND properties = ?7"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(receipt_json.clone()),
+                    SqlValue::Integer(completed_at),
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(namespace.to_string()),
+                    SqlValue::Integer(claim.firing_at),
+                    SqlValue::Text(claim.invocation_id.to_string()),
+                    SqlValue::Text(snapshot.clone()),
+                ],
+                label: Some("pending_events_persist_dispatch_outcome".into()),
+            })
+            .await
+            .context("pending-events: persist dispatch outcome")?;
+        if rows == 1 {
+            return Ok(Some(receipt));
+        }
+        drop(writer);
+        match current_note_properties_text(rt, namespace, id).await? {
+            Some(current) if current != snapshot => continue,
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 fn completion_from_receipt(receipt: &Value) -> DispatchCompletion {
@@ -2053,6 +2083,7 @@ async fn requeue_legacy_claim(
     selected_properties: &str,
 ) -> Result<bool> {
     let updated_at = Utc::now().timestamp_micros();
+    check_fixed_path_whole_object_snapshot(selected_properties)?;
     let mut writer = rt
         .sql()
         .writer()
@@ -2104,6 +2135,7 @@ async fn finalize_corrupt_receipt(
         object.remove("firing_at");
         object.remove("lease_expires_at");
     }
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties))?;
     let serialized = serde_json::to_string(&properties)
         .context("pending-events: serialize corrupt receipt failure state")?;
     let updated_at = Utc::now().timestamp_micros();
@@ -2533,6 +2565,18 @@ async fn current_note_properties_text(
     }
 }
 
+/// These direct SQL updates change only fixed, non-reserved JSON paths. The
+/// final object's top-level reserved-key membership is therefore identical to
+/// this snapshot's. Each caller either already has an exact-properties CAS or
+/// adds one to its UPDATE, so a concurrent writer cannot change the object
+/// between this check and the write.
+fn check_fixed_path_whole_object_snapshot(properties: &str) -> Result<()> {
+    let value: Value = serde_json::from_str(properties)
+        .context("pending-events: parse properties for reservation check")?;
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&value))?;
+    Ok(())
+}
+
 /// Parses a finalizer's freshly read current-properties CAS snapshot into the
 /// `Value` base a terminal write's field mutations are applied to. Callers
 /// must build their write on this value, not on the page-query snapshot taken
@@ -2686,9 +2730,9 @@ async fn finalize_firing_event(
         obj.remove("lease_expires_at");
     }
     // Same direct-SQL seam as `persist_dispatch_outcome` above, mask-not-
-    // block for the same reason: this is the terminal write shared by
+    // block credential content for the same reason: this is the terminal write shared by
     // fresh-dispatch finalization and expired-lease recovery, no caller can
-    // act on a refusal here, and refusing would leave the row `firing`
+    // act on a content-scan refusal here, and refusing would leave the row `firing`
     // forever instead of recording the outcome that already happened. It
     // re-embeds the same handler-supplied failure content
     // (`dispatch_receipt.error`/`error_payload`, plus the legacy flat
@@ -2775,6 +2819,7 @@ async fn finalize_firing_event(
              persisting the masked record anyway"
         );
     }
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties))?;
     let props_json = serde_json::to_string(&properties)
         .map_err(|e| anyhow::anyhow!("pending-events: serialize properties: {e}"))?;
     let mut writer = rt
@@ -7030,6 +7075,141 @@ mod tests {
             .await
             .expect("force update");
         assert_eq!(rows, 1, "test setup: row must exist");
+    }
+
+    fn assert_reserved_property_refusal(error: &anyhow::Error) {
+        match error.downcast_ref::<khive_runtime::RuntimeError>() {
+            Some(khive_runtime::RuntimeError::InvalidInput(message)) => {
+                assert!(message.contains("khive:secret_gate"), "{message}");
+            }
+            other => panic!("expected typed reserved-property refusal, got {other:?}: {error}"),
+        }
+    }
+
+    async fn plant_reserved_property(rt: &KhiveRuntime, id: uuid::Uuid) -> (Value, String) {
+        let mut properties = get_note_props(rt, id).await;
+        properties["khive:secret_gate"] = json!("caller-forged");
+        force_set_properties(rt, id, &properties).await;
+        let raw = get_raw_note_properties(rt, id).await;
+        (properties, raw)
+    }
+
+    #[tokio::test]
+    async fn whole_object_dispatch_writes_refuse_carried_reserved_property() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let trigger = due_rfc3339();
+        let lease = short_test_lease();
+
+        let claim_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let (_, before_claim) = plant_reserved_property(&rt, claim_id).await;
+        let claim_error = claim_pending_event(
+            &rt,
+            "local",
+            claim_id,
+            dispatch_occurrence_id(claim_id, trigger.parse::<DateTime<Utc>>().unwrap()),
+            &trigger,
+            "actor:test",
+            lease,
+        )
+        .await
+        .expect_err("claim must refuse reserved property");
+        assert_reserved_property_refusal(&claim_error);
+        assert_eq!(get_raw_note_properties(&rt, claim_id).await, before_claim);
+
+        let invoking_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let invoking_claim = claim_for_test(&rt, invoking_id, &trigger).await;
+        let (_, before_invoking) = plant_reserved_property(&rt, invoking_id).await;
+        let invoking_error =
+            mark_dispatch_invoking(&rt, "local", invoking_id, &invoking_claim, lease)
+                .await
+                .expect_err("invocation marker must refuse reserved property");
+        assert_reserved_property_refusal(&invoking_error);
+        assert_eq!(
+            get_raw_note_properties(&rt, invoking_id).await,
+            before_invoking
+        );
+
+        let outcome_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let outcome_claim = claim_for_test(&rt, outcome_id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", outcome_id, &outcome_claim, lease)
+                .await
+                .expect("mark clean row invoking")
+        );
+        let (_, before_outcome) = plant_reserved_property(&rt, outcome_id).await;
+        let outcome_error = persist_dispatch_outcome(
+            &rt,
+            "local",
+            outcome_id,
+            &outcome_claim,
+            &DispatchCompletion::Succeeded,
+        )
+        .await
+        .expect_err("outcome persistence must refuse reserved property");
+        assert_reserved_property_refusal(&outcome_error);
+        assert_eq!(
+            get_raw_note_properties(&rt, outcome_id).await,
+            before_outcome
+        );
+
+        let legacy_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let stale_firing_at =
+            Utc::now().timestamp_micros() - (LEGACY_STALE_FIRING_TIMEOUT_MICROS * 2);
+        let mut legacy = get_note_props(&rt, legacy_id).await;
+        legacy["status"] = json!("firing");
+        legacy["firing_at"] = json!(stale_firing_at);
+        legacy["khive:secret_gate"] = json!("caller-forged");
+        force_set_properties(&rt, legacy_id, &legacy).await;
+        let before_legacy = get_raw_note_properties(&rt, legacy_id).await;
+        let requeue_error =
+            requeue_legacy_claim(&rt, "local", legacy_id, stale_firing_at, &before_legacy)
+                .await
+                .expect_err("legacy requeue must refuse reserved property");
+        assert_reserved_property_refusal(&requeue_error);
+        assert_eq!(get_raw_note_properties(&rt, legacy_id).await, before_legacy);
+
+        let corrupt_error = finalize_corrupt_receipt(
+            &rt,
+            "local",
+            legacy_id,
+            stale_firing_at,
+            &legacy,
+            Utc::now().timestamp_micros(),
+            &before_legacy,
+        )
+        .await
+        .expect_err("corrupt receipt finalization must refuse reserved property");
+        assert_reserved_property_refusal(&corrupt_error);
+        assert_eq!(get_raw_note_properties(&rt, legacy_id).await, before_legacy);
+
+        let final_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let final_claim = claim_for_test(&rt, final_id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", final_id, &final_claim, lease)
+                .await
+                .expect("mark final row invoking")
+        );
+        let (mut final_properties, before_final) = plant_reserved_property(&rt, final_id).await;
+        final_properties["status"] = json!("fired");
+        let final_error = finalize_fired_event(
+            &rt,
+            "local",
+            final_id,
+            &final_properties,
+            Utc::now().timestamp_micros(),
+            &final_claim,
+            &before_final,
+        )
+        .await
+        .expect_err("firing finalization must refuse reserved property");
+        assert_reserved_property_refusal(&final_error);
+        assert_eq!(get_raw_note_properties(&rt, final_id).await, before_final);
     }
 
     /// A row claimed by a drain that then crashed before finalizing —

@@ -54,7 +54,14 @@ async fn repeated_subject_updates_count_raw_rows_toward_checkpoint() {
                 "RAW_DIRTY_LOG_COUNT: both coalesced rows must remain dirty"
             );
         } else {
-            assert_ne!(commit_record(&rt, MODEL), committed);
+            assert_eq!(commit_record(&rt, MODEL), committed);
+            assert!(
+                ann_segment_dir(&rt, MODEL)
+                    .expect("segment directory")
+                    .join(delta::HEAD_FILE)
+                    .exists(),
+                "coalesced raw-row checkpoint must publish a delta"
+            );
             assert_eq!(ann.indexes.read().await.get(&key).unwrap().dirty_ops, 0);
         }
         assert_recalled(&rt, &ann, &key, MODEL, ids[0], &final_text).await;
@@ -99,11 +106,15 @@ async fn elapsed_dirty_interval_checkpoints_without_generation_change() {
         1,
         "INTERVAL_DIRTY_CHECKPOINT: elapsed dirty state must publish without another generation bump; {status:?}"
     );
-    assert_ne!(
+    assert_eq!(
         commit_record(&rt, MODEL),
         committed,
-        "INTERVAL_DIRTY_CHECKPOINT: interval must rotate the segment commit"
+        "INTERVAL_DIRTY_CHECKPOINT: interval publishes the delta, not the base segment"
     );
+    assert!(ann_segment_dir(&rt, MODEL)
+        .expect("segment directory")
+        .join(delta::HEAD_FILE)
+        .exists());
     assert_eq!(
         current_generation(&ann, &key).await,
         generation,

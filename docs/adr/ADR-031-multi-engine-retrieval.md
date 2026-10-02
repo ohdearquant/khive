@@ -1174,6 +1174,33 @@ for aggregate or per-member disclosure; this amendment makes no assertion that t
 return values disclose all truncation. The private atomic post-commit mapper is likewise outside
 the public API census.
 
+Further surfaces still drop the embedding report and are not yet disclosing. Each reaches a
+bounded embedding only when its embedded text exceeds the document-embedding budget: 32768 UTF-8
+bytes, less the model's document-instruction prefix for a model that defines one.
+
+- The web pack's shared entity helpers `get_or_create` and `patch`, reached from `web.fetch` and
+  `web.extract` and redirect settlement in `web.refresh`, call the report-aware update and
+  discard its report. For a document entity, `get_or_create` embeds the entity name, which is the canonical URL, so a canonical URL
+  over the budget is embedded truncated without any signal from that helper in the verb reply.
+  `patch` re-embeds the stored name and description when it changes `entity_type`. Section 6
+  covers `web.refresh`'s guarded promotion and metadata updates; it does not cover the reports
+  discarded by these shared helpers when refresh creates redirect endpoints.
+- `create_web_receipt_note`, called by the web receipt writer, returns the stored receipt without
+  its report. The receipt summary embeds a requested URL or a search query, so a summary over the
+  budget is embedded truncated without any signal.
+- The public `keyed_memory::create_keyed_memory` returns `Ok` with the stored memory when its
+  content exceeds the budget, and drops the report that `create_keyed_memory_with_report`
+  returns. Nothing in a production path calls it: `memory.remember` uses
+  `create_keyed_memory_with_receipt_and_report` to retain both the original visibility fences and
+  truncation accounting. An external Rust consumer that calls it keeps the silent behavior.
+- The receipt-only memory APIs `create_keyed_memory_with_receipt` and
+  `create_note_with_decay_for_embedding_model_with_visibility` keep their existing return shapes
+  and omit the truncation report. `memory.remember` uses the combined receipt-and-report forms
+  instead; callers that need both disclosures can use those forms directly.
+
+Bringing these under the rule in decision 5 needs its own change, because each changes a return
+shape or a verb reply.
+
 ### Consequences
 
 - External Rust consumers of the five narrowed methods must migrate to the named report-aware

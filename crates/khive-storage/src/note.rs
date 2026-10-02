@@ -682,6 +682,22 @@ pub struct NoteFilter {
     /// by `query_notes_filtered_count_free` with `offset: 0`.
     #[serde(default)]
     pub after_instant: Option<NoteInstantSeekAfter>,
+    /// Restrict `message` rows to the ones this mailbox reader may see, in
+    /// the query itself. Rows of every other kind are unaffected. Applying the
+    /// partition here means a scan window, and any cursor derived from it,
+    /// only ever contains rows the reader is allowed to see.
+    #[serde(default)]
+    pub mailbox: Option<NoteMailboxScope>,
+}
+
+/// The actor partition a mailbox reader may see, as evaluated by the store.
+/// It mirrors the row-level mailbox rule: an inbound message belongs to its
+/// `to_actor`, an outbound message to its `from_actor`, and `legacy_local`
+/// additionally admits the unattributed pre-routing rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteMailboxScope {
+    pub actor_id: String,
+    pub legacy_local: bool,
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.

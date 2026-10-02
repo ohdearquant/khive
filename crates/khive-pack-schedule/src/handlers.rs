@@ -19,6 +19,25 @@ use khive_types::{EventKind, SubstrateKind};
 
 use crate::{CREATOR_PROVENANCE_MARKER_V1, CREATOR_PROVENANCE_VERB};
 
+#[cfg(test)]
+mod activation_seam {
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    tokio::task_local! {
+        pub(super) static AFTER_CREATE: (Arc<Barrier>, Arc<Barrier>);
+    }
+
+    pub(super) async fn pause_after_create() {
+        if let Ok((arrived, resume)) = AFTER_CREATE.try_with(Clone::clone) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), arrived.wait())
+                .await
+                .expect("public verb did not reach post-create seam");
+            resume.wait().await;
+        }
+    }
+}
+
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
@@ -223,9 +242,23 @@ async fn activate_with_creator_provenance(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     note: &Note,
-    mut properties: Value,
     event_type: &str,
 ) -> Result<(), RuntimeError> {
+    // Activation writes the whole properties object. Read the staged row,
+    // rather than reusing the pre-create clone: a stored runtime-owned key
+    // must refuse activation instead of being silently discarded.
+    let staged = runtime
+        .notes(token)?
+        .get_note(note.id)
+        .await?
+        .ok_or_else(|| {
+            RuntimeError::Internal(format!(
+                "schedule: staged event {} disappeared before provenance activation",
+                note.id
+            ))
+        })?;
+    let mut properties = staged.properties.unwrap_or_else(|| json!({}));
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties))?;
     let actor = format!("{}:{}", token.actor().kind, token.actor().id);
     let provenance = Event::new(
         token.namespace().as_str(),
@@ -242,6 +275,7 @@ async fn activate_with_creator_provenance(
     runtime.events(token)?.append_event(provenance).await?;
 
     properties["status"] = json!("pending");
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties))?;
     let activated = runtime
         .notes(token)?
         .update_note_properties(note.id, Some(properties), Utc::now().timestamp_micros())
@@ -769,7 +803,9 @@ pub(crate) async fn handle_remind(
             Vec::new(),
         )
         .await?;
-    activate_with_creator_provenance(runtime, token, &note, properties, "remind").await?;
+    #[cfg(test)]
+    activation_seam::pause_after_create().await;
+    activate_with_creator_provenance(runtime, token, &note, "remind").await?;
 
     let mut response = json!({
         "id": short_id(note.id),
@@ -849,7 +885,9 @@ pub(crate) async fn handle_schedule(
             Vec::new(),
         )
         .await?;
-    activate_with_creator_provenance(runtime, token, &note, properties, "schedule").await?;
+    #[cfg(test)]
+    activation_seam::pause_after_create().await;
+    activate_with_creator_provenance(runtime, token, &note, "schedule").await?;
 
     let mut response = json!({
         "id": short_id(note.id),
@@ -1083,9 +1121,8 @@ pub(crate) async fn handle_cancel(
     // fired_at) between our read above and the write below: the CAS only
     // succeeds if the row is still "pending" at write time, so a concurrent
     // fire can never be clobbered by a stale cancel (issue #462).
-    let updated = cancel_pending_event(runtime, token.namespace().as_str(), id, &cancelled_at)
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("cancel: conditional update: {e}")))?;
+    let updated =
+        cancel_pending_event(runtime, token.namespace().as_str(), id, &cancelled_at).await?;
     if !updated {
         return Err(RuntimeError::InvalidInput(format!(
             "cancel: event {id} is no longer pending; it was cancelled or fired concurrently"
@@ -1111,11 +1148,10 @@ pub(crate) async fn handle_cancel(
 /// Conditionally transition a `scheduled_event` note from `pending` to
 /// `cancelled`, returning `true` iff the transition was applied.
 ///
-/// Uses a `json_set`-on-`properties` UPDATE gated by
-/// `json_extract(properties,'$.status') = 'pending'` so the write only lands
-/// if the row is still pending at the moment the statement executes — a
-/// concurrent fire (or a second cancel) that already changed the status
-/// causes this to affect zero rows instead of overwriting the newer state.
+/// Uses a `json_set`-on-`properties` UPDATE gated by pending status and the
+/// exact raw properties snapshot that passed the reservation check. A
+/// concurrent fire (or a second cancel) affects zero rows rather than
+/// overwriting the newer state.
 async fn cancel_pending_event(
     runtime: &KhiveRuntime,
     namespace: &str,
@@ -1129,9 +1165,46 @@ async fn cancel_pending_event(
         .await
         .map_err(|e| RuntimeError::Internal(format!("cancel: open SQL writer: {e}")))?;
 
-    // json_set targets the fixed nested paths `$.status`/`$.cancelled_at`
-    // only; no caller input reaches this statement, so it cannot create or
-    // replace the top-level reserved property key.
+    let snapshot = writer
+        .query_scalar(SqlStatement {
+            sql: "SELECT properties FROM notes \
+                  WHERE id = ?1 \
+                    AND namespace = ?2 \
+                    AND kind = 'scheduled_event' \
+                    AND deleted_at IS NULL \
+                    AND json_extract(properties, '$.status') = 'pending'"
+                .into(),
+            params: vec![
+                SqlValue::Text(id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+            ],
+            label: Some("schedule_cancel_snapshot".into()),
+        })
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("cancel: read properties: {e}")))?;
+    let raw_properties = match snapshot {
+        None => return Ok(false),
+        Some(SqlValue::Text(raw)) => raw,
+        Some(other) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "cancel: event {id} has malformed properties ({other:?}); cannot mutate"
+            )));
+        }
+    };
+    let mut final_properties: Value = serde_json::from_str(&raw_properties).map_err(|e| {
+        RuntimeError::InvalidInput(format!(
+            "cancel: event {id} has malformed properties ({e}); cannot mutate"
+        ))
+    })?;
+    if !final_properties.is_object() {
+        return Err(RuntimeError::InvalidInput(format!(
+            "cancel: event {id} has malformed properties (expected JSON object); cannot mutate"
+        )));
+    }
+    final_properties["status"] = json!("cancelled");
+    final_properties["cancelled_at"] = json!(cancelled_at);
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&final_properties))?;
+
     let rows = writer
         .execute(SqlStatement {
             sql: "UPDATE notes \
@@ -1142,13 +1215,15 @@ async fn cancel_pending_event(
                     AND namespace = ?4 \
                     AND kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
-                    AND json_extract(properties, '$.status') = 'pending'"
+                    AND json_extract(properties, '$.status') = 'pending' \
+                    AND properties = ?5"
                 .to_string(),
             params: vec![
                 SqlValue::Text(cancelled_at.to_string()),
                 SqlValue::Integer(updated_at),
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(raw_properties),
             ],
             label: Some("schedule_cancel_pending".into()),
         })
@@ -1156,4 +1231,144 @@ async fn cancel_pending_event(
         .map_err(|e| RuntimeError::Internal(format!("cancel: conditional update: {e}")))?;
 
     Ok(rows == 1)
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use std::sync::Arc;
+
+    use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistryBuilder};
+    use khive_storage::types::{SqlStatement, SqlValue};
+    use serde_json::json;
+    use tokio::sync::Barrier;
+
+    use super::activation_seam::AFTER_CREATE;
+
+    #[tokio::test]
+    async fn public_schedule_verbs_refuse_reserved_key_on_staged_row() {
+        for (verb, params) in [
+            (
+                "schedule.remind",
+                json!({"content": "check status", "at": "2099-06-01T09:00:00Z"}),
+            ),
+            (
+                "schedule.schedule",
+                json!({"action": "create(kind=\"concept\", name=\"test\")", "at": "2099-06-01T09:00:00Z"}),
+            ),
+        ] {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            builder.register(crate::SchedulePack::new(runtime.clone()));
+            let registry = builder.build().expect("build registry");
+            let arrived = Arc::new(Barrier::new(2));
+            let resume = Arc::new(Barrier::new(2));
+            let task_arrived = Arc::clone(&arrived);
+            let task_resume = Arc::clone(&resume);
+            let dispatched = tokio::spawn(async move {
+                AFTER_CREATE
+                    .scope((task_arrived, task_resume), async move {
+                        registry.dispatch(verb, params).await
+                    })
+                    .await
+            });
+
+            arrived.wait().await;
+            let token = runtime.authorize(Namespace::local()).expect("local token");
+            let store = runtime.notes(&token).expect("notes");
+            let staged = runtime
+                .list_notes(&token, Some("scheduled_event"), 10, 0)
+                .await
+                .expect("staged notes");
+            assert_eq!(staged.len(), 1, "{verb}: expected one staged row");
+            let before = &staged[0];
+            let mut planted = before.properties.clone().expect("properties");
+            planted["khive:secret_gate"] = json!({"legacy": true});
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+                    params: vec![
+                        SqlValue::Text(planted.to_string()),
+                        SqlValue::Text(before.id.to_string()),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("plant stored key");
+            drop(writer);
+            resume.wait().await;
+
+            let error = dispatched.await.expect("dispatch task").expect_err(verb);
+            assert!(
+                matches!(&error, RuntimeError::InvalidInput(_)),
+                "{verb}: {error}"
+            );
+            assert!(
+                error.to_string().contains("khive:secret_gate"),
+                "{verb}: {error}"
+            );
+            let after = store
+                .get_note(before.id)
+                .await
+                .expect("read row")
+                .expect("row");
+            assert_eq!(after.properties, Some(planted), "{verb}: row changed");
+            assert_eq!(
+                after.updated_at, before.updated_at,
+                "{verb}: revision changed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_cancel_refuses_reserved_key_on_pending_row() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+        builder.register(crate::SchedulePack::new(runtime.clone()));
+        let registry = builder.build().expect("build registry");
+        let created = registry
+            .dispatch(
+                "schedule.remind",
+                json!({"content": "check status", "at": "2099-06-01T09:00:00Z"}),
+            )
+            .await
+            .expect("create pending event");
+        let id = created["full_id"]
+            .as_str()
+            .expect("full id")
+            .parse()
+            .expect("UUID");
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let store = runtime.notes(&token).expect("notes");
+        let before = store.get_note(id).await.expect("read row").expect("row");
+        let mut planted = before.properties.clone().expect("properties");
+        planted["khive:secret_gate"] = json!({"legacy": true});
+        let mut writer = runtime.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+                params: vec![
+                    SqlValue::Text(planted.to_string()),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("plant stored key");
+        drop(writer);
+
+        let error = registry
+            .dispatch("schedule.cancel", json!({"id": id.to_string()}))
+            .await
+            .expect_err("reserved key must refuse cancel");
+        assert!(matches!(&error, RuntimeError::InvalidInput(_)), "{error}");
+        assert!(error.to_string().contains("khive:secret_gate"), "{error}");
+        let after = store.get_note(id).await.expect("read row").expect("row");
+        assert_eq!(after.properties, Some(planted), "row changed");
+        assert_eq!(after.updated_at, before.updated_at, "revision changed");
+    }
 }

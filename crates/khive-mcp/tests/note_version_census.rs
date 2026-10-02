@@ -439,7 +439,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (EVENTS, "finalize_corrupt_receipt"),
         (EVENTS, "finalize_firing_event"),
         (GTD, "gtd_transition_statement"),
-        (GTD_REPAIR, "UPDATE_SQL"),
+        (GTD_REPAIR, "checked_update_sql"),
         (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
         (CREATE, "prepare_note_create"),
@@ -450,7 +450,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (MESSAGE, "create_keyed_message_pair"),
         // A matching quarantine replay repairs legacy retention metadata in
         // one UPDATE. The note version trigger, not this writer, advances it.
-        (COMM, "handle_ingest"),
+        (COMM, "repair_duplicate_quarantine"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
@@ -563,7 +563,12 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "task",
             r#"{"status":"inbox"}"#,
         ),
-        (GTD_REPAIR, "UPDATE_SQL", "task", r#"{"status":"archived"}"#),
+        (
+            GTD_REPAIR,
+            "checked_update_sql",
+            "task",
+            r#"{"status":"archived"}"#,
+        ),
         (
             SCHEDULE,
             "cancel_pending_event",
@@ -578,7 +583,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         (MESSAGE, "create_keyed_message_pair", "message", "{}"),
         (
             COMM,
-            "handle_ingest",
+            "repair_duplicate_quarantine",
             "message",
             r#"{"quarantined":true,"quarantine_content_ref":"census-ref","channel_kind":"email"}"#,
         ),
@@ -642,7 +647,10 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     r#"{"originals":{}}"#,
                 ],
             ),
-            SCHEDULE => conn.execute(sql, params!["2026-09-09T00:00:00Z", 200_i64, ID, "local"]),
+            SCHEDULE => conn.execute(
+                sql,
+                params!["2026-09-09T00:00:00Z", 200_i64, ID, "local", properties],
+            ),
             CURATION => conn.execute(sql, params![200_i64, "local", ID]),
             CREATE => conn.execute(sql, params!["census/key", ID, "local", "memory"]),
             OPERATIONS => conn.execute(

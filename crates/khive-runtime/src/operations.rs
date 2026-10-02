@@ -11,6 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
+use khive_storage::entity::EntityTypeCounts;
 use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::note::Note;
 use khive_storage::types::{
@@ -52,6 +53,56 @@ fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) ->
         ("merged_into", kept_id.to_string()),
     ]))
     .into()
+}
+
+/// The entity total and optional type report consumed together by `stats`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EntityStatsCounts {
+    pub entities: u64,
+    pub entities_by_type: Option<EntityTypeCounts>,
+}
+
+/// Count caller-visible live entities through one store. A supported breakdown
+/// supplies its own scalar total; only an unavailable report uses legacy counting.
+pub async fn entity_stats_counts(
+    store: &dyn khive_storage::EntityStore,
+    token: &NamespaceToken,
+) -> RuntimeResult<EntityStatsCounts> {
+    let namespaces: Vec<String> = token
+        .visible_namespaces()
+        .iter()
+        .map(|namespace| namespace.as_str().to_owned())
+        .collect();
+    match store.count_entities_by_type(&namespaces).await? {
+        Some(groups) => {
+            let entities = groups.iter().try_fold(0_u64, |total, (_, count)| {
+                total.checked_add(*count).ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "entity type counts exceed the scalar count range".into(),
+                    )
+                })
+            })?;
+            Ok(EntityStatsCounts {
+                entities,
+                entities_by_type: Some(groups),
+            })
+        }
+        None => {
+            let entities = store
+                .count_entities(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        namespaces,
+                        ..EntityFilter::default()
+                    },
+                )
+                .await?;
+            Ok(EntityStatsCounts {
+                entities,
+                entities_by_type: None,
+            })
+        }
+    }
 }
 
 /// Inputs for a store-owned entity identity. Unlike ordinary creation, a
@@ -4089,10 +4140,10 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        let (note, embedding, degradations) = self
+        let (note, embedding, degradations, _) = self
             .create_note_inner(
                 token, kind, name, content, None, salience, None, properties, annotates, None,
-                false,
+                false, false,
             )
             .await?;
         legacy_post_commit_result_with_embedding(
@@ -4119,7 +4170,7 @@ impl KhiveRuntime {
             "tags": ["web.receipt"],
             "request": request,
         });
-        let (note, _, degradations) = self
+        let (note, _, degradations, _) = self
             .create_note_inner(
                 token,
                 "observation",
@@ -4131,6 +4182,7 @@ impl KhiveRuntime {
                 Some(properties),
                 annotates,
                 None,
+                false,
                 true,
             )
             .await?;
@@ -4159,7 +4211,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
-        let (note, embedding, degradations) = self
+        let (note, embedding, degradations, _) = self
             .create_note_inner(
                 token,
                 kind,
@@ -4171,6 +4223,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
                 false,
             )
             .await?;
@@ -4195,7 +4248,7 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
-        let (note, embedding, degradations) = self
+        let (note, embedding, degradations, _) = self
             .create_note_inner(
                 token,
                 kind,
@@ -4207,6 +4260,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 None,
+                false,
                 false,
             )
             .await?;
@@ -4235,20 +4289,23 @@ impl KhiveRuntime {
         crate::retrieval::EmbeddingTruncationReport,
         Vec<PostCommitDegradation>,
     )> {
-        self.create_note_inner(
-            token,
-            kind,
-            name,
-            content,
-            embedding_content,
-            salience,
-            None,
-            properties,
-            annotates,
-            None,
-            false,
-        )
-        .await
+        let (note, embedding, degradations, _) = self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                embedding_content,
+                salience,
+                None,
+                properties,
+                annotates,
+                None,
+                false,
+                false,
+            )
+            .await?;
+        Ok((note, embedding, degradations))
     }
 
     /// Like [`Self::create_note`] but also sets a non-zero decay factor on the note.
@@ -4324,7 +4381,7 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
     ) -> RuntimeResult<Note> {
-        let (note, embedding, degradations) = self
+        let (note, embedding, degradations, _) = self
             .create_note_inner(
                 token,
                 kind,
@@ -4336,6 +4393,7 @@ impl KhiveRuntime {
                 properties,
                 annotates,
                 embedding_model,
+                false,
                 false,
             )
             .await?;
@@ -4362,7 +4420,7 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
     ) -> RuntimeResult<(Note, crate::retrieval::EmbeddingTruncationReport)> {
-        let (note, embedding, degradations) = self
+        let (note, embedding, degradations, _) = self
             .create_note_inner(
                 token,
                 kind,
@@ -4375,12 +4433,97 @@ impl KhiveRuntime {
                 annotates,
                 embedding_model,
                 false,
+                false,
             )
             .await?;
         legacy_post_commit_result(
             "create_note_with_decay_for_embedding_model_and_report",
             note.id,
             (note, embedding),
+            degradations,
+        )
+    }
+
+    /// Memory-pack receipt form of the decay create. Each returned sequence
+    /// was read inside the transaction that inserted that model's vector and
+    /// ANN upsert log row; a failed or version-rejected vector writes no fence.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_decay_for_embedding_model_with_visibility(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: Option<f64>,
+        decay_factor: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+        embedding_model: Option<&str>,
+    ) -> RuntimeResult<(Note, Vec<(String, u64)>)> {
+        let (note, _, degradations, fences) = self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                None,
+                salience,
+                Some(decay_factor),
+                properties,
+                annotates,
+                embedding_model,
+                true,
+                false,
+            )
+            .await?;
+        legacy_post_commit_result(
+            "create_note_with_decay_for_embedding_model_with_visibility",
+            note.id,
+            (note, fences),
+            degradations,
+        )
+    }
+
+    /// Memory-pack create returning both its committed vector fences and
+    /// embedding-input truncation accounting. Other post-commit degradations
+    /// retain the same non-retryable error behavior as the receipt-only API.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_decay_for_embedding_model_with_visibility_and_report(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        salience: Option<f64>,
+        decay_factor: f64,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+        embedding_model: Option<&str>,
+    ) -> RuntimeResult<(
+        Note,
+        Vec<(String, u64)>,
+        crate::retrieval::EmbeddingTruncationReport,
+    )> {
+        let (note, embedding, degradations, fences) = self
+            .create_note_inner(
+                token,
+                kind,
+                name,
+                content,
+                None,
+                salience,
+                Some(decay_factor),
+                properties,
+                annotates,
+                embedding_model,
+                true,
+                false,
+            )
+            .await?;
+        legacy_post_commit_result(
+            "create_note_with_decay_for_embedding_model_with_visibility_and_report",
+            note.id,
+            (note, fences, embedding),
             degradations,
         )
     }
@@ -4662,11 +4805,13 @@ impl KhiveRuntime {
         properties: Option<serde_json::Value>,
         annotates: Vec<Uuid>,
         embedding_model: Option<&str>,
+        capture_visibility: bool,
         web_receipt: bool,
     ) -> RuntimeResult<(
         Note,
         crate::retrieval::EmbeddingTruncationReport,
         Vec<PostCommitDegradation>,
+        Vec<(String, u64)>,
     )> {
         self.validate_note_kind(kind)?;
         // Owned identity properties are derived from the authorization token
@@ -4827,6 +4972,7 @@ impl KhiveRuntime {
         let embed_text = embedding_content.unwrap_or(canonical_embed_text);
 
         let mut embedding_report = crate::retrieval::EmbeddingTruncationReport::default();
+        let mut vector_fences = Vec::with_capacity(embed_model_names.len());
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
@@ -4873,9 +5019,28 @@ impl KhiveRuntime {
             let single_model_result: RuntimeResult<()> = match vec_result {
                 Ok(outcome) => {
                     embedding_report.observe(&outcome);
-                    self.publish_note_vector_revision(token, &note, model_name, &outcome.vector)
-                        .await
-                        .map(|_| ())
+                    if capture_visibility {
+                        match self
+                            .publish_note_vector_revision_with_seq(
+                                token,
+                                &note,
+                                model_name,
+                                &outcome.vector,
+                            )
+                            .await
+                        {
+                            Ok(Some(seq)) => {
+                                vector_fences.push((model_name.clone(), seq));
+                                Ok(())
+                            }
+                            Ok(None) => Ok(()),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        self.publish_note_vector_revision(token, &note, model_name, &outcome.vector)
+                            .await
+                            .map(|_| ())
+                    }
                 }
                 Err(e) => Err(e),
             };
@@ -4924,9 +5089,24 @@ impl KhiveRuntime {
             // TODO(P2): parallelize vector inserts
             for (model_name, outcome) in embed_model_names.iter().zip(outcomes) {
                 embedding_report.observe(&outcome);
-                let insert_result = self
-                    .publish_note_vector_revision(token, &note, model_name, &outcome.vector)
-                    .await;
+                let insert_result = if capture_visibility {
+                    self.publish_note_vector_revision_with_seq(
+                        token,
+                        &note,
+                        model_name,
+                        &outcome.vector,
+                    )
+                    .await
+                    .map(|seq| {
+                        if let Some(seq) = seq {
+                            vector_fences.push((model_name.clone(), seq));
+                        }
+                    })
+                } else {
+                    self.publish_note_vector_revision(token, &note, model_name, &outcome.vector)
+                        .await
+                        .map(|_| ())
+                };
                 if let Err(e) = insert_result {
                     self.compensate_note_creation(&note).await;
                     return Err(e);
@@ -5067,7 +5247,8 @@ impl KhiveRuntime {
             );
         }
 
-        Ok((note, embedding_report, degradations))
+        vector_fences.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((note, embedding_report, degradations, vector_fences))
     }
 
     /// List notes visible to the token, optionally filtered by kind.
@@ -6908,6 +7089,14 @@ impl KhiveRuntime {
             .await?)
     }
 
+    /// Return the coupled entity total and optional type counts for `stats`.
+    pub async fn entity_stats_counts(
+        &self,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<EntityStatsCounts> {
+        entity_stats_counts(self.entities(token)?.as_ref(), token).await
+    }
+
     // ---- Edge CRUD operations ----
 
     /// Fetch a single edge by id.
@@ -8100,7 +8289,7 @@ impl KhiveRuntime {
             .iter()
             .enumerate()
             .map(|(index, entity)| {
-                let mut plan = bulk_entity_plan(entity);
+                let mut plan = bulk_entity_plan(entity)?;
                 if injected_failure_index == Some(index) {
                     // Keep the guarded row insert; replace its FTS pair with the fault.
                     plan.statements.truncate(1);
@@ -8115,9 +8304,9 @@ impl KhiveRuntime {
                         guard: None,
                     });
                 }
-                AtomicOpPlan::AddEntity(plan)
+                Ok(AtomicOpPlan::AddEntity(plan))
             })
-            .collect();
+            .collect::<RuntimeResult<Vec<_>>>()?;
 
         match run_atomic_unit(self.sql().as_ref(), plans).await {
             Ok(AtomicRunOutcome::Committed { .. }) => Ok(entities),
@@ -8194,7 +8383,7 @@ impl KhiveRuntime {
         let _ = self.entities(token)?;
         let _ = self.text(token)?;
 
-        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity));
+        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity)?);
         Ok((entity, plan))
     }
 
@@ -8256,7 +8445,8 @@ pub struct NoteCreateSpec {
     pub properties: Option<serde_json::Value>,
 }
 
-fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
+fn bulk_entity_plan(entity: &Entity) -> RuntimeResult<AddEntityPlan> {
+    crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
     let mut statements = vec![PlanStatement {
         statement: entity_upsert_statement(entity),
         guard: Some(AffectedRowGuard::exactly(1)),
@@ -8270,11 +8460,11 @@ fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
                 guard: None,
             }),
     );
-    AddEntityPlan {
+    Ok(AddEntityPlan {
         entity_id: entity.id,
         statements,
         post_commit: PostCommitEffect::None,
-    }
+    })
 }
 
 fn guarded_link_batch_failure(
@@ -21327,6 +21517,26 @@ mod tests {
                 None,
                 Some(reserved_key_props()),
                 vec![],
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_create_note_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let err = rt
+            .try_create_note(
+                &tok,
+                "observation",
+                None,
+                "reserved-key conditional note",
+                Some(reserved_key_props()),
             )
             .await
             .expect_err("caller-supplied reserved key must be rejected");

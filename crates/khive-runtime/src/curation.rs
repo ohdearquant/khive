@@ -1291,6 +1291,10 @@ impl KhiveRuntime {
             changed_fields.push("entity_type");
         }
 
+        // A patch may carry properties from the stored row into the full
+        // replacement. Validate the final object, including that carry.
+        crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
+
         if expected.is_some() && changed_fields.is_empty() {
             return Ok((
                 entity,
@@ -1459,6 +1463,9 @@ impl KhiveRuntime {
         expected_deleted_at: Option<i64>,
         expected_version: Option<i64>,
     ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
+        // This final whole-object replacement must reserve the complete
+        // candidate, even if a future caller bypasses the patch preparer.
+        crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
         let id = entity.id;
         let _ = self.entities(token)?;
         let next_version = entity
@@ -2427,6 +2434,10 @@ impl KhiveRuntime {
             note.status = status;
         }
 
+        // The whole-note CAS persists the merged properties, including keys
+        // carried from the snapshot when the patch changes another field.
+        crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
+
         // JSON object key order is not meaningful to callers. Tags are also
         // set-like in every existing note reader, so their order is ignored
         // for the no-op decision while duplicate entries remain meaningful.
@@ -2864,6 +2875,7 @@ impl KhiveRuntime {
         let expected_deleted_at = snapshot.deleted_at;
         let id = snapshot.id;
         snapshot.properties = Some(Value::Object(properties));
+        crate::secret_gate::reject_reserved_secret_gate_property(snapshot.properties.as_ref())?;
         snapshot.updated_at = chrono::Utc::now().timestamp_micros().max(
             expected_updated_at.checked_add(1).ok_or_else(|| {
                 RuntimeError::Internal(format!(
@@ -2898,6 +2910,7 @@ impl KhiveRuntime {
         let expected_deleted_at = snapshot.deleted_at;
         let id = snapshot.id;
         snapshot.properties = Some(Value::Object(properties));
+        crate::secret_gate::reject_reserved_secret_gate_property(snapshot.properties.as_ref())?;
         snapshot.updated_at = chrono::Utc::now().timestamp_micros().max(
             expected_updated_at.checked_add(1).ok_or_else(|| {
                 RuntimeError::Internal(format!("note {id} updated_at cannot advance"))
@@ -15407,6 +15420,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_property_replacements_refuse_carried_reserved_key() {
+        let rt = rt();
+        rt.install_pack_owned_note_kinds(vec!["message".to_string()]);
+        let token = NamespaceToken::local();
+
+        for owner_path in [false, true] {
+            let mut note = outbound_message_note();
+            note.properties = Some(serde_json::json!({
+                "direction": "outbound",
+                "khive:secret_gate": "exempted:content-sha256-manifest-v1"
+            }));
+            let id = note.id;
+            rt.raw_notes(&token)
+                .unwrap()
+                .upsert_note(note)
+                .await
+                .unwrap();
+            let before = rt
+                .raw_notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let error = if owner_path {
+                rt.claim_outbound_message_external_id(&token, id, "<message@example.com>".into())
+                    .await
+                    .expect_err("owner claim must refuse the carried reserved key")
+            } else {
+                rt.mark_outbound_message_delivered(&token, id, "2026-09-28T00:00:00Z".into(), None)
+                    .await
+                    .expect_err("delivery outcome must refuse the carried reserved key")
+            };
+            assert!(
+                matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("khive:secret_gate")),
+                "unexpected error: {error:?}"
+            );
+            let after = rt
+                .raw_notes(&token)
+                .unwrap()
+                .get_note(id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(after).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn update_entity_rejects_reserved_secret_gate_key() {
         let rt = rt();
         let tok = NamespaceToken::local();
@@ -15448,6 +15514,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(unchanged.properties, Some(serde_json::json!({"k": "v"})));
+    }
+
+    #[tokio::test]
+    async fn persist_prepared_entity_update_rejects_reserved_final_object() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "reserved-final-object",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let mut prepared = entity.clone();
+        prepared.properties = Some(reserved_key_props());
+
+        let error = rt
+            .persist_prepared_entity_update(
+                &tok,
+                prepared,
+                false,
+                vec!["properties"],
+                entity.updated_at,
+                entity.deleted_at,
+                None,
+            )
+            .await
+            .expect_err("the persistence boundary must reject a reserved final property");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("khive:secret_gate")),
+            "unexpected error: {error:?}"
+        );
+        let unchanged = rt.get_entity(&tok, entity.id).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(unchanged).unwrap(),
+            serde_json::to_value(entity).unwrap()
+        );
+        assert!(entity_update_events(&rt, &tok).await.is_empty());
     }
 
     #[tokio::test]

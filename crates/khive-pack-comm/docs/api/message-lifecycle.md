@@ -653,7 +653,14 @@ commits a `quarantine-original` note attachment with that same reference in the
 note's transaction. This attachment is the blob sweep's liveness root; metadata
 alone does not own stored bytes. A duplicate transport id repairs a missing
 attachment only when its stored reference matches the replayed bytes and the
-exact channel kind and slug match. A matching channel-scoped replay also
+exact channel kind and slug match. The one-release legacy IMAP lookup applies
+those same ownership checks before acknowledging a quarantined replay; the
+old-key note keeps its stored `external_id`; the lookup already matched its
+`channel_slug`, and the repair backfills a missing `quarantine_content_ref` and
+restores a missing matching attachment. When that old-key row has no `expires_at`, the
+repair also installs one from replay time plus configured retention, so the row
+that now owns the original bytes is selected by channel cleanup; an existing
+deadline on an old-key row is left as it is. A matching channel-scoped replay also
 installs a missing expiry deadline from replay time plus configured retention
 while preserving a later existing deadline. An older quarantine row without a
 slug occupies the empty channel partition under ADR-056 and cannot be claimed
@@ -676,6 +683,17 @@ an unexpired quarantine note and its attachment remain available. This follows
 a live note owns its attachment and hard deletion releases that ownership.
 Cleanup failure holds the channel poll and is reported as a failure, so it
 cannot produce a success heartbeat or advance transport progress.
+
+The number of quarantine records that hold an original is bounded per channel
+configuration (for email, `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED`, default 256; see the
+[IMAP connector notes](../../../khive-channel-email/docs/api/imap-connector.md)).
+Before publishing an original, whether the adapter quarantined the message or
+`comm.ingest` refused it, the poller reads `comm.health`'s
+`quarantined_count` for the ingest namespace. At the cap, `comm.ingest`
+receives the quarantine record without `quarantine_content_ref` and with
+`quarantine_original_retained: "false"` and
+`quarantine_original_not_retained_reason: "retention-limit"`, so no attachment is
+created and no blob is published. The record keeps the normal retention deadline.
 
 A future promote or release path would need to clear the expiry before the
 deadline; no such path exists today. Older quarantine notes without

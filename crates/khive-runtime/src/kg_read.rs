@@ -8,6 +8,8 @@ use crate::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 
 pub(crate) struct KgReadResolver {
     runtimes: Vec<KhiveRuntime>,
+    primary: KhiveRuntime,
+    by_pack: HashMap<String, KhiveRuntime>,
 }
 
 impl KgReadResolver {
@@ -24,7 +26,15 @@ impl KgReadResolver {
                 unique.push(runtime.clone());
             }
         }
-        Self { runtimes: unique }
+        Self {
+            runtimes: unique,
+            primary: primary.clone(),
+            by_pack: runtimes.clone(),
+        }
+    }
+
+    pub(crate) fn runtime_for_pack(&self, pack: &str) -> &KhiveRuntime {
+        self.by_pack.get(pack).unwrap_or(&self.primary)
     }
 
     pub(crate) async fn by_id(

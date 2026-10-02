@@ -1926,6 +1926,9 @@ dependencies = [
  "chrono",
  "futures",
  "khive-channel",
+ "khive-pack-comm",
+ "khive-pack-kg",
+ "khive-runtime",
  "lettre",
  "mail-parser",
  "rand 0.8.7",
@@ -2507,6 +2510,7 @@ dependencies = [
  "khive-storage",
  "khive-types",
  "lattice-embed",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2515,6 +2519,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2759,6 +2764,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -2790,6 +2796,7 @@ dependencies = [
  "khive-quant",
  "libc",
  "memmap2",
+ "nix",
  "rand 0.8.7",
  "rayon",
  "serde",

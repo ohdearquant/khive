@@ -610,7 +610,7 @@ async fn redirected_304_preserves_source_and_terminal_rows() {
             let source_before = entity(&runtime, &token, source).await;
             let final_canonical = crate::identity::canonicalize(final_url.clone());
             let final_id = crate::identity::document_id(
-                crate::identity::site_id(&final_canonical),
+                crate::identity::site_id(&khive_types::Namespace::local(), &final_canonical),
                 &crate::identity::path_and_query(&final_canonical),
             );
             if existing_terminal {
@@ -1249,7 +1249,7 @@ async fn redirected_refresh_does_not_claim_a_terminal_row_created_during_its_req
     let source_url = Url::parse("https://metadata.example/new-target-source").unwrap();
     let terminal_url = Url::parse("https://metadata.example/new-target").unwrap();
     let source_id = seed(&runtime, &token, &source_url, &[]).await;
-    let terminal_id = document_id_for_url(&terminal_url);
+    let terminal_id = document_id_for_url(&token, &terminal_url);
     assert!(runtime
         .entities(&token)
         .unwrap()

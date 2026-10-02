@@ -1897,6 +1897,33 @@ fn v43_vector_provenance_sidecar_starts_empty() {
 }
 
 #[test]
+fn v46_indexes_memory_visibility_receipts_by_note_id() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("apply core migrations");
+
+    let columns = conn
+        .prepare("SELECT name FROM pragma_index_info('memory_visibility_receipts_note_id') ORDER BY seqno")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(columns, vec!["note_id".to_owned()]);
+
+    let detail: String = conn
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT model_count FROM memory_visibility_receipts WHERE note_id = ?1",
+            ["note-id"],
+            |row| row.get(3),
+        )
+        .unwrap();
+    assert!(
+        detail.contains("USING INDEX memory_visibility_receipts_note_id (note_id=?)"),
+        "note-only lookup must use the receipts index: {detail}"
+    );
+}
+
+#[test]
 fn outbound_due_index_is_versioned_and_raw_migration_connection_can_write() {
     let mut conn = open_memory();
     run_migrations(&mut conn).expect("apply core migrations on a raw connection");
@@ -5341,8 +5368,9 @@ fn recipient_transport_migration_fresh_and_previous_tail() {
             [],
         )
         .unwrap();
+        // Remove V45 and every later version so the runner replays a contiguous tail.
         conn.execute(
-            "DELETE FROM _schema_migrations WHERE version = ?1",
+            "DELETE FROM _schema_migrations WHERE version >= ?1",
             [RECIPIENT_TRANSPORT_VERSION],
         )
         .unwrap();
