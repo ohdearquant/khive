@@ -169,9 +169,12 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
-            start_host_background_tasks(&args, server, schedule_rt)
-        })
+        khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
+            server,
+            boot_guard,
+            args.daemon_options(),
+            |server| start_host_background_tasks(&args, server, schedule_rt),
+        )
         .await?;
         return Ok(());
     }
@@ -191,16 +194,134 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     serve_with_session_sweep(server, &args, registry).await
 }
 
+fn daemon_startup_report(
+    args: &Args,
+    server: &KhiveMcpServer,
+    has_schedule: bool,
+) -> khive_runtime::daemon::DaemonStartupReport {
+    let mut report = khive_runtime::daemon::DaemonStartupReport::default();
+    if args.daemon
+        && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
+    {
+        #[cfg(feature = "channel-email")]
+        report.skipped_components.extend([
+            "email_channel_poll".to_owned(),
+            "email_channel_outbound".to_owned(),
+        ]);
+        #[cfg(feature = "channel-telegram")]
+        report.skipped_components.extend([
+            "telegram_channel_poll".to_owned(),
+            "telegram_channel_outbound".to_owned(),
+        ]);
+        if has_schedule {
+            report.skipped_components.push("schedule-tick".to_owned());
+        }
+        report.idle_ineligible_reasons = crate::components::idle_retirement_obligations(server);
+        #[cfg(unix)]
+        if !server.default_runtime_is_read_only()
+            && server
+                .events_split_config()
+                .is_some_and(|split| split.socket_path.is_some())
+        {
+            report
+                .idle_ineligible_reasons
+                .push("events_child_may_be_exclusively_owned".to_owned());
+        }
+    }
+    report
+}
+
 fn start_host_background_tasks(
     args: &Args,
     server: &KhiveMcpServer,
     schedule_rt: Option<KhiveRuntime>,
-) {
+) -> khive_runtime::daemon::DaemonStartupReport {
+    let report = daemon_startup_report(args, server, schedule_rt.is_some());
+    if args.daemon
+        && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
+    {
+        for component in &report.skipped_components {
+            tracing::info!(component, "demand daemon: background component skipped");
+        }
+        start_daemon_components_if_daemon(args, server, None);
+        return report;
+    }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(server, args);
     #[cfg(feature = "channel-telegram")]
     spawn_telegram_channel_loops_if_daemon(server, args);
     start_daemon_components_if_daemon(args, server, schedule_rt);
+    report
+}
+
+#[cfg(all(test, unix))]
+mod demand_startup_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn runtime_config() -> khive_runtime::RuntimeConfig {
+        khive_runtime::RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            actor_id: Some("test:demand-startup".to_owned()),
+            packs: vec!["kg".to_owned()],
+            events_split: None,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn configured_channels_and_schedule_are_skipped_by_real_startup() {
+        let runtime = KhiveRuntime::new(runtime_config()).unwrap();
+        let server = KhiveMcpServer::new(runtime.clone()).unwrap();
+        let demand = Args::parse_from(["mcp", "--daemon", "--lifetime", "demand"]);
+        let before = khive_runtime::daemon::background_task_count();
+        let report = start_host_background_tasks(&demand, &server, Some(runtime));
+        assert_eq!(
+            khive_runtime::daemon::background_task_count(),
+            before,
+            "a configured schedule must not create its supervised worker"
+        );
+        assert!(report
+            .skipped_components
+            .contains(&"schedule-tick".to_owned()));
+        #[cfg(feature = "channel-email")]
+        assert!(report
+            .skipped_components
+            .contains(&"email_channel_poll".to_owned()));
+        #[cfg(feature = "channel-telegram")]
+        assert!(report
+            .skipped_components
+            .contains(&"telegram_channel_poll".to_owned()));
+        let persistent = Args::parse_from(["mcp", "--daemon"]);
+        assert!(daemon_startup_report(&persistent, &server, true)
+            .skipped_components
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn events_supervision_configuration_is_idle_ineligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = runtime_config();
+        config.events_split = Some(khive_runtime::events_split::EventsSplitConfig {
+            db_path: dir.path().join("events.db"),
+            socket_path: Some(dir.path().join("events.sock")),
+        });
+        let server = KhiveMcpServer::new(KhiveRuntime::new(config).unwrap()).unwrap();
+        let demand = Args::parse_from(["mcp", "--daemon", "--lifetime", "demand"]);
+        let report = daemon_startup_report(&demand, &server, false);
+        assert!(report
+            .idle_ineligible_reasons
+            .contains(&"events_child_may_be_exclusively_owned".to_owned()));
+        assert!(
+            daemon_startup_report(&Args::parse_from(["mcp", "--daemon"]), &server, false)
+                .idle_ineligible_reasons
+                .is_empty()
+        );
+    }
 }
 
 /// Whether this process owns the email channel loops (#602).
@@ -2320,9 +2441,12 @@ pub async fn serve_server(
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
-            start_host_background_tasks(args, server, schedule_rt)
-        })
+        khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
+            server,
+            boot_guard,
+            args.daemon_options(),
+            |server| start_host_background_tasks(args, server, schedule_rt),
+        )
         .await?;
         return Ok(());
     }
@@ -2450,6 +2574,7 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
                 BackendConfig {
                     kind: BackendKind::Memory,
                     path: None,
+                    wal_ceiling_bytes: None,
                     ..backend.clone()
                 }
             } else {
@@ -2596,14 +2721,19 @@ fn verify_reused_backend_alias_identity(
 
 /// Open the entire declared topology against one pre-open snapshot. The
 /// injectable opener makes the snapshot→SQLite-open race executable without a
-/// scheduler or global hook; production passes `open_backend` directly.
+/// scheduler or global hook; production passes `open_backend_with_wal_ceiling`.
 fn open_effective_backends_with<F>(
+    config: &RuntimeConfig,
     effective_backends: &[BackendConfig],
     max_readers: Option<usize>,
     mut opener: F,
 ) -> anyhow::Result<HashMap<String, Arc<StorageBackend>>>
 where
-    F: FnMut(&BackendConfig, Option<usize>) -> anyhow::Result<StorageBackend>,
+    F: FnMut(
+        &BackendConfig,
+        Option<usize>,
+        khive_db::WalCeilingPolicy,
+    ) -> anyhow::Result<StorageBackend>,
 {
     let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
     let identities = effective_backends
@@ -2615,11 +2745,13 @@ where
             })
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut identity_to_backend: HashMap<BackendAliasIdentity, Arc<StorageBackend>> =
+    let mut identity_to_backend: HashMap<BackendAliasIdentity, (Arc<StorageBackend>, String, u64)> =
         HashMap::new();
     for (backend_cfg, identity) in effective_backends.iter().zip(identities) {
+        let policy = wal_ceiling_policy_for_backend(config, backend_cfg)?;
+        let effective_bytes = policy.effective_bytes(backend_cfg.read_only);
         if let Some((ref key, ref canon)) = identity {
-            if let Some(existing) = identity_to_backend.get(key) {
+            if let Some((existing, first_name, first_bytes)) = identity_to_backend.get(key) {
                 verify_reused_backend_alias_identity(backend_cfg, key, canon, existing)?;
                 if existing.is_read_only() != backend_cfg.read_only {
                     anyhow::bail!(
@@ -2632,6 +2764,16 @@ where
                         existing.is_read_only(),
                     );
                 }
+                if *first_bytes != effective_bytes {
+                    return Err(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                        first_backend: first_name.clone(),
+                        second_backend: backend_cfg.name.clone(),
+                        path: canon.clone(),
+                        first_bytes: *first_bytes,
+                        second_bytes: effective_bytes,
+                    }
+                    .into());
+                }
                 backends.insert(backend_cfg.name.clone(), existing.clone());
                 continue;
             }
@@ -2642,11 +2784,11 @@ where
                 max_readers,
                 key,
                 canon,
-                &mut opener,
+                |cfg, max_readers| opener(cfg, max_readers, policy),
             )?;
             (backend, Some(opened))
         } else {
-            (opener(backend_cfg, max_readers)?, None)
+            (opener(backend_cfg, max_readers, policy)?, None)
         };
         let arc = Arc::new(backend);
         if let (Some((snapshot, _)), Some(opened)) = (identity, opened_key) {
@@ -2657,9 +2799,10 @@ where
                     backend_cfg.name
                 );
             }
-            identity_to_backend.insert(opened, arc.clone());
+            let cached = (arc.clone(), backend_cfg.name.clone(), effective_bytes);
+            identity_to_backend.insert(opened, cached.clone());
             if matches!(&snapshot, BackendAliasIdentity::Path(_)) {
-                identity_to_backend.insert(snapshot, arc.clone());
+                identity_to_backend.insert(snapshot, cached);
             }
         }
         backends.insert(backend_cfg.name.clone(), arc);
@@ -2691,6 +2834,63 @@ pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> any
             }
         } else {
             physical_sqlite.insert(identity, (&backend.name, backend.read_only));
+        }
+    }
+    Ok(())
+}
+
+fn wal_ceiling_policy_for_backend(
+    config: &RuntimeConfig,
+    backend: &BackendConfig,
+) -> anyhow::Result<khive_db::WalCeilingPolicy> {
+    let wal_mode = backend
+        .journal_mode
+        .as_deref()
+        .is_none_or(|mode| mode.eq_ignore_ascii_case("wal"));
+    let resolved = khive_runtime::resolve_wal_ceiling(
+        backend.wal_ceiling_bytes,
+        config.wal_ceiling_env_raw.as_deref(),
+        &backend.name,
+        backend.kind.clone(),
+        wal_mode,
+        backend.read_only,
+    )?;
+    Ok(khive_db::WalCeilingPolicy {
+        bytes: resolved.configured_bytes,
+        source: resolved.source,
+    })
+}
+
+/// Validate ceiling policy for every effective backend before daemon forwarding
+/// or opening any configured database. Aliases of one SQLite file must agree
+/// on the writer policy actually enforced by their shared pool.
+pub fn validate_wal_ceiling_topology(
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<()> {
+    let effective = effective_backend_configs(backends, force_memory);
+    let mut by_identity: HashMap<BackendAliasIdentity, (&str, u64)> = HashMap::new();
+    for backend in &effective {
+        let policy = wal_ceiling_policy_for_backend(config, backend)?;
+        let effective_bytes = policy.effective_bytes(backend.read_only);
+        let Some(path) = canonical_backend_path(backend)? else {
+            continue;
+        };
+        let identity = backend_alias_identity(&backend.name, &path)?;
+        if let Some((first_name, first_bytes)) = by_identity.get(&identity) {
+            if *first_bytes != effective_bytes {
+                return Err(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                    first_backend: (*first_name).to_string(),
+                    second_backend: backend.name.clone(),
+                    path,
+                    first_bytes: *first_bytes,
+                    second_bytes: effective_bytes,
+                }
+                .into());
+            }
+        } else {
+            by_identity.insert(identity, (&backend.name, effective_bytes));
         }
     }
     Ok(())
@@ -2818,13 +3018,15 @@ pub async fn migrate_configured_storage_topology(
             cli_db_override,
             &khive_cfg.backends,
         )?;
+        validate_wal_ceiling_topology(&base_config, &plan.effective_backends, false)?;
         let selected = plan
             .effective_backends
             .iter()
             .find(|backend| backend.name == target)
             .expect("the planner validated the selected backend")
             .clone();
-        let backend = Arc::new(open_backend(&selected, None)?);
+        let policy = wal_ceiling_policy_for_backend(&base_config, &selected)?;
+        let backend = Arc::new(open_backend_with_wal_ceiling(&selected, None, policy)?);
         prepare_core_schema_for_boot(Arc::clone(&backend), format!("backend {}", selected.name))
             .await?;
         crate::attachment_cutover::require_secondary_attachment_empty(
@@ -3181,7 +3383,12 @@ pub fn normalize_redundant_db_override_with_source(
         backends,
         config_source,
     )?;
-    if !force_memory {
+    if force_memory {
+        config.db_path = None;
+        config.wal_ceiling_bytes = 0;
+        config.wal_ceiling_configured_bytes = 0;
+        config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
+    } else {
         if let Some(main) = backends
             .iter()
             .find(|backend| backend.name == BackendId::MAIN)
@@ -3319,6 +3526,7 @@ async fn prepare_configured_storage_topology(
     // read-only/read-write alias topology without creating a partial set of
     // database files.
     validate_effective_backend_alias_modes(&effective_backends)?;
+    validate_wal_ceiling_topology(&base_config, &effective_backends, false)?;
 
     // ADR-170: the events split must anchor beside the store that actually
     // holds this deployment's data. The resolver derived it from
@@ -3352,7 +3560,12 @@ async fn prepare_configured_storage_topology(
     // preparation is deferred until after main is identified: every distinct
     // secondary must be inventoried before main can atomically enable
     // attachment-only GC at V21.
-    let backends = open_effective_backends_with(&effective_backends, max_readers, open_backend)?;
+    let backends = open_effective_backends_with(
+        &base_config,
+        &effective_backends,
+        max_readers,
+        open_backend_with_wal_ceiling,
+    )?;
 
     let main_backend = backends
         .get(BackendId::MAIN)
@@ -3977,6 +4190,7 @@ async fn build_server_inner(
     // backends slice keeps the line truthful in multi-backend mode, where the
     // config-declared backend paths — not `config.db_path` — receive writes.
     tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
+    tracing::info!(target: "khive.boot", "{}", resolved_wal_ceiling_disclosure(&config, &khive_cfg.backends, args.db.as_deref() == Some(":memory:")));
 
     if khive_cfg.backends.is_empty() {
         let runtime =
@@ -4454,11 +4668,11 @@ pub async fn build_single_backend_runtime(
 }
 
 async fn build_single_backend_runtime_with_max_readers(
-    config: RuntimeConfig,
+    mut config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     max_readers: Option<usize>,
 ) -> anyhow::Result<KhiveRuntime> {
-    let backend = Arc::new(open_single_backend(&config, max_readers)?);
+    let backend = Arc::new(open_single_backend(&mut config, max_readers)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator =
@@ -4481,9 +4695,10 @@ async fn build_single_backend_runtime_with_max_readers(
 }
 
 fn open_single_backend(
-    config: &RuntimeConfig,
+    config: &mut RuntimeConfig,
     max_readers: Option<usize>,
 ) -> anyhow::Result<StorageBackend> {
+    let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
     let backend = match &config.db_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -4494,8 +4709,11 @@ fn open_single_backend(
                     )
                 })?;
             }
-            StorageBackend::sqlite_with_max_readers(path, max_readers)
-                .map_err(|error| anyhow::anyhow!("open single SQLite backend: {error}"))?
+            StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, max_readers, wal_ceiling)
+                .map_err(|error| {
+                    let context = format!("open single SQLite backend: {error}");
+                    anyhow::Error::new(error).context(context)
+                })?
         }
         None => StorageBackend::memory()
             .map_err(|error| anyhow::anyhow!("open single in-memory backend: {error}"))?,
@@ -4507,11 +4725,12 @@ async fn prepare_single_backend_for_schema_admin(
     config: &RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<Arc<StorageBackend>> {
-    let backend = Arc::new(open_single_backend(config, None)?);
+    let mut config = config.clone();
+    let backend = Arc::new(open_single_backend(&mut config, None)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator = if schema_admin_requires_blob_hydrator(Arc::clone(&backend)).await? {
-        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.as_ref())?
+        resolve_blob_hydrator_for_boot(&config, khive_cfg, backend.as_ref(), backend.as_ref())?
     } else {
         None
     };
@@ -4636,7 +4855,16 @@ fn build_pack_runtime(
 }
 
 /// Open a `StorageBackend` from a `BackendConfig`.
+#[cfg(test)]
 fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Result<StorageBackend> {
+    open_backend_with_wal_ceiling(cfg, max_readers, khive_db::WalCeilingPolicy::default())
+}
+
+fn open_backend_with_wal_ceiling(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    wal_ceiling: khive_db::WalCeilingPolicy,
+) -> anyhow::Result<StorageBackend> {
     match cfg.kind {
         BackendKind::Memory => StorageBackend::memory()
             .map_err(|e| anyhow::anyhow!("backend {}: memory open: {e}", cfg.name)),
@@ -4660,12 +4888,25 @@ fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Resu
                 }
             }
             if cfg.read_only {
-                StorageBackend::sqlite_read_only_with_max_readers(&expanded, max_readers).map_err(
-                    |e| anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name),
+                StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
+                    &expanded,
+                    max_readers,
+                    wal_ceiling,
                 )
+                .map_err(|error| {
+                    let context = format!("backend {}: sqlite read-only open: {error}", cfg.name);
+                    anyhow::Error::new(error).context(context)
+                })
             } else {
-                let backend = StorageBackend::sqlite_with_max_readers(&expanded, max_readers)
-                    .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))?;
+                let backend = StorageBackend::sqlite_with_max_readers_and_wal_ceiling(
+                    &expanded,
+                    max_readers,
+                    wal_ceiling,
+                )
+                .map_err(|error| {
+                    let context = format!("backend {}: sqlite open: {error}", cfg.name);
+                    anyhow::Error::new(error).context(context)
+                })?;
                 if backend.is_read_only() {
                     anyhow::bail!(
                         "backend {}: path {} has no filesystem write bits; declare \
@@ -4748,6 +4989,93 @@ pub fn resolved_database_disclosure(
         }
         Some(path) => format!("database: {} (resolved)", path.display()),
     }
+}
+
+/// Report the resolved WAL policy for every storage target at startup. This
+/// uses the same configuration snapshot as daemon identity and backend open.
+pub fn resolved_wal_ceiling_disclosure(
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> String {
+    fn source_name(source: khive_runtime::WalCeilingSource) -> &'static str {
+        match source {
+            khive_runtime::WalCeilingSource::BackendField => "backend_field",
+            khive_runtime::WalCeilingSource::Environment => "environment",
+            khive_runtime::WalCeilingSource::Default => "default",
+        }
+    }
+
+    fn row(name: &str, configured: u64, effective: u64, source: &str, read_only: bool) -> String {
+        let status = if read_only && configured > 0 {
+            "read_only_not_enforced"
+        } else if effective > 0 {
+            "enforced"
+        } else {
+            "disabled"
+        };
+        // A backend name is operator-supplied text, so it takes the runtime's
+        // log-text path: credential shapes are masked, and control, format and
+        // line/paragraph separator characters (newline, escape sequences, bidi
+        // overrides) are escaped so a name cannot start a forged log line or
+        // drive the terminal.
+        let name = khive_runtime::secret_gate::bounded_masked_log_text(name);
+        format!(
+            "{name}: configured_bytes={configured} effective_bytes={effective} source={source} enabled={} status={status}",
+            effective > 0
+        )
+    }
+
+    if backends.is_empty() {
+        let read_only = config.db_path.as_deref().is_some_and(|path| {
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().readonly())
+        });
+        let effective = if config.db_path.is_none() || read_only {
+            0
+        } else {
+            config.wal_ceiling_bytes
+        };
+        return format!(
+            "wal_ceiling: {}",
+            row(
+                BackendId::MAIN,
+                config.wal_ceiling_configured_bytes,
+                effective,
+                source_name(config.wal_ceiling_source),
+                read_only,
+            )
+        );
+    }
+
+    let mut rows = Vec::with_capacity(backends.len());
+    for backend in backends {
+        let (configured, source) = if force_memory {
+            (0, khive_runtime::WalCeilingSource::Default)
+        } else {
+            match backend.wal_ceiling_bytes {
+                Some(bytes) => (bytes, khive_runtime::WalCeilingSource::BackendField),
+                None if backend.kind == BackendKind::Memory => {
+                    (0, khive_runtime::WalCeilingSource::Default)
+                }
+                None => (
+                    config.wal_ceiling_configured_bytes,
+                    config.wal_ceiling_source,
+                ),
+            }
+        };
+        let memory = force_memory || backend.kind == BackendKind::Memory;
+        let read_only = backend.read_only;
+        let effective = if memory || read_only { 0 } else { configured };
+        rows.push(row(
+            &backend.name,
+            configured,
+            effective,
+            source_name(source),
+            read_only,
+        ));
+    }
+    rows.sort();
+    format!("wal_ceiling: {}", rows.join("; "))
 }
 
 /// One-line, stdout-safe disclosure of the actor selected by the resolved
@@ -4866,6 +5194,7 @@ pub fn resolve_runtime_config_with_db_anchor(
             no_embed_base,
             db_path_for_config.as_deref(),
             packs_overridden,
+            inputs.db == Some(":memory:"),
         )?
     } else {
         let base_config = RuntimeConfig {
@@ -4882,6 +5211,7 @@ pub fn resolve_runtime_config_with_db_anchor(
             base_config,
             db_path_for_config.as_deref(),
             packs_overridden,
+            inputs.db == Some(":memory:"),
         )?
     };
 
@@ -5061,6 +5391,7 @@ fn resolve_config(
     base: RuntimeConfig,
     db_path: Option<&std::path::Path>,
     packs_overridden: bool,
+    force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
@@ -5077,17 +5408,87 @@ fn resolve_config(
                 );
             }
 
-            Ok(runtime_config_from_khive_config(&khive_cfg, base))
+            let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
+            Ok(resolved)
         }
         None => {
             let env_cfg = config_from_env();
-            if env_cfg.engines.is_empty() {
-                Ok(base)
+            let mut resolved = if env_cfg.engines.is_empty() {
+                base
             } else {
-                Ok(runtime_config_from_khive_config(&env_cfg, base))
-            }
+                runtime_config_from_khive_config(&env_cfg, base)
+            };
+            resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
+            Ok(resolved)
         }
     }
+}
+
+/// Validate the captured policy snapshot before a forwarding client computes its daemon
+/// identity. Backend field overrides are resolved from this same snapshot at
+/// the named-backend opener, so a later environment change cannot split the
+/// client fingerprint from the opened pool.
+fn resolve_runtime_wal_ceiling(
+    config: &mut RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<()> {
+    if force_memory {
+        config.wal_ceiling_bytes = 0;
+        config.wal_ceiling_configured_bytes = 0;
+        config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
+        return validate_wal_ceiling_topology(config, backends, true);
+    }
+    let env_raw = config.wal_ceiling_env_raw.clone();
+    let needs_fallback = backends.is_empty()
+        || backends.iter().any(|backend| {
+            backend.kind == BackendKind::Sqlite && backend.wal_ceiling_bytes.is_none()
+        });
+    let fallback = if needs_fallback {
+        khive_runtime::resolve_wal_ceiling(
+            None,
+            env_raw.as_deref(),
+            BackendId::MAIN,
+            if backends.is_empty() && config.db_path.is_none() {
+                BackendKind::Memory
+            } else {
+                BackendKind::Sqlite
+            },
+            true,
+            false,
+        )?
+    } else {
+        khive_runtime::ResolvedWalCeiling {
+            configured_bytes: 0,
+            effective_bytes: 0,
+            source: khive_runtime::WalCeilingSource::Default,
+        }
+    };
+    config.wal_ceiling_env_raw = env_raw;
+    config.wal_ceiling_configured_bytes = fallback.configured_bytes;
+    config.wal_ceiling_bytes = fallback.effective_bytes;
+    config.wal_ceiling_source = fallback.source;
+
+    if backends.is_empty() {
+        let kind = if config.db_path.is_some() {
+            BackendKind::Sqlite
+        } else {
+            BackendKind::Memory
+        };
+        let main = khive_runtime::resolve_wal_ceiling(
+            None,
+            config.wal_ceiling_env_raw.as_deref(),
+            BackendId::MAIN,
+            kind,
+            true,
+            false,
+        )?;
+        config.wal_ceiling_bytes = main.effective_bytes;
+    } else {
+        validate_wal_ceiling_topology(config, backends, false)?;
+    }
+    Ok(())
 }
 
 /// Resolve configuration without enabling embedding engines (no-embed path).
@@ -5101,20 +5502,26 @@ fn resolve_actor_from_config(
     base: RuntimeConfig,
     db_path: Option<&std::path::Path>,
     packs_overridden: bool,
+    force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
-            let resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
             Ok(RuntimeConfig {
                 embedding_model: None,
                 additional_embedding_models: vec![],
                 ..resolved
             })
         }
-        None => Ok(base),
+        None => {
+            let mut resolved = base;
+            resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
+            Ok(resolved)
+        }
     }
 }
 
@@ -5282,6 +5689,220 @@ mod tests {
     }
 
     #[test]
+    fn wal_ceiling_disclosure_names_disabled_default_and_read_only_policy() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(
+            resolved_wal_ceiling_disclosure(&config, &[], false),
+            "wal_ceiling: main: configured_bytes=0 effective_bytes=0 source=default enabled=false status=disabled"
+        );
+
+        let backend = BackendConfig {
+            name: "archive".into(),
+            kind: BackendKind::Sqlite,
+            path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+            cache_mb: None,
+            journal_mode: None,
+            wal_ceiling_bytes: Some(8192),
+            served_kinds: None,
+            read_only: true,
+        };
+        assert_eq!(
+            resolved_wal_ceiling_disclosure(&config, &[backend], false),
+            "wal_ceiling: archive: configured_bytes=8192 effective_bytes=0 source=backend_field enabled=false status=read_only_not_enforced"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_disclosure_escapes_log_unsafe_characters_in_backend_names() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        let disclose = |name: &str| {
+            let backend = BackendConfig {
+                name: name.into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+                cache_mb: None,
+                journal_mode: None,
+                wal_ceiling_bytes: None,
+                served_kinds: None,
+                read_only: false,
+            };
+            resolved_wal_ceiling_disclosure(&config, &[backend], false)
+        };
+
+        // One arm per category: Cc newline and ESC, Cf bidi override, Zl, Zp.
+        for (raw, escaped) in [
+            ('\n', "\\u{000a}"),
+            ('\u{1b}', "\\u{001b}"),
+            ('\u{202e}', "\\u{202e}"),
+            ('\u{2028}', "\\u{2028}"),
+            ('\u{2029}', "\\u{2029}"),
+        ] {
+            let line = disclose(&format!("arch{raw}ive"));
+            assert!(
+                !line.contains(raw),
+                "U+{:04X} must not reach the startup line raw; got {line:?}",
+                raw as u32
+            );
+            assert!(
+                line.starts_with(&format!(
+                    "wal_ceiling: arch{escaped}ive: configured_bytes=0"
+                )),
+                "U+{:04X} is escaped and the rest of the name is kept; got {line:?}",
+                raw as u32
+            );
+        }
+
+        // Accented and CJK names are ordinary text and print unchanged.
+        assert!(
+            disclose("archivé字").starts_with("wal_ceiling: archivé字: configured_bytes=0"),
+            "non-ASCII letters must be kept"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_disclosure_masks_credentials_in_backend_names() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        let disclose = |name: &str| {
+            let backend = BackendConfig {
+                name: name.into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+                cache_mb: None,
+                journal_mode: None,
+                wal_ceiling_bytes: None,
+                served_kinds: None,
+                read_only: false,
+            };
+            resolved_wal_ceiling_disclosure(&config, &[backend], false)
+        };
+
+        // A credential pasted into a backend name is masked like any other log text.
+        let password = "S3cr3tP4ss";
+        let line = disclose(&format!(
+            "{}://dbuser:{password}@db.example.com:5432/archive",
+            "postgresql"
+        ));
+        assert!(
+            !line.contains(password),
+            "a credential in a backend name must not reach the startup line; got {line:?}"
+        );
+    }
+
+    #[test]
+    fn named_backend_ceiling_identity_agrees_with_the_opener_resolution() {
+        // The named-backend opener resolves from the backend field and the
+        // environment snapshot only, never from `wal_ceiling_bytes`. The
+        // fingerprint must therefore also encode a disabled ceiling here.
+        let dir = tempfile::tempdir().expect("named backend ceiling tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("main.db")),
+            packs: vec!["kg".to_string()],
+            wal_ceiling_bytes: 1 << 20,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_env_raw: None,
+            ..RuntimeConfig::no_embeddings()
+        };
+        let backend = |name: &str| BackendConfig {
+            name: name.into(),
+            kind: BackendKind::Sqlite,
+            path: Some(dir.path().join(format!("{name}.db"))),
+            cache_mb: None,
+            journal_mode: None,
+            wal_ceiling_bytes: None,
+            served_kinds: None,
+            read_only: false,
+        };
+        let topology = KhiveConfig {
+            backends: vec![backend("archive"), backend("main")],
+            ..KhiveConfig::default()
+        };
+
+        for declared in &topology.backends {
+            let policy = wal_ceiling_policy_for_backend(&config, declared)
+                .expect("resolve named backend ceiling");
+            assert_eq!(
+                policy.bytes, 0,
+                "the opener enables no ceiling for backend {}",
+                declared.name
+            );
+        }
+        let config_id = crate::server::compute_config_id(&config, Some(&topology));
+        let topology_part = &config_id[config_id.find(";backends=[").expect("topology present")..];
+        assert_eq!(
+            topology_part.matches(":wal_ceiling_bytes=0").count(),
+            topology.backends.len(),
+            "the fingerprint must agree with the opener for named backends; got {topology_part}"
+        );
+        assert_eq!(
+            topology_part.matches("wal_ceiling_bytes=").count(),
+            topology.backends.len(),
+            "no named backend may encode a ceiling its opener does not enable; got {topology_part}"
+        );
+    }
+
+    #[test]
+    fn single_backend_opener_uses_effective_ceiling_when_configured_value_is_zero() {
+        // An enabled ceiling that this build cannot yet enforce refuses to
+        // open, so a refusal naming the ceiling proves the opener applied it;
+        // a silently dropped ceiling would open successfully.
+        const CEILING: u64 = 1 << 20;
+        let dir = tempfile::tempdir().expect("single backend ceiling tempdir");
+        let mut config = RuntimeConfig {
+            db_path: Some(dir.path().join("single.db")),
+            wal_ceiling_bytes: CEILING,
+            wal_ceiling_configured_bytes: 0,
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        let host_error = open_single_backend(&mut config, Some(2))
+            .err()
+            .expect("the host opener must not drop an enabled effective ceiling");
+        assert!(
+            matches!(
+                host_error.downcast_ref::<khive_db::SqliteError>(),
+                Some(khive_db::SqliteError::WalCapacityUnavailable { bytes, .. })
+                    if *bytes == CEILING
+            ),
+            "host opener refusal must name the effective ceiling; got {host_error:#}"
+        );
+
+        let runtime_dir = tempfile::tempdir().expect("runtime ceiling tempdir");
+        let runtime_error = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(runtime_dir.path().join("runtime.db")),
+            ..config.clone()
+        })
+        .err()
+        .expect("the runtime constructor must not drop an enabled effective ceiling");
+        assert!(
+            matches!(
+                &runtime_error,
+                khive_runtime::RuntimeError::Sqlite(
+                    khive_db::SqliteError::WalCapacityUnavailable { bytes, .. }
+                ) if *bytes == CEILING
+            ),
+            "runtime refusal must name the same ceiling; got {runtime_error:?}"
+        );
+
+        // A disabled ceiling still opens on the same path.
+        let mut disabled = RuntimeConfig {
+            db_path: Some(dir.path().join("disabled.db")),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            ..config
+        };
+        open_single_backend(&mut disabled, Some(2)).expect("a disabled ceiling opens");
+    }
+
+    #[test]
     fn resolved_actor_disclosure_names_attributed_actor() {
         let line = resolved_actor_disclosure(Some("lambda:worker"));
         assert_eq!(line, "actor: \"lambda:worker\" (resolved; attributed)");
@@ -5308,6 +5929,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("/data/main.db")),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             },
@@ -5319,6 +5941,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("/data/ignored-stray.db")),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             },
@@ -5350,6 +5973,7 @@ mod tests {
             path: Some(std::path::PathBuf::from("/data/main.db")),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         }];
@@ -6518,6 +7142,7 @@ id = "lambda:project-actor"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6527,6 +7152,7 @@ id = "lambda:project-actor"
                     path: Some(second_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6605,6 +7231,7 @@ id = "lambda:project-actor"
             path: Some(path.clone()),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         };
@@ -6711,6 +7338,7 @@ id = "lambda:project-actor"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6720,6 +7348,7 @@ id = "lambda:project-actor"
                     path: Some(secondary_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6770,6 +7399,7 @@ id = "lambda:project-actor"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6779,6 +7409,7 @@ id = "lambda:project-actor"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6910,6 +7541,7 @@ id = "lambda:project-actor"
                     path: Some(db_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 })
@@ -6984,6 +7616,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7126,6 +7759,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7242,6 +7876,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7325,6 +7960,7 @@ id = "lambda:project-actor"
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7359,6 +7995,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7460,6 +8097,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7739,6 +8377,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7783,6 +8422,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7994,6 +8634,7 @@ region = "us-east-1"
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: true,
             }],
@@ -8060,6 +8701,7 @@ region = "us-east-1"
                 path: Some(main_path),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: true,
             }],
@@ -8116,6 +8758,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8125,6 +8768,7 @@ region = "us-east-1"
                     path: Some(archive_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -8181,6 +8825,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -8190,6 +8835,7 @@ region = "us-east-1"
                     path: Some(blob_db),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8248,6 +8894,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8257,6 +8904,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8333,6 +8981,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8342,6 +8991,7 @@ region = "us-east-1"
                     path: Some(real_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8351,6 +9001,7 @@ region = "us-east-1"
                     path: Some(alias_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8435,6 +9086,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8444,6 +9096,7 @@ region = "us-east-1"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8495,6 +9148,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8504,6 +9158,7 @@ region = "us-east-1"
                     path: Some(secondary_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8544,6 +9199,7 @@ region = "us-east-1"
             path: None,
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         });
@@ -9043,6 +9699,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9052,6 +9709,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9127,6 +9785,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9136,6 +9795,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9228,6 +9888,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9270,6 +9931,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9331,6 +9993,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9416,6 +10079,7 @@ region = "us-east-1"
             path: Some(db_path.clone()),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: true,
         };
@@ -9463,6 +10127,7 @@ region = "us-east-1"
             path: Some(db_path),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         };
@@ -9492,6 +10157,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -9501,6 +10167,7 @@ region = "us-east-1"
                     path: Some(comm_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -9608,6 +10275,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: main_read_only,
                 },
@@ -9617,6 +10285,7 @@ region = "us-east-1"
                     path: Some(comm_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: comm_read_only,
                 },
@@ -9728,6 +10397,7 @@ region = "us-east-1"
                     journal_mode: None,
                     served_kinds: None,
                     read_only: false,
+                    wal_ceiling_bytes: None,
                 },
                 BackendConfig {
                     name: "blob-store".to_string(),
@@ -9737,6 +10407,7 @@ region = "us-east-1"
                     journal_mode: None,
                     served_kinds: None,
                     read_only: blob_read_only,
+                    wal_ceiling_bytes: None,
                 },
             ],
             packs: HashMap::from([(
@@ -9819,6 +10490,7 @@ region = "us-east-1"
                     path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9828,6 +10500,7 @@ region = "us-east-1"
                     path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9847,6 +10520,233 @@ region = "us-east-1"
         }
     }
 
+    #[test]
+    fn wal_disclosure_memory_main_does_not_disable_file_secondary() {
+        let config = RuntimeConfig {
+            db_path: None,
+            wal_ceiling_configured_bytes: 8192,
+            wal_ceiling_bytes: 8192,
+            wal_ceiling_source: khive_runtime::WalCeilingSource::Environment,
+            wal_ceiling_env_raw: Some("8192".into()),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let mut topology =
+            duplicate_sqlite_path_config(std::path::Path::new("unused-secondary.db"));
+        topology.backends[0].kind = BackendKind::Memory;
+        topology.backends[0].path = None;
+        let line = resolved_wal_ceiling_disclosure(&config, &topology.backends, false);
+        assert!(line.contains("alias: configured_bytes=8192 effective_bytes=8192 source=environment enabled=true status=enforced"), "SECONDARY_FILE_POLICY_DISCLOSURE: {line}");
+        assert!(line.contains("main: configured_bytes=0 effective_bytes=0 source=default enabled=false status=disabled"));
+        let forced = resolved_wal_ceiling_disclosure(&config, &topology.backends, true);
+        assert_eq!(
+            forced
+                .matches("effective_bytes=0 source=default enabled=false")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_aliases_reject_unequal_effective_limits_before_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("not-created.db");
+        let mut topology = duplicate_sqlite_path_config(&path);
+        topology.backends[0].wal_ceiling_bytes = Some(8192);
+        topology.backends[1].wal_ceiling_bytes = Some(16384);
+        let runtime = RuntimeConfig::default();
+
+        let error = validate_wal_ceiling_topology(&runtime, &topology.backends, false)
+            .expect_err("one physical writer cannot have two limits");
+        assert!(matches!(
+            error.downcast_ref::<khive_runtime::ConfigError>(),
+            Some(khive_runtime::ConfigError::WalCeilingAliasConflict { .. })
+        ));
+        assert!(!path.exists(), "static validation must not open a database");
+
+        topology.backends[0].read_only = true;
+        topology.backends[1].read_only = true;
+        validate_wal_ceiling_topology(&runtime, &topology.backends, false)
+            .expect("read-only aliases both enforce zero");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_missing_paths_share_identity_through_symlink_parent() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("wal-alias-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let database = real.join("not-created/deeper/database.db");
+        let relative = link
+            .strip_prefix(&cwd)
+            .unwrap()
+            .join("not-created/deeper/database.db");
+        for alias in [link.join("not-created/deeper/database.db"), relative] {
+            let mut topology = duplicate_sqlite_path_config(&database);
+            topology.backends[1].path = Some(alias);
+            topology.backends[0].wal_ceiling_bytes = Some(8192);
+            topology.backends[1].wal_ceiling_bytes = Some(16384);
+            let error = validate_wal_ceiling_topology(
+                &RuntimeConfig::no_embeddings(),
+                &topology.backends,
+                false,
+            )
+            .expect_err("MISSING_ALIAS_POLICY_CONFLICT");
+            assert!(matches!(
+                error.downcast_ref::<khive_runtime::ConfigError>(),
+                Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                    first_bytes: 8192,
+                    second_bytes: 16384,
+                    ..
+                })
+            ));
+            assert!(
+                !database.parent().unwrap().exists(),
+                "validation must not create missing path components"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_hard_link_aliases_reject_conflicting_policy_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        std::fs::write(&main, b"").unwrap();
+        std::fs::hard_link(&main, &alias).unwrap();
+        let mut topology = duplicate_sqlite_path_config(&main);
+        topology.backends[1].path = Some(alias);
+        topology.backends[0].wal_ceiling_bytes = Some(8192);
+        topology.backends[1].wal_ceiling_bytes = Some(16384);
+
+        let error =
+            validate_wal_ceiling_topology(&RuntimeConfig::default(), &topology.backends, false)
+                .expect_err("hard-linked aliases must enforce the same writer ceiling");
+        assert!(matches!(
+            error.downcast_ref::<khive_runtime::ConfigError>(),
+            Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                first_bytes: 8192,
+                second_bytes: 16384,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::metadata(&main).unwrap().len(), 0);
+
+        for backend in &mut topology.backends {
+            backend.read_only = true;
+        }
+        validate_wal_ceiling_topology(&RuntimeConfig::default(), &topology.backends, false)
+            .expect("read-only hard-linked aliases enforce zero despite configured values");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_cached_hard_link_alias_rejects_conflicting_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        drop(rusqlite::Connection::open(&main).unwrap());
+        std::fs::hard_link(&main, &alias).unwrap();
+        let mut topology = duplicate_sqlite_path_config(&main);
+        topology.backends[1].path = Some(alias);
+        topology.backends[0].wal_ceiling_bytes = Some(0);
+        topology.backends[1].wal_ceiling_bytes = Some(8192);
+        let mut opened = Vec::new();
+
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &topology.backends,
+            None,
+            |cfg, max_readers, policy| {
+                opened.push(cfg.name.clone());
+                assert_eq!(policy.bytes, 0, "only the disabled main should be opened");
+                assert_eq!(policy.source, khive_db::WalCeilingSource::BackendField);
+                open_backend_with_wal_ceiling(cfg, max_readers, policy)
+            },
+        )
+        .err()
+        .expect("cached physical aliases must not silently inherit another writer policy");
+        assert_eq!(opened, ["main"]);
+        assert!(matches!(
+            error.downcast_ref::<khive_runtime::ConfigError>(),
+            Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                first_backend,
+                second_backend,
+                first_bytes: 0,
+                second_bytes: 8192,
+                ..
+            }) if first_backend == "main" && second_backend == "alias"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_opener_forwards_each_backend_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let secondary = dir.path().join("secondary.db");
+        for path in [&main, &secondary] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let mut topology = duplicate_sqlite_path_config(&main);
+        topology.backends[0].wal_ceiling_bytes = Some(8192);
+        topology.backends[1].path = Some(alias);
+        topology.backends[1].wal_ceiling_bytes = Some(16384);
+        topology.backends.push(BackendConfig {
+            name: "secondary".to_string(),
+            path: Some(secondary),
+            wal_ceiling_bytes: None,
+            ..topology.backends[0].clone()
+        });
+        for backend in &mut topology.backends {
+            backend.read_only = true;
+        }
+        let runtime = RuntimeConfig {
+            wal_ceiling_env_raw: Some("32768".to_string()),
+            ..RuntimeConfig::default()
+        };
+        let mut opened = Vec::new();
+        let backends = open_effective_backends_with(
+            &runtime,
+            &topology.backends,
+            None,
+            |cfg, max_readers, policy| {
+                opened.push((cfg.name.clone(), policy));
+                open_backend_with_wal_ceiling(cfg, max_readers, policy)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            opened.len(),
+            2,
+            "the physical alias must reuse the main pool"
+        );
+        assert_eq!(opened[0].0, "main");
+        assert_eq!(opened[0].1.bytes, 8192);
+        assert_eq!(opened[0].1.source, khive_db::WalCeilingSource::BackendField);
+        assert_eq!(opened[1].0, "secondary");
+        assert_eq!(opened[1].1.bytes, 32768);
+        assert_eq!(opened[1].1.source, khive_db::WalCeilingSource::Environment);
+        assert!(Arc::ptr_eq(&backends["main"], &backends["alias"]));
+        assert!(!Arc::ptr_eq(&backends["main"], &backends["secondary"]));
+        for (name, policy) in opened {
+            let pool = backends[&name].pool_arc();
+            assert_eq!(pool.config().wal_ceiling, policy);
+            assert_eq!(policy.effective_bytes(pool.config().read_only), 0);
+        }
+    }
+
     #[tokio::test]
     async fn targeted_secondary_rejects_conflicting_physical_alias_modes_before_open() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -9859,6 +10759,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9868,6 +10769,7 @@ region = "us-east-1"
                     path: Some(aliased.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -9877,6 +10779,7 @@ region = "us-east-1"
                     path: Some(aliased.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9912,6 +10815,7 @@ region = "us-east-1"
                     path: Some(main.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9921,6 +10825,7 @@ region = "us-east-1"
                     path: Some(main),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9930,6 +10835,7 @@ region = "us-east-1"
                     path: Some(secondary),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9976,6 +10882,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -10186,23 +11093,28 @@ region = "us-east-1"
 
         let mut opened_main = false;
         let mut opened_alias = false;
-        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
-            if cfg.name == "main" {
-                let staged_replacement = dir.path().join("staged-replacement.db");
-                std::fs::hard_link(&replacement, &staged_replacement).unwrap();
-                std::fs::rename(&staged_replacement, &main).unwrap();
-                let backend = open_backend(cfg, max_readers)?;
-                opened_main = true;
-                assert_eq!(file_identity(&main), Some(replacement_identity));
-                let staged_original = dir.path().join("staged-original.db");
-                std::fs::hard_link(&alias, &staged_original).unwrap();
-                std::fs::rename(&staged_original, &main).unwrap();
-                Ok(backend)
-            } else {
-                opened_alias = true;
-                open_backend(cfg, max_readers)
-            }
-        })
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                if cfg.name == "main" {
+                    let staged_replacement = dir.path().join("staged-replacement.db");
+                    std::fs::hard_link(&replacement, &staged_replacement).unwrap();
+                    std::fs::rename(&staged_replacement, &main).unwrap();
+                    let backend = open_backend(cfg, max_readers)?;
+                    opened_main = true;
+                    assert_eq!(file_identity(&main), Some(replacement_identity));
+                    let staged_original = dir.path().join("staged-original.db");
+                    std::fs::hard_link(&alias, &staged_original).unwrap();
+                    std::fs::rename(&staged_original, &main).unwrap();
+                    Ok(backend)
+                } else {
+                    opened_alias = true;
+                    open_backend(cfg, max_readers)
+                }
+            },
+        )
         .err()
         .expect("the opened replacement must not be cached under the original inode");
         assert!(opened_main);
@@ -10239,22 +11151,27 @@ region = "us-east-1"
         }
 
         let mut opened_main = false;
-        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
-            if cfg.name == "main" {
-                let staged = dir.path().join("staged-replacement.db");
-                std::fs::hard_link(&replacement, &staged).unwrap();
-                std::fs::rename(&staged, &main).unwrap();
-                let backend = open_backend(cfg, max_readers)?;
-                assert_eq!(
-                    backend.pool().opened_file_identity_record(),
-                    Some(replacement_identity)
-                );
-                opened_main = true;
-                Ok(backend)
-            } else {
-                panic!("reject before looking up or opening the hard-link alias")
-            }
-        })
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                if cfg.name == "main" {
+                    let staged = dir.path().join("staged-replacement.db");
+                    std::fs::hard_link(&replacement, &staged).unwrap();
+                    std::fs::rename(&staged, &main).unwrap();
+                    let backend = open_backend(cfg, max_readers)?;
+                    assert_eq!(
+                        backend.pool().opened_file_identity_record(),
+                        Some(replacement_identity)
+                    );
+                    opened_main = true;
+                    Ok(backend)
+                } else {
+                    panic!("reject before looking up or opening the hard-link alias")
+                }
+            },
+        )
         .err()
         .expect("the opened replacement must not inherit the old topology snapshot");
         assert!(opened_main);
@@ -10286,21 +11203,26 @@ region = "us-east-1"
         }
 
         let mut opened_main = false;
-        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
-            if cfg.name == "main" {
-                std::fs::remove_file(&main).unwrap();
-                std::fs::hard_link(&replacement, &main).unwrap();
-                let backend = open_backend(cfg, max_readers)?;
-                assert_eq!(
-                    backend.pool().opened_file_identity_record(),
-                    Some(replacement_identity)
-                );
-                opened_main = true;
-                Ok(backend)
-            } else {
-                panic!("reject before cached alias reuse")
-            }
-        })
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                if cfg.name == "main" {
+                    std::fs::remove_file(&main).unwrap();
+                    std::fs::hard_link(&replacement, &main).unwrap();
+                    let backend = open_backend(cfg, max_readers)?;
+                    assert_eq!(
+                        backend.pool().opened_file_identity_record(),
+                        Some(replacement_identity)
+                    );
+                    opened_main = true;
+                    Ok(backend)
+                } else {
+                    panic!("reject before cached alias reuse")
+                }
+            },
+        )
         .err()
         .expect("a read-only legacy database replacement must fail before alias routing");
         assert!(opened_main);
@@ -10331,21 +11253,26 @@ region = "us-east-1"
         }
 
         let mut opened_main = false;
-        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
-            let backend = open_backend(cfg, max_readers)?;
-            if cfg.name == "main" {
-                assert_eq!(file_identity(&main), Some(original_identity));
-                assert_eq!(
-                    backend.pool().opened_file_identity_record(),
-                    Some(original_identity)
-                );
-                opened_main = true;
-                let staged = dir.path().join("staged-replacement.db");
-                std::fs::hard_link(&replacement, &staged).unwrap();
-                std::fs::rename(&staged, &main).unwrap();
-            }
-            Ok(backend)
-        })
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                let backend = open_backend(cfg, max_readers)?;
+                if cfg.name == "main" {
+                    assert_eq!(file_identity(&main), Some(original_identity));
+                    assert_eq!(
+                        backend.pool().opened_file_identity_record(),
+                        Some(original_identity)
+                    );
+                    opened_main = true;
+                    let staged = dir.path().join("staged-replacement.db");
+                    std::fs::hard_link(&replacement, &staged).unwrap();
+                    std::fs::rename(&staged, &main).unwrap();
+                }
+                Ok(backend)
+            },
+        )
         .err()
         .expect("the path replacement after SQLite open must fail before alias reuse");
         assert!(opened_main);
@@ -10376,16 +11303,21 @@ region = "us-east-1"
         }
 
         let mut opened_count = 0;
-        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
-            opened_count += 1;
-            let backend = open_backend(cfg, max_readers)?;
-            if cfg.name == "main" {
-                let staged = dir.path().join("staged-alias.db");
-                std::fs::hard_link(&replacement, &staged).unwrap();
-                std::fs::rename(&staged, &alias).unwrap();
-            }
-            Ok(backend)
-        })
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                opened_count += 1;
+                let backend = open_backend(cfg, max_readers)?;
+                if cfg.name == "main" {
+                    let staged = dir.path().join("staged-alias.db");
+                    std::fs::hard_link(&replacement, &staged).unwrap();
+                    std::fs::rename(&staged, &alias).unwrap();
+                }
+                Ok(backend)
+            },
+        )
         .err()
         .expect("changed alias must not reuse the cached original backend");
         assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
@@ -10419,15 +11351,20 @@ region = "us-east-1"
         }
 
         let mut opened_count = 0;
-        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
-            opened_count += 1;
-            let backend = open_backend(cfg, max_readers)?;
-            if cfg.name == "main" {
-                std::fs::remove_file(&alias).unwrap();
-                symlink(&replacement, &alias).unwrap();
-            }
-            Ok(backend)
-        })
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                opened_count += 1;
+                let backend = open_backend(cfg, max_readers)?;
+                if cfg.name == "main" {
+                    std::fs::remove_file(&alias).unwrap();
+                    symlink(&replacement, &alias).unwrap();
+                }
+                Ok(backend)
+            },
+        )
         .err()
         .expect("retargeted symlink must not reuse the cached original backend");
         assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
@@ -10463,15 +11400,20 @@ region = "us-east-1"
         }
 
         let mut opened_count = 0;
-        let error = open_effective_backends_with(&config.backends, None, |cfg, max_readers| {
-            opened_count += 1;
-            let backend = open_backend(cfg, max_readers)?;
-            if cfg.name == "main" {
-                std::fs::remove_file(&alias).unwrap();
-                symlink(&replacement, &alias).unwrap();
-            }
-            Ok(backend)
-        })
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                opened_count += 1;
+                let backend = open_backend(cfg, max_readers)?;
+                if cfg.name == "main" {
+                    std::fs::remove_file(&alias).unwrap();
+                    symlink(&replacement, &alias).unwrap();
+                }
+                Ok(backend)
+            },
+        )
         .err()
         .expect("retargeted configured path must fail before caching the opened backend");
         assert_eq!(opened_count, 1, "reject before opening the next backend");
@@ -10563,6 +11505,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10572,6 +11515,7 @@ region = "us-east-1"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10632,6 +11576,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10641,6 +11586,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10741,6 +11687,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10750,6 +11697,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10812,6 +11760,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10821,6 +11770,7 @@ region = "us-east-1"
                     path: Some(second_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -13518,6 +14468,7 @@ backend = "kg-backend"
                         path: Some(main_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13527,6 +14478,7 @@ backend = "kg-backend"
                         path: Some(kg_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13659,6 +14611,7 @@ backend = "kg-backend"
                         path: Some(dir.path().join("main.db")),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13668,6 +14621,7 @@ backend = "kg-backend"
                         path: Some(dir.path().join("comm.db")),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13770,6 +14724,7 @@ backend = "kg-backend"
                         path: Some(main_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13779,6 +14734,7 @@ backend = "kg-backend"
                         path: Some(comm_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -17463,6 +18419,7 @@ backend = "kg-backend"
                     path: Some(main_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -17472,6 +18429,7 @@ backend = "kg-backend"
                     path: Some(tool_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: tool_read_only,
                 },
