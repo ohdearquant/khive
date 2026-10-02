@@ -6,7 +6,7 @@
 //! `AttachmentStore`). File-backed for production; in-memory for tests.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rusqlite::OptionalExtension;
@@ -209,7 +209,26 @@ fn validate_vector_table_columns(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum StoreSchemaKind {
+    Entities,
+    Graph,
+    Notes,
+    Events,
+    Agents,
+}
+
+#[derive(Default)]
+struct StoreSchemaGate {
+    ready: AtomicBool,
+    #[cfg(test)]
+    attempts: AtomicUsize,
+}
+
 /// Concrete storage backend providing capability traits.
+///
+/// Capability schemas are initialized once per backend. An index removed by
+/// another process after initialization is recreated when this backend reopens.
 pub struct StorageBackend {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
@@ -221,6 +240,7 @@ pub struct StorageBackend {
     /// #827). Also exposed via
     /// `notes_seq_repair_run_count` for regression tests.
     notes_seq_repair_runs: AtomicUsize,
+    store_schemas: [StoreSchemaGate; 5],
 }
 
 impl StorageBackend {
@@ -297,6 +317,7 @@ impl StorageBackend {
             is_file_backed: true,
             path: Some(resolved),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
         })
     }
 
@@ -355,6 +376,7 @@ impl StorageBackend {
             is_file_backed: true,
             path: Some(resolved),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
         })
     }
 
@@ -375,6 +397,7 @@ impl StorageBackend {
             is_file_backed: false,
             path: None,
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
         })
     }
 
@@ -626,10 +649,7 @@ impl StorageBackend {
                 "entities namespace must be non-empty".to_string(),
             ));
         }
-        if !self.is_read_only() {
-            let writer = self.pool.try_writer()?;
-            entity::ensure_entities_schema(writer.conn())?;
-        }
+        self.ensure_store_schema(StoreSchemaKind::Entities, entity::ensure_entities_schema)?;
 
         Ok(Arc::new(entity::SqlEntityStore::new(
             Arc::clone(&self.pool),
@@ -668,16 +688,48 @@ impl StorageBackend {
                 "graph namespace must be non-empty".to_string(),
             ));
         }
-        if !self.is_read_only() {
-            let writer = self.pool.try_writer()?;
-            graph::ensure_graph_schema(writer.conn())?;
-        }
+        self.ensure_store_schema(StoreSchemaKind::Graph, graph::ensure_graph_schema)?;
 
         Ok(Arc::new(graph::SqlGraphStore::new_scoped(
             Arc::clone(&self.pool),
             self.is_file_backed,
             namespace.trim().to_string(),
         )))
+    }
+
+    fn ensure_store_schema(
+        &self,
+        kind: StoreSchemaKind,
+        ensure: fn(&rusqlite::Connection) -> Result<(), rusqlite::Error>,
+    ) -> Result<(), SqliteError> {
+        if self.is_read_only()
+            || self.store_schemas[kind as usize]
+                .ready
+                .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let writer = self.constructor_writer()?;
+        self.ensure_store_schema_with_writer(kind, writer.conn(), ensure)
+    }
+
+    fn ensure_store_schema_with_writer(
+        &self,
+        kind: StoreSchemaKind,
+        conn: &rusqlite::Connection,
+        ensure: fn(&rusqlite::Connection) -> Result<(), rusqlite::Error>,
+    ) -> Result<(), SqliteError> {
+        let gate = &self.store_schemas[kind as usize];
+        // Another first caller may have initialized this kind before this
+        // caller acquired the writer. Only successful batches publish readiness.
+        if gate.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        gate.attempts.fetch_add(1, Ordering::Relaxed);
+        ensure(conn)?;
+        gate.ready.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn constructor_writer(&self) -> Result<crate::pool::WriterGuard<'_>, SqliteError> {
@@ -713,9 +765,18 @@ impl StorageBackend {
                 "notes namespace must be non-empty".to_string(),
             ));
         }
-        if !self.is_read_only() {
+        if !self.is_read_only()
+            && (!self.store_schemas[StoreSchemaKind::Notes as usize]
+                .ready
+                .load(Ordering::Acquire)
+                || self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0)
+        {
             let writer = self.constructor_writer()?;
-            note::ensure_notes_schema(writer.conn())?;
+            self.ensure_store_schema_with_writer(
+                StoreSchemaKind::Notes,
+                writer.conn(),
+                note::ensure_notes_schema,
+            )?;
 
             // The anti-join repair is a full `notes` scan -- gate it to run at
             // most once per backend/pool. `try_writer()` blocks for exclusive
@@ -761,10 +822,7 @@ impl StorageBackend {
                 "events namespace must be non-empty".to_string(),
             ));
         }
-        if !self.is_read_only() {
-            let writer = self.constructor_writer()?;
-            event::ensure_events_schema(writer.conn())?;
-        }
+        self.ensure_store_schema(StoreSchemaKind::Events, event::ensure_events_schema)?;
 
         Ok(Arc::new(event::SqlEventStore::new_scoped(
             Arc::clone(&self.pool),
@@ -778,10 +836,7 @@ impl StorageBackend {
     /// other stores here, agent-process records are not namespace-scoped, so
     /// there is no `_for_namespace` variant.
     pub fn agents(&self) -> Result<Arc<dyn khive_storage::AgentStore>, SqliteError> {
-        if !self.is_read_only() {
-            let writer = self.pool.try_writer()?;
-            agents::ensure_agents_schema(writer.conn())?;
-        }
+        self.ensure_store_schema(StoreSchemaKind::Agents, agents::ensure_agents_schema)?;
 
         Ok(Arc::new(agents::SqlAgentStore::new(
             Arc::clone(&self.pool),
@@ -1245,6 +1300,10 @@ fn ann_root_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
     file.push(".ann");
     path.parent().map(|p| p.join(file))
 }
+
+#[cfg(test)]
+#[path = "backend/store_accessor_tests.rs"]
+mod store_accessor_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3128,6 +3187,7 @@ mod tests {
             is_file_backed: true,
             path: Some(path),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
         };
         (dir, backend)
     }
@@ -3219,6 +3279,7 @@ mod tests {
             is_file_backed: true,
             path: Some(path.clone()),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
         };
         let pool_b = ConnectionPool::new(cfg(path.clone())).expect("pool B should open");
         let backend_b = StorageBackend {
@@ -3226,6 +3287,7 @@ mod tests {
             is_file_backed: true,
             path: Some(path),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| StoreSchemaGate::default()),
         };
 
         let entities = backend_a
