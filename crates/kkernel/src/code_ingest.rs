@@ -27,7 +27,7 @@ use khive_runtime::{
     entity_fts_document, note_fts_document, secret_gate, GateRef, IngestAuditStore,
     InterceptedDispatchResult, KhiveRuntime, Namespace, PackRegistry, RuntimeError, VerbRegistry,
 };
-use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
+use khive_storage::{Entity, EntityStore, Note, NoteStore, SqlStatement, SqlValue, SubstrateKind};
 
 /// Upper bound on how long the real ingest path waits for the pool's writer
 /// task to exit after the last write returned. Generous relative to any
@@ -289,10 +289,7 @@ where
                 continue;
             }
             report.entities_created += 1;
-            entities
-                .upsert_entity(entity.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            persist_ingest_entity(entities.as_ref(), entity).await?;
 
             let doc = entity_fts_document(entity);
             let embed_body = doc.body.clone();
@@ -362,10 +359,7 @@ where
                 continue;
             }
             report.notes_created += 1;
-            notes
-                .upsert_note(note.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            persist_ingest_note(notes.as_ref(), note).await?;
 
             if let Ok(fts) = runtime.text_for_notes(&token) {
                 if let Err(e) = fts.upsert_document(note_fts_document(note)).await {
@@ -473,6 +467,26 @@ where
     drop(runtime);
 
     settle_writer_drain(ingest_result, writer_join, WRITER_DRAIN_TIMEOUT).await
+}
+
+// ADR-115 requires each direct write to check its final candidate, independently
+// of the earlier whole-batch preflight that protects the no-filesystem-effect path.
+async fn persist_ingest_entity(store: &dyn EntityStore, entity: &Entity) -> Result<()> {
+    secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    store
+        .upsert_entity(entity.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+async fn persist_ingest_note(store: &dyn NoteStore, note: &Note) -> Result<()> {
+    secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    store
+        .upsert_note(note.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Take the pool's writer-task JoinHandle for the drain, warning loudly when
@@ -760,7 +774,8 @@ mod tests {
 
     use async_trait::async_trait;
     use khive_runtime::{
-        EmbedderProvider, Gate, GateDecision, GateError, GateRef, GateRequest, RuntimeError,
+        EmbedderProvider, Gate, GateDecision, GateError, GateRef, GateRequest, RuntimeConfig,
+        RuntimeError,
     };
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService, MAX_TEXT_BYTES};
     use serial_test::serial;
@@ -1925,6 +1940,68 @@ mod tests {
                 && err.to_string().contains("runtime-owned"),
             "error must name the reservation rejection: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_ingest_writers_reject_reserved_properties_before_storage() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let mut batch = mapped_batch(&findings);
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(tmp.path().join("direct-writers.db")),
+            ..RuntimeConfig::no_embeddings()
+        })
+        .expect("open migrated isolated runtime");
+        let backend = runtime.backend();
+        let entities = backend.entities().expect("entity store");
+        let notes = backend.notes().expect("note store");
+
+        let mut entity = batch.entities.remove(0);
+        let entity_properties = entity
+            .properties
+            .get_or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .expect("entity properties object");
+        entity_properties.insert("khive:secret_gate".into(), serde_json::json!("forged"));
+        let entity_error = persist_ingest_entity(entities.as_ref(), &entity)
+            .await
+            .expect_err("the entity writer must reject the reserved key");
+        assert!(entity_error.to_string().contains("khive:secret_gate"));
+        assert!(entities.get_entity(entity.id).await.unwrap().is_none());
+        entity
+            .properties
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("khive:secret_gate");
+        persist_ingest_entity(entities.as_ref(), &entity)
+            .await
+            .expect("the ordinary entity candidate must persist");
+        assert!(entities.get_entity(entity.id).await.unwrap().is_some());
+
+        let mut note = batch.notes.remove(0);
+        let note_properties = note
+            .properties
+            .get_or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .expect("note properties object");
+        note_properties.insert("khive:secret_gate".into(), serde_json::json!("forged"));
+        let note_error = persist_ingest_note(notes.as_ref(), &note)
+            .await
+            .expect_err("the note writer must reject the reserved key");
+        assert!(note_error.to_string().contains("khive:secret_gate"));
+        assert!(notes.get_note(note.id).await.unwrap().is_none());
+        note.properties
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("khive:secret_gate");
+        persist_ingest_note(notes.as_ref(), &note)
+            .await
+            .expect("the ordinary note candidate must persist");
+        assert!(notes.get_note(note.id).await.unwrap().is_some());
     }
 
     #[serial]

@@ -819,11 +819,29 @@ impl KhiveRuntime {
         kind: Option<&str>,
         after_key: bool,
     ) -> RuntimeResult<khive_storage::note::Note> {
+        self.get_note_by_key_in_scope(token, key, kind, after_key, None)
+            .await
+    }
+
+    /// [`Self::get_note_by_key`] counting only the rows `mailbox` admits, so
+    /// a message the caller's mailbox hides answers as a missing key and
+    /// never enters the ambiguity count.
+    pub async fn get_note_by_key_in_scope(
+        &self,
+        token: &NamespaceToken,
+        key: &str,
+        kind: Option<&str>,
+        after_key: bool,
+        mailbox: Option<&khive_storage::note::NoteMailboxScope>,
+    ) -> RuntimeResult<khive_storage::note::Note> {
         crate::keyed_memory::validate_memory_key(key)?;
         let mut matches = self
             .notes(token)?
             .get_live_notes_by_key(token.namespace().as_str(), key, kind)
             .await?;
+        if let Some(scope) = mailbox {
+            matches.retain(|note| crate::MailboxView::scope_permits_message_note(scope, note));
+        }
         match matches.len() {
             0 => {
                 let error = KhiveError::not_found("note key", key);

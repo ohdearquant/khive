@@ -565,7 +565,7 @@ mod tests {
 
         let origin = Url::parse("https://served.example.test").unwrap();
         let canonical_origin = identity::canonicalize(origin);
-        let site = identity::site_id(&canonical_origin);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical_origin);
         assert_eq!(reply["site"], site.to_string());
 
         let expected_index = identity::document_id(
@@ -1028,8 +1028,10 @@ mod tests {
             "{error}"
         );
         let url = identity::canonicalize(Url::parse(origin).unwrap().join("a-large.bin").unwrap());
-        let large_id =
-            identity::document_id(identity::site_id(&url), &identity::path_and_query(&url));
+        let large_id = identity::document_id(
+            identity::site_id(&khive_types::Namespace::local(), &url),
+            &identity::path_and_query(&url),
+        );
         assert!(runtime
             .entities(&token)
             .unwrap()

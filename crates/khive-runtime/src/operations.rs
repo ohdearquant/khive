@@ -11,6 +11,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
+use khive_storage::entity::EntityTypeCounts;
 use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::note::Note;
 use khive_storage::types::{
@@ -52,6 +53,56 @@ fn merge_tombstone_restore_refused(id: Uuid, kept_id: impl std::fmt::Display) ->
         ("merged_into", kept_id.to_string()),
     ]))
     .into()
+}
+
+/// The entity total and optional type report consumed together by `stats`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct EntityStatsCounts {
+    pub entities: u64,
+    pub entities_by_type: Option<EntityTypeCounts>,
+}
+
+/// Count caller-visible live entities through one store. A supported breakdown
+/// supplies its own scalar total; only an unavailable report uses legacy counting.
+pub async fn entity_stats_counts(
+    store: &dyn khive_storage::EntityStore,
+    token: &NamespaceToken,
+) -> RuntimeResult<EntityStatsCounts> {
+    let namespaces: Vec<String> = token
+        .visible_namespaces()
+        .iter()
+        .map(|namespace| namespace.as_str().to_owned())
+        .collect();
+    match store.count_entities_by_type(&namespaces).await? {
+        Some(groups) => {
+            let entities = groups.iter().try_fold(0_u64, |total, (_, count)| {
+                total.checked_add(*count).ok_or_else(|| {
+                    RuntimeError::Internal(
+                        "entity type counts exceed the scalar count range".into(),
+                    )
+                })
+            })?;
+            Ok(EntityStatsCounts {
+                entities,
+                entities_by_type: Some(groups),
+            })
+        }
+        None => {
+            let entities = store
+                .count_entities(
+                    token.namespace().as_str(),
+                    EntityFilter {
+                        namespaces,
+                        ..EntityFilter::default()
+                    },
+                )
+                .await?;
+            Ok(EntityStatsCounts {
+                entities,
+                entities_by_type: None,
+            })
+        }
+    }
 }
 
 /// Inputs for a store-owned entity identity. Unlike ordinary creation, a
@@ -6812,6 +6863,14 @@ impl KhiveRuntime {
             .await?)
     }
 
+    /// Return the coupled entity total and optional type counts for `stats`.
+    pub async fn entity_stats_counts(
+        &self,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<EntityStatsCounts> {
+        entity_stats_counts(self.entities(token)?.as_ref(), token).await
+    }
+
     // ---- Edge CRUD operations ----
 
     /// Fetch a single edge by id.
@@ -8004,7 +8063,7 @@ impl KhiveRuntime {
             .iter()
             .enumerate()
             .map(|(index, entity)| {
-                let mut plan = bulk_entity_plan(entity);
+                let mut plan = bulk_entity_plan(entity)?;
                 if injected_failure_index == Some(index) {
                     // Keep the guarded row insert; replace its FTS pair with the fault.
                     plan.statements.truncate(1);
@@ -8019,9 +8078,9 @@ impl KhiveRuntime {
                         guard: None,
                     });
                 }
-                AtomicOpPlan::AddEntity(plan)
+                Ok(AtomicOpPlan::AddEntity(plan))
             })
-            .collect();
+            .collect::<RuntimeResult<Vec<_>>>()?;
 
         match run_atomic_unit(self.sql().as_ref(), plans).await {
             Ok(AtomicRunOutcome::Committed { .. }) => Ok(entities),
@@ -8098,7 +8157,7 @@ impl KhiveRuntime {
         let _ = self.entities(token)?;
         let _ = self.text(token)?;
 
-        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity));
+        let plan = AtomicOpPlan::AddEntity(bulk_entity_plan(&entity)?);
         Ok((entity, plan))
     }
 
@@ -8160,7 +8219,8 @@ pub struct NoteCreateSpec {
     pub properties: Option<serde_json::Value>,
 }
 
-fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
+fn bulk_entity_plan(entity: &Entity) -> RuntimeResult<AddEntityPlan> {
+    crate::secret_gate::reject_reserved_secret_gate_property(entity.properties.as_ref())?;
     let mut statements = vec![PlanStatement {
         statement: entity_upsert_statement(entity),
         guard: Some(AffectedRowGuard::exactly(1)),
@@ -8174,11 +8234,11 @@ fn bulk_entity_plan(entity: &Entity) -> AddEntityPlan {
                 guard: None,
             }),
     );
-    AddEntityPlan {
+    Ok(AddEntityPlan {
         entity_id: entity.id,
         statements,
         post_commit: PostCommitEffect::None,
-    }
+    })
 }
 
 fn guarded_link_batch_failure(
@@ -20993,6 +21053,26 @@ mod tests {
                 None,
                 Some(reserved_key_props()),
                 vec![],
+            )
+            .await
+            .expect_err("caller-supplied reserved key must be rejected");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_create_note_rejects_reserved_secret_gate_key() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let err = rt
+            .try_create_note(
+                &tok,
+                "observation",
+                None,
+                "reserved-key conditional note",
+                Some(reserved_key_props()),
             )
             .await
             .expect_err("caller-supplied reserved key must be rejected");

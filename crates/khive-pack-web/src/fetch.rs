@@ -770,7 +770,7 @@ pub(crate) async fn canonical_site(
     token: &NamespaceToken,
     canonical: &Url,
 ) -> Result<Uuid, RuntimeError> {
-    let id = identity::site_id(canonical);
+    let id = identity::site_id(token.namespace(), canonical);
     let (entity, _created) = crate::entities::get_or_create(
         runtime,
         token,
@@ -1784,7 +1784,10 @@ mod tests {
         .expect("settle");
         let new_id = uuid::Uuid::parse_str(reply["id"].as_str().unwrap()).unwrap();
         let old_id = identity::document_id(
-            identity::site_id(&identity::canonicalize(old.clone())),
+            identity::site_id(
+                &khive_types::Namespace::local(),
+                &identity::canonicalize(old.clone()),
+            ),
             &identity::path_and_query(&identity::canonicalize(old)),
         );
         let neighbors = runtime
@@ -1822,7 +1825,10 @@ mod tests {
         .expect("settle");
         let temp_new_id = uuid::Uuid::parse_str(reply2["id"].as_str().unwrap()).unwrap();
         let temp_old_id = identity::document_id(
-            identity::site_id(&identity::canonicalize(temp_old.clone())),
+            identity::site_id(
+                &khive_types::Namespace::local(),
+                &identity::canonicalize(temp_old.clone()),
+            ),
             &identity::path_and_query(&identity::canonicalize(temp_old)),
         );
         let neighbors2 = runtime
@@ -2502,7 +2508,7 @@ mod tests {
         assert_eq!(after, before, "a failed put left no receipt behind");
 
         let canonical = identity::canonicalize(outcome.final_url.clone());
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical);
         let id = identity::document_id(site, &identity::path_and_query(&canonical));
         assert!(
             runtime
