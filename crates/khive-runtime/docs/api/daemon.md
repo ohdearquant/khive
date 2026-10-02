@@ -97,12 +97,12 @@ changing request dispatch or the canonical verb result.
 
 ## Demand lifetime and voluntary retirement
 
-\`kkernel mcp --daemon\` defaults to persistent mode. Thin clients and recovery
-spawns pass \`--lifetime demand\`; a supervisor launch continues to use persistent
+`kkernel mcp --daemon` defaults to persistent mode. Thin clients and recovery
+spawns pass `--lifetime demand`; a supervisor launch continues to use persistent
 mode. Mode belongs to that process incarnation and is never inferred from a
 marker, parent process, or environment variable.
 
-Demand mode uses a positive \`--idle-timeout-secs\` interval, defaulting to 1800
+Demand mode uses a positive `--idle-timeout-secs` interval, defaulting to 1800
 seconds. That default is ADR-049 Amendment 11's initial placeholder; this change
 makes no measured tuning claim. The clock starts when the daemon is ready and
 restarts after an admitted ordinary request finishes its response and cleanup.
@@ -140,11 +140,11 @@ uses the existing signal shutdown path, including its bounded drain and repeat-s
 behavior. Initial frames and response writes each have a 30-second transport bound;
 the response bound does not interrupt dispatch or admitted writes.
 
-\`metrics_only\` diagnostics carry an optional \`metrics.lifecycle\` object. Its
-fields are \`lifetime\` (\`demand\` or \`persistent\`), \`instance_generation\` (a UUID
-stable for one process incarnation), \`effective_idle_interval_ms\`, \`phase\`
-(\`serving\`, \`draining\`, \`stopped\`), \`shutdown_reason\` (null, \`idle\`, or
-\`signal\`), \`skipped_components\`, \`idle_ineligible_reasons\`, \`ordinary_requests\`,
-and \`idle_blockers\`. The interval is reported in milliseconds, saturating at the
+`metrics_only` diagnostics carry an optional `metrics.lifecycle` object. Its
+fields are `lifetime` (`demand` or `persistent`), `instance_generation` (a UUID
+stable for one process incarnation), `effective_idle_interval_ms`, `phase`
+(`serving`, `draining`, `stopped`), `shutdown_reason` (null, `idle`, or
+`signal`), `skipped_components`, `idle_ineligible_reasons`, `ordinary_requests`,
+and `idle_blockers`. The interval is reported in milliseconds, saturating at the
 wire integer's maximum for an extreme configured duration. The lifecycle field
 is additive and absent from older snapshots; it does not change protocol version 8.
