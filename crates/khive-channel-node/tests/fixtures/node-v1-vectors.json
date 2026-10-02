@@ -1,6 +1,6 @@
 {
   "label": "test-only fixture",
-  "adr_sha256": "45c5336e413a48653ec920251979a647507985bacc2650d5a95d66145d412c67",
+  "adr_sha256": "5cf1c8df1163e4a676c4aa4adc474a93963d06d7164e4366bfccffb1a50df5be",
   "blocks": [
     {
       "group": "device_keys_sender",
@@ -542,6 +542,79 @@
     {
       "case": "a poll page whose first receipt fails verification",
       "required_outcome": "that message stays `pending`, the receipts after it are processed, and `receipts_after` advances past all of them"
+    },
+    {
+      "case": "a plaintext whose `sent_at` is `2026-09-23T20:00:00+01:00`",
+      "required_outcome": "`quarantined` receipt, no message note"
+    },
+    {
+      "case": "a plaintext whose `sent_at` is `2026-09-23 20:00:00Z`",
+      "required_outcome": "`quarantined` receipt, no message note"
+    },
+    {
+      "case": "a plaintext whose `sent_at` is `2026-09-23T20:00:00-00:00`",
+      "required_outcome": "`quarantined` receipt, no message note"
+    },
+    {
+      "case": "a server timestamp `2026-09-24T01:30:00+05:30`",
+      "required_outcome": "accepted and normalized to `2026-09-23T20:00:00Z`"
+    },
+    {
+      "case": "an identity-point signing key `01` followed by 31 zero bytes",
+      "required_outcome": "refused at enrolment and at pin"
+    },
+    {
+      "case": "a non-canonical signing key encoding: identity with the sign bit set, or `y = p + 1`",
+      "required_outcome": "refused at enrolment and at pin"
+    },
+    {
+      "case": "a plaintext with duplicate `x` members inside an ignored `extension` object",
+      "required_outcome": "`quarantined` receipt, no message note"
+    },
+    {
+      "case": "a poll page whose first delivery has `delivery_attempt_id` `not-a-uuid`, beside a valid delivery and receipt",
+      "required_outcome": "malformed delivery reported and skipped with no receipt; valid items and cursor remain readable"
     }
-  ]
+  ],
+  "supplemental_inputs": {
+    "sent_at_offset": {
+      "case": "a plaintext whose `sent_at` is `2026-09-23T20:00:00+01:00`",
+      "plaintext": "{\"body\":\"Did the report go out today?\",\"in_reply_to\":null,\"sent_at\":\"2026-09-23T20:00:00+01:00\",\"subject\":\"daily check\",\"thread_id\":null,\"v\":1}"
+    },
+    "sent_at_space": {
+      "case": "a plaintext whose `sent_at` is `2026-09-23 20:00:00Z`",
+      "plaintext": "{\"body\":\"Did the report go out today?\",\"in_reply_to\":null,\"sent_at\":\"2026-09-23 20:00:00Z\",\"subject\":\"daily check\",\"thread_id\":null,\"v\":1}"
+    },
+    "sent_at_unknown_offset": {
+      "case": "a plaintext whose `sent_at` is `2026-09-23T20:00:00-00:00`",
+      "plaintext": "{\"body\":\"Did the report go out today?\",\"in_reply_to\":null,\"sent_at\":\"2026-09-23T20:00:00-00:00\",\"subject\":\"daily check\",\"thread_id\":null,\"v\":1}"
+    },
+    "server_timestamp_offset": {
+      "case": "a server timestamp `2026-09-24T01:30:00+05:30`",
+      "timestamp": "2026-09-24T01:30:00+05:30",
+      "normalized": "2026-09-23T20:00:00Z"
+    },
+    "signing_key_identity": {
+      "case": "an identity-point signing key `01` followed by 31 zero bytes",
+      "signing_keys": [
+        "0100000000000000000000000000000000000000000000000000000000000000"
+      ]
+    },
+    "signing_key_noncanonical": {
+      "case": "a non-canonical signing key encoding: identity with the sign bit set, or `y = p + 1`",
+      "signing_keys": [
+        "0100000000000000000000000000000000000000000000000000000000000080",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+      ]
+    },
+    "nested_duplicate": {
+      "case": "a plaintext with duplicate `x` members inside an ignored `extension` object",
+      "plaintext": "{\"body\":\"Did the report go out today?\",\"in_reply_to\":null,\"sent_at\":\"2026-09-23T20:00:00Z\",\"subject\":\"daily check\",\"thread_id\":null,\"v\":1,\"extension\":{\"x\":1,\"x\":2}}"
+    },
+    "malformed_delivery": {
+      "case": "a poll page whose first delivery has `delivery_attempt_id` `not-a-uuid`, beside a valid delivery and receipt",
+      "delivery_attempt_id": "not-a-uuid",
+      "receipts_cursor": 41
+    }
+  }
 }

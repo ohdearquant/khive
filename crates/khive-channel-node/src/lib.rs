@@ -7,6 +7,7 @@ pub mod keys;
 pub mod plaintext;
 pub mod receipt;
 pub mod request;
+pub mod timestamp;
 pub mod wire;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -37,3 +38,12 @@ pub enum ProtocolError {
 
 #[cfg(test)]
 mod vectors;
+
+#[cfg(test)]
+mod docs_r3_tests;
+#[cfg(test)]
+mod plaintext_r3_tests;
+#[cfg(test)]
+mod timestamp_r3_tests;
+#[cfg(test)]
+mod wire_r3_tests;

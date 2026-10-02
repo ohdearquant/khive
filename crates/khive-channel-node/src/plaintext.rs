@@ -15,19 +15,44 @@ pub enum PlaintextKind {
     Report,
     Ask,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Plaintext {
     pub v: ProtocolVersion,
-    #[serde(deserialize_with = "required_option")]
     pub subject: Option<String>,
     pub body: String,
     pub sent_at: UtcTimestamp,
-    #[serde(deserialize_with = "required_option")]
     pub thread_id: Option<CanonicalUuid>,
-    #[serde(deserialize_with = "required_option")]
     pub in_reply_to: Option<CanonicalUuid>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<PlaintextKind>,
+}
+
+#[derive(Deserialize)]
+struct ParsedPlaintext {
+    v: ProtocolVersion,
+    #[serde(deserialize_with = "required_option")]
+    subject: Option<String>,
+    body: String,
+    sent_at: UtcTimestamp,
+    #[serde(deserialize_with = "required_option")]
+    thread_id: Option<CanonicalUuid>,
+    #[serde(deserialize_with = "required_option")]
+    in_reply_to: Option<CanonicalUuid>,
+    #[serde(default)]
+    kind: Option<PlaintextKind>,
+}
+impl ParsedPlaintext {
+    fn into_plaintext(self) -> Plaintext {
+        Plaintext {
+            v: self.v,
+            subject: self.subject,
+            body: self.body,
+            sent_at: self.sent_at,
+            thread_id: self.thread_id,
+            in_reply_to: self.in_reply_to,
+            kind: self.kind,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvalidPlaintextReason {
@@ -160,8 +185,8 @@ pub fn classify_plaintext(bytes: &[u8]) -> PlaintextClassification {
             return PlaintextClassification::Invalid(Reason::InvalidKind);
         }
     }
-    match serde_json::from_value(raw.value) {
-        Ok(value) => PlaintextClassification::Valid(value),
+    match serde_json::from_value::<ParsedPlaintext>(raw.value) {
+        Ok(value) => PlaintextClassification::Valid(value.into_plaintext()),
         Err(_) => PlaintextClassification::Invalid(Reason::NotObject),
     }
 }

@@ -331,6 +331,11 @@ This appendix fixes the bytes that the node adapter (item 5 of the amendment, `k
 and the hosted service's node ingress exchange. It exists so that both can be built against one
 contract at the same time, and so that neither side's first implementation becomes the definition.
 
+**Amended 2026-10-02 (v2 text).** A.2 gains a timestamp profile; A.3 states which signing keys and
+which signatures are acceptable; A.5 says that a duplicated member is invalid at any depth; A.6.3
+says what a client does with a poll item it cannot parse. The text of A.4, A.6.1 and A.8 is not
+changed, but A.3's key and signature rule applies wherever they pin or verify a signing key.
+
 ### A.1 Scope and versioning
 
 In scope: device request authentication, contact key lookup, envelope submission, delivery polling,
@@ -365,6 +370,13 @@ with `unsupported_version`.
   A.4 step 2 and answers `401`; only the body-size check of step 1 comes before it.
 - **Integers** in JSON: numbers from 0 to 2^53 - 1. In binary inputs: `u32` and `u64`, big-endian.
   Key epochs and contact generations are further bounded by A.10.
+- **Timestamps** in JSON are RFC 3339 date-times in one profile: `YYYY-MM-DDThh:mm:ss`, an optional
+  fraction of 1 to 9 digits, then `Z` or a numeric offset `+hh:mm` / `-hh:mm`. `T` and `Z` are
+  uppercase. A space separator, lowercase `t` or `z`, the offset `-00:00`, a seconds value of 60 and a
+  fraction longer than 9 digits are refused, never normalized. A timestamp the service writes
+  (`admitted_at`, `recorded_at`, `server_time`) may carry any offset, and a reader normalises it to UTC.
+  `sent_at` (A.5) is UTC: a reader accepts `Z` or `+00:00` and refuses any other offset, and a writer
+  writes `Z`.
 - **Request bodies** are JSON objects with exactly the members A.6 names for them. An unknown, a
   duplicated or a missing member is `invalid_request`.
 - `lp(x)` is a `u16` big-endian length followed by the bytes of `x`.
@@ -403,7 +415,13 @@ The **enrolment bundle** the client hands to the owner's enrolment operation is:
 over `ctx("enrol") || lp(realm) || kem_public_key || signing_public_key`. The service refuses a
 bundle whose keys are not 32 bytes, whose KEM key is one of the X25519 small-order points (checked as
 RFC 7748 section 6.1 describes: a shared secret of all zeros is rejected), whose signing key is not a
-valid Ed25519 point, or whose proof does not verify. It also refuses a bundle whose KEM key or
+canonical encoding of an Ed25519 point (RFC 8032 section 5.1.3: `y` below p, and no negative zero)
+or is a point of small order, or whose proof does not verify. Every party that pins or verifies with
+a signing key applies the same rule, so a degenerate key is refused where it is pinned and not only
+where it is enrolled. A verifier refuses a signature whose `S` is not below the group order L or whose
+`R` is not a canonical point encoding, and accepts it only when `[S]B = R + [k]A` holds without
+multiplying by the cofactor (the cofactorless check of RFC 8032 section 5.1.7), so two verifiers built
+from this text agree on every signature. The service also refuses a bundle whose KEM key or
 signing key is already enrolled for any device in the realm, so no two devices share a fingerprint.
 A device enrolled with a KEM key and no signing key cannot authenticate under A.4; its owner enrols
 it again with a new pair of keys, because its old KEM key is already enrolled in the realm and would
@@ -500,10 +518,11 @@ it on every send (A.6.2), and binding it into the ciphertext would force a re-en
 two agents re-accept each other.
 
 The plaintext is a UTF-8 JSON object: `v` (1), `subject` (string or null), `body` (string),
-`sent_at` (RFC 3339, UTC), `thread_id` (a UUID or null), `in_reply_to` (a logical message
+`sent_at` (RFC 3339, UTC, in the A.2 timestamp profile), `thread_id` (a UUID or null), `in_reply_to` (a logical message
 identifier or null) and, optionally, `kind` (`announce`, `report` or `ask`: the sender's declared
 purpose under runtime ADR-195 D4). A sender writes `kind` only with one of those three values and
 otherwise omits it; absent means unspecified. A recipient ignores members it does not know, except that a plaintext with a duplicated member,
+at the top level or inside any nested object including the value of a member it ignores,
 or with any of the reserved identity members `from`, `sender`, `to`, `recipient`, `tenant`,
 `namespace`, `actor`, `project`, `device` or `delegation`, is invalid and is quarantined (A.8): identity comes from the
 authenticated envelope, never from the plaintext. A `kind` with any other value, `null`,
@@ -702,6 +721,13 @@ last receipt in the page, or `receipts_after` when the page carries none. A clie
 `receipts_after` past a receipt once it has either verified it and durably recorded the outcome, or
 rejected it and reported it (A.8), so one receipt that fails verification cannot hold back the ones
 after it.
+
+A client parses each item of `deliveries` and of `receipts` on its own. An item that is not the shape
+this section gives, for example a malformed identifier or a signature of the wrong length, is
+reported and skipped. It does not make the page, the items beside it or `receipts_cursor`
+unreadable, and for a receipt it counts as rejected for the cursor rule above. A skipped delivery
+gets no receipt. A page whose own members (`receipts_cursor`, `server_time`, the two arrays) do not
+parse is refused whole.
 
 #### A.6.4 `POST /node/v1/receipts`
 
@@ -1180,6 +1206,14 @@ implementation.
 | a step 9 record that commits but whose outcome the service cannot confirm | `503 capacity_exhausted`, nothing forwarded, A.6.5 answers `unknown`; the client's resubmission of the same bytes is not charged again, and is admitted whenever a first submit of the same body would be, except that no credit is needed |
 | a re-encryption after `recipient_key_changed` and the owner's confirmation, to a replacement device whose key epoch number equals the old device's, no receipt having been recorded for the first admission; the re-encryption being one that, as a first submit, would be admitted, credit aside | admitted, not charged again |
 | a poll page whose first receipt fails verification | that message stays `pending`, the receipts after it are processed, and `receipts_after` advances past all of them |
+| a plaintext whose `sent_at` is `2026-09-23T20:00:00+01:00` | `quarantined` receipt, no message note |
+| a plaintext whose `sent_at` is `2026-09-23 20:00:00Z` | `quarantined` receipt, no message note |
+| a plaintext whose `sent_at` is `2026-09-23T20:00:00-00:00` | `quarantined` receipt, no message note |
+| a server timestamp `2026-09-24T01:30:00+05:30` | accepted and normalized to `2026-09-23T20:00:00Z` |
+| an identity-point signing key `01` followed by 31 zero bytes | refused at enrolment and at pin |
+| a non-canonical signing key encoding: identity with the sign bit set, or `y = p + 1` | refused at enrolment and at pin |
+| a plaintext with duplicate `x` members inside an ignored `extension` object | `quarantined` receipt, no message note |
+| a poll page whose first delivery has `delivery_attempt_id` `not-a-uuid`, beside a valid delivery and receipt | malformed delivery reported and skipped with no receipt; valid items and cursor remain readable |
 
 The seeds above are `SHA-256` of the ASCII labels `khive-node-v1 vector sender kem`,
 `khive-node-v1 vector recipient kem`, `khive-node-v1 vector sender sig`,

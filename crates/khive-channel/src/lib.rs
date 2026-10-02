@@ -267,11 +267,21 @@ pub struct DeliveryReceiptBinding {
 }
 
 /// The recipient's durable ingest outcome; this says nothing about read state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptDisposition {
     Stored,
     Quarantined,
+}
+
+impl<'de> Deserialize<'de> for ReceiptDisposition {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match String::deserialize(d)?.as_str() {
+            "stored" => Ok(Self::Stored),
+            "quarantined" => Ok(Self::Quarantined),
+            _ => Err(serde::de::Error::custom("invalid receipt disposition")),
+        }
+    }
 }
 
 /// A signed recipient commit receipt, containing no message content or local note id.

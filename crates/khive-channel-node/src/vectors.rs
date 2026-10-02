@@ -578,10 +578,10 @@ fn response_models_cover_each_endpoint_and_enforce_limits() {
         enc: sealed(&f).enc,
         ciphertext: sealed(&f).ciphertext,
     };
-    let now = UtcTimestamp::parse("2026-09-23T20:00:00Z").unwrap();
+    let now = ServerTimestamp::parse("2026-09-23T20:00:00Z").unwrap();
     let page = PollResponse {
-        deliveries: BoundedList::new(vec![delivery]).unwrap(),
-        receipts: BoundedList::new(vec![ReceiptItem {
+        deliveries: PollItems::new(vec![delivery]).unwrap(),
+        receipts: PollItems::new(vec![ReceiptItem {
             seq: JsonInteger::new(41).unwrap(),
             receipt: stored(&f),
             recorded_at: now.clone(),
@@ -773,17 +773,11 @@ fn w0_fixture_matches_authoritative_adr_a11_blocks() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/adr/ADR-105-cross-node-comm-transport.md");
     let adr = fs::read_to_string(path).unwrap();
+    let a11 = a11_section(&adr);
     assert_eq!(
-        hex::encode(Sha256::digest(adr.as_bytes())),
+        hex::encode(Sha256::digest(a11.as_bytes())),
         f["adr_sha256"].as_str().unwrap()
     );
-    let a11 = adr
-        .split_once("### A.11 Test vectors\n")
-        .unwrap()
-        .1
-        .split_once("### A.12 ")
-        .unwrap()
-        .0;
     let groups = [
         "device_keys_sender",
         "device_keys_recipient",
@@ -880,7 +874,7 @@ fn w0_fixture_matches_authoritative_adr_a11_blocks() {
     assert_eq!(negatives.len(), 11);
     let cases = table("**Conformance cases", "case");
     assert_eq!(f["conformance_cases"], json!(cases));
-    assert_eq!(cases.len(), 44);
+    assert_eq!(cases.len(), 52);
     for key in [
         "sender_kem_label",
         "recipient_kem_label",
@@ -893,4 +887,82 @@ fn w0_fixture_matches_authoritative_adr_a11_blocks() {
     ] {
         assert!(a11.contains(value(&f, "seed_derivation", key)));
     }
+}
+
+fn a11_section(adr: &str) -> &str {
+    adr.split_once("### A.11 Test vectors\n")
+        .expect("fixed A.11 heading")
+        .1
+        .split_once("### A.12 What this appendix does not change\n")
+        .expect("fixed A.12 heading")
+        .0
+}
+
+#[test]
+fn a11_pin_ignores_changes_outside_fixed_section() {
+    let f = fixture();
+    let adr = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/adr/ADR-105-cross-node-comm-transport.md"),
+    )
+    .unwrap();
+    let changed = format!("Unrelated documentation metadata.\n\n{adr}");
+    assert_ne!(
+        Sha256::digest(adr.as_bytes()),
+        Sha256::digest(changed.as_bytes())
+    );
+    assert_eq!(a11_section(&adr), a11_section(&changed));
+    assert_eq!(
+        hex::encode(Sha256::digest(a11_section(&changed).as_bytes())),
+        f["adr_sha256"].as_str().unwrap()
+    );
+}
+
+#[test]
+fn delivery_unknown_member_is_refused_after_valid_parse() {
+    let f = fixture();
+    let h = header(&f);
+    let mut delivery = json!({
+        "delivery_attempt_id": receipt_binding(&f).delivery_attempt_id,
+        "logical_message_id": value(&f, "envelope", "logical_message_id"),
+        "protocol_version": 1,
+        "sender_agent_id": h.sender_agent_id,
+        "sender_device_id": h.sender_device_id,
+        "sender_key_epoch": h.sender_key_epoch,
+        "recipient_agent_id": h.recipient_agent_id,
+        "recipient_device_id": h.recipient_device_id,
+        "recipient_key_epoch": h.recipient_key_epoch,
+        "contact_generation": 3,
+        "enc": sealed(&f).enc,
+        "ciphertext": sealed(&f).ciphertext,
+    });
+    let parsed: Delivery = serde_json::from_value(delivery.clone()).unwrap();
+    assert_eq!(
+        parsed.delivery_attempt_id,
+        receipt_binding(&f).delivery_attempt_id
+    );
+    delivery["unexpected_member"] = json!(true);
+    assert!(serde_json::from_value::<Delivery>(delivery).is_err());
+}
+
+#[test]
+fn contact_foreign_realm_is_refused_after_valid_key_pin() {
+    let f = fixture();
+    let h = header(&f);
+    let keys = facility(&f, "device_keys_recipient").public_keys();
+    let contact = ContactResponse {
+        agent_id: h.recipient_agent_id,
+        address: NodeAddress::new(h.realm.clone(), h.recipient_agent_id),
+        device_id: h.recipient_device_id,
+        key_epoch: h.recipient_key_epoch,
+        kem_public_key: keys.kem.clone(),
+        signing_public_key: keys.signing.clone(),
+        fingerprint: keys.fingerprint(),
+        contact_generation: Epoch::new(3).unwrap(),
+    };
+    assert_eq!(contact.validated_keys(&h.realm).unwrap(), keys);
+    assert_eq!(
+        contact.validated_keys(&Realm::parse("foreign.example").unwrap()),
+        Err(crate::ProtocolError::InvalidEncoding)
+    );
 }

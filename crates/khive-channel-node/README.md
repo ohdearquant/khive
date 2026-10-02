@@ -14,3 +14,6 @@ keys. The W0 fixture copies the protocol's A.11 byte vectors and conformance cas
 clients and hosted services. The source tests compare this copy with the authoritative ADR and
 reproduce the RFC 9180 Auth-mode suite vector. Deterministic key/ephemeral constructors exist only
 in test builds.
+
+Timestamp JSON uses uppercase `T` and `Z`, rejects spaces, lowercase `t`/`z`, `-00:00`, leap seconds and fractions longer than nine digits; `sent_at` accepts `Z` or `+00:00`, while server timestamps accept numeric offsets and normalize to UTC `Z`.
+Signing public keys must have a canonical Ed25519 encoding and must not be points of small order, both at enrolment and pinning.

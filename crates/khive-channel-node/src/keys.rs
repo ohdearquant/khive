@@ -47,9 +47,12 @@ impl<'de> Deserialize<'de> for KemPublicKey {
 pub struct SigningPublicKey(HexBytes<32>);
 impl SigningPublicKey {
     pub fn new(bytes: [u8; 32]) -> Result<Self, ProtocolError> {
-        CompressedEdwardsY(bytes)
+        let point = CompressedEdwardsY(bytes)
             .decompress()
             .ok_or(ProtocolError::InvalidKey)?;
+        if point.is_small_order() || point.compress().to_bytes() != bytes {
+            return Err(ProtocolError::InvalidKey);
+        }
         Ok(Self(HexBytes::new(bytes)))
     }
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -210,13 +213,20 @@ impl InMemoryKeyFacility {
         let recipient = <NodeKem as Kem>::PublicKey::from_bytes(recipient.as_bytes())
             .map_err(|_| ProtocolError::InvalidKey)?;
         let mode = OpModeS::Auth((self.kem.clone(), NodeKem::sk_to_pk(&self.kem)));
-        let (enc, mut context) = hpke::setup_sender::<ChaCha20Poly1305, HkdfSha256, NodeKem, _>(
+        let mut rng = FallibleRng {
+            inner: rng,
+            failed: false,
+        };
+        let setup = hpke::setup_sender::<ChaCha20Poly1305, HkdfSha256, NodeKem, _>(
             &mode,
             &recipient,
             &header.info()?,
-            rng,
-        )
-        .map_err(|_| ProtocolError::Encryption)?;
+            &mut rng,
+        );
+        if rng.failed {
+            return Err(ProtocolError::Randomness);
+        }
+        let (enc, mut context) = setup.map_err(|_| ProtocolError::Encryption)?;
         // Fresh context, exactly one seal: sequence number zero.
         let ciphertext = context
             .seal(plaintext, &aad(id)?)
@@ -272,6 +282,31 @@ impl KeyFacility for InMemoryKeyFacility {
     }
 }
 
+// HPKE requires infallible fills. A failed fill cannot release a context or
+// ciphertext; its placeholder is discarded before any seal operation.
+struct FallibleRng<'a, R> {
+    inner: &'a mut R,
+    failed: bool,
+}
+impl<R: rand_core::CryptoRng> rand_core::CryptoRng for FallibleRng<'_, R> {}
+impl<R: RngCore> RngCore for FallibleRng<'_, R> {
+    fn next_u32(&mut self) -> u32 {
+        rand_core::impls::next_u32_via_fill(self)
+    }
+    fn next_u64(&mut self) -> u64 {
+        rand_core::impls::next_u64_via_fill(self)
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let _ = self.try_fill_bytes(dest);
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.inner.try_fill_bytes(dest).inspect_err(|_| {
+            dest.fill(0);
+            self.failed = true;
+        })
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct TestEphemeral(pub(crate) [u8; 32]);
 #[cfg(test)]
@@ -293,3 +328,7 @@ impl RngCore for TestEphemeral {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "keys_r3_tests.rs"]
+mod r3_tests;
