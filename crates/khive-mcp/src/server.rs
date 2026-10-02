@@ -3671,12 +3671,18 @@ fn substitution_error_payload(name: &str, arg_val: &ArgValue, prev: &Value) -> V
 }
 
 /// ADR-103 Amendment 2: stamp the per-op envelope entry with the dispatch's
-/// frozen usage snapshot. All-or-nothing: an empty snapshot (nothing measured
-/// counted, but the context WAS armed) still stamps `{}`; the key is absent
-/// only when no context existed. Best-effort — never alters ok/error status.
+/// frozen usage snapshot when its counters remain complete. A marked context
+/// omits the key even after freeze. Best-effort — never alters ok/error status.
 fn stamp_usage(entry: &mut Value, ctx: &khive_runtime::usage::UsageContext) {
     if let Value::Object(map) = entry {
-        map.insert("usage".to_string(), ctx.frozen_or_snapshot());
+        match ctx.shipping_snapshot() {
+            Some(snapshot) => {
+                map.insert("usage".to_string(), snapshot);
+            }
+            None => {
+                map.remove("usage");
+            }
+        }
     }
 }
 
