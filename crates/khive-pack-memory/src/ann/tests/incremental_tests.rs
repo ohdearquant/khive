@@ -348,6 +348,7 @@ async fn failed_full_checkpoint_readopt_can_publish_next_incremental_delta() {
         );
         assert_eq!(fallback.base_ops, SEED_COUNT);
         assert_eq!(fallback.delta_raw_ops, 0);
+        assert_eq!(fallback.delta_chunks, 0);
         assert!(fallback.last_delta_nonce.is_none());
     }
 
@@ -359,6 +360,7 @@ async fn failed_full_checkpoint_readopt_can_publish_next_incremental_delta() {
     assert!(dir.join(delta::HEAD_FILE).exists());
     assert_recalled(&rt, &ann, &key, MODEL, id, text).await;
     let restarted = AnnBridge::load(&dir).expect("delta based on saved checkpoint must load");
+    assert_eq!(restarted.delta_chunks, 1);
     assert_eq!(restarted.base_commit_digest, Some(digest));
     assert!(restarted.id_map.contains(&id));
 }
@@ -369,9 +371,26 @@ async fn failed_installed_compaction_readopt_resets_base_for_next_delta() {
     const MODEL: &str = "ann-installed-compaction-readopt-fallback-model";
     let (rt, token, ann, key, _) = seeded(MODEL).await;
     let dir = ann_segment_dir(&rt, MODEL).expect("segment directory");
+    ann.checkpoint_policy
+        .write()
+        .expect("checkpoint policy")
+        .max_dirty_ops = 1;
+    write_note(
+        &rt,
+        &token,
+        "accepted delta before failed compaction readopt",
+    )
+    .await;
+    bump_generation(&ann, &key).await;
+    let (_, primed) = warm_with_event(&rt, &token, &ann, MODEL).await;
+    assert_eq!(primed["path"], "incremental_checkpoint");
     {
         let mut indexes = ann.indexes.write().await;
         let bridge = indexes.get_mut(&key).expect("seeded bridge");
+        assert_eq!(
+            bridge.delta_chunks, 1,
+            "accepted installed delta must count"
+        );
         bridge.delta_raw_ops = delta::compaction_limit(bridge.base_ops) - 1;
     }
     ann.fail_next_segment_load.store(true, Ordering::SeqCst);
@@ -389,6 +408,7 @@ async fn failed_installed_compaction_readopt_resets_base_for_next_delta() {
         assert_eq!(fallback.base_commit_digest, Some(digest));
         assert_eq!(fallback.commit_digest, Some(digest));
         assert_eq!(fallback.delta_raw_ops, 0);
+        assert_eq!(fallback.delta_chunks, 0);
         assert!(fallback.delta_batches.is_empty());
         assert!(fallback.last_delta_nonce.is_none());
     }
@@ -403,6 +423,7 @@ async fn failed_installed_compaction_readopt_resets_base_for_next_delta() {
     assert_eq!(event["path"], "incremental_checkpoint");
     assert!(dir.join(delta::HEAD_FILE).exists());
     let reopened = AnnBridge::load(&dir).expect("delta on compacted base must load");
+    assert_eq!(reopened.delta_chunks, 1);
     assert_eq!(reopened.base_commit_digest, Some(digest));
     assert!(reopened.id_map.contains(&id));
 }
@@ -1137,9 +1158,7 @@ fn delta_checkpoints_append_only_new_chunks_until_exact_compaction_bound() {
             base_metadata,
             "delta publication must preserve the base segment nonce"
         );
-        bridge.commit_digest = Some(publication.identity);
-        bridge.last_delta_nonce = Some(publication.last_nonce);
-        bridge.delta_batches.clear();
+        bridge.mark_delta_checkpoint(&publication);
         bridge.mark_checkpointed();
         bridge = AnnBridge::load(&active_dir).expect("adopter replays committed chain");
         assert_eq!(bridge.commit_digest, Some(publication.identity));

@@ -26,13 +26,10 @@ const MIN_COMPACTION_OPS: usize = 5_000;
 // The retired chain is removed by following its links, so this budget bounds
 // only the sweep for crash leftovers (unpublished chunks and staging files).
 const ORPHAN_SCAN_BUDGET: usize = MIN_COMPACTION_OPS * 2;
-// Longest retired chain the cleanup walk will follow. The writer publishes one
-// chunk per checkpoint, each carrying at least one raw operation, and stops
-// publishing once the cumulative raw count reaches `compaction_limit`, so a
-// chain is shorter than that limit: under 5,000 chunks at the minimum policy,
-// and under 100,000 for a base of up to one million vectors. A longer chain is
-// left to the orphan sweep rather than collected in memory.
-const MAX_RETIRED_CHAIN: usize = 100_000;
+// Publication keeps every new chain within this cleanup walk budget, separate
+// from the cumulative raw-operation policy. Legacy or malformed longer chains
+// are still walked within this bound and left to the bounded orphan sweep.
+pub(super) const MAX_RETIRED_CHAIN: usize = 100_000;
 
 #[derive(Clone)]
 pub(super) struct DeltaBatch {
@@ -52,6 +49,7 @@ pub(super) struct DeltaOverlay {
 pub(super) struct DeltaPublication {
     pub(super) identity: [u8; 32],
     pub(super) last_nonce: Uuid,
+    pub(super) chunk_count: usize,
 }
 
 struct Head {
@@ -368,10 +366,13 @@ pub(super) fn write(dir: &Path, bridge: &AnnBridge) -> Result<DeltaPublication, 
     let base_digest = bridge
         .base_commit_digest
         .ok_or_else(|| "memory delta has no base segment commit".to_string())?;
-    if bridge.delta_batches.is_empty() || bridge.delta_raw_ops >= compaction_limit(bridge.base_ops)
-    {
+    if bridge.needs_full_compaction() {
         return Err("memory delta is empty or requires full compaction".into());
     }
+    let chunk_count = bridge
+        .delta_chunks
+        .checked_add(1)
+        .ok_or_else(|| "memory delta chunk count overflow".to_string())?;
     // One chunk per publication: the last final-state operation per UUID wins,
     // raw counts add up, and the newest batch supplies the chunk watermark.
     let mut seen = HashSet::new();
@@ -419,6 +420,7 @@ pub(super) fn write(dir: &Path, bridge: &AnnBridge) -> Result<DeltaPublication, 
     let publication = DeltaPublication {
         identity: identity(&base_digest, &head),
         last_nonce: nonce,
+        chunk_count,
     };
     khive_vamana::write_auxiliary_sidecar_atomic(dir, HEAD_FILE, &head)
         .map_err(|error| format!("publish memory delta HEAD: {error}"))?;
@@ -592,9 +594,7 @@ mod tests {
 
     fn publish(dir: &Path, bridge: &mut AnnBridge) -> DeltaPublication {
         let publication = write(dir, bridge).expect("publish delta");
-        bridge.commit_digest = Some(publication.identity);
-        bridge.last_delta_nonce = Some(publication.last_nonce);
-        bridge.delta_batches.clear();
+        bridge.mark_delta_checkpoint(&publication);
         publication
     }
 
@@ -638,6 +638,7 @@ mod tests {
         }
 
         let publication = publish(dir, &mut bridge);
+        assert_eq!(bridge.delta_chunks, 1, "pending batches are not chunks");
 
         assert_eq!(
             delta_names(dir),
@@ -657,8 +658,174 @@ mod tests {
             "the last final-state operation per UUID wins"
         );
         let adopted = AnnBridge::load(dir).expect("replay coalesced chunk");
+        assert_eq!(adopted.delta_chunks, 1);
         assert_eq!(adopted.commit_digest, Some(publication.identity));
         assert!(adopted.id_map.contains(&a));
+    }
+
+    fn add_delta_op(bridge: &mut AnnBridge, seq: u64) -> Uuid {
+        let id = Uuid::new_v4();
+        let ops = vec![(id, Some(vec![0.0, 1.0, seq as f32, 0.0]))];
+        bridge
+            .apply_final_ops(ops.clone(), seq)
+            .expect("apply tail");
+        bridge.record_delta_batch(ops, seq, 1);
+        id
+    }
+
+    fn accept_checkpoint(bridge: &mut AnnBridge, written: super::super::WrittenCheckpoint) -> bool {
+        match written {
+            super::super::WrittenCheckpoint::Delta(publication) => {
+                bridge.mark_delta_checkpoint(&publication);
+                bridge.mark_checkpointed();
+                false
+            }
+            super::super::WrittenCheckpoint::Full(digest) => {
+                bridge.mark_full_checkpoint_base(digest);
+                bridge.mark_checkpointed();
+                true
+            }
+        }
+    }
+
+    #[test]
+    fn checkpoint_publication_compacts_before_chain_exceeds_cleanup_walk() {
+        const WALK_CAP: usize = 2;
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut bridge = persisted_base(dir);
+        let base_metadata = fs::read(dir.join("metadata.bin")).expect("base metadata");
+        let mut ids = Vec::new();
+        for seq in 2..=4 {
+            ids.push(add_delta_op(&mut bridge, seq));
+        }
+        assert_eq!(bridge.delta_batches.len(), 3);
+        let first = super::super::write_file_checkpoint(dir, &bridge, WALK_CAP)
+            .expect("publish coalesced chunk");
+        assert!(!accept_checkpoint(&mut bridge, first));
+        assert_eq!(bridge.delta_chunks, 1);
+        assert_eq!(bridge.delta_raw_ops, 3);
+        ids.push(add_delta_op(&mut bridge, 5));
+        let second = super::super::write_file_checkpoint(dir, &bridge, WALK_CAP)
+            .expect("publish chunk at walk boundary");
+        assert!(!accept_checkpoint(&mut bridge, second));
+        assert_eq!(bridge.delta_chunks, WALK_CAP);
+        assert_eq!(fs::read(dir.join("metadata.bin")).unwrap(), base_metadata);
+        let retired = retired_chain_within(dir, WALK_CAP);
+        assert_eq!(retired.len(), WALK_CAP);
+        assert_eq!(delta_names(dir).len(), WALK_CAP);
+
+        bridge = AnnBridge::load(dir).expect("restart at chain boundary");
+        ids.push(add_delta_op(&mut bridge, 6));
+        assert!(bridge.delta_raw_ops < compaction_limit(bridge.base_ops));
+        let third = super::super::write_file_checkpoint(dir, &bridge, WALK_CAP)
+            .expect("checkpoint after restored chain reaches walk bound");
+        let full = accept_checkpoint(&mut bridge, third);
+        let observed = retired_chain_within(dir, WALK_CAP + 1);
+        assert!(
+            observed.len() <= WALK_CAP,
+            "PUBLISHED_CHAIN_EXCEEDS_CLEANUP_WALK: {} chunks, cap {WALK_CAP}",
+            observed.len()
+        );
+        assert!(full, "chain bound must select a full checkpoint");
+        assert_ne!(fs::read(dir.join("metadata.bin")).unwrap(), base_metadata);
+        assert!(!dir.join(HEAD_FILE).exists());
+        assert!(delta_names(dir).is_empty(), "full save retires every chunk");
+        assert_eq!(bridge.delta_chunks, 0, "FULL_CHUNK_COUNT_RESET");
+        assert!(bridge.delta_batches.is_empty());
+        assert_eq!(bridge.delta_raw_ops, 0);
+        let adopted = AnnBridge::load(dir).expect("adopt full checkpoint");
+        assert_eq!(adopted.delta_chunks, 0);
+        assert_eq!(adopted.index.last_applied_seq(), Some(6));
+        for id in ids {
+            assert!(adopted.id_map.contains(&id));
+        }
+
+        let next = add_delta_op(&mut bridge, 7);
+        let first_new = super::super::write_file_checkpoint(dir, &bridge, WALK_CAP)
+            .expect("first delta over compacted base");
+        assert!(!accept_checkpoint(&mut bridge, first_new));
+        assert_eq!(bridge.delta_chunks, 1);
+        let next_adopter = AnnBridge::load(dir).expect("adopt post-compaction delta");
+        assert_eq!(next_adopter.delta_chunks, 1);
+        assert!(next_adopter.id_map.contains(&next));
+    }
+
+    #[test]
+    fn failed_head_publication_keeps_accepted_chunk_count_and_retry_chain() {
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut bridge = persisted_base(dir);
+        add_delta_op(&mut bridge, 2);
+        publish(dir, &mut bridge);
+        assert_eq!(bridge.delta_chunks, 1);
+        let head_before = fs::read(dir.join(HEAD_FILE)).expect("accepted HEAD");
+        let identity_before = bridge.commit_digest;
+        let nonce_before = bridge.last_delta_nonce;
+        let pending = add_delta_op(&mut bridge, 3);
+        let blocked_stage = dir.join(format!("{HEAD_FILE}.tmp"));
+        fs::create_dir(&blocked_stage).expect("block HEAD staging, retain old HEAD");
+
+        let refusal = write(dir, &bridge)
+            .err()
+            .expect("HEAD publication must fail");
+        assert!(refusal.contains("publish memory delta HEAD"), "{refusal}");
+        assert_eq!(bridge.delta_chunks, 1);
+        assert_eq!(bridge.commit_digest, identity_before);
+        assert_eq!(bridge.last_delta_nonce, nonce_before);
+        assert_eq!(bridge.delta_batches.len(), 1);
+        assert_eq!(fs::read(dir.join(HEAD_FILE)).unwrap(), head_before);
+        assert_eq!(delta_names(dir).len(), 2, "failed HEAD leaves one orphan");
+        let before_retry = AnnBridge::load(dir).expect("old accepted chain remains loadable");
+        assert_eq!(before_retry.delta_chunks, 1);
+        assert!(!before_retry.id_map.contains(&pending));
+
+        fs::remove_dir(&blocked_stage).expect("unblock HEAD staging");
+        publish(dir, &mut bridge);
+        assert_eq!(bridge.delta_chunks, 2, "orphan must not count as accepted");
+        assert_eq!(retired_chain_within(dir, 3).len(), 2);
+        assert_eq!(delta_names(dir).len(), 3);
+        let adopted = AnnBridge::load(dir).expect("adopt successful retry");
+        assert_eq!(adopted.delta_chunks, 2);
+        assert!(adopted.id_map.contains(&pending));
+    }
+
+    #[test]
+    fn failed_full_publication_retains_delta_count_and_pending_batch() {
+        const WALK_CAP: usize = 2;
+        let temp = tempfile::tempdir().expect("segment directory");
+        let dir = temp.path();
+        let mut bridge = persisted_base(dir);
+        for seq in 2..=3 {
+            add_delta_op(&mut bridge, seq);
+            publish(dir, &mut bridge);
+        }
+        let pending = add_delta_op(&mut bridge, 4);
+        let head_before = fs::read(dir.join(HEAD_FILE)).expect("accepted HEAD");
+        let metadata_before = fs::read(dir.join("metadata.bin")).expect("accepted base");
+        let identity_before = bridge.commit_digest;
+        let invalid_dir = dir.join("not-a-checkpoint-directory");
+        fs::write(&invalid_dir, b"regular file").expect("block checkpoint directory");
+
+        assert!(super::super::write_file_checkpoint(&invalid_dir, &bridge, WALK_CAP).is_err());
+        assert_eq!(bridge.delta_chunks, WALK_CAP);
+        assert_eq!(bridge.delta_batches.len(), 1);
+        assert_eq!(bridge.delta_raw_ops, 3);
+        assert_eq!(bridge.commit_digest, identity_before);
+        assert_eq!(fs::read(dir.join(HEAD_FILE)).unwrap(), head_before);
+        assert_eq!(fs::read(dir.join("metadata.bin")).unwrap(), metadata_before);
+        let still_published = AnnBridge::load(dir).expect("old accepted checkpoint is intact");
+        assert_eq!(still_published.delta_chunks, WALK_CAP);
+        assert!(!still_published.id_map.contains(&pending));
+
+        let retry = super::super::write_file_checkpoint(dir, &bridge, WALK_CAP)
+            .expect("full publication retries from retained chain");
+        assert!(accept_checkpoint(&mut bridge, retry));
+        assert_eq!(bridge.delta_chunks, 0);
+        let adopted = AnnBridge::load(dir).expect("adopt full retry");
+        assert_eq!(adopted.delta_chunks, 0);
+        assert!(adopted.id_map.contains(&pending));
+        assert!(delta_names(dir).is_empty());
     }
 
     #[test]

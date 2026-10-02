@@ -255,9 +255,7 @@ pub(super) async fn maintain_installed(
             }
             Ok(CheckpointResult::Delta(publication)) => {
                 if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
-                    bridge.commit_digest = Some(publication.identity);
-                    bridge.last_delta_nonce = Some(publication.last_nonce);
-                    bridge.delta_batches.clear();
+                    bridge.mark_delta_checkpoint(&publication);
                     bridge.mark_checkpointed();
                 }
             }
@@ -301,6 +299,7 @@ pub(super) async fn maintain_installed(
             // A pathless publication has no delta chain to retain or compact.
             bridge.delta_batches.clear();
             bridge.delta_raw_ops = 0;
+            bridge.delta_chunks = 0;
             bridge.base_ops = bridge.index.num_vectors();
             bridge.mark_checkpointed();
         }

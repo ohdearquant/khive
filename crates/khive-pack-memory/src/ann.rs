@@ -74,6 +74,7 @@ pub(crate) struct AnnBridge {
     base_ops: usize,
     delta_batches: Vec<delta::DeltaBatch>,
     delta_raw_ops: u64,
+    delta_chunks: usize,
     last_delta_nonce: Option<Uuid>,
     /// Indexed namespaces, used to skip unnecessary recall over-fetch retries.
     pub(crate) namespace_set: HashSet<String>,
@@ -630,6 +631,7 @@ impl AnnBridge {
             base_ops: n,
             delta_batches: Vec::new(),
             delta_raw_ops: 0,
+            delta_chunks: 0,
             last_delta_nonce: None,
             namespace_set,
             generation: 0,
@@ -704,7 +706,15 @@ impl AnnBridge {
         self.base_ops = self.index.num_vectors();
         self.delta_batches.clear();
         self.delta_raw_ops = 0;
+        self.delta_chunks = 0;
         self.last_delta_nonce = None;
+    }
+
+    fn mark_delta_checkpoint(&mut self, publication: &delta::DeltaPublication) {
+        self.commit_digest = Some(publication.identity);
+        self.last_delta_nonce = Some(publication.last_nonce);
+        self.delta_chunks = publication.chunk_count;
+        self.delta_batches.clear();
     }
 
     fn record_delta_batch(
@@ -725,8 +735,13 @@ impl AnnBridge {
     }
 
     fn needs_full_compaction(&self) -> bool {
+        self.needs_full_compaction_with_chain_limit(delta::MAX_RETIRED_CHAIN)
+    }
+
+    fn needs_full_compaction_with_chain_limit(&self, max_chunks: usize) -> bool {
         self.delta_batches.is_empty()
             || self.delta_raw_ops >= delta::compaction_limit(self.base_ops)
+            || self.delta_chunks >= max_chunks
     }
 
     fn rebuild_reverse_map(&mut self) {
@@ -928,6 +943,7 @@ impl AnnBridge {
             base_ops,
             delta_batches: Vec::new(),
             delta_raw_ops: 0,
+            delta_chunks: 0,
             last_delta_nonce: None,
             namespace_set: HashSet::new(),
             generation: 0,
@@ -948,6 +964,7 @@ impl AnnBridge {
             bridge.published_seq = overlay.applied_seq;
             bridge.commit_digest = Some(overlay.identity);
             bridge.delta_raw_ops = overlay.raw_count;
+            bridge.delta_chunks = overlay.batches.len();
             bridge.last_delta_nonce = Some(overlay.last_nonce);
         }
         Ok(bridge)
@@ -3685,9 +3702,7 @@ async fn checkpoint_raise_compact_readopt(
             install_replacing(ann, key, stamp(replacement)).await
         }
         Ok(CheckpointResult::Delta(publication)) => {
-            bridge.commit_digest = Some(publication.identity);
-            bridge.last_delta_nonce = Some(publication.last_nonce);
-            bridge.delta_batches.clear();
+            bridge.mark_delta_checkpoint(&publication);
             bridge.mark_checkpointed();
             bridge.set_namespace_set(namespace_set);
             install_replacing(ann, key, stamp(bridge)).await
@@ -3777,11 +3792,7 @@ async fn persist_file_checkpoint(
         }
     }
 
-    let persisted = if bridge.needs_full_compaction() {
-        bridge.save_atomic(dir).map(WrittenCheckpoint::Full)
-    } else {
-        delta::write(dir, bridge).map(WrittenCheckpoint::Delta)
-    };
+    let persisted = write_file_checkpoint(dir, bridge, delta::MAX_RETIRED_CHAIN);
     let written = match persisted {
         Ok(publication) => publication,
         Err(e) => {
@@ -3821,6 +3832,18 @@ async fn persist_file_checkpoint(
                 })
             }
         },
+    }
+}
+
+fn write_file_checkpoint(
+    dir: &std::path::Path,
+    bridge: &AnnBridge,
+    max_chunks: usize,
+) -> Result<WrittenCheckpoint, String> {
+    if bridge.needs_full_compaction_with_chain_limit(max_chunks) {
+        bridge.save_atomic(dir).map(WrittenCheckpoint::Full)
+    } else {
+        delta::write(dir, bridge).map(WrittenCheckpoint::Delta)
     }
 }
 
