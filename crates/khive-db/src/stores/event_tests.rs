@@ -28,6 +28,54 @@ fn make_event(namespace: &str) -> Event {
     .with_payload(json!({ "result_kind": "note" }))
 }
 
+#[tokio::test]
+async fn append_usage_mark_distinguishes_typed_writer_outcomes() {
+    use khive_storage::usage::{scope, UsageContext, UsageUnit};
+
+    for state in [
+        WriterTaskRequestState::NotStarted,
+        WriterTaskRequestState::TransactionRolledBack,
+        WriterTaskRequestState::SideEffectsUnknown,
+    ] {
+        for error in [
+            StorageError::WriterTaskTerminated {
+                request_state: state,
+            },
+            StorageError::WriterTaskRequestFailed {
+                request_state: state,
+                source: Box::new(StorageError::Pool {
+                    operation: "append_event".into(),
+                    message: "write failed".into(),
+                }),
+            },
+        ] {
+            let ctx = UsageContext::new();
+            ctx.add(UsageUnit::EventRows, 1);
+            scope(ctx.clone(), async { mark_unknown_append_usage(&error) }).await;
+            assert_eq!(
+                ctx.shipping_snapshot().is_none(),
+                state == WriterTaskRequestState::SideEffectsUnknown,
+                "{error:?}"
+            );
+            assert_eq!(ctx.snapshot()["event_rows"], 1);
+        }
+    }
+
+    let ctx = UsageContext::new();
+    scope(ctx.clone(), async {
+        mark_unknown_append_usage(&StorageError::driver(
+            StorageCapability::Events,
+            "append_event",
+            std::io::Error::other("write failed"),
+        ));
+    })
+    .await;
+    assert_eq!(ctx.shipping_snapshot(), Some(json!({})));
+    mark_unknown_append_usage(&StorageError::WriterTaskTerminated {
+        request_state: WriterTaskRequestState::SideEffectsUnknown,
+    });
+}
+
 async fn observations_for(store: &SqlEventStore, event_id: Uuid) -> Vec<EventObservation> {
     let pool = Arc::clone(&store.pool);
     tokio::task::spawn_blocking(move || {
