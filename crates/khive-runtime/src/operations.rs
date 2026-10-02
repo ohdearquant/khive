@@ -34,6 +34,14 @@ use khive_db::stores::text::insert_document_statements;
 use khive_db::{pool::RuntimeWriteOperation, SqliteError};
 use rusqlite::OptionalExtension;
 
+#[cfg(test)]
+mod batch_edge_tests;
+
+struct EdgeReadWindow {
+    outcomes: Vec<Option<RuntimeResult<Option<Edge>>>>,
+    groups: Vec<(khive_types::Namespace, Vec<usize>)>,
+}
+
 /// The restore unit committed the row and its text index; only the
 /// post-commit embedding rebuild failed. Name that, so the caller does not
 /// read an ordinary restore failure over a record that is already live.
@@ -6960,6 +6968,143 @@ impl KhiveRuntime {
             .graph(&record_tok)?
             .get_edge(LinkId::from(edge_id))
             .await?)
+    }
+
+    /// Read live edges by ID in input order, without a visibility predicate.
+    ///
+    /// Stored namespaces are validated before the corresponding edge decode.
+    /// Each namespace group uses its own graph capability; missing rows remain
+    /// `None`. Group failures belong to their first input, and the earliest
+    /// input error wins after all groups in that bounded window are observed.
+    /// Metadata statement failures are fatal batch errors. Windows are separate
+    /// read observations, not a snapshot of the whole request.
+    pub async fn get_edges_by_id(
+        &self,
+        _token: &NamespaceToken,
+        ids: &[Uuid],
+    ) -> RuntimeResult<Vec<Option<Edge>>> {
+        let mut edges = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(900) {
+            let window = self.prepare_edge_read_window(chunk).await?;
+            edges.extend(
+                Self::hydrate_edge_read_window(chunk, window, |record_token| {
+                    self.graph(record_token)
+                })
+                .await?,
+            );
+        }
+        Ok(edges)
+    }
+
+    async fn prepare_edge_read_window(&self, ids: &[Uuid]) -> RuntimeResult<EdgeReadWindow> {
+        let placeholders = (1..=ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut reader = self.sql().reader().await?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT id, namespace FROM graph_edges WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+                ),
+                params: ids.iter().map(|id| SqlValue::Text(id.to_string())).collect(),
+                label: Some("get_edge_namespace".into()),
+            })
+            .await?;
+        let mut namespaces = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let Some(SqlValue::Text(id)) = row.columns.first().map(|column| &column.value) else {
+                return Err(RuntimeError::Internal(
+                    "edge namespace lookup returned an invalid id".into(),
+                ));
+            };
+            let id = Uuid::parse_str(id).map_err(|e| {
+                RuntimeError::Internal(format!("edge namespace lookup returned an invalid id: {e}"))
+            })?;
+            let value = row
+                .columns
+                .get(1)
+                .map(|column| column.value.clone())
+                .unwrap_or(SqlValue::Null);
+            namespaces.insert(id, value);
+        }
+        let mut window = EdgeReadWindow {
+            outcomes: (0..ids.len()).map(|_| Some(Ok(None))).collect(),
+            groups: Vec::new(),
+        };
+        let mut group_indices = HashMap::new();
+        for (index, id) in ids.iter().enumerate() {
+            let Some(SqlValue::Text(record_ns)) = namespaces.get(id) else {
+                continue;
+            };
+            match khive_types::Namespace::parse(record_ns) {
+                Ok(namespace) => {
+                    let next_group = window.groups.len();
+                    let group = *group_indices.entry(record_ns.clone()).or_insert(next_group);
+                    if group == next_group {
+                        window.groups.push((namespace, Vec::new()));
+                    }
+                    window.groups[group].1.push(index);
+                    window.outcomes[index] = None;
+                }
+                Err(error) => {
+                    window.outcomes[index] = Some(Err(RuntimeError::Internal(format!(
+                        "edge namespace invalid: {error}"
+                    ))));
+                }
+            }
+        }
+        Ok(window)
+    }
+
+    async fn hydrate_edge_read_window<F>(
+        ids: &[Uuid],
+        mut window: EdgeReadWindow,
+        mut graph: F,
+    ) -> RuntimeResult<Vec<Option<Edge>>>
+    where
+        F: FnMut(&NamespaceToken) -> RuntimeResult<std::sync::Arc<dyn khive_storage::GraphStore>>,
+    {
+        for (namespace, indices) in window.groups {
+            let record_token = NamespaceToken::for_namespace(namespace);
+            let group_ids: Vec<LinkId> = indices
+                .iter()
+                .map(|&index| LinkId::from(ids[index]))
+                .collect();
+            let outcomes = match graph(&record_token) {
+                Ok(store) => store
+                    .get_edge_read_outcomes(&group_ids)
+                    .await
+                    .map_err(RuntimeError::from),
+                Err(error) => Err(error),
+            };
+            match outcomes {
+                Ok(outcomes) if outcomes.len() == indices.len() => {
+                    for (index, outcome) in indices.into_iter().zip(outcomes) {
+                        window.outcomes[index] = Some(outcome.map_err(RuntimeError::from));
+                    }
+                }
+                Ok(_) => {
+                    window.outcomes[indices[0]] = Some(Err(RuntimeError::Internal(
+                        "edge batch returned an invalid outcome count".into(),
+                    )));
+                }
+                Err(error) => {
+                    window.outcomes[indices[0]] = Some(Err(error));
+                }
+            }
+        }
+        window
+            .outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.unwrap_or_else(|| {
+                    Err(RuntimeError::Internal(
+                        "edge batch omitted an input outcome".into(),
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Fetch a single edge by id.

@@ -15,8 +15,9 @@ use khive_types::pack::pack_registry_tag;
 use super::common::{
     canonical_entity_kind, canonical_note_kind, describe_entity_type_normalization, deser,
     immutable_event_error, normalize_entity_timestamps, parse_relation, reconcile_entity_type,
-    reconcile_specific, remap_note_status, resolve_kind_spec, resolve_uuid_unfiltered, to_json,
-    validate_weight, CreateParams, KindSpec,
+    reconcile_entity_type_with_context, reconcile_specific, remap_note_status, resolve_kind_spec,
+    resolve_kind_spec_with_context, resolve_uuid_unfiltered, to_json, validate_weight,
+    BulkKindContext, CreateParams, KindSpec,
 };
 use crate::KgPack;
 
@@ -161,8 +162,9 @@ impl KgPack {
         mut fields: CreateParams,
         args: &mut Value,
         hook: Option<&Arc<dyn KindHook>>,
-        registry: &VerbRegistry,
+        kind_resolution: (&VerbRegistry, Option<&BulkKindContext>),
     ) -> Result<(CreateParams, Option<Value>), RuntimeError> {
+        let (registry, context) = kind_resolution;
         // Callers establish the shared field types and canonical kind first.
         // Owners may then normalize values before semantic validation; both
         // singleton and bulk creation pass through this same boundary.
@@ -204,11 +206,12 @@ impl KgPack {
             if name.trim().is_empty() {
                 return Err(RuntimeError::InvalidInput("name must not be empty".into()));
             }
-            let entity_type = reconcile_entity_type(
+            let entity_type = reconcile_entity_type_with_context(
                 Some(kind),
                 required_entity_type,
                 fields.entity_type.as_deref(),
                 registry,
+                context,
             )?;
             let normalized = describe_entity_type_normalization(
                 fields.entity_type.as_deref(),
@@ -229,6 +232,7 @@ impl KgPack {
         entry: super::params::BulkCreateEntry,
         token: &NamespaceToken,
         registry: &VerbRegistry,
+        context: Option<&BulkKindContext>,
     ) -> Result<(PreparedBulkEntity, Option<Value>), RuntimeError> {
         let hook = registry.find_kind_hook(&kind);
         // Bulk entries already crossed their typed deserialization boundary.
@@ -282,7 +286,7 @@ impl KgPack {
                 fields,
                 &mut args,
                 hook.as_ref(),
-                registry,
+                (registry, context),
             )
             .await?;
         if fields.kind != "entity" {
@@ -363,7 +367,14 @@ impl KgPack {
             fence: None,
         };
         let (fields, _normalized) = self
-            .prepare_create_fields(&kind, None, fields, &mut args, hook.as_ref(), registry)
+            .prepare_create_fields(
+                &kind,
+                None,
+                fields,
+                &mut args,
+                hook.as_ref(),
+                (registry, None),
+            )
             .await?;
         if fields.kind != "note" {
             return Err(RuntimeError::InvalidInput(
@@ -401,10 +412,11 @@ impl KgPack {
         raw: Value,
         token: &NamespaceToken,
         registry: &VerbRegistry,
+        context: Option<&BulkKindContext>,
     ) -> Result<PreparedBulkItem, RuntimeError> {
         let mut entry: super::params::BulkCreateEntry = serde_json::from_value(raw)
             .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
-        let item_kind_spec = resolve_kind_spec(&entry.kind, registry)
+        let item_kind_spec = resolve_kind_spec_with_context(&entry.kind, registry, context)
             .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}].kind: {e}")))?;
         match item_kind_spec {
             KindSpec::Entity {
@@ -428,16 +440,24 @@ impl KgPack {
                     "items[{idx}]: kind=entity requires a specific kind — use kind=<concept|…> or kind=entity + entity_kind=<…>"
                 )))?;
                 if entry.entity_type.is_none() {
-                    entry.entity_type = reconcile_entity_type(
+                    entry.entity_type = reconcile_entity_type_with_context(
                         Some(&canonical),
                         entity_type.as_deref(),
                         None,
                         registry,
+                        context,
                     )
                     .map_err(|e| RuntimeError::InvalidInput(format!("items[{idx}]: {e}")))?;
                 }
                 let (prepared, normalized) = self
-                    .prepare_bulk_entity(canonical, entity_type.as_deref(), entry, token, registry)
+                    .prepare_bulk_entity(
+                        canonical,
+                        entity_type.as_deref(),
+                        entry,
+                        token,
+                        registry,
+                        context,
+                    )
                     .await
                     .map_err(|error| {
                         RuntimeError::InvalidInput(format!("items[{idx}]: {error}"))
@@ -860,10 +880,14 @@ impl KgPack {
                 }
             };
 
+            let context = BulkKindContext::default();
             let mut prepared: Vec<Result<PreparedBulkItem, RuntimeError>> =
                 Vec::with_capacity(attempted);
             for (idx, raw) in raw_items.into_iter().enumerate() {
-                prepared.push(self.prepare_bulk_item(idx, raw, token, registry).await);
+                prepared.push(
+                    self.prepare_bulk_item(idx, raw, token, registry, Some(&context))
+                        .await,
+                );
             }
 
             return if atomic {
@@ -988,7 +1012,7 @@ impl KgPack {
                 fields,
                 &mut params,
                 hook.as_ref(),
-                registry,
+                (registry, None),
             )
             .await?;
         let skip_dedup = p.skip_dedup_check.unwrap_or(false);
