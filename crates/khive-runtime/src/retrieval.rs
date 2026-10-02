@@ -945,6 +945,15 @@ impl KhiveRuntime {
                 mode: text_mode,
                 filter: Some(TextFilter {
                     namespaces: visible_ns.clone(),
+                    // Push the entity-kind filter into the FTS query. Without it the
+                    // text arm returns the top `candidates` rows across EVERY entity
+                    // kind in the namespace and the kind is applied only afterwards,
+                    // so when one kind dominates the lexical ranking a search for a
+                    // rarer kind gets back fewer rows than exist, or none. The
+                    // `EntityFilter.kinds` check below stays as the backstop.
+                    record_kinds: entity_kind
+                        .map(|kind| vec![kind.to_string()])
+                        .unwrap_or_default(),
                     ..TextFilter::default()
                 }),
                 top_k: candidates,
@@ -2628,6 +2637,91 @@ mod tests {
         assert_eq!(
             hits[0].entity_id, target.id,
             "the properties-filtered entity must be returned even when ranked below limit"
+        );
+    }
+
+    /// Entity-branch kind-filter regression.
+    ///
+    /// Scenario: `limit=1`, so the text arm fetches 4 candidates, and
+    /// `entity_kind="document"`. Twelve `concept` entities repeat the query term and
+    /// outrank the one `document` entity that mentions it once in a long description.
+    ///
+    /// When the kind is applied only after the text arm has picked its candidates,
+    /// the filter sees four concepts and the document is never returned. The kind
+    /// has to reach the text query so the candidate budget is spent on documents.
+    #[tokio::test]
+    async fn hybrid_search_entity_kind_filter_pushed_into_text_arm() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        for i in 0..12 {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                &format!("quillfeather decoy {i}"),
+                Some("quillfeather quillfeather quillfeather"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+
+        let description = format!(
+            "A long administrative description that mentions quillfeather once. {}",
+            "Unrelated filing, scheduling and review words. ".repeat(20)
+        );
+        let target = rt
+            .create_entity(
+                &tok,
+                "document",
+                None,
+                "Archive filing report",
+                Some(description.as_str()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Premise: without a kind filter the target ranks behind more entities than
+        // the 4 candidates the filtered `limit=1` search requests from the text arm.
+        let unfiltered = rt
+            .hybrid_search(&tok, "quillfeather", None, 13, None, None, &[], None)
+            .await
+            .unwrap();
+        let target_rank = unfiltered
+            .iter()
+            .position(|hit| hit.entity_id == target.id)
+            .expect("the document is found without a kind filter");
+        assert!(
+            target_rank >= 4,
+            "the document must rank behind the candidate window, got rank {target_rank}"
+        );
+
+        let hits = rt
+            .hybrid_search(
+                &tok,
+                "quillfeather",
+                None,
+                1,
+                Some("document"),
+                None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "the kind-filtered search must return the matching document"
+        );
+        assert_eq!(
+            hits[0].entity_id, target.id,
+            "the returned hit must be the document, not a concept"
         );
     }
 
