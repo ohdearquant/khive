@@ -8,6 +8,9 @@
 
 mod capture;
 mod handlers;
+mod membership;
+#[cfg(test)]
+mod membership_tests;
 mod pack;
 mod receipts;
 pub mod sandbox;

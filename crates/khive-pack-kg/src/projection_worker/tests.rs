@@ -793,3 +793,424 @@ async fn applied_and_emit_projection_error_suppresses_success_event() {
         "a projection update error must suppress ProposalApplied success"
     );
 }
+
+async fn guarded_usage_setup(
+    file_backed: bool,
+) -> (KhiveRuntime, NamespaceToken, Option<std::path::PathBuf>) {
+    let directory = file_backed.then(|| {
+        let path = std::env::temp_dir().join(format!("khive-kg-guarded-usage-{}", Uuid::new_v4()));
+        std::fs::create_dir(&path).expect("isolated projection workspace");
+        path
+    });
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: directory.as_ref().map(|path| path.join("projection.db")),
+        packs: vec!["kg".into()],
+        actor_id: Some("lambda:kg-query-receipts-fixture".into()),
+        brain_profile: None,
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    })
+    .expect("isolated attributed projection runtime");
+    let tok = rt
+        .authorize(Namespace::local())
+        .expect("projection namespace");
+    let mut builder = khive_runtime::VerbRegistryBuilder::new();
+    builder.register(crate::KgPack::new(rt.clone()));
+    let registry = builder.build().expect("projection schema registry");
+    registry.apply_schema_plans(rt.backend());
+    (rt, tok, directory)
+}
+
+fn cleanup_guarded_usage(
+    rt: KhiveRuntime,
+    tok: NamespaceToken,
+    directory: Option<std::path::PathBuf>,
+) {
+    drop(tok);
+    drop(rt);
+    if let Some(path) = directory {
+        std::fs::remove_dir_all(path).expect("remove isolated projection workspace");
+    }
+}
+
+fn reviewed_usage_payload(pid: Uuid, decision: ProposalDecision) -> ProposalReviewedPayload {
+    ProposalReviewedPayload {
+        proposal_id: Id128::from_u128(pid.as_u128()),
+        reviewer: "synthetic-reviewer".into(),
+        decision,
+        comment: None,
+    }
+}
+
+fn guarded_usage_event(pid: Uuid, kind: EventKind) -> Event {
+    let mut event = Event::new(
+        "forged-namespace",
+        "synthetic-proposal",
+        kind,
+        SubstrateKind::Entity,
+        "forged-actor",
+    );
+    event.aggregate_kind = Some("proposal".into());
+    event.aggregate_id = Some(pid);
+    event.payload = serde_json::json!({"proposal_id": pid});
+    event
+}
+
+fn counted_event_rows(usage: &khive_runtime::usage::UsageContext) -> u64 {
+    usage
+        .snapshot()
+        .get("event_rows")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+async fn guarded_projection_snapshot(rt: &KhiveRuntime, pid: Uuid) -> serde_json::Value {
+    let access = rt.sql();
+    let mut reader = access.reader().await.expect("projection snapshot reader");
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT * FROM proposals_open WHERE proposal_id = ?1".into(),
+            params: vec![SqlValue::Text(pid.to_string())],
+            label: Some("test.guarded_projection_snapshot".into()),
+        })
+        .await
+        .expect("snapshot query")
+        .expect("projection exists");
+    serde_json::to_value(row).expect("serialize exact projection snapshot")
+}
+
+async fn assert_guarded_event_stamp(rt: &KhiveRuntime, tok: &NamespaceToken, event_id: Uuid) {
+    let event = rt
+        .events(tok)
+        .expect("attributed event store")
+        .get_event(event_id)
+        .await
+        .expect("event read")
+        .expect("committed event");
+    assert_eq!(event.namespace, tok.namespace().as_str());
+    assert_eq!(
+        event.actor,
+        format!("{}:{}", tok.actor().kind, tok.actor().id)
+    );
+}
+
+#[tokio::test]
+async fn guarded_review_and_withdraw_count_only_committed_events() {
+    for file_backed in [false, true] {
+        let (rt, tok, directory) = guarded_usage_setup(file_backed).await;
+        {
+            let worker = ProposalsProjectionWorker::new(rt.clone());
+            let pid = Uuid::new_v4();
+            worker
+                .on_proposal_created(&tok, pid, "synthetic-proposer", "usage", None)
+                .await
+                .expect("create projection");
+            let payload = reviewed_usage_payload(pid, ProposalDecision::Approve);
+            let event = guarded_usage_event(pid, EventKind::ProposalReviewed);
+            let event_id = event.id;
+            let usage = khive_runtime::usage::UsageContext::new();
+            let (hit, receipt) = khive_runtime::usage::scope(
+                usage.clone(),
+                worker.reviewed_and_emit(&tok, &payload, event, true),
+            )
+            .await
+            .expect("review commits");
+            assert!(hit);
+            assert_eq!(receipt, event_id);
+            assert_eq!(counted_event_rows(&usage), 1);
+            assert_guarded_event_stamp(&rt, &tok, event_id).await;
+            let row = worker
+                .get_proposal_row(&tok, pid)
+                .await
+                .expect("read projection")
+                .expect("projection");
+            assert_eq!(row.status, "approved");
+            assert_eq!(row.approve_count, 1);
+            assert_eq!(row.reject_count, 0);
+
+            let event = guarded_usage_event(pid, EventKind::ProposalWithdrawn);
+            let event_id = event.id;
+            let usage = khive_runtime::usage::UsageContext::new();
+            let (hit, receipt) = khive_runtime::usage::scope(
+                usage.clone(),
+                worker.withdrawn_and_emit(&tok, pid, event),
+            )
+            .await
+            .expect("withdraw commits");
+            assert!(hit);
+            assert_eq!(receipt, event_id);
+            assert_eq!(counted_event_rows(&usage), 1);
+            assert_guarded_event_stamp(&rt, &tok, event_id).await;
+            assert_eq!(
+                worker
+                    .get_proposal_row(&tok, pid)
+                    .await
+                    .expect("read")
+                    .expect("projection")
+                    .status,
+                "withdrawn"
+            );
+        }
+        cleanup_guarded_usage(rt, tok, directory);
+    }
+}
+
+#[tokio::test]
+async fn guarded_comment_counts_real_insert_but_not_logical_cas_hit() {
+    for file_backed in [false, true] {
+        let (rt, tok, directory) = guarded_usage_setup(file_backed).await;
+        {
+            let worker = ProposalsProjectionWorker::new(rt.clone());
+            let pid = Uuid::new_v4();
+            let payload = reviewed_usage_payload(pid, ProposalDecision::Comment);
+            let event = guarded_usage_event(pid, EventKind::ProposalReviewed);
+            let event_id = event.id;
+            let usage = khive_runtime::usage::UsageContext::new();
+            let (hit, receipt) = khive_runtime::usage::scope(
+                usage.clone(),
+                worker.reviewed_and_emit(&tok, &payload, event, false),
+            )
+            .await
+            .expect("missing comment retains logical success");
+            assert!(
+                hit,
+                "comment's public cas_hit stays true even without a row"
+            );
+            assert_eq!(receipt, event_id);
+            assert!(!event_exists(&rt, event_id).await);
+            assert_eq!(counted_event_rows(&usage), 0);
+
+            worker
+                .on_proposal_created(&tok, pid, "synthetic-proposer", "comment", None)
+                .await
+                .expect("create projection");
+            let before = guarded_projection_snapshot(&rt, pid).await;
+            let event = guarded_usage_event(pid, EventKind::ProposalReviewed);
+            let event_id = event.id;
+            let usage = khive_runtime::usage::UsageContext::new();
+            let (hit, _) = khive_runtime::usage::scope(
+                usage.clone(),
+                worker.reviewed_and_emit(&tok, &payload, event, false),
+            )
+            .await
+            .expect("existing comment commits");
+            assert!(hit);
+            assert_eq!(counted_event_rows(&usage), 1);
+            assert_guarded_event_stamp(&rt, &tok, event_id).await;
+            assert_ne!(guarded_projection_snapshot(&rt, pid).await, before);
+            assert_eq!(
+                worker
+                    .get_proposal_row(&tok, pid)
+                    .await
+                    .expect("read")
+                    .expect("projection")
+                    .status,
+                "open"
+            );
+        }
+        cleanup_guarded_usage(rt, tok, directory);
+    }
+}
+
+#[tokio::test]
+async fn guarded_terminal_cas_misses_do_not_write_or_count_events() {
+    for file_backed in [false, true] {
+        let (rt, tok, directory) = guarded_usage_setup(file_backed).await;
+        {
+            let worker = ProposalsProjectionWorker::new(rt.clone());
+            let pid = Uuid::new_v4();
+            worker
+                .on_proposal_created(&tok, pid, "synthetic-proposer", "terminal", None)
+                .await
+                .expect("create");
+            assert!(worker
+                .on_proposal_withdrawn(&tok, pid)
+                .await
+                .expect("seed terminal status"));
+            let before = guarded_projection_snapshot(&rt, pid).await;
+            let event = guarded_usage_event(pid, EventKind::ProposalWithdrawn);
+            let event_id = event.id;
+            let usage = khive_runtime::usage::UsageContext::new();
+            let (hit, _) = khive_runtime::usage::scope(
+                usage.clone(),
+                worker.withdrawn_and_emit(&tok, pid, event),
+            )
+            .await
+            .expect("withdraw CAS miss");
+            assert!(!hit);
+            assert!(!event_exists(&rt, event_id).await);
+            assert_eq!(counted_event_rows(&usage), 0);
+            let payload = reviewed_usage_payload(pid, ProposalDecision::Reject);
+            let event = guarded_usage_event(pid, EventKind::ProposalReviewed);
+            let event_id = event.id;
+            let usage = khive_runtime::usage::UsageContext::new();
+            let (hit, _) = khive_runtime::usage::scope(
+                usage.clone(),
+                worker.reviewed_and_emit(&tok, &payload, event, true),
+            )
+            .await
+            .expect("review CAS miss");
+            assert!(!hit);
+            assert!(!event_exists(&rt, event_id).await);
+            assert_eq!(counted_event_rows(&usage), 0);
+            let event = guarded_usage_event(pid, EventKind::ProposalApplied);
+            let event_id = event.id;
+            let usage = khive_runtime::usage::UsageContext::new();
+            assert!(!khive_runtime::usage::scope(
+                usage.clone(),
+                worker.applied_and_emit(&tok, pid, event)
+            )
+            .await
+            .expect("apply CAS miss"));
+            assert!(!event_exists(&rt, event_id).await);
+            assert_eq!(counted_event_rows(&usage), 0);
+            assert_eq!(guarded_projection_snapshot(&rt, pid).await, before);
+        }
+        cleanup_guarded_usage(rt, tok, directory);
+    }
+}
+
+#[tokio::test]
+async fn guarded_apply_shared_executor_counts_exactly_one_event() {
+    for file_backed in [false, true] {
+        let (rt, tok, directory) = guarded_usage_setup(file_backed).await;
+        {
+            let worker = ProposalsProjectionWorker::new(rt.clone());
+            let pid = Uuid::new_v4();
+            worker
+                .on_proposal_created(&tok, pid, "synthetic-proposer", "apply", None)
+                .await
+                .expect("create");
+            worker
+                .on_proposal_reviewed(
+                    &tok,
+                    &reviewed_usage_payload(pid, ProposalDecision::Approve),
+                )
+                .await
+                .expect("approve");
+            assert!(worker
+                .pre_apply_cas(&tok, pid)
+                .await
+                .expect("claim applying"));
+            let event = guarded_usage_event(pid, EventKind::ProposalApplied);
+            let event_id = event.id;
+            let usage = khive_runtime::usage::UsageContext::new();
+            assert!(khive_runtime::usage::scope(
+                usage.clone(),
+                worker.applied_and_emit(&tok, pid, event)
+            )
+            .await
+            .expect("apply commits"));
+            assert_eq!(
+                counted_event_rows(&usage),
+                1,
+                "apply must not retain its former second increment"
+            );
+            assert_guarded_event_stamp(&rt, &tok, event_id).await;
+            assert_eq!(
+                worker
+                    .get_proposal_row(&tok, pid)
+                    .await
+                    .expect("read")
+                    .expect("projection")
+                    .status,
+                "applied"
+            );
+        }
+        cleanup_guarded_usage(rt, tok, directory);
+    }
+}
+
+#[tokio::test]
+async fn guarded_event_insert_failure_rolls_back_projection_and_usage() {
+    for file_backed in [false, true] {
+        let (rt, tok, directory) = guarded_usage_setup(file_backed).await;
+        {
+            let worker = ProposalsProjectionWorker::new(rt.clone());
+            for kind in [
+                EventKind::ProposalReviewed,
+                EventKind::ProposalWithdrawn,
+                EventKind::ProposalApplied,
+            ] {
+                let pid = Uuid::new_v4();
+                worker
+                    .on_proposal_created(&tok, pid, "synthetic-proposer", "rollback", None)
+                    .await
+                    .expect("create");
+                if kind == EventKind::ProposalApplied {
+                    worker
+                        .on_proposal_reviewed(
+                            &tok,
+                            &reviewed_usage_payload(pid, ProposalDecision::Approve),
+                        )
+                        .await
+                        .expect("approve");
+                    assert!(worker.pre_apply_cas(&tok, pid).await.expect("claim"));
+                }
+                let event = guarded_usage_event(pid, kind);
+                let event_id = event.id;
+                rt.events(&tok)
+                    .expect("event store")
+                    .append_event(event.clone())
+                    .await
+                    .expect("seed duplicate event ID");
+                let persisted_before = rt
+                    .events(&tok)
+                    .expect("event store")
+                    .get_event(event_id)
+                    .await
+                    .expect("read event")
+                    .expect("event");
+                let before = guarded_projection_snapshot(&rt, pid).await;
+                let usage = khive_runtime::usage::UsageContext::new();
+                let result = khive_runtime::usage::scope(usage.clone(), async {
+                    match kind {
+                        EventKind::ProposalReviewed => worker
+                            .reviewed_and_emit(
+                                &tok,
+                                &reviewed_usage_payload(pid, ProposalDecision::Approve),
+                                event,
+                                true,
+                            )
+                            .await
+                            .map(|_| ()),
+                        EventKind::ProposalWithdrawn => worker
+                            .withdrawn_and_emit(&tok, pid, event)
+                            .await
+                            .map(|_| ()),
+                        EventKind::ProposalApplied => {
+                            worker.applied_and_emit(&tok, pid, event).await.map(|_| ())
+                        }
+                        _ => unreachable!(),
+                    }
+                })
+                .await;
+                assert!(
+                    result.is_err(),
+                    "real duplicate event insert must fail after the projection UPDATE"
+                );
+                assert_eq!(
+                    counted_event_rows(&usage),
+                    0,
+                    "rolled-back append is not executed event usage"
+                );
+                assert_eq!(
+                    guarded_projection_snapshot(&rt, pid).await,
+                    before,
+                    "status, timestamps and review counters roll back together"
+                );
+                let persisted_after = rt
+                    .events(&tok)
+                    .expect("event store")
+                    .get_event(event_id)
+                    .await
+                    .expect("read event")
+                    .expect("preexisting event remains");
+                assert_eq!(
+                    serde_json::to_value(persisted_after).unwrap(),
+                    serde_json::to_value(persisted_before).unwrap()
+                );
+            }
+        }
+        cleanup_guarded_usage(rt, tok, directory);
+    }
+}

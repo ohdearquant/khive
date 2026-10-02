@@ -702,6 +702,11 @@ async fn dry_run_report(
 pub(crate) fn open_read_only_snapshot(
     db_path: &Path,
 ) -> Result<(StorageBackend, tempfile::TempDir)> {
+    let mut config = khive_runtime::RuntimeConfig {
+        db_path: Some(db_path.to_path_buf()),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let wal_ceiling = config.resolve_wal_ceiling_policy(true)?;
     let snapshot_dir = tempfile::TempDir::new()
         .context("failed to create a scratch directory for the dry-run db snapshot")?;
     let file_name = db_path
@@ -748,8 +753,12 @@ pub(crate) fn open_read_only_snapshot(
         }
     }
 
-    let backend =
-        StorageBackend::sqlite_read_only(&snapshot_db).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let backend = StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
+        &snapshot_db,
+        None,
+        wal_ceiling,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok((backend, snapshot_dir))
 }
 
@@ -770,6 +779,41 @@ fn shm_sidecar_path(db_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn dry_run_snapshot_validates_captured_wal_environment() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("source.db");
+        let seed = StorageBackend::sqlite(&db).unwrap();
+        seed.prepare_core_schema().unwrap();
+        drop(seed);
+        let before = std::fs::read(&db).unwrap();
+        std::env::set_var("KHIVE_SQLITE_WAL_CEILING_BYTES", "abc");
+        let error = open_read_only_snapshot(&db)
+            .err()
+            .expect("SNAPSHOT_INVALID_ENV");
+        assert!(
+            matches!(error.downcast_ref::<khive_runtime::RuntimeError>(), Some(khive_runtime::RuntimeError::Sqlite(khive_db::SqliteError::InvalidConfig(message))) if message.contains("KHIVE_SQLITE_WAL_CEILING_BYTES"))
+        );
+        for raw in ["0", "8192"] {
+            std::env::set_var("KHIVE_SQLITE_WAL_CEILING_BYTES", raw);
+            let (snapshot, _scratch) =
+                open_read_only_snapshot(&db).expect("read-only ceiling is diagnostic");
+            assert!(snapshot.is_read_only());
+            assert_eq!(
+                snapshot.pool_arc().config().wal_ceiling.bytes,
+                raw.parse::<u64>().unwrap()
+            );
+            assert_eq!(
+                snapshot.pool_arc().config().wal_ceiling.source,
+                khive_runtime::WalCeilingSource::Environment
+            );
+        }
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+    }
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
