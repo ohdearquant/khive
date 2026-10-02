@@ -55,7 +55,9 @@ pub use checkpoint::{
     CheckpointTick,
 };
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
-pub use error::SqliteError;
+pub use error::{
+    SqliteError, SQLITE_WAL_CAPACITY_REFUSED_STAGE, SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE,
+};
 pub use fts_maintenance::{
     fts_maintenance_counters, FtsIndexStructure, FtsLevelStructure, FtsMaintenanceCounters,
     FtsSegmentDiagnostics,
@@ -74,7 +76,7 @@ pub use migrations::{
 };
 pub use pool::{
     CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,
-    WriterGuard,
+    WalCeilingPolicy, WalCeilingSource, WriterGuard,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use read_cancellation::scope_test_read_progress;

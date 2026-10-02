@@ -72,7 +72,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::checkpoint;
-use crate::pool::ConnectionPool;
+use crate::pool::{ConnectionPool, WalCeilingSource};
 
 /// Raw `PRAGMA wal_checkpoint(PASSIVE)` return row.
 ///
@@ -1457,6 +1457,39 @@ fn request_census_budget() -> Option<Duration> {
 
 /// The full database-integrity, reader/writer-contention, and WAL/checkpoint
 /// payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WalCeilingDiagnostics {
+    /// Resolved configuration value, retained even on a read-only backend.
+    pub configured_bytes: u64,
+    /// Active writer-policy limit; zero on read-only backends and when disabled.
+    pub effective_bytes: u64,
+    pub source: WalCeilingSource,
+    pub enabled: bool,
+    /// Why the configured policy is active or inactive for this backend.
+    pub status: &'static str,
+}
+
+impl WalCeilingDiagnostics {
+    fn from_pool(pool: &ConnectionPool) -> Self {
+        let policy = pool.config().wal_ceiling;
+        let read_only = pool.config().read_only;
+        let effective_bytes = policy.effective_bytes(read_only);
+        Self {
+            configured_bytes: policy.bytes,
+            effective_bytes,
+            source: policy.source,
+            enabled: effective_bytes > 0,
+            status: if effective_bytes > 0 {
+                "enforced"
+            } else if read_only && policy.bytes > 0 {
+                "read_only_not_enforced"
+            } else {
+                "disabled"
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
@@ -1471,6 +1504,8 @@ pub struct DbDiagnostics {
     /// `None` for an in-memory backend — the file-backed sections then carry
     /// their own unavailability reasons.
     pub db_path: Option<String>,
+    /// Explicit WAL ceiling policy for this already-open database.
+    pub wal_ceiling: WalCeilingDiagnostics,
     pub wal_file: Option<WalFileState>,
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
@@ -1752,6 +1787,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
             note_search_fallback_route_total: 0,
             search_mechanism,
             db_path: None,
+            wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1808,6 +1844,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         note_search_fallback_route_total: 0,
         search_mechanism,
         db_path: Some(path.display().to_string()),
+        wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -1878,6 +1915,7 @@ fn collect_inner(
             note_search_fallback_route_total: 0,
             search_mechanism,
             db_path: None,
+            wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1929,6 +1967,7 @@ fn collect_inner(
         note_search_fallback_route_total: 0,
         search_mechanism,
         db_path: Some(path.display().to_string()),
+        wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -2313,7 +2352,66 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
-    use crate::pool::{ConnectionPool, PoolConfig};
+    use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy, WalCeilingSource};
+
+    #[test]
+    fn default_wal_ceiling_is_explicitly_disabled_in_diagnostics() {
+        let pool = ConnectionPool::new(PoolConfig::for_test()).expect("in-memory pool");
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let json = serde_json::to_value(report).expect("report serializes");
+        assert_eq!(
+            json.get("wal_ceiling"),
+            Some(&serde_json::json!({
+                "configured_bytes": 0,
+                "effective_bytes": 0,
+                "source": "default",
+                "enabled": false,
+                "status": "disabled"
+            })),
+            "zero is an explicit disabled policy, not an omitted field"
+        );
+    }
+
+    #[test]
+    fn read_only_wal_ceiling_keeps_configured_value_without_enforcement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("read-only-ceiling.db");
+        rusqlite::Connection::open(&path)
+            .expect("create source database")
+            .execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .expect("persist source database");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            read_only: true,
+            write_queue_enabled: Some(false),
+            wal_ceiling: WalCeilingPolicy {
+                bytes: 8192,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        })
+        .expect("read-only backend must accept configured policy");
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let json = serde_json::to_value(report).expect("report serializes");
+        assert_eq!(
+            json["wal_ceiling"],
+            serde_json::json!({
+                "configured_bytes": 8192,
+                "effective_bytes": 0,
+                "source": "backend_field",
+                "enabled": false,
+                "status": "read_only_not_enforced"
+            })
+        );
+    }
 
     /// The budget knob is read per request, so a wrong read is a wrong bound
     /// on every call. `0` has to mean unbounded rather than "spend nothing",

@@ -3,6 +3,7 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -444,6 +445,68 @@ fn deny_retired_writer(_context: AuthContext<'_>) -> Authorization {
 
 pub(crate) const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
 
+/// Where the effective WAL ceiling byte value was configured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalCeilingSource {
+    BackendField,
+    Environment,
+    #[default]
+    Default,
+}
+
+/// Resolved WAL-extent policy for one SQLite backend. A zero-byte policy is
+/// explicitly disabled; it remains visible in diagnostics and config identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalCeilingPolicy {
+    pub bytes: u64,
+    pub source: WalCeilingSource,
+}
+
+impl WalCeilingPolicy {
+    /// Validate checks that do not need SQLite's page-size observation.
+    /// Read-only backends retain configured metadata but enforce no writer
+    /// policy. Invalid offset arithmetic is rejected in either mode.
+    pub fn validate_static(
+        self,
+        file_backed: bool,
+        wal_mode: bool,
+        read_only: bool,
+    ) -> Result<(), SqliteError> {
+        if self.bytes == 0 {
+            return Ok(());
+        }
+        if i64::try_from(self.bytes).is_err() {
+            return Err(SqliteError::WalCeilingOffsetOverflow { bytes: self.bytes });
+        }
+        if read_only {
+            return Ok(());
+        }
+        if !file_backed {
+            return Err(SqliteError::WalCeilingUnsupported {
+                bytes: self.bytes,
+                backend_kind: "in-memory backend",
+            });
+        }
+        if !wal_mode {
+            return Err(SqliteError::WalCeilingUnsupported {
+                bytes: self.bytes,
+                backend_kind: "non-WAL backend",
+            });
+        }
+        Ok(())
+    }
+
+    /// Bytes of writer policy that could be enforced on this backend.
+    pub fn effective_bytes(self, read_only: bool) -> u64 {
+        if read_only {
+            0
+        } else {
+            self.bytes
+        }
+    }
+}
+
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -475,6 +538,9 @@ pub struct PoolConfig {
     /// every connection that can execute SQL. Reader connections are already
     /// opened read-only regardless of this flag.
     pub read_only: bool,
+    /// ADR-194 WAL active-extent ceiling and its resolved configuration source.
+    /// Zero explicitly disables this independent policy.
+    pub wal_ceiling: WalCeilingPolicy,
     /// Route migrated store write paths through the single-writer
     /// `WriterTask` channel (ADR-067 Component A) instead of the legacy
     /// per-call pool-mutex/standalone-connection path. Enabled by default
@@ -575,6 +641,7 @@ impl Default for PoolConfig {
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
             read_only: false,
+            wal_ceiling: WalCeilingPolicy::default(),
             // `var_os`, not `var`: the documented contract is "any SET value
             // other than 1/true means Some(false)" — a set-but-non-Unicode
             // value must count as set (var() would return Err and silently
@@ -1680,6 +1747,11 @@ impl ConnectionPool {
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
         validate_write_admission_deadline(config.write_admission_deadline_ms)?;
+        config.wal_ceiling.validate_static(
+            config.path.is_some(),
+            config.wal_mode,
+            config.read_only,
+        )?;
 
         // Resolve "no preference" (`None`) now that `path` is known: on for
         // file-backed pools, off for in-memory ones. An explicit `Some(_)`
@@ -1731,6 +1803,7 @@ impl ConnectionPool {
             read_only_open_target.as_deref(),
             identity_path.as_deref(),
         )?;
+        validate_wal_ceiling_at_open(&writer, &config)?;
         // The identity bootstrap can take a write lock before the remaining
         // connection pragmas are configured. Honor the caller's wait bound.
         writer.busy_timeout(config.busy_timeout)?;
@@ -3240,6 +3313,35 @@ fn open_writer_connection(
         }
         None => Connection::open_in_memory().map_err(Into::into),
     }
+}
+
+/// Validate the one-frame reset floor using this backend connection's own
+/// page size. This runs before writer configuration changes journal mode or
+/// performs any schema work. The WAL I/O limiter arrives in a later slice, so
+/// a valid nonzero policy still refuses to open rather than running uncovered.
+fn validate_wal_ceiling_at_open(conn: &Connection, config: &PoolConfig) -> Result<(), SqliteError> {
+    let bytes = config.wal_ceiling.effective_bytes(config.read_only);
+    if bytes == 0 {
+        return Ok(());
+    }
+    let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let page_size = u64::try_from(page_size).map_err(|_| {
+        SqliteError::InvalidData("SQLite reported a negative page size".to_string())
+    })?;
+    let minimum_bytes = page_size.checked_add(56).ok_or_else(|| {
+        SqliteError::InvalidData("SQLite page size overflowed the WAL frame floor".to_string())
+    })?;
+    if bytes < minimum_bytes {
+        return Err(SqliteError::WalCeilingBelowMinimum {
+            bytes,
+            page_size,
+            minimum_bytes,
+        });
+    }
+    Err(SqliteError::WalCapacityUnavailable {
+        bytes,
+        capability: "WAL I/O limiter",
+    })
 }
 
 /// Select the one case that may safely use SQLite's immutable URI contract: a
@@ -6363,6 +6465,219 @@ mod tests {
         };
         let pool = ConnectionPool::new(cfg).expect("in-memory pool should open");
         assert_eq!(pool.max_readers(), 0);
+    }
+
+    #[test]
+    fn wal_ceiling_below_one_frame_reset_floor_is_typed_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-ceiling-floor.db");
+        let seed = Connection::open(&path).unwrap();
+        seed.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let page_size: i64 = seed
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let page_size = u64::try_from(page_size)
+            .map_err(|_| {
+                SqliteError::InvalidData("SQLite reported a negative page size".to_string())
+            })
+            .unwrap();
+        drop(seed);
+        let bytes = page_size + 55;
+
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            wal_ceiling: WalCeilingPolicy {
+                bytes,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("the one-frame reset floor must refuse this policy"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingBelowMinimum {
+                bytes: observed,
+                page_size: observed_page_size,
+                minimum_bytes,
+            } if observed == bytes
+                && observed_page_size == page_size
+                && minimum_bytes == page_size + 56
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_floor_reads_existing_backend_page_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-ceiling-8192.db");
+        let seed = Connection::open(&path).unwrap();
+        seed.pragma_update(None, "page_size", 8192).unwrap();
+        seed.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let page_size: i64 = seed
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let page_size = u64::try_from(page_size)
+            .map_err(|_| {
+                SqliteError::InvalidData("SQLite reported a negative page size".to_string())
+            })
+            .unwrap();
+        assert_eq!(page_size, 8192, "fixture must persist the larger page size");
+        drop(seed);
+
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_ceiling: WalCeilingPolicy {
+                bytes: 4096 + 56,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("an 8192-byte page cannot fit below its own one-frame floor"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingBelowMinimum {
+                bytes: 4152,
+                page_size: 8192,
+                minimum_bytes: 8248,
+            }
+        ));
+        let refused = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let identity_rows: i64 = refused
+            .query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE name = ?1",
+                [DATABASE_ID_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            identity_rows, 0,
+            "WAL policy refusal must precede identity nonce installation"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_at_one_frame_floor_fails_closed_without_io_limiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-ceiling-unavailable.db");
+        let seed = Connection::open(&path).unwrap();
+        seed.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let page_size: i64 = seed
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let page_size = u64::try_from(page_size)
+            .map_err(|_| {
+                SqliteError::InvalidData("SQLite reported a negative page size".to_string())
+            })
+            .unwrap();
+        drop(seed);
+        let bytes = page_size + 56;
+
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_ceiling: WalCeilingPolicy {
+                bytes,
+                source: WalCeilingSource::Environment,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("enabled ceiling must not open without the WAL I/O limiter"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.wal_capacity_stage(),
+            Some(crate::error::SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE)
+        );
+        assert!(matches!(
+            error,
+            SqliteError::WalCapacityUnavailable {
+                bytes: observed,
+                capability: "WAL I/O limiter",
+            } if observed == bytes
+        ));
+        let refused = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let identity_rows: i64 = refused
+            .query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE name = ?1",
+                [DATABASE_ID_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            identity_rows, 0,
+            "WAL policy refusal must precede identity nonce installation"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_refuses_in_memory_backend_at_pool_open() {
+        let error = match ConnectionPool::new(PoolConfig {
+            wal_ceiling: WalCeilingPolicy {
+                bytes: 8192,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("an in-memory backend cannot enforce a WAL ceiling"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingUnsupported {
+                backend_kind: "in-memory backend",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_refuses_non_wal_backend_at_pool_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("non-wal-ceiling.db")),
+            wal_mode: false,
+            wal_ceiling: WalCeilingPolicy {
+                bytes: 8192,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("a rollback-journal backend cannot enforce a WAL ceiling"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingUnsupported {
+                backend_kind: "non-WAL backend",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_refuses_offset_overflow_at_pool_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = i64::MAX as u64 + 1;
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("wal-ceiling-overflow.db")),
+            wal_ceiling: WalCeilingPolicy {
+                bytes,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("ceiling cannot exceed signed SQLite file offsets"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingOffsetOverflow { bytes: observed } if observed == bytes
+        ));
     }
 
     #[test]
