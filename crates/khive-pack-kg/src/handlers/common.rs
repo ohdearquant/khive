@@ -3,7 +3,7 @@
 //! Param structs (deserialization types) live in `super::params` and are
 //! re-exported here so existing `use super::common::*` imports keep working.
 
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr, sync::OnceLock};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -88,10 +88,52 @@ pub(crate) fn canonical_note_kind(
 
 // ---- Entity-type validation ----
 
+// A bulk request owns its composition; prepared plans never retain this context.
+#[derive(Default)]
+pub(super) struct BulkKindContext {
+    entity_types: OnceLock<EntityTypeRegistry>,
+}
+
+fn build_entity_types(registry: &VerbRegistry, _site: &'static str) -> EntityTypeRegistry {
+    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    #[cfg(test)]
+    let _ = REGISTRY_BUILDS.try_with(|builds| builds.lock().unwrap().push(_site));
+    composed
+}
+
+fn entity_types_for<'a>(
+    registry: &VerbRegistry,
+    context: Option<&'a BulkKindContext>,
+    site: &'static str,
+) -> Cow<'a, EntityTypeRegistry> {
+    match context {
+        Some(context) => Cow::Borrowed(
+            context
+                .entity_types
+                .get_or_init(|| build_entity_types(registry, site)),
+        ),
+        None => Cow::Owned(build_entity_types(registry, site)),
+    }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static REGISTRY_BUILDS: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>;
+}
+
 pub(crate) fn validate_entity_type(
     kind_name: &str,
     entity_type: Option<&str>,
     registry: &VerbRegistry,
+) -> Result<Option<String>, RuntimeError> {
+    validate_entity_type_with_context(kind_name, entity_type, registry, None)
+}
+
+pub(super) fn validate_entity_type_with_context(
+    kind_name: &str,
+    entity_type: Option<&str>,
+    registry: &VerbRegistry,
+    context: Option<&BulkKindContext>,
 ) -> Result<Option<String>, RuntimeError> {
     let Some(raw) = entity_type else {
         return Ok(None);
@@ -101,7 +143,7 @@ pub(crate) fn validate_entity_type(
         .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind_name:?}")))?;
     // ADR-017 additive composition (not `EntityTypeRegistry::global()`); see
     // docs/api/entity-kind-validation.md#validate_entity_type.
-    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let composed = entity_types_for(registry, context, "pinned_type_104");
     let resolved = composed.resolve(kind, Some(raw))?;
     Ok(resolved.entity_type)
 }
@@ -114,14 +156,23 @@ pub(crate) fn validate_entity_type_filter(
     entity_type: Option<&str>,
     registry: &VerbRegistry,
 ) -> Result<Option<String>, RuntimeError> {
+    validate_entity_type_filter_with_context(kind_name, entity_type, registry, None)
+}
+
+pub(super) fn validate_entity_type_filter_with_context(
+    kind_name: Option<&str>,
+    entity_type: Option<&str>,
+    registry: &VerbRegistry,
+    context: Option<&BulkKindContext>,
+) -> Result<Option<String>, RuntimeError> {
     let Some(raw) = entity_type else {
         return Ok(None);
     };
     if let Some(kind) = kind_name {
-        return validate_entity_type(kind, Some(raw), registry);
+        return validate_entity_type_with_context(kind, Some(raw), registry, context);
     }
 
-    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let composed = entity_types_for(registry, context, "unpinned_filter_124");
     let matches: Vec<_> = EntityKind::ALL
         .into_iter()
         .filter_map(|kind| {
@@ -264,7 +315,7 @@ impl KindSpec {
 /// fixed substrate names plus every granular entity/note kind `registry` has
 /// merged in from the loaded pack set. Sourced entirely from the registry so
 /// a pack that registers a new kind is reflected here without a code change.
-fn all_valid_kind_names(registry: &VerbRegistry) -> Vec<String> {
+fn all_valid_kind_names(registry: &VerbRegistry, context: Option<&BulkKindContext>) -> Vec<String> {
     let mut all: Vec<String> = vec![
         "entity".into(),
         "note".into(),
@@ -274,7 +325,7 @@ fn all_valid_kind_names(registry: &VerbRegistry) -> Vec<String> {
     ];
     all.extend(registry.all_entity_kinds().iter().map(|s| (*s).to_string()));
     all.extend(
-        EntityTypeRegistry::with_extra(registry.all_entity_types())
+        entity_types_for(registry, context, "valid_kinds_277")
             .definitions()
             .iter()
             .map(|definition| definition.type_name.to_string()),
@@ -291,7 +342,7 @@ fn all_valid_kind_names(registry: &VerbRegistry) -> Vec<String> {
 pub fn missing_kind_error(param_name: &str, registry: &VerbRegistry) -> RuntimeError {
     RuntimeError::InvalidInput(format!(
         "missing required param {param_name:?}; valid kinds: {}",
-        all_valid_kind_names(registry).join(" | ")
+        all_valid_kind_names(registry, None).join(" | ")
     ))
 }
 
@@ -304,6 +355,14 @@ pub fn missing_kind_error(param_name: &str, registry: &VerbRegistry) -> RuntimeE
 /// Returns [`RuntimeError::InvalidInput`] listing every valid value if `raw` matches
 /// neither a substrate name nor a registered granular kind.
 pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec, RuntimeError> {
+    resolve_kind_spec_with_context(raw, registry, None)
+}
+
+pub(super) fn resolve_kind_spec_with_context(
+    raw: &str,
+    registry: &VerbRegistry,
+    context: Option<&BulkKindContext>,
+) -> Result<KindSpec, RuntimeError> {
     let normalized = raw.trim().to_ascii_lowercase();
 
     match normalized.as_str() {
@@ -348,7 +407,7 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
                 .map(|kind| kind.name())
         });
     let token = khive_types::to_snake_case(raw.trim());
-    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let composed = entity_types_for(registry, context, "subtype_kind_351");
     let mut matches = composed.definitions().iter().filter(|definition| {
         definition.type_name == token.as_str()
             && legacy_base.is_none_or(|base| base == definition.kind.name())
@@ -391,7 +450,7 @@ pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec,
 
     Err(RuntimeError::InvalidInput(format!(
         "unknown kind {raw:?}; valid: {}",
-        all_valid_kind_names(registry).join(" | ")
+        all_valid_kind_names(registry, context).join(" | ")
     )))
 }
 
@@ -401,7 +460,20 @@ pub(crate) fn reconcile_entity_type(
     explicit: Option<&str>,
     registry: &VerbRegistry,
 ) -> Result<Option<String>, RuntimeError> {
-    let resolved = validate_entity_type_filter(kind, explicit, registry)?;
+    reconcile_entity_type_with_context(kind, from_kind, explicit, registry, None)
+}
+
+pub(super) fn reconcile_entity_type_with_context(
+    kind: Option<&str>,
+    from_kind: Option<&str>,
+    explicit: Option<&str>,
+    registry: &VerbRegistry,
+    context: Option<&BulkKindContext>,
+) -> Result<Option<String>, RuntimeError> {
+    let resolved = match context {
+        Some(_) => validate_entity_type_filter_with_context(kind, explicit, registry, context)?,
+        None => validate_entity_type_filter(kind, explicit, registry)?,
+    };
     match (from_kind, resolved) {
         (Some(expected), Some(actual)) if expected != actual => Err(RuntimeError::InvalidInput(
             format!("kind={expected:?} contradicts entity_type={actual:?}; pick one"),
@@ -1433,3 +1505,7 @@ mod note_projection_tests {
         assert!(label.ends_with('\u{2026}'), "got {label}");
     }
 }
+
+#[cfg(test)]
+#[path = "common/bulk_kind_tests.rs"]
+mod bulk_kind_tests;
