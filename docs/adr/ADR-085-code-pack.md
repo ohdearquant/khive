@@ -2119,14 +2119,21 @@ The existing `sweep_clock` and `last_seen_at` keep B5's meaning: they record the
 latest invocation time and actual entity observation, respectively. The new
 completion marker supplies L2 reuse authority, rather than replacing visible
 clocks with a completed-only clock. Owners and languages are independent. No
-selected L2 work means no L2 completion state, and completion of a partial
-subtree does not claim that the whole project was scanned.
+selected L2 work means no L2 completion state. Reuse authority is owner-wide, so
+only an invocation that covered the whole owner may grant it: an invocation
+whose ingest `path` lies strictly inside an owner's project root (the directory
+of that owner's manifest, compared after the canonicalization ingest already
+applies) writes that owner's attempted marker like any L2 invocation and never
+its completed marker. The next invocation that covers the whole owner therefore
+finds no completed predecessor and recovers, instead of fast-pathing unchanged
+files outside the earlier subtree whose edges carry older stamps.
 
 ### Graph completion, skips and accounting
 
-For each participating owner, write its completed marker only after this
-invocation's file work, pending-write flush, synchronous re-resolution, natural
-unchanged-edge refresh and inbound containment refresh have all finished. The
+For each participating owner whose project root lies inside this invocation's
+ingest `path`, write its completed marker only after this invocation's file
+work, pending-write flush, synchronous re-resolution, natural unchanged-edge
+refresh and inbound containment refresh have all finished. The
 completed marker carries this invocation's own run ID and exact sweep-time
 string. When the fresh project state's attempted marker for that owner does not
 carry this invocation's run ID, the invocation writes no completed marker, and
@@ -2189,6 +2196,11 @@ is not an executed proof.
   observe the committed prefix rather than simulate an error before the write.
   An attempt marker moved after destructive work must fail the corresponding
   recovery control.
+- Complete a whole-owner invocation, then complete an invocation whose `path` is a
+  subdirectory of that owner, then change nothing and run a whole-owner
+  invocation again. The subtree invocation must leave no completed marker, and
+  the final invocation must parse for real every file outside the subtree.
+  Letting the subtree invocation write its completed marker must fail this arm.
 - Exercise missing, malformed, unknown-version, incomplete and clock-mismatched
   new marker entries. Such entries must force real parsing without broadening
   legacy predicates. Repeat and reverse sweep times with distinct run IDs; a
