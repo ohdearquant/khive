@@ -1,7 +1,7 @@
 use super::latest_receipt;
-use crate::receipt::{RECEIPT_PROVENANCE_VALUE, RECEIPT_TAG};
+use crate::receipt::{RECEIPT_PROVENANCE_KEY, RECEIPT_PROVENANCE_VALUE, RECEIPT_TAG};
 use khive_runtime::{BackendId, KhiveRuntime, NamespaceToken, RuntimeConfig};
-use khive_storage::{Edge, EdgeRelation, Entity, Note};
+use khive_storage::{Direction, Edge, EdgeRelation, Entity, NeighborHit, NeighborQuery, Note};
 use khive_types::Namespace;
 use serde_json::json;
 use std::sync::Arc;
@@ -318,4 +318,237 @@ async fn generic_receipt_shape_is_not_refresh_or_extract_provenance() {
             .map(|(id, _)| id),
         Some(trusted)
     );
+}
+
+async fn edge(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    source: Uuid,
+    target: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+) {
+    let now = chrono::Utc::now();
+    runtime
+        .graph(token)
+        .unwrap()
+        .upsert_edge(Edge {
+            id: Uuid::new_v4().into(),
+            namespace: token.namespace().as_str().to_string(),
+            source_id: source,
+            target_id: target,
+            relation,
+            weight,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        })
+        .await
+        .unwrap();
+}
+
+fn out_query(relation: EdgeRelation, limit: Option<u32>) -> NeighborQuery {
+    NeighborQuery {
+        direction: Direction::Out,
+        relations: Some(vec![relation]),
+        limit,
+        min_weight: None,
+    }
+}
+
+/// The receipt walk reads only the node id of each neighbour, so it must not
+/// pay for the name and kind lookups that `KhiveRuntime::neighbors` adds. The
+/// reference below spells the same walk with the un-enriched primitives; the
+/// walk may read no more than that.
+#[tokio::test]
+async fn capture_for_body_walk_reads_no_neighbor_enrichment() {
+    let runtime = runtime(
+        Arc::new(khive_db::StorageBackend::memory().unwrap()),
+        BackendId::main(),
+    );
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let entity_id = Uuid::from_u128(1);
+    target(&runtime, &token, entity_id).await;
+    // Six receipts, each superseding the one before it. None of them carries
+    // the requested body, so the walk visits the whole chain.
+    let chain: Vec<Uuid> = (0..6).map(|i| Uuid::from_u128(100 + i)).collect();
+    for (i, id) in chain.iter().enumerate() {
+        receipt(&runtime, "local", entity_id, *id, 10 * (i as i64 + 1)).await;
+    }
+    for pair in chain.windows(2) {
+        edge(
+            &runtime,
+            &token,
+            pair[1],
+            pair[0],
+            EdgeRelation::Supersedes,
+            1.0,
+        )
+        .await;
+    }
+    let body_ref = "f".repeat(64);
+    let entity = runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(entity_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let pool = runtime.backend().pool();
+
+    // One walk first, so a cost the store pays only once is charged to neither
+    // the measured walk nor the reference below.
+    crate::receipt::capture_for_body(&runtime, &token, &entity, &body_ref)
+        .await
+        .unwrap();
+    let before = pool.reader_acquisition_snapshot().acquisitions;
+    let found = crate::receipt::capture_for_body(&runtime, &token, &entity, &body_ref)
+        .await
+        .unwrap();
+    let walk_reads = pool.reader_acquisition_snapshot().acquisitions - before;
+    assert!(found.is_none());
+
+    let before = pool.reader_acquisition_snapshot().acquisitions;
+    let mut cursor = runtime
+        .latest_annotating_note_with_property(
+            &token,
+            entity_id,
+            "observation",
+            RECEIPT_TAG,
+            RECEIPT_PROVENANCE_KEY,
+            RECEIPT_PROVENANCE_VALUE,
+        )
+        .await
+        .unwrap();
+    let notes = runtime.notes(&token).unwrap();
+    let mut visited = 0;
+    while let Some(id) = cursor {
+        visited += 1;
+        notes.get_note(id).await.unwrap();
+        cursor = runtime
+            .neighbors_with_query_page(
+                &token,
+                id,
+                out_query(EdgeRelation::Supersedes, Some(1)),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .first()
+            .map(|hit| hit.node_id);
+    }
+    let plain_reads = pool.reader_acquisition_snapshot().acquisitions - before;
+    assert_eq!(visited, chain.len(), "every receipt is visited");
+
+    // Control: on this fixture the enriched lookup really does cost more, so
+    // an equal total cannot come from enrichment being free here.
+    let before = pool.reader_acquisition_snapshot().acquisitions;
+    runtime
+        .neighbors(
+            &token,
+            chain[5],
+            Direction::Out,
+            Some(1),
+            Some(vec![EdgeRelation::Supersedes]),
+        )
+        .await
+        .unwrap();
+    let enriched_step = pool.reader_acquisition_snapshot().acquisitions - before;
+    let before = pool.reader_acquisition_snapshot().acquisitions;
+    runtime
+        .neighbors_with_query_page(
+            &token,
+            chain[5],
+            out_query(EdgeRelation::Supersedes, Some(1)),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let plain_step = pool.reader_acquisition_snapshot().acquisitions - before;
+    assert!(
+        enriched_step > plain_step,
+        "the fixture must show the enrichment reads this test guards against"
+    );
+
+    assert_eq!(
+        walk_reads, plain_reads,
+        "the receipt walk must read only what the un-enriched primitives read"
+    );
+}
+
+/// Skipping enrichment must not change which neighbours come back or in what
+/// order: the soft-deleted filter and the weight ordering run either way.
+#[tokio::test]
+async fn unenriched_neighbors_keep_the_ids_and_order_of_enriched_neighbors() {
+    let runtime = runtime(
+        Arc::new(khive_db::StorageBackend::memory().unwrap()),
+        BackendId::main(),
+    );
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let entity_id = Uuid::from_u128(1);
+    let deleted_id = Uuid::from_u128(2);
+    let note_id = Uuid::from_u128(3);
+    let anchor = Uuid::from_u128(4);
+    target(&runtime, &token, entity_id).await;
+    target(&runtime, &token, deleted_id).await;
+    // `receipt` stores a note that annotates `entity_id` at weight 1.0.
+    receipt(&runtime, "local", entity_id, note_id, 10).await;
+    receipt(&runtime, "local", entity_id, anchor, 20).await;
+    edge(
+        &runtime,
+        &token,
+        anchor,
+        deleted_id,
+        EdgeRelation::Annotates,
+        0.9,
+    )
+    .await;
+    edge(
+        &runtime,
+        &token,
+        anchor,
+        note_id,
+        EdgeRelation::Annotates,
+        0.5,
+    )
+    .await;
+    runtime
+        .entities(&token)
+        .unwrap()
+        .delete_entity(deleted_id, khive_storage::DeleteMode::Soft)
+        .await
+        .unwrap();
+
+    let enriched = runtime
+        .neighbors(
+            &token,
+            anchor,
+            Direction::Out,
+            None,
+            Some(vec![EdgeRelation::Annotates]),
+        )
+        .await
+        .unwrap();
+    let plain = runtime
+        .neighbors_with_query_page(
+            &token,
+            anchor,
+            out_query(EdgeRelation::Annotates, None),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    let ids = |hits: &[NeighborHit]| hits.iter().map(|hit| hit.node_id).collect::<Vec<_>>();
+    assert_eq!(ids(&enriched), vec![entity_id, note_id]);
+    assert_eq!(ids(&plain), ids(&enriched));
+    assert!(enriched.iter().all(|hit| hit.name.is_some()));
+    assert!(plain.iter().all(|hit| hit.name.is_none()));
 }
