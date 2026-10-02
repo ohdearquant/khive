@@ -818,6 +818,8 @@ pub struct SearchMechanismSnapshot {
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    #[cfg(any(test, feature = "test-support"))]
+    statement_observer: Arc<crate::statement_observer::StatementObserverHub>,
     main_pool_generation: OnceLock<u64>,
     /// Three-state gate for whether the ADR-091 scheduled task has claimed
     /// routine WAL reclamation for this pool. Until claimed, every
@@ -1878,8 +1880,15 @@ impl ConnectionPool {
 
         let readers = ArrayQueue::new(max_readers.max(1));
 
+        #[cfg(any(test, feature = "test-support"))]
+        let statement_observer = crate::statement_observer::StatementObserverHub::new()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&writer, &statement_observer)?;
+
         let mut pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            #[cfg(any(test, feature = "test-support"))]
+            statement_observer,
             main_pool_generation: OnceLock::new(),
             checkpoint_ownership: CheckpointOwnershipGate::new(),
             pooled_writer_retired: AtomicBool::new(false),
@@ -2343,6 +2352,23 @@ impl ConnectionPool {
         &self.config
     }
 
+    /// Observe actual SQLite statement starts on this private test pool.
+    ///
+    /// The limit bounds retained SQL records. Failed steps count as attempts;
+    /// preparation alone does not count. The guard observes every pool-owned
+    /// connection, including the queued writer. Do not run unrelated background
+    /// work on the fixture pool; see the guard documentation for limitations.
+    /// Connection setup runs before observation begins on each connection and
+    /// is never recorded, including for opens during an active observation.
+    /// Reader connection opens use the existing reader acquisition counters instead.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_test_statement_starts(
+        &self,
+        limit: usize,
+    ) -> Result<crate::statement_observer::StatementStartObservation, SqliteError> {
+        self.statement_observer.observe(limit)
+    }
+
     /// Identify this pool's counter window when it is designated as main.
     /// Repeated runtime handles and diagnostics reads reuse the same generation;
     /// constructing secondary pools does not consume main-pool generations.
@@ -2712,6 +2738,8 @@ impl ConnectionPool {
             self.verify_connection_file_identity(&conn, identity_path)?;
         }
         self.verify_opened_database_id(&conn)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
         Ok(conn)
     }
 
@@ -2810,6 +2838,8 @@ impl ConnectionPool {
             )?;
         }
 
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
         Ok(conn)
     }
 
@@ -2963,6 +2993,8 @@ impl ConnectionPool {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         self.reader_acquisition_counters
             .record_standalone_open(purpose);
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
         Ok(conn)
     }
 
