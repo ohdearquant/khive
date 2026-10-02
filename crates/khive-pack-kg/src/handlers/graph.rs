@@ -130,16 +130,20 @@ impl KgPack {
         } else {
             None
         };
-        let mut responses = Vec::with_capacity(hits.len());
-        for hit in hits {
-            let endpoints = match projection {
-                NeighborProjection::Summary => None,
-                _ => self
-                    .runtime
-                    .get_edge(token, hit.edge_id)
+        let endpoints = match projection {
+            NeighborProjection::Summary => vec![None; hits.len()],
+            _ => {
+                let ids: Vec<_> = hits.iter().map(|hit| hit.edge_id).collect();
+                self.runtime
+                    .get_edges_by_id(token, &ids)
                     .await?
-                    .map(|e| (e.source_id, e.target_id)),
-            };
+                    .into_iter()
+                    .map(|edge| edge.map(|edge| (edge.source_id, edge.target_id)))
+                    .collect()
+            }
+        };
+        let mut responses = Vec::with_capacity(hits.len());
+        for (hit, endpoints) in hits.into_iter().zip(endpoints) {
             let response = match projection {
                 NeighborProjection::Edge => serde_json::json!({
                     "origin_id": node_id,
@@ -750,7 +754,7 @@ mod tests {
 
         // The pool counter measures the actual reader calls behind the handler.
         // Both projections run the same adjacency query; only Record needs the
-        // additional per-hit edge reads. Account for diagnostics' own fixed
+        // additional batched endpoint read. Account for diagnostics' own fixed
         // read cost by measuring one pair of empty snapshots first.
         let diagnostics_before = pooled_reader_checkouts(&rt).await;
         let diagnostics_after = pooled_reader_checkouts(&rt).await;
@@ -814,8 +818,8 @@ mod tests {
         assert_eq!(record["neighbors"].as_array().unwrap().len(), 3);
         assert_eq!(
             record_cost,
-            query_cost + 3 * edge_cost,
-            "Record must fetch one edge per returned hit"
+            query_cost + edge_cost,
+            "Record must batch the retained edge IDs into one namespace window"
         );
 
         let context_over_cap = pack
