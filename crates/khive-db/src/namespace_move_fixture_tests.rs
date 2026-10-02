@@ -15,7 +15,8 @@ use rusqlite::Connection;
 use crate::migrations::run_migrations;
 use crate::namespace_census::census;
 use crate::namespace_move::{
-    move_namespace, Collision, MoveError, MoveRequest, MoveRoute, SubjectClass,
+    disposition, move_namespace, Collision, MoveError, MoveRequest, MoveRoute, SubjectClass,
+    TableDisposition,
 };
 use crate::namespace_move_fixture::{
     build, routes, Fixture, FixtureSpec, ATOM, ATOM_SLUG_HOLDER, EDGE, ENTITY, NOTE_DELETED,
@@ -82,6 +83,227 @@ fn collisions(outcome: Result<crate::namespace_move::MoveCounts, MoveError>) -> 
         Err(other) => panic!("expected named collisions, got {other}"),
         Ok(counts) => panic!("expected a refusal, the move succeeded: {counts:?}"),
     }
+}
+
+#[test]
+fn every_current_namespace_table_has_a_move_disposition() {
+    let conn = migrated();
+    let inventory = census(&conn).expect("current schema census");
+    let unknown: Vec<_> = inventory
+        .tables
+        .iter()
+        .filter(|table| disposition(table).is_none())
+        .map(|table| table.name.as_str())
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "every shipped namespace-bearing table needs a move disposition: {unknown:?}"
+    );
+    for name in ["memory_visibility_receipts", "memory_visibility_fences"] {
+        let table = inventory
+            .tables
+            .iter()
+            .find(|table| table.name == name)
+            .expect("ADR-144 receipt table in the live schema census");
+        assert_eq!(
+            disposition(table),
+            Some(TableDisposition::SubjectKeyed {
+                subject_column: "note_id"
+            })
+        );
+    }
+    for name in ["comm_sender_transport", "sessions", "session_messages"] {
+        let table = inventory
+            .tables
+            .iter()
+            .find(|table| table.name == name)
+            .expect("operational table in the live schema census");
+        assert_eq!(disposition(table), Some(TableDisposition::LeaveBehind));
+    }
+}
+
+#[test]
+fn independently_keyed_transport_and_session_mirror_rows_are_reported_left_behind() {
+    let conn = migrated();
+    conn.execute_batch(
+        "INSERT INTO notes (id, namespace, kind, name, content, created_at, updated_at) \
+         VALUES ('outbound-note', 'source', 'message', 'outbound', 'content', 1, 1), \
+                ('session-note', 'source', 'session', 'session', 'content', 1, 1); \
+         INSERT INTO comm_sender_transport \
+           (namespace, logical_message_id, outbound_note_id, kind, slug, credential_ref, \
+            recipient_address, protocol_version, sender_agent_id, sender_assurance, \
+            recipient_agent_id, recipient_device_id, recipient_key_epoch, contact_generation, \
+            sender_key_epoch, recipient_key_fingerprint, enc, ciphertext, envelope_seq, state, \
+            created_at, updated_at) \
+         VALUES ('source', 'logical-message', 'outbound-note', 'khive', 'device', 'key-ref', \
+                 'address', 1, 'sender', 'claimed', 'recipient', 'device-id', 1, 1, 1, \
+                 'fingerprint', zeroblob(32), zeroblob(1), 1, 'pending', 1, 1); \
+         INSERT INTO sessions \
+           (id, provider_session_id, source, message_count, first_seen_at, last_seen_at, namespace) \
+         VALUES ('provider-session', 'provider-session', 'codex', 1, 1, 1, 'source'); \
+         INSERT INTO session_messages \
+           (id, session_id, seq, msg_type, text, raw, created_at, namespace, source, content_hash) \
+         VALUES ('provider-event', 'provider-session', 0, 'user', 'hello', '{}', 1, \
+                 'source', 'codex', 'hash')",
+    )
+    .expect("seed independently keyed rows");
+
+    let request = MoveRequest::new(
+        "source",
+        vec![
+            MoveRoute {
+                class: SubjectClass::Note("message".into()),
+                target: "message-target".into(),
+            },
+            MoveRoute {
+                class: SubjectClass::Note("session".into()),
+                target: "session-target".into(),
+            },
+        ],
+    );
+    let moved = attempt(&conn, &request).expect("routed notes can move independently");
+    assert_eq!(moved.subjects.get("note:message"), Some(&1));
+    assert_eq!(moved.subjects.get("note:session"), Some(&1));
+    for table in ["comm_sender_transport", "sessions", "session_messages"] {
+        assert_eq!(moved.left_behind.get(table), Some(&1), "{table}");
+        assert!(!moved.rows.contains_key(table), "{table} was not moved");
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM {table} WHERE namespace = 'source'")
+            ),
+            1,
+            "{table} retains its independently keyed source row"
+        );
+    }
+    assert_eq!(
+        text(
+            &conn,
+            "SELECT namespace FROM notes WHERE id = 'outbound-note'"
+        ),
+        "message-target"
+    );
+    assert_eq!(
+        text(
+            &conn,
+            "SELECT namespace FROM notes WHERE id = 'session-note'"
+        ),
+        "session-target"
+    );
+}
+
+#[test]
+fn memory_visibility_receipts_follow_partitioned_notes_with_foreign_keys_on() {
+    let conn = migrated();
+    conn.execute_batch("PRAGMA foreign_keys = ON")
+        .expect("enable immediate foreign keys");
+    let foreign_keys: i64 = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .expect("read foreign key mode");
+    assert_eq!(foreign_keys, 1);
+
+    for (id, kind) in [
+        ("memory-with-fence", "memory"),
+        ("memory-zero-model", "memory"),
+        ("other-note", "observation"),
+    ] {
+        conn.execute(
+            "INSERT INTO notes (id, namespace, kind, name, content, created_at, updated_at) \
+             VALUES (?1, 'source', ?2, 'a name', 'some content', 1, 1)",
+            rusqlite::params![id, kind],
+        )
+        .expect("seed routed note");
+    }
+    conn.execute(
+        "INSERT INTO memory_visibility_receipts (namespace, note_id, model_count) \
+         VALUES ('source', 'memory-with-fence', 1), \
+                ('source', 'memory-zero-model', 0)",
+        [],
+    )
+    .expect("seed receipt headers");
+    conn.execute(
+        "INSERT INTO memory_visibility_fences \
+         (namespace, note_id, model, ann_write_log_seq) \
+         VALUES ('source', 'memory-with-fence', 'test-model', 1)",
+        [],
+    )
+    .expect("seed the child fence under its source receipt");
+
+    let request = MoveRequest::new(
+        "source",
+        vec![
+            MoveRoute {
+                class: SubjectClass::Note("memory".into()),
+                target: "memory-target".into(),
+            },
+            MoveRoute {
+                class: SubjectClass::Note("observation".into()),
+                target: "other-target".into(),
+            },
+        ],
+    );
+    let moved = attempt(&conn, &request).expect("composite FK remains valid during the move");
+    assert_eq!(moved.subjects.get("note:memory"), Some(&2));
+    assert_eq!(moved.subjects.get("note:observation"), Some(&1));
+    assert_eq!(moved.rows.get("memory_visibility_receipts"), Some(&2));
+    assert_eq!(moved.rows.get("memory_visibility_fences"), Some(&1));
+    assert!(!moved.left_behind.contains_key("memory_visibility_receipts"));
+    assert!(!moved.left_behind.contains_key("memory_visibility_fences"));
+    assert_eq!(
+        text(&conn, "SELECT namespace FROM notes WHERE id = 'other-note'"),
+        "other-target",
+        "the unrelated note route is partitioned independently"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM memory_visibility_receipts \
+             WHERE namespace = 'memory-target'"
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM memory_visibility_fences \
+             WHERE namespace = 'memory-target' AND note_id = 'memory-with-fence'"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT model_count FROM memory_visibility_receipts \
+             WHERE namespace = 'memory-target' AND note_id = 'memory-zero-model'"
+        ),
+        0,
+        "a zero-model receipt still follows its note"
+    );
+    for table in ["memory_visibility_receipts", "memory_visibility_fences"] {
+        assert_eq!(
+            count(
+                &conn,
+                &format!(
+                    "SELECT COUNT(*) FROM {table} \
+                     WHERE namespace IN ('source', 'other-target')"
+                )
+            ),
+            0,
+            "receipt rows must follow only the memory route"
+        );
+    }
+    let mut check = conn
+        .prepare("PRAGMA foreign_key_check")
+        .expect("prepare foreign key check");
+    assert!(
+        check
+            .query([])
+            .expect("foreign key check")
+            .next()
+            .unwrap()
+            .is_none(),
+        "the moved receipt and fence preserve every FK"
+    );
 }
 
 /// The baseline every refusal arm is read against: the same rows, no occupied
