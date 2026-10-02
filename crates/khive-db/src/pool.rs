@@ -2430,6 +2430,15 @@ impl ConnectionPool {
         Arc::clone(&self.sql_bridge_writer_slots)
     }
 
+    /// Current writer holds that prevent voluntary daemon retirement.
+    ///
+    /// The raw-SQL writer permit remains handle-scoped even in autocommit.
+    /// This read acquires no connection and changes no admission policy.
+    pub fn retirement_writer_holds(&self) -> usize {
+        usize::from(self.writer.is_locked())
+            + usize::from(self.sql_bridge_writer_slots.available_permits() == 0)
+    }
+
     /// This pool's ADR-091 backend-scoped attribution origin (ADR-091,
     /// backend-scoped WAL-pin attribution design note): `Database(_)` for a
     /// file-backed pool, `Memory` for an in-memory pool. Every
