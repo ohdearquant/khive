@@ -8,7 +8,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
     KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry,
 };
-use khive_types::{EdgeEndpointRule, HandlerDef, Pack, PackSchemaPlan};
+use khive_types::{EdgeEndpointRule, HandlerDef, Pack, PackColumnAddition, PackSchemaPlan};
 
 use crate::{handlers, vocab::SESSION_HANDLERS};
 
@@ -36,6 +36,8 @@ impl Pack for SessionPack {
         pack: "session",
         statements: &crate::vocab::SESSION_SCHEMA_PLAN_STMTS,
     });
+    const SCHEMA_COLUMN_ADDITIONS: &'static [PackColumnAddition] =
+        &crate::vocab::SESSION_SCHEMA_COLUMN_ADDITIONS;
 }
 
 struct SessionPackFactory;
@@ -91,6 +93,10 @@ impl PackRuntime for SessionPack {
             pack: "session",
             statements: &crate::vocab::SESSION_SCHEMA_PLAN_STMTS,
         }
+    }
+
+    fn schema_column_additions(&self) -> &'static [PackColumnAddition] {
+        <Self as Pack>::SCHEMA_COLUMN_ADDITIONS
     }
 
     async fn warm(&self) {
