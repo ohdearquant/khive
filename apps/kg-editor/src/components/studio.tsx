@@ -1049,7 +1049,14 @@ export function Studio({ initialBundle }: { initialBundle: ReviewBundle }) {
 
   function downloadBundle() {
     const value = coreReport ?? bundle;
-    const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+    let serialized: string;
+    try {
+      serialized = JSON.stringify(value, null, 2);
+    } catch (error) {
+      showToast({ tone: "warning", message: error instanceof Error ? `Bundle download failed: ${error.message}` : "Bundle download failed." });
+      return;
+    }
+    const blob = new Blob([serialized], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
