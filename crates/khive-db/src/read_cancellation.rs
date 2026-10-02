@@ -701,12 +701,16 @@ where
     scope.run_with_cleanup_and_context(conn, || read(conn, admission), || Ok(()), Some(context))
 }
 
-fn storage_error_is_sqlite_interrupt(error: &StorageError) -> bool {
+/// The SQLite primary result code a driver-level storage error carries, whether
+/// the source is a bare `rusqlite::Error` or one wrapped in `SqliteError`.
+/// `None` for every other storage error and for driver errors that are not
+/// SQLite failures.
+pub(crate) fn storage_error_sqlite_code(error: &StorageError) -> Option<rusqlite::ErrorCode> {
     let StorageError::Driver { source, .. } = error else {
-        return false;
+        return None;
     };
     if let Some(error) = source.downcast_ref::<rusqlite::Error>() {
-        return error.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted);
+        return error.sqlite_error_code();
     }
     source
         .downcast_ref::<crate::error::SqliteError>()
@@ -714,7 +718,10 @@ fn storage_error_is_sqlite_interrupt(error: &StorageError) -> bool {
             crate::error::SqliteError::Rusqlite(error) => error.sqlite_error_code(),
             _ => None,
         })
-        == Some(rusqlite::ErrorCode::OperationInterrupted)
+}
+
+fn storage_error_is_sqlite_interrupt(error: &StorageError) -> bool {
+    storage_error_sqlite_code(error) == Some(rusqlite::ErrorCode::OperationInterrupted)
 }
 
 struct CancelReadOnDrop {
@@ -918,6 +925,52 @@ mod tests {
             !body.contains("state.lock"),
             "SQLite's per-1,000-op progress callback must stay lock-free"
         );
+    }
+
+    #[test]
+    fn storage_error_sqlite_code_reads_bare_and_wrapped_driver_sources_only() {
+        fn failure(code: i32) -> rusqlite::Error {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+        }
+        let bare = StorageError::driver(
+            StorageCapability::Entities,
+            "bare",
+            failure(rusqlite::ffi::SQLITE_BUSY),
+        );
+        let wrapped = StorageError::driver(
+            StorageCapability::Sql,
+            "wrapped",
+            crate::error::SqliteError::Rusqlite(failure(rusqlite::ffi::SQLITE_BUSY)),
+        );
+        let locked = StorageError::driver(
+            StorageCapability::Sql,
+            "locked",
+            failure(rusqlite::ffi::SQLITE_LOCKED),
+        );
+        let not_sqlite_failure = StorageError::driver(
+            StorageCapability::Sql,
+            "invalid",
+            crate::error::SqliteError::InvalidData("not a driver code".into()),
+        );
+        let timeout = StorageError::Timeout {
+            operation: "timeout".into(),
+        };
+
+        assert_eq!(
+            storage_error_sqlite_code(&bare),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert_eq!(
+            storage_error_sqlite_code(&wrapped),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert_eq!(
+            storage_error_sqlite_code(&locked),
+            Some(rusqlite::ErrorCode::DatabaseLocked),
+            "SQLITE_LOCKED is a different code and must not read as busy"
+        );
+        assert_eq!(storage_error_sqlite_code(&not_sqlite_failure), None);
+        assert_eq!(storage_error_sqlite_code(&timeout), None);
     }
 
     #[test]

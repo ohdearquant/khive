@@ -78,7 +78,11 @@ where
             operation,
             pool.reader_until(|| scope.should_stop()),
         )?;
-        scope.run_pooled_reader(&mut guard, read)
+        let result = scope.run_pooled_reader(&mut guard, read);
+        if let Err(error) = &result {
+            pool.record_reader_query_error(error);
+        }
+        result
     })
     .await
 }
