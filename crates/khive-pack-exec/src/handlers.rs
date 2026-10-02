@@ -30,6 +30,7 @@ use khive_storage::ContentRef;
 
 #[cfg(unix)]
 use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
+use crate::membership::{MembershipWork, SuppliedRefs};
 use crate::receipts;
 use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
@@ -237,10 +238,11 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
             .collect(),
     );
     let next = tree::parse_entries(&candidate)?;
+    let supplied = SuppliedRefs::new(&supplied_refs, MembershipWork::for_runtime(rt));
     // A caller-supplied ref that names no object refuses here, still before any write.
     let referenced: Vec<TreeEntry> = next
         .iter()
-        .filter(|entry| supplied_refs.contains(&entry.content_ref))
+        .filter(|entry| supplied.contains(&entry.content_ref))
         .cloned()
         .collect();
     tree::verify_blobs(rt, &referenced).await?;
@@ -1295,12 +1297,6 @@ fn materialize_entries(
     Ok(())
 }
 
-fn declared_covers(declared: &[String], path: &str) -> bool {
-    declared
-        .iter()
-        .any(|d| d == path || path.starts_with(&format!("{d}/")))
-}
-
 /// The resource identifier `setrlimit` takes: an enum-typed integer on glibc,
 /// a plain `c_int` on every other unix libc.
 #[cfg(all(unix, target_os = "linux", target_env = "gnu"))]
@@ -1650,6 +1646,10 @@ async fn execute(
     // Capture errors describe a completed, unsuccessful run. Finalize its
     // receipt rather than propagating past receipt insertion in `run`.
     let mut root_unconfirmed: Option<String> = None;
+    let declared = req
+        .declared
+        .as_ref()
+        .map(|paths| tree::DeclaredCoverage::new(paths, MembershipWork::for_runtime(rt)));
     let captured: Result<(), RuntimeError> = async {
         let (found, skipped) =
             walk(&capture_root)
@@ -1726,10 +1726,9 @@ async fn execute(
                     out_entries.push((*old).clone());
                 }
                 existing => {
-                    let allowed = req
-                        .declared
+                    let allowed = declared
                         .as_ref()
-                        .is_none_or(|d| declared_covers(d, path));
+                        .is_none_or(|d| d.covers(path));
                     if !allowed {
                         undeclared.insert(path.clone());
                         if let Some(old) = existing {
@@ -1761,10 +1760,9 @@ async fn execute(
             if found.contains_key(*path) {
                 continue;
             }
-            let allowed = req
-                .declared
+            let allowed = declared
                 .as_ref()
-                .is_none_or(|d| declared_covers(d, path));
+                .is_none_or(|d| d.covers(path));
             if !allowed {
                 undeclared.insert(path.to_string());
                 out_entries.push((*old).clone());
