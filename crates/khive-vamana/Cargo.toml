@@ -31,6 +31,7 @@ khive-quant = { version = "0.9.0", path = "../khive-quant", default-features = f
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+nix = { version = "0.31", features = ["dir"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
