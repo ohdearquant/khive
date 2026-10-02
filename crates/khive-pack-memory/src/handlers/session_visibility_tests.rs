@@ -543,14 +543,18 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         }).expect("move transaction")
     };
     assert!(u64::try_from(destination_seq).unwrap() > old_seq);
-    let log_rows_before_replay = {
+    {
         let connection = backend.pool().reader().expect("log reader");
-        connection
-            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("log count")
-    };
+        let replacement_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log \
+                 WHERE subject_id = ?1 AND namespace = ?2 AND seq > ?3",
+                (original["id"].as_str().unwrap(), target, destination_seq),
+                |row| row.get(0),
+            )
+            .expect("pre-replay subject log count");
+        assert_eq!(replacement_rows, 0, "move has no later subject log row");
+    }
     let replay = registry
         .dispatch_with_identity(
             "memory.remember",
@@ -566,13 +570,15 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
     assert_eq!(receipt["fences"][0]["ann_write_log_seq"], destination_seq);
     {
         let connection = backend.pool().reader().expect("replay log reader");
-        let log_rows_after_replay: i64 = connection
-            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| row.get(0))
-            .expect("post-replay log count");
-        assert_eq!(
-            log_rows_after_replay, log_rows_before_replay,
-            "replay writes no replacement log row"
-        );
+        let replacement_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log \
+                 WHERE subject_id = ?1 AND namespace = ?2 AND seq > ?3",
+                (original["id"].as_str().unwrap(), target, destination_seq),
+                |row| row.get(0),
+            )
+            .expect("post-replay subject log count");
+        assert_eq!(replacement_rows, 0, "replay writes no replacement log row");
     }
     let target_token = rt
         .authorize(Namespace::parse(target).unwrap())
