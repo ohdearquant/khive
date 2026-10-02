@@ -192,6 +192,13 @@ impl EntityPosteriors {
         self.map.peek(id)
     }
 
+    /// Effective maximum number of retained entity posteriors.
+    ///
+    /// A requested capacity of zero is normalized to one by construction.
+    pub fn capacity(&self) -> usize {
+        self.map.cap().get()
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
