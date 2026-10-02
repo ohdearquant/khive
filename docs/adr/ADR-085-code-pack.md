@@ -2006,3 +2006,199 @@ Every Unix host gate must include **both directions** for close, whole-file unlo
 Acceptance must also make a newly introduced unclassified SQLite **and raw** opener fail the chosen enforcement boundary. This tests census closure rather than only the paths already listed. If the narrowed option is chosen, the residual worker placement and inability to run those operations beside the in-process guarded owner require executed controls. Concurrent admissions and deterministic barriers around ordinary preflight/open must cover identity substitution and pre-existing peers; a scan without a concurrent-opener arm cannot prove serialization.
 
 Unix and Windows gates retain Amendment 12's native identity/alias refusal, protected-file presence/bytes/size/mtime, prior-WAL transition, hot-journal recovery, DELETE rebase concurrency, retained-owner lifetime and zero-`xShm*` controls. Non-adversarial quarantine occupancy remains zero. Record the exact source revision, named commands and selected tests, OS/filesystem and actual caller/open/unlock/close events, together with independent before/after lock observations. None of the mechanisms, routes, admission alternatives or acceptance obligations here is asserted to have passed merely because this text or its census exists.
+
+## Amendment 14 (2026-10-02): sequential recovery of interrupted L2 sweeps
+
+**Status: Proposed; pending review and ratification.**
+
+**Amends:** Amendment 2 B5's L2 freshness protocol. **Retains:** deterministic
+project/module/symbol ownership, observed `last_seen_at` and per-project/language
+`sweep_clock`, historical and manually authored edges, the existing secret gate,
+and the existing L1/L1.5 clock behavior. This amendment does not change Amendment
+12, Amendment 13 or their implementation and ratification holds. It specifies
+new project properties and recovery behavior; it does not assert an implemented
+or verified recovery path.
+
+### Interrupted runs and the sequential guarantee
+
+The current project clock advances before file and edge work. A failed or
+cancelled L2 invocation can therefore retain a committed prefix: some natural
+edges carry an earlier sweep stamp, while others already carry the failed
+invocation's stamp. A subsequent unchanged-file fast path that refreshes only an
+exact predecessor stamp cannot recover both populations. Recording only a
+completed timestamp is also insufficient once a failed invocation has committed
+some edge refreshes. Widening refresh to older timestamps would promote retained
+removed references and is not the recovery rule.
+
+Recovery is guaranteed for **sequential invocations** of one
+`(source_project, language)` owner. Attempt and completion identities are not
+leases, fences or a serialization mechanism. This amendment establishes no
+correctness guarantee for overlapping writers of that owner, including writers
+using separate runtimes or processes. Existing per-row compare-and-set/rebase
+behavior remains; no clock maximum, stale-lease stealing, process-local mutex or
+new serialization is introduced. A caller-supplied sweep time may repeat or move
+backward and must not serve as invocation identity or invocation order.
+
+### Versioned durable owner state
+
+The project entity retains `properties.sweep_clock` and gains
+`properties.l2_sweep_runs`, an object keyed by the same language used for that
+owner's sweep clock. Each participating owner's language entry has this shape:
+
+```json
+{
+  "version": 1,
+  "attempted": {
+    "run_id": "b024eb06-bd98-44c5-8542-74b49df6e528",
+    "sweep_time": "2026-10-02T04:00:00+00:00"
+  },
+  "completed": {
+    "run_id": "b024eb06-bd98-44c5-8542-74b49df6e528",
+    "sweep_time": "2026-10-02T04:00:00+00:00"
+  }
+}
+```
+
+The example is a completed invocation, not a shared identity. `run_id` is a
+fresh, unpredictable UUID v4, stored in canonical lowercase dashed spelling.
+One invocation retains the same identity for every write of a given owner;
+repeated upserts of that owner do not create new attempts. `sweep_time` is the
+exact string emitted by that invocation's existing sweep-time serialization. It
+is compared as opaque text, not normalized or ordered. The new reader does not
+add RFC3339 validation to legacy sweep clocks or edge metadata.
+
+`version` must be the JSON integer `1`. `attempted` must be an object containing
+exactly the string fields `run_id` and `sweep_time`. `completed` is either `null`
+or an object with those same two fields. The owner entry has exactly the three
+fields shown. Unknown versions, unknown owner-entry fields, missing fields,
+wrong types or noncanonical/non-v4 run IDs provide **no reuse authority**. A
+missing or malformed `l2_sweep_runs` object or target-language entry likewise
+requires recovery. An incomplete attempt is valid stored state, but is not a
+completed predecessor. These checks govern the new markers only; they do not
+introduce stricter legacy project-kind, language, namespace or timestamp
+predicates.
+
+A predecessor authorizes the unchanged-file fast path only when its new entry
+is valid, both markers are non-null, their run IDs and sweep-time strings are
+identical, and the retained `sweep_clock[language]` is exactly that completed
+sweep-time string. Capture that authority once, before any selected-L2 path
+advances the owner's visible clock, including an earlier selected L1 or L1.5
+upsert. A later L1-only invocation may advance the visible clock without changing
+L2 markers; the resulting mismatch requires real L2 recovery on the next L2
+invocation. No-L2 invocations create neither new L2 attempts nor completions.
+
+The current attempt is written in the existing `upsert_project` mutation that
+advances the visible clock; it adds no separate attempt mutation. Preserve a
+valid predecessor's completed marker while replacing its attempted marker.
+When the target marker is absent or malformed, initialize a valid current
+attempt with `completed: null`; never reinterpret malformed data as a completed
+predecessor. Merge against fresh project state, preserving unrelated properties
+and other languages' entries. A project write refused by the existing gate
+remains refused; the marker does not provide alternate write authority.
+
+### Re-observation and historical-edge eligibility
+
+Without a fully completed predecessor, every encountered file of that owner
+must follow the real source read, parse, persistence and re-resolution path,
+even when its content hash, scanner identity and declaration ownership match.
+Select recovery before the unchanged-file decision and `preserve_l2_state`.
+Existing failures or refusals may still skip a file; recovery does not replace a
+read/parse/gate refusal with a refresh. Successful empty declaration sets remain
+observed coverage.
+
+Recovery republishes only references actually observed through the existing
+scanner and resolution rules. It does not make every failed-run stamp eligible,
+revive removed references, refresh manual edges, delete historical rows or
+change owner/endpoint authority. On a fully completed predecessor, retain the
+unchanged-file fast path and the existing exact predecessor-stamp guard for
+natural `depends_on` and `implements` refresh. The inbound `contains` refresh
+retains its existing owner/derived predicates; this amendment does not claim it
+has the same predecessor-stamp predicate as the natural-edge refresh.
+
+The existing `sweep_clock` and `last_seen_at` keep B5's meaning: they record the
+latest invocation time and actual entity observation, respectively. The new
+completion marker supplies L2 reuse authority, rather than replacing visible
+clocks with a completed-only clock. Owners and languages are independent. No
+selected L2 work means no L2 completion state, and completion of a partial
+subtree does not claim that the whole project was scanned.
+
+### Graph completion, skips and accounting
+
+For each participating owner, write its completed marker only after this
+invocation's file work, pending-write flush, synchronous re-resolution, natural
+unchanged-edge refresh and inbound containment refresh have all finished. The
+completed marker copies the current attempt's run ID and exact sweep-time
+string. This is one additional guarded project mutation after graph work, merged
+with fresh properties and other languages' state. It is not a request-wide
+transaction: prior graph/entity/FTS writes remain committed when a later
+operation fails or the future is cancelled.
+
+Completion means **graph completion of this invocation's observed coverage**.
+It does not mean every source file was successfully read or parsed, every gate
+accepted, or the response was delivered. Read/parse/gate-skipped files' historical
+edges are never promoted. Their existing stale-edge strand after an otherwise
+completed invocation remains a known limitation outside this amendment. Missing
+files, removed references and unvisited subtree members remain historical.
+
+The entity compare-and-set can commit the completed marker before its following
+FTS document write fails. In that case the invocation returns its existing
+error while graph completion remains durable. A crash after the completion row
+commit and before response acknowledgement has the same durable interpretation.
+This does not promise FTS convergence or a successful response, and must not be
+reported as a rollback of the completed row. Failure before completion leaves
+an incomplete attempt and requires real re-observation on the next sequential
+invocation.
+
+Public report fields retain their meanings. The attempted marker shares the
+existing project mutation and adds no separate project/FTS accounting. A
+successful completion update adds one to `projects_updated`; its successful FTS
+write adds one to `fts_indexed`. Existing entity revision/version history also
+advances for that additional mutation. No new report field is introduced, and
+an invocation returning an error does not acquire a successful report merely
+because its completed row is durable. The dependent change must disclose these
+counter and mutation changes, the sequential-only guarantee, the durable
+completion/FTS-error boundary and the remaining skipped-file strand.
+
+### Acceptance and sequencing
+
+Before dependent recovery code merges, review and ratify this final amendment
+through the existing ADR process. Landing Proposed text alone does not adopt it
+or release its dependent code. The code change must follow the already frozen
+L2 batching change (#3715), preserve its pending-write ordering and failure
+behavior, and use a separate private recovery fixture. This amendment neither
+ratifies Amendment 13 nor releases that amendment's native-routing hold.
+
+Acceptance must use real file-backed runtimes and actual committed storage
+failures. Cover WAL and rollback DELETE for the sequential recovery mechanism;
+the WAL fixture does not change the dedicated code-map target's governed journal
+posture. Retain an original-source baseline and independently applicable removal
+controls. A timeout, compile failure, zero selected tests or an authored fixture
+is not an executed proof.
+
+- Reproduce an interrupted early file/persistence run and a partial final refresh
+  that leaves both old and failed-run edge stamps. After removing the actual
+  SQLite fault, unchanged disk must trigger real parsing and republish every
+  still-observed reference. Removed, manual, foreign-owner and unvisited edges
+  must retain their historical state. Removing forced reparse must fail the
+  mixed-stamp witness.
+- Fail after changed-file or re-resolution work has committed, and cancel after
+  a real committed edge update. Reopen an independent runtime before recovery;
+  observe the committed prefix rather than simulate an error before the write.
+  An attempt marker moved after destructive work must fail the corresponding
+  recovery control.
+- Exercise missing, malformed, unknown-version, incomplete and clock-mismatched
+  new marker entries. Such entries must force real parsing without broadening
+  legacy predicates. Repeat and reverse sweep times with distinct run IDs; a
+  timestamp-equality completion control must fail.
+- Inject a real fault on the completion row, then a separate real fault on its
+  post-row FTS write. Assert incomplete recovery in the first case and durable
+  graph completion plus the returned FTS error in the second. Completing before
+  either refresh phase or pending flush must fail a named witness.
+- Observe successful recovery followed by unchanged fast-path reuse, independent
+  project/language state, no-L2 calls, successful empty files and skipped files.
+  Assert the extra successful completion mutation and report accounting. A
+  skipped-file fixture must retain, rather than conceal, the known stale-edge
+  limitation.
+
+No implementation, native acceptance, formal review or ratification is asserted
+by this Proposed amendment.
