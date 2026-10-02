@@ -492,6 +492,10 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         dims: 16,
     });
     let (registry, shared_ann) = registry_with_ann(&rt);
+    let ann_key = AnnKey::from_token(MODEL);
+    // Keep both replay and the session exact-tail read in the unpublished phase.
+    let publication_guard = ann::hold_model_warm_lock_for_test(&shared_ann, &ann_key).await;
+    let warm_started = shared_ann.attempt_floor_notify.notified();
     let source = "visibility-move-source";
     let target = "visibility-move-target";
     let identity = |namespace: &str| RequestIdentity {
@@ -519,6 +523,9 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         )
         .await
         .expect("keyed source remember");
+    tokio::time::timeout(std::time::Duration::from_secs(10), warm_started)
+        .await
+        .expect("original remember starts its background ANN attempt");
     let old_seq = original["visibility_token"]["fences"][0]["ann_write_log_seq"]
         .as_u64()
         .expect("original write fence");
@@ -567,6 +574,7 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
     assert_eq!(replay["replayed"], true);
     let receipt = replay["visibility_token"].clone();
     assert_eq!(receipt["namespace"], target);
+    assert_eq!(receipt["fences"][0]["model"], MODEL);
     assert_eq!(receipt["fences"][0]["ann_write_log_seq"], destination_seq);
     {
         let connection = backend.pool().reader().expect("replay log reader");
@@ -609,6 +617,19 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         .await
         .expect("unapplied destination row proves its exact live tail snapshot");
     assert!(contains_id(&recalled, &original["id"]));
+
+    assert_eq!(
+        ann::bridge_applied_seq(&shared_ann, &AnnKey::from_token(MODEL)).await,
+        None
+    );
+
+    drop(publication_guard);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ann::wait_until_warm_idle(&shared_ann, &ann_key),
+    )
+    .await
+    .expect("remember's background ANN publication finishes after release");
 
     ann::ensure_ann_for_model(&rt, &target_token, &shared_ann, MODEL)
         .await
