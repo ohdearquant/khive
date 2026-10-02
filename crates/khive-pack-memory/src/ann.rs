@@ -22,6 +22,30 @@ use khive_vamana::{
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
+#[cfg(test)]
+tokio::task_local! {
+    static SESSION_EXACT_STATEMENT_COUNT: std::cell::Cell<usize>;
+    static SESSION_FENCE_PROBE_COUNT: std::cell::Cell<usize>;
+}
+
+#[cfg(test)]
+pub(crate) async fn count_session_statements<F: std::future::Future>(
+    future: F,
+) -> (F::Output, usize, usize) {
+    SESSION_EXACT_STATEMENT_COUNT
+        .scope(std::cell::Cell::new(0), async {
+            SESSION_FENCE_PROBE_COUNT
+                .scope(std::cell::Cell::new(0), async {
+                    let output = future.await;
+                    let probes = SESSION_FENCE_PROBE_COUNT.with(std::cell::Cell::get);
+                    let exact = SESSION_EXACT_STATEMENT_COUNT.with(std::cell::Cell::get);
+                    (output, probes, exact)
+                })
+                .await
+        })
+        .await
+}
+
 #[path = "ann/incremental.rs"]
 mod incremental;
 use incremental::*;
@@ -2261,6 +2285,11 @@ async fn compact_log(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+pub(crate) async fn compact_log_for_test(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
+    compact_log(rt, model).await
+}
+
 /// Live corpus count and tail count for this consumer's scope, captured in ONE
 /// statement so both come from the same SQLite read snapshot. Live is the
 /// join-filtered global corpus; the tail spans every namespace under the same
@@ -2768,6 +2797,220 @@ pub(crate) fn merge_fresh_tail_for_route(
             .then_with(|| a.0.cmp(&b.0))
     });
     Ok(merged)
+}
+
+/// Keep the cheap wait probe and candidate-producing snapshot on the same
+/// original-log-or-published-watermark fence predicate.
+fn session_fence_predicate(
+    model_param: usize,
+    seq_param: usize,
+    namespace_param: usize,
+    consumer_param: usize,
+    wildcard_param: usize,
+) -> String {
+    format!(
+        "EXISTS(SELECT 1 FROM ann_write_log \
+                  WHERE seq = ?{seq_param} AND namespace = ?{namespace_param} \
+                    AND embedding_model = ?{model_param} \
+                    AND kind = 'note' AND field = 'note.content' \
+                    AND op = 'upsert') \
+         OR EXISTS(SELECT 1 FROM ann_consumer_watermark \
+                    WHERE consumer = ?{consumer_param} AND namespace = ?{wildcard_param} \
+                      AND embedding_model = ?{model_param} \
+                      AND watermark >= ?{seq_param} AND watermark >= 0)"
+    )
+}
+
+/// Poll only the fence while a session recall waits. This is a scheduling hint,
+/// not the candidate proof: `session_exact_candidates` repeats the same
+/// predicate inside its candidate-producing SQLite snapshot.
+pub(crate) async fn session_unmet_fences(
+    rt: &KhiveRuntime,
+    fence: &crate::visibility::VisibilityFence,
+) -> Vec<String> {
+    let mut reader = match rt.sql().reader().await {
+        Ok(reader) => reader,
+        Err(error) => {
+            tracing::warn!(%error, "session fence probe could not open a reader");
+            return fence
+                .fences
+                .iter()
+                .map(|entry| entry.model.clone())
+                .collect();
+        }
+    };
+    let sql = format!(
+        "SELECT ({}) AS has_fence",
+        session_fence_predicate(1, 2, 3, 4, 5)
+    );
+    let mut unmet = Vec::new();
+    for entry in &fence.fences {
+        let Ok(seq) = i64::try_from(entry.ann_write_log_seq) else {
+            unmet.push(entry.model.clone());
+            continue;
+        };
+        #[cfg(test)]
+        let _ = SESSION_FENCE_PROBE_COUNT.try_with(|count| count.set(count.get() + 1));
+        let result = reader
+            .query_scalar(SqlStatement {
+                sql: sql.clone(),
+                params: vec![
+                    SqlValue::Text(entry.model.clone()),
+                    SqlValue::Integer(seq),
+                    SqlValue::Text(fence.namespace.clone()),
+                    SqlValue::Text(ANN_CONSUMER.into()),
+                    SqlValue::Text(ANN_WILDCARD_NS.into()),
+                ],
+                label: Some("memory_session_fence_probe".into()),
+            })
+            .await;
+        if !matches!(&result, Ok(Some(SqlValue::Integer(1)))) {
+            if let Err(error) = result {
+                tracing::warn!(model = %entry.model, %error, "session fence probe failed");
+            }
+            unmet.push(entry.model.clone());
+        }
+    }
+    unmet
+}
+
+/// Return exact KNN candidates only when the same SQL statement also proves
+/// the write fence. An original log row proves the un-compacted tail; this
+/// consumer's active wildcard watermark proves a published segment covered a
+/// compacted row. The exact scan and both proof alternatives share one SQLite
+/// snapshot, so a separate preflight clock cannot certify later candidates.
+/// Per-namespace KNN queries are materialized before their union is ranked,
+/// so a global top-k cannot hide candidates in another visible namespace.
+pub(crate) async fn session_exact_candidates(
+    rt: &KhiveRuntime,
+    model: &str,
+    query: &[f32],
+    visible_namespaces: &[String],
+    receipt_namespace: &str,
+    required_seq: u64,
+    k: usize,
+) -> Result<Option<Vec<(Uuid, f32)>>, String> {
+    let Ok(required_seq) = i64::try_from(required_seq) else {
+        // SQLite rowids cannot reach this otherwise well-formed future fence.
+        return Ok(None);
+    };
+    if query.is_empty() || query.iter().any(|component| !component.is_finite()) {
+        return Err("session exact query vector is empty or non-finite".into());
+    }
+
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let query_blob = query.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let mut params = vec![
+        SqlValue::Blob(query_blob),
+        SqlValue::Integer(i64::try_from(k).unwrap_or(i64::MAX)),
+        SqlValue::Text(model.to_owned()),
+        SqlValue::Integer(required_seq),
+        SqlValue::Text(receipt_namespace.to_owned()),
+        SqlValue::Text(ANN_CONSUMER.into()),
+        SqlValue::Text(ANN_WILDCARD_NS.into()),
+    ];
+    let mut seen = HashSet::new();
+    let mut knn_ctes = Vec::new();
+    let mut union_arms = Vec::new();
+    let scopes = if k == 0 { &[][..] } else { visible_namespaces };
+    for namespace in scopes {
+        if !seen.insert(namespace.as_str()) {
+            continue;
+        }
+        let index = knn_ctes.len();
+        let parameter = params.len() + 1;
+        params.push(SqlValue::Text(namespace.clone()));
+        knn_ctes.push(format!(
+            "session_knn_{index} AS MATERIALIZED ( \
+               SELECT v.subject_id, v.namespace AS vector_namespace, distance \
+                 FROM {table_name} v \
+                WHERE embedding MATCH ?1 AND namespace = ?{parameter} \
+                  AND embedding_model = ?3 AND kind = 'note' AND field = 'note.content' \
+                ORDER BY distance LIMIT ?2)"
+        ));
+        union_arms.push(format!(
+            "SELECT subject_id, vector_namespace, distance FROM session_knn_{index}"
+        ));
+    }
+    let union = if union_arms.is_empty() {
+        "SELECT NULL AS subject_id, NULL AS vector_namespace, NULL AS distance WHERE 0".into()
+    } else {
+        union_arms.join(" UNION ALL ")
+    };
+    let knn_ctes = if knn_ctes.is_empty() {
+        String::new()
+    } else {
+        format!("{}, ", knn_ctes.join(", "))
+    };
+    let proof = session_fence_predicate(3, 4, 5, 6, 7);
+    let sql = format!(
+        "WITH session_proof AS MATERIALIZED ( \
+           SELECT ({proof}) AS has_fence), \
+         {knn_ctes}session_union AS MATERIALIZED ({union}), \
+         session_ranked AS MATERIALIZED ( \
+           SELECT c.subject_id, c.distance FROM session_union c \
+           JOIN notes n ON n.id = c.subject_id \
+             AND n.namespace = c.vector_namespace AND n.deleted_at IS NULL \
+           ORDER BY c.distance, c.subject_id LIMIT ?2) \
+         SELECT p.has_fence, r.subject_id, r.distance \
+           FROM session_proof p LEFT JOIN session_ranked r ON 1 = 1 \
+          ORDER BY r.distance, r.subject_id"
+    );
+    let mut reader = rt.sql().reader().await.map_err(|error| error.to_string())?;
+    #[cfg(test)]
+    let _ = SESSION_EXACT_STATEMENT_COUNT.try_with(|count| count.set(count.get() + 1));
+    let rows = reader
+        .query_all(SqlStatement {
+            sql,
+            params,
+            label: Some("memory_session_exact_snapshot".into()),
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let first = rows
+        .first()
+        .ok_or("session exact statement returned no proof row")?;
+    match first.get("has_fence") {
+        Some(SqlValue::Integer(0)) => return Ok(None),
+        Some(SqlValue::Integer(1)) => {}
+        other => {
+            return Err(format!(
+                "session exact proof has unexpected value {other:?}"
+            ))
+        }
+    }
+
+    let mut candidates = Vec::with_capacity(rows.len().min(k));
+    for row in rows {
+        let (id, distance) = match (row.get("subject_id"), row.get("distance")) {
+            (Some(SqlValue::Null), Some(SqlValue::Null)) => continue,
+            (Some(SqlValue::Text(id)), Some(SqlValue::Float(distance))) => (id, *distance),
+            other => {
+                return Err(format!(
+                    "session exact candidate has unexpected value {other:?}"
+                ))
+            }
+        };
+        let id = Uuid::parse_str(id).map_err(|error| format!("session exact id: {error}"))?;
+        // Mirror khive-db's sqlite_cosine_score boundary tolerance, then use
+        // the shared deterministic distance conversion (vectors.rs:170-196).
+        const BOUNDARY_EPSILON: f64 = 8.0 * f32::EPSILON as f64;
+        if !distance.is_finite()
+            || !(-BOUNDARY_EPSILON..=2.0 + BOUNDARY_EPSILON).contains(&distance)
+        {
+            return Err(format!(
+                "session exact cosine distance out of range: {distance}"
+            ));
+        }
+        let score = khive_score::try_score_from_distance(
+            distance.clamp(0.0, 2.0) as f32,
+            khive_types::DistanceMetric::Cosine,
+        )
+        .map_err(|error| error.to_string())?
+        .to_f64() as f32;
+        candidates.push((id, score));
+    }
+    Ok(Some(candidates))
 }
 
 /// Merge a fresh-tail's coalesced final ops into an ANN candidate list
@@ -5718,6 +5961,128 @@ mod tests {
             runtime: rt,
             _temp_dir: tmp,
         }
+    }
+
+    #[tokio::test]
+    async fn session_exact_snapshot_proves_receipt_with_candidates_and_zero_hits() {
+        const MODEL: &str = "session-exact-proof-model";
+        const CONTENT: &str = "distinctive session exact proof memory";
+        let rt = test_runtime_with_hash_embedder(MODEL, 8);
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        let (note, fences) = rt
+            .create_note_with_decay_for_embedding_model_with_visibility(
+                &token,
+                "memory",
+                None,
+                CONTENT,
+                Some(0.8),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("write note and exact visibility receipt");
+        let seq = fences
+            .iter()
+            .find(|(model, _)| model == MODEL)
+            .map(|(_, seq)| *seq)
+            .expect("model fence");
+        let query = fnv_to_vec(CONTENT, 8);
+        let candidates =
+            session_exact_candidates(&rt, MODEL, &query, &["local".into()], "local", seq, 10)
+                .await
+                .expect("one-statement exact read")
+                .expect("matching receipt is proven");
+        assert!(
+            candidates
+                .iter()
+                .any(|(id, score)| *id == note.id && *score > 0.95),
+            "candidate-producing read must include the recent matching note: {candidates:?}"
+        );
+
+        let empty = session_exact_candidates(&rt, MODEL, &query, &[], "local", seq, 10)
+            .await
+            .expect("empty-visible-set read")
+            .expect("the same statement still proves the receipt");
+        assert!(empty.is_empty(), "proof must survive zero candidates");
+        let zero_limit =
+            session_exact_candidates(&rt, MODEL, &query, &["local".into()], "local", seq, 0)
+                .await
+                .expect("zero-limit read")
+                .expect("zero limit still proves the receipt");
+        assert!(zero_limit.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_exact_snapshot_refuses_wrong_namespace_model_and_future_fence() {
+        const MODEL: &str = "session-exact-wrong-receipt-model";
+        let rt = test_runtime_with_hash_embedder(MODEL, 8);
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        let (_note, fences) = rt
+            .create_note_with_decay_for_embedding_model_with_visibility(
+                &token,
+                "memory",
+                None,
+                "session exact wrong receipt",
+                Some(0.8),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("write note and exact visibility receipt");
+        let seq = fences[0].1;
+        let query = fnv_to_vec("session exact wrong receipt", 8);
+        let visible = ["local".into()];
+        assert!(
+            session_exact_candidates(&rt, MODEL, &query, &visible, "other", seq, 10)
+                .await
+                .expect("namespace mismatch is not a read error")
+                .is_none()
+        );
+        assert!(
+            session_exact_candidates(&rt, MODEL, &query, &visible, "local", seq + 1, 10)
+                .await
+                .expect("future fence is not a read error")
+                .is_none()
+        );
+
+        let mut writer = rt.sql().writer().await.expect("SQL writer");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE ann_write_log SET op = 'delete' WHERE seq = ?1".into(),
+                params: vec![SqlValue::Integer(seq as i64)],
+                label: Some("session_exact_wrong_op_fixture".into()),
+            })
+            .await
+            .expect("alter fixture receipt operation");
+        drop(writer);
+        assert!(
+            session_exact_candidates(&rt, MODEL, &query, &visible, "local", seq, 10)
+                .await
+                .expect("delete receipt is not a read error")
+                .is_none()
+        );
+
+        let mut writer = rt.sql().writer().await.expect("SQL writer");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE ann_write_log SET op = 'upsert', embedding_model = 'other-model' WHERE seq = ?1"
+                    .into(),
+                params: vec![SqlValue::Integer(seq as i64)],
+                label: Some("session_exact_wrong_model_fixture".into()),
+            })
+            .await
+            .expect("alter fixture receipt model");
+        drop(writer);
+        assert!(
+            session_exact_candidates(&rt, MODEL, &query, &visible, "local", seq, 10)
+                .await
+                .expect("model mismatch is not a read error")
+                .is_none()
+        );
     }
 
     /// A completed warm releases its guard so a later write can trigger another rebuild.
