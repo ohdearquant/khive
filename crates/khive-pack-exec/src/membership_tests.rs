@@ -388,6 +388,10 @@ fn coverage_shared_prefix_build_and_long_deletion_queries_are_bounded() {
         state.query_bytes <= (4 * long.len()) as u64,
         "QUERY_BYTE_BUDGET: {state:?}"
     );
+    assert!(
+        state.query_lookups > 0 && state.query_lookups <= state.query_bytes,
+        "QUERY_LOOKUP_BUDGET: {state:?}"
+    );
     assert_eq!(state.queries, 2);
 }
 
