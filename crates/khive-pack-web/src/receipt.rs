@@ -17,7 +17,8 @@ pub const RECEIPT_PROVENANCE_VALUE: &str = khive_runtime::secret_gate::WEB_RECEI
 
 use khive_runtime::{EntityPatch, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{
-    Attachment, AttachmentSubstrate, ContentRef, Direction, EdgeRelation, NewAttachment,
+    Attachment, AttachmentSubstrate, ContentRef, Direction, EdgeRelation, NeighborQuery,
+    NewAttachment,
 };
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -81,13 +82,20 @@ pub(crate) async fn capture_for_body(
                 return Ok(Some((id, request.clone())));
             }
         }
+        // Only the node id is read, so skip the name and kind lookups.
         cursor = runtime
-            .neighbors(
+            .neighbors_with_query_page(
                 token,
                 id,
-                Direction::Out,
-                Some(1),
-                Some(vec![EdgeRelation::Supersedes]),
+                NeighborQuery {
+                    direction: Direction::Out,
+                    relations: Some(vec![EdgeRelation::Supersedes]),
+                    limit: Some(1),
+                    min_weight: None,
+                },
+                None,
+                None,
+                false,
             )
             .await?
             .first()
@@ -131,13 +139,20 @@ async fn receipt_annotates_document(
     receipt_id: Uuid,
     document_id: Uuid,
 ) -> Result<bool, RuntimeError> {
+    // Only the node id is compared, so skip the name and kind lookups.
     Ok(runtime
-        .neighbors(
+        .neighbors_with_query_page(
             token,
             receipt_id,
-            Direction::Out,
+            NeighborQuery {
+                direction: Direction::Out,
+                relations: Some(vec![EdgeRelation::Annotates]),
+                limit: None,
+                min_weight: None,
+            },
             None,
-            Some(vec![EdgeRelation::Annotates]),
+            None,
+            false,
         )
         .await?
         .iter()

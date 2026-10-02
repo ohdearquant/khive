@@ -12,7 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use khive_storage::error::StorageError;
+use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::event::{
     Event, EventAppendDisposition, EventFilter, EventObservation, IdempotentEventBatchResult,
     ObservationRole, ReferentKind,
@@ -33,6 +33,22 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     e.into_storage_error(StorageCapability::Events, op)
+}
+
+fn mark_unknown_append_usage(error: &StorageError) {
+    if matches!(
+        error,
+        StorageError::WriterTaskRequestFailed {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+            ..
+        } | StorageError::WriterTaskTerminated {
+            request_state: WriterTaskRequestState::SideEffectsUnknown,
+        }
+    ) {
+        if let Some(ctx) = khive_storage::usage::current() {
+            ctx.mark_unmeasured();
+        }
+    }
 }
 
 /// An EventStore backed by SQLite tables.
@@ -1281,7 +1297,8 @@ impl EventStore for SqlEventStore {
                 .await
                 .inspect(|()| {
                     khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-                });
+                })
+                .inspect_err(mark_unknown_append_usage);
         }
 
         // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
@@ -1304,6 +1321,7 @@ impl EventStore for SqlEventStore {
         .inspect(|()| {
             khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
         })
+        .inspect_err(mark_unknown_append_usage)
     }
 
     async fn append_events(&self, events: Vec<Event>) -> Result<BatchWriteSummary, StorageError> {
@@ -1326,7 +1344,8 @@ impl EventStore for SqlEventStore {
                         khive_storage::usage::UsageUnit::EventRows,
                         summary.affected,
                     );
-                });
+                })
+                .inspect_err(mark_unknown_append_usage);
         }
 
         // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
@@ -1357,6 +1376,7 @@ impl EventStore for SqlEventStore {
                 summary.affected,
             );
         })
+        .inspect_err(mark_unknown_append_usage)
     }
 
     async fn get_event(&self, id: Uuid) -> Result<Option<Event>, StorageError> {
