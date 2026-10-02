@@ -144,13 +144,20 @@ impl KgPack {
                         enrich,
                         namespace: namespace.clone(),
                     };
-                    let raw_hits = if origin.is_some() {
+                    let (raw_hits, entity_kinds) = if origin.is_some() {
                         self.runtime
-                            .neighbors_for_resolved_kg_read(token, node_id, options)
+                            .neighbors_for_resolved_kg_read_with_entity_kinds(
+                                token, node_id, options,
+                            )
                             .await?
                     } else {
                         registry
-                            .neighbors_for_kg_read(&self.runtime, token, node_id, options)
+                            .neighbors_for_kg_read_with_entity_kinds(
+                                &self.runtime,
+                                token,
+                                node_id,
+                                options,
+                            )
                             .await?
                     };
                     let raw_count = raw_hits.len();
@@ -159,14 +166,21 @@ impl KgPack {
                         let allowed = match permitted.get(&hit.node_id) {
                             Some(allowed) => *allowed,
                             None => {
-                                let allowed = message_neighbor_permitted(
-                                    &self.runtime,
-                                    registry,
-                                    token,
-                                    &mailbox_view,
-                                    &hit,
-                                )
-                                .await?;
+                                let allowed = if entity_kinds
+                                    .get(&hit.node_id)
+                                    .is_some_and(|kind| kind != "message")
+                                {
+                                    true
+                                } else {
+                                    message_neighbor_permitted(
+                                        &self.runtime,
+                                        registry,
+                                        token,
+                                        &mailbox_view,
+                                        &hit,
+                                    )
+                                    .await?
+                                };
                                 permitted.insert(hit.node_id, allowed);
                                 allowed
                             }

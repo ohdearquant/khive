@@ -43,6 +43,32 @@ impl VerbRegistry {
         node_id: Uuid,
         options: KgNeighborRead,
     ) -> Result<Vec<NeighborHit>, RuntimeError> {
+        self.neighbors_for_kg_read_inner(runtime, token, node_id, options, false)
+            .await
+            .map(|(hits, _)| hits)
+    }
+
+    /// Resolve a live origin and share entity-kind hints from its graph's
+    /// deletion screen with mailbox filtering, retaining the original token.
+    pub async fn neighbors_for_kg_read_with_entity_kinds(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        options: KgNeighborRead,
+    ) -> Result<(Vec<NeighborHit>, HashMap<Uuid, String>), RuntimeError> {
+        self.neighbors_for_kg_read_inner(runtime, token, node_id, options, true)
+            .await
+    }
+
+    async fn neighbors_for_kg_read_inner(
+        &self,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        options: KgNeighborRead,
+        with_entity_kinds: bool,
+    ) -> Result<(Vec<NeighborHit>, HashMap<Uuid, String>), RuntimeError> {
         neighbor_read_namespaces(token, options.namespace.as_ref())?;
         if self
             .resolve_kg_read_by_id(runtime, token, node_id, false)
@@ -54,9 +80,16 @@ impl VerbRegistry {
                 "neighbor anchor {node_id} not found"
             )));
         }
-        runtime
-            .neighbors_for_resolved_kg_read(token, node_id, options)
-            .await
+        if with_entity_kinds {
+            runtime
+                .neighbors_for_resolved_kg_read_with_entity_kinds(token, node_id, options)
+                .await
+        } else {
+            runtime
+                .neighbors_for_resolved_kg_read(token, node_id, options)
+                .await
+                .map(|hits| (hits, HashMap::new()))
+        }
     }
 
     /// The directed form of [`Self::neighbors_for_kg_read`], retaining stored
