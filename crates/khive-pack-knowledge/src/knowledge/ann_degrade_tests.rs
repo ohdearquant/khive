@@ -182,6 +182,10 @@ impl EmbedderProvider for ControlledRankingProvider {
 
 fn rt_with_fake_embedder() -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -210,6 +214,10 @@ fn rt_with_fake_embedder() -> KhiveRuntime {
 
 fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -242,6 +250,10 @@ fn rt_with_controlled_ranking(fail_fresh_rerank: bool) -> KhiveRuntime {
 /// `retrieval_snapshots` write path, so an in-memory rebuild persists nothing.
 pub(super) fn file_rt_with_fake_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),

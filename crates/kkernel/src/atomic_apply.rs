@@ -249,10 +249,8 @@ fn atomic_preparation_pack_names(cfg: &RuntimeConfig) -> Vec<String> {
 /// but classifying `verb-refused` requires the same loaded-vs-known distinction
 /// normal dispatch gets from `VerbRegistry::has_verb`.
 fn build_atomic_preflight_registry(cfg: &RuntimeConfig) -> Result<(VerbRegistry, KhiveRuntime)> {
-    let mut metadata_cfg = cfg.clone();
-    metadata_cfg.db_path = None;
-    metadata_cfg.embedding_model = None;
-    metadata_cfg.additional_embedding_models.clear();
+    // Pack-registry metadata has no file-backed writer; ADR-194 allows this explicit opt-out.
+    let mut metadata_cfg = cfg.clone().for_metadata_registry();
     metadata_cfg.default_namespace =
         Namespace::parse("kkernel-atomic-preflight").unwrap_or_else(|_| Namespace::local());
     let pack_names = metadata_cfg.packs.clone();
@@ -1624,6 +1622,41 @@ mod validate_atomic_args_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_preflight_registry_explicitly_disables_writer_ceiling() {
+        if crate::test_process::run_in_child() {
+            return;
+        }
+        std::env::set_var("KHIVE_SQLITE_WAL_CEILING_BYTES", "8192");
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("not-opened/database.db");
+        let cfg = RuntimeConfig {
+            db_path: Some(target.clone()),
+            packs: vec!["kg".into()],
+            wal_ceiling_bytes: 8192,
+            wal_ceiling_configured_bytes: 8192,
+            wal_ceiling_source: khive_runtime::WalCeilingSource::BackendField,
+            ..RuntimeConfig::no_embeddings()
+        };
+        let (registry, runtime) =
+            build_atomic_preflight_registry(&cfg).expect("ATOMIC_METADATA_CEILING_EXEMPTION");
+        assert!(registry.has_verb("create"));
+        assert!(!runtime.backend().is_file_backed());
+        assert_eq!(
+            runtime.config().wal_ceiling_source,
+            khive_runtime::WalCeilingSource::BackendField
+        );
+        assert_eq!(runtime.config().wal_ceiling_bytes, 0);
+        assert!(!target.parent().unwrap().exists());
+        let file = KhiveRuntime::new(cfg)
+            .err()
+            .expect("target still governed by captured policy");
+        assert!(matches!(
+            file,
+            RuntimeError::Sqlite(khive_db::SqliteError::WalCapacityUnavailable { bytes: 8192, .. })
+        ));
+    }
 
     use khive_types::Namespace;
 
