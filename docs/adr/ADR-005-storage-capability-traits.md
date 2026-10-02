@@ -793,7 +793,7 @@ No capability category, vocabulary validation, namespace authority, or backend p
 
 ## Amendment: input-aligned edge read outcomes (2026-10-01)
 
-**Status: Proposed.** This additive capability amendment concerns
+**Status: Accepted (2026-10-02).** This additive capability amendment concerns
 [#3701](https://github.com/ohdearquant/khive/issues/3701), KG `neighbors` Record and
 Edge projections. It must be accepted before dependent implementation merges. The accepted text above remains in force; this proposal does
 not change [ADR-007 Rules 1 and 2](ADR-007-namespace.md#rule-1--storage-is-dumb),
