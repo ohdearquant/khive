@@ -2127,9 +2127,12 @@ subtree does not claim that the whole project was scanned.
 For each participating owner, write its completed marker only after this
 invocation's file work, pending-write flush, synchronous re-resolution, natural
 unchanged-edge refresh and inbound containment refresh have all finished. The
-completed marker copies the current attempt's run ID and exact sweep-time
-string. This is one additional guarded project mutation after graph work, merged
-with fresh properties and other languages' state. It is not a request-wide
+completed marker carries this invocation's own run ID and exact sweep-time
+string. When the fresh project state's attempted marker for that owner does not
+carry this invocation's run ID, the invocation writes no completed marker, and
+the entry stays without reuse authority. This is one additional guarded project
+mutation after graph work, merged with fresh properties and other languages'
+state. It is not a request-wide
 transaction: prior graph/entity/FTS writes remain committed when a later
 operation fails or the future is cancelled.
 
@@ -2189,7 +2192,10 @@ is not an executed proof.
 - Exercise missing, malformed, unknown-version, incomplete and clock-mismatched
   new marker entries. Such entries must force real parsing without broadening
   legacy predicates. Repeat and reverse sweep times with distinct run IDs; a
-  timestamp-equality completion control must fail.
+  timestamp-equality completion control must fail. Replace the attempted marker
+  with a different valid run ID after this invocation's attempt and before its
+  completion: no completed marker is written and the next invocation parses for
+  real. A completion that copies the stored attempt must fail this arm.
 - Inject a real fault on the completion row, then a separate real fault on its
   post-row FTS write. Assert incomplete recovery in the first case and durable
   graph completion plus the returned FTS error in the second. Completing before
