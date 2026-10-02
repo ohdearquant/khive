@@ -27,6 +27,7 @@ fn memory_backend(name: &str) -> BackendConfig {
         path: None,
         cache_mb: None,
         journal_mode: None,
+        wal_ceiling_bytes: None,
         served_kinds: None,
         read_only: false,
     }

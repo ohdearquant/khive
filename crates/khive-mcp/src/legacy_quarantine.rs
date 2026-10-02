@@ -572,6 +572,7 @@ mod tests {
                     path: Some(path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 })
