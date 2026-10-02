@@ -2673,6 +2673,10 @@ fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
     // Default impl resolves embedding_model to a real on-disk model, which is
     // absent on CI runners and fails entity creation with ModelInitialization.
     let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
