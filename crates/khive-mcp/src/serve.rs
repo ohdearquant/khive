@@ -2928,7 +2928,12 @@ fn plan_configured_storage_targets(
                 canonical_backend_path(selected)?,
                 canonical_backend_path(main)?,
             ) {
-                (Some(selected), Some(main)) => selected == main,
+                (Some(selected), Some(main)) => {
+                    match (file_identity(&selected), file_identity(&main)) {
+                        (Some(selected), Some(main)) => selected == main,
+                        _ => selected == main,
+                    }
+                }
                 // A force-memory override intentionally creates one distinct
                 // ephemeral backend per configured name; only the literal
                 // main name is the canonical-main target in that mode.
