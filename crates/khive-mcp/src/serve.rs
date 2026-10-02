@@ -561,11 +561,18 @@ fn start_daemon_components_if_daemon(
     #[cfg(unix)]
     if server.default_runtime_is_read_only() {
         tracing::info!("read-only deployment: events daemon supervision skipped");
-    } else if let Some(split) = server.events_split_config() {
+    } else if let (Some(split), Some(wal_ceiling)) = (
+        server.events_split_config(),
+        server.events_wal_ceiling_policy(),
+    ) {
         if let Some(socket) = split.socket_path.clone() {
             khive_runtime::daemon::track_named_background_task(
                 "events_daemon_supervision",
-                khive_runtime::events_split::supervise_events_daemon(split.db_path.clone(), socket),
+                khive_runtime::events_split::supervise_events_daemon_with_wal_ceiling(
+                    split.db_path.clone(),
+                    socket,
+                    wal_ceiling,
+                ),
             );
         }
     }

@@ -5,13 +5,15 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use khive_db::{SqliteError, StorageBackend, WalCeilingSource};
+use khive_db::{ConnectionPool, SqliteError, StorageBackend, WalCeilingPolicy, WalCeilingSource};
 use khive_runtime::daemon::{read_frame, write_frame};
 use khive_runtime::events_split::{
     direct_backend_for, direct_backend_read_only_for, run_events_daemon, EventsRequest,
-    EventsResponse, TestRegistryGuard, EVENTS_PROTOCOL_VERSION,
+    EventsResponse, EventsSplitConfig, TestRegistryGuard, EVENTS_PROTOCOL_VERSION,
 };
-use khive_runtime::{KhiveRuntime, RuntimeConfig, RuntimeError};
+use khive_runtime::{
+    resolve_wal_ceiling, BackendKind, KhiveRuntime, Namespace, RuntimeConfig, RuntimeError,
+};
 use khive_storage::EventFilter;
 use tokio::net::UnixStream;
 
@@ -336,6 +338,8 @@ async fn events_wal_child() {
         daemon_case(&root, raw.as_deref()).await;
     } else if case.starts_with("cache_") {
         cache_case(&root, case == "cache_readonly");
+    } else if case.starts_with("backend_field_") {
+        backend_field_case(&root, &case).await;
     } else {
         let readonly = case == "readonly";
         let db = root.join("before-open").join("events.db");
@@ -379,8 +383,160 @@ async fn events_wal_child() {
     }
     let timeout_sink_expected = case == "readonly"
         || case.starts_with("cache_")
+        || case.starts_with("backend_field_")
         || matches!(raw.as_deref(), None | Some("0"));
     assert_private_timeout_sink(&root, timeout_sink_expected).await;
     assert!(!root.join("home").exists(), "fixtures must not touch HOME");
     println!("EVENT_WAL_CASE_EXECUTED");
+}
+
+#[test]
+fn runtime_events_use_explicit_zero_backend_field_over_nonzero_environment() {
+    run_case("backend_field_zero_events", Some("67108864"));
+}
+
+#[test]
+fn runtime_sidecar_sql_uses_explicit_zero_backend_field_over_nonzero_environment() {
+    run_case("backend_field_zero_sidecar", Some("67108864"));
+}
+
+#[test]
+fn runtime_events_report_nonzero_backend_field_over_different_environment() {
+    run_case("backend_field_nonzero_events", Some("16384"));
+}
+
+#[test]
+fn runtime_sidecar_sql_reports_nonzero_backend_field_over_different_environment() {
+    run_case("backend_field_nonzero_sidecar", Some("16384"));
+}
+
+fn assert_backend_field_report(pool: &ConnectionPool, configured: u64, readonly: bool) {
+    assert_eq!(pool.config().wal_ceiling.bytes, configured);
+    assert_eq!(
+        pool.config().wal_ceiling.source,
+        WalCeilingSource::BackendField
+    );
+    assert_eq!(pool.config().read_only, readonly);
+    let report = khive_db::diagnostics::collect(
+        pool,
+        khive_db::diagnostics::BuildIdentity::from_env("test", None),
+        Duration::from_secs(30),
+    );
+    assert_eq!(report.wal_ceiling.configured_bytes, configured);
+    assert_eq!(report.wal_ceiling.effective_bytes, 0);
+    assert_eq!(report.wal_ceiling.source, WalCeilingSource::BackendField);
+    assert!(!report.wal_ceiling.enabled);
+    assert_eq!(
+        report.wal_ceiling.status,
+        if readonly && configured > 0 {
+            "read_only_not_enforced"
+        } else {
+            "disabled"
+        }
+    );
+}
+
+async fn backend_field_case(root: &Path, case: &str) {
+    let readonly = case.starts_with("backend_field_nonzero_");
+    let field = if readonly { 8192 } else { 0 };
+    let inherited = std::env::var(WAL_ENV).expect("conflicting inherited ceiling");
+    assert_eq!(inherited, if readonly { "16384" } else { "67108864" });
+    let resolved = resolve_wal_ceiling(
+        Some(field),
+        Some(&inherited),
+        "main",
+        BackendKind::Sqlite,
+        true,
+        readonly,
+    )
+    .expect("explicit main backend field resolves before the environment");
+    assert_eq!(resolved.configured_bytes, field);
+    assert_eq!(resolved.effective_bytes, 0);
+    assert_eq!(resolved.source, WalCeilingSource::BackendField);
+    let policy = WalCeilingPolicy {
+        bytes: resolved.configured_bytes,
+        source: resolved.source,
+    };
+    let main_db = root.join("main.db");
+    let events_db = root.join("before-open").join("events.db");
+    if readonly {
+        seed_snapshot(&main_db);
+    }
+    if readonly || case.ends_with("_sidecar") {
+        std::fs::create_dir_all(events_db.parent().expect("fixture parent")).unwrap();
+        seed_snapshot(&events_db);
+    }
+    let backend = Arc::new(if readonly {
+        StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(&main_db, Some(2), policy)
+            .expect("read-only declared main backend opens")
+    } else {
+        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(&main_db, Some(2), policy)
+            .expect("explicit disabled main backend opens despite nonzero environment")
+    });
+    if !readonly {
+        backend
+            .prepare_core_schema()
+            .expect("prepared declared main schema");
+    }
+    let config = RuntimeConfig {
+        db_path: Some(main_db),
+        events_split: Some(EventsSplitConfig {
+            db_path: events_db.clone(),
+            socket_path: None,
+        }),
+        ..RuntimeConfig::no_embeddings()
+    };
+    // Named-backend hosts retain the fallback config; the opened main pool is authoritative.
+    assert_eq!(
+        config.wal_ceiling_env_raw.as_deref(),
+        Some(inherited.as_str())
+    );
+    assert_eq!(config.wal_ceiling_source, WalCeilingSource::Default);
+    assert_eq!(config.wal_ceiling_policy().bytes, 0);
+    let runtime = KhiveRuntime::from_backend(backend, config);
+    assert_backend_field_report(runtime.backend().pool(), field, readonly);
+    assert_eq!(runtime.diagnostic_backends().len(), 1);
+    let token = runtime
+        .authorize(Namespace::local())
+        .expect("local event fixture token");
+    let (events, sql) = if case.ends_with("_events") {
+        (
+            Some(runtime.events(&token).expect(
+                "EVENT_BACKEND_FIELD: events accessor must open with the main pool policy",
+            )),
+            None,
+        )
+    } else {
+        (None, Some(runtime.events_sidecar_sql_read_only()
+            .expect("EVENT_BACKEND_FIELD: sidecar SQL accessor must open with the main pool policy")
+            .expect("preexisting events sidecar must be available")))
+    };
+    if let Some(events) = &events {
+        assert_eq!(
+            events
+                .count_events(EventFilter::default())
+                .await
+                .expect("merged event fixture reads"),
+            0
+        );
+    }
+    assert!(
+        events.is_some() || sql.is_some(),
+        "the requested accessor must return its live capability"
+    );
+    let canonical_events = events_db.canonicalize().expect("opened events file");
+    let opened = runtime.diagnostic_backends();
+    assert_eq!(opened.len(), 2, "main and events are distinct opened pools");
+    let lanes: Vec<_> = opened
+        .iter()
+        .filter(|entry| entry.canonical_path.as_deref() == Some(canonical_events.as_path()))
+        .collect();
+    assert_eq!(
+        lanes.len(),
+        1,
+        "the actual events pool must appear once in runtime diagnostics"
+    );
+    assert_eq!(lanes[0].backend_names, vec!["events".to_owned()]);
+    assert_backend_field_report(&lanes[0].pool, field, readonly);
+    assert_backend_field_report(runtime.backend().pool(), field, readonly);
 }
