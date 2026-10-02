@@ -2791,6 +2791,7 @@ dependencies = [
  "khive-quant",
  "libc",
  "memmap2",
+ "nix",
  "rand 0.8.7",
  "rayon",
  "serde",

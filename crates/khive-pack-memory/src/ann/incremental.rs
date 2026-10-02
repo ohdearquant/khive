@@ -49,6 +49,12 @@ pub(super) fn checkpoint_policy(ann: &SharedAnn) -> CheckpointPolicy {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The replay-versus-rebuild cost boundary is independent of the cumulative
+/// delta-chain compaction limit (ADR-079 Amendment 1, restart rule 7).
+pub(super) fn replay_limit(live: u64, rebuild_fraction: f64) -> u64 {
+    (rebuild_fraction * live as f64).ceil() as u64
+}
+
 pub(super) async fn checkpoint_due(ann: &SharedAnn, key: &AnnKey) -> bool {
     if !ann.builds_corpus_indexes {
         return false;
@@ -64,6 +70,10 @@ pub(super) async fn checkpoint_due(ann: &SharedAnn, key: &AnnKey) -> bool {
 pub(super) fn load_segment(ann: &SharedAnn, dir: &std::path::Path) -> Result<AnnBridge, String> {
     #[cfg(test)]
     ann.segment_load_count.fetch_add(1, Ordering::SeqCst);
+    #[cfg(test)]
+    if ann.fail_next_segment_load.swap(false, Ordering::SeqCst) {
+        return Err("injected segment re-adoption failure".into());
+    }
     #[cfg(not(test))]
     let _ = ann;
     AnnBridge::load(dir)
@@ -110,9 +120,9 @@ pub(super) enum InstalledMaintenance {
 }
 
 pub(super) struct IncrementalTail {
-    ops: Vec<(Uuid, Option<Vec<f32>>)>,
-    applied: u64,
-    raw_count: u64,
+    pub(super) ops: Vec<(Uuid, Option<Vec<f32>>)>,
+    pub(super) applied: u64,
+    pub(super) raw_count: u64,
 }
 
 /// Read the delta and its raw row count under the same registry-protected snapshot.
@@ -158,7 +168,9 @@ pub(super) async fn maintain_installed(
         return Ok(InstalledMaintenance::Absent);
     };
     let policy = checkpoint_policy(ann);
-    let max_delta = (policy.rebuild_fraction * live as f64).ceil() as u64;
+    // Bound this *tail* by replay cost. Cumulative delta headroom only chooses
+    // whether the accepted tail publishes another chunk or a full checkpoint.
+    let max_delta = replay_limit(live as u64, policy.rebuild_fraction);
     let IncrementalTail {
         ops,
         applied: new_s,
@@ -185,11 +197,13 @@ pub(super) async fn maintain_installed(
             return Ok(InstalledMaintenance::Absent);
         }
         if raw_count > 0 {
+            let recorded_ops = ops.clone();
             if let Err(error) = bridge.apply_final_ops(ops, new_s) {
                 tracing::warn!(%error, model, "memory ANN incremental apply failed; rebuilding");
                 indexes.remove(key);
                 return Ok(InstalledMaintenance::Rebuild);
             }
+            bridge.record_delta_batch(recorded_ops, new_s, raw_count);
         }
         bridge.generation = generation;
         bridge.dirty_ops = bridge.dirty_ops.saturating_add(raw_count);
@@ -197,8 +211,10 @@ pub(super) async fn maintain_installed(
             // Deltas span all namespaces. Empty is the conservative over-fetch policy.
             bridge.namespace_set.clear();
         }
-        let publish = policy.due(bridge);
-        if publish {
+        // Crossing the chain limit must compact the already-applied bridge in
+        // this pass. It is not a reason to rescan and rebuild the corpus.
+        let publish = policy.due(bridge) || (raw_count > 0 && bridge.needs_full_compaction());
+        if publish && bridge.needs_full_compaction() {
             bridge
                 .consolidate_if_needed(policy.consolidate_tau)
                 .map_err(RuntimeError::Internal)?;
@@ -220,13 +236,26 @@ pub(super) async fn maintain_installed(
             persist_file_checkpoint(rt, ann, model, &dir, bridge, WatermarkAuthority::Active).await;
         drop(indexes);
         match publication {
-            Ok(Some(mut reopened)) => {
+            Ok(CheckpointResult::Full {
+                reopened: Some(mut reopened),
+                ..
+            }) => {
                 reopened.generation = generation;
                 reopened.epoch_baseline = epoch;
-                install_replacing(ann, key, reopened).await;
+                install_replacing(ann, key, *reopened).await;
             }
-            Ok(None) => {
+            Ok(CheckpointResult::Full {
+                reopened: None,
+                base_digest,
+            }) => {
                 if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
+                    bridge.mark_full_checkpoint_base(base_digest);
+                    bridge.mark_checkpointed();
+                }
+            }
+            Ok(CheckpointResult::Delta(publication)) => {
+                if let Some(bridge) = ann.indexes.write().await.get_mut(key) {
+                    bridge.mark_delta_checkpoint(&publication);
                     bridge.mark_checkpointed();
                 }
             }
@@ -267,6 +296,11 @@ pub(super) async fn maintain_installed(
         }
         let mut indexes = ann.indexes.write().await;
         if let Some(bridge) = indexes.get_mut(key) {
+            // A pathless publication has no delta chain to retain or compact.
+            bridge.delta_batches.clear();
+            bridge.delta_raw_ops = 0;
+            bridge.delta_chunks = 0;
+            bridge.base_ops = bridge.index.num_vectors();
             bridge.mark_checkpointed();
         }
         drop(indexes);
