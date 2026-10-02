@@ -1178,12 +1178,116 @@ describe("repository showcase", () => {
     const { container } = render(<RepoShowcase bundle={bundle} />);
     await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
 
+    const timeline = container.querySelector<HTMLElement>("[data-cadence-timeline]")!;
+    expect(container.querySelectorAll("[data-cadence-timeline]")).toHaveLength(1);
+    expect(timeline.querySelectorAll("table")).toHaveLength(1);
     expect(container.querySelector('[data-cadence-series="commits"]')).toHaveAttribute("data-series-status", "complete");
-    for (const id of ["issues_opened", "issues_closed", "pull_requests_opened", "pull_requests_merged"]) {
+    for (const id of ["issues_opened", "issues_closed", "pull_requests_opened", "pull_requests_merged"] as const) {
       const series = container.querySelector<HTMLElement>(`[data-cadence-series="${id}"]`)!;
       expect(series).toHaveAttribute("data-series-status", "unavailable");
+      expect(series.querySelector("table")).toBeNull();
       expect(within(series).getAllByText(bundle.capability.labels.unavailable).length).toBeGreaterThan(0);
+      const reason = bundle.aggregates.cadence_timeline[id].disclosure.reason;
+      expect(series).toHaveTextContent(reason!);
     }
+  });
+
+  it("filters one chronological cadence timeline in place without dropping other series", async () => {
+    const bundle = structuredClone(golden());
+    const analysis = bundle.aggregates.cadence_timeline;
+    analysis.issues_opened = {
+      ...analysis.issues_opened,
+      items: [
+        { week_start: "2026-06-29", count: 3 },
+        { week_start: "2026-08-10", count: 4 },
+      ],
+      total_count: { status: "available", value: 2 },
+      truncated: false,
+      next_cursor: null,
+      disclosure: { status: "complete", reason: null },
+    };
+    analysis.pull_requests_merged = {
+      ...analysis.pull_requests_merged,
+      items: [{ week_start: "2026-07-13", count: 2 }],
+      total_count: { status: "available", value: 1 },
+      truncated: false,
+      next_cursor: null,
+      disclosure: { status: "complete", reason: null },
+    };
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+
+    const timeline = container.querySelector<HTMLElement>("[data-cadence-timeline]")!;
+    const rows = () => Array.from(timeline.querySelectorAll<HTMLElement>("[data-cadence-row]"));
+    const location = window.location.href;
+    expect(timeline.querySelectorAll("table")).toHaveLength(1);
+    expect(timeline).toHaveAttribute("data-total-rows", "13");
+    expect(rows()).toHaveLength(13);
+    expect(rows().map((row) => row.dataset.weekStart)).toEqual(
+      rows().map((row) => row.dataset.weekStart).sort((left, right) => left!.localeCompare(right!)),
+    );
+    expect(rows().map((row) => row.dataset.series)).toContain("issues_opened");
+    expect(rows().map((row) => row.dataset.series)).toContain("pull_requests_merged");
+
+    await user.click(within(timeline).getByRole("button", { name: bundle.capability.labels.metrics.issues_opened }));
+    expect(container.querySelector("[data-cadence-timeline]")).toBe(timeline);
+    expect(window.location.href).toBe(location);
+    expect(timeline).toHaveAttribute("data-total-rows", "13");
+    expect(timeline).toHaveAttribute("data-active-series", "issues_opened");
+    expect(rows().map((row) => [row.dataset.weekStart, row.dataset.series])).toEqual([
+      ["2026-06-29", "issues_opened"],
+      ["2026-08-10", "issues_opened"],
+    ]);
+    expect(container.querySelector(".repo-chart")).toHaveTextContent(
+      bundle.capability.labels.metrics.issues_opened,
+    );
+
+    await user.click(within(timeline).getByRole("button", { name: "All series" }));
+    expect(container.querySelector("[data-cadence-timeline]")).toBe(timeline);
+    expect(window.location.href).toBe(location);
+    expect(rows()).toHaveLength(13);
+    expect(timeline.querySelectorAll("table")).toHaveLength(1);
+  });
+
+  it("keeps empty and truncated cadence reasons with their series bounds", async () => {
+    const bundle = structuredClone(golden());
+    const analysis = bundle.aggregates.cadence_timeline;
+    analysis.issues_closed = {
+      ...analysis.issues_closed,
+      items: [],
+      total_count: { status: "available", value: 0 },
+      truncated: false,
+      next_cursor: null,
+      disclosure: { status: "complete", reason: null },
+    };
+    analysis.pull_requests_merged = {
+      ...analysis.pull_requests_merged,
+      items: [{ week_start: "2026-07-13", count: 2 }],
+      total_count: { status: "available", value: 7 },
+      bound: { ...analysis.pull_requests_merged.bound, max_items: 1 },
+      truncated: true,
+      next_cursor: "more-merged-weeks",
+      disclosure: { status: "truncated", reason: "fixture cadence sampling bound" },
+    };
+    const user = userEvent.setup();
+    const { container } = render(<RepoShowcase bundle={bundle} />);
+    await user.click(container.querySelector('[data-view-id="cadence_timeline"]')!);
+
+    const timeline = container.querySelector<HTMLElement>("[data-cadence-timeline]")!;
+    const empty = container.querySelector<HTMLElement>('[data-cadence-series="issues_closed"]')!;
+    const truncated = container.querySelector<HTMLElement>('[data-cadence-series="pull_requests_merged"]')!;
+    expect(empty).toHaveAttribute("data-series-status", "complete");
+    expect(empty.querySelector('[data-state="empty"]')).toBeVisible();
+    expect(empty).toHaveTextContent("0 / 0");
+    expect(truncated).toHaveAttribute("data-series-status", "truncated");
+    expect(truncated.querySelector('[data-state="truncated"]')).toHaveAttribute("data-bound", "1");
+    expect(truncated).toHaveTextContent("fixture cadence sampling bound");
+
+    await user.click(within(timeline).getByRole("button", { name: bundle.capability.labels.metrics.issues_closed }));
+    expect(timeline.querySelector('[data-state="empty"]')).toBeVisible();
+    await user.click(within(timeline).getByRole("button", { name: bundle.capability.labels.metrics.issues_opened }));
+    expect(timeline.querySelector('[data-state="unavailable"]')).toHaveTextContent("issue-open cadence was not requested");
   });
 
   it("reports a cursor-bearing cadence series as truncated even when its disclosure says complete", async () => {

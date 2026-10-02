@@ -1,12 +1,13 @@
 //! Deterministic identity for web entities (ADR-191 D1).
 //!
-//! `site` keys on `(scheme, host, port)`; `page` and `resource` key on
+//! `site` keys on `(write namespace, scheme, host, port)`; `page` and `resource` key on
 //! `(site, canonical path+query)` — the SAME formula for both subtypes,
 //! deliberately: D3 re-types an unfetched `resource` to `page` IN PLACE when
 //! `fetch` later learns the body is HTML, and identity must not change when
 //! that happens ("the id does not change because identity is by address").
 //! Subtype is a property of content, never an input to the id.
 
+use khive_types::Namespace;
 use uuid::Uuid;
 
 /// Fixed namespace UUID for every `Uuid::new_v5` computed by this pack.
@@ -52,9 +53,13 @@ pub fn site_key(url: &url::Url) -> String {
     )
 }
 
-/// Deterministic id for the `site` entity owning `url`.
-pub fn site_id(url: &url::Url) -> Uuid {
-    Uuid::new_v5(&WEB_NAMESPACE, format!("site|{}", site_key(url)).as_bytes())
+/// Deterministic id for the `site` entity owning `url` in `write_namespace`.
+/// The namespace must be the one in the authorized token used for persistence.
+pub fn site_id(write_namespace: &Namespace, url: &url::Url) -> Uuid {
+    Uuid::new_v5(
+        &WEB_NAMESPACE,
+        format!("site|{}|{}", write_namespace.as_str(), site_key(url)).as_bytes(),
+    )
 }
 
 /// Canonical path+query string used as the second half of the `page`/
@@ -128,7 +133,7 @@ mod tests {
             canonicalize(Url::parse("https://example.com/x?id=1#section").unwrap());
         let different_value = canonicalize(Url::parse("https://example.com/x?id=2").unwrap());
 
-        let site = site_id(&base);
+        let site = site_id(&Namespace::local(), &base);
         let id_a = document_id(site, &path_and_query(&base));
         let id_b = document_id(site, &path_and_query(&same_fragment_only));
         let id_c = document_id(site, &path_and_query(&different_value));
@@ -153,8 +158,11 @@ mod tests {
             let right =
                 canonicalize(Url::parse(&format!("https://example.com/item?{right}")).unwrap());
             assert_ne!(
-                document_id(site_id(&left), &path_and_query(&left)),
-                document_id(site_id(&right), &path_and_query(&right)),
+                document_id(site_id(&Namespace::local(), &left), &path_and_query(&left)),
+                document_id(
+                    site_id(&Namespace::local(), &right),
+                    &path_and_query(&right)
+                ),
                 "{left} versus {right}"
             );
         }
@@ -182,8 +190,11 @@ mod tests {
             let right =
                 canonicalize(Url::parse(&format!("https://example.com/item?{right}")).unwrap());
             assert_eq!(
-                document_id(site_id(&left), &path_and_query(&left)),
-                document_id(site_id(&right), &path_and_query(&right))
+                document_id(site_id(&Namespace::local(), &left), &path_and_query(&left)),
+                document_id(
+                    site_id(&Namespace::local(), &right),
+                    &path_and_query(&right)
+                )
             );
         }
     }
@@ -194,7 +205,7 @@ mod tests {
         // computes the id whether the caller intends `page` or `resource`,
         // which is what lets fetch re-type a row in place.
         let url = canonicalize(Url::parse("https://example.com/robots.txt").unwrap());
-        let site = site_id(&url);
+        let site = site_id(&Namespace::local(), &url);
         let first = document_id(site, &path_and_query(&url));
         let second = document_id(site, &path_and_query(&url));
         assert_eq!(first, second);
@@ -204,17 +215,23 @@ mod tests {
     fn explicit_non_default_port_is_preserved_in_site_identity() {
         let default_port = canonicalize(Url::parse("https://example.com/").unwrap());
         let explicit_port = canonicalize(Url::parse("https://example.com:8443/").unwrap());
-        assert_ne!(site_id(&default_port), site_id(&explicit_port));
+        assert_ne!(
+            site_id(&Namespace::local(), &default_port),
+            site_id(&Namespace::local(), &explicit_port)
+        );
     }
 
     #[test]
     fn same_tuple_from_independent_parses_converges() {
         let a = canonicalize(Url::parse("https://example.com/a?b=1&a=2").unwrap());
         let b = canonicalize(Url::parse("https://EXAMPLE.com:443/a?a=2&b=1").unwrap());
-        assert_eq!(site_id(&a), site_id(&b));
         assert_eq!(
-            document_id(site_id(&a), &path_and_query(&a)),
-            document_id(site_id(&b), &path_and_query(&b))
+            site_id(&Namespace::local(), &a),
+            site_id(&Namespace::local(), &b)
+        );
+        assert_eq!(
+            document_id(site_id(&Namespace::local(), &a), &path_and_query(&a)),
+            document_id(site_id(&Namespace::local(), &b), &path_and_query(&b))
         );
     }
 

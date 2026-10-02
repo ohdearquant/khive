@@ -1629,6 +1629,10 @@ async fn upsert_entities(
                 version: 1,
                 content_ref: None,
             };
+            khive_runtime::secret_gate::reject_reserved_secret_gate_property(
+                entity.properties.as_ref(),
+            )
+            .map_err(|error| anyhow!("entity {} properties rejected: {error}", entity.id))?;
             // Use the canonical FTS document constructor so sync, create, update,
             // merge, and reindex all produce identical document shapes.
             let fts_doc = entity_fts_document(&entity);
@@ -4049,4 +4053,36 @@ async fn issue2673_sync_upserts_advance_destination_entity_version() {
             version
         );
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn direct_entity_upsert_refuses_reserved_properties_before_storage() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = runtime.authorize(khive_types::Namespace::local()).unwrap();
+    let id = Uuid::new_v4();
+    let record = NdjsonEntity {
+        id,
+        kind: "concept".into(),
+        entity_type: None,
+        name: "reserved sync row".into(),
+        description: None,
+        properties: Some(serde_json::json!({
+            "khive:secret_gate": "exempted:content-sha256-manifest-v1"
+        })),
+        tags: vec![],
+        created_at: None,
+        updated_at: None,
+    };
+    let error = upsert_entities(&runtime, "local", vec![record])
+        .await
+        .expect_err("direct sync writer must refuse the reserved property");
+    assert!(error.to_string().contains("khive:secret_gate"), "{error}");
+    assert!(runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(id)
+        .await
+        .unwrap()
+        .is_none());
 }

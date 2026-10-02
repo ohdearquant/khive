@@ -7,7 +7,7 @@ use khive_runtime::{
     AllowAllGate, BackendId, EmailMessageIdDomains, KhiveRuntime, Namespace, NamespaceToken,
     NotePatch, RequestIdentity, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
-use khive_storage::types::{SqlRow, SqlValue};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_storage::Note;
 use khive_types::{Pack, Visibility};
 
@@ -5070,6 +5070,83 @@ fn build_identity_registry(
     (registry, rt)
 }
 
+#[tokio::test]
+async fn generic_message_lists_keep_same_namespace_mailboxes_separate() {
+    let backend = shared_backend();
+    let (sender, _) = build_actor_registry(backend.clone(), "lambda:sender");
+    let (recipient, _) = build_actor_registry(backend.clone(), "lambda:recipient");
+    let (other, _) = build_actor_registry(backend, "lambda:other");
+
+    let public = other
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "observation", "content": "visible observation"}),
+        )
+        .await
+        .expect("other actor creates a non-message note");
+    let public_id = public["id"].as_str().expect("observation id");
+    let sent = sender
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:recipient",
+                "content": "private same-namespace message"
+            }),
+        )
+        .await
+        .expect("sender writes a dual-copy message");
+    let thread_prefix = &sent["full_id"].as_str().expect("outbound id")[..8];
+
+    for (actor, registry, expected_messages) in [
+        ("sender", &sender, 1),
+        ("recipient", &recipient, 1),
+        ("other", &other, 0),
+    ] {
+        let explicit = registry
+            .dispatch("list", serde_json::json!({"kind": "message", "limit": 10}))
+            .await
+            .expect("explicit message list");
+        assert_eq!(
+            list_items(&explicit).len(),
+            expected_messages,
+            "{actor}: {explicit}"
+        );
+    }
+
+    for args in [
+        serde_json::json!({"kind": "note", "limit": 1}),
+        serde_json::json!({"kind": "note", "limit": 1, "after": ""}),
+    ] {
+        let broad = other.dispatch("list", args).await.expect("broad note list");
+        let notes = broad["items"]
+            .as_array()
+            .or_else(|| broad["notes"].as_array())
+            .expect("note page");
+        assert_eq!(notes.len(), 1, "{broad}");
+        assert_eq!(notes[0]["id"], public_id, "{broad}");
+        assert!(!broad.to_string().contains("private same-namespace message"));
+    }
+
+    let hidden_prefix = other
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": thread_prefix}),
+        )
+        .await
+        .expect_err("a foreign thread prefix is outside this mailbox");
+    assert!(hidden_prefix
+        .to_string()
+        .contains("no message thread matches"));
+    let own_prefix = recipient
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": thread_prefix}),
+        )
+        .await
+        .expect("recipient resolves its thread prefix");
+    assert_eq!(list_items(&own_prefix).len(), 1, "{own_prefix}");
+}
+
 /// Actor A sends to actor B.
 #[tokio::test]
 async fn t_actor_inbox_filters_to_actor() {
@@ -5692,7 +5769,7 @@ async fn imap_account_keys_keep_accounts_distinct_and_recognize_same_account_leg
 }
 
 #[tokio::test]
-async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
+async fn imap_legacy_key_repairs_duplicate_quarantine_before_ack() {
     use khive_storage::BlobStore as _;
 
     let (registry, runtime) = build_registry_for_ns("local");
@@ -5705,6 +5782,10 @@ async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
         .put(b"quarantined original".to_vec())
         .await
         .expect("publish original");
+    let wrong_ref = blob_store
+        .put(b"different original".to_vec())
+        .await
+        .expect("publish different original");
     runtime
         .install_blob_store(blob_store)
         .expect("install blob store");
@@ -5736,32 +5817,137 @@ async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
         .await
         .expect("leave metadata-only legacy row"));
 
+    let replay = |content_ref: String| {
+        serde_json::json!({
+            "from": "email:quarantine", "to": "email:a@example.com",
+            "content": "quarantined replay", "channel_kind": "email",
+            "channel_slug": "a@example.com", "external_id": new_id,
+            "legacy_external_id": old_id,
+            "metadata": {
+                "quarantined": true,
+                "quarantine_content_ref": content_ref,
+            },
+        })
+    };
     let error = registry
-        .dispatch(
-            "comm.ingest",
-            serde_json::json!({
-                "from": "email:quarantine", "to": "email:a@example.com",
-                "content": "quarantined replay", "channel_kind": "email",
-                "channel_slug": "a@example.com", "external_id": new_id,
-                "legacy_external_id": old_id,
-                "metadata": {
-                    "quarantined": true,
-                    "quarantine_content_ref": original_ref.to_string(),
-                },
-            }),
-        )
+        .dispatch("comm.ingest", replay(wrong_ref.to_string()))
         .await
-        .expect_err("a legacy-key ack must not bypass quarantine ownership repair");
+        .expect_err("different original bytes must not receive a duplicate ack");
     assert!(matches!(
         error,
         khive_runtime::RuntimeError::InvalidInput(message)
-            if message.contains("legacy_external_id cannot be combined with quarantine metadata")
+            if message.contains("duplicate quarantine external_id holds different original bytes")
     ));
     assert!(attachments
         .get_attachment(note_id, "quarantine-original")
         .await
         .expect("attachment lookup")
         .is_none());
+
+    let duplicate = registry
+        .dispatch("comm.ingest", replay(original_ref.to_string()))
+        .await
+        .expect("matching legacy quarantine replay repairs before ack");
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(duplicate["thread_id"], original["thread_id"]);
+    let attachment = attachments
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("attachment lookup")
+        .expect("owner repaired");
+    assert_eq!(attachment.content_ref, original_ref);
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let notes = runtime.notes(&token).expect("note store");
+    assert_eq!(
+        notes.count_notes("local", Some("message")).await.unwrap(),
+        1
+    );
+    let old_note = notes
+        .get_note(note_id)
+        .await
+        .unwrap()
+        .expect("old row retained");
+    assert_eq!(old_note.properties.unwrap()["external_id"], old_id);
+}
+
+#[tokio::test]
+async fn imap_legacy_key_backfills_original_on_note_only_quarantine() {
+    use khive_storage::BlobStore as _;
+
+    let (registry, runtime) = build_registry_for_ns("local");
+    let blob_root = tempfile::tempdir().expect("blob root");
+    let blob_store = Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+            .expect("blob store"),
+    );
+    let original_ref = blob_store
+        .put(b"byte-exact legacy quarantine original".to_vec())
+        .await
+        .expect("publish original");
+    runtime
+        .install_blob_store(blob_store)
+        .expect("install blob store");
+    let old_id = "imap:mail.example.com:17:note-only";
+    let new_id = "imap:mail.example.com:a@example.com:17:note-only";
+    let old = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "old note-only quarantine", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": old_id,
+                "metadata": {"quarantined": "true", "quarantine_reason": "off-allowlist"},
+            }),
+        )
+        .await
+        .expect("seed note-only quarantine");
+    let replay = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "replayed quarantine", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": new_id,
+                "legacy_external_id": old_id,
+                "metadata": {
+                    "quarantined": "true",
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("same-mailbox old key must repair before duplicate acknowledgement");
+    assert_eq!(replay["deduplicated"], true);
+    assert_eq!(replay["thread_id"], old["thread_id"]);
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let notes = runtime.notes(&token).expect("note store");
+    assert_eq!(
+        notes.count_notes("local", Some("message")).await.unwrap(),
+        1
+    );
+    let note_id = old["full_id"]
+        .as_str()
+        .expect("old note id")
+        .parse()
+        .expect("canonical UUID");
+    let note = notes
+        .get_note(note_id)
+        .await
+        .unwrap()
+        .expect("old row retained");
+    let props = note.properties.expect("old row properties");
+    assert_eq!(props["external_id"], old_id);
+    assert_eq!(props["quarantine_content_ref"], original_ref.to_string());
+    let owner = runtime
+        .core()
+        .attachments()
+        .expect("attachment store")
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("attachment lookup")
+        .expect("legacy note roots its original");
+    assert_eq!(owner.content_ref, original_ref);
 }
 
 /// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must echo the literal stored value — not fabricate the duplicate's note UUID (which would route a caller into a DIFFERENT thread on a later send).
@@ -14729,6 +14915,62 @@ async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
         channels[0]["channel_slug"].as_str(),
         Some("recipient@example.com")
     );
+}
+
+/// Coordinate patches must fail before any sibling property or note revision changes (#2990).
+#[tokio::test]
+async fn heartbeat_refuses_carried_reserved_property_without_changing_row() {
+    let (registry, runtime) = build_registry_for_ns("local");
+    let heartbeat = serde_json::json!({
+        "namespace": "local",
+        "channel_kind": "email",
+        "channel_slug": "reserved@example.com",
+        "poll_interval_secs": 5,
+        "outcome": "success",
+    });
+    registry
+        .dispatch("comm.heartbeat", heartbeat.clone())
+        .await
+        .expect("seed heartbeat");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let rows = runtime
+        .list_notes(&token, Some("channel_health"), 10, 0)
+        .await
+        .expect("read heartbeat");
+    assert_eq!(rows.len(), 1);
+    let before = &rows[0];
+    let mut planted = before.properties.clone().expect("properties");
+    planted["khive:secret_gate"] = serde_json::json!({"legacy": true});
+    let mut writer = runtime.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+            params: vec![
+                SqlValue::Text(planted.to_string()),
+                SqlValue::Text(before.id.to_string()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("plant stored key");
+    drop(writer);
+
+    let error = registry
+        .dispatch("comm.heartbeat", heartbeat)
+        .await
+        .expect_err("carried reserved key must be refused");
+    assert!(
+        matches!(&error, khive_runtime::RuntimeError::InvalidInput(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("khive:secret_gate"), "{error}");
+    let after = runtime
+        .get_note_including_deleted(&token, before.id)
+        .await
+        .expect("read row")
+        .expect("heartbeat row");
+    assert_eq!(after.properties, Some(planted), "row changed");
+    assert_eq!(after.updated_at, before.updated_at, "revision changed");
 }
 
 /// Coordinate patches must fail before any sibling property or note revision changes (#2990).

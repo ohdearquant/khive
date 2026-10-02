@@ -1491,7 +1491,8 @@ the async boundary waits without another cancellation timeout; if detachment
 wins, a later classifier returns the typed timeout before executing SQLite.
 
 Operator controls are `KHIVE_REQUEST_READ_TIMEOUT_SECS` (default 30, valid
-1–3600 seconds, invalid/zero falls back to the nonzero default),
+1–86400 seconds since Amendment 23; above the maximum clamps to it, invalid/zero
+falls back to the nonzero default, and either correction logs a warning),
 `KHIVE_SQLITE_INTERRUPT_GRACE_MS` (default 500, valid 10–5000 ms), and
 `KHIVE_SQLITE_INTERRUPT_HARD_CAP_MS` (default 5000, valid 100–60000 ms, the
 second-stage join bound above). These bound read work and interrupt
@@ -1992,3 +1993,39 @@ and the busy clause of Amendment 21 item 2. Everything else in both stands.
     no run reaches one second, and no report carries a pin depth.
   - A TRUNCATE no-progress event under a commit loop with no reader logs `backfill_gap_frames` and no
     field named as a pin depth.
+
+### 2026-09-30 amendment (Amendment 23): a one-day request-read ceiling for trusted local work
+
+**Context.** `KHIVE_REQUEST_READ_TIMEOUT_SECS` accepted 1–3600 seconds, and any other value, including
+a larger one, silently became the 30-second default. The deadline is per request and never renewed.
+A trusted local bulk ingest of a graph archive with over a hundred thousand entities projected past
+3600 seconds in one request, so the only way to finish it was to cut the archive into slices by hand. Setting a longer value did
+not help and did not say so: 7200 ran with 30 seconds.
+
+**Decision.**
+
+- The accepted range is 1–86400 seconds (`MAX_REQUEST_READ_TIMEOUT_SECS`). The default stays 30.
+- A value above 86400 is clamped to 86400. Zero, a negative number or a non-integer uses the default,
+  so the guard is never disabled. Either correction logs a warning, once per process, naming the value
+  that was set and the ceiling in force. No value is corrected silently.
+- One resolver in `khive-storage` owns the range; the MCP server's own copy of the range check is
+  removed and it records the resolved value as before.
+- The deadline stays per request and non-renewing, and cancellation is unchanged. This amendment
+  changes only how long one request may be allowed to run when the operator asks for it.
+
+**Scope.** The setting is read from the process environment of the daemon or of an in-process
+`kkernel exec`. It is an operator control, not a request parameter, so no caller can raise it. A
+deployment that serves other tenants keeps whatever ceiling its operator sets; this amendment only
+widens what an operator may choose.
+
+**Alternatives considered.**
+
+- _An explicit unbounded sentinel (`0`)._ Rejected: zero has meant "use the default" since the
+  setting shipped, and reusing it would turn an existing misconfiguration into an unbounded read. A
+  finite one-day maximum covers the measured case.
+- _Refuse to start on an out-of-range value._ Rejected: the resolver is read per request as well as at
+  startup, and a warning plus a stated correction keeps every entry path answering the same way.
+
+**Acceptance.** A resolver test maps unset, 1, 3600, 7200 and 86400 to themselves (unset to 30),
+86401 to 86400 with a correction, and 0, a negative value and a non-integer to 30 with a correction.
+With the old range, 7200 resolves to 30 and the test fails.
