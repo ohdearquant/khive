@@ -959,8 +959,9 @@ memory provenance extension requires its own source/API and first-error decision
 **Status: Proposed.** This additive runtime adapter concerns
 [#3709](https://github.com/ohdearquant/khive/issues/3709) and
 [#3729](https://github.com/ohdearquant/khive/issues/3729). It must be accepted before
-dependent implementation merges. The accepted EventStore capability, namespace
-contract, dispatch Gate and event transport remain unchanged.
+dependent implementation merges. Apart from the query_events ordering requirement
+below, the EventStore capability, namespace contract, dispatch Gate and event
+transport remain unchanged.
 
 ### Runtime adapter over the existing capability
 
@@ -997,6 +998,13 @@ moodboard retains its original storage conversion and moodboard messages. Both
 callers map each mechanical variant explicitly.
 
 ### Exact cursor behavior
+
+Every EventStore::query_events implementation must return rows ordered
+created_at DESC, id DESC. This is a trait requirement for every backend; the
+implementation change adds this same requirement to the trait's method doc.
+The cursor walk below is defined only under that order. A page in any other
+order is outside the contract, including a page returned through a forwarding
+or merged-store adapter.
 
 The adapter reproduces the existing collectors, including these edge cases:
 
@@ -1064,6 +1072,36 @@ response parity for aggregation. Include ties below, at and beyond 4096,
 i64 extrema, duplicate re-reads, final-page budget clipping, storage failures,
 count/walk divergence, and the signed saturation-order witness. Migrate all
 existing tests of the removed exhaustive Vec path onto the shipping visitor.
+
+Order conformance must cover differing timestamps, equal-timestamp UUID ties,
+and paginated output for every production EventStore implementation:
+
+- SqlEventStore has query_events_orders_by_created_at_then_id_desc in
+  crates/khive-db/src/stores/event_tests.rs. It currently checks the equal-timestamp
+  UUID tie; extend it to cover timestamp order and pagination.
+- AttributedEventStore delegates query_events unchanged to its inner store.
+  It needs attributed_query_events_preserves_created_at_then_id_desc to check
+  that delegation with an ordered backing store.
+- ForwardingEventStore returns the received page unchanged. It needs
+  forwarding_query_events_preserves_created_at_then_id_desc to check the
+  complete forwarded page order through the event transport.
+- SplitEventStore sorts its merged page by created_at DESC, id DESC before
+  applying the requested offset and limit. Its existing
+  split_store_routes_plain_to_legacy_idempotent_to_lane_and_merges_reads checks
+  membership, not order. It needs
+  split_query_events_orders_by_created_at_then_id_desc across both stores,
+  timestamp and UUID ties, and page boundaries.
+- The cursor walk's Store test double in
+  crates/khive-runtime/tests/event_cursor_walk.rs must return that order too.
+  It needs cursor_store_orders_by_created_at_then_id_desc to check its query
+  output.
+- AppendAfterCountStore in crates/khive-pack-brain/src/tests.rs delegates
+  query_events unchanged and must retain that order in the concurrent-boundary
+  fixture.
+- The implementation must include ascending_query_events_page_is_detected_or_refused
+  with a deliberately ascending page. The arm must detect the walk's failure
+  under that non-conforming order or refuse the page, with bounded query calls;
+  it must never accept silent repeated delivery as successful traversal.
 
 A dedicated integration test binary must measure actual peak live allocation
 against increasing admitted populations with fixed output-key cardinality,
