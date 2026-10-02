@@ -51,6 +51,10 @@ pub(crate) struct StatementObserverHub {
 /// Scoped observation of all connections owned by one private test pool.
 ///
 /// This includes its queued writer and replacement/standalone connections.
+/// Each connection runs its setup statements before observation starts on that
+/// connection; those statements are never recorded, even when the connection
+/// opens during an active observation. Reader connection opens are tracked by the
+/// existing reader acquisition counters, separately from statement starts.
 /// Unrelated work on the same pool is included; use an isolated pool without
 /// background work and select the target SQL from the resulting records.
 /// Only one observation may be active per pool. Dropping this guard stops new

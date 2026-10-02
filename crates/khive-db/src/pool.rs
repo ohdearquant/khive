@@ -2285,6 +2285,9 @@ impl ConnectionPool {
     /// preparation alone does not count. The guard observes every pool-owned
     /// connection, including the queued writer. Do not run unrelated background
     /// work on the fixture pool; see the guard documentation for limitations.
+    /// Connection setup runs before observation begins on each connection and
+    /// is never recorded, including for opens during an active observation.
+    /// Reader connection opens use the existing reader acquisition counters instead.
     #[cfg(any(test, feature = "test-support"))]
     pub fn observe_test_statement_starts(
         &self,

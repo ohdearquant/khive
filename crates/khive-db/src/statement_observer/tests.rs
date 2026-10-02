@@ -277,6 +277,39 @@ fn replacement_and_standalone_connections_share_pool_observation() {
 }
 
 #[test]
+fn fresh_standalone_connection_excludes_setup_statements() {
+    for wal in [true, false] {
+        let (_dir, pool) = fixture(wal, true, false);
+        let before = pool.reader_acquisition_snapshot();
+        let observation = pool.observe_test_statement_starts(256).unwrap();
+        let connection = pool
+            .open_standalone_reader(StandaloneReaderPurpose::ExplicitSqlReadTransaction)
+            .unwrap();
+        let after = pool.reader_acquisition_snapshot();
+        assert_eq!(after.standalone_opens, before.standalone_opens + 1);
+        assert_eq!(
+            after.infrastructure_standalone_opens,
+            before.infrastructure_standalone_opens
+        );
+        let sql = "SELECT 271 AS fresh_standalone_statement";
+        assert_eq!(
+            connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            271
+        );
+        assert_eq!(
+            observation.started_statements().unwrap(),
+            vec![StartedStatement {
+                sql: sql.to_owned(),
+                readonly: true,
+            }],
+            "only the known statement is observed, with no connection setup SQL"
+        );
+    }
+}
+
+#[test]
 fn observation_off_is_zero_and_unwind_releases_the_guard() {
     let (_dir, pool) = fixture(false, false, false);
     let observation = pool.observe_test_statement_starts(128).unwrap();
