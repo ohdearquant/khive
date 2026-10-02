@@ -5,6 +5,11 @@ use std::time::Duration;
 use khive_storage::{StorageCapability, StorageError};
 use thiserror::Error;
 
+/// Stable ADR-194 capacity stages. The refusal stage is reserved for the WAL
+/// I/O limiter; this configuration-only slice emits only unavailable.
+pub const SQLITE_WAL_CAPACITY_REFUSED_STAGE: &str = "sqlite_wal_capacity_refused";
+pub const SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE: &str = "sqlite_wal_capacity_unavailable";
+
 /// Errors produced by the SQLite storage backend.
 #[derive(Debug, Error)]
 pub enum SqliteError {
@@ -46,6 +51,38 @@ pub enum SqliteError {
         floor_bytes: u64,
     },
 
+    /// A configured WAL ceiling cannot be represented by SQLite's signed
+    /// file-offset arithmetic.
+    #[error("invalid WAL ceiling {bytes} bytes: exceeds supported SQLite file offsets")]
+    WalCeilingOffsetOverflow { bytes: u64 },
+
+    /// A WAL ceiling was enabled for a backend that cannot produce a WAL.
+    #[error("invalid WAL ceiling {bytes} bytes: {backend_kind} does not support WAL enforcement")]
+    WalCeilingUnsupported {
+        bytes: u64,
+        backend_kind: &'static str,
+    },
+
+    /// One committed WAL frame cannot fit, even immediately after reset.
+    #[error(
+        "invalid WAL ceiling {bytes} bytes: page size {page_size} requires at least {minimum_bytes} bytes for one WAL frame"
+    )]
+    WalCeilingBelowMinimum {
+        bytes: u64,
+        page_size: u64,
+        minimum_bytes: u64,
+    },
+
+    /// A valid enabled policy cannot run until its WAL I/O limiter exists.
+    #[error(
+        "{stage}: WAL ceiling {bytes} bytes cannot be enforced: missing {capability}",
+        stage = SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE
+    )]
+    WalCapacityUnavailable {
+        bytes: u64,
+        capability: &'static str,
+    },
+
     /// A `PoolConfig` value violated a validated invariant at configuration
     /// load time (e.g. ADR-131 Decision 2's `write_admission_deadline_ms`
     /// range). Fires before any connection is opened, and is never silently
@@ -68,6 +105,14 @@ pub enum SqliteError {
 }
 
 impl SqliteError {
+    /// Stable structured stage for an ADR-194 WAL-capacity failure.
+    pub fn wal_capacity_stage(&self) -> Option<&'static str> {
+        match self {
+            Self::WalCapacityUnavailable { .. } => Some(SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE),
+            _ => None,
+        }
+    }
+
     pub(crate) fn into_storage_error(
         self,
         capability: StorageCapability,

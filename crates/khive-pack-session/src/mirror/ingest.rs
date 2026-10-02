@@ -122,6 +122,718 @@ pub struct MirrorStats {
     /// still have claimed. The dispatch loop treats the advance as
     /// uncontested only when the same pass also `scanned` no ordinary line.
     pub skipped_oversized_bytes: bool,
+    /// Identity of the file handle read for this pass. Persisted with an
+    /// advancing cursor so a same-path replacement cannot inherit its offset.
+    pub file_identity: Option<String>,
+}
+
+/// Stable across appends, but different for a replacement file at the same
+/// path. The identity is read from the open handle, so the identity a caller
+/// compares is the identity of the object it reads:
+///
+/// - Unix: device and inode (`unix:<dev>:<ino>`).
+/// - Windows: volume serial number and 128-bit file id from `FileIdInfo`
+///   (`windows:<volume>:<file id>`, hexadecimal). Creation time is not used
+///   there: NTFS file system tunneling can give a file re-created or renamed
+///   into a recently vacated name the creation time of the file it replaced.
+/// - Other targets, which have neither: file creation time where available.
+pub(crate) fn file_identity(file: &std::fs::File) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(format!("unix:{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(windows)]
+    {
+        use std::fmt::Write as _;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+        };
+
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: `file` keeps the handle live for the call; `info` is a
+        // writable buffer of the exact size FileIdInfo requires.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&raw mut info).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut identity = format!("windows:{:016x}:", info.VolumeSerialNumber);
+        for byte in info.FileId.Identifier {
+            let _ = write!(identity, "{byte:02x}");
+        }
+        Ok(identity)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(format!("created:{:?}", file.metadata()?.created().ok()))
+    }
+}
+
+fn open_source_file(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        return windows_source_open::open_file(path);
+    }
+    #[cfg(not(windows))]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(path)
+    }
+}
+
+/// Open a scheduled source through its configured directory, refusing untrusted
+/// ancestor links and a linked final file. Each directory handle pins the
+/// component used by the next handle-relative open, so replacing a parent during the walk
+/// cannot redirect the remaining components outside `root`.
+#[derive(Clone, Copy)]
+pub(crate) struct TrustedSource<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) directory_identities: &'a [String],
+}
+
+/// Prove the configured root through native directory handles before its
+/// identity can become the first probe's witness. Root-owned ancestor links
+/// resolve only when a root-owned parent prevents non-root entry replacement.
+/// The final root component still refuses every link.
+/// No pathname canonicalization admits a root.
+#[cfg(unix)]
+fn open_source_root(root: &Path) -> std::io::Result<Vec<std::fs::File>> {
+    use std::ffi::{CString, OsStr, OsString};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+
+    fn open_anchor(absolute: bool) -> std::io::Result<std::fs::File> {
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        options.open(if absolute { "/" } else { "." })
+    }
+
+    fn walk_components(
+        pinned_directories: &mut Vec<std::fs::File>,
+        path: &Path,
+        allow_final_link: bool,
+        remaining_links: &mut u32,
+    ) -> std::io::Result<()> {
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let name = match component {
+                Component::RootDir | Component::CurDir => continue,
+                Component::ParentDir => OsStr::new(".."),
+                Component::Normal(name) => name,
+                Component::Prefix(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "mirror source root contains an unsupported path prefix",
+                    ));
+                }
+            };
+            open_component(
+                pinned_directories,
+                name,
+                allow_final_link || components.peek().is_some(),
+                remaining_links,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn open_component(
+        pinned_directories: &mut Vec<std::fs::File>,
+        name: &OsStr,
+        allow_root_owned_link: bool,
+        remaining_links: &mut u32,
+    ) -> std::io::Result<()> {
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mirror source root contains a NUL byte",
+            )
+        })?;
+        let parent_fd = pinned_directories
+            .last()
+            .expect("root anchor is retained")
+            .as_raw_fd();
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY,
+            )
+        };
+        if fd >= 0 {
+            pinned_directories.push(unsafe { std::fs::File::from_raw_fd(fd) });
+            return Ok(());
+        }
+        let open_error = std::io::Error::last_os_error();
+        if !allow_root_owned_link {
+            return Err(open_error);
+        }
+        if !matches!(
+            open_error.raw_os_error(),
+            Some(libc::ELOOP) | Some(libc::ENOTDIR)
+        ) {
+            return Err(open_error);
+        }
+        let mut link_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent_fd,
+                name.as_ptr(),
+                link_stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let link_stat = unsafe { link_stat.assume_init() };
+        if link_stat.st_mode & libc::S_IFMT != libc::S_IFLNK {
+            return Err(open_error);
+        }
+        if link_stat.st_uid != 0 {
+            return Err(std::io::Error::other(
+                "mirror source root has a non-root-owned ancestor symlink",
+            ));
+        }
+        let mut parent_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(parent_fd, parent_stat.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let parent_stat = unsafe { parent_stat.assume_init() };
+        if !ancestor_symlink_parent_fd_is_trusted(
+            parent_fd,
+            parent_stat.st_uid,
+            parent_stat.st_mode,
+        ) {
+            return Err(std::io::Error::other(
+                "mirror source root ancestor symlink parent permits non-root entry replacement",
+            ));
+        }
+        if *remaining_links == 0 {
+            return Err(std::io::Error::other(
+                "mirror source root exceeds the ancestor symlink limit",
+            ));
+        }
+        *remaining_links -= 1;
+        let mut target = vec![0u8; libc::PATH_MAX as usize];
+        let length = unsafe {
+            libc::readlinkat(
+                parent_fd,
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if length < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if length == 0 || length as usize == target.len() {
+            return Err(std::io::Error::other(
+                "mirror source root ancestor symlink target is empty or too long",
+            ));
+        }
+        target.truncate(length as usize);
+        let mut after = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                parent_fd,
+                name.as_ptr(),
+                after.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let after = unsafe { after.assume_init() };
+        if after.st_dev != link_stat.st_dev
+            || after.st_ino != link_stat.st_ino
+            || after.st_mode != link_stat.st_mode
+            || after.st_uid != link_stat.st_uid
+        {
+            return Err(std::io::Error::other(
+                "mirror source root ancestor symlink changed while resolving",
+            ));
+        }
+        let target = PathBuf::from(OsString::from_vec(target));
+        if target.is_absolute() {
+            pinned_directories.push(open_anchor(true)?);
+        }
+        walk_components(pinned_directories, &target, true, remaining_links)
+    }
+
+    let mut pinned_directories = vec![open_anchor(root.is_absolute())?];
+    // Retain every directory handle until the source leaf opens.
+    let mut remaining_links = 8;
+    walk_components(&mut pinned_directories, root, false, &mut remaining_links)?;
+    Ok(pinned_directories)
+}
+
+#[cfg(unix)]
+fn ancestor_symlink_parent_is_trusted(uid: libc::uid_t, mode: libc::mode_t) -> bool {
+    uid == 0 && (mode & 0o022 == 0 || mode & libc::S_ISVTX != 0)
+}
+
+#[cfg(unix)]
+fn ancestor_symlink_parent_fd_is_trusted(
+    parent_fd: std::os::fd::RawFd,
+    uid: libc::uid_t,
+    mode: libc::mode_t,
+) -> bool {
+    if !ancestor_symlink_parent_is_trusted(uid, mode) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ancestor_symlink_parent_has_no_acl(parent_fd)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = parent_fd;
+        true
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ancestor_symlink_parent_has_no_acl(parent_fd: std::os::fd::RawFd) -> bool {
+    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: libc::c_int, acl_type: libc::c_int) -> *mut libc::c_void;
+        fn acl_free(acl: *mut libc::c_void) -> libc::c_int;
+    }
+
+    // The pinned parent, rather than its pathname, supplies the ACL witness.
+    let acl = unsafe { acl_get_fd_np(parent_fd, ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        // Darwin reports an absent FILESEC_ACL as ENOENT; other failures refuse.
+        return std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT);
+    }
+    unsafe { acl_free(acl) };
+    false
+}
+
+#[cfg(unix)]
+pub(crate) fn open_source_file_beneath(
+    root: &Path,
+    path: &Path,
+    expected_directories: Option<&[String]>,
+) -> std::io::Result<(std::fs::File, Vec<String>)> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let relative = path.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mirror source is outside its configured root",
+        )
+    })?;
+    let mut components = relative.components().peekable();
+    if components.peek().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "mirror source does not name a file beneath its configured root",
+        ));
+    }
+
+    // Retain the configured root's ancestors and every subsequent directory
+    // until the leaf opens. Every child open uses the proved parent handle.
+    let mut pinned_directories = open_source_root(root)?;
+    let mut directory_identities = Vec::new();
+    let root_identity = file_identity(
+        pinned_directories
+            .last()
+            .expect("configured root is retained"),
+    )?;
+    if expected_directories.is_some_and(|expected| expected.first() != Some(&root_identity)) {
+        return Err(std::io::Error::other(
+            "mirror source root changed after its metadata probe",
+        ));
+    }
+    if expected_directories.is_none() {
+        directory_identities.push(root_identity);
+    }
+    let mut directory_depth = 1;
+
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mirror source contains a non-normal path component",
+            ));
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "mirror source contains a NUL byte",
+            )
+        })?;
+        let last = components.peek().is_none();
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let flags = if last {
+            flags
+        } else {
+            flags | libc::O_DIRECTORY
+        };
+        let directory = pinned_directories
+            .last()
+            .expect("source parent is retained");
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let opened = unsafe { std::fs::File::from_raw_fd(fd) };
+        if last {
+            if expected_directories.is_some_and(|expected| expected.len() != directory_depth) {
+                return Err(std::io::Error::other(
+                    "mirror source ancestor count changed after its metadata probe",
+                ));
+            }
+            return Ok((opened, directory_identities));
+        }
+        let identity = file_identity(&opened)?;
+        if expected_directories
+            .is_some_and(|expected| expected.get(directory_depth) != Some(&identity))
+        {
+            return Err(std::io::Error::other(
+                "mirror source parent changed after its metadata probe",
+            ));
+        }
+        if expected_directories.is_none() {
+            directory_identities.push(identity);
+        }
+        directory_depth += 1;
+        pinned_directories.push(opened);
+    }
+    unreachable!("nonempty component iterator must return its final file")
+}
+
+#[cfg(windows)]
+pub(crate) use windows_source_open::open_source_file_beneath;
+
+#[cfg(windows)]
+mod windows_source_open {
+    use std::ffi::OsStr;
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+    use std::path::{Component, Path};
+
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        NtCreateFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    };
+    use windows_sys::Win32::Foundation::{
+        RtlNtStatusToDosError, HANDLE, OBJ_CASE_INSENSITIVE, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    use super::file_identity;
+
+    fn invalid(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, message)
+    }
+
+    fn verify_handle(file: &File, directory: bool) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || (directory && !metadata.is_dir())
+            || (!directory && !metadata.is_file())
+        {
+            return Err(invalid(
+                "mirror source component has the wrong kind or is a reparse point",
+            ));
+        }
+        Ok(())
+    }
+
+    fn open_root(root: &Path) -> io::Result<Vec<File>> {
+        let root = if root.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            root
+        };
+        let absolute = if root.is_absolute() {
+            root.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(root)
+        };
+        let mut pinned = Vec::new();
+        // Pin every configured-root ancestor without delete sharing. A later
+        // absolute open cannot traverse a swapped-in junction above `root`.
+        for ancestor in absolute.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(ancestor)?;
+            verify_handle(&file, true)?;
+            pinned.push(file);
+        }
+        if pinned.is_empty() {
+            return Err(invalid("mirror source root is empty"));
+        }
+        Ok(pinned)
+    }
+
+    pub(super) fn open_file(path: &Path) -> io::Result<File> {
+        let file = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        verify_handle(&file, false)?;
+        Ok(file)
+    }
+
+    fn open_child(directory: &File, name: &OsStr, last: bool) -> io::Result<File> {
+        let mut wide: Vec<u16> = name.encode_wide().collect();
+        if wide.is_empty()
+            || wide.iter().any(|unit| {
+                *unit == 0
+                    || *unit == u16::from(b'/')
+                    || *unit == u16::from(b'\\')
+                    || *unit == u16::from(b':')
+            })
+        {
+            return Err(invalid(
+                "mirror source contains an invalid Windows path component",
+            ));
+        }
+        let byte_len = wide
+            .len()
+            .checked_mul(std::mem::size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| invalid("mirror source component is too long"))?;
+        let unicode_name = UNICODE_STRING {
+            Length: byte_len,
+            MaximumLength: byte_len,
+            Buffer: wide.as_mut_ptr(),
+        };
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: directory.as_raw_handle(),
+            ObjectName: &raw const unicode_name,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            SecurityDescriptor: std::ptr::null(),
+            SecurityQualityOfService: std::ptr::null(),
+        };
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let desired_access = if last {
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        } else {
+            FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+        };
+        let create_options = if last {
+            FILE_NON_DIRECTORY_FILE
+        } else {
+            FILE_DIRECTORY_FILE
+        } | FILE_OPEN_REPARSE_POINT
+            | FILE_SYNCHRONOUS_IO_NONALERT;
+        let share_mode = if last {
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_WRITE
+        };
+        // SAFETY: the name buffer, structures, and pinned parent handle remain
+        // live for the call. The successful child handle is owned by `File`.
+        let status = unsafe {
+            NtCreateFile(
+                &raw mut handle,
+                desired_access,
+                &raw const attributes,
+                &raw mut io_status,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                share_mode,
+                FILE_OPEN,
+                create_options,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: translating a returned NTSTATUS has no preconditions.
+            let error = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        // SAFETY: `handle` was freshly returned by `NtCreateFile` and is
+        // transferred exactly once.
+        let file = unsafe { File::from_raw_handle(handle as RawHandle) };
+        verify_handle(&file, !last)?;
+        Ok(file)
+    }
+
+    pub(crate) fn open_source_file_beneath(
+        root: &Path,
+        path: &Path,
+        expected_directories: Option<&[String]>,
+    ) -> io::Result<(File, Vec<String>)> {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| invalid("mirror source is outside its configured root"))?;
+        let mut components = relative.components().peekable();
+        if components.peek().is_none() {
+            return Err(invalid(
+                "mirror source does not name a file beneath its configured root",
+            ));
+        }
+
+        let mut pinned_directories = open_root(root)?;
+        let root_identity = file_identity(
+            pinned_directories
+                .last()
+                .ok_or_else(|| invalid("mirror source root is empty"))?,
+        )?;
+        if expected_directories.is_some_and(|expected| expected.first() != Some(&root_identity)) {
+            return Err(io::Error::other(
+                "mirror source root changed after its metadata probe",
+            ));
+        }
+        let mut directory_identities = Vec::new();
+        if expected_directories.is_none() {
+            directory_identities.push(root_identity);
+        }
+        let mut directory_depth = 1;
+
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(invalid(
+                    "mirror source contains a non-normal path component",
+                ));
+            };
+            let last = components.peek().is_none();
+            let opened = open_child(
+                pinned_directories
+                    .last()
+                    .ok_or_else(|| invalid("mirror source root is empty"))?,
+                name,
+                last,
+            )?;
+            if last {
+                if expected_directories.is_some_and(|expected| expected.len() != directory_depth) {
+                    return Err(io::Error::other(
+                        "mirror source ancestor count changed after its metadata probe",
+                    ));
+                }
+                return Ok((opened, directory_identities));
+            }
+            let identity = file_identity(&opened)?;
+            if expected_directories
+                .is_some_and(|expected| expected.get(directory_depth) != Some(&identity))
+            {
+                return Err(io::Error::other(
+                    "mirror source parent changed after its metadata probe",
+                ));
+            }
+            if expected_directories.is_none() {
+                directory_identities.push(identity);
+            }
+            directory_depth += 1;
+            pinned_directories.push(opened);
+        }
+        unreachable!("nonempty component iterator must return its final file")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::ffi::OsStr;
+
+        use super::{open_child, open_root};
+        use tempfile::TempDir;
+
+        #[test]
+        fn mirror_windows_pinned_intermediate_directory_cannot_leave_root() {
+            let temp = TempDir::new().expect("tempdir");
+            let root = temp.path().join("root");
+            let outside = temp.path().join("outside");
+            let parent = root.join("staged");
+            let moved = outside.join("staged");
+            std::fs::create_dir_all(&parent).expect("staged directory");
+            std::fs::create_dir_all(&outside).expect("outside directory");
+            std::fs::write(parent.join("source.jsonl"), b"inside\n").expect("source file");
+
+            std::fs::rename(&parent, &moved).expect("unheld directory can leave root");
+            std::fs::rename(&moved, &parent).expect("restore source directory");
+
+            let directories = open_root(&root).expect("pin root ancestors");
+            let directory = open_child(
+                directories.last().expect("root handle"),
+                OsStr::new("staged"),
+                false,
+            )
+            .expect("pin intermediate directory");
+            assert!(
+                std::fs::rename(&parent, &moved).is_err(),
+                "an opened intermediate directory must not leave its configured root"
+            );
+            assert!(open_child(&directory, OsStr::new("source.jsonl"), true).is_ok());
+
+            drop(directory);
+            std::fs::rename(&parent, &moved).expect("rename succeeds after releasing directory");
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn open_source_file_beneath(
+    _root: &Path,
+    _path: &Path,
+    _expected_directories: Option<&[String]>,
+) -> std::io::Result<(std::fs::File, Vec<String>)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure directory-relative mirror source opens are unavailable on this platform",
+    ))
+}
+
+fn checked_identity(
+    file: &std::fs::File,
+    metadata: &std::fs::Metadata,
+    expected_identity: Option<&str>,
+) -> std::io::Result<String> {
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "mirror source is not a regular file",
+        ));
+    }
+    let identity = file_identity(file)?;
+    if expected_identity.is_some_and(|expected| expected != identity.as_str()) {
+        return Err(std::io::Error::other(
+            "mirror source was replaced after its metadata probe",
+        ));
+    }
+    Ok(identity)
 }
 
 /// Ceiling on bytes read per `mirror_file` call in production (8 MiB); bounds
@@ -212,6 +924,27 @@ pub async fn mirror_file_deferred(
     source: LineTailSource,
     codex_session_id: Option<&str>,
 ) -> Result<MirrorStats, RuntimeError> {
+    mirror_file_deferred_checked(
+        runtime,
+        path,
+        start_offset,
+        source,
+        codex_session_id,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn mirror_file_deferred_checked(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    source: LineTailSource,
+    codex_session_id: Option<&str>,
+    expected_identity: Option<&str>,
+    trusted_source: Option<TrustedSource<'_>>,
+) -> Result<MirrorStats, RuntimeError> {
     mirror_file_inner(
         runtime,
         path,
@@ -220,6 +953,8 @@ pub async fn mirror_file_deferred(
         codex_session_id,
         MirrorLimits::production(),
         false,
+        expected_identity,
+        trusted_source,
     )
     .await
 }
@@ -235,9 +970,26 @@ pub async fn mirror_file_deferred(
 pub async fn commit_empty_advance(
     runtime: &KhiveRuntime,
     path: &Path,
-    new_offset: u64,
+    stats: &MirrorStats,
 ) -> Result<(), RuntimeError> {
-    write_cursor_only(runtime, path, &None, new_offset).await
+    write_cursor_only(
+        runtime,
+        path,
+        &None,
+        stats.new_offset,
+        stats.file_identity.as_deref(),
+    )
+    .await
+}
+
+/// Store a legacy cursor's first observed identity without changing its offset.
+pub async fn adopt_cursor_identity(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    offset: u64,
+    identity: &str,
+) -> Result<(), RuntimeError> {
+    write_cursor_only(runtime, path, &None, offset, Some(identity)).await
 }
 
 /// A single bounded read pass: at most `limits.max_bytes_per_pass` bytes and
@@ -248,6 +1000,7 @@ struct MirrorChunk {
     new_offset: u64,
     /// See [`MirrorStats::skipped_oversized_bytes`].
     skipped_oversized_bytes: bool,
+    file_identity: String,
 }
 
 /// Outcome of `read_line_bounded` for one line. See
@@ -341,15 +1094,25 @@ fn read_bounded_chunk(
     source: LineTailSource,
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
+    expected_identity: Option<&str>,
+    trusted_source: Option<TrustedSource<'_>>,
 ) -> std::io::Result<MirrorChunk> {
-    let mut file = std::fs::File::open(path)?;
-    let file_len = file.metadata()?.len();
+    let mut file = match trusted_source {
+        Some(source) => {
+            open_source_file_beneath(source.root, path, Some(source.directory_identities))?.0
+        }
+        None => open_source_file(path)?,
+    };
+    let metadata = file.metadata()?;
+    let identity = checked_identity(&file, &metadata, expected_identity)?;
+    let file_len = metadata.len();
     if start_offset >= file_len {
         return Ok(MirrorChunk {
             events: Vec::new(),
             scanned: 0,
             new_offset: start_offset,
             skipped_oversized_bytes: false,
+            file_identity: identity,
         });
     }
 
@@ -454,6 +1217,7 @@ fn read_bounded_chunk(
         scanned,
         new_offset,
         skipped_oversized_bytes,
+        file_identity: identity,
     })
 }
 
@@ -474,6 +1238,8 @@ async fn mirror_file_with_limits(
         codex_session_id,
         limits,
         true,
+        None,
+        None,
     )
     .await
 }
@@ -484,6 +1250,7 @@ async fn mirror_file_with_limits(
 /// if no later candidate inserts rows for the same span (see
 /// `candidate_dispatch` in `service.rs`). When true (every non-dispatch
 /// caller and test), the cursor is committed immediately as before.
+#[allow(clippy::too_many_arguments)]
 async fn mirror_file_inner(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -492,14 +1259,24 @@ async fn mirror_file_inner(
     codex_session_id: Option<&str>,
     limits: MirrorLimits,
     commit_empty_advance: bool,
+    expected_identity: Option<&str>,
+    trusted_source: Option<TrustedSource<'_>>,
 ) -> Result<MirrorStats, RuntimeError> {
-    let chunk =
-        read_bounded_chunk(path, start_offset, source, codex_session_id, limits).map_err(|e| {
-            RuntimeError::Internal(format!(
-                "mirror_file: failed to read {:?} at offset {start_offset}: {e}",
-                path
-            ))
-        })?;
+    let chunk = read_bounded_chunk(
+        path,
+        start_offset,
+        source,
+        codex_session_id,
+        limits,
+        expected_identity,
+        trusted_source,
+    )
+    .map_err(|e| {
+        RuntimeError::Internal(format!(
+            "mirror_file: failed to read {:?} at offset {start_offset}: {e}",
+            path
+        ))
+    })?;
 
     if chunk.new_offset == start_offset {
         // Nothing was consumed this pass (EOF, or only a partial trailing
@@ -510,6 +1287,7 @@ async fn mirror_file_inner(
             scanned: 0,
             new_offset: chunk.new_offset,
             skipped_oversized_bytes: false,
+            file_identity: Some(chunk.file_identity),
         });
     }
 
@@ -528,7 +1306,14 @@ async fn mirror_file_inner(
         // silently swallowing it would let the cursor and the
         // already-consumed bytes drift apart.
         if commit_empty_advance {
-            write_cursor_only(runtime, path, &None, chunk.new_offset).await?;
+            write_cursor_only(
+                runtime,
+                path,
+                &None,
+                chunk.new_offset,
+                Some(&chunk.file_identity),
+            )
+            .await?;
         }
         return Ok(MirrorStats {
             inserted: 0,
@@ -536,6 +1321,7 @@ async fn mirror_file_inner(
             scanned: chunk.scanned,
             new_offset: chunk.new_offset,
             skipped_oversized_bytes: chunk.skipped_oversized_bytes,
+            file_identity: Some(chunk.file_identity),
         });
     }
 
@@ -547,6 +1333,7 @@ async fn mirror_file_inner(
         &chunk.events,
         chunk.scanned,
         chunk.new_offset,
+        &chunk.file_identity,
     )
     .await
 }
@@ -648,7 +1435,35 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
     start_offset: u64,
     max_bytes: u64,
 ) -> Result<MirrorStats, RuntimeError> {
-    mirror_whole_file_export(runtime, path, start_offset, max_bytes, CHATGPT_EXPORT_SPEC).await
+    mirror_whole_file_export(
+        runtime,
+        path,
+        start_offset,
+        max_bytes,
+        CHATGPT_EXPORT_SPEC,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn mirror_chatgpt_export_file_checked(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    expected_identity: &str,
+    trusted_source: TrustedSource<'_>,
+) -> Result<MirrorStats, RuntimeError> {
+    mirror_whole_file_export(
+        runtime,
+        path,
+        start_offset,
+        chatgpt_max_bytes(),
+        CHATGPT_EXPORT_SPEC,
+        Some(expected_identity),
+        Some(trusted_source),
+    )
+    .await
 }
 
 /// Read a whole claude.ai export `conversations.json`, parse its
@@ -675,6 +1490,27 @@ async fn mirror_claude_ai_export_file_with_max_bytes(
         start_offset,
         max_bytes,
         CLAUDE_AI_EXPORT_SPEC,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn mirror_claude_ai_export_file_checked(
+    runtime: &KhiveRuntime,
+    path: &Path,
+    start_offset: u64,
+    expected_identity: &str,
+    trusted_source: TrustedSource<'_>,
+) -> Result<MirrorStats, RuntimeError> {
+    mirror_whole_file_export(
+        runtime,
+        path,
+        start_offset,
+        claude_ai_max_bytes(),
+        CLAUDE_AI_EXPORT_SPEC,
+        Some(expected_identity),
+        Some(trusted_source),
     )
     .await
 }
@@ -685,10 +1521,29 @@ async fn mirror_whole_file_export(
     start_offset: u64,
     max_bytes: u64,
     spec: WholeFileExportSpec,
+    expected_identity: Option<&str>,
+    trusted_source: Option<TrustedSource<'_>>,
 ) -> Result<MirrorStats, RuntimeError> {
-    let file_len = std::fs::metadata(path).map(|m| m.len()).map_err(|e| {
+    let file = match trusted_source {
+        Some(source) => {
+            open_source_file_beneath(source.root, path, Some(source.directory_identities))
+                .map(|(file, _)| file)
+        }
+        None => open_source_file(path),
+    }
+    .map_err(|e| {
+        RuntimeError::Internal(format!("{}: failed to open {path:?}: {e}", spec.operation))
+    })?;
+    let metadata = file.metadata().map_err(|e| {
         RuntimeError::Internal(format!("{}: failed to stat {path:?}: {e}", spec.operation))
     })?;
+    let identity = checked_identity(&file, &metadata, expected_identity).map_err(|e| {
+        RuntimeError::Internal(format!(
+            "{}: failed to verify {path:?}: {e}",
+            spec.operation
+        ))
+    })?;
+    let file_len = metadata.len();
 
     if file_len <= start_offset {
         return Ok(MirrorStats {
@@ -697,6 +1552,7 @@ async fn mirror_whole_file_export(
             scanned: 0,
             new_offset: start_offset,
             skipped_oversized_bytes: false,
+            file_identity: Some(identity),
         });
     }
 
@@ -715,11 +1571,27 @@ async fn mirror_whole_file_export(
             scanned: 0,
             new_offset: start_offset,
             skipped_oversized_bytes: false,
+            file_identity: Some(identity),
         });
     }
 
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        RuntimeError::Internal(format!("{}: failed to read {path:?}: {e}", spec.operation))
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|e| {
+            RuntimeError::Internal(format!("{}: failed to read {path:?}: {e}", spec.operation))
+        })?;
+    if bytes.len() as u64 != file_len {
+        return Err(RuntimeError::Internal(format!(
+            "{}: {path:?} changed size during read; retrying",
+            spec.operation
+        )));
+    }
+    let content = String::from_utf8(bytes).map_err(|e| {
+        RuntimeError::Internal(format!(
+            "{}: invalid UTF-8 in {path:?}: {e}",
+            spec.operation
+        ))
     })?;
 
     let parsed = (spec.parser)(&content).ok_or_else(|| {
@@ -739,6 +1611,7 @@ async fn mirror_whole_file_export(
         &parsed.events,
         scanned,
         file_len,
+        &identity,
     )
     .await
 }
@@ -749,6 +1622,7 @@ async fn mirror_whole_file_export(
 /// whole-file paths. See
 /// `crates/khive-pack-session/docs/api/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`
 /// for the ADR-099 D5 suspension-free rationale.
+#[allow(clippy::too_many_arguments)]
 async fn write_events_and_cursor(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -757,6 +1631,7 @@ async fn write_events_and_cursor(
     events: &[parse::ParsedEvent],
     scanned: u64,
     new_offset: u64,
+    file_identity: &str,
 ) -> Result<MirrorStats, RuntimeError> {
     let now_us = Utc::now().timestamp_micros();
     let sql = runtime.sql();
@@ -764,6 +1639,7 @@ async fn write_events_and_cursor(
     let sessions_owned: Vec<parse::ParsedSession> = sessions.to_vec();
     let events_owned: Vec<parse::ParsedEvent> = events.to_vec();
     let path_owned: PathBuf = path.to_path_buf();
+    let identity_owned = file_identity.to_string();
 
     let op: khive_storage::AtomicUnitOp = Box::new(move |writer: &mut dyn SqlWriter| {
         Box::pin(async move {
@@ -777,6 +1653,7 @@ async fn write_events_and_cursor(
                     scanned,
                     new_offset,
                     now_us,
+                    file_identity: &identity_owned,
                 },
             )
             .await
@@ -860,10 +1737,11 @@ async fn ensure_session_on_writer(
 /// entirely — this function must not, and does not, issue its own
 /// `BEGIN`/`COMMIT`/`ROLLBACK`.
 #[derive(Clone, Copy)]
-struct MirrorWriteProgress {
+struct MirrorWriteProgress<'a> {
     scanned: u64,
     new_offset: u64,
     now_us: i64,
+    file_identity: &'a str,
 }
 
 async fn write_events_and_cursor_on_writer(
@@ -872,12 +1750,13 @@ async fn write_events_and_cursor_on_writer(
     source_value: &'static str,
     sessions: &[parse::ParsedSession],
     events: &[parse::ParsedEvent],
-    progress: MirrorWriteProgress,
+    progress: MirrorWriteProgress<'_>,
 ) -> khive_storage::types::StorageResult<MirrorStats> {
     let MirrorWriteProgress {
         scanned,
         new_offset,
         now_us,
+        file_identity,
     } = progress;
     let mut inserted: u64 = 0;
     let mut replay_mismatches: u64 = 0;
@@ -1090,7 +1969,15 @@ async fn write_events_and_cursor_on_writer(
         }
     }
 
-    upsert_cursor_on_writer(writer, path, last_session_id.as_deref(), new_offset, now_us).await?;
+    upsert_cursor_on_writer(
+        writer,
+        path,
+        last_session_id.as_deref(),
+        new_offset,
+        now_us,
+        Some(file_identity),
+    )
+    .await?;
     if replay_mismatches > 0 {
         tracing::warn!(
             source = source_value,
@@ -1108,6 +1995,7 @@ async fn write_events_and_cursor_on_writer(
         scanned,
         new_offset,
         skipped_oversized_bytes: false,
+        file_identity: Some(file_identity.to_string()),
     })
 }
 
@@ -1126,17 +2014,19 @@ async fn upsert_cursor_on_writer(
     session_id: Option<&str>,
     new_offset: u64,
     now_us: i64,
+    file_identity: Option<&str>,
 ) -> khive_storage::types::StorageResult<()> {
     let path_str = path.to_string_lossy().into_owned();
     writer
         .execute(SqlStatement {
             sql:
-                "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at) \
-              VALUES(?1, ?2, ?3, ?4) \
+                "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at, file_identity) \
+              VALUES(?1, ?2, ?3, ?4, ?5) \
               ON CONFLICT(file_path) DO UPDATE SET \
                 session_id=excluded.session_id, \
                 byte_offset=excluded.byte_offset, \
-                updated_at=excluded.updated_at"
+                updated_at=excluded.updated_at, \
+                file_identity=excluded.file_identity"
                     .into(),
             params: vec![
                 SqlValue::Text(path_str),
@@ -1145,6 +2035,9 @@ async fn upsert_cursor_on_writer(
                     .unwrap_or(SqlValue::Null),
                 SqlValue::Integer(new_offset as i64),
                 SqlValue::Integer(now_us),
+                file_identity
+                    .map(|identity| SqlValue::Text(identity.to_string()))
+                    .unwrap_or(SqlValue::Null),
             ],
             label: Some("session_mirror_cursor_upsert".into()),
         })
@@ -1173,6 +2066,7 @@ async fn write_cursor_only(
     path: &Path,
     session_id: &Option<String>,
     new_offset: u64,
+    file_identity: Option<&str>,
 ) -> Result<(), RuntimeError> {
     let now_us = Utc::now().timestamp_micros();
     let path_str = path.to_string_lossy().into_owned();
@@ -1182,12 +2076,13 @@ async fn write_cursor_only(
         .await
         .map_err(|e| RuntimeError::Internal(format!("mirror_file: cursor writer: {e}")))?;
     w.execute(SqlStatement {
-        sql: "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at) \
-              VALUES(?1, ?2, ?3, ?4) \
+        sql: "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at, file_identity) \
+              VALUES(?1, ?2, ?3, ?4, ?5) \
               ON CONFLICT(file_path) DO UPDATE SET \
                 session_id=COALESCE(excluded.session_id, session_mirror_cursor.session_id), \
                 byte_offset=excluded.byte_offset, \
-                updated_at=excluded.updated_at"
+                updated_at=excluded.updated_at, \
+                file_identity=excluded.file_identity"
             .into(),
         params: vec![
             SqlValue::Text(path_str),
@@ -1197,6 +2092,9 @@ async fn write_cursor_only(
                 .unwrap_or(SqlValue::Null),
             SqlValue::Integer(new_offset as i64),
             SqlValue::Integer(now_us),
+            file_identity
+                .map(|identity| SqlValue::Text(identity.to_string()))
+                .unwrap_or(SqlValue::Null),
         ],
         label: Some("session_mirror_cursor_only".into()),
     })
@@ -1219,6 +2117,432 @@ mod tests {
     use super::*;
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
 
+    #[cfg(unix)]
+    #[test]
+    fn ancestor_symlink_parent_trust_requires_protected_root_entry() {
+        assert!(ancestor_symlink_parent_is_trusted(0, 0o755));
+        assert!(ancestor_symlink_parent_is_trusted(0, 0o1777));
+        assert!(!ancestor_symlink_parent_is_trusted(0, 0o775));
+        assert!(!ancestor_symlink_parent_is_trusted(0, 0o757));
+        assert!(!ancestor_symlink_parent_is_trusted(501, 0o755));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ancestor_acl_fixture() -> (TempDir, std::fs::File, libc::mode_t) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = TempDir::new().expect("ACL fixture directory");
+        let output = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(dir.path())
+            .output()
+            .expect("remove fixture ACL");
+        assert!(
+            output.status.success(),
+            "remove fixture ACL: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("fixture mode");
+        let fd = std::fs::File::open(dir.path()).expect("open fixture directory");
+        let mode = fd.metadata().expect("fixture metadata").mode() as libc::mode_t;
+        // Synthetic root ownership keeps the real ACL witness unprivileged.
+        assert!(ancestor_symlink_parent_is_trusted(0, mode));
+        (dir, fd, mode)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ancestor_symlink_parent_acl_refuses_delete_child_grant() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let (dir, fd, mode) = ancestor_acl_fixture();
+        assert!(ancestor_symlink_parent_fd_is_trusted(
+            fd.as_raw_fd(),
+            0,
+            mode
+        ));
+        let output = std::process::Command::new("/bin/chmod")
+            .args(["+a", "everyone allow add_file,delete_child"])
+            .arg(dir.path())
+            .output()
+            .expect("install fixture ACL");
+        assert!(
+            output.status.success(),
+            "install fixture ACL: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let after_mode = fd.metadata().expect("ACL fixture metadata").mode() as libc::mode_t;
+        assert_eq!(
+            after_mode, mode,
+            "ACL grant must leave passing mode bits intact"
+        );
+        assert!(ancestor_symlink_parent_is_trusted(0, after_mode));
+        assert!(!ancestor_symlink_parent_fd_is_trusted(
+            fd.as_raw_fd(),
+            0,
+            after_mode
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ancestor_symlink_parent_without_acl_keeps_mode_trust() {
+        use std::os::fd::AsRawFd;
+
+        let (_dir, fd, mode) = ancestor_acl_fixture();
+        assert!(ancestor_symlink_parent_fd_is_trusted(
+            fd.as_raw_fd(),
+            0,
+            mode
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ancestor_symlink_parent_unreadable_acl_refuses_mode_trust() {
+        assert!(ancestor_symlink_parent_is_trusted(0, 0o755));
+        assert!(!ancestor_symlink_parent_fd_is_trusted(-1, 0, 0o755));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_open_refuses_a_symlink() {
+        let dir = TempDir::new().expect("tempdir");
+        let outside = NamedTempFile::new().expect("outside file");
+        let link = dir.path().join("linked.jsonl");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        assert!(open_source_file(&link).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scheduled_file_rejects_replaced_parent_symlink_at_probe_and_open() {
+        let dir = TempDir::new().expect("tempdir");
+        let fixture = std::fs::canonicalize(dir.path()).expect("fixture directory");
+        let root = fixture.join("root");
+        let parent = root.join("staged");
+        let outside = fixture.join("outside");
+        std::fs::create_dir_all(&parent).expect("inside parent");
+        std::fs::create_dir_all(&outside).expect("outside parent");
+        let source = parent.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("inside source");
+        let outside_source = outside.join("source.jsonl");
+        std::fs::write(&outside_source, b"outside\n").expect("outside source");
+
+        let (original_probe, directory_identities) =
+            open_source_file_beneath(&root, &source, None).expect("initial probe");
+        assert!(original_probe
+            .metadata()
+            .expect("inside metadata")
+            .is_file());
+        std::fs::rename(&parent, root.join("staged-old")).expect("move inside parent");
+        std::os::unix::fs::symlink(&outside, &parent).expect("replace parent with symlink");
+
+        assert!(open_source_file_beneath(&root, &source, None).is_err());
+        let outside_identity =
+            file_identity(&std::fs::File::open(&outside_source).expect("outside"))
+                .expect("outside identity");
+        assert!(read_bounded_chunk(
+            &source,
+            0,
+            LineTailSource::ClaudeCode,
+            None,
+            MirrorLimits::production(),
+            Some(&outside_identity),
+            Some(TrustedSource {
+                root: &root,
+                directory_identities: &directory_identities,
+            }),
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_opens_beneath_a_root_owned_system_ancestor_symlink() {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut fixture = None;
+        for parent in [PathBuf::from("/tmp"), std::env::temp_dir()] {
+            let mut has_root_owned_link = false;
+            let mut all_links_root_owned = true;
+            for ancestor in parent.ancestors() {
+                let Ok(metadata) = std::fs::symlink_metadata(ancestor) else {
+                    all_links_root_owned = false;
+                    break;
+                };
+                if metadata.file_type().is_symlink() {
+                    has_root_owned_link = true;
+                    all_links_root_owned &= metadata.uid() == 0;
+                }
+            }
+            if !has_root_owned_link || !all_links_root_owned {
+                continue;
+            }
+            if let Ok(temp) = TempDir::new_in(&parent) {
+                assert!(
+                    temp.path().starts_with(&parent),
+                    "fixture retains the system ancestor spelling"
+                );
+                fixture = Some(temp);
+                break;
+            }
+        }
+        let Some(temp) = fixture else {
+            eprintln!("QUALIFIED SKIP: no writable temporary base beneath a root-owned system ancestor symlink; run on macOS /tmp or /var/folders");
+            return;
+        };
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).expect("configured root");
+        let source = root.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("source fixture");
+        let physical_source = std::fs::canonicalize(&source).expect("physical source fixture");
+        let expected_identity =
+            file_identity(&std::fs::File::open(&physical_source).expect("physical source"))
+                .expect("physical source identity");
+        let physical_root = std::fs::canonicalize(&root).expect("physical root fixture");
+        let expected_root_identity =
+            file_identity(&std::fs::File::open(&physical_root).expect("physical root"))
+                .expect("physical root identity");
+
+        let (opened, directories) =
+            open_source_file_beneath(&root, &source, None).expect("root-owned ancestor admission");
+        assert_eq!(
+            file_identity(&opened).expect("opened identity"),
+            expected_identity
+        );
+        assert_eq!(directories, vec![expected_root_identity]);
+        let (reopened, _) = open_source_file_beneath(&root, &source, Some(&directories))
+            .expect("checked source reopen through system ancestor");
+        assert_eq!(
+            file_identity(&reopened).expect("reopened identity"),
+            expected_identity
+        );
+        assert_eq!(
+            std::fs::read(&physical_source).expect("unchanged source"),
+            b"inside\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_refuses_a_non_root_owned_ancestor_symlink() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = TempDir::new().expect("fixture outside source tree");
+        let fixture = std::fs::canonicalize(temp.path()).expect("physical fixture anchor");
+        let protected = fixture.join("protected");
+        let root = protected.join("exports");
+        std::fs::create_dir_all(&root).expect("protected fixture root");
+        let source = root.join("source.jsonl");
+        std::fs::write(&source, b"protected\n").expect("protected source");
+        let before = std::fs::metadata(&source).expect("protected metadata before");
+        let (original, original_directories) =
+            open_source_file_beneath(&root, &source, None).expect("ordinary root admission");
+        let original_identity = file_identity(&original).expect("protected source identity");
+        let ancestor = fixture.join("linked");
+        std::os::unix::fs::symlink(&protected, &ancestor).expect("non-root fixture ancestor link");
+        if std::fs::symlink_metadata(&ancestor)
+            .expect("link ownership")
+            .uid()
+            == 0
+        {
+            eprintln!("QUALIFIED SKIP: the test-created ancestor symlink is root-owned; run this refusal and its control as a non-root user");
+            return;
+        }
+        let linked_root = ancestor.join("exports");
+        let linked_source = linked_root.join("source.jsonl");
+        assert!(
+            open_source_file_beneath(&linked_root, &linked_source, None).is_err(),
+            "a non-root-owned ancestor link must refuse before admitting a root identity"
+        );
+        let (reopened, directories) =
+            open_source_file_beneath(&root, &source, None).expect("ordinary root remains usable");
+        assert_eq!(
+            file_identity(&reopened).expect("reopened identity"),
+            original_identity
+        );
+        assert_eq!(directories, original_directories);
+        let after = std::fs::metadata(&source).expect("protected metadata after");
+        assert_eq!(
+            std::fs::read(&source).expect("protected bytes after"),
+            b"protected\n"
+        );
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after.modified().expect("mtime after"),
+            before.modified().expect("mtime before")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_refuses_its_leaf_symlink() {
+        let temp = TempDir::new().expect("fixture outside source tree");
+        let fixture = std::fs::canonicalize(temp.path()).expect("physical fixture anchor");
+        let root = fixture.join("root");
+        std::fs::create_dir(&root).expect("ordinary source root");
+        let source = root.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("source fixture");
+        let linked_root = fixture.join("linked-root");
+        std::os::unix::fs::symlink(&root, &linked_root).expect("configured-root leaf link");
+        assert!(
+            open_source_file_beneath(&linked_root, &linked_root.join("source.jsonl"), None)
+                .is_err()
+        );
+        let (opened, _) = open_source_file_beneath(&root, &source, None).expect("ordinary root");
+        assert_eq!(
+            file_identity(&opened).expect("opened identity"),
+            file_identity(&std::fs::File::open(&source).expect("source handle"))
+                .expect("source identity")
+        );
+        assert_eq!(
+            std::fs::read(&source).expect("unchanged source"),
+            b"inside\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_root_keeps_absolute_relative_empty_and_parent_directory_semantics() {
+        let cwd = std::fs::canonicalize(std::env::current_dir().expect("current directory"))
+            .expect("physical current directory");
+        let dir = TempDir::new().expect("fixture outside source tree");
+        let absolute_fixture = std::fs::canonicalize(dir.path()).expect("fixture directory");
+        let absolute_root = absolute_fixture.join("root");
+        std::fs::create_dir(&absolute_root).expect("source root");
+        let source = absolute_root.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("source fixture");
+        let identity = file_identity(&std::fs::File::open(&source).expect("source handle"))
+            .expect("source identity");
+        let mut cwd_components = cwd.components().peekable();
+        let mut fixture_components = absolute_fixture.components().peekable();
+        while cwd_components.peek().is_some() && cwd_components.peek() == fixture_components.peek()
+        {
+            cwd_components.next();
+            fixture_components.next();
+        }
+        let mut relative_fixture = PathBuf::new();
+        for _ in cwd_components {
+            relative_fixture.push("..");
+        }
+        for component in fixture_components {
+            relative_fixture.push(component.as_os_str());
+        }
+        let relative_root = relative_fixture.join("root");
+
+        for root in [
+            absolute_root.clone(),
+            relative_root.clone(),
+            relative_root.join("..").join("root"),
+        ] {
+            let path = root.join("source.jsonl");
+            let (file, directories) =
+                open_source_file_beneath(&root, &path, None).expect("configured root probe");
+            assert_eq!(file_identity(&file).expect("opened identity"), identity);
+            assert_eq!(directories.len(), 1, "root witness shape remains unchanged");
+            let (file, _) = open_source_file_beneath(&root, &path, Some(&directories))
+                .expect("checked source reopen");
+            assert_eq!(file_identity(&file).expect("reopened identity"), identity);
+        }
+
+        let cwd_identity = file_identity(&std::fs::File::open(&cwd).expect("current directory"))
+            .expect("current-directory identity");
+        for root in [Path::new(""), Path::new(".")] {
+            let directories = open_source_root(root).expect("current-directory root probe");
+            assert_eq!(directories.len(), 1);
+            assert_eq!(
+                file_identity(&directories[0]).expect("root identity"),
+                cwd_identity
+            );
+        }
+
+        let filesystem_root = open_source_root(Path::new("/")).expect("filesystem root");
+        assert_eq!(filesystem_root.len(), 1);
+        assert!(filesystem_root[0]
+            .metadata()
+            .expect("root metadata")
+            .is_dir());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mirror_windows_file_identity_changes_when_renamed_replacement_takes_the_path() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, b"original\n").expect("original file");
+        let original = file_identity(&open_source_file(&path).expect("open original"))
+            .expect("original identity");
+        assert!(
+            original.starts_with("windows:"),
+            "unexpected identity spelling: {original}"
+        );
+
+        let mut appender = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open for append");
+        appender.write_all(b"appended\n").expect("append");
+        drop(appender);
+        assert_eq!(
+            file_identity(&open_source_file(&path).expect("open appended"))
+                .expect("appended identity"),
+            original,
+            "an append keeps the file identity"
+        );
+
+        // Save-by-rename: write a sibling temp file, then rename it over the
+        // original name. The replacement may inherit the original's creation
+        // time, so only the handle's file id can tell the two files apart.
+        let staged = dir.path().join("transcript.jsonl.tmp");
+        std::fs::write(&staged, b"replacement\n").expect("staged file");
+        std::fs::rename(&staged, &path).expect("rename over original");
+        let replaced = file_identity(&open_source_file(&path).expect("open replacement"))
+            .expect("replacement identity");
+        assert_ne!(
+            replaced, original,
+            "a same-path replacement must not reuse the original identity"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mirror_windows_scheduled_file_rejects_parent_and_file_reparse_points() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path().join("root");
+        let parent = root.join("staged");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&parent).expect("inside parent");
+        std::fs::create_dir_all(&outside).expect("outside parent");
+        let source = parent.join("source.jsonl");
+        std::fs::write(&source, b"inside\n").expect("inside source");
+        let outside_source = outside.join("source.jsonl");
+        std::fs::write(&outside_source, b"outside\n").expect("outside source");
+
+        let (_, directory_identities) =
+            open_source_file_beneath(&root, &source, None).expect("initial probe");
+        std::fs::rename(&parent, root.join("staged-old")).expect("move inside parent");
+        symlink_dir(&outside, &parent).expect("create parent link");
+        assert!(open_source_file_beneath(&root, &source, None).is_err());
+        assert!(open_source_file_beneath(&root, &source, Some(&directory_identities)).is_err());
+
+        std::fs::remove_dir(&parent).expect("remove parent link");
+        std::fs::create_dir(&parent).expect("restore parent");
+        symlink_file(&outside_source, &source).expect("link source");
+        assert!(open_source_file_beneath(&root, &source, None).is_err());
+        assert!(open_source_file(&source).is_err());
+
+        let linked_root_parent = dir.path().join("linked-root-parent");
+        symlink_dir(&root, &linked_root_parent).expect("link root parent");
+        let nested_root = linked_root_parent.join("staged-old");
+        let nested_source = nested_root.join("source.jsonl");
+        assert!(open_source_file_beneath(&nested_root, &nested_source, None).is_err());
+    }
+
     /// Build a file-backed runtime (exercises the real `atomic_unit`
     /// single-writer path) and apply the session schema. Caller must keep
     /// the returned `TempDir` alive.
@@ -1226,6 +2550,10 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -2008,7 +3336,7 @@ mod tests {
         );
 
         // Dispatch ends without an inserting candidate: the loop commits.
-        commit_empty_advance(&rt, &path, stats.new_offset)
+        commit_empty_advance(&rt, &path, &stats)
             .await
             .expect("end-of-dispatch commit");
         assert_eq!(
@@ -3247,7 +4575,18 @@ mod tests {
         let stats = mirror_claude_ai_export_file_with_max_bytes(&rt, &path, 0, 1)
             .await
             .expect("oversized export is skipped");
-        assert_eq!(stats, MirrorStats::default());
+        // The pass reports the identity it observed (the in-memory poll state
+        // needs it), but persists nothing: no cursor row is written.
+        assert_eq!(
+            stats,
+            MirrorStats {
+                file_identity: Some(
+                    file_identity(&std::fs::File::open(&path).expect("open export"))
+                        .expect("export identity")
+                ),
+                ..MirrorStats::default()
+            }
+        );
         assert_eq!(cursor_offset(&rt, &path.to_string_lossy()).await, None);
     }
 
@@ -3279,7 +4618,7 @@ mod tests {
 
                 // Cursor advance succeeds too — mirrors `upsert_cursor_on_writer`
                 // running near the end of `write_events_and_cursor_on_writer`.
-                upsert_cursor_on_writer(writer, &path_owned, Some("mid-tx-session"), 999, 1)
+                upsert_cursor_on_writer(writer, &path_owned, Some("mid-tx-session"), 999, 1, None)
                     .await?;
 
                 // Third write fails with a genuine (non-suppressed) SQL error —
@@ -3373,6 +4712,7 @@ mod tests {
                         scanned: 1,
                         new_offset: 100,
                         now_us,
+                        file_identity: "test-file",
                     },
                 )
                 .await
@@ -3473,6 +4813,7 @@ mod tests {
                         scanned: 1,
                         new_offset: 100,
                         now_us,
+                        file_identity: "test-file",
                     },
                 )
                 .await

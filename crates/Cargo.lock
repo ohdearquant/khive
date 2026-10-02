@@ -2506,6 +2506,7 @@ dependencies = [
  "khive-score",
  "khive-storage",
  "khive-types",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2514,6 +2515,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2789,6 +2791,7 @@ dependencies = [
  "khive-quant",
  "libc",
  "memmap2",
+ "nix",
  "rand 0.8.7",
  "rayon",
  "serde",

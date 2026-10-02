@@ -2,7 +2,7 @@
 //! See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::recall_feedback::{on_recall_hit, on_recall_miss};
 
@@ -17,6 +17,7 @@ use khive_runtime::{
 };
 use khive_storage::types::{Direction, EdgeFilter, NeighborQuery};
 use khive_storage::EdgeRelation;
+use khive_types::{Details, KhiveError};
 
 use crate::config::{RecallConfig, ScoreBreakdown};
 use crate::rerank::{weighted_rerank, RerankFeatures};
@@ -130,12 +131,103 @@ fn reject_archived_brain_profile(response: &Value, profile_id: &str) -> Result<(
     Ok(())
 }
 
+fn freshness_unmet(models: &[String]) -> RuntimeError {
+    let mut failed = models.to_vec();
+    failed.sort();
+    failed.dedup();
+    KhiveError::unavailable(format!(
+        "freshness_unmet: memory.recall could not prove visibility for models {}",
+        failed.join(", ")
+    ))
+    .with_details(Details::new_owned([
+        ("reason", "freshness_unmet".to_string()),
+        ("failed_models", failed.join(",")),
+    ]))
+    .into()
+}
+
+fn session_attempt_deadline(
+    first_attempt: bool,
+    wait_end: Instant,
+    attempt_deadline: Instant,
+) -> Instant {
+    if first_attempt {
+        attempt_deadline
+    } else {
+        attempt_deadline.min(wait_end)
+    }
+}
+
 impl MemoryPack {
+    async fn collect_recall_candidates_with_session(
+        &self,
+        query: &str,
+        token: &NamespaceToken,
+        opts: RecallCandidateParams<'_>,
+        wait_end: Instant,
+        attempt_deadline: Instant,
+    ) -> Result<super::common::RecallCandidateSet, RuntimeError> {
+        if opts
+            .session_fence
+            .is_none_or(|fence| fence.fences.is_empty())
+        {
+            return self.collect_recall_candidates(query, token, opts).await;
+        }
+        let required_models: Vec<String> = opts
+            .session_fence
+            .expect("nonempty session fence checked")
+            .fences
+            .iter()
+            .map(|fence| fence.model.clone())
+            .collect();
+        let fence = opts.session_fence.expect("nonempty session fence checked");
+        let mut first_attempt = true;
+        loop {
+            // A zero wait still gets one immediate attempt. Only retries are
+            // bounded by the caller's wait window as well as the request cap.
+            let deadline = session_attempt_deadline(first_attempt, wait_end, attempt_deadline);
+            if Instant::now() >= deadline {
+                return Err(freshness_unmet(&required_models));
+            }
+            first_attempt = false;
+
+            // Poll the inexpensive fence without embedding, FTS or KNN. The
+            // candidate-producing read proves it again in its own snapshot.
+            let probe = Box::pin(crate::ann::session_unmet_fences(&self.runtime, fence));
+            let unmet = tokio::time::timeout_at(deadline.into(), probe)
+                .await
+                .map_err(|_| freshness_unmet(&required_models))?;
+            let failed_models = if unmet.is_empty() {
+                let candidate_future = Box::pin(self.collect_recall_candidates(query, token, opts));
+                let candidates = tokio::time::timeout_at(deadline.into(), candidate_future)
+                    .await
+                    .map_err(|_| freshness_unmet(&required_models))??;
+                if candidates.session_unmet_models.is_empty() {
+                    return Ok(candidates);
+                }
+                candidates.session_unmet_models
+            } else {
+                unmet
+            };
+            khive_storage::ensure_request_read_active("memory.recall")?;
+            let now = Instant::now();
+            if now >= wait_end {
+                return Err(freshness_unmet(&failed_models));
+            }
+            let pause = wait_end
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(40));
+            tokio::time::sleep(pause).await;
+            khive_storage::ensure_request_read_active("memory.recall")?;
+        }
+    }
+
     pub(crate) async fn handle_recall(
         &self,
         token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
+        hard_deadline: Option<Instant>,
     ) -> Result<Value, RuntimeError> {
         use std::sync::atomic::Ordering;
 
@@ -162,6 +254,28 @@ impl MemoryPack {
             None => token.clone(),
         };
         let token = &effective_token;
+        let requested_models = p
+            .embedding_model
+            .as_ref()
+            .map(|model| vec![model.clone()])
+            .unwrap_or_else(|| self.runtime.registered_embedding_model_names());
+        let visible_namespaces = token.visible_namespace_strs();
+        let session_fence = crate::visibility::parse_recall_visibility(
+            p.consistency.as_ref(),
+            p.visibility_token.as_ref(),
+            &visible_namespaces,
+            &requested_models,
+        )?;
+        let timeout_ms = crate::visibility::parse_timeout_ms(p.timeout_ms.as_ref())?;
+        let wait_started = Instant::now();
+        let wait_by_caller = wait_started + Duration::from_millis(timeout_ms);
+        let request_deadline = hard_deadline.or_else(|| {
+            wait_started.checked_add(Duration::from_millis(crate::pack::recall_deadline_ms()))
+        });
+        let wait_by_request = request_deadline
+            .and_then(|deadline| deadline.checked_sub(Duration::from_secs(2)))
+            .unwrap_or(wait_started);
+        let session_wait_end = wait_by_caller.min(wait_by_request);
 
         let created_after_us = p
             .created_after
@@ -359,18 +473,21 @@ impl MemoryPack {
         // already-large pipeline and then into the MCP dispatch poll stack.
         let mut current_candidate_limit = candidate_limit;
         let mut recall_stage_timings = RecallStageTimings::default();
-        let mut candidates = Box::pin(self.collect_recall_candidates(
+        let mut candidates = Box::pin(self.collect_recall_candidates_with_session(
             query_trimmed,
             token,
             RecallCandidateParams {
                 candidate_limit: current_candidate_limit,
                 embedding_model: p.embedding_model.as_deref(),
+                session_fence: session_fence.as_ref(),
                 cjk_fts_bypass,
                 snippet_policy: TextSnippetPolicy::Omit,
                 fts_gather: &effective_fts_gather,
                 ann_overfetch_max_rounds,
                 ann_ready_timeout_ms,
             },
+            session_wait_end,
+            wait_by_request,
         ))
         .await?;
         recall_stage_timings.add_retrieval_round(candidates.timings);
@@ -438,18 +555,21 @@ impl MemoryPack {
                 break;
             }
             current_candidate_limit = widened;
-            candidates = Box::pin(self.collect_recall_candidates(
+            candidates = Box::pin(self.collect_recall_candidates_with_session(
                 query_trimmed,
                 token,
                 RecallCandidateParams {
                     candidate_limit: current_candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
+                    session_fence: session_fence.as_ref(),
                     cjk_fts_bypass,
                     snippet_policy: TextSnippetPolicy::Omit,
                     fts_gather: &effective_fts_gather,
                     ann_overfetch_max_rounds,
                     ann_ready_timeout_ms,
                 },
+                session_wait_end,
+                wait_by_request,
             ))
             .await?;
             recall_stage_timings.add_retrieval_round(candidates.timings);
@@ -1372,6 +1492,28 @@ mod tests {
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    #[test]
+    fn session_retry_deadline_obeys_caller_window_but_first_attempt_does_not() {
+        let now = std::time::Instant::now();
+        let request_cap = now + std::time::Duration::from_secs(2);
+        let caller_cap = now + std::time::Duration::from_millis(25);
+        assert_eq!(
+            super::session_attempt_deadline(true, caller_cap, request_cap),
+            request_cap,
+            "timeout_ms=0 still permits one immediate proof and candidate attempt"
+        );
+        assert_eq!(
+            super::session_attempt_deadline(false, caller_cap, request_cap),
+            caller_cap,
+            "a retry already in flight must end at the caller's wait deadline"
+        );
+        assert_eq!(
+            super::session_attempt_deadline(false, request_cap, caller_cap),
+            caller_cap,
+            "the request cap can end a retry sooner than the caller window"
+        );
+    }
 
     #[test]
     fn rank_sort_keeps_nan_last_and_breaks_equal_scores_by_id() {
@@ -2495,6 +2637,7 @@ mod tests {
             40,
             2,
             1_000,
+            None,
         )
         .await
         .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
@@ -2530,6 +2673,7 @@ mod tests {
                 40,
                 2,
                 0,
+                None,
             ),
         )
         .await
@@ -5822,6 +5966,7 @@ mod tests {
                     "query": "direct mismatch regression",
                 }),
                 &registry,
+                None,
             )
             .await
             .expect_err("a local token must not elevate into a measurement arm");

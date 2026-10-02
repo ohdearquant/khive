@@ -56,14 +56,20 @@ This durable signal is necessary because `kkernel reindex` runs in another proce
 ## File-generation rotation watcher
 
 File-backed pack warm starts one five-second watcher for the lifetime of the shared ANN state. Each
-unchanged tick reads only `metadata.bin`; it does not touch vector, graph, lifecycle, or code pages.
-Every new `save_atomic` commit includes a publication nonce, so the commit digest changes even when
-the index payload is byte-for-byte identical. This makes the digest a file-generation identity,
-not merely a content hash.
+unchanged tick reads `metadata.bin` and the fixed-size delta HEAD (`memory_delta.head`); it does
+not touch vector, graph, lifecycle, code, or delta chunk pages. The publication identity it
+compares is the base commit digest when no valid delta HEAD names that base, and otherwise a
+hash of the base commit digest and the HEAD bytes. Every full `save_atomic` commit includes a
+publication nonce, and every delta HEAD names a freshly generated chunk nonce, so the identity
+changes on each publication even when the index payload is byte-for-byte identical. This makes it a
+file-generation identity, not merely a content hash. Delta HEAD and chunk layout, the compaction
+bound, and cleanup are described in `../ann.md` under "Delta checkpoints".
 
 When a peer identity differs, the watcher takes the model single-flight lock and
 `<segment-dir>/.bridge-checkpoint.lock`, then rechecks, validates, and mmaps the complete segment and
-UUID sidecar. It preserves the incumbent's in-process generation, durable epoch baseline, and
+UUID sidecar, then replays the delta chain if one exists. A chain holding any upsert copies the
+vector store and codes into owned memory, so a peer that follows a delta checkpoint holds that
+private copy until a full save is adopted. It preserves the incumbent's in-process generation, durable epoch baseline, and
 non-regressing write-log watermark before swapping the bridge, but not its namespace coverage: a
 peer's checkpoint can cover namespaces this process never observed, so the rotated bridge starts
 from the conservative empty set and recall keeps over-fetching until a full scan repopulates it.
@@ -123,8 +129,8 @@ SQLite statement counts the live corpus, selects the corpus-relative retained-lo
 subject's current vector, and evaluates live-note membership. That replay statement is the snapshot
 boundary on both standalone and pool-backed readers: a concurrent commit is wholly visible or wholly
 invisible, never a log row from one state combined with a vector or note row from another.
-File-backed checkpoint writers serialize the segment, UUID sidecar, registry transition, and mmap
-re-adoption with `<segment-dir>/.bridge-checkpoint.lock`. After acquiring that lock, a writer
+File-backed checkpoint writers serialize the segment, UUID sidecar, delta HEAD and chunks, delta
+cleanup, registry transition, and mmap re-adoption with `<segment-dir>/.bridge-checkpoint.lock`. After acquiring that lock, a writer
 revalidates that its candidate watermark is not behind the durable row before touching the segment;
 a slower process therefore cannot overwrite a newer commit and then lose its conditional raise.
 
