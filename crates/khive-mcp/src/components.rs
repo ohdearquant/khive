@@ -155,6 +155,21 @@ fn schedule_component_registration(
 
 const BLOB_UPLOAD_COMPONENT_NAME: &str = "blob-upload-sweep";
 
+/// Service obligations without an idle-retirement completion contract.
+/// Unknown linked components stay named and ineligible; a registration is
+/// never silently treated as expendable cache maintenance.
+pub(crate) fn idle_retirement_obligations(server: &KhiveMcpServer) -> Vec<String> {
+    let mut obligations: Vec<String> = inventory::iter::<DaemonComponentRegistration>()
+        .map(|registration| format!("unclassified_component:{}", registration.name))
+        .collect();
+    if server.blob_upload_manager().is_some() {
+        obligations.push(format!("service_obligation:{BLOB_UPLOAD_COMPONENT_NAME}"));
+    }
+    obligations.sort();
+    obligations.dedup();
+    obligations
+}
+
 fn blob_upload_component_registration(
     manager: Arc<khive_pack_blob::uploads::UploadManager>,
 ) -> ComponentRegistration {
