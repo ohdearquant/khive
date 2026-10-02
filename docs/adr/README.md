@@ -266,6 +266,7 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 
 Amendments to accepted records:
 
+- [ADR-005 amendment: input-aligned edge read outcomes](ADR-005-storage-capability-traits.md#amendment-input-aligned-edge-read-outcomes-2026-10-01) (2026-10-01): proposed aligned edge read outcomes and runtime batching by validated stored namespace (#3701).
 - [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
 - [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-proposed-2026-09-14-additive-task-query-filters-2678) (2026-09-14): additive task-query filters (#2678).
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-an-independently-installed-distribution-is-a-pack-2026-09-12) (2026-09-12): an independently installed distribution is a pack.
