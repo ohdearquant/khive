@@ -991,11 +991,12 @@ request cancellation and statement lifetime. The callback runs synchronously in
 delivery order; fallible or asynchronous callbacks require a separate contract.
 
 EventWalkError distinguishes the original storage error, a missing timestamp
-boundary during duplicate-page handling, and a dense timestamp tie with its
-fetch limit. It does not choose a public RuntimeError or a pack-specific message.
-Brain retains its original storage-to-InvalidInput mapping and its brain messages;
-moodboard retains its original storage conversion and moodboard messages. Both
-callers map each mechanical variant explicitly.
+boundary during duplicate-page handling, a dense timestamp tie with its fetch
+limit, and an out-of-order fetched page. It does not choose a public RuntimeError
+or a pack-specific message. Brain retains its original storage-to-InvalidInput
+mapping and its brain messages; moodboard retains its original storage conversion
+and moodboard messages. Both callers map each mechanical variant explicitly,
+including the out-of-order-page variant.
 
 ### Exact cursor behavior
 
@@ -1006,8 +1007,13 @@ The cursor walk below is defined only under that order. A page in any other
 order is outside the contract, including a page returned through a forwarding
 or merged-store adapter.
 
-The adapter reproduces the existing collectors, including these edge cases:
+The adapter reproduces the existing collectors with one additional page-order
+check, including these edge cases:
 
+- Before any row of a fetched page is admitted, check that the complete page is
+  non-increasing by (created_at, id). If it is not, return the out-of-order-page
+  error and pass nothing from that page to the visitor. This check precedes
+  boundary deduplication and final-page budget clipping.
 - Clone the input filter for every query, replace only before, always use offset
   zero and clamp the requested page size to 1 through the existing transport cap
   of 4096. Keep all other namespace, actor, kind and time predicates.
@@ -1099,9 +1105,9 @@ and paginated output for every production EventStore implementation:
   query_events unchanged and must retain that order in the concurrent-boundary
   fixture.
 - The implementation must include ascending_query_events_page_is_detected_or_refused
-  with a deliberately ascending page. The arm must detect the walk's failure
-  under that non-conforming order or refuse the page, with bounded query calls;
-  it must never accept silent repeated delivery as successful traversal.
+  with a deliberately ascending page. The walk must return the out-of-order-page
+  error within a bounded number of queries and admit no row from that page; it
+  must never accept silent repeated delivery as successful traversal.
 
 A dedicated integration test binary must measure actual peak live allocation
 against increasing admitted populations with fixed output-key cardinality,
