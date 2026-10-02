@@ -1151,7 +1151,7 @@ impl ErrorConstructorCensus {
                         || self.root_function("khive-mcp/src/daemon.rs", "request_too_large_error")
                         || self.root_function(
                             "khive-runtime/src/daemon.rs",
-                            "handle_conn_with_shutdown",
+                            "handle_conn_with_lifecycle",
                         ))
             }
             _ => false,
@@ -1464,6 +1464,46 @@ fn a3_production_error_constructor_census_is_closed_and_runtime_match_is_total()
         })
         .expect("RuntimeError declaration must be present");
     assert_eq!(runtime_variants, variants, "every real runtime variant must have an explicit projection arm; adding a catch-all is not coverage");
+}
+
+#[test]
+fn a3_constructor_census_limits_normalized_carrier_to_lifecycle_owner() {
+    use syn::visit::Visit;
+    let frame = r#"DaemonResponseFrame { ok: false, error: Some(error.message), error_detail: Some(error.error_detail) }"#;
+    for (source, body, allowed) in [
+        (
+            "khive-runtime/src/daemon.rs",
+            format!("fn handle_conn_with_lifecycle() {{ let error = DaemonDispatchError::new(error.message, Some(error.error_detail)); {frame}; }}"),
+            true,
+        ),
+        (
+            "khive-runtime/src/daemon.rs",
+            format!("fn handle_conn_with_shutdown() {{ {frame}; }}"),
+            false,
+        ),
+        (
+            "khive-runtime/src/daemon.rs",
+            format!("mod unchecked {{ fn handle_conn_with_lifecycle() {{ {frame}; }} }}"),
+            false,
+        ),
+        (
+            "khive-mcp/src/server.rs",
+            format!("fn handle_conn_with_lifecycle() {{ {frame}; }}"),
+            false,
+        ),
+    ] {
+        let mut census = ErrorConstructorCensus {
+            source: source.into(),
+            ..Default::default()
+        };
+        census.visit_file(&syn::parse_file(&body).expect("valid carrier fixture"));
+        assert!(census.constructors_seen > 0);
+        assert_eq!(
+            census.offenders.is_empty(),
+            allowed,
+            "normalized carrier owner: {source}: {body}"
+        );
+    }
 }
 
 #[test]
