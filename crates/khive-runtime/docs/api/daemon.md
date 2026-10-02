@@ -93,3 +93,58 @@ unless a writer task exists. The `write_last_*_micros` fields expose that task's
 queue-wait, transaction-acquisition, body, commit, and total stages, plus the observation time.
 All new fields are additive `serde(default)` metrics-only fields; older peers can omit them without
 changing request dispatch or the canonical verb result.
+
+
+## Demand lifetime and voluntary retirement
+
+`kkernel mcp --daemon` defaults to persistent mode. Thin clients and recovery
+spawns pass `--lifetime demand`; a supervisor launch continues to use persistent
+mode. Mode belongs to that process incarnation and is never inferred from a
+marker, parent process, or environment variable.
+
+Demand mode uses a positive `--idle-timeout-secs` interval, defaulting to 1800
+seconds. That default is ADR-049 Amendment 11's initial placeholder; this change
+makes no measured tuning claim. The clock starts when the daemon is ready and
+restarts after an admitted ordinary request finishes its response and cleanup.
+Probe, planning, metrics, WAL checkpoint and cache-maintenance traffic do not
+restart it. A connected client with no admitted request or retained state does
+not keep the daemon alive.
+
+Demand startup skips email and Telegram inbound/outbound loops compiled into the
+host, and skips the configured schedule ticker. Logs and lifecycle diagnostics
+name each skipped component. Persistent startup keeps the existing component
+behavior. A configuration capable of supervising an exclusively owned events
+child is idle-ineligible: the current supervision interface cannot prove that
+an existing events service will remain independently owned. No events-child
+shutdown request is introduced.
+
+Retirement is prevented by admitted ordinary requests, open SQL transactions,
+held raw-SQL writer permits (including autocommit handles), a checked-out pooled
+writer, active operation phases, and unsettled tracked workers. Unknown dispatcher
+resource inventory and linked components are named blockers. Blob upload sweeping
+is a service obligation without an idle completion contract and therefore makes
+that configuration idle-ineligible. The inspected WAL checkpoint and memory/knowledge
+ANN rotation-watch loops are expendable maintenance; their tracked lifetimes still
+participate in final drain. Maintenance does not reset ordinary activity.
+
+Hosts without a disclosed main checkpoint pool (including in-memory or registry-only
+constructors) report `main_backend_pool_inventory_unavailable` and remain idle-ineligible.
+Their currently available host interface does not certify a complete pool inventory.
+
+The idle decision and ordinary-request admission share one mutex. Once retirement
+wins, the daemon closes its listener and refuses a later ordinary frame before
+dispatch. It stops new maintenance, retains its rendezvous ownership while workers
+settle, and keeps draining if its drain interval expires. Voluntary retirement
+never aborts admitted work solely because that interval elapsed. An operator signal
+uses the existing signal shutdown path, including its bounded drain and repeat-signal
+behavior. Initial frames and response writes each have a 30-second transport bound;
+the response bound does not interrupt dispatch or admitted writes.
+
+`metrics_only` diagnostics carry an optional `metrics.lifecycle` object. Its
+fields are `lifetime` (`demand` or `persistent`), `instance_generation` (a UUID
+stable for one process incarnation), `effective_idle_interval_ms`, `phase`
+(`serving`, `draining`, `stopped`), `shutdown_reason` (null, `idle`, or
+`signal`), `skipped_components`, `idle_ineligible_reasons`, `ordinary_requests`,
+and `idle_blockers`. The interval is reported in milliseconds, saturating at the
+wire integer's maximum for an extreme configured duration. The lifecycle field
+is additive and absent from older snapshots; it does not change protocol version 8.
