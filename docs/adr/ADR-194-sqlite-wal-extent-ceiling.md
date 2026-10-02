@@ -4,6 +4,7 @@
 **Date**: 2026-09-23\
 **Authors**: khive maintainers\
 **Tracking**: Refs #1876\
+**Amended**: 2026-10-02, section 5 memory-backend scope (#3669)\
 **Implementation**: none in this ADR; accepting or merging this document does not close #1876
 
 ## Context
