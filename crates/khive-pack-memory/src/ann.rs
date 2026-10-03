@@ -10,11 +10,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority, PENDING_WATERMARK};
+use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{
     is_benign_shutdown_cancellation, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::StorageError;
+use khive_vamana::distance::l2_normalize;
 use khive_vamana::{
     read_commit_fingerprint, read_commit_info, read_external_ids_sidecar, segment_commit_digest,
     write_external_ids_sidecar, CorpusFingerprint, VamanaConfig, VamanaIndex,
@@ -1041,15 +1043,6 @@ impl AnnBridge {
     /// Populate `namespace_set` from an already-queried set of namespace strings.
     pub(crate) fn set_namespace_set(&mut self, ns_set: HashSet<String>) {
         self.namespace_set = ns_set;
-    }
-}
-
-fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-8 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
     }
 }
 
@@ -2235,19 +2228,6 @@ pub(crate) const NOTE_SEARCH_CONSUMER: &str = "note_search";
 /// every namespace). `'*'` is not a valid `Namespace` value, so wildcard rows
 /// cannot collide with per-namespace rows.
 const ANN_WILDCARD_NS: &str = "*";
-
-const ANN_REBUILD_THRESHOLD_DEFAULT: f64 = 0.20;
-
-/// `ann_rebuild_threshold` (ADR-079 Amendment 1 §5): the tail fraction of the
-/// live vector count above which replay costs more than a full rebuild.
-/// Values outside `(0, 1]` fall back to the default.
-fn ann_rebuild_threshold() -> f64 {
-    std::env::var("KHIVE_ANN_REBUILD_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0 && *v <= 1.0)
-        .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
-}
 
 /// Durably register this consumer's wildcard row as pending (`-2`). MUST run
 /// before the first full scan, persist, or serve: pending blocks compaction in
