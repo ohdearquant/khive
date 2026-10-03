@@ -949,6 +949,19 @@ pub struct GraphMutationEventOutcome {
 
 const GRAPH_MUTATION_EVENTS_OP: &str = "compose_graph_mutation_events";
 
+fn count_graph_mutation_events(outcome: &GraphMutationEventOutcome) {
+    let written = match &outcome.mutation {
+        GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
+        GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
+        GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
+        _ => 0,
+    };
+    khive_storage::usage::count(
+        khive_storage::usage::UsageUnit::EventRows,
+        (written + outcome.retired.len()) as u64,
+    );
+}
+
 /// Internal seam for khive-runtime; no compatibility promise.
 ///
 /// Guarded composition seam for packs.
@@ -989,7 +1002,9 @@ where
                     make_events,
                 )
             })
-            .await;
+            .await
+            .inspect(count_graph_mutation_events)
+            .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)));
     }
     pool.record_direct_route(crate::timeout_sink::Site::DirectRouteGraphGeneralWrite);
     let is_file_backed = backend.is_file_backed();
@@ -1026,6 +1041,8 @@ where
     .map_err(|error| {
         StorageError::driver(StorageCapability::Graph, GRAPH_MUTATION_EVENTS_OP, error)
     })?
+    .inspect(count_graph_mutation_events)
+    .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)))
 }
 
 fn run_graph_mutation_transaction<R, F>(

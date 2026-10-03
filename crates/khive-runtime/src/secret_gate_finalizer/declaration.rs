@@ -90,6 +90,8 @@ pub(crate) struct RouteInventoryEntry {
     pub(crate) id: &'static str,
     /// `crate-name/src/file.rs::enclosing::function`.
     pub(crate) site: &'static str,
+    /// Number of syntactic properties-write occurrences at this site.
+    pub(crate) expected_writes: usize,
     pub(crate) target: Substrate,
     pub(crate) write_class: WriteClass,
     pub(crate) kind_policy: KindPolicy,
@@ -99,6 +101,40 @@ pub(crate) struct RouteInventoryEntry {
     pub(crate) family: Option<&'static str>,
     pub(crate) acceptance: Acceptance,
 }
+
+/// A write whose table name is supplied through a formatting placeholder.
+/// The table expression is not resolved by the source census.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct RuntimeTableWriteInventoryEntry {
+    pub(crate) site: &'static str,
+    pub(crate) expected_writes: usize,
+    /// A properties route ID, or an explicit non-properties classification.
+    pub(crate) properties_route: Option<&'static str>,
+}
+
+pub(crate) const RUNTIME_TABLE_WRITE_INVENTORY: &[RuntimeTableWriteInventoryEntry] = &[
+    RuntimeTableWriteInventoryEntry {
+        site: "khive-runtime/src/atomic_message.rs::vector_insert_statements",
+        expected_writes: 1,
+        properties_route: None,
+    },
+    RuntimeTableWriteInventoryEntry {
+        site: "khive-runtime/src/curation.rs::KhiveRuntime::entity_vector_insert_statements",
+        expected_writes: 1,
+        properties_route: None,
+    },
+    RuntimeTableWriteInventoryEntry {
+        site: "khive-runtime/src/curation.rs::merge_entity_sql",
+        expected_writes: 2,
+        properties_route: None,
+    },
+    RuntimeTableWriteInventoryEntry {
+        site: "khive-runtime/src/curation.rs::merge_note_sql",
+        expected_writes: 2,
+        properties_route: None,
+    },
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -162,6 +198,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.atomic.entity.create",
         site: "khive-runtime/src/atomic_prepare.rs::prepare_add_entity",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::ProposalRevalidate,
@@ -174,6 +211,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.atomic.entity.update",
         site: "khive-runtime/src/atomic_prepare.rs::prepare_update_entity_plan_with_version_and_type",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
@@ -186,6 +224,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.bulk.entity",
         site: "khive-runtime/src/operations.rs::bulk_entity_plan",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,
@@ -198,6 +237,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.atomic.note.create",
         site: "khive-runtime/src/atomic_prepare.rs::prepare_add_note",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::ProposalRevalidate,
@@ -210,6 +250,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.atomic.note.update",
         site: "khive-runtime/src/note_write.rs::KhiveRuntime::prepare_versioned_note_update",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
@@ -222,6 +263,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.atomic.message",
         site: "khive-runtime/src/atomic_message.rs::prepare_atomic_note_requests",
+        expected_writes: 2,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -234,6 +276,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "gtd.transition.statement",
         site: "khive-pack-gtd/src/handlers.rs::gtd_transition_statement",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -246,6 +289,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "schedule.activate",
         site: "khive-pack-schedule/src/handlers.rs::activate_with_creator_provenance",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -258,6 +302,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "comm.heartbeat",
         site: "khive-pack-comm/src/handlers.rs::handle_heartbeat",
+        expected_writes: 2,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -270,6 +315,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "pending.claim",
         site: "khive-mcp/src/pending_events.rs::claim_pending_event",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -282,6 +328,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "pending.corrupt",
         site: "khive-mcp/src/pending_events.rs::finalize_corrupt_receipt",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -294,6 +341,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "pending.finalize",
         site: "khive-mcp/src/pending_events.rs::finalize_firing_event",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -306,6 +354,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "pending.invoking",
         site: "khive-mcp/src/pending_events.rs::mark_dispatch_invoking",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -318,6 +367,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "pending.outcome",
         site: "khive-mcp/src/pending_events.rs::persist_dispatch_outcome",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -330,6 +380,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "pending.requeue",
         site: "khive-mcp/src/pending_events.rs::requeue_legacy_claim",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -342,6 +393,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "pending.lease",
         site: "khive-mcp/src/pending_events.rs::renew_dispatch_lease",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.lease_expires_at" },
         kind_policy: KindPolicy::SpecializedWriter,
@@ -354,6 +406,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "code.source.mutate",
         site: "khive-pack-code/src/source_ingest.rs::mutate_entity",
+        expected_writes: 2,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -366,6 +419,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "comm.ingest.quarantine_repair",
         site: "khive-pack-comm/src/handlers.rs::repair_duplicate_quarantine",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::FixedKeySet { key_paths: &["$.channel_slug", "$.quarantine_content_ref"] },
         kind_policy: KindPolicy::SpecializedWriter,
@@ -378,6 +432,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "comm.reply.read",
         site: "khive-pack-comm/src/handlers.rs::handle_reply",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
         kind_policy: KindPolicy::SpecializedWriter,
@@ -390,6 +445,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "comm.read.one",
         site: "khive-pack-comm/src/handlers.rs::mark_read_target",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
         kind_policy: KindPolicy::SpecializedWriter,
@@ -402,6 +458,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "comm.read.atomic",
         site: "khive-pack-comm/src/handlers.rs::mark_read_targets_atomic",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
         kind_policy: KindPolicy::SpecializedWriter,
@@ -414,6 +471,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "gtd.repair",
         site: "khive-pack-gtd/src/repair.rs::checked_update_sql",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -426,6 +484,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "schedule.cancel",
         site: "khive-pack-schedule/src/handlers.rs::cancel_pending_event",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -438,6 +497,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "web.get_or_create",
         site: "khive-pack-web/src/entities.rs::get_or_create",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,
@@ -450,6 +510,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "curation.entity.update",
         site: "khive-runtime/src/curation.rs::KhiveRuntime::persist_prepared_entity_update",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
@@ -462,6 +523,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "curation.outbound.delivery",
         site: "khive-runtime/src/curation.rs::KhiveRuntime::replace_outbound_message_properties",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
@@ -474,6 +536,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "curation.outbound.owner",
         site: "khive-runtime/src/curation.rs::KhiveRuntime::replace_outbound_message_properties_as_owner",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
@@ -486,6 +549,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "curation.merge.entity",
         site: "khive-runtime/src/curation.rs::merge_entity_sql",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
@@ -498,6 +562,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "curation.merge.note",
         site: "khive-runtime/src/curation.rs::merge_note_sql",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
@@ -510,6 +575,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.keyed_message",
         site: "khive-runtime/src/keyed_message.rs::create_keyed_message_pair",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -522,6 +588,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_create",
         site: "khive-runtime/src/note_create.rs::prepare_note_create",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,
@@ -534,6 +601,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.insert_note_if_absent",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::insert_note_if_absent",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -546,6 +614,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.try_insert_note",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::try_insert_note",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -558,6 +627,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.replace_note_if_unchanged",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::replace_note_if_unchanged",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -570,6 +640,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.update_note_properties",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::update_note_properties",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -582,6 +653,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.upsert_note",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::upsert_note",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -594,6 +666,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.upsert_notes",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::upsert_notes",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -606,6 +679,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.set_note_property",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::set_note_property",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -618,6 +692,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.try_patch_note_property",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::try_patch_note_property",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -630,6 +705,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.note_store.patch_note_property_atomic",
         site: "khive-runtime/src/note_store_guard.rs::PolicyEnforcingNoteStore::patch_note_property_atomic",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::None,
@@ -642,6 +718,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.try_create_note",
         site: "khive-runtime/src/operations.rs::KhiveRuntime::try_create_note_impl",
+        expected_writes: 2,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -654,6 +731,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.claim_entity",
         site: "khive-runtime/src/operations.rs::KhiveRuntime::claim_entity_if_absent",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,
@@ -666,6 +744,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.create_entity_inner",
         site: "khive-runtime/src/operations.rs::KhiveRuntime::create_entity_with_embedding_report_inner",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,
@@ -678,6 +757,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.create_note_inner",
         site: "khive-runtime/src/operations.rs::KhiveRuntime::create_note_inner",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,
@@ -690,6 +770,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.import.entity",
         site: "khive-runtime/src/portability.rs::KhiveRuntime::import_kg",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::KindHookCreate,
@@ -702,6 +783,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "vcs.sync.entities",
         site: "khive-vcs/src/sync.rs::upsert_entities",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -714,6 +796,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "kkernel.code_ingest.entity",
         site: "kkernel/src/code_ingest.rs::persist_ingest_entity",
+        expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -726,6 +809,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "kkernel.code_ingest.note",
         site: "kkernel/src/code_ingest.rs::persist_ingest_note",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::SpecializedWriter,
@@ -738,6 +822,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "migration.005.unique_comm_external_id",
         site: "khive-db/sql/005-unique-comm-external-id.sql::statement_1",
+        expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::PrivilegedEscape,
         kind_policy: KindPolicy::None,

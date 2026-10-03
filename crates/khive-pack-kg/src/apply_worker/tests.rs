@@ -189,12 +189,14 @@ async fn changeset_adapter_builds_atomic_plans_for_supported_proposal_writes() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
     let source = rt
-        .create_entity(&tok, "concept", None, "Source", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Source", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create source");
     let target = rt
-        .create_entity(&tok, "concept", None, "Target", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Target", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create target");
     let registry = build_registry(&rt);
     let worker = ProposalApplyWorker::new(rt);
@@ -280,7 +282,7 @@ async fn changeset_adapter_builds_atomic_plans_for_supported_proposal_writes() {
 async fn proposal_apply_refuses_registry_tags_for_create_update_and_merge() {
     let (rt, tok) = setup();
     let protected = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "project",
             None,
@@ -290,10 +292,20 @@ async fn proposal_apply_refuses_registry_tags_for_create_update_and_merge() {
             vec!["ToOl-ReGiStRy".to_string()],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("trusted fixture creates registry row");
     let ordinary = rt
-        .create_entity(&tok, "project", None, "Ordinary row", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "project",
+            None,
+            "Ordinary row",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create ordinary row");
     let registry = build_registry(&rt);
     let worker = ProposalApplyWorker::new(rt);
@@ -371,7 +383,7 @@ async fn apply_worker_atomic_update_preserves_explicit_description_clear() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -381,6 +393,7 @@ async fn apply_worker_atomic_update_preserves_explicit_description_clear() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     let proposal_id = Uuid::new_v4();
     let changeset = ProposalChangeset::UpdateEntity {
@@ -415,7 +428,7 @@ async fn apply_worker_returns_atomic_update_truncation_report() {
     rt.register_embedder(TruncationProvider);
     ensure_schema(&rt).await;
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -425,6 +438,7 @@ async fn apply_worker_returns_atomic_update_truncation_report() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     let proposal_id = Uuid::new_v4();
     let changeset = ProposalChangeset::UpdateEntity {
@@ -455,7 +469,7 @@ async fn committed_post_commit_failure_stays_applying_and_is_not_replayed() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -465,6 +479,7 @@ async fn committed_post_commit_failure_stays_applying_and_is_not_replayed() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     let proposal_id = Uuid::new_v4();
     seed_proposal_created_event(
@@ -571,7 +586,7 @@ async fn committed_created_record_resolution_failure_is_not_reverted_or_replayed
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
     let source = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -581,9 +596,10 @@ async fn committed_created_record_resolution_failure_is_not_reverted_or_replayed
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create source");
     let target = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -593,6 +609,7 @@ async fn committed_created_record_resolution_failure_is_not_reverted_or_replayed
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create target");
     let proposal_id = Uuid::new_v4();
     seed_proposal_created_event(
@@ -768,12 +785,14 @@ async fn apply_worker_applies_add_edge_changeset() {
 
     // Create two entities to link.
     let e1 = rt
-        .create_entity(&tok, "concept", None, "EntityA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "EntityA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create e1");
     let e2 = rt
-        .create_entity(&tok, "concept", None, "EntityB", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "EntityB", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create e2");
 
     let proposal_id = Uuid::new_v4();
@@ -1500,12 +1519,14 @@ async fn budget_some_zero_allows_edge_only_changeset() {
 
     // Pre-create two entities outside the proposal.
     let e1 = rt
-        .create_entity(&tok, "concept", None, "EdgeSrc", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "EdgeSrc", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create e1");
     let e2 = rt
-        .create_entity(&tok, "concept", None, "EdgeDst", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "EdgeDst", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create e2");
 
     let proposal_id = Uuid::new_v4();

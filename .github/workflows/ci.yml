@@ -1314,23 +1314,17 @@ jobs:
         # the ratchet needs, so an unfinished measurement is a red gate rather
         # than a skipped one.
         #
-        # THE BUDGET IS SET FROM A MEASUREMENT, NOT FROM A ROUND NUMBER. It was
-        # 28 minutes and the step was cut at it on every run measured, so no run
-        # since the gate was added produced a measurement at all. Raised here,
-        # the step completed in 29m15s: the old budget was short by about one
-        # minute, which is why it always looked like a hang rather than a budget.
+        # THE BUDGET IS SET FROM A MEASUREMENT, NOT FROM A ROUND NUMBER. The
+        # original completed measurement was 29m15s, with a 1.37x margin giving
+        # 40 minutes. Recent successful Compute coverage runs reached 39 minutes
+        # (#3808), and a 40-minute run was cut just after producing its coverage
+        # value. Preserve that margin against the slower successful measurement:
+        # ceil(39 x 1.37) = ceil(53.43) = 54 minutes.
         #
-        # The margin is sized off what the same runner class actually does with a
-        # long cargo workload: twelve recent main pushes gave eight successful
-        # ubuntu shard-1 runs at 23, 24, 26, 28, 28, 28, 29 and 33 minutes, a
-        # spread of 0.82x to 1.18x of their median. 1.18 x 29m15s is 34.5, so a
-        # 35-minute budget would sit exactly at the worst ratio observed, with
-        # nothing left for a runner slower than any in that sample. Since a miss
-        # is now a red required check rather than a silent skip, the cost of
-        # being tight is a blocked merge and another half hour, while the cost of
-        # being loose is wall clock on a genuine hang. 40 is 1.37x the
-        # measurement and still well under the job budget above.
-        timeout-minutes: 40
+        # A miss is a red required check rather than a silent skip. The step
+        # must still expire before the 75-minute job budget so the reporting and
+        # failing steps below can run; the job continues to bound genuine hangs.
+        timeout-minutes: 54
         working-directory: crates
         # Keep #705's instrumented replay-test margin local to that test.
         # A global checkout override made unrelated recall tests wait 300s

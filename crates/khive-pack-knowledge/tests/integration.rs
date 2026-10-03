@@ -114,6 +114,67 @@ async fn pack_registers_cleanly_with_verb_registry() {
     );
 }
 
+struct LearnWarningEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for LearnWarningEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "learn-warning-test"
+    }
+}
+
+struct LearnWarningEmbedderProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for LearnWarningEmbedderProvider {
+    fn name(&self) -> &str {
+        "learn-warning-test"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(&self) -> Result<Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+        Ok(Arc::new(LearnWarningEmbeddingService))
+    }
+}
+
+#[tokio::test]
+async fn learn_reports_embedding_truncation() {
+    let runtime = rt();
+    runtime.register_embedder(LearnWarningEmbedderProvider);
+    let f = pack(runtime);
+    let description = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+
+    let response = f
+        .dispatch(
+            "knowledge.learn",
+            json!({"name": "long description", "description": description}),
+        )
+        .await
+        .expect("learn with an over-limit description");
+
+    assert_eq!(
+        response["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "learn must disclose a truncated embedding input: {response}"
+    );
+    assert_eq!(response["description"].as_str(), Some(description.as_str()));
+}
+
 // ── learn verb ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -595,7 +656,7 @@ async fn issue2732_topic_query_count_distinguishes_corpus_window_and_output() {
         .unwrap();
     const QUERY: &str = "orchardwindowprobe";
     for slot in 0..17 {
-        core.create_entity(
+        core.create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -605,6 +666,7 @@ async fn issue2732_topic_query_count_distinguishes_corpus_window_and_output() {
             vec!["count-domain".into()],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     }
     // An independent, fixed-bound core search supplies exact candidate IDs and scores.
@@ -708,7 +770,7 @@ async fn issue2824_empty_and_whitespace_topic_queries_stay_on_the_query_branch()
         .unwrap();
     const QUERY: &str = "orchardwindowprobe";
     for slot in 0..17 {
-        core.create_entity(
+        core.create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -718,6 +780,7 @@ async fn issue2824_empty_and_whitespace_topic_queries_stay_on_the_query_branch()
             vec!["count-domain".into()],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     }
 
@@ -770,7 +833,7 @@ async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
         .unwrap();
     const QUERY: &str = "orchardwindowprobe";
     for slot in 0..13 {
-        core.create_entity(
+        core.create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -780,6 +843,7 @@ async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
             vec!["other".into()],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     }
     let ranked = core

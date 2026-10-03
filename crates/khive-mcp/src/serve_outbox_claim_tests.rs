@@ -163,12 +163,13 @@ async fn transient_claim_failure_backs_off_then_claims_and_delivers() {
     // Make the existing persisted deadline due without sleeping or bypassing
     // the public metadata-update path.
     runtime
-        .update_note(&token, id, {
+        .update_note_with_embedding_report(&token, id, {
             let mut patch = NotePatch::default();
             patch.properties = Some(serde_json::json!({"next_attempt_at":"2000-01-01T00:00:00Z"}));
             patch
         })
         .await
+        .map(|(row, _report)| row)
         .unwrap();
     cycle(&runtime, &channel).await;
     let delivered = runtime
@@ -190,13 +191,14 @@ async fn transient_claim_failure_backs_off_then_claims_and_delivers() {
         assert_eq!(sent[0].message_id.as_deref(), Some(expected.as_str()));
     }
     let error = runtime
-        .update_note(&token, id, {
+        .update_note_with_embedding_report(&token, id, {
             let mut patch = NotePatch::default();
             patch.properties =
                 Some(serde_json::json!({"external_id":"<caller-forged@example.com>"}));
             patch
         })
         .await
+        .map(|(row, _report)| row)
         .unwrap_err();
     assert!(matches!(error, RuntimeError::InvalidInput(_)));
     let after_refusal = runtime

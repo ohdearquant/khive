@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{TimeZone, Utc};
+use khive_db::stores::graph::GraphMutationPreconditions;
 use khive_db::StorageBackend;
 use khive_runtime::{
     EdgeEndpointKind, KhiveRuntime, LinkSpec, Namespace, NamespaceToken, RuntimeConfig,
@@ -13,6 +14,7 @@ use khive_runtime::{
 use khive_storage::graph::{
     CommitAnnotationCursorValue, CommitAnnotationGuard, CommitAnnotationInsertOutcome,
 };
+use khive_storage::usage::{scope, UsageContext};
 use khive_storage::{
     DeleteMode, Edge, EdgeRelation, EdgeUpsertDisposition, Entity, Event, EventFilter, LinkId,
     Note, PageRequest, SqlStatement, SqlValue,
@@ -337,7 +339,14 @@ async fn event_failure(path: Path) {
     }
     let before = f.snapshot().await;
     f.script(format!("CREATE TRIGGER c9_event_fault BEFORE INSERT ON events WHEN NEW.verb='link' AND EXISTS(SELECT 1 FROM graph_edges WHERE source_id='{}' AND target_id='{}' AND deleted_at IS NULL) BEGIN SELECT RAISE(ABORT,'c9-event-after-edge'); END;",id(1),id(2))).await;
-    let error = attempt(&f, path, guard.clone()).await.unwrap_err();
+    let failed_usage = UsageContext::new();
+    let error = scope(failed_usage.clone(), attempt(&f, path, guard.clone()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        failed_usage.shipping_snapshot().unwrap().get("event_rows"),
+        None
+    );
     assert!(
         error.to_string().contains("c9-event-after-edge"),
         "fault must run after graph DML: {error:?}"
@@ -362,7 +371,14 @@ async fn event_failure(path: Path) {
         "edge, ledger, event and projection unit must roll back"
     );
     f.script("DROP TRIGGER c9_event_fault").await;
-    let edge = attempt(&f, path, guard).await.unwrap();
+    let committed_usage = UsageContext::new();
+    let edge = scope(committed_usage.clone(), attempt(&f, path, guard))
+        .await
+        .unwrap();
+    assert_eq!(
+        committed_usage.shipping_snapshot().unwrap()["event_rows"],
+        1
+    );
     assert_created(
         &f,
         &edge,
@@ -387,11 +403,18 @@ async fn batch_failure(projection: bool) {
         format!("CREATE TRIGGER c9_second_fault BEFORE INSERT ON events WHEN NEW.verb='link' AND json_extract(NEW.payload,'$.target_id')='{}' AND EXISTS(SELECT 1 FROM graph_edges WHERE source_id='{}' AND target_id='{}') AND EXISTS(SELECT 1 FROM events WHERE verb='link' AND json_extract(payload,'$.target_id')='{}') BEGIN SELECT RAISE(ABORT,'c9-second-event'); END;",id(3),id(1),id(3),id(2))
     };
     f.script(script).await;
-    let error = f
-        .runtime
-        .link_many_observed(&f.token, vec![spec(id(2)), spec(id(3))])
-        .await
-        .unwrap_err();
+    let failed_usage = UsageContext::new();
+    let error = scope(
+        failed_usage.clone(),
+        f.runtime
+            .link_many_observed(&f.token, vec![spec(id(2)), spec(id(3))]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        failed_usage.shipping_snapshot().unwrap().get("event_rows"),
+        None
+    );
     assert!(
         error.to_string().contains(if projection {
             "c9-second-projection"
@@ -406,11 +429,18 @@ async fn batch_failure(projection: bool) {
         "row2 failure must roll back every edge, event, projection and ledger row"
     );
     f.script("DROP TRIGGER c9_second_fault").await;
-    let rows = f
-        .runtime
-        .link_many_observed(&f.token, vec![spec(id(2)), spec(id(3))])
-        .await
-        .unwrap();
+    let committed_usage = UsageContext::new();
+    let rows = scope(
+        committed_usage.clone(),
+        f.runtime
+            .link_many_observed(&f.token, vec![spec(id(2)), spec(id(3))]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        committed_usage.shipping_snapshot().unwrap()["event_rows"],
+        2
+    );
     assert_eq!(
         rows.iter().map(|r| r.edge.target_id).collect::<Vec<_>>(),
         vec![id(2), id(3)]
@@ -740,6 +770,34 @@ async fn attribution_and_note_event() {
         "event endpoints are omitted, note/edge positions retained"
     );
 }
+async fn guarded_web_reconciliation_usage() {
+    let f = Fixture::new().await;
+    let old = attempt(&f, Path::Single, None).await.unwrap();
+    let mut second = spec(id(3));
+    second.source_id = id(2);
+    let usage = UsageContext::new();
+    let (upserts, retirements) = scope(
+        usage.clone(),
+        f.runtime.link_many_guarded_observed(
+            &f.token,
+            vec![spec(id(3)), second],
+            GraphMutationPreconditions::default(),
+            vec![old.clone()],
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(upserts.len(), 2);
+    assert_eq!(retirements, vec![old.id]);
+    assert_eq!(usage.shipping_snapshot().unwrap()["event_rows"], 3);
+    assert!(f
+        .edge(id(1), id(2), EdgeRelation::Extends)
+        .await
+        .unwrap()
+        .deleted_at
+        .is_some());
+}
+
 async fn exercise(name: &str) {
     match name {
         "link_observed_event_failure_rolls_back_and_retry_creates_once" => {
@@ -766,6 +824,9 @@ async fn exercise(name: &str) {
         }
         "link_attribution_and_note_event_projection_stay_on_source" => {
             attribution_and_note_event().await
+        }
+        "guarded_web_reconciliation_counts_upserts_and_retirements" => {
+            guarded_web_reconciliation_usage().await
         }
         _ => panic!("unknown fixture case {name}"),
     }
@@ -860,4 +921,9 @@ fn commit_annotation_event_failure_rolls_back_and_create_only_outcomes_keep_curs
 #[test]
 fn link_attribution_and_note_event_projection_stay_on_source() {
     run_case("link_attribution_and_note_event_projection_stay_on_source")
+}
+
+#[test]
+fn guarded_web_reconciliation_counts_upserts_and_retirements() {
+    run_case("guarded_web_reconciliation_counts_upserts_and_retirements")
 }

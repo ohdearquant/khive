@@ -2009,7 +2009,7 @@ Unix and Windows gates retain Amendment 12's native identity/alias refusal, prot
 
 ## Amendment 14 (2026-10-02): sequential recovery of interrupted L2 sweeps
 
-**Status: Proposed; pending review and ratification.**
+**Status: Accepted; ratified by the maintainer, 2026-10-03.**
 
 **Amends:** Amendment 2 B5's L2 freshness protocol. **Retains:** deterministic
 project/module/symbol ownership, observed `last_seen_at` and per-project/language
@@ -2150,6 +2150,13 @@ edges are never promoted. Their existing stale-edge strand after an otherwise
 completed invocation remains a known limitation outside this amendment. Missing
 files, removed references and unvisited subtree members remain historical.
 
+An owner whose manifests sit under more than one project root is outside the
+whole-owner guarantee. An invocation whose `path` covers only one of those roots
+can write that owner's completed marker, and the next whole-owner invocation then
+takes the unchanged fast path for the other root's files, whose edges keep their
+older stamp until a file under that root changes. This is a known limitation,
+tracked as #3752.
+
 The entity compare-and-set can commit the completed marker before its following
 FTS document write fails. In that case the invocation returns its existing
 error while graph completion remains durable. A crash after the completion row
@@ -2218,5 +2225,5 @@ is not an executed proof.
   skipped-file fixture must retain, rather than conceal, the known stale-edge
   limitation.
 
-No implementation, native acceptance, formal review or ratification is asserted
-by this Proposed amendment.
+Ratification releases the dependent recovery change (#3736) to its normal
+review. No implementation or native acceptance is asserted by this amendment.

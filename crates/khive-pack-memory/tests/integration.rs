@@ -3744,10 +3744,8 @@ async fn test_recall_rejects_degenerate_and_overflowing_token_budgets() {
     }
 }
 
-/// More matching supersedes edges than ranked candidates must not truncate the
-/// inbound-edge check. More than one storage page targets A and the following
-/// edge targets B, so both the page loop and the old candidate-count leak are
-/// exercised deterministically.
+/// High inbound fan-in on one candidate must not hide another target. The
+/// same suppression fixture also observes and plans the actual recall SQL.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
@@ -3842,7 +3840,7 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
     assert_eq!(inserted_b, 1, "fixture must add the page-two edge");
     drop(writer);
 
-    let registry = make_registry(rt);
+    let registry = make_registry(rt.clone());
     let baseline = registry
         .dispatch(
             "memory.recall",
@@ -3870,6 +3868,12 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
     assert!(baseline_ids.contains(&target_a_id.as_str()));
     assert!(baseline_ids.contains(&target_b_id.as_str()));
 
+    let observation = rt
+        .core()
+        .backend()
+        .pool()
+        .observe_test_statement_starts(1024)
+        .expect("observe actual recall statements");
     let suppressed = registry
         .dispatch(
             "memory.recall",
@@ -3889,8 +3893,53 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
         .expect("suppressed recall");
     assert!(
         suppressed.as_array().is_some_and(Vec::is_empty),
-        "every targeted candidate must be suppressed after an exhaustive edge walk: {suppressed}"
+        "every targeted candidate must be suppressed after target lookups: {suppressed}"
     );
+    let statements = observation
+        .started_statements()
+        .expect("complete statement observation");
+    drop(observation);
+    let edge_lookups: Vec<_> = statements
+        .iter()
+        .filter(|statement| {
+            statement.sql.contains("target_id IN (") && statement.sql.contains("relation IN (")
+        })
+        .collect();
+    assert_eq!(
+        edge_lookups.len(),
+        2,
+        "one first-match lookup per candidate"
+    );
+    let mut reader = rt.sql().reader().await.expect("planner reader");
+    for statement in edge_lookups {
+        assert!(statement.readonly);
+        assert!(
+            !statement.sql.contains("graph_edges_seq"),
+            "SUPERSEDES_TARGET_LOOKUP: recall must not drive the global insertion ledger: {}",
+            statement.sql
+        );
+        let plan = reader
+            .explain(SqlStatement {
+                sql: statement.sql.clone(),
+                params: vec![
+                    SqlValue::Text("local".into()),
+                    SqlValue::Text(target_a_id.clone()),
+                    SqlValue::Text("supersedes".into()),
+                    SqlValue::Integer(1),
+                    SqlValue::Integer(0),
+                ],
+                label: Some("supersedes-actual-lookup-plan".into()),
+            })
+            .await
+            .expect("plan the executed production statement");
+        assert!(
+            plan.iter().any(|row| matches!(row.get("detail"), Some(SqlValue::Text(detail))
+                if detail.contains("SEARCH graph_edges")
+                    && detail.contains("idx_graph_edges_ns_tgt_rel")
+                    && detail.contains("target_id=?"))),
+            "SUPERSEDES_TARGET_LOOKUP: actual recall SQL must seek the target/relation index: {plan:?}"
+        );
+    }
 }
 
 // =============================================================================
@@ -7148,4 +7197,207 @@ async fn bulk_create_refuses_a_memory_note_item_in_both_modes() {
         Some(1),
         "only the best-effort sibling may be stored: {observations}"
     );
+}
+
+/// A memory whose content exceeds the embedder input budget is stored, and the
+/// response discloses the truncation instead of failing after the commit.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn remember_over_embedding_budget_succeeds_and_discloses_truncation() {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new("truncation-enc", 4, 0.9));
+    let registry = make_registry(rt);
+
+    let content = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+    let result = registry
+        .dispatch("memory.remember", json!({ "content": content }))
+        .await
+        .expect("an over-budget memory must not fail after commit");
+
+    assert_eq!(
+        result["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "remember must disclose the truncated embedding input: {result}"
+    );
+    let note_id = result["id"].as_str().expect("note id present");
+    let stored = registry
+        .dispatch("get", json!({ "id": note_id }))
+        .await
+        .expect("the committed memory must be readable");
+    assert_eq!(stored["id"], json!(note_id));
+}
+
+/// A keyed memory over the embedder input budget discloses the truncation on
+/// the fresh write and its replay. Replay retains the stored identity and
+/// fences, reports its recomputed truncation, and adds no rows.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn keyed_remember_discloses_truncation_on_fresh_write_and_on_identical_replay() {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new("truncation-enc", 4, 0.9));
+    let registry = make_registry(rt);
+
+    let args = json!({
+        "content": "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1),
+        "key": "keyed-truncation",
+    });
+    let created = registry
+        .dispatch("memory.remember", args.clone())
+        .await
+        .expect("an over-budget keyed memory must not fail after commit");
+    assert!(
+        created.get("replayed").is_none(),
+        "first call is a fresh write: {created}"
+    );
+    assert_eq!(
+        created["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "a fresh keyed remember must disclose the truncated embedding input: {created}"
+    );
+
+    let replayed = registry
+        .dispatch("memory.remember", args)
+        .await
+        .expect("replay must succeed");
+    assert_eq!(
+        replayed["replayed"],
+        json!(true),
+        "second call replays: {replayed}"
+    );
+    assert_eq!(replayed["id"], created["id"]);
+    assert_eq!(
+        replayed["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "a replay must disclose its computed truncated embedding input: {replayed}"
+    );
+}
+
+/// Both remember branches retain a visibility fence while disclosing bounded
+/// embedding input. Keyed replay keeps that fence even after log compaction.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay() {
+    const MODEL: &str = "all-minilm-l6-v2";
+    for keyed in [false, true] {
+        let rt = make_runtime();
+        rt.register_embedder(ConstVecProvider::new(
+            MODEL,
+            EmbeddingModel::AllMiniLmL6V2.dimensions(),
+            0.9,
+        ));
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        let registry = make_registry(rt.clone());
+        let content = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+        let mut args = json!({
+            "content": content,
+            "memory_type": "semantic",
+            "embedding_model": MODEL,
+        });
+        if keyed {
+            args["key"] = json!("joint-receipt-key");
+        }
+        let created = registry
+            .dispatch("memory.remember", args.clone())
+            .await
+            .expect("bounded embedding input must not fail after commit");
+        assert_eq!(
+            created["warnings"],
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+            "keyed={keyed}: truncation and its fence must be returned together"
+        );
+        let receipt = created["visibility_token"].clone();
+        assert_eq!(receipt["version"], json!(1));
+        assert_eq!(receipt["namespace"], json!("local"));
+        assert_eq!(receipt["fences"].as_array().map(Vec::len), Some(1));
+        assert_eq!(receipt["fences"][0]["model"], json!(MODEL));
+        let seq = receipt["fences"][0]["ann_write_log_seq"]
+            .as_u64()
+            .expect("positive committed vector fence");
+        assert!(seq > 0);
+        let id: Uuid = created["id"].as_str().expect("note id").parse().unwrap();
+        let stored = rt
+            .notes(&token)
+            .unwrap()
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.content, content,
+            "full source text must remain stored"
+        );
+
+        let mut reader = rt.sql().reader().await.unwrap();
+        let high_sequence = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT seq FROM sqlite_sequence WHERE name = 'ann_write_log'".into(),
+                params: vec![],
+                label: Some("joint-remember-committed-sequence".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(high_sequence, Some(SqlValue::Integer(value)) if value == seq as i64));
+        drop(reader);
+
+        if keyed {
+            let durable = khive_runtime::keyed_memory::memory_visibility_receipt(&rt, &token, id)
+                .await
+                .unwrap()
+                .expect("keyed memory must retain its original receipt");
+            assert_eq!(durable, vec![(MODEL.to_owned(), seq)]);
+            let mut writer = rt.sql().writer().await.unwrap();
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM ann_write_log WHERE namespace = ?1 AND subject_id = ?2"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text("local".into()),
+                        SqlValue::Text(id.to_string()),
+                    ],
+                    label: Some("joint-remember-compact-original-log".into()),
+                })
+                .await
+                .unwrap();
+            drop(writer);
+            let replayed = registry.dispatch("memory.remember", args).await.unwrap();
+            assert_eq!(replayed["id"], created["id"]);
+            assert_eq!(replayed["replayed"], json!(true));
+            assert_eq!(replayed["visibility_token"], receipt);
+            assert_eq!(
+                replayed["warnings"], created["warnings"],
+                "replay must retain its computed truncation warning with the original fence"
+            );
+            let mut reader = rt.sql().reader().await.unwrap();
+            let replay_rows = reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM ann_write_log WHERE namespace = ?1 AND subject_id = ?2".into(),
+                    params: vec![SqlValue::Text("local".into()), SqlValue::Text(id.to_string())],
+                    label: Some("joint-remember-replay-no-new-log".into()),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(replay_rows, Some(SqlValue::Integer(0))));
+            drop(reader);
+            let holders = rt
+                .notes(&token)
+                .unwrap()
+                .get_live_notes_by_key("local", "joint-receipt-key", Some("memory"))
+                .await
+                .unwrap();
+            assert_eq!(holders.len(), 1);
+            assert_eq!(holders[0].id, id);
+        }
+    }
 }

@@ -322,7 +322,7 @@ async fn one_selected_backend_preserves_real_entity_and_note_evidence() {
     let namespace = Namespace::local();
     let token = runtime.authorize(namespace.clone()).unwrap();
     runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -332,6 +332,7 @@ async fn one_selected_backend_preserves_real_entity_and_note_evidence() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .unwrap();
     runtime
         .create_note(

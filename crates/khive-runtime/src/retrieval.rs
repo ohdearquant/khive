@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
 use crate::curation::note_fts_document;
+use crate::embedder_registry::with_embedding_admission;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
@@ -232,7 +233,7 @@ impl KhiveRuntime {
     /// own a single model implicitly).
     ///
     /// Applies no instruction prefix (generic role). Use
-    /// [`Self::embed_document_with_model`] / [`Self::embed_query_with_model`] for
+    /// [`Self::embed_document_with_model_outcome`] / [`Self::embed_query_with_model`] for
     /// instruction-tuned models where the asymmetric prefix matters.
     ///
     /// Returns `UnknownModel` if `model_name` is not in the embedder registry.
@@ -244,8 +245,8 @@ impl KhiveRuntime {
         // was handed to the provider is counted even if this task is aborted
         // while parked on the await (drain_embed_join_set cancellation path).
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
-        let out = service.embed_one(text, emb_model).await;
-        Ok(out?)
+        let out = with_embedding_admission(service.embed_one(text, emb_model)).await;
+        out
     }
 
     /// Embed a document/passage for indexing using the named model.
@@ -266,17 +267,6 @@ impl KhiveRuntime {
     /// the embedding model config.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
-    pub async fn embed_document_with_model(
-        &self,
-        model_name: &str,
-        text: &str,
-    ) -> RuntimeResult<Vec<f32>> {
-        Ok(self
-            .embed_document_with_model_outcome_inner(None, model_name, text)
-            .await?
-            .vector)
-    }
-
     pub async fn embed_document_with_model_outcome(
         &self,
         model_name: &str,
@@ -313,7 +303,8 @@ impl KhiveRuntime {
         let embedded_bytes = text.len();
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
-        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
+        let embeddings =
+            with_embedding_admission(service.embed_passage(&[text.to_string()], emb_model)).await;
         let mut vectors = embeddings?;
         if vectors.len() != 1 {
             return Err(RuntimeError::Internal(format!(
@@ -381,8 +372,10 @@ impl KhiveRuntime {
         let embeddings = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await,
-            _ => service.embed_query(&texts, emb_model).await,
+            | EmbeddingModel::BgeLargeEnV15 => {
+                with_embedding_admission(service.embed(&texts, emb_model)).await
+            }
+            _ => with_embedding_admission(service.embed_query(&texts, emb_model)).await,
         };
         let out = embeddings?
             .into_iter()
@@ -393,16 +386,34 @@ impl KhiveRuntime {
 
     /// Embed a document for indexing using the configured default model.
     ///
-    /// Delegates to [`Self::embed_document_with_model`]. Use for entity/note
+    /// Delegates to [`Self::embed_document_outcome`]. Use for entity/note
     /// create and reindex paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    /// Returns an error if the input is bounded; use the outcome method to
+    /// inspect the vector together with the truncation metadata.
     pub async fn embed_document(&self, text: &str) -> RuntimeResult<Vec<f32>> {
+        let outcome = self.embed_document_outcome(text).await?;
+        if outcome.truncated {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding input truncated from {} to {} bytes; use embed_document_outcome to inspect the bounded vector",
+                outcome.source_bytes, outcome.embedded_bytes
+            )));
+        }
+        Ok(outcome.vector)
+    }
+
+    /// Embed a document with the default model and retain input-bounding metadata.
+    pub async fn embed_document_outcome(
+        &self,
+        text: &str,
+    ) -> RuntimeResult<DocumentEmbeddingOutcome> {
         let model_name = self.default_embedder_name();
         if model_name.is_empty() {
             return Err(RuntimeError::Unconfigured("embedding_model".into()));
         }
-        self.embed_document_with_model(model_name, text).await
+        self.embed_document_with_model_outcome(model_name, text)
+            .await
     }
 
     /// Embed a query for retrieval using the configured default model.
@@ -465,9 +476,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = service.embed(texts, emb_model).await;
+        let out = with_embedding_admission(service.embed(texts, emb_model)).await;
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
-        Ok(out?)
+        out
     }
 
     /// Embed a batch of documents for indexing using the named model.
@@ -477,10 +488,12 @@ impl KhiveRuntime {
     /// A mixed batch is bounded into one ordered owned batch so truncation never
     /// fragments one provider batch into sequential singleton inference calls.
     ///
-    /// **Reindex caveat**: see [`Self::embed_document_with_model`] — the same
+    /// **Reindex caveat**: see [`Self::embed_document_with_model_outcome`] — the same
     /// incomparability applies to batch-indexed vectors when switching models.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
+    /// Returns an error when any input is bounded; use the outcomes method to
+    /// retain the bounded vectors and per-document byte counts.
     pub async fn embed_document_batch_with_model(
         &self,
         model_name: &str,
@@ -489,12 +502,20 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        Ok(self
+        let outcomes = self
             .embed_document_batch_with_model_outcomes(model_name, texts)
-            .await?
-            .into_iter()
-            .map(|outcome| outcome.vector)
-            .collect())
+            .await?;
+        let mut report = EmbeddingTruncationReport::default();
+        for outcome in &outcomes {
+            report.observe(outcome);
+        }
+        if report.any_truncated() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding input truncated for {} documents ({} discarded bytes); use embed_document_batch_with_model_outcomes to inspect the bounded vectors",
+                report.truncated, report.discarded_bytes
+            )));
+        }
+        Ok(outcomes.into_iter().map(|outcome| outcome.vector).collect())
     }
 
     pub async fn embed_document_batch_with_model_outcomes(
@@ -536,13 +557,13 @@ impl KhiveRuntime {
             crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
         }
         let out = if texts.iter().all(|text| text.len() <= budget) {
-            service.embed_passage(texts, emb_model).await
+            with_embedding_admission(service.embed_passage(texts, emb_model)).await
         } else {
             let bounded_texts: Vec<String> = texts
                 .iter()
                 .map(|text| bounded_embedding_input(text, budget).0.to_owned())
                 .collect();
-            service.embed_passage(&bounded_texts, emb_model).await
+            with_embedding_admission(service.embed_passage(&bounded_texts, emb_model)).await
         };
         if token.is_none() {
             crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
@@ -579,6 +600,8 @@ impl KhiveRuntime {
     /// bulk knowledge-atom and section indexing paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    /// Returns an error when any input is bounded; use
+    /// [`Self::embed_document_batch_outcomes`] to retain the bounded vectors.
     pub async fn embed_document_batch(&self, texts: &[String]) -> RuntimeResult<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -627,11 +650,13 @@ impl KhiveRuntime {
         let out = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => service.embed(texts, emb_model).await,
-            _ => service.embed_query(texts, emb_model).await,
+            | EmbeddingModel::BgeLargeEnV15 => {
+                with_embedding_admission(service.embed(texts, emb_model)).await
+            }
+            _ => with_embedding_admission(service.embed_query(texts, emb_model)).await,
         };
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
-        Ok(out?)
+        out
     }
 
     /// Search vectors using either a caller-provided embedding or query text.
@@ -678,7 +703,7 @@ impl KhiveRuntime {
             })
             .await;
         crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
-        Ok(hits?)
+        hits.map_err(RuntimeError::from)
     }
 
     /// The note-search vector leg uses the pack-owned graph when that model
@@ -3180,9 +3205,10 @@ mod tests {
         let rt_ref = &rt;
         let (doc_emb, query_emb) = tokio::runtime::Runtime::new().unwrap().block_on(async {
             let d = rt_ref
-                .embed_document_with_model(&model.to_string(), &text)
+                .embed_document_with_model_outcome(&model.to_string(), &text)
                 .await
-                .unwrap();
+                .unwrap()
+                .vector;
             let q = rt_ref
                 .embed_query_with_model(&model.to_string(), &text)
                 .await
@@ -3215,9 +3241,10 @@ mod tests {
         let rt_ref = &rt;
         let (doc_emb, query_emb) = tokio::runtime::Runtime::new().unwrap().block_on(async {
             let d = rt_ref
-                .embed_document_with_model(&model.to_string(), &text)
+                .embed_document_with_model_outcome(&model.to_string(), &text)
                 .await
-                .unwrap();
+                .unwrap()
+                .vector;
             let q = rt_ref
                 .embed_query_with_model(&model.to_string(), &text)
                 .await

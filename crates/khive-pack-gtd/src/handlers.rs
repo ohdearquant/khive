@@ -1373,6 +1373,8 @@ impl GtdPack {
         let prepared =
             crate::task_create::prepare_task_create(self.runtime(), token, input).await?;
 
+        let mut embedding_truncation =
+            khive_runtime::retrieval::EmbeddingTruncationReport::default();
         let (note, replayed) = if let Some(key) = p.idempotency_key.as_deref() {
             khive_runtime::keyed_memory::validate_memory_key(key)?;
             let existing = self
@@ -1409,7 +1411,10 @@ impl GtdPack {
                     )
                     .await
                 {
-                    Ok((note, _)) => (note, false),
+                    Ok((note, truncation)) => {
+                        embedding_truncation = truncation;
+                        (note, false)
+                    }
                     Err(error) => {
                         let raced = self
                             .runtime()
@@ -1431,20 +1436,24 @@ impl GtdPack {
                 }
             }
         } else {
-            (
-                self.runtime()
-                    .create_note(
-                        token,
-                        "task",
-                        Some(prepared.title.as_str()),
-                        &prepared.content,
-                        Some(prepared.salience),
-                        Some(prepared.properties.clone()),
-                        prepared.annotates.clone(),
-                    )
-                    .await?,
-                false,
-            )
+            // The report-returning variant keeps a truncated embedding input
+            // from failing the call after the task is committed, which would
+            // skip the `depends_on` edges recorded below.
+            let (note, truncation) = self
+                .runtime()
+                .create_note_with_embedding_content_and_report(
+                    token,
+                    "task",
+                    Some(prepared.title.as_str()),
+                    &prepared.content,
+                    None,
+                    Some(prepared.salience),
+                    Some(prepared.properties.clone()),
+                    prepared.annotates.clone(),
+                )
+                .await?;
+            embedding_truncation = truncation;
+            (note, false)
         };
 
         // Record `depends_on` as graph edges (the GTD pack's `EDGE_RULES` extends
@@ -1468,6 +1477,10 @@ impl GtdPack {
         let mut response = render_task(&note);
         if replayed {
             response["replayed"] = json!(true);
+        }
+        if embedding_truncation.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
         Ok(response)
     }

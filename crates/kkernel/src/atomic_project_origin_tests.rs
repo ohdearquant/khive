@@ -14,7 +14,7 @@ mod atomic_project_origin_witnesses {
             .authorize(Namespace::local())
             .expect("authorize local fixture");
         let source = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 kind,
                 None,
@@ -24,9 +24,10 @@ mod atomic_project_origin_witnesses {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let document = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "document",
                 None,
@@ -36,6 +37,7 @@ mod atomic_project_origin_witnesses {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         assert_eq!(
             runtime.get_entity(&token, source.id).await.unwrap().kind,

@@ -124,8 +124,17 @@ fn empty_registry() -> khive_runtime::VerbRegistry {
 /// Used by feedback tests that need a valid target_id.
 async fn create_test_entity(rt: &KhiveRuntime, token: &NamespaceToken) -> String {
     let entity = rt
-        .create_entity(token, "concept", None, "test-target", None, None, vec![])
+        .create_entity_with_embedding_report(
+            token,
+            "concept",
+            None,
+            "test-target",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create test entity");
     entity.id.to_string()
 }
@@ -6978,6 +6987,79 @@ async fn feedback_accepts_short_prefix_target_id() {
     assert_eq!(result["signal"], json!("useful"), "signal must round-trip");
 }
 
+struct AdapterWarningEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for AdapterWarningEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "adapter-warning-test"
+    }
+}
+
+struct AdapterWarningEmbedderProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for AdapterWarningEmbedderProvider {
+    fn name(&self) -> &str {
+        "adapter-warning-test"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(
+        &self,
+    ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+        Ok(std::sync::Arc::new(AdapterWarningEmbeddingService))
+    }
+}
+
+#[tokio::test]
+async fn register_adapter_reports_embedding_truncation() {
+    let (pack, runtime) = make_pack();
+    runtime.register_embedder(AdapterWarningEmbedderProvider);
+    let registry = empty_registry();
+    let token = runtime.authorize(Namespace::local()).unwrap();
+    let active_revision = std::env::var("KHIVE_BRAIN_BASE_MODEL_REVISION")
+        .unwrap_or_else(|_| crate::handlers::DEFAULT_BASE_MODEL_REVISION.to_string());
+    let adapter_id = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+
+    let response = pack
+        .dispatch(
+            "brain.register_adapter",
+            json!({
+                "adapter_id": adapter_id,
+                "content_hash": "sha256:abcd1234",
+                "base_model_revision": active_revision,
+            }),
+            &registry,
+            &token,
+        )
+        .await
+        .expect("register_adapter with an over-limit adapter ID");
+
+    assert_eq!(response["registered"], json!(true));
+    assert_eq!(response["adapter_id"].as_str(), Some(adapter_id.as_str()));
+    assert_eq!(
+        response["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "register_adapter must disclose a truncated embedding input: {response}"
+    );
+}
+
 // ── #354: brain.register_adapter ─────────────────────────────────────────────
 
 // ACCEPT: matching base_model_revision registers the adapter and persists the artifact.
@@ -12697,3 +12779,6 @@ mod dispatch_counters {
         assert_eq!(state.snapshot_serializations.load(Ordering::Relaxed), 1);
     }
 }
+
+#[path = "event_usage_tests.rs"]
+mod event_usage_tests;

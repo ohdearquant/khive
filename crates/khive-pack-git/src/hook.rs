@@ -17,11 +17,6 @@ use uuid::Uuid;
 use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError};
 use khive_storage::Note;
 
-/// A 40-character lowercase-hex string, the shape of a full git commit SHA-1.
-fn is_40_hex(s: &str) -> bool {
-    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 /// The canonical `changed_paths` element shape. `pub(crate)` so the ingester
 /// filters the raw `git log -z --name-only` stream against exactly the rule
 /// this hook enforces, instead of handing the hook paths it must reject
@@ -73,7 +68,7 @@ fn properties_obj_mut(
 /// `validate_note_update` reject the same value the same way instead of
 /// carrying two copies of the check.
 fn validate_sha_shape(sha: &str) -> Result<(), RuntimeError> {
-    if is_40_hex(sha) {
+    if crate::object_id::is_40_hex(sha.as_bytes()) {
         Ok(())
     } else {
         Err(RuntimeError::InvalidInput(format!(
@@ -105,7 +100,7 @@ fn validate_parents_shape(value: &Value) -> Result<(), RuntimeError> {
         let s = p.as_str().ok_or_else(|| {
             RuntimeError::InvalidInput(format!("commit properties.parents[{idx}] must be a string"))
         })?;
-        if !is_40_hex(s) {
+        if !crate::object_id::is_40_hex(s.as_bytes()) {
             return Err(RuntimeError::InvalidInput(format!(
                 "commit properties.parents[{idx}] {s:?} must be a 40-character hex string"
             )));

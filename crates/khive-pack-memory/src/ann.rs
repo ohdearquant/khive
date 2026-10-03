@@ -78,6 +78,9 @@ impl AnnKey {
 
 pub(crate) struct AnnBridge {
     index: VamanaIndex,
+    incarnation: Arc<()>,
+    #[cfg(test)]
+    reverse_map_scan_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     id_map: Vec<Uuid>,
     /// Built on first replay; subsequent batches update only changed subjects.
     reverse_map: Option<HashMap<Uuid, u32>>,
@@ -642,6 +645,9 @@ impl AnnBridge {
             .map_err(|e| RuntimeError::Internal(e.to_string()))?;
         Ok(Self {
             index,
+            incarnation: Arc::new(()),
+            #[cfg(test)]
+            reverse_map_scan_hook: None,
             id_map,
             reverse_map: None,
             #[cfg(test)]
@@ -768,10 +774,45 @@ impl AnnBridge {
             || self.delta_chunks >= max_chunks
     }
 
+    fn fork_for_maintenance(&self) -> Self {
+        Self {
+            index: self.index.fork_for_maintenance(),
+            incarnation: Arc::new(()),
+            #[cfg(test)]
+            reverse_map_scan_hook: self.reverse_map_scan_hook.clone(),
+            id_map: self.id_map.clone(),
+            reverse_map: self.reverse_map.clone(),
+            #[cfg(test)]
+            reverse_map_builds: self.reverse_map_builds,
+            dirty_ops: self.dirty_ops,
+            published_seq: self.published_seq,
+            last_checkpoint: self.last_checkpoint,
+            commit_digest: self.commit_digest,
+            base_commit_digest: self.base_commit_digest,
+            base_applied_seq: self.base_applied_seq,
+            base_ops: self.base_ops,
+            delta_batches: self.delta_batches.clone(),
+            delta_raw_ops: self.delta_raw_ops,
+            delta_chunks: self.delta_chunks,
+            last_delta_nonce: self.last_delta_nonce,
+            namespace_set: self.namespace_set.clone(),
+            generation: self.generation,
+            epoch_baseline: self.epoch_baseline,
+            #[cfg(test)]
+            drop_probe: None,
+        }
+    }
+
     fn rebuild_reverse_map(&mut self) {
         // A tombstoned ordinal can retain its previous UUID until slot reuse.
         let mut reverse = HashMap::with_capacity(self.index.live_count());
         for (ordinal, uuid) in self.id_map.iter().enumerate() {
+            #[cfg(test)]
+            if ordinal == self.id_map.len() / 2 {
+                if let Some(hook) = &self.reverse_map_scan_hook {
+                    hook();
+                }
+            }
             if !self.index.is_tombstoned(ordinal as u32) {
                 reverse.insert(*uuid, ordinal as u32);
             }
@@ -954,6 +995,9 @@ impl AnnBridge {
         let base_ops = index.num_vectors();
         let mut bridge = Self {
             index,
+            incarnation: Arc::new(()),
+            #[cfg(test)]
+            reverse_map_scan_hook: None,
             id_map,
             reverse_map: None,
             #[cfg(test)]
@@ -1855,6 +1899,12 @@ async fn ensure_ann_for_model_inner(
     // The fingerprint sandwich bounds scan races; generation ordering closes the
     // later persistence/install window and prevents an older build from winning.
     details.path = "full_build";
+    let empty_corpus_fence = ann
+        .indexes
+        .read()
+        .await
+        .get(&key)
+        .map(MaintenanceFence::capture);
     let fp_before = compute_memory_fingerprint(rt, token, model).await;
     match load_and_build_from_vector_store(rt, token, model).await {
         Ok(Some(bridge)) => {
@@ -1891,6 +1941,34 @@ async fn ensure_ann_for_model_inner(
             })
         }
         Ok(None) => {
+            // An empty rebuild has no replacement to retire an incumbent retained
+            // after private replay failed. Evict only that unchanged incarnation.
+            khive_storage::ensure_request_read_active("memory.ann.empty_corpus")?;
+            if empty_corpus_fence.is_some()
+                && fp_before
+                    .as_ref()
+                    .is_none_or(|fingerprint| fingerprint.vector_count != 0)
+            {
+                return Ok(AnnEnsureStatus::DiscardedStaleBuild);
+            }
+            if durable_epoch(rt).await != target_epoch {
+                return Ok(AnnEnsureStatus::DiscardedStaleBuild);
+            }
+            let retired = {
+                let mut indexes = ann.indexes.write().await;
+                let unchanged = match &empty_corpus_fence {
+                    Some(fence) => indexes
+                        .get(&key)
+                        .is_some_and(|bridge| fence.matches(bridge)),
+                    None => !indexes.contains_key(&key),
+                };
+                if !unchanged {
+                    return Ok(AnnEnsureStatus::DiscardedStaleBuild);
+                }
+                khive_storage::ensure_request_read_active("memory.ann.empty_corpus")?;
+                indexes.remove(&key)
+            };
+            drop(retired);
             tracing::debug!(namespace = %ns, model = %model, "memory ANN: no note vectors to build");
             Ok(AnnEnsureStatus::EmptyCorpus)
         }
@@ -4345,6 +4423,7 @@ mod owned_build_tests;
 mod tests {
     use super::*;
     mod incremental_tests;
+    mod maintenance_lock_tests;
     use serial_test::serial;
 
     #[tokio::test(start_paused = true)]
@@ -7343,12 +7422,13 @@ mod tests {
         );
 
         const UPDATED_TEXT: &str = "tail dedup UPDATED content, unrelated to the original";
-        rt.update_note(
+        rt.update_note_with_embedding_report(
             &token,
             target.id,
             khive_runtime::NotePatch::new(None, Some(UPDATED_TEXT.to_string()), None, None, None),
         )
         .await
+        .map(|(row, _report)| row)
         .expect("update target note");
 
         // Query the segment's stale embedding of the ORIGINAL content: the

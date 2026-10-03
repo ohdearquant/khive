@@ -10,6 +10,7 @@
 //! - **Memory**: Uses pool-backed approach (acquire pool connection per-query inside `spawn_blocking`).
 
 use std::any::Any;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -140,11 +141,46 @@ fn prepare_batch_statements<'conn>(
     Ok(prepared)
 }
 
+/// Actual event-row insertions observed inside one owned atomic transaction.
+/// Labels come from the canonical event statement builders, not SQL parsing.
+/// Observation rows and unrelated DML never contribute. This accumulator crosses
+/// the blocking writer boundary; usage is published on the caller task only after
+/// the transaction owner reports a committed result.
+#[derive(Default)]
+struct AtomicEventRows(AtomicU64);
+
+impl AtomicEventRows {
+    fn observe(&self, statement: &SqlStatement, affected: u64) {
+        if matches!(
+            statement.label.as_deref(),
+            Some(
+                "event_insert_on_writer"
+                    | "hard-delete-derived_from-warning"
+                    | "hard-delete-supersedes-warning"
+                    | "hard-delete-precedes-warning"
+                    | "hard-delete-supports-warning"
+                    | "hard-delete-refutes-warning"
+            )
+        ) {
+            let _ = self
+                .0
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                    Some(total.saturating_add(affected))
+                });
+        }
+    }
+
+    fn committed_rows(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// Bind and execute handles returned by [`prepare_batch_statements`].
 fn execute_prepared_batch<'conn>(
     conn: &'conn rusqlite::Connection,
     prepared: Vec<PreparedBatchStatement<'conn>>,
     statements: &[SqlStatement],
+    event_rows: Option<&AtomicEventRows>,
 ) -> Result<u64, rusqlite::Error> {
     debug_assert_eq!(prepared.len(), statements.len());
     let mut total = 0u64;
@@ -156,7 +192,11 @@ fn execute_prepared_batch<'conn>(
             }
         };
         bind_params(&mut prepared, &statement.params)?;
-        total += prepared.raw_execute()? as u64;
+        let affected = prepared.raw_execute()? as u64;
+        if let Some(event_rows) = event_rows {
+            event_rows.observe(statement, affected);
+        }
+        total += affected;
     }
     Ok(total)
 }
@@ -421,6 +461,7 @@ fn execute_standalone_batch(
     conn: &rusqlite::Connection,
     statements: &[SqlStatement],
     origin: khive_storage::tx_registry::TxOrigin,
+    event_rows: Option<&AtomicEventRows>,
 ) -> (BatchHandleDisposition, Result<u64, BatchFailure>) {
     let prepared = match prepare_batch_statements(conn, statements) {
         Ok(prepared) => prepared,
@@ -468,7 +509,7 @@ fn execute_standalone_batch(
     let _tx_handle =
         khive_storage::tx_registry::register_scoped(Some("execute_batch".to_string()), origin);
     let result = (|| -> Result<u64, rusqlite::Error> {
-        let total = execute_prepared_batch(conn, prepared, statements)?;
+        let total = execute_prepared_batch(conn, prepared, statements, event_rows)?;
         conn.execute_batch("COMMIT")?;
         Ok(total)
     })();
@@ -1972,6 +2013,7 @@ struct SqliteWriter {
     db: String,
     /// Reader-pool owner and explicit-transaction exception source.
     pool: Arc<ConnectionPool>,
+    event_rows: Option<Arc<AtomicEventRows>>,
 }
 
 fn execute_top_level_maintenance(
@@ -2296,6 +2338,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // left untouched so a subsequent `execute`/`execute_script` call on
         // this same handle still works over the standalone connection.
         if let Some(writer_task) = self.writer_task.clone() {
+            let event_rows = self.event_rows.clone();
             return writer_task
                 .send_bounded(move |conn| {
                     let mut stmt = prepare_cached_sql_statement(conn, &statement.sql)
@@ -2305,6 +2348,9 @@ impl khive_storage::SqlWriter for SqliteWriter {
                     let affected = stmt
                         .raw_execute()
                         .map_err(|e| map_rusqlite_err(e, "execute"))?;
+                    if let Some(event_rows) = event_rows.as_deref() {
+                        event_rows.observe(&statement, affected as u64);
+                    }
                     Ok(affected as u64)
                 })
                 .await;
@@ -2315,11 +2361,16 @@ impl khive_storage::SqlWriter for SqliteWriter {
             operation: "execute".into(),
             message: "connection already consumed".into(),
         })?;
+        let event_rows = self.event_rows.clone();
         let (handle, result) = tokio::task::spawn_blocking(move || {
             let res = (|| -> Result<usize, rusqlite::Error> {
                 let mut stmt = prepare_cached_sql_statement(&handle.conn, &statement.sql)?;
                 bind_params(&mut stmt, &statement.params)?;
-                stmt.raw_execute()
+                let affected = stmt.raw_execute()?;
+                if let Some(event_rows) = event_rows.as_deref() {
+                    event_rows.observe(&statement, affected as u64);
+                }
+                Ok(affected)
             })();
             (handle, res)
         })
@@ -2358,11 +2409,12 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // `COMMIT` would commit early and break all-or-nothing).
         reject_transaction_control_statements(&statements, "execute_batch")?;
         if let Some(writer_task) = self.writer_task.clone() {
+            let event_rows = self.event_rows.clone();
             return writer_task
                 .send_bounded(move |conn| {
                     let prepared = prepare_batch_statements(conn, &statements)
                         .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
-                    execute_prepared_batch(conn, prepared, &statements)
+                    execute_prepared_batch(conn, prepared, &statements, event_rows.as_deref())
                         .map_err(|e| map_rusqlite_err(e, "execute_batch"))
                 })
                 .await;
@@ -2374,8 +2426,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
             message: "connection already consumed".into(),
         })?;
         let origin = self.origin.clone();
+        let event_rows = self.event_rows.clone();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            let (disposition, result) = execute_standalone_batch(&handle.conn, &statements, origin);
+            let (disposition, result) =
+                execute_standalone_batch(&handle.conn, &statements, origin, event_rows.as_deref());
             let retained = match disposition {
                 BatchHandleDisposition::Retain => Some(handle),
                 BatchHandleDisposition::Poison => None,
@@ -3013,7 +3067,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                 Some("pool_writer.execute_batch".to_string()),
                 pool.origin(),
             );
-            let result = execute_prepared_batch(&guard, prepared, &statements)
+            let result = execute_prepared_batch(&guard, prepared, &statements, None)
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"));
             match result {
                 Ok(total) => {
@@ -3079,6 +3133,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
 /// drives `op` to completion via `block_on_sync` synchronously, and drops
 /// the `InlineWriter` before that borrow ends, all within one stack frame.
 struct InlineWriter {
+    event_rows: Option<Arc<AtomicEventRows>>,
     conn: *const rusqlite::Connection,
 }
 
@@ -3161,6 +3216,9 @@ impl khive_storage::SqlWriter for InlineWriter {
         let affected = stmt
             .raw_execute()
             .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
+        if let Some(event_rows) = self.event_rows.as_deref() {
+            event_rows.observe(&statement, affected as u64);
+        }
         Ok(affected as u64)
     }
 
@@ -3175,8 +3233,13 @@ impl khive_storage::SqlWriter for InlineWriter {
         reject_transaction_control_statements(&statements, "inline.execute_batch")?;
         let prepared = prepare_batch_statements(self.conn(), &statements)
             .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
-        execute_prepared_batch(self.conn(), prepared, &statements)
-            .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))
+        execute_prepared_batch(
+            self.conn(),
+            prepared,
+            &statements,
+            self.event_rows.as_deref(),
+        )
+        .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
@@ -3414,6 +3477,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 None
             };
             Ok(Box::new(SqliteWriter {
+                event_rows: None,
                 handle,
                 writer_task,
                 origin: self.pool.origin(),
@@ -3441,110 +3505,109 @@ impl khive_storage::SqlAccess for SqlBridge {
         &self,
         op: AtomicUnitOp,
     ) -> khive_storage::types::StorageResult<Box<dyn Any + Send>> {
-        if self.is_file_backed {
-            if self.pool.config().read_only {
-                return Err(StorageError::Pool {
-                    operation: "atomic_unit".into(),
-                    message: "backend is read-only".into(),
-                });
-            }
-            // Best-effort, same guard `writer()` uses: `Ok(None)` on flag-off;
-            // `Err(WriterTaskNoRuntime)` propagates loud rather than silently
-            // falling back to a competing connection from a sync caller. ADR-136
-            // D1 gate 3: `Ok(None)` under strict routing is ALSO a fail-closed
-            // error (queue was requested but unavailable), not just a degrade.
-            let handle = self.pool.writer_task_handle()?;
-            if handle.is_none() && self.pool.config().write_routing_strict {
-                return Err(StorageError::Pool {
-                    operation: "atomic_unit".into(),
-                    message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is \
-                              available; refusing to fall back to a direct connection"
-                        .into(),
-                });
-            }
-            if handle.is_none() && self.pool.write_queue_active() {
-                crate::timeout_sink::emit_direct_route_violation(
-                    &crate::timeout_sink::db_label(&self.pool),
-                    crate::timeout_sink::Site::DirectRouteAtomicUnit,
-                );
-            }
-            if let Some(writer_task) = handle {
-                // Flag-on: ONE queued WriteRequest. `run_writer_task` already
-                // has an open `BEGIN IMMEDIATE` on its dedicated connection
-                // before this closure runs and issues `COMMIT`/`ROLLBACK`
-                // after it returns — `op` must not (and, via `InlineWriter`,
-                // does not) issue its own transaction control.
-                return writer_task
-                    .send_bounded(move |conn| {
-                        let mut inline = InlineWriter {
-                            conn: conn as *const rusqlite::Connection,
-                        };
-                        // Flatten: `block_on_sync` now returns `Result<F::Output,
-                        // StorageError>` (outer = "did the future actually
-                        // resolve on first poll", inner = the op's own
-                        // `StorageResult`) instead of panicking on `Pending`
-                        // (ADR-067 Component A). Either
-                        // error flows through this closure's ordinary `Err`
-                        // return, which `WriteRequest::execute_and_reply`
-                        // already turns into a normal ROLLBACK + error reply —
-                        // no panic, so the writer task survives.
-                        match block_on_sync(op(&mut inline)) {
-                            Ok(inner) => inner,
-                            Err(e) => Err(e),
-                        }
-                    })
-                    .await;
-            }
-            // Flag-off (or no writer task available): manual
-            // BEGIN IMMEDIATE/COMMIT/ROLLBACK on a standalone writer —
-            // byte-for-byte the pre-ADR-067 shape.
-            //
-            // Contract: this acquire waits on the pool-wide one-permit
-            // writer-handle budget — the same permit a live `writer()` handle
-            // holds for its lifetime — so it times out with
-            // `StorageError::AdmissionTimeout` after `checkout_timeout` while a writer
-            // handle is checked out (and a `writer()` call times out while
-            // this unit runs). Callers must not hold a boxed writer handle
-            // across an `atomic_unit()` call on the same pool; drop the
-            // handle first. The `writer_task` branch above never touches this
-            // budget.
-            let handle_slot = acquire_handle_slot(
-                self.pool.sql_bridge_writer_slots(),
-                self.pool.config().checkout_timeout,
-                "sql_bridge.atomic_unit_handle",
-                SlotTimeoutClass::Admission,
-            )
-            .await?;
-            let (conn, handle_slot) =
-                open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
-            let mut writer = SqliteWriter {
-                handle: Some(StandaloneHandle {
-                    conn,
-                    _retained_slot: Some(handle_slot),
-                    read_transaction_slot: None,
-                }),
-                writer_task: None,
-                origin: self.pool.origin(),
-                db: crate::timeout_sink::db_label(&self.pool),
-                pool: Arc::clone(&self.pool),
-            };
-            run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
-        } else {
-            // Every statement shares one connection. Keep its guard through
-            // commit/rollback so other units and ordinary writes cannot join it.
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.try_writer().map_err(|error: SqliteError| {
-                    StorageError::driver(StorageCapability::Sql, "atomic_unit", error)
-                })?;
-                let conn = guard.conn();
-                if !conn.is_autocommit() {
-                    pool.retire_pooled_writer(conn);
-                    return Err(StorageError::WriterTaskTerminated {
-                        request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        let event_rows = Arc::new(AtomicEventRows::default());
+        let result = async {
+            if self.is_file_backed {
+                if self.pool.config().read_only {
+                    return Err(StorageError::Pool {
+                        operation: "atomic_unit".into(),
+                        message: "backend is read-only".into(),
                     });
                 }
-                if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+                // Best-effort, same guard `writer()` uses: `Ok(None)` on flag-off;
+                // `Err(WriterTaskNoRuntime)` propagates loud rather than silently
+                // falling back to a competing connection from a sync caller. ADR-136
+                // D1 gate 3: `Ok(None)` under strict routing is ALSO a fail-closed
+                // error (queue was requested but unavailable), not just a degrade.
+                let handle = self.pool.writer_task_handle()?;
+                if handle.is_none() && self.pool.config().write_routing_strict {
+                    return Err(StorageError::Pool {
+                        operation: "atomic_unit".into(),
+                        message: "KHIVE_WRITE_ROUTING=strict but no writer-task handle is \
+                              available; refusing to fall back to a direct connection"
+                            .into(),
+                    });
+                }
+                if handle.is_none() && self.pool.write_queue_active() {
+                    crate::timeout_sink::emit_direct_route_violation(
+                        &crate::timeout_sink::db_label(&self.pool),
+                        crate::timeout_sink::Site::DirectRouteAtomicUnit,
+                    );
+                }
+                if let Some(writer_task) = handle {
+                    // Flag-on: ONE queued WriteRequest. `run_writer_task` already
+                    // has an open `BEGIN IMMEDIATE` on its dedicated connection
+                    // before this closure runs and issues `COMMIT`/`ROLLBACK`
+                    // after it returns — `op` must not (and, via `InlineWriter`,
+                    // does not) issue its own transaction control.
+                    let pending_event_rows = Arc::clone(&event_rows);
+                    return writer_task
+                        .send_bounded(move |conn| {
+                            let mut inline = InlineWriter {
+                                event_rows: Some(Arc::clone(&pending_event_rows)),
+                                conn: conn as *const rusqlite::Connection,
+                            };
+                            // Flatten: `block_on_sync` now returns `Result<F::Output,
+                            // StorageError>` (outer = "did the future actually
+                            // resolve on first poll", inner = the op's own
+                            // `StorageResult`) instead of panicking on `Pending`
+                            // (ADR-067 Component A). Either
+                            // error flows through this closure's ordinary `Err`
+                            // return, which `WriteRequest::execute_and_reply`
+                            // already turns into a normal ROLLBACK + error reply —
+                            // no panic, so the writer task survives.
+                            match block_on_sync(op(&mut inline)) {
+                                Ok(inner) => inner,
+                                Err(e) => Err(e),
+                            }
+                        })
+                        .await;
+                }
+                // Flag-off (or no writer task available): manual
+                // BEGIN IMMEDIATE/COMMIT/ROLLBACK on a standalone writer —
+                // byte-for-byte the pre-ADR-067 shape.
+                //
+                // Contract: this acquire waits on the pool-wide one-permit
+                // writer-handle budget — the same permit a live `writer()` handle
+                // holds for its lifetime — so it times out with
+                // `StorageError::AdmissionTimeout` after `checkout_timeout` while a writer
+                // handle is checked out (and a `writer()` call times out while
+                // this unit runs). Callers must not hold a boxed writer handle
+                // across an `atomic_unit()` call on the same pool; drop the
+                // handle first. The `writer_task` branch above never touches this
+                // budget.
+                let handle_slot = acquire_handle_slot(
+                    self.pool.sql_bridge_writer_slots(),
+                    self.pool.config().checkout_timeout,
+                    "sql_bridge.atomic_unit_handle",
+                    SlotTimeoutClass::Admission,
+                )
+                .await?;
+                let (conn, handle_slot) =
+                    open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
+                let mut writer = SqliteWriter {
+                    event_rows: Some(Arc::clone(&event_rows)),
+                    handle: Some(StandaloneHandle {
+                        conn,
+                        _retained_slot: Some(handle_slot),
+                        read_transaction_slot: None,
+                    }),
+                    writer_task: None,
+                    origin: self.pool.origin(),
+                    db: crate::timeout_sink::db_label(&self.pool),
+                    pool: Arc::clone(&self.pool),
+                };
+                run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
+            } else {
+                // Every statement shares one connection. Keep its guard through
+                // commit/rollback so other units and ordinary writes cannot join it.
+                let pool = Arc::clone(&self.pool);
+                let pending_event_rows = Arc::clone(&event_rows);
+                tokio::task::spawn_blocking(move || {
+                    let guard = pool.try_writer().map_err(|error: SqliteError| {
+                        StorageError::driver(StorageCapability::Sql, "atomic_unit", error)
+                    })?;
+                    let conn = guard.conn();
                     if !conn.is_autocommit() {
                         pool.retire_pooled_writer(conn);
                         return Err(StorageError::WriterTaskTerminated {
@@ -3552,30 +3615,47 @@ impl khive_storage::SqlAccess for SqlBridge {
                                 khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                         });
                     }
-                    return Err(map_rusqlite_err(error, "atomic_unit.begin"));
-                }
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
-                    Some("atomic_unit".to_string()),
-                    pool.origin(),
-                );
-                let (result, terminal_state) = crate::writer_task::execute_wrapped_transaction(
-                    conn,
-                    "atomic_unit.commit",
-                    |conn| {
-                        let mut inline = InlineWriter {
-                            conn: conn as *const rusqlite::Connection,
-                        };
-                        block_on_sync(op(&mut inline)).and_then(|result| result)
-                    },
-                );
-                if terminal_state.is_some() {
-                    pool.retire_pooled_writer(conn);
-                }
-                result
-            })
-            .await
-            .map_err(|error| StorageError::driver(StorageCapability::Sql, "atomic_unit", error))?
+                    if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+                        if !conn.is_autocommit() {
+                            pool.retire_pooled_writer(conn);
+                            return Err(StorageError::WriterTaskTerminated {
+                                request_state:
+                                    khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                            });
+                        }
+                        return Err(map_rusqlite_err(error, "atomic_unit.begin"));
+                    }
+                    let _tx_handle = khive_storage::tx_registry::register_scoped(
+                        Some("atomic_unit".to_string()),
+                        pool.origin(),
+                    );
+                    let (result, terminal_state) = crate::writer_task::execute_wrapped_transaction(
+                        conn,
+                        "atomic_unit.commit",
+                        |conn| {
+                            let mut inline = InlineWriter {
+                                event_rows: Some(Arc::clone(&pending_event_rows)),
+                                conn: conn as *const rusqlite::Connection,
+                            };
+                            block_on_sync(op(&mut inline)).and_then(|result| result)
+                        },
+                    );
+                    if terminal_state.is_some() {
+                        pool.retire_pooled_writer(conn);
+                    }
+                    result
+                })
+                .await
+                .map_err(|error| {
+                    StorageError::driver(StorageCapability::Sql, "atomic_unit", error)
+                })?
+            }
         }
+        .await;
+        khive_storage::usage::account_event_write(
+            result.as_ref().map(|_| event_rows.committed_rows()),
+        );
+        result
     }
 }
 
@@ -5065,6 +5145,7 @@ mod tests {
         .unwrap();
 
         let mut writer = InlineWriter {
+            event_rows: None,
             conn: &conn as *const rusqlite::Connection,
         };
         let affected = block_on_sync(khive_storage::SqlWriter::execute_batch(
@@ -5092,6 +5173,7 @@ mod tests {
     fn inline_execute_batch_preserves_schema_dependencies_between_statements() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         let mut writer = InlineWriter {
+            event_rows: None,
             conn: &conn as *const rusqlite::Connection,
         };
 
@@ -6856,6 +6938,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, _completed) = blocking_non_interrupting_progress_gate(&conn);
         let mut writer = SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(writer_slot),
@@ -7063,6 +7146,7 @@ mod tests {
             .unwrap();
         let conn = open_standalone_writer(&pool).unwrap();
         let mut writer = SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
@@ -7130,6 +7214,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
         let mut writer = SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
@@ -7222,6 +7307,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
         let mut writer = SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
@@ -7313,6 +7399,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
         let writer = Arc::new(tokio::sync::Mutex::new(SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
@@ -7405,6 +7492,7 @@ mod tests {
         .unwrap();
         let conn = open_standalone_writer(&pool).unwrap();
         let mut writer = SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
@@ -7981,6 +8069,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         conn.authorizer(Some(deny_rollback)).unwrap();
         let mut writer = SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
@@ -8082,6 +8171,7 @@ mod tests {
         // batch's own `BEGIN IMMEDIATE` fails non-transiently.
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let mut writer = SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
@@ -8182,6 +8272,7 @@ mod tests {
         .unwrap();
         let conn = open_standalone_writer(&pool).unwrap();
         let mut writer = SqliteWriter {
+            event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
                 _retained_slot: Some(handle_slot),
@@ -8974,6 +9065,7 @@ mod tests {
             .expect("queue-enabled file pool must offer a writer task")
             .expect("writer task present under write_queue_enabled");
         let mut post_cancel = SqliteWriter {
+            event_rows: None,
             handle: None,
             writer_task: Some(writer_task),
             origin: pool.origin(),

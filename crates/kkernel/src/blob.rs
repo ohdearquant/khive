@@ -12,7 +12,7 @@ use clap::Subcommand;
 use khive_runtime::{BackendKind, KhiveConfig, KhiveRuntime, RuntimeConfig};
 #[cfg(all(test, unix))]
 use khive_storage::TopLevelMaintenance;
-use khive_storage::{SqlAccess, SqlRow, SqlStatement, SqlValue};
+use khive_storage::{SqlAccess, SqlStatement, SqlValue};
 use serde::Serialize;
 
 const PAGE_SIZE: usize = 128;
@@ -403,13 +403,46 @@ async fn read_page(
     rows.into_iter()
         .map(|row| {
             Ok(AttachmentRow {
-                record_uuid: text_column(&row, "record_uuid")?,
-                substrate: text_column(&row, "substrate")?,
-                role: text_column(&row, "role")?,
-                content_ref: text_column(&row, "content_ref")?,
-                media_type: optional_text_column(&row, "media_type")?,
-                size_bytes: optional_integer_column(&row, "size_bytes")?,
-                created_at: integer_column(&row, "created_at")?,
+                record_uuid: row.text("record_uuid").map(str::to_owned).map_err(|_| {
+                    anyhow!(
+                        "record_uuid: expected text, got {:?}",
+                        row.get("record_uuid")
+                    )
+                })?,
+                substrate: row.text("substrate").map(str::to_owned).map_err(|_| {
+                    anyhow!("substrate: expected text, got {:?}", row.get("substrate"))
+                })?,
+                role: row
+                    .text("role")
+                    .map(str::to_owned)
+                    .map_err(|_| anyhow!("role: expected text, got {:?}", row.get("role")))?,
+                content_ref: row.text("content_ref").map(str::to_owned).map_err(|_| {
+                    anyhow!(
+                        "content_ref: expected text, got {:?}",
+                        row.get("content_ref")
+                    )
+                })?,
+                media_type: row
+                    .opt_text("media_type")
+                    .map(|value| value.map(str::to_owned))
+                    .map_err(|_| {
+                        anyhow!(
+                            "media_type: expected nullable text, got {:?}",
+                            row.get("media_type")
+                        )
+                    })?,
+                size_bytes: row.opt_i64("size_bytes").map_err(|_| {
+                    anyhow!(
+                        "size_bytes: expected nullable integer, got {:?}",
+                        row.get("size_bytes")
+                    )
+                })?,
+                created_at: row.i64("created_at").map_err(|_| {
+                    anyhow!(
+                        "created_at: expected integer, got {:?}",
+                        row.get("created_at")
+                    )
+                })?,
                 read_at,
             })
         })
@@ -429,43 +462,22 @@ async fn probe_member(member: &Member, ids: &[String]) -> Result<HashMap<String,
     drop(reader);
     let mut found = HashMap::<String, Presence>::new();
     for row in rows {
-        let id = text_column(&row, "id")?;
-        let live = optional_integer_column(&row, "deleted_at")?.is_none();
+        let id = row
+            .text("id")
+            .map(str::to_owned)
+            .map_err(|_| anyhow!("id: expected text, got {:?}", row.get("id")))?;
+        let live = row
+            .opt_i64("deleted_at")
+            .map_err(|_| {
+                anyhow!(
+                    "deleted_at: expected nullable integer, got {:?}",
+                    row.get("deleted_at")
+                )
+            })?
+            .is_none();
         found.entry(id).or_default().live |= live;
     }
     Ok(found)
-}
-
-fn text_column(row: &SqlRow, column: &str) -> Result<String> {
-    match row.get(column) {
-        Some(SqlValue::Text(value)) => Ok(value.clone()),
-        other => Err(anyhow!("{column}: expected text, got {other:?}")),
-    }
-}
-
-fn integer_column(row: &SqlRow, column: &str) -> Result<i64> {
-    match row.get(column) {
-        Some(SqlValue::Integer(value)) => Ok(*value),
-        other => Err(anyhow!("{column}: expected integer, got {other:?}")),
-    }
-}
-
-fn optional_text_column(row: &SqlRow, column: &str) -> Result<Option<String>> {
-    match row.get(column) {
-        Some(SqlValue::Null) => Ok(None),
-        Some(SqlValue::Text(value)) => Ok(Some(value.clone())),
-        other => Err(anyhow!("{column}: expected nullable text, got {other:?}")),
-    }
-}
-
-fn optional_integer_column(row: &SqlRow, column: &str) -> Result<Option<i64>> {
-    match row.get(column) {
-        Some(SqlValue::Null) => Ok(None),
-        Some(SqlValue::Integer(value)) => Ok(Some(*value)),
-        other => Err(anyhow!(
-            "{column}: expected nullable integer, got {other:?}"
-        )),
-    }
 }
 
 #[cfg(test)]

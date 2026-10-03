@@ -146,7 +146,7 @@ async fn failed_post_claim_index_keeps_id_and_retry_repairs_suggest() {
 async fn minted_legacy_id_wins_and_derived_tombstone_refuses() {
     let (rt, token) = fixture();
     let legacy = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             REGISTRY_ENTITY_KIND,
             Some("tool"),
@@ -156,6 +156,7 @@ async fn minted_legacy_id_wins_and_derived_tombstone_refuses() {
             vec![REGISTRY_TAG.into(), "tool".into()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("legacy row");
     let (found, created, _) = register_one(&rt, &token, spec("LEGACY ROW", &[]))
         .await
@@ -195,7 +196,7 @@ async fn deleted_legacy_id_blocks_same_name_registration() {
     let (rt, token) = fixture();
     let name = "deleted legacy row";
     let legacy = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             REGISTRY_ENTITY_KIND,
             Some("tool"),
@@ -205,6 +206,7 @@ async fn deleted_legacy_id_blocks_same_name_registration() {
             vec![REGISTRY_TAG.into(), "tool".into()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("legacy row");
     let derived = derived_registry_id("object", token.namespace().as_str(), name);
     assert_ne!(legacy.id, derived);
@@ -232,7 +234,7 @@ async fn deleted_legacy_id_blocks_same_name_registration() {
 async fn tombstones_with_other_tag_or_namespace_do_not_hold_registry_name() {
     let (rt, token) = fixture();
     let other_tag = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             REGISTRY_ENTITY_KIND,
             Some("tool"),
@@ -242,6 +244,7 @@ async fn tombstones_with_other_tag_or_namespace_do_not_hold_registry_name() {
             vec!["unrelated".into()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("other-tag row");
     rt.entities(&token)
         .expect("entity store")
@@ -257,7 +260,7 @@ async fn tombstones_with_other_tag_or_namespace_do_not_hold_registry_name() {
         .authorize(Namespace::parse("foreign-tool-claims").expect("other namespace"))
         .expect("other token");
     let foreign = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &other_token,
             REGISTRY_ENTITY_KIND,
             Some("tool"),
@@ -267,6 +270,7 @@ async fn tombstones_with_other_tag_or_namespace_do_not_hold_registry_name() {
             vec![REGISTRY_TAG.into(), "tool".into()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("foreign row");
     rt.entities(&other_token)
         .expect("foreign entity store")
@@ -284,7 +288,7 @@ async fn deleted_legacy_capability_blocks_same_name_claim() {
     let (rt, token) = fixture();
     let name = "legacy capability tombstone";
     let legacy = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             Some("capability"),
@@ -294,6 +298,7 @@ async fn deleted_legacy_capability_blocks_same_name_claim() {
             vec![CAPABILITY_TAG.into()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("legacy capability");
     let derived = derived_registry_id("capability", token.namespace().as_str(), name);
     assert_ne!(legacy.id, derived);

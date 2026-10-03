@@ -261,7 +261,7 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
         .expect("setup token");
     let board_fingerprint = "a".repeat(64);
     let board = runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &setup_token,
             "artifact",
             Some("moodboard"),
@@ -271,6 +271,7 @@ async fn attributed_serve_randomizes_occurrences_and_judgment_is_immutable() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("board");
     let mut assets = Vec::new();
     for (index, bytes) in [b"asset-one".as_slice(), b"asset-two".as_slice()]
@@ -519,7 +520,7 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
     let board_fingerprint = "a".repeat(64);
     let descriptor_fingerprint = "b".repeat(64);
     let board = runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &setup_token,
             "artifact",
             Some("moodboard"),
@@ -529,6 +530,7 @@ async fn public_training_publishes_calibrated_fann_and_preference_stays_nonconfo
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("board");
     let anchor_ref = blob_store
         .put(b"anchor".to_vec())

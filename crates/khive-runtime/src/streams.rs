@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 use khive_storage::{
-    AtomicUnitOp, Note, SqlAccess, SqlRow, SqlStatement, SqlValue, SqlWriter, StorageCapability,
+    AtomicUnitOp, Note, SqlAccess, SqlStatement, SqlValue, SqlWriter, StorageCapability,
     StorageError, WriterTaskRequestState,
 };
 use khive_types::{Details, KhiveError};
@@ -52,24 +52,6 @@ fn validate_stream(stream: &str) -> RuntimeResult<()> {
         ));
     }
     Ok(())
-}
-
-fn integer(row: &SqlRow, name: &str) -> RuntimeResult<i64> {
-    match row.get(name) {
-        Some(SqlValue::Integer(value)) => Ok(*value),
-        _ => Err(RuntimeError::Internal(format!(
-            "stream query missing integer {name}"
-        ))),
-    }
-}
-
-fn text<'a>(row: &'a SqlRow, name: &str) -> RuntimeResult<&'a str> {
-    match row.get(name) {
-        Some(SqlValue::Text(value)) => Ok(value),
-        _ => Err(RuntimeError::Internal(format!(
-            "stream query missing text {name}"
-        ))),
-    }
 }
 
 fn write_failure(message: &str) -> StorageError {
@@ -715,7 +697,7 @@ async fn apply_stream_member(
                     ));
                 };
                 Ok((
-                    json!({"id": id, "version": integer(&stored, "version")?, "updated_at": micros_to_iso(integer(&stored, "updated_at")?)}),
+                    json!({"id": id, "version": stored.i64("version").map_err(|_| RuntimeError::Internal("stream query missing integer version".to_owned()))?, "updated_at": micros_to_iso(stored.i64("updated_at").map_err(|_| RuntimeError::Internal("stream query missing integer updated_at".to_owned()))?)}),
                     applied.effect,
                 ))
             }
@@ -730,7 +712,10 @@ async fn apply_stream_member(
                 };
                 // Versions are local to a note identity. A replacement can be
                 // at the expected version without being the prepared target.
-                if text(&holder, "id")? != id.to_string() {
+                if holder.text("id").map_err(|_| {
+                    RuntimeError::Internal("stream query missing text id".to_owned())
+                })? != id.to_string()
+                {
                     if let AtomicOpPlan::Update(update) = &plan {
                         if let Some(expected) = update
                             .note_guard
@@ -739,7 +724,11 @@ async fn apply_stream_member(
                         {
                             return Err(NoteWriteConflict::Version {
                                 expected,
-                                current: integer(&holder, "version")?,
+                                current: holder.i64("version").map_err(|_| {
+                                    RuntimeError::Internal(
+                                        "stream query missing integer version".to_owned(),
+                                    )
+                                })?,
                             }
                             .into_error()
                             .into());
@@ -1467,7 +1456,11 @@ impl KhiveRuntime {
         )).await?;
         let head = rows
             .first()
-            .map(|row| integer(row, "head_seq"))
+            .map(|row| {
+                row.i64("head_seq").map_err(|_| {
+                    RuntimeError::Internal("stream query missing integer head_seq".to_owned())
+                })
+            })
             .transpose()?
             .unwrap_or(0);
         let mut entries = Vec::new();
@@ -1476,10 +1469,14 @@ impl KhiveRuntime {
             if matches!(row.get("seq"), Some(SqlValue::Null)) {
                 continue;
             }
-            let seq = integer(row, "seq")?;
-            let record: Value = serde_json::from_str(text(row, "content")?)
-                .map_err(|e| RuntimeError::Internal(format!("invalid stream record JSON: {e}")))?;
-            entries.push(json!({"seq": seq, "id": text(row, "id")?, "record": record, "created_at": micros_to_iso(integer(row, "created_at")?)}));
+            let seq = row.i64("seq").map_err(|_| {
+                RuntimeError::Internal("stream query missing integer seq".to_owned())
+            })?;
+            let record: Value = serde_json::from_str(row.text("content").map_err(|_| {
+                RuntimeError::Internal("stream query missing text content".to_owned())
+            })?)
+            .map_err(|e| RuntimeError::Internal(format!("invalid stream record JSON: {e}")))?;
+            entries.push(json!({"seq": seq, "id": row.text("id").map_err(|_| RuntimeError::Internal("stream query missing text id".to_owned()))?, "record": record, "created_at": micros_to_iso(row.i64("created_at").map_err(|_| RuntimeError::Internal("stream query missing integer created_at".to_owned()))?)}));
             last = Some(seq);
         }
         Ok(
@@ -1494,7 +1491,9 @@ impl KhiveRuntime {
             "SELECT COUNT(*) AS count, COALESCE(MAX(seq),0) AS head_seq FROM note_streams WHERE namespace=?1 AND stream=?2",
             vec![SqlValue::Text(token.namespace().as_str().into()), SqlValue::Text(stream.into())],
         )).await?.ok_or_else(|| RuntimeError::Internal("stream.stat returned no aggregate row".into()))?;
-        Ok(json!({"head_seq": integer(&row, "head_seq")?, "count": integer(&row, "count")?}))
+        Ok(
+            json!({"head_seq": row.i64("head_seq").map_err(|_| RuntimeError::Internal("stream query missing integer head_seq".to_owned()))?, "count": row.i64("count").map_err(|_| RuntimeError::Internal("stream query missing integer count".to_owned()))?}),
+        )
     }
 
     /// Membership lookup only after the caller has resolved an accessible note.
@@ -1520,8 +1519,26 @@ impl KhiveRuntime {
                 .with_details(Details::new_owned([
                     ("reason", "stream_member".into()),
                     ("id", note.id.to_string()),
-                    ("stream", text(&row, "stream")?.into()),
-                    ("seq", integer(&row, "seq")?.to_string()),
+                    (
+                        "stream",
+                        row.text("stream")
+                            .map_err(|_| {
+                                RuntimeError::Internal(
+                                    "stream query missing text stream".to_owned(),
+                                )
+                            })?
+                            .into(),
+                    ),
+                    (
+                        "seq",
+                        row.i64("seq")
+                            .map_err(|_| {
+                                RuntimeError::Internal(
+                                    "stream query missing integer seq".to_owned(),
+                                )
+                            })?
+                            .to_string(),
+                    ),
                 ]))
                 .into())
         })

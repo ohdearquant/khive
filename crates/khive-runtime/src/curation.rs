@@ -1340,7 +1340,8 @@ impl KhiveRuntime {
         ))
     }
 
-    pub async fn update_entity(
+    #[cfg(test)]
+    pub(crate) async fn update_entity(
         &self,
         token: &NamespaceToken,
         id: Uuid,
@@ -1390,6 +1391,8 @@ impl KhiveRuntime {
     /// Property removals apply after the normal merge and preserve all other keys.
     /// Missing keys alone are a no-op; reserved runtime-owned keys cannot be removed.
     /// A changed, deleted, or missing entity returns a conflict without writing.
+    /// A bounded embedding returns a non-retryable error with the committed ID
+    /// and truncation report; use the report-aware variant to retain the record.
     pub async fn update_entity_if_unchanged(
         &self,
         token: &NamespaceToken,
@@ -1397,6 +1400,31 @@ impl KhiveRuntime {
         patch: EntityPatch,
         remove_properties: &[&str],
     ) -> RuntimeResult<Entity> {
+        let (entity, embedding) = self
+            .update_entity_if_unchanged_with_embedding_report(
+                token,
+                expected,
+                patch,
+                remove_properties,
+            )
+            .await?;
+        crate::operations::legacy_post_commit_result_with_embedding(
+            "update_entity_if_unchanged",
+            entity.id,
+            entity,
+            embedding,
+            Vec::new(),
+        )
+    }
+
+    /// Apply a guarded admin patch and retain embedding truncation accounting.
+    pub async fn update_entity_if_unchanged_with_embedding_report(
+        &self,
+        token: &NamespaceToken,
+        expected: &Entity,
+        patch: EntityPatch,
+        remove_properties: &[&str],
+    ) -> RuntimeResult<(Entity, crate::retrieval::EmbeddingTruncationReport)> {
         let (entity, reindex_required, changed_fields, expected_updated_at, expected_deleted_at) =
             self.prepare_guarded_entity_update(
                 token,
@@ -1407,20 +1435,21 @@ impl KhiveRuntime {
             )
             .await?;
         if changed_fields.is_empty() {
-            return Ok(entity);
-        }
-        Ok(self
-            .persist_prepared_entity_update(
-                token,
+            return Ok((
                 entity,
-                reindex_required,
-                changed_fields,
-                expected_updated_at,
-                expected_deleted_at,
-                None,
-            )
-            .await?
-            .0)
+                crate::retrieval::EmbeddingTruncationReport::default(),
+            ));
+        }
+        self.persist_prepared_entity_update(
+            token,
+            entity,
+            reindex_required,
+            changed_fields,
+            expected_updated_at,
+            expected_deleted_at,
+            None,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1714,6 +1743,7 @@ impl KhiveRuntime {
                     })
                 })
                 .await
+                .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)))
                 .map_err(map_merge_entity_storage_error)?
         } else {
             tokio::task::spawn_blocking(move || {
@@ -1757,7 +1787,7 @@ impl KhiveRuntime {
 
         // Count only committed event rows; dry-run never inserts an event.
         if !dry_run {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+            khive_storage::usage::account_event_write(Ok(1));
             tracing::info!(
                 into_id = %summary.kept_id,
                 from_id = %summary.removed_id,
@@ -2441,7 +2471,8 @@ impl KhiveRuntime {
     }
 
     /// Patch-style note update.
-    pub async fn update_note(
+    #[cfg(test)]
+    pub(crate) async fn update_note(
         &self,
         token: &NamespaceToken,
         id: Uuid,
@@ -2561,7 +2592,7 @@ impl KhiveRuntime {
     /// Claim `external_id` on an outbound `message` note through the
     /// ADR-124-sanctioned store-level owner path, bypassing the
     /// caller-facing owner-established-property refusal in
-    /// [`Self::update_note`] (and its crate-internal prepare path). This is deliberately
+    /// [`Self::update_note_with_embedding_report`] (and its crate-internal prepare path). This is deliberately
     /// NOT exposed through any registered verb (ADR-124's stated bound): it is
     /// reachable only from pack/runtime code that owns outbox bookkeeping for
     /// the `message` note kind.
@@ -3543,6 +3574,7 @@ impl KhiveRuntime {
                     })
                 })
                 .await
+                .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)))
                 .map_err(map_merge_note_storage_error)?
         } else {
             tokio::task::spawn_blocking(move || {
@@ -3585,7 +3617,7 @@ impl KhiveRuntime {
 
         // Count only committed event rows; dry-run never inserts an event.
         if !dry_run {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+            khive_storage::usage::account_event_write(Ok(1));
             tracing::info!(
                 into_id = %summary.kept_id,
                 from_id = %summary.removed_id,

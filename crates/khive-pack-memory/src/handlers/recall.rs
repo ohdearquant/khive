@@ -15,7 +15,7 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::{Direction, EdgeFilter, NeighborQuery};
+use khive_storage::types::{Direction, EdgeFilter, NeighborQuery, PageRequest};
 use khive_storage::EdgeRelation;
 use khive_types::{Details, KhiveError};
 
@@ -34,11 +34,6 @@ use super::common::{
     DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID,
     RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
-
-/// Bounded storage page for inbound supersession checks. This is deliberately
-/// independent of recall candidate cardinality: one candidate may have any
-/// number of superseding edges.
-const SUPERSEDES_EDGE_PAGE_SIZE: u32 = 256;
 
 fn compare_rank_scores_desc(left: f32, right: f32) -> std::cmp::Ordering {
     match (left.is_nan(), right.is_nan()) {
@@ -977,32 +972,25 @@ impl MemoryPack {
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
             if !candidate_ids.is_empty() {
                 let graph = self.runtime.graph(token)?;
-                let filter = EdgeFilter {
-                    target_ids: candidate_ids,
-                    relations: vec![EdgeRelation::Supersedes],
-                    ..EdgeFilter::default()
-                };
-                let mut after = None;
-                loop {
-                    // Walk the immutable insertion sequence to exhaustion.
-                    // A single fixed-size query tied to candidate count can
-                    // omit targets when another candidate has many inbound
-                    // supersedes edges (#1749).
+                for candidate_id in candidate_ids {
                     let edges = graph
-                        .query_edges_sequence_after(
-                            filter.clone(),
-                            after,
-                            SUPERSEDES_EDGE_PAGE_SIZE,
+                        .query_edges(
+                            EdgeFilter {
+                                target_ids: vec![candidate_id],
+                                relations: vec![EdgeRelation::Supersedes],
+                                ..EdgeFilter::default()
+                            },
+                            vec![],
+                            PageRequest {
+                                offset: 0,
+                                limit: 1,
+                            },
                         )
                         .await?;
                     khive_storage::ensure_request_read_active("memory.recall")?;
-                    for edge in &edges.items {
-                        superseded_by_edge.insert(edge.target_id);
+                    if !edges.items.is_empty() {
+                        superseded_by_edge.insert(candidate_id);
                     }
-                    let Some(next_after) = edges.next_after else {
-                        break;
-                    };
-                    after = Some(next_after);
                 }
             }
 
@@ -1493,6 +1481,13 @@ mod tests {
 
     use crate::MemoryPack;
 
+    mod timing {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_support/timing.rs"
+        ));
+    }
+
     #[test]
     fn session_retry_deadline_obeys_caller_window_but_first_attempt_does_not() {
         let now = std::time::Instant::now();
@@ -1853,8 +1848,8 @@ mod tests {
 
         // Coverage retains the watchdog and result assertions without making
         // instrumented scheduling part of the caller-latency contract.
-        if std::env::var_os("LLVM_PROFILE_FILE").is_none() {
-            let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 2;
+        let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 2;
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
             assert!(
                 elapsed < caller_bound,
                 "#836 recall exceeded its caller-derived completion bound \
@@ -4333,10 +4328,16 @@ mod tests {
             "[ADR-081 §5 latency] recall without brain pack: {without_brain:?}; \
              recall with brain pack (profile resolution + async ledger dispatch): {with_brain:?}"
         );
-        assert!(
-            with_brain < Duration::from_secs(2),
-            "profile resolution must not introduce unbounded latency, got {with_brain:?}"
-        );
+        // Dispatch uses this same cached deadline when the request has no override.
+        let caller_bound =
+            Duration::from_millis(crate::pack::recall_deadline_ms()).saturating_mul(2);
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
+            assert!(
+                with_brain < caller_bound,
+                "profile resolution exceeded its configured caller-derived completion bound \
+                 {caller_bound:?}, got {with_brain:?}"
+            );
+        }
     }
 
     // ── ADR-104 Stage A: serve-time profile projection ─────────────────────
@@ -7031,10 +7032,9 @@ mod tests {
         }
     }
 
-    /// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
-    #[tokio::test]
-    #[serial_test::serial(config_ledger)]
-    async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+    async fn held_embed_deadline_result_with_caller_delay(
+        caller_delay: Option<std::time::Duration>,
+    ) {
         const MODEL: &str = "recall-889-slow-model";
         const CALLER_DEADLINE_MS: u64 = 50;
         let hold = Arc::new(Notify::new());
@@ -7080,6 +7080,10 @@ mod tests {
             ),
         )
         .await;
+        // Simulate an instrumented caller resuming after the real recall outcome.
+        if let Some(delay) = caller_delay {
+            tokio::time::sleep(delay).await;
+        }
         let elapsed = start.elapsed();
 
         // Release the timed-out worker so it does not occupy a blocking-pool slot.
@@ -7103,14 +7107,68 @@ mod tests {
             }
         }
 
-        if std::env::var_os("LLVM_PROFILE_FILE").is_none() {
-            let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 10;
+        let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 10;
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
             assert!(
                 elapsed < caller_bound,
                 "#889 recall exceeded its caller-derived completion bound \
                  {caller_bound:?}, took {elapsed:?}"
             );
         }
+    }
+
+    /// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+        held_embed_deadline_result_with_caller_delay(None).await;
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn recall_889_coverage_delay_retains_typed_deadline_outcome() {
+        const CHILD: &str = "KHIVE_RECALL_TIMING_COVERAGE_CHILD";
+        const NAME: &str =
+            "handlers::recall::tests::recall_889_coverage_delay_retains_typed_deadline_outcome";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os("LLVM_PROFILE_FILE").is_some());
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                held_embed_deadline_result_with_caller_delay(Some(
+                    std::time::Duration::from_millis(750),
+                )),
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("child-output.txt");
+        let output = std::fs::File::create(&output_path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("LLVM_PROFILE_FILE", dir.path().join("recall-%p.profraw"))
+            .stdout(std::process::Stdio::from(output.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(output))
+            .spawn()
+            .unwrap();
+        let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= watchdog {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("coverage fixture watchdog expired; no semantic outcome");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let output = std::fs::read_to_string(output_path).unwrap();
+        assert!(status.success(), "coverage recall child failed:\n{output}");
+        assert!(
+            output.contains("1 passed; 0 failed"),
+            "coverage recall requires nonzero exact child selection: {output}"
+        );
     }
 
     // ── #30/#889: tracing-capture harness for the deadline-exceeded WARN ──────

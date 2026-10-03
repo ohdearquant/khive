@@ -44,20 +44,24 @@ fn runtime(path: &Path) -> (KhiveRuntime, NamespaceToken) {
 
 async fn seed(runtime: &KhiveRuntime, token: &NamespaceToken) -> SeedIds {
     let into = runtime
-        .create_entity(token, "concept", None, "Kept", None, None, vec![])
+        .create_entity_with_embedding_report(token, "concept", None, "Kept", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let from = runtime
-        .create_entity(token, "concept", None, "Merged", None, None, vec![])
+        .create_entity_with_embedding_report(token, "concept", None, "Merged", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let left = runtime
-        .create_entity(token, "concept", None, "Left", None, None, vec![])
+        .create_entity_with_embedding_report(token, "concept", None, "Left", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let right = runtime
-        .create_entity(token, "concept", None, "Right", None, None, vec![])
+        .create_entity_with_embedding_report(token, "concept", None, "Right", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let into_note = runtime
         .create_note(token, "observation", None, "First note", None, None, vec![])
