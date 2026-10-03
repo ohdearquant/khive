@@ -1167,14 +1167,21 @@ async fn mark_read_targets_best_effort(
     targets: Vec<(Uuid, Note)>,
     include_body: bool,
 ) -> Result<Value, RuntimeError> {
-    let mut results = Vec::with_capacity(targets.len());
+    // Read every target's fields before marking any target, so a failed field
+    // lookup cannot leave earlier messages marked as read.
+    let mut prepared_targets = Vec::with_capacity(targets.len());
     for (id, note) in targets {
-        let original_properties = note.properties.clone();
         let message = if include_body {
             Some(read_message_fields(runtime, &note).await?)
         } else {
             None
         };
+        prepared_targets.push((id, note, message));
+    }
+
+    let mut results = Vec::with_capacity(prepared_targets.len());
+    for (id, note, message) in prepared_targets {
+        let original_properties = note.properties.clone();
         match mark_read_target(runtime, token, id, note).await {
             Ok(result) => results.push(read_result_with_body(result, message)),
             Err(error) => {
@@ -1203,16 +1210,21 @@ async fn mark_read_targets_best_effort(
 
 async fn read_message_fields(runtime: &KhiveRuntime, note: &Note) -> Result<Value, RuntimeError> {
     let message = note_to_message_json(note);
-    let attachments = crate::file_attachments::metadata(runtime, note.id).await?;
-    Ok(json!({
-        "attachments": attachments,
+    let attachment_fields = crate::file_attachments::metadata(runtime, note.id).await?;
+    let mut fields = json!({
         "subject": message["subject"],
         "content": message["content"],
         "from": message["from"],
         "to": message["to"],
         "direction": message["direction"],
         "created_at": message["created_at"],
-    }))
+    });
+    if let (Some(fields), Value::Object(attachment_fields)) =
+        (fields.as_object_mut(), attachment_fields)
+    {
+        fields.extend(attachment_fields);
+    }
+    Ok(fields)
 }
 
 fn read_result_with_body(mut result: Value, message: Option<Value>) -> Value {

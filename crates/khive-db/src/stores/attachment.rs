@@ -8,7 +8,8 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::attachment::{
-    validate_attachment_role, Attachment, AttachmentStore, AttachmentSubstrate,
+    validate_attachment_role, Attachment, AttachmentReadReport, AttachmentStore,
+    AttachmentSubstrate,
 };
 use khive_storage::error::StorageError;
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -276,6 +277,41 @@ impl AttachmentStore for SqlAttachmentStore {
             )?;
             let rows = stmt.query_map([record_uuid], read_attachment)?;
             rows.collect()
+        })
+        .await
+    }
+
+    async fn list_attachments_report(
+        &self,
+        record_uuid: Uuid,
+    ) -> Result<AttachmentReadReport, StorageError> {
+        let record_uuid = record_uuid.to_string();
+        self.with_reader("list_attachments_report", move |conn| {
+            let quarantined: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM attachment_quarantine WHERE record_uuid = ?1",
+                [&record_uuid],
+                |row| row.get(0),
+            )?;
+            let mut report = AttachmentReadReport {
+                unreadable_count: u64::try_from(quarantined)
+                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, quarantined))?,
+                ..AttachmentReadReport::default()
+            };
+            let mut stmt = conn.prepare(
+                "SELECT record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at \
+                 FROM attachments WHERE record_uuid = ?1 ORDER BY role ASC",
+            )?;
+            let mut rows = stmt.query([record_uuid])?;
+            while let Some(row) = rows.next()? {
+                match read_attachment(row) {
+                    Ok(attachment) => report.attachments.push(attachment),
+                    Err(_) => report.unreadable_count += 1,
+                }
+            }
+            if report.unreadable_count > 0 {
+                report.unreadable_reason = Some("unreadable_attachment".to_string());
+            }
+            Ok(report)
         })
         .await
     }

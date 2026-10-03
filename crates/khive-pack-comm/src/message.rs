@@ -54,6 +54,7 @@ pub(crate) const MESSAGE_PROJECTION_FIELDS: &[&str] = &[
     "sent_by_process",
     "idempotency_key",
     "attachments",
+    "attachments_error",
 ];
 
 pub(crate) fn validate_message_projection_fields(

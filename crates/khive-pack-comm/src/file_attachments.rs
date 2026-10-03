@@ -1,7 +1,7 @@
 //! Ordered, local-message attachment metadata over the existing substrate.
 
 use khive_runtime::{KhiveRuntime, RuntimeError};
-use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
+use khive_storage::{AttachmentReadReport, AttachmentSubstrate, ContentRef, NewAttachment};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -85,27 +85,37 @@ pub(crate) async fn prepare(
 pub(crate) async fn rows(
     runtime: &KhiveRuntime,
     id: Uuid,
-) -> Result<Vec<Attachment>, RuntimeError> {
+) -> Result<AttachmentReadReport, RuntimeError> {
     // Ordinary split-backend messages have no file attachments; never cross databases.
     if runtime.backend_id().as_str() != khive_runtime::BackendId::MAIN {
-        return Ok(Vec::new());
+        return Ok(AttachmentReadReport::default());
     }
-    let mut rows = runtime.attachments()?.list_attachments(id).await?;
-    rows.retain(|row| {
+    // An unreadable row is reported on its message. A failure of the lookup
+    // itself still returns an error, before comm.read marks any message.
+    let mut report = runtime.attachments()?.list_attachments_report(id).await?;
+    report.attachments.retain(|row| {
         row.substrate == AttachmentSubstrate::Note && role_index(&row.role).is_some()
     });
-    rows.sort_by_key(|row| role_index(&row.role));
-    Ok(rows)
+    report.attachments.sort_by_key(|row| role_index(&row.role));
+    Ok(report)
 }
 
 pub(crate) async fn metadata(runtime: &KhiveRuntime, id: Uuid) -> Result<Value, RuntimeError> {
-    Ok(json!(rows(runtime, id)
-        .await?
+    let report = rows(runtime, id).await?;
+    let attachments = report.attachments
         .into_iter()
         .map(|row| json!({
             "content_ref": row.content_ref, "size": row.size_bytes, "media_type": row.media_type,
         }))
-        .collect::<Vec<_>>()))
+        .collect::<Vec<_>>();
+    let mut fields = json!({"attachments": attachments});
+    if report.unreadable_count > 0 {
+        fields["attachments_error"] = json!({
+            "count": report.unreadable_count,
+            "reason": report.unreadable_reason.as_deref().unwrap_or("unreadable_attachment"),
+        });
+    }
+    Ok(fields)
 }
 
 pub(crate) async fn enrich(
@@ -118,7 +128,11 @@ pub(crate) async fn enrich(
         .ok_or_else(|| {
             RuntimeError::Internal("message attachment view has no canonical owner UUID".into())
         })?;
-    message["attachments"] = metadata(runtime, id).await?;
+    if let (Some(message), Value::Object(fields)) =
+        (message.as_object_mut(), metadata(runtime, id).await?)
+    {
+        message.extend(fields);
+    }
     Ok(())
 }
 

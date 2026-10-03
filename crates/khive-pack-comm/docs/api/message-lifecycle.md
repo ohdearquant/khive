@@ -47,6 +47,26 @@ read, sorted by index. Other roles and malformed suffixes are ignored.
 contains file bytes. Media type is nullable because references carry no MIME
 catalog metadata; size is the stored per-message stat observation.
 
+An unreadable attachment row leaves its message and readable attachments
+available. Inbox, thread and body-bearing read responses add
+`attachments_error: {count, reason: "unreadable_attachment"}` to that message.
+The marker is also an accepted projection field. The count includes
+unreadable rows preserved by migration 047 in
+`attachment_quarantine`; a clean message omits the marker. The migration
+preserves every column of an invalid-role row and its blob reference while
+tightening the attachment role CHECK to reject empty roles and C0, DEL and
+C1 control characters. Quarantined references remain blob owners in the GC
+liveness predicate,
+including after deletion of their original record; this preserves the bytes
+until the quarantined metadata can be repaired. GC admission still requires
+the exact completed V21 epoch: migrated V47 stores remain refused until
+later epoch ownership has been reviewed.
+
+A failure of the attachment lookup itself still returns an error. Bulk
+`comm.read(body=true)` reads every target's fields before marking the first
+target, so that error does not change any target's read flag. Mark failures
+remain per-item statuses. `body=false` does not read attachment metadata.
+
 Use [blob.import and blob.export](../../../khive-pack-blob/docs/api/file-transfers.md)
 to move files between server directories and the blob store without returning
 bytes through those tools. `blob.get` keeps its existing small-object base64
