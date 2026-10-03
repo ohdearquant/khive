@@ -546,7 +546,7 @@ after the check is not detected, and a platform with no descriptor-to-path query
 
 ## Amendment 12 (2026-10-03): descendant identity, cleanup evidence and capture
 
-**Status: Proposed.** This is a design proposal for #3631 and the remaining process-lifetime
+**Status: Accepted (2026-10-03; see Ratification below).** This is a design proposal for #3631 and the remaining process-lifetime
 question in #3291. It has not been ratified and authorizes no implementation by itself. The accepted
 text above, including Amendment 11, remains binding. Acceptance 6 is still an unmet target on the
 shipped backend.
@@ -830,3 +830,33 @@ assertion after a normal target compiles and passes with nonzero selection. Remo
 admission must fail the no-signal-to-replacement assertion. Compiler/setup failures and empty
 selections prove neither. Existing capture mutation witnesses must continue to distinguish
 no-follow identity reads from pathname substitution. All such evidence remains outstanding.
+
+### Ratification (2026-10-03)
+
+Ratified by the maintainer. This block governs where the text above says Proposed, not ratified or
+not selected.
+
+Scope: ADR-181's posture is that the agent's tool set is khive verbs, the shell exists only inside
+one verb, and a run has no network, no home directory and no credentials. Amendment 11's arm shows
+that a detached survivor keeps every one of those denials. Acceptance 6 is therefore a hygiene and
+resource target, not a breach of that posture, and a heuristic sweep is not presented as
+certification.
+
+1. Publication: uniform provisional. On the Seatbelt backend `tree_quiescence` is `unverified`, and
+   bounded artifacts are published with that qualification regardless of the observation outcome or
+   `seen_alive`. The certified-only alternative is rejected: it withholds output and creates no
+   termination proof.
+2. Backend: initial-group cleanup is kept, with the receipt fields below; acceptance 6 stays open.
+   The `SYS_setsid`/`SYS_setpgid` Seatbelt denial does not ship: libc `daemon()` fails under it and
+   spawn attributes bypass it, so it costs compatibility without providing certification. No guest
+   or coalition backend is selected; either returns as its own ADR carrying the boundary proof this
+   amendment lists.
+3. Receipt vocabulary: accepted as proposed, additive and closed: `process_cleanup` with `scope`,
+   `observation` (`not_attempted`, `complete`, `incomplete`), `seen_alive`, `certification`
+   (`unverified`, `certified_none`) and `detail`, plus `tree_quiescence`. `certified_none` is
+   reserved: a producer-side test asserts that the Seatbelt backend never emits it, so the field
+   cannot become a claim before a backend earns it.
+
+Implementation released by this ratification is receipt-only, with the tests this amendment lists
+for the receipt vocabulary, `seen_alive` preservation, historical receipts and the uniform
+publication policy, plus the reserved-value test above.
