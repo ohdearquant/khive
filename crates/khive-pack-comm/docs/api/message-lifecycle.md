@@ -122,7 +122,7 @@ copy they were replying to.
 The runtime pre-generates that outbound UUID before either note is written, so
 the canonical `thread_id` and `comm_schema_version = 1` are already known when
 both notes are constructed. `dual_write_message` commits both fully-formed v1
-notes through `khive_runtime::create_notes_atomic` in one atomic writer
+notes through `khive_runtime::create_notes_atomic_with_report` in one atomic writer
 transaction — a failure on either note rolls back the whole unit, so no
 partial or unversioned row can ever be observed.
 

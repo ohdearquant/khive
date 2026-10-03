@@ -4625,7 +4625,7 @@ mod compact_prefix_resolver_tests {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
         let project = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "project",
                 None,
@@ -4635,6 +4635,7 @@ mod compact_prefix_resolver_tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let compact = project.id.simple().to_string();
         let wildcard_input = format!("{}%", &compact[..8]);
@@ -4651,7 +4652,7 @@ mod compact_prefix_resolver_tests {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
         let project = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "project",
                 None,
@@ -4661,6 +4662,7 @@ mod compact_prefix_resolver_tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let compact = project.id.simple().to_string();
 
@@ -4677,7 +4679,7 @@ mod find_document_for_path_tests {
     use khive_runtime::Namespace;
 
     async fn create_document(rt: &KhiveRuntime, token: &NamespaceToken, source_uri: &str) -> Uuid {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             token,
             "document",
             None,
@@ -4687,6 +4689,7 @@ mod find_document_for_path_tests {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .unwrap()
         .id
     }
@@ -4779,7 +4782,7 @@ mod module_index_loader_tests {
         name: &str,
         path: &str,
     ) -> Uuid {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             token,
             "concept",
             Some("module"),
@@ -4792,6 +4795,7 @@ mod module_index_loader_tests {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .unwrap()
         .id
     }

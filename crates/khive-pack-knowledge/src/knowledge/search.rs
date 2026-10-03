@@ -2104,11 +2104,14 @@ async fn rerank_search_from_store(
     if !fallback_texts.is_empty() {
         let embedded = match khive_storage::await_request_read_phase(
             "knowledge.embedding_rerank.fallback",
-            runtime.embed_document_batch(&fallback_texts),
+            runtime.embed_document_batch_outcomes(&fallback_texts),
         )
         .await
         {
-            Ok(Ok(vectors)) => vectors,
+            Ok(Ok(outcomes)) => outcomes
+                .into_iter()
+                .map(|outcome| outcome.vector)
+                .collect::<Vec<_>>(),
             Ok(Err(_)) => return Ok(None),
             Err(error) if is_timeout(&error) => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -7182,6 +7185,79 @@ mod tests {
         );
         assert_eq!(out["rerank_provenance"]["candidates"], 1);
         assert_eq!(out["rerank_provenance"]["embedded_fallback"], 1);
+    }
+
+    #[tokio::test]
+    async fn over_limit_fallback_candidate_keeps_whole_search_reranked() {
+        let (runtime, _, _) = rt_with_role_aware_recording_embedder();
+        let repeated_text = "bounded fallback candidate ";
+        let long_content =
+            repeated_text.repeat(lattice_embed::MAX_TEXT_BYTES / repeated_text.len() + 2);
+        assert!(
+            atom_embed_text_fields("Bounded Fallback Long", &long_content, "[]").len()
+                > lattice_embed::MAX_TEXT_BYTES
+        );
+        {
+            let access = runtime.sql();
+            let mut writer = access.writer().await.expect("writer");
+            for (id, slug, name, content) in [
+                (
+                    "94000000-0000-0000-0000-000000000011",
+                    "bounded-fallback-long",
+                    "Bounded Fallback Long",
+                    long_content.as_str(),
+                ),
+                (
+                    "94000000-0000-0000-0000-000000000012",
+                    "bounded-fallback-short",
+                    "Bounded Fallback Short",
+                    "bounded fallback candidate with short content",
+                ),
+            ] {
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO knowledge_atoms ( \
+                                  id, namespace, slug, name, content, tags, properties, finalized, \
+                                  status, source_uri, source_type, created_at, updated_at, deleted_at \
+                              ) VALUES (?, 'local', ?, ?, ?, '[]', NULL, 1, 'reviewed', \
+                                        NULL, NULL, 1000, 1000, NULL)"
+                            .to_string(),
+                        params: vec![
+                            SqlValue::Text(id.into()),
+                            SqlValue::Text(slug.into()),
+                            SqlValue::Text(name.into()),
+                            SqlValue::Text(content.into()),
+                        ],
+                        label: None,
+                    })
+                    .await
+                    .expect("seed fallback candidate without a stored vector");
+            }
+        }
+
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let ann = vamana::new_shared();
+        let out = KnowledgeHandlers::search(
+            &runtime,
+            &token,
+            json!({"query": "bounded fallback candidate", "rerank": true}),
+            &ann,
+        )
+        .await
+        .expect("bounded fallback must not disable search reranking");
+
+        assert_eq!(out["total"], 2, "both lexical candidates must be returned");
+        let results = out["results"].as_array().expect("search results");
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert_eq!(
+                result["score_provenance"]["embedding_rerank"], true,
+                "the long fallback must not skip reranking for either hit: {out:?}"
+            );
+        }
+        assert_eq!(out["rerank_provenance"]["candidates"], 2);
+        assert_eq!(out["rerank_provenance"]["from_stored"], 0);
+        assert_eq!(out["rerank_provenance"]["embedded_fallback"], 2);
     }
 
     #[tokio::test]

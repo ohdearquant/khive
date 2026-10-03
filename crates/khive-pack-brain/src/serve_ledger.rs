@@ -54,13 +54,6 @@ pub struct ServeLedgerRow {
     pub scorer_run_id: Option<String>,
 }
 
-fn row_text(row: &khive_storage::types::SqlRow, col: &str) -> Result<String, RuntimeError> {
-    match row.get(col) {
-        Some(SqlValue::Text(s)) => Ok(s.clone()),
-        _ => Err(sql_err("read row", format!("missing {col} column"))),
-    }
-}
-
 fn row_opt_text(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
     match row.get(col) {
         Some(SqlValue::Text(s)) => Some(s.clone()),
@@ -72,13 +65,6 @@ fn row_opt_int(row: &khive_storage::types::SqlRow, col: &str) -> Option<i64> {
     match row.get(col) {
         Some(SqlValue::Integer(n)) => Some(*n),
         _ => None,
-    }
-}
-
-fn row_int(row: &khive_storage::types::SqlRow, col: &str) -> Result<i64, RuntimeError> {
-    match row.get(col) {
-        Some(SqlValue::Integer(n)) => Ok(*n),
-        _ => Err(sql_err("read row", format!("missing {col} column"))),
     }
 }
 
@@ -247,9 +233,18 @@ pub async fn get_serve_row(
     };
 
     Ok(Some(ServeLedgerRow {
-        id: row_text(&row, "id")?,
-        namespace: row_text(&row, "namespace")?,
-        consumer_kind: row_text(&row, "consumer_kind")?,
+        id: row
+            .text("id")
+            .map(str::to_owned)
+            .map_err(|_| sql_err("read row", "missing id column"))?,
+        namespace: row
+            .text("namespace")
+            .map(str::to_owned)
+            .map_err(|_| sql_err("read row", "missing namespace column"))?,
+        consumer_kind: row
+            .text("consumer_kind")
+            .map(str::to_owned)
+            .map_err(|_| sql_err("read row", "missing consumer_kind column"))?,
         served_by_profile_id: row_opt_text(&row, "served_by_profile_id"),
         resolved_profile_id: row_opt_text(&row, "resolved_profile_id"),
         resolved_at: row_opt_int(&row, "resolved_at"),
@@ -257,10 +252,21 @@ pub async fn get_serve_row(
         serve_attribution: ServeAttribution::from_column(
             row_opt_text(&row, "serve_attribution").as_deref(),
         ),
-        target_id: row_text(&row, "target_id")?,
-        query_class: row_text(&row, "query_class")?,
-        query_raw: row_text(&row, "query_raw")?,
-        served_at: row_int(&row, "served_at")?,
+        target_id: row
+            .text("target_id")
+            .map(str::to_owned)
+            .map_err(|_| sql_err("read row", "missing target_id column"))?,
+        query_class: row
+            .text("query_class")
+            .map(str::to_owned)
+            .map_err(|_| sql_err("read row", "missing query_class column"))?,
+        query_raw: row
+            .text("query_raw")
+            .map(str::to_owned)
+            .map_err(|_| sql_err("read row", "missing query_raw column"))?,
+        served_at: row
+            .i64("served_at")
+            .map_err(|_| sql_err("read row", "missing served_at column"))?,
         grade: row_opt_text(&row, "grade"),
         graded_at: row_opt_int(&row, "graded_at"),
         scorer_run_id: row_opt_text(&row, "scorer_run_id"),

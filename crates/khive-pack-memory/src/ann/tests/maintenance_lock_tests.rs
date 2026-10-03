@@ -51,7 +51,7 @@ async fn update(
     key: &AnnKey,
     id: Uuid,
 ) {
-    rt.update_note(
+    rt.update_note_with_embedding_report(
         token,
         id,
         khive_runtime::NotePatch::new(
@@ -63,6 +63,7 @@ async fn update(
         ),
     )
     .await
+    .map(|(row, _report)| row)
     .unwrap();
     bump_generation(ann, key).await;
 }

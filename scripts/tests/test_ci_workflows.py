@@ -472,8 +472,13 @@ class CoverageRatchetWorkflowTests(unittest.TestCase):
     def test_measuring_budget_stays_inside_the_job_budget(self):
         measurement = indented_block(workflow_text("ci.yml"), "coverage-measurement", 2)
         job = re.findall(r"(?m)^    timeout-minutes: (\d+)$", measurement)
-        step = re.findall(r"(?m)^        timeout-minutes: (\d+)$", measurement)
+        compute = step_block(measurement, "Compute coverage")
+        step = re.findall(r"(?m)^        timeout-minutes: (\d+)$", compute)
         self.assertEqual((len(job), len(step)), (1, 1))
+        # Preserve the original 1.37x margin against the known 39-minute
+        # successful instrumented run, rounding up to whole minutes.
+        derived_floor = (39 * 137 + 99) // 100
+        self.assertGreaterEqual(int(step[0]), derived_floor)
         # A job-level timeout cancels the job, and a cancelled job is neither
         # success nor skipped, so the step budget has to expire first for the
         # reporting and failing steps above to run at all.

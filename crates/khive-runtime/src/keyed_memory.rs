@@ -127,17 +127,54 @@ pub async fn create_keyed_memory(
     spec: KeyedMemorySpec<'_>,
 ) -> RuntimeResult<(Note, Option<Uuid>, bool)> {
     let (note, edge_id, replayed, _) =
-        create_keyed_memory_with_receipt(runtime, token, spec).await?;
+        create_keyed_memory_with_report(runtime, token, spec).await?;
     Ok((note, edge_id, replayed))
 }
 
-/// Receipt-bearing keyed create used by `memory.remember`. The existing
-/// three-field API above remains for callers that do not surface the token.
+/// Same as [`create_keyed_memory`], also returning the embedding-input
+/// truncation report computed for this call. A replay stores nothing new but
+/// retains the report from preparing this call's identical content.
+pub async fn create_keyed_memory_with_report(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    spec: KeyedMemorySpec<'_>,
+) -> RuntimeResult<(
+    Note,
+    Option<Uuid>,
+    bool,
+    crate::retrieval::EmbeddingTruncationReport,
+)> {
+    let (note, edge_id, replayed, _, report) =
+        create_keyed_memory_with_receipt_and_report(runtime, token, spec).await?;
+    Ok((note, edge_id, replayed, report))
+}
+
+/// Receipt-bearing keyed create. The original per-model receipt is retained
+/// on replay, including an explicit receipt for a write with zero models.
 pub async fn create_keyed_memory_with_receipt(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     spec: KeyedMemorySpec<'_>,
 ) -> RuntimeResult<(Note, Option<Uuid>, bool, Vec<(String, u64)>)> {
+    let (note, edge_id, replayed, fences, _) =
+        create_keyed_memory_with_receipt_and_report(runtime, token, spec).await?;
+    Ok((note, edge_id, replayed, fences))
+}
+
+/// Return both the original visibility receipt and the embedding-input report.
+/// Replays retain the stored fences and the report computed while preparing
+/// this call's embedding input; the report does not describe the original write.
+pub async fn create_keyed_memory_with_receipt_and_report(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    spec: KeyedMemorySpec<'_>,
+) -> RuntimeResult<(
+    Note,
+    Option<Uuid>,
+    bool,
+    Vec<(String, u64)>,
+    crate::retrieval::EmbeddingTruncationReport,
+)> {
     validate_memory_key(spec.key)?;
     if spec.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -179,7 +216,7 @@ pub async fn create_keyed_memory_with_receipt(
                 let fences = memory_visibility_receipt(runtime, token, note.id)
                     .await?
                     .ok_or_else(|| missing_visibility_receipt(note.id))?;
-                return Ok((note, edge_id, false, fences));
+                return Ok((note, edge_id, false, fences, prepared.embedding_truncation));
             }
             Ok(AtomicRunOutcome::RolledBack {
                 failure:
@@ -198,7 +235,7 @@ pub async fn create_keyed_memory_with_receipt(
                         let fences = memory_visibility_receipt(runtime, token, holder.id)
                             .await?
                             .ok_or_else(|| missing_visibility_receipt(holder.id))?;
-                        return Ok((holder, None, true, fences));
+                        return Ok((holder, None, true, fences, prepared.embedding_truncation));
                     }
                     return Err(idempotency_conflict(spec.key, &holder));
                 }

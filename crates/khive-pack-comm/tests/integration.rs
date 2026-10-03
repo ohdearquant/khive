@@ -12913,7 +12913,7 @@ async fn direct_runtime_update_refuses_transport_owned_message_properties() {
         ("channel_slug", serde_json::json!("forged-account")),
     ] {
         let error = runtime
-            .update_note(
+            .update_note_with_embedding_report(
                 &token,
                 id,
                 NotePatch::new(
@@ -12925,6 +12925,7 @@ async fn direct_runtime_update_refuses_transport_owned_message_properties() {
                 ),
             )
             .await
+            .map(|(row, _report)| row)
             .expect_err("direct runtime update must refuse transport-owned message properties");
         assert!(
             error.to_string().contains(key),
@@ -13013,7 +13014,7 @@ async fn direct_runtime_update_allows_transport_named_properties_on_other_kinds(
     let token = runtime.authorize(Namespace::local()).expect("local token");
 
     let updated = runtime
-        .update_note(
+        .update_note_with_embedding_report(
             &token,
             id,
             NotePatch::new(
@@ -13029,6 +13030,7 @@ async fn direct_runtime_update_allows_transport_named_properties_on_other_kinds(
             ),
         )
         .await
+        .map(|(row, _report)| row)
         .expect("transport-named keys are not reserved on an observation");
     assert_eq!(updated.properties.unwrap()["quarantined"], true);
 }

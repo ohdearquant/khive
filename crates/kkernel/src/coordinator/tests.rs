@@ -609,8 +609,9 @@ async fn locator_cache_miss_then_hit() {
     let runtime = coord.primary_runtime().unwrap();
     let token = runtime.authorize(ns.clone()).unwrap();
     let entity = runtime
-        .create_entity(&token, "concept", None, "LoRA", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "LoRA", None, None, vec![])
         .await
+        .map(|(row, _report)| row)
         .expect("create entity");
 
     // First locate: cache miss → backend scan → cache populated.
@@ -647,7 +648,7 @@ async fn fan_out_search_single_backend_returns_hits() {
     let runtime = coord.primary_runtime().unwrap();
     let token = runtime.authorize(ns.clone()).unwrap();
     runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -657,6 +658,7 @@ async fn fan_out_search_single_backend_returns_hits() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity");
 
     let request = validated_kg_search(serde_json::json!({
@@ -689,7 +691,7 @@ async fn fan_out_search_passes_text_mode_to_entity_and_note_backends() {
             .authorize(namespace.clone())
             .expect("authorize local");
         let entity = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "concept",
                 None,
@@ -699,6 +701,7 @@ async fn fan_out_search_passes_text_mode_to_entity_and_note_backends() {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .expect("seed entity");
         let note = runtime
             .create_note(
@@ -764,7 +767,7 @@ async fn fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error()
 
     let token = runtime.authorize(ns.clone()).unwrap();
     runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -774,6 +777,7 @@ async fn fan_out_search_single_backend_preserves_text_hits_on_vector_arm_error()
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity");
     break_vector_arm(&runtime);
 
@@ -917,7 +921,7 @@ async fn fan_out_search_multi_backend_vector_arm_failure_isolated_to_its_backend
 
     let tok_broken = rt_broken.authorize(ns.clone()).unwrap();
     rt_broken
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_broken,
             "concept",
             None,
@@ -927,12 +931,13 @@ async fn fan_out_search_multi_backend_vector_arm_failure_isolated_to_its_backend
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create on broken backend");
     break_vector_arm(&rt_broken);
 
     let tok_healthy = rt_healthy.authorize(ns.clone()).unwrap();
     rt_healthy
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_healthy,
             "concept",
             None,
@@ -942,6 +947,7 @@ async fn fan_out_search_multi_backend_vector_arm_failure_isolated_to_its_backend
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create on healthy backend");
 
     let request = validated_kg_search(serde_json::json!({
@@ -999,7 +1005,7 @@ async fn fan_out_search_single_backend_applies_source_filter_before_limit() {
     let token = runtime.authorize(ns.clone()).expect("authorize local");
 
     runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -1009,6 +1015,7 @@ async fn fan_out_search_single_backend_applies_source_filter_before_limit() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create source-filter entity");
     runtime
         .create_note(
@@ -1070,7 +1077,7 @@ async fn fan_out_search_two_backends_merged() {
     // Create one entity on each backend.
     let tok_main = rt_main.authorize(ns.clone()).unwrap();
     rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "concept",
             None,
@@ -1080,11 +1087,12 @@ async fn fan_out_search_two_backends_merged() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create on main");
 
     let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
     rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             None,
@@ -1094,6 +1102,7 @@ async fn fan_out_search_two_backends_merged() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create on lore");
 
     // Fan-out search for "LoRA" — both backends should contribute.
@@ -1130,7 +1139,7 @@ async fn fan_out_search_caps_merged_entity_hits_at_limit() {
     for (rt, prefix) in [(&rt_main, "Main"), (&rt_lore, "Lore")] {
         let token = rt.authorize(ns.clone()).unwrap();
         for i in 0..3 {
-            rt.create_entity(
+            rt.create_entity_with_embedding_report(
                 &token,
                 "concept",
                 None,
@@ -1140,6 +1149,7 @@ async fn fan_out_search_caps_merged_entity_hits_at_limit() {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .expect("create entity");
         }
     }
@@ -1260,7 +1270,7 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
 
     let token = rt_main.authorize(ns.clone()).unwrap();
     rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -1270,6 +1280,7 @@ async fn fan_out_search_hung_backend_times_out_sibling_still_returns() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity on healthy backend");
 
     let request = validated_kg_search(serde_json::json!({
@@ -1619,7 +1630,7 @@ async fn fan_out_search_with_visibility_single_backend_finds_extra_namespace_row
 
     let token = runtime.authorize(tenant_ns.clone()).unwrap();
     runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -1629,6 +1640,7 @@ async fn fan_out_search_with_visibility_single_backend_finds_extra_namespace_row
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity in tenant-a");
 
     let request = validated_kg_search(serde_json::json!({
@@ -1682,7 +1694,7 @@ async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row(
 
     let token = rt_lore.authorize(tenant_ns.clone()).unwrap();
     rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -1692,6 +1704,7 @@ async fn fan_out_search_with_visibility_multi_backend_finds_extra_namespace_row(
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity in tenant-b on the lore backend");
 
     let request = validated_kg_search(serde_json::json!({
@@ -2107,7 +2120,7 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
     // Seed one entity on the "lore" backend so a search returns a hit.
     let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
     rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             None,
@@ -2117,6 +2130,7 @@ async fn fan_out_partial_failure_preserves_working_backend_hits() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity on lore");
 
     let mut registry = BackendRegistry::new();
@@ -2182,7 +2196,7 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
 
     let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
     rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             None,
@@ -2192,6 +2206,7 @@ async fn fan_out_panicked_backend_is_explicit_in_per_backend() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity on healthy backend");
 
     let mut registry = BackendRegistry::new();
@@ -2317,7 +2332,7 @@ async fn invalidate_clears_locate_cache() {
     let runtime = coord.primary_runtime().unwrap();
     let token = runtime.authorize(ns.clone()).unwrap();
     let entity = runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -2327,6 +2342,7 @@ async fn invalidate_clears_locate_cache() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity");
 
     // Populate the cache.
@@ -2366,8 +2382,17 @@ async fn t1_single_backend_zero_change_invariant() {
     // Create entity and locate — same result as calling the runtime directly.
     let token = rt.authorize(ns.clone()).unwrap();
     let entity = rt
-        .create_entity(&token, "concept", None, "T1Entity", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "T1Entity",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(row, _report)| row)
         .expect("T1: create entity");
 
     let located = coord.locate(entity.id, &ns).await;
@@ -2413,7 +2438,7 @@ async fn t2_cross_backend_link_stamps_target_backend() {
     // Create entity on "main".
     let tok_main = rt_main.authorize(ns.clone()).unwrap();
     let src = rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "project",
             None,
@@ -2423,12 +2448,13 @@ async fn t2_cross_backend_link_stamps_target_backend() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("T2: create source on main");
 
     // Create entity on "lore".
     let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
     let tgt = rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             None,
@@ -2438,6 +2464,7 @@ async fn t2_cross_backend_link_stamps_target_backend() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("T2: create target on lore");
 
     // Link across backends.
@@ -2482,7 +2509,7 @@ async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
     // Create entity on "main".
     let tok_main = rt_main.authorize(ns.clone()).unwrap();
     let src = rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "concept",
             None,
@@ -2492,12 +2519,13 @@ async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("T2b: create source on main");
 
     // Create entity on "lore".
     let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
     let tgt = rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "project",
             None,
@@ -2507,6 +2535,7 @@ async fn cross_backend_illegal_entity_pair_rejected_and_not_persisted() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("T2b: create target on lore");
 
     // concept -> project competes_with is not in the base allowlist and no
@@ -2615,7 +2644,7 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
     // Entity creation on "main" consumes the gate's first free `Allow` call.
     let tok_main = rt_main.authorize(ns.clone()).expect("setup authorize");
     let src = rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "project",
             None,
@@ -2625,11 +2654,12 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("T2c: create source on main");
 
     let tok_lore = rt_lore.authorize(ns.clone()).expect("setup authorize lore");
     let tgt = rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             None,
@@ -2639,6 +2669,7 @@ async fn t2c_cross_backend_link_authorize_gate_error_omits_backend_text_from_wir
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("T2c: create target on lore");
 
     let server = two_backend_server_with_packs(Arc::clone(&rt_main), Arc::clone(&rt_lore), &["kg"]);
@@ -2851,7 +2882,7 @@ async fn t3_fan_out_search_merged_from_two_backends() {
     let ns = Namespace::local();
 
     let tok_a = rt_a.authorize(ns.clone()).unwrap();
-    rt_a.create_entity(
+    rt_a.create_entity_with_embedding_report(
         &tok_a,
         "concept",
         None,
@@ -2861,10 +2892,11 @@ async fn t3_fan_out_search_merged_from_two_backends() {
         vec![],
     )
     .await
+    .map(|(row, _report)| row)
     .expect("T3: create on alpha");
 
     let tok_b = rt_b.authorize(ns.clone()).unwrap();
-    rt_b.create_entity(
+    rt_b.create_entity_with_embedding_report(
         &tok_b,
         "concept",
         None,
@@ -2874,6 +2906,7 @@ async fn t3_fan_out_search_merged_from_two_backends() {
         vec![],
     )
     .await
+    .map(|(row, _report)| row)
     .expect("T3: create on beta");
 
     // Search "Entity" — should match both AlphaEntity and BetaEntity.
@@ -2910,8 +2943,17 @@ async fn t4_locate_namespace_agnostic() {
     // Create entity in the "local" namespace.
     let token = rt.authorize(ns.clone()).unwrap();
     let entity = rt
-        .create_entity(&token, "concept", None, "T4NSAgnostic", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "T4NSAgnostic",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(row, _report)| row)
         .expect("T4: create entity");
 
     // locate with the same namespace should work.
@@ -2949,8 +2991,17 @@ async fn t5_record_created_prewarns_locator() {
     // Create an entity but DON'T call locate yet.
     let token = rt.authorize(ns.clone()).unwrap();
     let entity = rt
-        .create_entity(&token, "concept", None, "T5Prewarm", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "T5Prewarm",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(row, _report)| row)
         .expect("T5: create entity");
 
     // Prewarm the locator.
@@ -3050,7 +3101,7 @@ async fn fan_out_search_props_filter_drops_non_matching() {
     // Entity on "main" — does NOT have the target property.
     let tok_main = rt_main.authorize(ns.clone()).unwrap();
     rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "concept",
             None,
@@ -3060,12 +3111,13 @@ async fn fan_out_search_props_filter_drops_non_matching() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create decoy on main");
 
     // Entity on "lore" — has the target property.
     let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
     let target = rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             None,
@@ -3075,6 +3127,7 @@ async fn fan_out_search_props_filter_drops_non_matching() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create target on lore");
 
     let mut registry = BackendRegistry::new();
@@ -3121,7 +3174,7 @@ async fn fan_out_search_props_filter_before_truncation_semantics() {
     // With widening (search_limit = min(1*50, 500) = 50) the full candidate set
     // is fetched, the decoy is filtered by the property predicate, and the target
     // survives. Without widening at limit=1 the decoy could crowd out the target.
-    rt.create_entity(
+    rt.create_entity_with_embedding_report(
         &tok,
         "concept",
         None,
@@ -3131,10 +3184,11 @@ async fn fan_out_search_props_filter_before_truncation_semantics() {
         vec![],
     )
     .await
+    .map(|(row, _report)| row)
     .expect("create decoy");
 
     let target = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -3144,6 +3198,7 @@ async fn fan_out_search_props_filter_before_truncation_semantics() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create target");
 
     let coord = SubstrateCoordinator::single(rt);
@@ -3183,7 +3238,7 @@ async fn fan_out_search_tags_filter_drops_non_matching() {
 
     let tok_main = rt_main.authorize(ns.clone()).unwrap();
     rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "concept",
             None,
@@ -3193,11 +3248,12 @@ async fn fan_out_search_tags_filter_drops_non_matching() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create untagged on main");
 
     let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
     let tagged = rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             None,
@@ -3207,6 +3263,7 @@ async fn fan_out_search_tags_filter_drops_non_matching() {
             vec!["target-tag".to_string()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create tagged on lore");
 
     let mut registry = BackendRegistry::new();
@@ -3247,7 +3304,7 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
     let tok_lore = rt_lore.authorize(ns.clone()).unwrap();
 
     rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "concept",
             Some("algorithm"),
@@ -3257,9 +3314,10 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
             vec!["other-tag".to_string()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create tag decoy");
     rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "concept",
             Some("technique"),
@@ -3269,9 +3327,10 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
             vec!["entity-target".to_string()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity-type decoy");
     rt_main
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_main,
             "document",
             Some("paper"),
@@ -3281,9 +3340,10 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
             vec!["entity-target".to_string()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create kind decoy");
     rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             Some("algorithm"),
@@ -3293,9 +3353,10 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
             vec!["entity-target".to_string()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create properties decoy");
     let target = rt_lore
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_lore,
             "concept",
             Some("algorithm"),
@@ -3305,6 +3366,7 @@ async fn fan_out_search_preserves_full_entity_filter_contract() {
             vec!["entity-target".to_string()],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create matching entity");
 
     let mut registry = BackendRegistry::new();
@@ -3511,7 +3573,7 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
 
     // Seed one concept on each backend.
     let tok_a = rt_a.authorize(ns.clone()).unwrap();
-    rt_a.create_entity(
+    rt_a.create_entity_with_embedding_report(
         &tok_a,
         "concept",
         None,
@@ -3521,10 +3583,11 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
         vec![],
     )
     .await
+    .map(|(row, _report)| row)
     .expect("T7a: create concept on alpha");
 
     let tok_b = rt_b.authorize(ns.clone()).unwrap();
-    rt_b.create_entity(
+    rt_b.create_entity_with_embedding_report(
         &tok_b,
         "concept",
         None,
@@ -3534,6 +3597,7 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
         vec![],
     )
     .await
+    .map(|(row, _report)| row)
     .expect("T7a: create concept on beta");
 
     let server = two_backend_server(Arc::clone(&rt_a), Arc::clone(&rt_b));
@@ -3626,7 +3690,7 @@ async fn multi_backend_and_direct_search_rows_have_exact_key_set_parity() {
     let namespace = RuntimeNamespace::local();
     let token = primary.authorize(namespace).expect("authorize primary");
     primary
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -3636,6 +3700,7 @@ async fn multi_backend_and_direct_search_rows_have_exact_key_set_parity() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity shape probe");
     primary
         .create_note(
@@ -3685,7 +3750,7 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
 
     // Create a concept AND a document on rt_a with overlapping names.
     let tok_a = rt_a.authorize(ns.clone()).unwrap();
-    rt_a.create_entity(
+    rt_a.create_entity_with_embedding_report(
         &tok_a,
         "concept",
         None,
@@ -3695,9 +3760,10 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
         vec![],
     )
     .await
+    .map(|(row, _report)| row)
     .expect("T7b: create concept on alpha");
 
-    rt_a.create_entity(
+    rt_a.create_entity_with_embedding_report(
         &tok_a,
         "document",
         None,
@@ -3707,6 +3773,7 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
         vec![],
     )
     .await
+    .map(|(row, _report)| row)
     .expect("T7b: create document on alpha");
 
     // rt_b is empty — all results come from rt_a.
@@ -3763,7 +3830,7 @@ async fn coordinator_service_search_reports_vector_arm_error_in_json_envelope() 
 
     let token = rt_broken.authorize(ns).unwrap();
     rt_broken
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -3773,6 +3840,7 @@ async fn coordinator_service_search_reports_vector_arm_error_in_json_envelope() 
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity");
     break_vector_arm(&rt_broken);
 
@@ -3835,7 +3903,7 @@ async fn t7c_multi_backend_search_min_score_applied() {
     let ns = RuntimeNamespace::local();
 
     let tok_a = rt_a.authorize(ns.clone()).unwrap();
-    rt_a.create_entity(
+    rt_a.create_entity_with_embedding_report(
         &tok_a,
         "concept",
         None,
@@ -3845,6 +3913,7 @@ async fn t7c_multi_backend_search_min_score_applied() {
         vec![],
     )
     .await
+    .map(|(row, _report)| row)
     .expect("T7c: create entity");
 
     let _ = rt_b.authorize(ns.clone()).unwrap();
@@ -4004,7 +4073,7 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
 
     let token = rt.authorize(ns.clone()).unwrap();
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -4014,6 +4083,7 @@ async fn substrate_coordinator_service_hydrates_entity_and_note_metadata() {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .expect("create entity");
     let note = rt
         .create_note(

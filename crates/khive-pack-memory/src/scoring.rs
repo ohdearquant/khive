@@ -566,6 +566,7 @@ impl ScoringConfig {
 // ── Utility functions ─────────────────────────────────────────────────────────
 
 /// Returns `true` when >15% of the query's characters are CJK.
+// Keep the f32 boundary: the shared f64 ratio can classify near-threshold queries differently.
 pub fn contains_cjk(text: &str) -> bool {
     let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {

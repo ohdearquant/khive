@@ -6,7 +6,7 @@
 //! copy of a `comm.send`/`comm.reply`), which previously cost roughly a
 //! dozen separate writer acquisitions per send: two `create_note_inner`
 //! calls (row + FTS + one vector insert per registered model each) plus a
-//! root-send `thread_id` patch. Shaped as `create_notes_atomic(Vec<AtomicNoteSpec>)`
+//! root-send `thread_id` patch. Shaped as `create_notes_atomic_with_report(Vec<AtomicNoteSpec>)`
 //! rather than a comm-specific pair primitive so other multi-write verbs
 //! can share the same preparation. Keyed `memory.remember` appends a required
 //! annotation and final key claim before committing its prepared plan.
@@ -23,7 +23,7 @@
 //! here is embeddings are computed *before* commit instead of *after*, so
 //! the vector rows land in the SAME atomic unit as the note row and FTS
 //! document, and no post-commit reindex is needed at all — every plan built
-//! by [`create_notes_atomic`] carries `post_commit: PostCommitEffect::None`.
+//! by [`create_notes_atomic_with_report`] carries `post_commit: PostCommitEffect::None`.
 //!
 //! # One writer acquisition
 //!
@@ -309,14 +309,15 @@ pub(crate) fn vector_insert_statements(
 /// document, or vector row from any spec is left behind (embed failures
 /// occur before any write is attempted; commit-pass failures roll back the
 /// whole unit per [`crate::atomic_runner::run_atomic_unit`]'s guarantee).
-pub async fn create_notes_atomic(
+#[cfg(test)]
+pub(crate) async fn create_notes_atomic(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
 ) -> RuntimeResult<Vec<Note>> {
     Ok(create_notes_atomic_with_report(runtime, specs).await?.0)
 }
 
-/// The truncation-reporting form of [`create_notes_atomic`]. The report keeps
+/// Build and commit notes with an embedding-truncation report. The report keeps
 /// logical per-note/model accounting even when identical content shares one
 /// provider result, and is returned only when the whole note set commits
 /// successfully.

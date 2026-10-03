@@ -743,7 +743,7 @@ async fn issue_2678_context_compares_canonical_uuid_without_requiring_live_ancho
         Some(json!({"context_entity_id": noncanonical})),
     );
     runtime
-        .update_note(
+        .update_note_with_embedding_report(
             &runtime
                 .authorize(khive_runtime::Namespace::local())
                 .unwrap(),
@@ -751,6 +751,7 @@ async fn issue_2678_context_compares_canonical_uuid_without_requiring_live_ancho
             legacy_patch,
         )
         .await
+        .map(|(row, _report)| row)
         .expect("seed a legacy noncanonical context property");
     let stored = fixture
         .dispatch("get", json!({"id": legacy_stored["full_id"]}))

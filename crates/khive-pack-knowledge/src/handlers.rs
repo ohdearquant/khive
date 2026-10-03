@@ -146,10 +146,10 @@ impl KnowledgePack {
         // Concept entities are linkable graph rows and must live on the core
         // (main) backend even when the pack is assigned a secondary backend
         // (ADR-073; same seam as the session pack's ADR-083 §4 fix).
-        let entity = self
+        let (entity, embedding_report) = self
             .runtime
             .core()
-            .create_entity(
+            .create_entity_with_embedding_report(
                 token,
                 "concept",
                 None,
@@ -160,7 +160,7 @@ impl KnowledgePack {
             )
             .await?;
 
-        Ok(json!({
+        let mut response = json!({
             "id": short_id(entity.id),
             "full_id": entity.id.as_hyphenated().to_string(),
             "kind": "concept",
@@ -169,7 +169,12 @@ impl KnowledgePack {
             "domain": domain_norm,
             "tags": entity.tags,
             "namespace": entity.namespace,
-        }))
+        });
+        if embedding_report.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+        }
+        Ok(response)
     }
 
     /// Link a concept to the paper/source that introduced it (`introduced_by` edge).
@@ -508,7 +513,7 @@ mod tests {
         // links against in production).
         let source = rt
             .core()
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "document",
                 None,
@@ -518,6 +523,7 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(entity, _report)| entity)
             .expect("source document entity");
         let source_id = source.id.to_string();
         pack.dispatch(
