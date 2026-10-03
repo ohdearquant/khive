@@ -364,3 +364,89 @@ fn successful_entropy_preserves_a11_encapsulation_bytes() {
         decode_hex(value(&fixture, "envelope", "ciphertext")).unwrap()
     );
 }
+
+struct GenerationEntropy {
+    inputs: [[u8; 32]; 2],
+    destinations: Vec<usize>,
+    fail_at: Option<usize>,
+}
+impl rand_core::CryptoRng for GenerationEntropy {}
+impl RngCore for GenerationEntropy {
+    fn next_u32(&mut self) -> u32 {
+        panic!("unexpected integer entropy request")
+    }
+    fn next_u64(&mut self) -> u64 {
+        panic!("unexpected integer entropy request")
+    }
+    fn fill_bytes(&mut self, _dest: &mut [u8]) {
+        panic!("generation must use fallible entropy fills")
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        let index = self.destinations.len();
+        self.destinations.push(dest.as_ptr() as usize);
+        dest.copy_from_slice(&self.inputs[index]);
+        if self.fail_at == Some(index) {
+            return Err(std::num::NonZeroU32::new(rand_core::Error::CUSTOM_START)
+                .unwrap()
+                .into());
+        }
+        Ok(())
+    }
+}
+
+fn generation_entropy() -> GenerationEntropy {
+    let fixture = fixture();
+    GenerationEntropy {
+        inputs: [
+            fixed(&fixture, "device_keys_sender", "kem_ikm"),
+            fixed(&fixture, "device_keys_sender", "signing_seed"),
+        ],
+        destinations: Vec::new(),
+        fail_at: None,
+    }
+}
+
+#[test]
+fn generated_signing_seed_stays_at_entropy_fill_address() {
+    let mut rng = generation_entropy();
+    let facility = InMemoryKeyFacility::generate_with_rng(&mut rng).unwrap();
+    assert_eq!(rng.destinations.len(), 2);
+    let seed_address = rng.destinations[1];
+    assert_eq!(seed_address, facility.signing_seed.as_ptr() as usize);
+    let moved = Box::new(std::hint::black_box(facility));
+    assert_eq!(seed_address, moved.signing_seed.as_ptr() as usize);
+}
+
+#[test]
+fn generated_keys_preserve_fixture_public_keys_and_signatures() {
+    let fixture = fixture();
+    let mut rng = generation_entropy();
+    let generated = InMemoryKeyFacility::generate_with_rng(&mut rng).unwrap();
+    let expected = InMemoryKeyFacility::from_test_seeds(&rng.inputs[0], &rng.inputs[1]);
+    let keys = generated.public_keys();
+    assert_eq!(
+        keys.kem.as_bytes(),
+        &fixed::<32>(&fixture, "device_keys_sender", "kem_public_key")
+    );
+    assert_eq!(
+        keys.signing.as_bytes(),
+        &fixed::<32>(&fixture, "device_keys_sender", "signing_public_key")
+    );
+    let input = b"signing seed storage regression";
+    let signature = generated.sign(input);
+    assert_eq!(signature, expected.sign(input));
+    keys.signing.verify(input, &signature).unwrap();
+}
+
+#[test]
+fn generation_reports_each_entropy_failure() {
+    for fail_at in 0..2 {
+        let mut rng = generation_entropy();
+        rng.fail_at = Some(fail_at);
+        assert!(matches!(
+            InMemoryKeyFacility::generate_with_rng(&mut rng),
+            Err(ProtocolError::Randomness)
+        ));
+        assert_eq!(rng.destinations.len(), fail_at + 1);
+    }
+}
