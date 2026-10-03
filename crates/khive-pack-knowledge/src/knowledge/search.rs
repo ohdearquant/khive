@@ -2779,6 +2779,7 @@ async fn load_domain_by_id_or_slug(
         .ok_or_else(|| RuntimeError::NotFound(format!("domain not found: {id:?}")))
 }
 
+#[cfg(test)]
 async fn load_atom_by_id_or_slug(
     runtime: &KhiveRuntime,
     ns: &str,
@@ -4083,6 +4084,140 @@ impl KnowledgeHandlers {
         Ok((out, query_embedding))
     }
 
+    const COMPOSE_ATOM_CHUNK_SIZE: usize = 64;
+
+    fn compose_domain_member_ids(atoms: &[Atom], members: &[String]) -> HashSet<String> {
+        let mut first_by_slug = HashMap::with_capacity(atoms.len());
+        for atom in atoms {
+            first_by_slug.entry(atom.slug.as_str()).or_insert(atom.id);
+        }
+        members
+            .iter()
+            .filter_map(|slug| first_by_slug.get(slug.as_str()))
+            .map(|id| id.to_string())
+            .collect()
+    }
+
+    async fn load_compose_atom_window(
+        runtime: &KhiveRuntime,
+        ns: &str,
+        references: &[String],
+    ) -> Result<Vec<Result<Atom, RuntimeError>>, RuntimeError> {
+        if references.is_empty() {
+            return Ok(Vec::new());
+        }
+        assert!(references.len() <= Self::COMPOSE_ATOM_CHUNK_SIZE);
+        khive_storage::ensure_request_read_active("knowledge.compose")?;
+        let raw: Vec<_> = references
+            .iter()
+            .map(|reference| reference.trim())
+            .collect();
+        let mut inputs = Vec::with_capacity(raw.len());
+        let mut params = vec![SqlValue::Text(ns.to_owned())];
+        for (ordinal, reference) in raw.iter().enumerate() {
+            let is_uuid = Uuid::parse_str(reference).is_ok();
+            let is_prefix = !is_uuid
+                && reference.len() >= 8
+                && reference.len() <= 36
+                && reference
+                    .chars()
+                    .all(|character| character.is_ascii_hexdigit() || character == '-');
+            let first = params.len() + 1;
+            inputs.push(format!(
+                "({ordinal},?{first},{},?{})",
+                usize::from(is_uuid),
+                first + 1
+            ));
+            params.push(SqlValue::Text((*reference).to_owned()));
+            params.push(if is_prefix {
+                SqlValue::Text(format!("{}%", hex_prefix_to_uuid_pattern(reference)))
+            } else {
+                SqlValue::Null
+            });
+        }
+        let statement = SqlStatement {
+            sql: format!(
+                "WITH input(ordinal,raw_ref,is_uuid,prefix) AS (VALUES {}) \
+                 SELECT input.ordinal AS compose_ordinal, \
+                    CASE WHEN input.is_uuid=0 AND NOT EXISTS( \
+                        SELECT 1 FROM knowledge_atoms slug WHERE slug.slug=input.raw_ref \
+                        AND slug.namespace=?1 AND slug.deleted_at IS NULL) THEN 1 ELSE 0 END AS compose_prefix, atom.* \
+                 FROM input JOIN knowledge_atoms atom ON \
+                    atom.rowid IN(SELECT by_id.rowid FROM knowledge_atoms by_id \
+                        WHERE input.is_uuid=1 AND by_id.id=input.raw_ref \
+                        AND by_id.namespace=?1 AND by_id.deleted_at IS NULL \
+                        UNION ALL SELECT by_slug.rowid FROM knowledge_atoms by_slug \
+                        WHERE input.is_uuid=0 AND by_slug.slug=input.raw_ref \
+                        AND by_slug.namespace=?1 AND by_slug.deleted_at IS NULL LIMIT 1) \
+                    OR atom.rowid IN(SELECT prefixed.rowid FROM knowledge_atoms prefixed \
+                        WHERE input.is_uuid=0 AND input.prefix IS NOT NULL \
+                        AND NOT EXISTS(SELECT 1 FROM knowledge_atoms slug \
+                            WHERE slug.slug=input.raw_ref AND slug.namespace=?1 AND slug.deleted_at IS NULL) \
+                        AND prefixed.namespace=?1 AND prefixed.deleted_at IS NULL \
+                        AND prefixed.id LIKE input.prefix LIMIT 2) \
+                 ORDER BY input.ordinal",
+                inputs.join(",")
+            ),
+            params,
+            label: Some("compose_atom_window".into()),
+        };
+        let context = if Uuid::parse_str(raw[0]).is_ok() {
+            "compose atom by id"
+        } else {
+            "compose atom by slug"
+        };
+        let access = runtime.sql();
+        let mut reader = access
+            .reader()
+            .await
+            .map_err(|error| sql_err("compose atom reader", error))?;
+        #[cfg(test)]
+        compose_read_tests::observe_reader();
+        #[cfg(test)]
+        let before = runtime
+            .backend()
+            .pool()
+            .reader_acquisition_snapshot()
+            .pooled_checkouts;
+        let rows = reader
+            .query_all(statement)
+            .await
+            .map_err(|error| sql_err(context, error))?;
+        #[cfg(test)]
+        compose_read_tests::observe_query(runtime, before);
+        let mut aligned: Vec<Vec<khive_storage::types::SqlRow>> =
+            (0..raw.len()).map(|_| Vec::new()).collect();
+        for row in rows {
+            let ordinal = row_i64(&row, "compose_ordinal")
+                .and_then(|ordinal| usize::try_from(ordinal).ok())
+                .filter(|ordinal| *ordinal < aligned.len())
+                .ok_or_else(|| {
+                    RuntimeError::Internal("invalid compose atom window ordinal".into())
+                })?;
+            aligned[ordinal].push(row);
+        }
+        let outcomes = raw
+            .iter()
+            .zip(aligned)
+            .map(|(reference, rows)| {
+                if rows.len() > 1
+                    && rows.first().and_then(|row| row_i64(row, "compose_prefix")) == Some(1)
+                {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "ambiguous atom prefix {reference:?} matches multiple atoms"
+                    )));
+                }
+                rows.into_iter()
+                    .next()
+                    .and_then(|row| atom_from_row(&row))
+                    .ok_or_else(|| RuntimeError::NotFound(format!("atom not found: {reference:?}")))
+            })
+            .collect();
+        #[cfg(test)]
+        compose_read_tests::pause_after_window().await;
+        Ok(outcomes)
+    }
+
     pub(crate) async fn compose(
         runtime: &KhiveRuntime,
         token: &NamespaceToken,
@@ -4274,34 +4409,40 @@ impl KnowledgeHandlers {
         let mut ordered_atoms: Vec<Atom> = Vec::new();
         let mut omitted_members: Vec<String> = Vec::new();
 
-        for slug in &member_slugs {
-            try_or_finish!(khive_storage::ensure_request_read_active(
-                "knowledge.compose"
-            ));
-            let atom = match load_atom_by_id_or_slug(runtime, &ns, slug).await {
-                Ok(atom) => atom,
-                // Domain membership is not rewritten when an atom is deleted.
-                // A stale member must not discard the remaining briefing.
-                Err(RuntimeError::NotFound(_)) => {
-                    omitted_members.push(slug.clone());
-                    continue;
+        for window in member_slugs.chunks(Self::COMPOSE_ATOM_CHUNK_SIZE) {
+            let outcomes =
+                try_or_finish!(Self::load_compose_atom_window(runtime, &ns, window).await);
+            for (slug, outcome) in window.iter().zip(outcomes) {
+                try_or_finish!(khive_storage::ensure_request_read_active(
+                    "knowledge.compose"
+                ));
+                let atom = match outcome {
+                    Ok(atom) => atom,
+                    Err(RuntimeError::NotFound(_)) => {
+                        omitted_members.push(slug.clone());
+                        continue;
+                    }
+                    Err(error) => {
+                        timing.finish(0);
+                        return Err(error);
+                    }
+                };
+                if seen_ids.insert(atom.id.to_string()) {
+                    ordered_atoms.push(atom);
                 }
-                Err(e) => {
-                    timing.finish(0);
-                    return Err(e);
-                }
-            };
-            if seen_ids.insert(atom.id.to_string()) {
-                ordered_atoms.push(atom);
             }
         }
-        for id in &atom_ids {
-            try_or_finish!(khive_storage::ensure_request_read_active(
-                "knowledge.compose"
-            ));
-            let atom = try_or_finish!(load_atom_by_id_or_slug(runtime, &ns, id).await);
-            if seen_ids.insert(atom.id.to_string()) {
-                ordered_atoms.push(atom);
+        for window in atom_ids.chunks(Self::COMPOSE_ATOM_CHUNK_SIZE) {
+            let outcomes =
+                try_or_finish!(Self::load_compose_atom_window(runtime, &ns, window).await);
+            for outcome in outcomes {
+                try_or_finish!(khive_storage::ensure_request_read_active(
+                    "knowledge.compose"
+                ));
+                let atom = try_or_finish!(outcome);
+                if seen_ids.insert(atom.id.to_string()) {
+                    ordered_atoms.push(atom);
+                }
             }
         }
 
@@ -4396,15 +4537,7 @@ impl KnowledgeHandlers {
         try_or_finish!(timing.begin(Phase::Rerank));
 
         let section_results = if has_sections {
-            let domain_member_ids: HashSet<String> = member_slugs
-                .iter()
-                .filter_map(|slug| {
-                    ordered_atoms
-                        .iter()
-                        .find(|a| a.slug == *slug)
-                        .map(|a| a.id.to_string())
-                })
-                .collect();
+            let domain_member_ids = Self::compose_domain_member_ids(&ordered_atoms, &member_slugs);
 
             let domain_scores: HashMap<String, f32> = ordered_atoms
                 .iter()
@@ -4658,6 +4791,10 @@ pub(crate) async fn seed_low_overlap_corpus(runtime: &KhiveRuntime, n: u32, voca
         .await
         .expect("seed low-overlap corpus");
 }
+
+#[cfg(test)]
+#[path = "compose_read_tests.rs"]
+mod compose_read_tests;
 
 #[cfg(test)]
 #[path = "lexical_timeout_tests.rs"]
