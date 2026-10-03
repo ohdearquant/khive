@@ -8,9 +8,7 @@ use serde_json::{json, Value};
 use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 
-pub fn now_micros() -> i64 {
-    chrono::Utc::now().timestamp_micros()
-}
+pub use khive_storage::now_micros;
 
 fn text(row: &SqlRow, col: &str) -> Option<String> {
     match row.get(col) {

@@ -85,3 +85,9 @@ pub use khive_types::{
     AgentRecord, AgentState, EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind,
     TerminalReason,
 };
+
+/// The current time as microseconds since the Unix epoch, the unit stored
+/// rows use for their timestamps.
+pub fn now_micros() -> i64 {
+    chrono::Utc::now().timestamp_micros()
+}
