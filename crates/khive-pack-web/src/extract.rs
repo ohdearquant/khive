@@ -632,7 +632,8 @@ struct ExistingLinks {
     legacy_claimed_targets: Vec<Uuid>,
     legacy_claimed: Vec<Value>,
     legacy_unclaimed: Vec<Value>,
-    retractions: Vec<Uuid>,
+    snapshots: HashMap<Uuid, khive_storage::Edge>,
+    retractions: Vec<khive_storage::Edge>,
 }
 
 fn is_legacy_extractor_write(edge: &khive_storage::Edge) -> bool {
@@ -670,6 +671,7 @@ async fn inspect_existing_links(
     let mut legacy_claimed = Vec::new();
     let mut legacy_unclaimed = Vec::new();
     let mut retractions = Vec::new();
+    let mut snapshots = HashMap::new();
     for edge in existing {
         if edge.namespace != token.namespace().as_str() {
             continue;
@@ -679,6 +681,7 @@ async fn inspect_existing_links(
             .as_ref()
             .and_then(|metadata| metadata.get("web_extract"))
             == Some(&Value::Bool(true));
+        snapshots.insert(edge.target_id, edge.clone());
         existing_edge_ids.insert(edge.target_id, Uuid::from(edge.id));
         if !marked {
             if present.contains(&edge.target_id) && is_legacy_extractor_write(&edge) {
@@ -699,7 +702,7 @@ async fn inspect_existing_links(
                 }));
             }
         } else if !present.contains(&edge.target_id) {
-            retractions.push(edge.id);
+            retractions.push(edge);
         }
     }
     // `list_edges` intentionally omits tombstones. An unmarked soft-deleted
@@ -721,6 +724,7 @@ async fn inspect_existing_links(
         else {
             continue;
         };
+        snapshots.insert(*target_id, edge.clone());
         existing_edge_ids.insert(*target_id, Uuid::from(edge.id));
         let marked = edge
             .metadata
@@ -753,7 +757,8 @@ async fn inspect_existing_links(
         legacy_claimed_targets,
         legacy_claimed,
         legacy_unclaimed,
-        retractions: retractions.into_iter().map(Uuid::from).collect(),
+        snapshots,
+        retractions,
     })
 }
 
@@ -910,10 +915,36 @@ async fn extract_links(
             resurrect: false,
         });
     }
-    let edges = runtime.link_many(token, link_specs).await?;
-    for edge_id in &existing.retractions {
-        runtime.delete_edge(token, *edge_id, false).await?;
-    }
+    let guards = link_specs
+        .iter()
+        .filter(|spec| spec.relation == EdgeRelation::LinksTo)
+        .map(|spec| khive_db::stores::graph::GraphEdgeSnapshotGuard {
+            namespace: token.namespace().as_str().to_owned(),
+            source_id: document_id,
+            target_id: spec.target_id,
+            relation: EdgeRelation::LinksTo,
+            expected: existing.snapshots.get(&spec.target_id).cloned(),
+        })
+        .collect();
+    // Attachment concordance was checked on canonical main before preparation.
+    // This source-backend transaction fences the document body property and all
+    // selected edge snapshots, including absence, before any reconciliation DML.
+    let (rows, _) = runtime
+        .link_many_guarded_observed(
+            token,
+            link_specs,
+            khive_db::stores::graph::GraphMutationPreconditions {
+                document: Some(khive_db::stores::graph::GraphDocumentGuard {
+                    namespace: token.namespace().as_str().to_owned(),
+                    id: document_id,
+                    expected_blob_ref: source_content_ref.to_owned(),
+                }),
+                edges: guards,
+            },
+            existing.retractions.clone(),
+        )
+        .await?;
+    let edges: Vec<_> = rows.into_iter().map(|row| row.edge).collect();
     let collisions = targets
         .iter()
         .filter(|target| existing.unmarked_targets.contains(&target.id))
@@ -1313,8 +1344,9 @@ async fn run_extract_with_link_selection(
         .any(|kind| kind == "links")
         .then(|| parse_link_occurrences(&body, &link_headers));
     // The second check closes the hydration and parse window before any
-    // derived row, link, or extraction note is written. Later interleavings
-    // still require an atomic graph replacement primitive to serialize fully.
+    // derived row, link, or extraction note is written. Link reconciliation
+    // also checks the source document property inside its graph transaction;
+    // canonical-main attachment concordance remains an outside precheck.
     verify_source_body(runtime, token, target_id, &source_content_ref).await?;
     let mut result = serde_json::Map::new();
     let mut targets_remaining = link_limit;

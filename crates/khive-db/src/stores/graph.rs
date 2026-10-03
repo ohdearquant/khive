@@ -19,9 +19,9 @@ use khive_storage::types::{
     PageRequest, PathNode, SeekCursor, SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue,
     TraversalExecutionBudget, TraversalOptions, TraversalRequest,
 };
-use khive_storage::GraphStore;
 use khive_storage::LinkId;
 use khive_storage::StorageCapability;
+use khive_storage::{Event, GraphStore, StorageResult};
 use khive_types::EdgeRelation;
 
 use crate::error::SqliteError;
@@ -877,6 +877,388 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
     }
 }
 
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// A live source-document reference observed before pack preparation.
+#[doc(hidden)]
+pub struct GraphDocumentGuard {
+    pub namespace: String,
+    pub id: Uuid,
+    pub expected_blob_ref: String,
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// The complete row, or absence, observed for one canonical natural key.
+#[doc(hidden)]
+pub struct GraphEdgeSnapshotGuard {
+    pub namespace: String,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relation: EdgeRelation,
+    pub expected: Option<Edge>,
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Source-row expectations checked before any graph mutation.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct GraphMutationPreconditions {
+    pub document: Option<GraphDocumentGuard>,
+    pub edges: Vec<GraphEdgeSnapshotGuard>,
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Existing graph engines selected for a source-backend composition unit.
+#[doc(hidden)]
+pub enum GraphMutationRequest {
+    Single {
+        request: EdgeUpsertRequest,
+        guard_endpoints: bool,
+    },
+    Batch {
+        requests: Vec<EdgeUpsertRequest>,
+        guard_endpoints: bool,
+    },
+    CommitAnnotation {
+        edge: Edge,
+        guard: CommitAnnotationGuard,
+    },
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Transaction-observed outcomes retain the existing graph classifications.
+#[doc(hidden)]
+pub enum GraphMutationOutcome {
+    Single(GuardedEdgeUpsertOutcome),
+    Batch(GuardedEdgeBatchUpsertOutcome),
+    CommitAnnotation(CommitAnnotationInsertOutcome),
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Ordered upsert results and the separate preimages of retired live edges.
+#[doc(hidden)]
+pub struct GraphMutationEventOutcome {
+    pub mutation: GraphMutationOutcome,
+    pub retired: Vec<Edge>,
+}
+
+const GRAPH_MUTATION_EVENTS_OP: &str = "compose_graph_mutation_events";
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Guarded composition seam for packs.
+#[doc(hidden)]
+pub async fn compose_graph_mutation_events<F>(
+    backend: &crate::StorageBackend,
+    mutation: GraphMutationRequest,
+    preconditions: GraphMutationPreconditions,
+    retirements: Vec<Edge>,
+    make_events: F,
+) -> StorageResult<GraphMutationEventOutcome>
+where
+    F: FnOnce(&GraphMutationEventOutcome) -> StorageResult<Vec<Event>> + Send + 'static,
+{
+    if backend.is_read_only() {
+        return Err(StorageError::Pool {
+            operation: GRAPH_MUTATION_EVENTS_OP.into(),
+            message: "backend is read-only".into(),
+        });
+    }
+    // Retain the normal accessors' store-readiness checks before admission;
+    // no schema work or asynchronous dispatch enters the enlisted engine.
+    backend
+        .graph()
+        .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+    backend
+        .events()
+        .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+    let pool = backend.pool_arc();
+    if let Some(writer_task) = pool.writer_task_for_write(None, GRAPH_MUTATION_EVENTS_OP)? {
+        return writer_task
+            .send_bounded(move |conn| {
+                graph_mutation_events_enlisted(
+                    conn,
+                    mutation,
+                    preconditions,
+                    retirements,
+                    make_events,
+                )
+            })
+            .await;
+    }
+    pool.record_direct_route(crate::timeout_sink::Site::DirectRouteGraphGeneralWrite);
+    let is_file_backed = backend.is_file_backed();
+    tokio::task::spawn_blocking(move || {
+        if is_file_backed {
+            let conn = pool
+                .open_standalone_writer()
+                .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+            run_graph_mutation_transaction(&pool, &conn, false, move |conn| {
+                graph_mutation_events_enlisted(
+                    conn,
+                    mutation,
+                    preconditions,
+                    retirements,
+                    make_events,
+                )
+            })
+        } else {
+            let guard = pool
+                .try_writer()
+                .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+            run_graph_mutation_transaction(&pool, guard.conn(), true, move |conn| {
+                graph_mutation_events_enlisted(
+                    conn,
+                    mutation,
+                    preconditions,
+                    retirements,
+                    make_events,
+                )
+            })
+        }
+    })
+    .await
+    .map_err(|error| {
+        StorageError::driver(StorageCapability::Graph, GRAPH_MUTATION_EVENTS_OP, error)
+    })?
+}
+
+fn run_graph_mutation_transaction<R, F>(
+    pool: &ConnectionPool,
+    conn: &rusqlite::Connection,
+    pooled: bool,
+    operation: F,
+) -> StorageResult<R>
+where
+    F: FnOnce(&rusqlite::Connection) -> StorageResult<R>,
+{
+    if !conn.is_autocommit() {
+        if pooled {
+            pool.retire_pooled_writer(conn);
+        }
+        return Err(StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        });
+    }
+    if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+        if !conn.is_autocommit() {
+            if pooled {
+                pool.retire_pooled_writer(conn);
+            }
+            return Err(StorageError::WriterTaskTerminated {
+                request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            });
+        }
+        crate::timeout_sink::maybe_emit_busy(
+            &crate::timeout_sink::db_label(pool),
+            crate::timeout_sink::Site::StandaloneGraph,
+            &error,
+        );
+        return Err(map_err(error, GRAPH_MUTATION_EVENTS_OP));
+    }
+    let _tx_handle = khive_storage::tx_registry::register_scoped(
+        Some(GRAPH_MUTATION_EVENTS_OP.to_string()),
+        pool.origin(),
+    );
+    let (result, terminal_state) = crate::writer_task::execute_wrapped_transaction(
+        conn,
+        "compose_graph_mutation_events.commit",
+        operation,
+    );
+    if pooled && terminal_state.is_some() {
+        pool.retire_pooled_writer(conn);
+    }
+    result
+}
+
+fn graph_mutation_conflict(message: &'static str) -> StorageError {
+    StorageError::Conflict {
+        capability: StorageCapability::Graph,
+        operation: GRAPH_MUTATION_EVENTS_OP.into(),
+        message: message.into(),
+    }
+}
+
+fn edge_snapshot_matches(actual: &Edge, expected: &Edge) -> bool {
+    actual.id == expected.id
+        && actual.namespace == expected.namespace
+        && actual.source_id == expected.source_id
+        && actual.target_id == expected.target_id
+        && actual.relation == expected.relation
+        && actual.weight.to_bits() == expected.weight.to_bits()
+        && actual.metadata == expected.metadata
+        && actual.target_backend == expected.target_backend
+        && actual.created_at == expected.created_at
+        && actual.updated_at == expected.updated_at
+        && actual.deleted_at == expected.deleted_at
+}
+
+fn check_graph_mutation_preconditions(
+    conn: &rusqlite::Connection,
+    preconditions: &GraphMutationPreconditions,
+    retirements: &[Edge],
+) -> StorageResult<()> {
+    if let Some(document) = &preconditions.document {
+        let matches: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM entities WHERE id=?1 AND namespace=?2 \
+                 AND deleted_at IS NULL AND json_type(properties, '$.blob_ref')='text' \
+                 AND json_extract(properties, '$.blob_ref')=?3 COLLATE BINARY)",
+                rusqlite::params![
+                    document.id.to_string(),
+                    &document.namespace,
+                    &document.expected_blob_ref,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        if !matches {
+            return Err(graph_mutation_conflict(
+                "source document body reference changed",
+            ));
+        }
+    }
+    for guard in &preconditions.edges {
+        let actual = edge_by_natural_key_parts_including_deleted(
+            conn,
+            &guard.namespace,
+            guard.source_id,
+            guard.target_id,
+            guard.relation,
+        )
+        .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        let matches = match (actual.as_ref(), guard.expected.as_ref()) {
+            (None, None) => true,
+            (Some(actual), Some(expected)) => edge_snapshot_matches(actual, expected),
+            _ => false,
+        };
+        if !matches {
+            return Err(graph_mutation_conflict("edge ownership snapshot changed"));
+        }
+    }
+    for expected in retirements {
+        let actual = edge_by_natural_key_including_deleted(conn, expected)
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        if expected.deleted_at.is_some()
+            || !actual
+                .as_ref()
+                .is_some_and(|actual| edge_snapshot_matches(actual, expected))
+        {
+            return Err(graph_mutation_conflict("edge retirement snapshot changed"));
+        }
+    }
+    Ok(())
+}
+
+/// Connection-enlisted graph/event engine: no transaction control or await.
+fn graph_mutation_events_enlisted<F>(
+    conn: &rusqlite::Connection,
+    mutation: GraphMutationRequest,
+    preconditions: GraphMutationPreconditions,
+    retirements: Vec<Edge>,
+    make_events: F,
+) -> StorageResult<GraphMutationEventOutcome>
+where
+    F: FnOnce(&GraphMutationEventOutcome) -> StorageResult<Vec<Event>>,
+{
+    if !retirements.is_empty() && !matches!(&mutation, GraphMutationRequest::Batch { .. }) {
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Graph,
+            operation: GRAPH_MUTATION_EVENTS_OP.into(),
+            message: "retirements require a batch mutation".into(),
+        });
+    }
+    check_graph_mutation_preconditions(conn, &preconditions, &retirements)?;
+    let mutation = match mutation {
+        GraphMutationRequest::Single {
+            request,
+            guard_endpoints,
+        } => GraphMutationOutcome::Single(
+            observed_edge_upsert(conn, &request, guard_endpoints)
+                .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?,
+        ),
+        GraphMutationRequest::Batch {
+            requests,
+            guard_endpoints,
+        } => {
+            let outcome = observed_edge_batch_upsert(conn, &requests, guard_endpoints)
+                .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+            if outcome.refusal.is_none() && outcome.rows.len() != requests.len() {
+                return Err(graph_mutation_conflict(
+                    "edge result count differs from request count",
+                ));
+            }
+            GraphMutationOutcome::Batch(outcome)
+        }
+        GraphMutationRequest::CommitAnnotation { edge, guard } => {
+            if edge.relation != EdgeRelation::Annotates || edge.deleted_at.is_some() {
+                return Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Graph,
+                    operation: GRAPH_MUTATION_EVENTS_OP.into(),
+                    message: "expected a live annotates edge".into(),
+                });
+            }
+            GraphMutationOutcome::CommitAnnotation(
+                conditional_commit_annotation_insert(conn, edge, &guard)
+                    .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?,
+            )
+        }
+    };
+    let written = match &mutation {
+        GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
+        GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
+        GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
+        _ => {
+            return Ok(GraphMutationEventOutcome {
+                mutation,
+                retired: Vec::new(),
+            })
+        }
+    };
+    let mut retired = Vec::with_capacity(retirements.len());
+    for edge in retirements {
+        let statement =
+            edge_soft_delete_statement(Uuid::from(edge.id), Utc::now().timestamp_micros());
+        let mut stmt = conn
+            .prepare(&statement.sql)
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        bind_params(&mut stmt, &statement.params)
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        if stmt
+            .raw_execute()
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?
+            != 1
+        {
+            return Err(graph_mutation_conflict(
+                "edge retirement changed during mutation",
+            ));
+        }
+        retired.push(edge);
+    }
+    let outcome = GraphMutationEventOutcome { mutation, retired };
+    let expected_events = written + outcome.retired.len();
+    if expected_events == 0 {
+        return Ok(outcome);
+    }
+    let events = make_events(&outcome)?;
+    if events.len() != expected_events {
+        return Err(graph_mutation_conflict(
+            "event result count differs from mutation count",
+        ));
+    }
+    for event in &events {
+        super::event::append_event_in_transaction(conn, event).map_err(|error| {
+            StorageError::driver(StorageCapability::Events, GRAPH_MUTATION_EVENTS_OP, error)
+        })?;
+    }
+    Ok(outcome)
+}
+
 /// A GraphStore backed by SQLite tables.
 pub struct SqlGraphStore {
     pool: Arc<ConnectionPool>,
@@ -1582,18 +1964,33 @@ fn edge_by_natural_key_including_deleted(
     conn: &rusqlite::Connection,
     edge: &Edge,
 ) -> Result<Option<Edge>, rusqlite::Error> {
-    let (source_id, target_id) =
-        canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+    edge_by_natural_key_parts_including_deleted(
+        conn,
+        &edge.namespace,
+        edge.source_id,
+        edge.target_id,
+        edge.relation,
+    )
+}
+
+fn edge_by_natural_key_parts_including_deleted(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+) -> Result<Option<Edge>, rusqlite::Error> {
+    let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
     conn.query_row(
         "SELECT namespace, id, source_id, target_id, relation, weight, \
                 created_at, updated_at, deleted_at, metadata, target_backend \
          FROM graph_edges \
          WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 AND relation = ?4",
         rusqlite::params![
-            &edge.namespace,
+            namespace,
             source_id.to_string(),
             target_id.to_string(),
-            edge.relation.as_str(),
+            relation.as_str(),
         ],
         read_edge,
     )

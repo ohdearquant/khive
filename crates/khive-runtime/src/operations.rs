@@ -28,7 +28,10 @@ use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, KhiveError, Substra
 
 use khive_db::stores::entity::{entity_hard_delete_statement, entity_upsert_statement};
 use khive_db::stores::event::hard_delete_lineage_warning_statements;
-use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
+use khive_db::stores::graph::{
+    compose_graph_mutation_events, edge_hard_delete_statement, purge_incident_edges_statement,
+    GraphMutationOutcome, GraphMutationPreconditions, GraphMutationRequest,
+};
 use khive_db::stores::note::note_hard_delete_statement;
 use khive_db::stores::text::insert_document_statements;
 use khive_db::{pool::RuntimeWriteOperation, SqliteError};
@@ -3212,11 +3215,36 @@ impl KhiveRuntime {
         // fact: a second concurrent write landing between the refusal and a
         // post-hoc read could otherwise misreport which endpoint was actually
         // missing at write time.
-        let result = match self
-            .graph(token)?
-            .upsert_edge_guarded_observed(EdgeUpsertRequest { edge, resurrect })
-            .await?
-        {
+        let attribution = crate::EventAttribution::from_token(token);
+        let outcome = compose_graph_mutation_events(
+            self.backend(),
+            GraphMutationRequest::Single {
+                request: EdgeUpsertRequest { edge, resurrect },
+                guard_endpoints: true,
+            },
+            GraphMutationPreconditions::default(),
+            Vec::new(),
+            move |outcome| match &outcome.mutation {
+                GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(result)) => {
+                    Ok(vec![Self::link_mutation_event(
+                        &attribution,
+                        result,
+                        source_kind,
+                        target_kind,
+                    )])
+                }
+                _ => Err(Self::link_composition_shape_error(
+                    "expected a written singleton",
+                )),
+            },
+        )
+        .await?;
+        let GraphMutationOutcome::Single(outcome) = outcome.mutation else {
+            return Err(RuntimeError::Internal(
+                "link: unexpected composition outcome".into(),
+            ));
+        };
+        let result = match outcome {
             GuardedEdgeUpsertOutcome::Written(result) => result,
             GuardedEdgeUpsertOutcome::Refused(EdgeUpsertRefusal::MissingEndpoints(missing)) => {
                 return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
@@ -3232,8 +3260,6 @@ impl KhiveRuntime {
                 )))
             }
         };
-        self.append_link_mutation_event(token, &result, source_kind, target_kind)
-            .await?;
         Ok(result)
     }
 
@@ -3312,31 +3338,59 @@ impl KhiveRuntime {
             metadata,
             target_backend,
         };
-        let result = self
-            .graph(token)?
-            .upsert_edge_observed(EdgeUpsertRequest { edge, resurrect })
-            .await
-            .map_err(|error| {
-                if matches!(error, khive_storage::StorageError::Conflict { .. }) {
-                    RuntimeError::InvalidInput(format!(
-                        "edge natural key is soft-deleted; pass resurrect=true to link explicitly: {error}"
-                    ))
-                } else {
-                    error.into()
+        let attribution = crate::EventAttribution::from_token(token);
+        let outcome = compose_graph_mutation_events(
+            self.backend(),
+            GraphMutationRequest::Single {
+                request: EdgeUpsertRequest { edge, resurrect },
+                guard_endpoints: false,
+            },
+            GraphMutationPreconditions::default(),
+            Vec::new(),
+            move |outcome| match &outcome.mutation {
+                GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(result)) => {
+                    Ok(vec![Self::link_mutation_event(
+                        &attribution,
+                        result,
+                        source_kind,
+                        target_kind,
+                    )])
                 }
-            })?;
-        self.append_link_mutation_event(token, &result, source_kind, target_kind)
-            .await?;
-        Ok(result)
+                _ => Err(Self::link_composition_shape_error(
+                    "expected a written singleton",
+                )),
+            },
+        )
+        .await?;
+        match outcome.mutation {
+            GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(result)) => Ok(result),
+            GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Refused(
+                EdgeUpsertRefusal::ResurrectionRequired { edge },
+            )) => {
+                let error = khive_storage::StorageError::Conflict {
+                    capability: khive_storage::StorageCapability::Graph,
+                    operation: "upsert_edge_observed".into(),
+                    message: format!(
+                        "edge {} is soft-deleted; explicit resurrection is required",
+                        edge.id,
+                    ),
+                };
+                Err(RuntimeError::InvalidInput(format!(
+                    "edge natural key is soft-deleted; pass resurrect=true to link explicitly: {error}"
+                )))
+            }
+            _ => Err(RuntimeError::Internal(
+                "link: unexpected composition outcome".into(),
+            )),
+        }
     }
 
-    async fn append_link_mutation_event(
-        &self,
-        token: &NamespaceToken,
+    fn link_mutation_event(
+        attribution: &crate::EventAttribution,
         result: &EdgeUpsertResult,
         source_kind: EdgeEndpointKind,
         target_kind: EdgeEndpointKind,
-    ) -> RuntimeResult<()> {
+    ) -> Event {
         let kind = match result.disposition {
             EdgeUpsertDisposition::Created => EventKind::LinkCreated,
             EdgeUpsertDisposition::Updated | EdgeUpsertDisposition::Resurrected => {
@@ -3344,7 +3398,6 @@ impl KhiveRuntime {
             }
         };
         let edge_id = Uuid::from(result.edge.id);
-        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
         let mut payload = serde_json::json!({
             "id": edge_id,
             "namespace": result.edge.namespace,
@@ -3360,21 +3413,25 @@ impl KhiveRuntime {
             payload["source_kind"] = serde_json::json!(source_kind.name());
             payload["target_kind"] = serde_json::json!(target_kind.name());
         }
-        let event = khive_storage::event::Event::new(
-            result.edge.namespace.clone(),
-            "link",
-            kind,
-            SubstrateKind::Entity,
-            actor,
+        attribution.stamp(
+            Event::new(
+                result.edge.namespace.clone(),
+                "link",
+                kind,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(edge_id)
+            .with_payload(payload),
         )
-        .with_target(edge_id)
-        .with_payload(payload);
-        self.events(token)?
-            .append_event(event)
-            .await
-            .map_err(|error| {
-                RuntimeError::Internal(format!("link: lifecycle event write failed: {error}"))
-            })
+    }
+
+    fn link_composition_shape_error(message: &'static str) -> khive_storage::StorageError {
+        khive_storage::StorageError::InvalidInput {
+            capability: khive_storage::StorageCapability::Graph,
+            operation: "link_mutation_event".into(),
+            message: message.into(),
+        }
     }
 
     /// Returns `true` if `id` resolves to a live substrate record in the
@@ -8146,7 +8203,7 @@ impl KhiveRuntime {
     /// All edges are validated and constructed with `build_edge` before any
     /// write. If validation fails for any entry the entire batch is rejected
     /// (no writes occur). On success, all edges are persisted in a single
-    /// atomic transaction via `upsert_edges`.
+    /// source transaction with every lifecycle event and observation projection.
     ///
     /// After the bulk upsert, each edge is read back by its natural key
     /// (namespace, source_id, target_id, relation) so that the returned IDs
@@ -8175,8 +8232,53 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         specs: Vec<LinkSpec>,
     ) -> RuntimeResult<Vec<EdgeUpsertResult>> {
-        if specs.is_empty() {
-            return Ok(vec![]);
+        self.link_many_guarded_observed(
+            token,
+            specs,
+            GraphMutationPreconditions::default(),
+            Vec::new(),
+        )
+        .await
+        .map(|(rows, _)| rows)
+    }
+
+    /// Internal seam for khive-runtime; no compatibility promise.
+    ///
+    /// Guarded composition seam for packs.
+    #[doc(hidden)]
+    pub async fn link_many_guarded_observed(
+        &self,
+        token: &NamespaceToken,
+        specs: Vec<LinkSpec>,
+        preconditions: GraphMutationPreconditions,
+        retirements: Vec<Edge>,
+    ) -> RuntimeResult<(Vec<EdgeUpsertResult>, Vec<LinkId>)> {
+        let namespace = token.namespace().as_str();
+        let foreign_document = preconditions
+            .document
+            .as_ref()
+            .is_some_and(|guard| guard.namespace != namespace);
+        let foreign_edge = preconditions.edges.iter().any(|guard| {
+            guard.namespace != namespace
+                || guard
+                    .expected
+                    .as_ref()
+                    .is_some_and(|edge| edge.namespace != namespace)
+        });
+        if foreign_document
+            || foreign_edge
+            || retirements.iter().any(|edge| edge.namespace != namespace)
+        {
+            return Err(RuntimeError::InvalidInput(
+                "guarded link namespace does not match token namespace".into(),
+            ));
+        }
+        if specs.is_empty()
+            && preconditions.document.is_none()
+            && preconditions.edges.is_empty()
+            && retirements.is_empty()
+        {
+            return Ok((Vec::new(), Vec::new()));
         }
         let mut edges = Vec::with_capacity(specs.len());
         let mut endpoint_kinds = Vec::with_capacity(specs.len());
@@ -8201,10 +8303,63 @@ impl KhiveRuntime {
                 resurrect: spec.resurrect,
             })
             .collect();
-        let outcome = self
-            .graph(token)?
-            .upsert_edges_guarded_observed(requests)
-            .await?;
+        let attribution = crate::EventAttribution::from_token(token);
+        let outcome = compose_graph_mutation_events(
+            self.backend(),
+            GraphMutationRequest::Batch {
+                requests,
+                guard_endpoints: true,
+            },
+            preconditions,
+            retirements,
+            move |outcome| {
+                let GraphMutationOutcome::Batch(batch) = &outcome.mutation else {
+                    return Err(Self::link_composition_shape_error(
+                        "expected a written batch",
+                    ));
+                };
+                if batch.rows.len() != endpoint_kinds.len() {
+                    return Err(Self::link_composition_shape_error(
+                        "edge result count differs from validated endpoint count",
+                    ));
+                }
+                let mut events = Vec::with_capacity(batch.rows.len() + outcome.retired.len());
+                for (row, (source_kind, target_kind)) in batch.rows.iter().zip(endpoint_kinds) {
+                    events.push(Self::link_mutation_event(
+                        &attribution,
+                        row,
+                        source_kind,
+                        target_kind,
+                    ));
+                }
+                for edge in &outcome.retired {
+                    let edge_id = Uuid::from(edge.id);
+                    events.push(
+                        attribution.stamp(
+                            Event::new(
+                                edge.namespace.clone(),
+                                "delete",
+                                EventKind::EdgeDeleted,
+                                SubstrateKind::Entity,
+                                "",
+                            )
+                            .with_target(edge_id)
+                            .with_payload(serde_json::json!({
+                                "id": edge_id, "namespace": edge.namespace, "hard": false,
+                            })),
+                        ),
+                    );
+                }
+                Ok(events)
+            },
+        )
+        .await?;
+        let retired = outcome.retired.into_iter().map(|edge| edge.id).collect();
+        let GraphMutationOutcome::Batch(outcome) = outcome.mutation else {
+            return Err(RuntimeError::Internal(
+                "link_many: unexpected composition outcome".into(),
+            ));
+        };
         if let Some(refusal) = outcome.refusal {
             return match refusal.reason {
                 EdgeUpsertRefusal::MissingEndpoints(missing) => {
@@ -8222,16 +8377,7 @@ impl KhiveRuntime {
                 }
             };
         }
-        if outcome.rows.len() != endpoint_kinds.len() {
-            return Err(RuntimeError::Internal(
-                "link_many: edge result count differs from validated endpoint count".into(),
-            ));
-        }
-        for (row, (source_kind, target_kind)) in outcome.rows.iter().zip(endpoint_kinds) {
-            self.append_link_mutation_event(token, row, source_kind, target_kind)
-                .await?;
-        }
-        Ok(outcome.rows)
+        Ok((outcome.rows, retired))
     }
 
     /// Create a historical commit-to-project annotation without replacing a
@@ -8269,23 +8415,36 @@ impl KhiveRuntime {
                 },
             )
             .await?;
-        let result = self
-            .graph(token)?
-            .insert_commit_annotation_if_absent(edge, guard)
-            .await?;
-        if let CommitAnnotationInsertOutcome::Created(edge) = &result {
-            self.append_link_mutation_event(
-                token,
-                &EdgeUpsertResult {
-                    edge: edge.clone(),
-                    disposition: EdgeUpsertDisposition::Created,
-                    previous: None,
-                },
-                EdgeEndpointKind::Note,
-                EdgeEndpointKind::Entity,
-            )
-            .await?;
-        }
+        let attribution = crate::EventAttribution::from_token(token);
+        let outcome = compose_graph_mutation_events(
+            self.backend(),
+            GraphMutationRequest::CommitAnnotation { edge, guard },
+            GraphMutationPreconditions::default(),
+            Vec::new(),
+            move |outcome| match &outcome.mutation {
+                GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(
+                    edge,
+                )) => Ok(vec![Self::link_mutation_event(
+                    &attribution,
+                    &EdgeUpsertResult {
+                        edge: edge.clone(),
+                        disposition: EdgeUpsertDisposition::Created,
+                        previous: None,
+                    },
+                    EdgeEndpointKind::Note,
+                    EdgeEndpointKind::Entity,
+                )]),
+                _ => Err(Self::link_composition_shape_error(
+                    "expected a created annotation",
+                )),
+            },
+        )
+        .await?;
+        let GraphMutationOutcome::CommitAnnotation(result) = outcome.mutation else {
+            return Err(RuntimeError::Internal(
+                "link annotation: unexpected composition outcome".into(),
+            ));
+        };
         Ok(result)
     }
 
