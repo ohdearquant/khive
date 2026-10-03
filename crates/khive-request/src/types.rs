@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 
+use khive_types::json_type_name;
 use serde_json::Value;
 
 /// Maximum operations in a batch or chain.
@@ -254,17 +255,6 @@ fn prev_path_prefix(resolved_prefix: &str) -> String {
         "$prev".to_string()
     } else {
         format!("$prev.{resolved_prefix}")
-    }
-}
-
-fn json_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
     }
 }
 
@@ -612,3 +602,45 @@ impl fmt::Display for DslError {
 }
 
 impl std::error::Error for DslError {}
+
+#[cfg(test)]
+mod prev_type_tests {
+    use super::{ArgValue, PrevFailure};
+    use serde_json::json;
+
+    #[test]
+    fn prev_type_errors_name_numbers_for_field_and_index_segments() {
+        for (path, previous, prefix, segment, expected) in [
+            ("user.id", json!({"user": 7}), "$prev.user", "id", "object"),
+            (
+                "items[0]",
+                json!({"items": 7}),
+                "$prev.items",
+                "[0]",
+                "array",
+            ),
+        ] {
+            let argument = ArgValue::PrevRef { path: path.into() };
+            let failure = argument
+                .find_prev_failure(&previous)
+                .expect("a number cannot be traversed");
+            assert_eq!(
+                failure,
+                PrevFailure::WrongType {
+                    arg_path: "".into(),
+                    prev_path: format!("$prev.{path}"),
+                    resolved_prefix: prefix.into(),
+                    segment: segment.into(),
+                    expected,
+                    found: "number",
+                }
+            );
+            assert_eq!(
+                failure.to_string(),
+                format!(
+                    "$prev.{path}: {prefix} is a number, not an {expected}, so {segment:?} cannot be applied to it"
+                )
+            );
+        }
+    }
+}
