@@ -38,8 +38,29 @@ Shape is intentionally generic across git record kinds within a project —
 `kind` distinguishes `commits` / `issues` / `prs` cursors so a follow-up pack
 (e.g. a code-review pack) can reuse this exact table for its own cursor rows
 without a schema change, keyed by its own `project_id`/`kind` pair.
-Idempotent (`CREATE TABLE IF NOT EXISTS`), applied once at pack registration
-time; not part of the core versioned migration chain.
+The seven schema statements install the receipts table and its two indexes,
+the cursor table and its update index, and two nonunique live-note expression
+indexes: namespace/kind/commit SHA and namespace/kind/issue/pull_request number
+plus project identity.
+The number lookup explicitly restricts its literal kind set to the two kinds
+its production callers pass, so the partial index is usable with bound kind
+parameters. JSON value types, exact namespace/project matching and deleted-row
+exclusion remain query predicates; text numbers do not match integer binds.
+
+Legacy duplicate issue/PR numbers retain an unspecified winner under unordered
+`LIMIT 1`. A changed query plan can select a different holder, including a row
+with an invalid stored ID; there is no unique constraint, trailing UUID sort key,
+new refusal or history repair. Commit lookup still detects two live SHA holders
+before decoding their IDs. Annotation repair and the writer's annotation COUNT
+include tombstones and are unchanged; these live indexes do not accelerate those
+all-row paths. Deleted malformed JSON is outside the index predicates and is not
+repaired or indexed by this pack plan.
+
+Idempotent (`CREATE TABLE/INDEX IF NOT EXISTS`), applied once at pack registration
+time in the existing schema-plan transaction; not part of the core versioned
+migration chain. Stores without the Git pack keep the existing semantic queries
+but do not receive these indexes. Read-only stores use any already-installed
+indexes without attempting schema writes.
 
 ## `GIT_EDGE_RULES`
 

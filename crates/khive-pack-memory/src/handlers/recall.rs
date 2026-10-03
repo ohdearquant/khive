@@ -3476,17 +3476,50 @@ mod tests {
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns.clone()).expect("authorize local");
 
-        rt.create_note(
-            &token,
+        // Seed the real note and FTS legs without create_note's NoteCreated
+        // append: the tested backend's event accessor must remain cold.
+        let note = khive_storage::Note::new(
+            ns.as_str(),
             "memory",
-            None,
             "event acquisition failure recall note",
-            Some(0.7),
-            None,
-            vec![],
         )
-        .await
-        .expect("create note");
+        .with_salience(0.7);
+        rt.notes(&token)
+            .expect("note store")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed real memory row");
+        rt.text_for_notes(&token)
+            .expect("note FTS store")
+            .upsert_document(khive_storage::types::TextDocument {
+                subject_id: note.id,
+                kind: khive_types::SubstrateKind::Note,
+                record_kind: Some("memory".into()),
+                namespace: ns.as_str().to_owned(),
+                title: None,
+                body: note.content,
+                tags: vec![],
+                metadata: None,
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("seed real lexical leg");
+        let event_rows = rt
+            .sql()
+            .reader()
+            .await
+            .expect("premise reader")
+            .query_scalar(khive_storage::types::SqlStatement {
+                sql: "SELECT COUNT(*) FROM events".into(),
+                params: vec![],
+                label: Some("recall_acquisition_cold_premise".into()),
+            })
+            .await
+            .expect("inspect migrated event table without acquiring EventStore");
+        assert!(
+            matches!(event_rows, Some(khive_storage::types::SqlValue::Integer(0))),
+            "fixture must not emit create/other events before cold acquisition"
+        );
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
@@ -3546,6 +3579,57 @@ mod tests {
             .fields
             .get("error")
             .is_some_and(|error| !error.is_empty()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn warm_recall_event_store_acquisition_finishes_while_writer_is_held() {
+        use std::time::Duration;
+
+        let rt = KhiveRuntime::memory().expect("runtime");
+        let token = rt.authorize(Namespace::local()).expect("local");
+        rt.events(&token)
+            .expect("first real event accessor initializes its schema");
+        let pool = rt.backend().pool();
+        let bound = Duration::from_secs(1).min(pool.config().checkout_timeout / 2);
+        assert!(bound >= Duration::from_millis(100));
+        let writer = pool
+            .writer()
+            .expect("hold writer after event initialization");
+        let before = pool.writer_acquisition_snapshot();
+        let acquiring_rt = rt.clone();
+        // This is emit_recall_executed_event's actual accessor. Appending the
+        // event remains writer work; the companion isolates acquisition only.
+        let mut acquiring = tokio::task::spawn_blocking(move || acquiring_rt.events(&token));
+        let while_held = tokio::time::timeout(bound, &mut acquiring).await;
+        drop(writer);
+        let store = match while_held {
+            Ok(joined) => joined
+                .expect("event acquisition worker joins")
+                .expect("warm event accessor"),
+            Err(_) => {
+                let _ = tokio::time::timeout(bound, acquiring).await;
+                panic!("warm recall event accessor must return before writer release");
+            }
+        };
+        let after = pool.writer_acquisition_snapshot();
+        assert_eq!(after.timeouts, before.timeouts);
+        assert_eq!(
+            after.pooled_acquisitions, before.pooled_acquisitions,
+            "warm event acquisition must not request the writer"
+        );
+        let page = store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::types::PageRequest {
+                    limit: 1,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("the acquired handle reads the real event table after release");
+        assert!(page.items.is_empty());
     }
 
     // `#[serial(background_tasks)]`: see the note on
