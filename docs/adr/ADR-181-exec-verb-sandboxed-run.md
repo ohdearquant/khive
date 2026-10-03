@@ -543,3 +543,290 @@ old path: the receipt describes the renamed tree, and files written to the new d
 captured. Otherwise `tree_capture` is
 `complete`, `failed` for a capture error, or `none` when the run did not reach capture. A removal
 after the check is not detected, and a platform with no descriptor-to-path query runs no such check.
+
+## Amendment 12 (2026-10-03): descendant identity, cleanup evidence and capture
+
+**Status: Proposed.** This is a design proposal for #3631 and the remaining process-lifetime
+question in #3291. It has not been ratified and authorizes no implementation by itself. The accepted
+text above, including Amendment 11, remains binding. Acceptance 6 is still an unmet target on the
+shipped backend.
+
+### Boundary examined
+
+The backend at this proposal's source revision is macOS Seatbelt through `/usr/bin/sandbox-exec`.
+Startup refuses a host without that launcher; there is no shipped Linux confinement backend. The
+[profile](../../crates/khive-pack-exec/src/sandbox.rs) allows `process-exec` and `process-fork`. The
+[launcher](../../crates/khive-pack-exec/src/handlers.rs) creates an initial session, clears the host
+environment, waits for the direct child and signals the initial group. A descendant can change its
+group or session. The existing detached-survivor fixture deliberately observes it after the receipt;
+that fixture tests retained file and network restrictions, not whole-tree termination.
+
+This proposal distinguishes four requirements: admit an authentic run member, acquire a capability
+bound to that exact process, have permission and a supported interface to act on it, and establish
+that every member exited. None implies the others. A copied marker, matching UID, PID or PID plus a
+previously read birth time is insufficient. Reading a birth time or `p_uniqueid` again and then
+calling `kill(pid, signal)` still has a check-to-signal race. Reopening a process handle from an
+already stale PID has the same admission problem. A numeric process-group ID retained after its
+original leader has been reaped is also not a lifetime capability.
+
+### Mechanisms and counterexamples
+
+Costs below are source-derived work descriptions, not measurements. Let P be the number of
+processes examined and S the number of sweep rounds. An algorithm doing one linear census per round
+examines O(P × S) census records; ancestry traversal, identity admission, stop acknowledgement and
+settlement add work. No algorithm or overall cost bound is selected here. All observation and
+cleanup work needs finite process, byte, round and time limits; a limit or inaccessible process
+produces incomplete evidence, never certification of an empty run.
+
+| Mechanism                                                                            | What it can establish                                                                                                                                              | Escape or missing proof                                                                                                                                                                                                                                                                                     | Cost and disposition                                                                                                                                                                                                                        |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Parent-chain census, stop, then repeated enumeration                                 | Discover currently connected descendants; after confirmed stops, another round can find children created before those stops.                                       | A double fork whose intermediate parent exited before discovery has lost that current parent chain. Sending SIGSTOP is not acknowledgement that every thread is quiescent. PID and parent-PID reuse can misidentify membership or the signal target.                                                        | Repeated census records plus ancestry, identity and stop acknowledgements. An unchanged snapshot is a fixed point of the observation, not proof that no orphan exists. Do not use it as certification.                                      |
+| Per-run argument or environment marker                                               | A descendant retaining the marker may be found after reparenting or `setsid`.                                                                                      | A program can exec with another environment, erase its user-stack marker or copy it to another same-UID process. Restricted targets can hide environment values. A marker authenticates neither membership nor identity.                                                                                    | Bounded metadata reads for P processes per round. Treat matches as diagnostic leads only; never signal on the marker alone.                                                                                                                 |
+| Dedicated supervisor                                                                 | Keeps its own children waitable and can retain identities admitted before execution. Linux child-subreaper semantics additionally adopt eligible orphans.          | A normal macOS parent does not acquire every double-fork orphan. Polling has the same discovery gap. Subreaping alone supplies no atomic termination boundary.                                                                                                                                              | Another long-lived process, IPC, retained member state and crash recovery. A complete, non-bypassable admission mechanism remains required. No macOS subreaper equivalent was established by the examined interfaces.                       |
+| Seatbelt denial of `SYS_setsid` and `SYS_setpgid`, followed by initial-group cleanup | A platform probe reported refusal of those two direct Unix syscalls. It establishes a concrete candidate rule rather than an inferred profile operation.           | The same probe reported escape through `POSIX_SPAWN_SETSID` and `POSIX_SPAWN_SETPGROUP`. Denying two syscall entries does not prevent their internal spawn paths. Current group cleanup has no certified empty-group observation.                                                                           | Policy checks and compatibility work. Session/group-changing calls receive EPERM on the probed host; supported tool coverage and other creation routes remain unverified. Do not ship this rule plus `killpg` as containment certification. |
+| Retained Mach task capability or private audit-token signalling                      | Potentially act on an exact admitted target without a later bare-PID signal.                                                                                       | Acquisition and authenticated lineage need proof. Access is permission-dependent; the examined audit-token interfaces are private, and identity versions can change across exec. Signalling is not a general identity-bound wait API.                                                                       | Per-member acquisition, lifecycle handling, OS/SDK compatibility and permission gates. A feasibility route, not a selected production dependency.                                                                                           |
+| Darwin coalition                                                                     | Kernel task membership, inherited through relevant task creation, and empty-state notification are stronger ingredients than a parent-chain snapshot.              | Run-scoped creation and explicit admission have privilege or private-entitlement gates. A terminate request does not kill members and does not immediately freeze all activation. A supported per-run creation, admission, termination and empty-notification chain is not established for this deployment. | Retained coalition state, privileged controller/admission and notification lifecycle. Actual daemon coalition membership must be checked; UID alone neither grants nor disproves access. Not a selected backend.                            |
+| Per-run guest using `Virtualization.framework`                                       | If all run execution stays in the guest, completed destructive VM stop supplies a boundary for guest execution independent of its process tree.                    | Guest shutdown requests are not exit evidence. Host helpers, writable host shares, output buffers and storage completion need separate boundaries. Entitlement, host support and configuration admission must succeed before launch.                                                                        | Guest OS/image, boot, CPU/memory, output transport and tool compatibility costs. No cost is measured. A named alternative requiring a separate backend design, not a feature of the current launcher.                                       |
+| Separate Linux cgroup v2 backend                                                     | With membership established before untrusted execution and escape prevented, kernel group termination and an empty-group observation can support a stronger claim. | Moving an already running process into a group leaves a launch race; writable migration paths can invalidate membership. Kernel support, delegation and sandbox policy need explicit admission.                                                                                                             | A group per run, a privileged or delegated controller and lifecycle monitoring. Future backend work, unavailable through the shipped Seatbelt launcher.                                                                                     |
+
+### Seatbelt probe and source boundary
+
+A platform probe reported results on macOS 27.0, build 26A428, arm64, using this profile:
+
+```scheme
+(version 1)
+(allow default)
+(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid))
+```
+
+Forked-child `setsid()` and `setpgid(0, 0)` succeeded without that profile and returned EPERM under
+it. In contrast, `posix_spawn` with `POSIX_SPAWN_SETSID` or `POSIX_SPAWN_SETPGROUP` created a new
+session or group with and without the profile. These are reported observations for that host,
+not a supported-SDK guarantee, a complete route census or a tool compatibility benchmark.
+
+The pinned XNU [Unix syscall dispatch](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/dev/arm/systemcalls.c#L160-L167)
+calls `mac_proc_check_syscall_unix` when the syscall filter rejects an entry. This is the relevant
+hook; generic scheduling or signal hooks do not establish that rule's behavior. The
+[spawn attribute path](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exec.c#L4485-L4502)
+calls `setpgid` and `setsid_internal` internally. That source path explains why filtering the two
+standalone syscall entries cannot by itself close the measured spawn escape. XNU also has
+[a fork policy check](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_fork.c#L286-L295),
+but a hook does not prove a compatible complete policy for fork, vfork, spawn and every escape
+attribute. Those additional route and deployment checks remain outstanding.
+
+Apple's pinned [Libc `daemon()` implementation](https://github.com/apple-oss-distributions/Libc/blob/71bbe350ab79eef58113991d817ccc6165061a64/gen/FreeBSD/daemon.c#L93-L110)
+forks and then calls `setsid`, returning failure if that call fails. This identifies an API
+compatibility cost of the candidate rule by source; it is not a measured `daemon()` probe or a
+claim about any particular tool. A supported tool inventory, helper creation patterns and exact
+OS/SDK policy availability require their own evidence. An unknown profile operation was also
+reported to be rejected by the parser; that does not authorize inventing another rule name.
+
+### Identity, membership and settlement evidence
+
+Apple's pinned [libproc header](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/libsyscall/wrappers/libproc/libproc.h#L41-L44)
+marks those interfaces private. The [audit-token signal path](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/proc_info.c#L3564-L3624)
+checks identity and policy, reacquires a validated process reference and retains it through the
+signal. Its [identity lookup](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_proc.c#L485-L519)
+validates process generation and unique identity. This refutes the blanket claim that Darwin has
+no identity-bound signalling mechanism. It does not establish complete run membership or supported
+availability on the deployment target. The [exec path changes the identity version](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exec.c#L7096-L7105);
+refreshing a stale token requires renewed identity admission.
+
+[Wait functions operate on child processes](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/wait4.2.html).
+Waiting on an unreaped owned child does not supply a wait capability for arbitrary discovered
+nonchildren. A complete sweep design must separately prove identity-bound exit observation,
+permission, lifecycle races and supportedness for those nonchildren. It cannot append `waitpid`
+to a private signal call and claim settlement. The required combination may be unavailable to the
+deployed daemon; its availability must not be assumed from the existence of either API alone.
+
+[Process-args sysctl](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_sysctl.c#L1328-L1406)
+can omit environment values for restricted processes even with a matching UID. Ordinary
+[orphan reparenting](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exit.c#L2471-L2474)
+goes to `initproc` in the examined source. Darwin's [event header](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/event.h#L258-L262)
+does not deliver the child PID with `NOTE_FORK`, and its recursive flags are
+[unsupported since 10.5](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/sys/event.h#L362-L369).
+They do not supply the missing recursive tracker.
+
+Darwin's [coalition syscall gate](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/sys_coalition.c#L220-L249)
+requires privileged coalition membership for create, terminate and reap. The
+[membership check](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/coalition.c#L1607-L1620)
+checks a coalition's privileged flag, not a blanket root-UID rule. Initial coalitions are
+[privileged](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/coalition.c#L2337-L2348),
+so a daemon's actual membership cannot be inferred from its non-root UID. Explicit
+[spawn selection](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_exec.c#L4070-L4085)
+requires privileged membership or the private coalition-spawn entitlement. Ordinary
+[inheritance](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/task.c#L1929-L1967)
+is distinct from admission into a newly selected run coalition.
+
+The [terminate operation](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/coalition.c#L2179-L2233)
+requests notification and reaches terminated state when its active count is zero; it does not kill
+member tasks. The [activation check](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/coalition.c#L1488-L1519)
+rejects terminated/reaped state, not a terminate request alone. A termination request must not be
+described as an immediate freeze of all admission. Supported notification access, complete
+membership and member termination must be proved as a chain. Enumerating coalition member PIDs
+then signalling those numbers would still reintroduce the check-to-signal race. These sources
+establish useful ingredients; they do not certify their absence or their deployable composition.
+
+Linux v6.17's [subreaper adoption path](https://github.com/torvalds/linux/blob/e5f0a698b34ed76002dc5cff3804a61c80233a7a/kernel/exit.c)
+handles eligible orphans, and its [pidfd signal path](https://github.com/torvalds/linux/blob/e5f0a698b34ed76002dc5cff3804a61c80233a7a/kernel/signal.c)
+uses a retained process identifier. Its [cgroup v2 contract](https://github.com/torvalds/linux/blob/e5f0a698b34ed76002dc5cff3804a61c80233a7a/Documentation/admin-guide/cgroup-v2.rst)
+defines `populated` live-process evidence and `cgroup.kill` handling of concurrent forks and
+migrations. This pinned release is a valid source reference, not a statement about the running
+macOS host or an already implemented backend.
+
+### A named guest alternative
+
+A per-run `VZVirtualMachine` is a concrete alternative to host-tree discovery. Apple requires the
+[`com.apple.security.virtualization` entitlement](https://developer.apple.com/documentation/virtualization/adding-the-virtualization-entitlement-to-your-project).
+[`isSupported`](https://developer.apple.com/documentation/virtualization/vzvirtualmachine/issupported)
+and configuration `validate()` must admit the actual host and configuration before untrusted
+execution. This proposal has not established entitlement availability for the shipped binary,
+SDK/OS support on every deployment, or working controller lifecycle there. A non-root VM process
+is not categorically excluded: Apple's [raw disk attachment guidance](https://developer.apple.com/documentation/virtualization/vzdiskblockdevicestoragedeviceattachment)
+recommends a separate privileged disk opener rather than running the VM as root. A file-backed
+image avoids claiming that raw-device privilege is a prerequisite for every guest.
+
+[`requestStop()`](https://developer.apple.com/documentation/virtualization/vzvirtualmachine/requeststop())
+asks the guest to shut down; the request is not proof of exit. Apple specifies that
+[`stop(completionHandler:)`](https://developer.apple.com/documentation/virtualization/vzvirtualmachine/stop(completionhandler:))
+is destructive and completes after successful stop or an error. A selected design must require
+successful completion and the stopped state, not a sent request. This supports a guest-execution
+boundary only when all workload execution remains inside that VM. It does not automatically settle
+host helpers, drain output buffers, complete host storage I/O or make an artifact immutable. Avoid
+writable host shares and confine any necessary host helpers separately. Specify output transport,
+bounded collection and storage settlement before claiming a quiescent artifact. Guest image
+management, boot, CPU/memory and tool compatibility are real design obligations; no performance or
+availability measurement is supplied here.
+
+### Proposed decision and receipt wording
+
+Do not replace initial-group cleanup with a heuristic whole-host kill sweep. First expose actual
+scope and lack of certification; keep acceptance 6 open. A complete sweep may be considered only
+after an independently reviewed membership-admission, identity-binding and settlement design is
+selected. It must establish the run root before execution, retain admitted member provenance,
+observe stop completion and settle every process it stopped within finite bounds. On abort it must
+not leave a process stopped indefinitely or resume a replacement process. It cannot fall back to a
+bare PID or an expired numeric PGID. Missing ancestry or an erased marker lowers coverage.
+
+Those prerequisites may remain unsatisfied for a macOS daemon. That does not prohibit every narrow
+safe cleanup action: a direct child held in unreaped parent custody can be signalled and waited;
+an initial group can be signalled only while a proven live guard prevents group-ID reuse and the
+intended membership is separately established. These actions do not certify escaped descendants.
+A diagnostic census alone does not authorize signalling another process. Ratification must choose
+between limited cleanup without certification, rejecting certified execution on this backend, or
+admitting a different lifetime boundary. It must not promise that best-effort complete sweeping will
+always become available.
+
+The proposed additive `process_cleanup` field separates scope, observation completeness, positive
+observations and certification. For an unobserved descendant census on the current backend:
+
+```json
+{
+  "process_cleanup": {
+    "scope": "initial_group",
+    "observation": "not_attempted",
+    "seen_alive": false,
+    "certification": "unverified",
+    "detail": "Detached descendant termination is not certified on this backend."
+  }
+}
+```
+
+`observation` concerns the bounded descendant census, not whether the direct child was waited. Its
+closed proposed values are `not_attempted`, `complete` and `incomplete`. `complete` says the specified
+bounded observation completed; it does not assert complete run membership. Unreadable metadata,
+partial enumeration, unavailable identity binding, unacknowledged stops or exhausted bounds produce
+`incomplete`. Independently, `seen_alive: true` preserves any observation of an admitted live member,
+including when another part of the census is incomplete or that member later exits. It is never
+cleared to hide a positive observation. `false` means no positive observation was recorded, not
+that descendants do not exist. Historical sightings and current settlement detail must not be
+confused.
+
+The only proposed certification values are `unverified` and `certified_none`. The latter requires
+a non-bypassable membership boundary and evidence that it is empty at the receipt boundary; none
+of the evaluated current Seatbelt mechanisms establishes it. A failed signal or accepted kill
+request alone is not exit evidence. Older receipts without the field remain uncertified.
+`timed_out`, the direct-child exit status and execution success do not imply descendant termination.
+A consumer requiring certification must explicitly refuse the unsupported backend before launch;
+a tool name is not an admission policy.
+
+### Capture policy and ratification choice
+
+The no-follow, pre-launch-directory-handle option in #3291 is already implemented:
+[`CaptureRoot::open`](../../crates/khive-pack-exec/src/capture.rs) pins the directory before launch;
+component-relative `openat` uses `O_NOFOLLOW` and compares opened identities. Keep this implementation
+and Amendment 11's root verification and bounded output collection. A later pathname walk would
+regress that boundary. Capture is not an atomic filesystem snapshot, and a pinned directory does
+not freeze file contents. An unknown or known writer can mutate it during collection.
+
+The recommended publication policy is uniformly provisional for uncertified runs. Add
+`tree_quiescence: "unverified" | "certified"` independently of `tree_capture`, reporting
+`unverified` on the current backend. Under this proposed policy, publish bounded collected artifacts
+with that qualification regardless of whether observation was not attempted, complete or incomplete,
+and regardless of `seen_alive`. A survivor observation does not selectively remove `tree_out`,
+changed entries or execution success. Amendment 11's actual root/capture errors and output limits
+still govern capture degradation and success. `tree_capture: complete` means collection completed;
+it does not mean every writer exited or the published bytes constitute a final immutable tree.
+A consumer needing a final quiescent artifact must reject unverified publication. This explicitly
+accepts that published data can be provisional or change after collection.
+
+The alternative for ratification is uniformly certified-only publication: withhold all collected
+artifacts for every run lacking certification, even when no census ran or a completed census found
+nothing. It would also require an explicit pre-launch refusal policy for consumers requiring
+certified execution on the current backend. It removes provisional output availability without
+creating termination proof. Do not mix these policies so that skipping observation publishes while
+observing a survivor loses output. Ratification must explicitly select one uniform policy; this
+Proposed amendment recommends provisional publication and does not record a signed selection.
+
+### Refutation of this recommendation
+
+Truthful fields and uniform provisional publication do not stop a scrubbed double-fork orphan.
+CPU use and writes in an allowed run directory can continue after return, and collected files can
+mix content from different times. A private signal API does not cure incomplete membership,
+unsupported nonchild settlement or unavailable permissions. The two-syscall Seatbelt rule is
+insufficient because measured spawn attributes bypass it. A coalition terminate request is not a
+kill operation. A VM shutdown request is not completed stop. None should be presented as a
+convenient proof of acceptance 6.
+
+The strongest objection to the recommendation is that availability of provisional artifacts is
+inadequate for callers requiring complete lifetime containment. Those callers must refuse current
+certified execution, choose the uniform certified-only publication policy or fund a separately
+admitted kernel/guest boundary. That changes availability, tool compatibility and operating costs.
+A fork-free profile could remove descendants but also helper-based tools; compatibility and all
+creation routes would still need proof. A heuristic fixed-point census, mutable marker or bare-PID
+birth-time check is rejected as certification. These tradeoffs remain explicit; #3631 and #3291
+are not closed by receipt wording.
+
+### Implementation and acceptance hold
+
+No production change follows from this Proposed amendment. Ratification must select the uniform
+publication policy, supported OS/SDK range, membership/identity/settlement primitives, actual
+permissions, finite budgets and certified-policy admission surface. Membership and identity
+prerequisites may prevent complete best-effort cleanup indefinitely on a deployment; select narrow
+safe actions or reject certified execution rather than weakening them. A certified backend also
+needs a complete boundary proof. Dependent source work waits for an authenticated signed decision.
+The reported platform probes are not complete containment evidence; all new deployment, liveness,
+compatibility, overhead and certification checks remain outstanding.
+
+Receipt-only work, if ratified, needs separate tests for the closed vocabulary, preservation of
+`seen_alive` under incomplete observation, historical receipts, durable lookup/listing and the
+chosen uniform publication policy across unobserved, complete, incomplete and survivor cases.
+Execution success must continue to describe the direct child and actual capture outcome under that
+chosen policy. Such tests cannot satisfy descendant liveness. Liveness/control gates are conditional
+on an actually selected containment implementation, not the addition of receipt fields.
+
+That later gate must retain Amendment 11's output-bound and file/network confinement obligations.
+The existing survivor fixture describes current lifetime behavior; a stronger backend must retain
+the denial witnesses and unsandboxed controls when reanchoring its lifecycle. Add receipt-boundary
+liveness cases for direct `setsid`/`setpgid`, both spawn escape attributes, fork/vfork/daemon routes,
+a scrubbed double-fork orphan, marker erasure and exit/exec during identity admission. A PID-reuse
+arm must prove that an unrelated replacement receives no signal; rereading a birth time is not that
+proof. Include inaccessible/partial census with a positive sighting retained, STOP not acknowledged,
+budget exhaustion, supervisor failure and known/unknown writers with the same publication policy.
+A selected coalition backend must prove admission and empty notification, not merely terminate
+request success; a guest backend must distinguish shutdown request from completed destructive stop
+and settle output/storage. Independently removing selected cleanup must fail a named liveness
+assertion after a normal target compiles and passes with nonzero selection. Removing identity
+admission must fail the no-signal-to-replacement assertion. Compiler/setup failures and empty
+selections prove neither. Existing capture mutation witnesses must continue to distinguish
+no-follow identity reads from pathname substitution. All such evidence remains outstanding.
