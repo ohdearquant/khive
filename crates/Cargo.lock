@@ -2572,6 +2572,7 @@ dependencies = [
  "criterion",
  "inventory",
  "khive-gate",
+ "khive-pack-comm",
  "khive-pack-formal",
  "khive-pack-gtd",
  "khive-query",

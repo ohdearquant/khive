@@ -149,6 +149,48 @@ struct EventsDaemonArgs {
     /// `.sock` extension, beside that database.
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Resolved main-backend WAL ceiling bytes, including an explicit zero.
+    #[arg(long, requires = "wal_ceiling_source")]
+    wal_ceiling_bytes: Option<u64>,
+
+    /// Configuration source of the resolved main-backend WAL ceiling.
+    #[arg(long, value_enum, requires = "wal_ceiling_bytes")]
+    wal_ceiling_source: Option<EventsWalCeilingSource>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum EventsWalCeilingSource {
+    #[value(name = "backend_field")]
+    BackendField,
+    #[value(name = "environment")]
+    Environment,
+    #[value(name = "default")]
+    Default,
+}
+
+#[cfg(any(unix, test))]
+impl EventsDaemonArgs {
+    fn wal_ceiling_policy(&self) -> Result<Option<khive_db::WalCeilingPolicy>> {
+        match (self.wal_ceiling_bytes, self.wal_ceiling_source) {
+            (None, None) => Ok(None),
+            (Some(bytes), Some(source)) => {
+                let source = match source {
+                    EventsWalCeilingSource::BackendField => khive_db::WalCeilingSource::BackendField,
+                    EventsWalCeilingSource::Environment => khive_db::WalCeilingSource::Environment,
+                    EventsWalCeilingSource::Default => khive_db::WalCeilingSource::Default,
+                };
+                let policy = khive_db::WalCeilingPolicy { bytes, source };
+                policy
+                    .validate_static(true, true, false)
+                    .context("events-daemon: invalid explicit WAL ceiling policy")?;
+                Ok(Some(policy))
+            }
+            _ => anyhow::bail!(
+                "events-daemon: --wal-ceiling-bytes and --wal-ceiling-source must be supplied together"
+            ),
+        }
+    }
 }
 
 /// Database schema lifecycle subcommands.
@@ -342,6 +384,7 @@ pub async fn cli_main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::EventsDaemon(a) => {
+            let wal_ceiling = a.wal_ceiling_policy()?;
             let db = match a.db {
                 Some(db) => db,
                 None => {
@@ -357,7 +400,15 @@ pub async fn cli_main() -> Result<()> {
             let socket = a
                 .socket
                 .unwrap_or_else(|| khive_runtime::events_split::events_socket_path_beside(&db));
-            khive_runtime::events_split::run_events_daemon(&db, &socket).await
+            match wal_ceiling {
+                Some(policy) => {
+                    khive_runtime::events_split::run_events_daemon_with_wal_ceiling(
+                        &db, &socket, policy,
+                    )
+                    .await
+                }
+                None => khive_runtime::events_split::run_events_daemon(&db, &socket).await,
+            }
         }
         #[cfg(not(unix))]
         Command::EventsDaemon(_) => {
@@ -1122,6 +1173,10 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cli_events_wal_policy_tests.rs"]
+mod events_wal_policy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2570,4 +2625,5 @@ no_embed = true
         );
     }
     include!("cli_backend_batch_tests.rs");
+    include!("cli_file_identity_tests.rs");
 }

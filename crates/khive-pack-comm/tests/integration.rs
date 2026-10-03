@@ -13295,10 +13295,7 @@ async fn comm_send_still_stamps_from_actor_with_validator_installed() {
         .and_then(serde_json::Value::as_str)
         .expect("send must return full_id")
         .to_string();
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": full_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, true_actor, &full_id).await;
     assert_eq!(
         after["properties"]["from_actor"], true_actor,
         "comm.send's own from_actor stamp must still be the sending actor"
@@ -13376,6 +13373,21 @@ async fn send_message_as(registry: &VerbRegistry, actor: &str, content: &str) ->
         .to_string()
 }
 
+async fn get_message_as(registry: &VerbRegistry, actor: &str, id: &str) -> serde_json::Value {
+    registry
+        .dispatch_with_identity(
+            "get",
+            serde_json::json!({"id": id}),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("get must succeed")
+}
+
 /// FORGERY-BLOCKED arm: merging a `message` note authored by Y into one authored by X with `strategy="prefer_from"` — the attack this guard exists for — must leave the surviving note's `from_actor` as X, not Y.
 #[tokio::test]
 async fn merge_preserves_into_note_from_actor_under_prefer_from() {
@@ -13397,10 +13409,7 @@ async fn merge_preserves_into_note_from_actor_under_prefer_from() {
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:x", &into_id).await;
     assert_eq!(
         after["properties"]["from_actor"], "lambda:x",
         "prefer_from must not be able to transfer attribution from the absorbed note"
@@ -13428,10 +13437,7 @@ async fn merge_preserves_into_note_from_actor_under_prefer_into() {
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:x", &into_id).await;
     assert_eq!(after["properties"]["from_actor"], "lambda:x");
 }
 
@@ -13689,10 +13695,7 @@ async fn merge_still_folds_non_owned_properties_by_strategy() {
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:x", &into_id).await;
     assert_eq!(
         after["properties"]["tag"], "from-tag",
         "a non-owned key must still fold by strategy — only owner-established keys are pinned"
@@ -13774,7 +13777,7 @@ async fn merge_reports_properties_merged_for_key_that_actually_survives() {
             serde_json::json!({
                 "kind": "message",
                 "content": "into note, properties_merged accuracy arm",
-                "properties": {"to_actor": "into", "base": "i"},
+                "properties": {"direction": "outbound", "to_actor": "into", "base": "i"},
             }),
         )
         .await
@@ -13790,7 +13793,7 @@ async fn merge_reports_properties_merged_for_key_that_actually_survives() {
             serde_json::json!({
                 "kind": "message",
                 "content": "from note, properties_merged accuracy arm",
-                "properties": {"to_actor": "from", "added": "x"},
+                "properties": {"direction": "outbound", "to_actor": "from", "added": "x"},
             }),
         )
         .await
@@ -13854,7 +13857,7 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
             serde_json::json!({
                 "kind": "message",
                 "content": "into note, nested-union accuracy arm",
-                "properties": {"thread_id": {"keep": 1}},
+                "properties": {"direction": "outbound", "thread_id": {"keep": 1}},
             }),
             Some(identity.clone()),
         )
@@ -13871,7 +13874,7 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
             serde_json::json!({
                 "kind": "message",
                 "content": "from note, nested-union accuracy arm",
-                "properties": {"thread_id": {"discarded": 2}},
+                "properties": {"direction": "outbound", "thread_id": {"discarded": 2}},
             }),
             Some(identity),
         )
@@ -13895,10 +13898,7 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:z", &into_id).await;
     assert_eq!(
         after["properties"]["thread_id"],
         serde_json::json!({"keep": 1}),
@@ -13949,10 +13949,7 @@ async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_
         "fixture invariant: the absorbed note must carry transport-established external_id"
     );
 
-    let before = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let before = get_message_as(&registry, "lambda:x", &into_id).await;
     assert!(
         before["properties"].get("external_id").is_none(),
         "fixture invariant: the into-note must not already carry an \
@@ -13972,10 +13969,7 @@ async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:x", &into_id).await;
     assert!(
         after["properties"].get("external_id").is_none(),
         "restoration must strip the absorbed note's `external_id`, since the \

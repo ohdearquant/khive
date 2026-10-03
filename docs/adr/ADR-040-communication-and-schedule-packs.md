@@ -8,6 +8,12 @@
 adds three fields to successful read payloads upon acceptance. Existing decisions
 remain accepted; this proposed addition requires acceptance before implementation merges.
 
+**Proposed amendment**: [comm message file attachments](#amendment-proposed-comm-message-file-attachments-2026-10-02)
+adds an optional `attachments` list of blob content references to `comm.send` and `comm.reply`,
+an `attachments` field to `comm.inbox`, `comm.thread` and `comm.read` results, and two confined
+file-transfer verbs on the blob pack. Existing decisions remain accepted; this proposed addition
+requires acceptance before implementation merges.
+
 **Accepted amendment**: [monthly recurrence keeps its day of month](#amendment-2026-09-25-monthly-recurrence-keeps-its-day-of-month)
 stores a monthly row's anchor so that a clamped short month no longer moves every later
 occurrence.
@@ -1050,3 +1056,364 @@ Acceptance, stated before any implementation runs:
 - Rows that clamped before the change keep their clamped day.
 
 Refs: #3322.
+
+## Amendment (proposed): comm message file attachments (2026-10-02)
+
+**Status**: proposed. Acceptance is required before dependent implementation merges.
+
+The requirement is "file bytes never enter a tool result", with files moved on a local server by
+`blob.import(path)` and `blob.export(content_ref, path)` and on a remote MCP surface by "refs plus
+short-lived signed HTTPS URLs (PUT for upload, GET for download)"; this amendment specifies the
+local half only and defers the remote half, signed-URL transfer, to a later amendment of
+[ADR-105](ADR-105-cross-node-comm-transport.md), as listed under [Out of scope](#out-of-scope).
+
+This amendment lets a message carry files by reference. `comm.send` and `comm.reply` accept an
+optional `attachments` list of blob content references. `comm.inbox`, `comm.thread` and `comm.read`
+return each message's references with their sizes. File bytes never appear in a comm request or
+result. Bytes move through the blob pack: the existing upload verbs and `blob.get`, plus two new
+verbs, `blob.import` and `blob.export`, that move a file between the server's disk and the blob
+store inside configured directories. A message sent without attachments behaves exactly as it did
+before, and no schema migration is needed.
+
+The "Message-to-entity attachment" section above covers linking a message to a knowledge-graph
+entity with the `annotates` relation. It is a different feature and is unchanged. In this amendment
+"attachment" always means a file reference carried by a message.
+
+### Data model
+
+1. **A message holds references.** An attachment is the BLAKE3 content reference of an object in
+   the blob store ([ADR-111](ADR-111-blob-store.md)). Attaching copies no bytes. Identical bytes are
+   one stored object however many messages, copies or recipients name them.
+2. **The references are Attachment rows.** [ADR-121](ADR-121-attachments-first-class.md) defines the
+   `attachments` table on the canonical main backend. It is keyed by `(record_uuid, role)`, carries
+   `content_ref`, `media_type`, `size_bytes` and `created_at`, and is the only source of liveness
+   for blob garbage collection. Each attachment of a message is one row on the Note substrate,
+   owned by the message note. The note's `properties` gain no attachment key, because a property
+   that names a blob does not keep the blob from being reclaimed (see
+   [Retention and garbage collection](#retention-and-garbage-collection)).
+3. **Roles are positional.** The table holds one row per role per record. The reference at
+   zero-based position `n` of the caller's list is therefore stored under the role
+   `message-attachment:n`, for `n` from 0 to 7. The role records a position and says nothing about
+   format. It is distinct from the `quarantine-original` role that channel quarantine uses. A
+   reader selects exactly these eight role names on Note rows and orders them by `n`. Any other
+   role on a message note is not an attachment of that message, including a role such as
+   `message-attachment:8`.
+4. **What a row records.** `content_ref` is the reference the caller supplied. `size_bytes` is the
+   object's size as the blob store reported it when the message was sent. `media_type` is null in
+   this version, because the blob store keeps no media type and the send carries none. No file
+   name is recorded.
+5. **Both copies carry the rows.** A send writes an outbound copy for the sender and an inbound
+   copy for the recipient ([ADR-057](ADR-057-comm-actor-addressed-delivery.md)). Each copy has its
+   own complete set of rows with the same roles, references and sizes, so deleting one copy leaves
+   the other complete.
+6. **The rows are fixed at send time.** This version has no verb that adds, replaces or removes an
+   attachment of a message that has been sent.
+7. **Relation to the note boundary in ADR-121.** ADR-121 §2 limits a note attachment to the note's
+   own content in another modality, and places an independent thing, such as a report delivered
+   through a conversation, in an entity that the message annotates. This amendment lets a sender
+   attach any file to a message, and the rows record what the message carried. A recipient who
+   wants a file as a named record creates the entity and attaches the same content reference, as
+   ADR-121 §7 describes, with no byte copy and no change to the message. The positional roles are a
+   use of the existing table and do not extend ADR-121's rule that a role names a rendition.
+
+### Verb changes
+
+#### `comm.send` and `comm.reply`
+
+Both verbs accept an optional `attachments` array of at most eight distinct content references.
+Each reference is the 64-character lowercase hexadecimal string that `blob.put`, `blob.commit` or
+`blob.import` returns. The list keeps the caller's order, and the views show it in that order. An
+empty list is the same as omitting the parameter: it needs no blob store and no particular backend,
+and it leaves the request identity unchanged.
+
+A call with a non-empty list runs these checks in order before any write and returns the first
+failure:
+
+1. The list has more than eight references.
+2. The recipient is an outbound channel address (see [External channels](#external-channels)).
+3. Comm is served by a backend other than the canonical main backend (see
+   [Placement and the transaction](#placement-and-the-transaction)).
+4. The server has no blob store installed. This failure is the existing unconfigured error.
+5. For each reference in list order, one of these holds: the value is not a valid content
+   reference, it repeats an earlier reference in the list, no object is stored under it, or adding
+   its stored size takes the running total above 64 MiB (67,108,864 bytes).
+
+Every failure except the fourth is an invalid-input error whose message names the offending
+reference, or the recipient or limit involved. A missing object refuses the whole call and names
+that reference. A refused call writes no note and no attachment row. This amendment adds no error
+code, so the wire form of these errors is whatever the request surface gives any invalid-input
+error.
+
+`comm.reply` takes the same list, and the list belongs to the reply alone. A reply does not copy the
+attachments of the message it answers. The recipient that check 2 examines is the reply's resolved
+other party, which is a channel address when the answered message was ingested from a channel.
+
+**One transaction.** The two note rows, their index rows, and every attachment row of both copies
+commit in the single transaction that already makes the dual write atomic. If any statement fails,
+including an attachment insert, neither note exists afterwards. No attachment row is written after
+that transaction commits.
+
+**Caller-keyed requests.** With an `idempotency_key` and a non-empty list, the ordered list is part
+of the request identity. The same key with a different list, or with the same references in a
+different order, is the existing `key_conflict`. The same key with the same list returns the
+original result without writing, once both stored copies are found to carry exactly the expected
+rows: the same roles, references, sizes and media types. A pair that lacks a row is a
+`key_conflict` and is not repaired. A request without attachments keeps the identity it had before
+this amendment, so keys minted earlier remain valid. The list is validated on every attempt,
+including a replay, so a replay that names an object no longer in the store is refused at
+validation.
+
+#### `comm.inbox`, `comm.thread` and `comm.read`
+
+Each message record in an `inbox` or `thread` result gains `attachments`, an array of
+`{content_ref, size, media_type}` objects in list order. `size` is the recorded `size_bytes`, and
+`media_type` is null in this version. A message without attachments carries an empty array in the
+canonical payload. The agent presentation drops that empty array, as [ADR-045](ADR-045-verb-response-presentation.md)
+specifies for every empty array. `attachments` joins the closed `fields` vocabulary of both verbs
+and is assembled before projection, so `fields=["attachments"]` returns it and the other
+projection rules are unchanged. With `box="sent"`, `comm.inbox` shows the rows of the outbound
+copy. A thread shows one entry for the two copies of a message, as it does today, and because both
+copies carry the same rows that entry shows the same attachments whichever copy it is built from.
+
+`comm.read` adds the same array to the message fields that the 2026-09-24 amendment returns for a
+successful mark. With `body=false` it adds nothing and keeps its acknowledgement-only shape.
+
+No comm response contains file bytes. Selection, ordering, pagination, counts, deduplication,
+cursors and read state are unchanged. `comm.delivered`, `comm.mark_read`, `comm.unread`,
+`comm.health`, `comm.probe`, `comm.ingest` and the generic record verbs are unchanged.
+
+#### Moving bytes in and out
+
+A sender stores an object with `blob.put`, with the staged `blob.begin`, `blob.put_part` and
+`blob.commit` sequence, or with `blob.import`, and passes the returned reference to `comm.send`. A
+recipient reads the references from its message views, then reads an object with `blob.get` or
+writes it to the server's disk with `blob.export`. `blob.get` is unchanged. Its response is bounded
+by the daemon frame, so an object larger than one frame is read by successive calls with `range`
+([ADR-173](ADR-173-blob-chunked-upload.md) describes the bound).
+
+#### `blob.import` and `blob.export`
+
+`blob.import(path, media_type?)` reads one regular file beneath the import directory and stores it
+in the blob store. Its result is `{content_ref, size}`, plus the `media_type` argument echoed when
+it was supplied. The echo is a receipt, and the blob store records no media type. The file is at
+most 64 MiB. It passes through the existing staged-upload path in 64 KiB parts, so the reference is
+the BLAKE3 digest of the bytes the store accepted, the declared length is checked at commit, and
+the staged-upload ceilings and idle expiry apply. A file whose length changes during the read is
+refused. A blob store without staged-upload support refuses the call, and there is no whole-file
+buffering fallback.
+
+`blob.export(content_ref, path)` verifies and reads an existing object of at most 64 MiB through
+the runtime's shared admission control, writes it to a temporary file in the destination's
+directory, and renames that file over the destination. Its result is `{path, size}`. A failure
+before the rename leaves any earlier destination file intact. A caller that loses the response
+cannot tell from it whether the file was written.
+
+Neither result contains file bytes. Both verbs are classified as write operations in the gate's
+operation table ([ADR-129](ADR-129-fail-closed-gate-default.md) Amendment 3), so a read-only
+runtime refuses them and a `deny_writes_for` restriction denies them. The table's classifier
+revision changes with this addition.
+
+### Limits
+
+| Limit                                        | Value                                 | Enforced by                                                                                           |
+| -------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| References in one send or reply              | 8, no duplicates                      | the comm handlers, before any write (checks 1 and 5)                                                  |
+| Total stored size of those references        | 64 MiB                                | the comm handlers, from the sizes the blob store reports (check 5)                                    |
+| Size of one stored object                    | 64 MiB                                | `blob.put`, `blob.begin` and `blob.import` on the way in; `blob.get` and `blob.export` on the way out |
+| Decoded size of one `blob.put_part` argument | the `part_limit` `blob.begin` returns | `blob.put_part`                                                                                       |
+
+The count and the total bound one call's list, and both copies of the message share that list. The
+values are fixed in this version, and changing them needs an amendment. They are limits on a
+message and set no quota on an actor or a mailbox.
+
+### Confined roots for file import and export
+
+`blob.import` and `blob.export` read and write the filesystem of the machine that runs the khive
+server. Each verb is confined to one directory.
+
+- The import directory is `~/.khive/imports`, or the value of `KHIVE_IMPORT_FROM_ROOT` when that is
+  set and non-empty. The export directory is the existing `save_to` directory: `~/.khive/exports`,
+  or the value of `KHIVE_SAVE_TO_ROOT`. Each call resolves both directories to canonical paths and
+  creates a missing one. A call is refused when the two are equal or when one lies inside the
+  other.
+- Import accepts a path relative to the import directory, or an absolute path spelled beneath the
+  canonical import directory. It refuses an empty path, any `..` component, a file whose canonical
+  path lies outside the directory, a symlink at any component below the directory whether it
+  points inside or outside, and anything that is not a regular file. It opens the file without
+  following links where the platform supports that, and it checks the opened object again.
+- Export applies the `save_to` destination policy. A relative path resolves under the export
+  directory. The destination is refused when it contains `..`, when its resolved parent lies
+  outside the export directory (checked before any directory is created), or when it is an
+  existing symlink or directory. An existing regular file is replaced.
+- The `blob.export` help names the export directory and `KHIVE_SAVE_TO_ROOT`. On a local server a
+  caller that needs the file where it works points that variable at its working directory, so a
+  confined export is not mistaken for a failed download.
+- Every call is confined. These verbs have no unrestricted operator mode of the kind the
+  command-line form of `save_to` has.
+- The checks do not stop another local process from swapping a directory between the check and the
+  use. An operator configures the two directories and their ancestors so that only trusted
+  processes can change them.
+- The server has no signal that identifies a hosted or multi-tenant surface. A deployment that
+  serves callers it does not trust must not expose either verb.
+
+ADR-121 §3 accepts a local file path only on local stdio deployments and rejects it elsewhere with
+an error that names the constraint. The blob pack has no signal that identifies such a deployment,
+so confinement to the configured directories is the control in every deployment. If a signal is
+added later, both rules should use it. `blob.put` still accepts base64 bytes only and never a
+path.
+
+### External channels
+
+Version 1 refuses attachments for any recipient that routes to an outbound transport. The prefixes
+`email:`, `telegram:` and `khive1:` (the node address form of
+[ADR-105](ADR-105-cross-node-comm-transport.md)) mark those recipients. A `comm.send` or
+`comm.reply` to one of them with a non-empty list is refused at check 2. The message text is not
+sent without its attachments, so no transport silently drops a file.
+
+Three facts support the rule. [ADR-056](ADR-056-channel-transport-layer.md) limits the Telegram
+adapter to text, [ADR-122](ADR-122-email-outbound-delivery.md) does not define attachment delivery
+for email, and the node wire protocol of ADR-105 carries no attachments in version 1. A content
+reference is a bearer capability (ADR-111 Amendment 4), and sending one over a transport hands it
+outside the deployment. A refusal reaches the sender, and a silent drop would not.
+
+A transport added later inherits the refusal. The change that adds its address prefix to outbound
+routing adds the prefix to this refusal set, and a later record says how attachments cross it, if
+they do.
+
+### Visibility
+
+Mailbox scoping decides who sees a reference. Both copies of a message are in the sender's
+namespace (ADR-057), and visibility is the existing actor-addressed rule. A mailbox view shows an
+actor's inbound copies, where `to_actor` is that actor, and its outbound copies, where `from_actor`
+is that actor. The view's actor is the caller. It is another actor only when the gate authorizes a
+delegated read through `mailbox_actor`. `comm.read` requires the caller to be the addressee. The
+`attachments` array is part of the message record and follows the record, so the references reach
+exactly the actors who can read the message. This amendment adds no authorization seam, and the
+legacy-row rules of ADR-057 are unchanged.
+
+The object is not scoped by mailbox. Under [ADR-111](ADR-111-blob-store.md) Amendment 4, possession
+of a content reference is the capability to read the object, and `blob.get`, `blob.stat` and
+`blob.export` consult neither attachment rows nor message visibility. An attachment therefore
+delivers a reference to the recipient. It grants nothing and restricts nothing, and any other
+holder of the reference can read the bytes with the same verbs. A sender who needs the bytes to stay
+private to the recipients encrypts them before upload, as that amendment advises for sensitive
+low-entropy content. Its rule that references stay off public and unauthenticated surfaces applies
+to the references in message records.
+
+The existence check in `comm.send` and `comm.reply` is an existence probe of the same kind as
+`blob.stat`. Single-user local deployments accept that residue, as ADR-111 Amendment 4 records.
+Per-tenant read control is out of scope here (see below).
+
+### Retention and garbage collection
+
+Attachment rows are what keep an attached object alive. The blob sweep treats an object as live
+when at least one row in the main database's `attachments` table names its reference (ADR-121 §5,
+ADR-111 §8).
+
+- **Rows belong to copies.** Each copy of a message owns its rows. Deleting the sender's copy
+  releases only the sender's rows, and the recipient's rows keep the object alive.
+- **Soft delete keeps the rows and hard delete removes them.** A soft delete leaves a note's
+  attachment rows in place. A hard delete removes them in the same transaction that removes the
+  note (ADR-121 §6). Neither touches the object's bytes.
+- **Reclamation belongs to the sweep.** An object whose last row is gone becomes an orphan, and the
+  sweep reclaims it under the rules of ADR-111 §8 and ADR-121 Amendment 1, including the publish
+  grace. An object that another record also names, such as an entity or another message with the
+  same bytes, stays live. Messages and their attachments have no expiry of their own.
+- **Before the send.** An uploaded object that is not yet attached has no row. Only the store's
+  publish grace protects it: one hour by default on the filesystem store, restarted when the same
+  bytes are put again. The existence check refuses an object that was reclaimed first, so a
+  reclaimed object is reported and never attached. The S3 store has no transactional sweep
+  (ADR-111 §8).
+- **Between the check and the commit.** The check reserves nothing. A sweep that claims the
+  reference after the check makes the attachment insert abort, and that abort rolls back the whole
+  send. A send that commits first removes the object from the sweep's candidates. A sweep that
+  claims, deletes and finishes between the check and the commit is not detected, and the message
+  then names a missing object. That needs an object that was last published longer ago than the
+  publish grace. A physical deletion outside the sweep, which ADR-111 §8 reserves for offline
+  maintenance, has the same effect. This amendment adds no repair for either case.
+
+### Placement and the transaction
+
+Attachment rows exist on the canonical main backend only (ADR-121), and a runtime bound to any
+other backend refuses to write them. Note rows live on the backend that serves comm. One
+transaction cannot span two databases, and rows written after the notes would leave a window in
+which a message exists without its attachments. So when comm is served by a backend other than
+main, `comm.send` and `comm.reply` refuse a non-empty list before any write. Messages without
+attachments are unaffected on such a backend, and their views return an empty `attachments` array
+without reading another database.
+
+The blob store is a separate resource. Object bytes live in the filesystem or S3 store that the
+runtime has installed, and no SQL transaction covers them under any routing of the blob pack. The
+existence and size check in check 5 is therefore a pre-check that reserves nothing, and
+[Retention and garbage collection](#retention-and-garbage-collection) states the window that
+leaves.
+
+### Out of scope
+
+- Remote transfer: short-lived signed HTTPS URLs returned over MCP for upload and download, and
+  cross-tenant relay of messages with attachments. Both belong to a later amendment of
+  [ADR-105](ADR-105-cross-node-comm-transport.md).
+- Per-tenant read control over attached references, including applying the put-ledger of ADR-111
+  Amendment 4 to the `attachments` argument and any grant of read rights to a recipient. Until it
+  exists, comm file attachments suit deployments where the callers trust one another to the degree
+  that amendment accepts.
+- Attachments over any external channel in either direction, including turning an inbound channel
+  attachment into a message attachment. The `quarantine-original` role is unchanged.
+- File names and media types. This version records no name and a null media type.
+- Adding, replacing or removing the attachments of a sent message.
+- Forwarding. [ADR-123](ADR-123-comm-forward.md) is proposed, and its payload lists attachments by
+  `role` and `content_ref`. It is reconciled with the view defined here when ADR-123 is accepted.
+- Quotas per actor or mailbox, and objects larger than 64 MiB.
+- Indexing or embedding attachment content.
+- Changes to `blob.get`, to the other comm verbs, and to the generic record verbs.
+
+### Acceptance
+
+Acceptance requires these arms, each selecting at least one test and passing:
+
+1. A send with two references leaves both copies with two rows each under `message-attachment:0`
+   and `message-attachment:1`. `comm.inbox` (both boxes), `comm.thread` (both orders) and
+   `comm.read` with `body=true` show them in order, and `blob.export` of each reference writes the
+   original bytes.
+2. A reply with an attachment behaves the same, and does not copy the answered message's
+   attachments.
+3. Each refusal below returns its specific reason and leaves the counts of notes and attachment
+   rows unchanged: a missing object, nine references, a duplicate reference, a total over 64 MiB,
+   a malformed reference, an `email:`, `telegram:` or `khive1:` recipient, a reply to a message
+   ingested from a channel, and a comm backend other than main.
+4. A failure injected into the inbound copy's attachment insert leaves neither note and no rows.
+5. A keyed send replays with the same list, conflicts with a different list or a different order,
+   conflicts when a stored copy lacks a row without repairing it, and keeps the identity of an
+   attachment-free request unchanged.
+6. An attachment-free message shows `attachments: []`. `fields=["attachments"]` projects it.
+   `comm.read` with `body=false` is unchanged. A `quarantine-original` row and a
+   `message-attachment:8` row are never shown.
+7. A hard delete removes a copy's rows in the same transaction and leaves the other copy's rows. A
+   soft delete leaves them.
+8. `blob.import` then `blob.export` round-trips byte-equal, and the imported reference equals the
+   BLAKE3 digest of the file. These are refused: a `..` path, a path outside the import
+   directory, a symlink inside the directory that points outside it, a symlink inside the directory
+   that points inside it, a symlinked ancestor, a directory, a file over 64 MiB, a file whose
+   length changes during the read, an export onto a symlink or a directory, equal or nested
+   directories, a read-only runtime, and a store without staged-upload support.
+
+A mutation must make its named test fail at its own assertion when it removes the existence check,
+the import directory check, the import symlink check, the external-channel refusal, or the replay
+row check, writes rows on one copy only, or writes rows after the commit.
+
+### Alternatives considered
+
+- **Carry bytes in comm requests and results.** Rejected. Every inbox read would grow with every
+  attachment, and the daemon frame bounds the size of any one call (ADR-173).
+- **Record the references in a message property.** Rejected. Garbage collection reads only the
+  `attachments` table, so a property would leave the object open to reclamation after the grace
+  period.
+- **Change the attachment table to allow several rows per role.** Deferred. Positional roles fit
+  the existing table and need no migration, at the cost of a role that records a position. A later
+  amendment can change this if a second consumer needs a multi-valued role.
+- **Send the text and drop the files for external recipients.** Rejected. The loss would be silent,
+  and the reference would travel outside the deployment.
+- **Write the attachment rows after the notes commit.** Rejected. It leaves a window in which a
+  delivered message lacks its attachments, and a failure there has no clean recovery.
+- **Let `comm.send` read a server file by path.** Rejected. It would add a second path-reading
+  surface. Uploading through the blob verbs keeps one confined surface.

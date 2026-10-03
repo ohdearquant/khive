@@ -2,7 +2,7 @@
 
 **Scope:** `crates/khive-vamana/src/graph.rs` — `VamanaGraph::build`, `greedy_search_inner`, `robust_prune_inner`
 **ADR refs:** ADR-048 (Vamana as the knowledge-pack ANN engine)
-**Last reviewed:** 2026-06-06
+**Last reviewed:** 2026-10-02
 
 ---
 
@@ -25,30 +25,60 @@ that excludes `i`. Self-loops and duplicates are impossible by construction.
 ### Phase 2 — Two-pass refinement
 
 The two passes use `alpha = 1.0` then `alpha = config.alpha`, unconditionally
-— including when `config.alpha == 1.0`, so both passes run at the same alpha:
+— including when `config.alpha == 1.0`, so both passes run at the same alpha.
+The insertion order is shuffled once, with a fixed seed, before the first pass;
+both passes walk that same order in chunks of `batch_size` nodes. `batch_size`
+is `BUILD_BATCH_SIZE` (1024) unless the `KHIVE_BUILD_BATCH` environment variable
+sets another value (minimum 1):
 
 ```
+order = shuffle(0..N)                              // once, before the passes
 for pass_alpha in [1.0, config.alpha]:
-    shuffle insertion order
-    for batch in shuffled_nodes.chunks(BUILD_BATCH_SIZE):
-        snapshot = adjacency.clone()           // read-stable snapshot for parallelism
-        proposals = batch.par_iter().map(|node|:
-            greedy_search(node) over snapshot
-            candidates = expanded ∪ results ∪ current_neighbors
-            robust_prune(node, candidates, pass_alpha, max_degree)
-        adjacency[proposals] ← proposals      // apply forward edges
-        backedges = reverse(proposals)
-        adjacency.par_iter_mut().for_each(|target|:
-            merge backedges into neighbors
-            if overflow: robust_prune(target, merged, pass_alpha, max_degree)
+    for batch in order.chunks(batch_size):
+        // current neighbor lists of the batch nodes; `adjacency` is not cloned
+        batch_prior = [adjacency[node].clone() for node in batch]
+
+        // proposal phase: read-only over the shared `adjacency`
+        // (rayon `par_iter` with the `parallel` feature, sequential without it)
+        proposals = for (node, prior) in zip(batch, batch_prior):
+            search = greedy_search(vector[node]) from the medoid over adjacency,
+                     k = max_degree
+            candidates = sort_dedup_u32(search.expanded ∪ search.results ∪ prior)
+            (node, robust_prune(node, candidates, pass_alpha, max_degree))
+
+        // apply forward edges: replace each batch node's list
+        for (node, neighbors) in proposals:
+            adjacency[node] = neighbors
+
+        // sparse back-edge map, ordered by target id (BTreeMap)
+        backedges = {}
+        for (source, neighbors) in proposals:
+            for target in neighbors where target != source:
+                backedges[target].push(source)
+
+        // sequential merge
+        for (target, sources) in backedges:
+            for source in sources where source not in adjacency[target]:
+                adjacency[target].push(source)
+            if len(adjacency[target]) > max_degree:
+                adjacency[target] = robust_prune(target, adjacency[target],
+                                                 pass_alpha, max_degree)
+
+for list in adjacency:
+    sort_dedup_u32(list); list.truncate(max_degree)
 ```
 
-Each pass applies forward edges (greedy-search proposals) and back-edges
-(connectivity from all nodes that just pointed to a target).
+Within a batch every node searches the adjacency as it stood before any proposal of
+that batch was applied, so nodes in one batch do not see each other's new edges; the
+next batch does. A proposal replaces its node's list; the node's previous neighbors
+(`batch_prior`) take part only as extra candidates for the prune. Every proposed
+forward edge `source -> target` gets a back-edge: `source` is appended to the list of
+`target` when absent, and a target whose list then exceeds `max_degree` is re-pruned
+at the same `pass_alpha`. The merge runs in ascending target id, so its order is fixed.
 
 The second pass at `alpha = config.alpha == 1.0` is **not** a redundant rerun
 of the first pass, even though `pass_alpha` is identical across both. Each
-pass's `greedy_search` runs over the adjacency the *previous* pass left
+pass's `greedy_search` runs over the adjacency the _previous_ pass left
 behind, so the second pass explores a more-connected graph and its
 `robust_prune` calls see a different (typically richer) candidate set than
 the first pass did — the two passes are not idempotent. Differential testing
@@ -137,10 +167,16 @@ the window before PR4 makes the invariant crash-safe:
 `VamanaGraph::build_sq8`, `greedy_search_inner_sq8`, and `robust_prune_inner_sq8`
 (ADR-052 §1, Step 2 — two-tier principle) route graph construction and search through
 `GsSq8Codec::l2_sq` (integer L2²) on pre-encoded corpus vectors instead of the f32
-kernel, for the frontier priority queue / candidate acquisition stage only:
+kernel, for the candidate-acquisition stage only (ordering the search frontier and
+ordering the prune pool):
 
-- `build_sq8` produces a graph topology equivalent to `build`; the caller trains the
-  codec and encodes the corpus before calling it.
+- `build_sq8` runs the same build flow as `build` (same medoid, initial adjacency,
+  shuffled order, two-pass schedule, batching, forward-edge application and back-edge
+  merge), with `greedy_search_inner_sq8` and `robust_prune_inner_sq8` in place of the
+  f32 functions, including for the re-prune of an over-full back-edge target. Because
+  candidates are ordered by SQ8 distance, the two builds are not guaranteed to produce
+  the same adjacency for the same input. The caller trains the codec and encodes the
+  corpus before calling it.
 - `greedy_search_inner_sq8` re-scores every frontier candidate with exact f32 L2²
   before final top-k selection (SQ8 for acquisition, exact f32 for final ranking).
   Frontier ties on equal SQ8 codes are broken with exact f32 distance, since distinct
@@ -166,5 +202,6 @@ monotonic-path reachability through `p`. `reverse_adj` is updated in lockstep on
 rewire (the PR1 invariant).
 
 References:
+
 - Wolverine: PVLDB 18(7):2268-2280, VLDB 2025 (Liu/Zheng/Yue/Ruan/Zhou/Jensen)
 - FreshDiskANN: SIGMOD 2022 (>95% recall at 20% deletion with eager repair)
