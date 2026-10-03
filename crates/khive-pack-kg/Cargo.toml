@@ -39,6 +39,8 @@ khive-runtime = { path = "../khive-runtime", features = ["fault-injection", "tes
 khive-pack-formal = { version = "0.9.0", path = "../khive-pack-formal" }
 # Path-only: cyclic dev-dep pair with khive-pack-gtd; cargo strips it at publish.
 khive-pack-gtd = { path = "../khive-pack-gtd" }
+# Path-only: cyclic dev-dependency with khive-pack-comm.
+khive-pack-comm = { path = "../khive-pack-comm" }
 lattice-embed = { workspace = true }
 
 [[test]]

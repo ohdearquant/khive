@@ -33,7 +33,7 @@ impl MailboxView {
     }
 
     /// The same actor partitions as Comm's inbox and sent views. Generic note
-    /// listing applies this before its own page limit, including for broad
+    /// reads apply this before returning message rows, including broad
     /// kind=note reads that encounter a message row.
     pub fn permits_message_note(&self, token: &NamespaceToken, note: &Note) -> bool {
         permits_message_note(&self.actor_id, self.legacy_local(token), note)
@@ -110,13 +110,13 @@ impl KhiveRuntime {
         let selector_field = match verb {
             "comm.inbox" | "comm.thread" => Some("mailbox_actor"),
             "comm.probe" => Some("actor"),
-            // Generic message listing has no cross-actor selector. The caller
-            // still needs the ordinary list gate decision and a row-level
+            // Generic message reads have no cross-actor selector. The caller
+            // still needs the ordinary verb gate decision and a row-level
             // mailbox filter before any message can be returned.
-            "list" => None,
+            "list" | "search" | "get" | "context" | "neighbors" => None,
             _ => {
                 return Err(RuntimeError::InvalidInput(
-                    "mailbox views are supported only by comm.inbox, comm.thread, comm.probe and list"
+                    "mailbox views are supported only by comm.inbox, comm.thread, comm.probe, list, search, get, context and neighbors"
                         .into(),
                 ));
             }
@@ -135,9 +135,9 @@ impl KhiveRuntime {
                 )));
             }
         } else if selector.is_some() {
-            return Err(RuntimeError::InvalidInput(
-                "list has no cross-actor mailbox selector".into(),
-            ));
+            return Err(RuntimeError::InvalidInput(format!(
+                "{verb} has no cross-actor mailbox selector"
+            )));
         }
         match check_with_mailbox_policy(self.config().gate.as_ref(), &req) {
             Ok(GateDecision::Allow { .. }) => {
