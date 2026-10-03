@@ -1115,6 +1115,8 @@ pub(crate) async fn handle_mark_read(
 
 const MAX_BULK_READ_IDS: usize = 500;
 
+const BULK_READ_WINDOW: usize = 128;
+
 async fn validate_bulk_read_targets(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1136,12 +1138,64 @@ async fn validate_bulk_read_targets(
     let requested_count = raw_ids.len();
     let mut seen = HashSet::new();
     let mut targets = Vec::with_capacity(requested_count);
-    for raw in raw_ids {
-        let (id, note) = validate_read_target(runtime, token, &raw).await?;
-        if seen.insert(id) {
-            targets.push((id, note));
+    let mut index = 0;
+    while index < requested_count {
+        // Lookahead parses only complete UUIDs. A prefix or invalid spelling
+        // stops the window, and keeps its resolution at the original phase.
+        let ids: Vec<Uuid> = raw_ids[index..]
+            .iter()
+            .take(BULK_READ_WINDOW)
+            .map(|raw| raw.parse::<Uuid>())
+            .take_while(Result::is_ok)
+            .map(Result::unwrap)
+            .collect();
+        if ids.is_empty() {
+            let (id, note) = validate_read_target(runtime, token, &raw_ids[index]).await?;
+            if seen.insert(id) {
+                targets.push((id, note));
+            }
+            index += 1;
+            continue;
         }
+
+        let store = runtime.notes(token)?;
+        match store.get_notes_batch(&ids).await {
+            Ok(notes) => {
+                let notes: HashMap<Uuid, Note> =
+                    notes.into_iter().map(|note| (note.id, note)).collect();
+                #[cfg(test)]
+                read_cluster_tests::observe_phase(read_cluster_tests::Phase::BatchRead(
+                    ids.clone(),
+                ))
+                .await;
+                for id in &ids {
+                    let note = notes.get(id).cloned().ok_or_else(|| {
+                        RuntimeError::NotFound(format!("read: message {id} not found"))
+                    })?;
+                    let (id, note) = validate_read_note(token, *id, note)?;
+                    if seen.insert(id) {
+                        targets.push((id, note));
+                    }
+                }
+            }
+            Err(_) => {
+                // A batch can decode a later bad row before an earlier
+                // missing/ineligible target. Replay this exact window with
+                // the original point reads to retain its first error/text.
+                for raw in &raw_ids[index..index + ids.len()] {
+                    let (id, note) = validate_read_target(runtime, token, raw).await?;
+                    if seen.insert(id) {
+                        targets.push((id, note));
+                    }
+                }
+            }
+        }
+        index += ids.len();
+        #[cfg(test)]
+        read_cluster_tests::observe_phase(read_cluster_tests::Phase::ValidatedWindow(ids)).await;
     }
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::ValidatedAll).await;
     Ok((requested_count, targets))
 }
 
@@ -1224,23 +1278,41 @@ async fn mark_read_targets_atomic(
         )
         .await?;
 
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::AtomicCommitted).await;
     let mut results = Vec::with_capacity(targets.len());
-    for (id, note) in targets {
-        let properties = match store.get_note(id).await {
-            Ok(Some(fresh)) => fresh.properties.unwrap_or_else(|| json!({})),
-            _ => {
-                let mut fallback = note.properties.unwrap_or_else(|| json!({}));
-                fallback["read"] = json!(true);
-                fallback
-            }
-        };
-        results.push(json!({
-            "id": short_id(id),
-            "full_id": id.as_hyphenated().to_string(),
-            "status": "success",
-            "read": true,
-            "properties": properties,
-        }));
+    for window in targets.chunks(BULK_READ_WINDOW) {
+        let ids: Vec<Uuid> = window.iter().map(|(id, _)| *id).collect();
+        let fresh = store.get_notes_batch(&ids).await;
+        let fresh = fresh.map(|notes| {
+            notes
+                .into_iter()
+                .map(|note| (note.id, note))
+                .collect::<HashMap<Uuid, Note>>()
+        });
+        for (id, note) in window {
+            let latest = match &fresh {
+                Ok(notes) => notes.get(id).cloned(),
+                // The mutation is already committed: an unreadable batch is
+                // retried only as fresh scalar reads, never as a mutation.
+                Err(_) => store.get_note(*id).await.ok().flatten(),
+            };
+            let properties = match latest {
+                Some(fresh) => fresh.properties.unwrap_or_else(|| json!({})),
+                None => {
+                    let mut fallback = note.properties.clone().unwrap_or_else(|| json!({}));
+                    fallback["read"] = json!(true);
+                    fallback
+                }
+            };
+            results.push(json!({
+                "id": short_id(*id),
+                "full_id": id.as_hyphenated().to_string(),
+                "status": "success",
+                "read": true,
+                "properties": properties,
+            }));
+        }
     }
     Ok(bulk_read_response(requested_count, results))
 }
@@ -1290,6 +1362,14 @@ async fn validate_read_target(
         .map_err(|e| RuntimeError::Internal(format!("read: get_note: {e}")))?
         .ok_or_else(|| RuntimeError::NotFound(format!("read: message {id} not found")))?;
 
+    validate_read_note(token, id, note)
+}
+
+fn validate_read_note(
+    token: &NamespaceToken,
+    id: Uuid,
+    note: Note,
+) -> Result<(Uuid, Note), RuntimeError> {
     if note.namespace != token.namespace().as_str() {
         return Err(RuntimeError::NotFound(format!(
             "read: message {id} not found"
@@ -1958,20 +2038,36 @@ pub(crate) async fn handle_thread(
         order_by: None,
         ..Default::default()
     };
-    let mut db_offset: u32 = 0;
+    let mut physical_cursor = None;
     let mut seen_row_ids = HashSet::new();
     loop {
+        let mut page_filter = thread_filter.clone();
+        page_filter.after = physical_cursor;
         let page = thread_store
             .query_notes_filtered_count_free(
                 token.namespace().as_str(),
-                &thread_filter,
+                &page_filter,
                 PageRequest {
                     limit: PAGE_SIZE,
-                    offset: db_offset.into(),
+                    offset: 0,
                 },
             )
             .await?;
         let fetched = page.items.len() as u32;
+        // Advance from the last physical row before mailbox filtering or
+        // logical twin folding, as inbox does. The response limit stays late.
+        physical_cursor = page
+            .items
+            .last()
+            .map(|note| khive_storage::note::NoteSeekAfter {
+                created_at: note.created_at,
+                id: note.id,
+            });
+        #[cfg(test)]
+        read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadPage(
+            page.items.iter().map(|note| note.id).collect(),
+        ))
+        .await;
         for n in &page.items {
             if seen_row_ids.insert(n.id) {
                 rows.push(ThreadRow {
@@ -1984,7 +2080,6 @@ pub(crate) async fn handle_thread(
         if fetched < PAGE_SIZE {
             break;
         }
-        db_offset += PAGE_SIZE;
     }
 
     // Explicitly include the already-validated root when the SQL filter missed it
@@ -6448,3 +6543,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "read_cluster_tests.rs"]
+mod read_cluster_tests;

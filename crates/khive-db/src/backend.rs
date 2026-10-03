@@ -6,7 +6,7 @@
 //! `AttachmentStore`). File-backed for production; in-memory for tests.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rusqlite::OptionalExtension;
@@ -209,11 +209,70 @@ fn validate_vector_table_columns(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StoreSchemaKind {
+    Entities,
+    Graph,
+    Notes,
+    Events,
+    Agents,
+}
+
+impl StoreSchemaKind {
+    fn initializer(self) -> fn(&rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        match self {
+            Self::Entities => entity::ensure_entities_schema,
+            Self::Graph => graph::ensure_graph_schema,
+            Self::Notes => note::ensure_notes_schema,
+            Self::Events => event::ensure_events_schema,
+            Self::Agents => agents::ensure_agents_schema,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct StoreSchemaGate {
+    pub(crate) ready: AtomicBool,
+    #[cfg(test)]
+    pub(crate) attempts: AtomicUsize,
+}
+
+impl StoreSchemaGate {
+    pub(crate) fn ensure(
+        &self,
+        conn: &rusqlite::Connection,
+        ensure: fn(&rusqlite::Connection) -> Result<(), rusqlite::Error>,
+    ) -> Result<(), rusqlite::Error> {
+        // A concurrent initializer or repair may have completed while this
+        // caller waited for the writer. Publish readiness only after success.
+        if self.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+        ensure(conn)?;
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
 /// Concrete storage backend providing capability traits.
+///
+/// Capability schemas are initialized once per backend. An index removed by
+/// another process is repaired on the narrowly supported forced-index read paths. Other
+/// external schema changes may still require reopening the backend.
 pub struct StorageBackend {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
     path: Option<std::path::PathBuf>,
+    /// Vector model keys whose `vec_<model_key>` table this backend has already
+    /// validated or created. A key is recorded only after the whole check
+    /// succeeded under the writer, so a failed check is retried by the next
+    /// fetch and a warm fetch never takes the writer. A table another process
+    /// creates for a model this set does not hold is still validated before
+    /// use; one that is replaced after its model was recorded is not
+    /// re-checked until the backend reopens.
+    vector_tables_ready: parking_lot::Mutex<std::collections::HashSet<String>>,
     /// How many times the lazy `notes_seq` anti-join repair has actually
     /// executed against this backend's pool. Gates `notes_for_namespace` so
     /// the repair (a full `notes` scan) runs at most once per backend for
@@ -221,6 +280,7 @@ pub struct StorageBackend {
     /// #827). Also exposed via
     /// `notes_seq_repair_run_count` for regression tests.
     notes_seq_repair_runs: AtomicUsize,
+    store_schemas: [Arc<StoreSchemaGate>; 5],
 }
 
 impl StorageBackend {
@@ -313,7 +373,9 @@ impl StorageBackend {
             pool: Arc::new(pool),
             is_file_backed: true,
             path: Some(resolved),
+            vector_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
     }
 
@@ -388,7 +450,9 @@ impl StorageBackend {
             pool: Arc::new(pool),
             is_file_backed: true,
             path: Some(resolved),
+            vector_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
     }
 
@@ -408,7 +472,9 @@ impl StorageBackend {
             pool: Arc::new(pool),
             is_file_backed: false,
             path: None,
+            vector_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         })
     }
 
@@ -660,10 +726,7 @@ impl StorageBackend {
                 "entities namespace must be non-empty".to_string(),
             ));
         }
-        if !self.is_read_only() {
-            let writer = self.pool.try_writer()?;
-            entity::ensure_entities_schema(writer.conn())?;
-        }
+        self.ensure_store_schema(StoreSchemaKind::Entities)?;
 
         Ok(Arc::new(entity::SqlEntityStore::new(
             Arc::clone(&self.pool),
@@ -702,16 +765,41 @@ impl StorageBackend {
                 "graph namespace must be non-empty".to_string(),
             ));
         }
-        if !self.is_read_only() {
-            let writer = self.pool.try_writer()?;
-            graph::ensure_graph_schema(writer.conn())?;
-        }
+        self.ensure_store_schema(StoreSchemaKind::Graph)?;
 
-        Ok(Arc::new(graph::SqlGraphStore::new_scoped(
-            Arc::clone(&self.pool),
-            self.is_file_backed,
-            namespace.trim().to_string(),
-        )))
+        Ok(Arc::new(
+            graph::SqlGraphStore::new_scoped(
+                Arc::clone(&self.pool),
+                self.is_file_backed,
+                namespace.trim().to_string(),
+            )
+            .with_index_repair(crate::stores::index_repair::IndexRepairContext::new(
+                Arc::clone(&self.pool),
+                self.store_schemas.clone(),
+                crate::stores::index_repair::IndexReadKind::Graph,
+            )),
+        ))
+    }
+
+    fn ensure_store_schema(&self, kind: StoreSchemaKind) -> Result<(), SqliteError> {
+        if self.is_read_only()
+            || self.store_schemas[kind as usize]
+                .ready
+                .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        let writer = self.constructor_writer()?;
+        self.ensure_store_schema_with_writer(kind, writer.conn())
+    }
+
+    fn ensure_store_schema_with_writer(
+        &self,
+        kind: StoreSchemaKind,
+        conn: &rusqlite::Connection,
+    ) -> Result<(), SqliteError> {
+        self.store_schemas[kind as usize].ensure(conn, kind.initializer())?;
+        Ok(())
     }
 
     fn constructor_writer(&self) -> Result<crate::pool::WriterGuard<'_>, SqliteError> {
@@ -747,9 +835,14 @@ impl StorageBackend {
                 "notes namespace must be non-empty".to_string(),
             ));
         }
-        if !self.is_read_only() {
+        if !self.is_read_only()
+            && (!self.store_schemas[StoreSchemaKind::Notes as usize]
+                .ready
+                .load(Ordering::Acquire)
+                || self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0)
+        {
             let writer = self.constructor_writer()?;
-            note::ensure_notes_schema(writer.conn())?;
+            self.ensure_store_schema_with_writer(StoreSchemaKind::Notes, writer.conn())?;
 
             // The anti-join repair is a full `notes` scan -- gate it to run at
             // most once per backend/pool. `try_writer()` blocks for exclusive
@@ -763,10 +856,15 @@ impl StorageBackend {
             }
         }
 
-        Ok(Arc::new(note::SqlNoteStore::new(
-            Arc::clone(&self.pool),
-            self.is_file_backed,
-        )))
+        Ok(Arc::new(
+            note::SqlNoteStore::new(Arc::clone(&self.pool), self.is_file_backed).with_index_repair(
+                crate::stores::index_repair::IndexRepairContext::new(
+                    Arc::clone(&self.pool),
+                    self.store_schemas.clone(),
+                    crate::stores::index_repair::IndexReadKind::Notes,
+                ),
+            ),
+        ))
     }
 
     /// How many times the lazy `notes_seq` anti-join repair has actually
@@ -795,10 +893,7 @@ impl StorageBackend {
                 "events namespace must be non-empty".to_string(),
             ));
         }
-        if !self.is_read_only() {
-            let writer = self.constructor_writer()?;
-            event::ensure_events_schema(writer.conn())?;
-        }
+        self.ensure_store_schema(StoreSchemaKind::Events)?;
 
         Ok(Arc::new(event::SqlEventStore::new_scoped(
             Arc::clone(&self.pool),
@@ -812,10 +907,7 @@ impl StorageBackend {
     /// other stores here, agent-process records are not namespace-scoped, so
     /// there is no `_for_namespace` variant.
     pub fn agents(&self) -> Result<Arc<dyn khive_storage::AgentStore>, SqliteError> {
-        if !self.is_read_only() {
-            let writer = self.pool.try_writer()?;
-            agents::ensure_agents_schema(writer.conn())?;
-        }
+        self.ensure_store_schema(StoreSchemaKind::Agents)?;
 
         Ok(Arc::new(agents::SqlAgentStore::new(
             Arc::clone(&self.pool),
@@ -872,6 +964,12 @@ impl StorageBackend {
 
     /// Ensure all requested vector tables with one schema-writer acquisition.
     /// Read-only backends inspect the same tables using one reader instead.
+    ///
+    /// A writable backend prepares each model's table once: the first call that
+    /// names it validates or creates the table under the writer and records the
+    /// model only after every step succeeded. Later calls for a recorded model
+    /// return without taking the writer, and a failed call records nothing, so
+    /// the next call repeats the check.
     pub fn ensure_vector_tables(&self, models: &[(&str, usize)]) -> Result<(), SqliteError> {
         for (model_key, _) in models {
             validate_vector_model_key(model_key)?;
@@ -905,12 +1003,22 @@ impl StorageBackend {
             return Ok(());
         }
 
+        let pending = self.unprepared_vector_tables(models);
+        if pending.is_empty() {
+            return Ok(());
+        }
         let writer = self.constructor_writer()?;
+        // A concurrent caller may have prepared these tables while this one
+        // waited for the writer.
+        let pending = self.unprepared_vector_tables(&pending);
+        if pending.is_empty() {
+            return Ok(());
+        }
 
         // Detect old-schema vec0 tables that predate the `field` column.
         // Use pragma_table_info to check columns directly; substring matching on the
         // CREATE DDL is fragile (a model_key containing "field" would false-match).
-        for (model_key, _) in models {
+        for (model_key, _) in &pending {
             let table = format!("vec_{model_key}");
             // V17 migration (vector_embedding_model_tag_preserving_rebuild) adds
             // `field` and `embedding_model` to all pre-existing vec0 tables at
@@ -947,7 +1055,7 @@ impl StorageBackend {
             .conn()
             .execute_batch(crate::migrations::ANN_CONSUMER_PENDING_DDL)?;
         // Create missing vec0 tables without changing existing vector data.
-        for (model_key, dimensions) in models {
+        for (model_key, dimensions) in &pending {
             let ddl = format!(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
                  subject_id TEXT PRIMARY KEY, \
@@ -961,7 +1069,24 @@ impl StorageBackend {
             );
             writer.conn().execute_batch(&ddl)?;
         }
+        // Record the models only now that every step above succeeded, while the
+        // writer is still held so a waiting caller re-checks against this set.
+        self.vector_tables_ready.lock().extend(
+            pending
+                .iter()
+                .map(|(model_key, _)| (*model_key).to_string()),
+        );
         Ok(())
+    }
+
+    /// The requested vector models this backend has not yet validated or created.
+    fn unprepared_vector_tables<'a>(&self, models: &[(&'a str, usize)]) -> Vec<(&'a str, usize)> {
+        let ready = self.vector_tables_ready.lock();
+        models
+            .iter()
+            .filter(|(model_key, _)| !ready.contains(*model_key))
+            .copied()
+            .collect()
     }
 
     /// Register an embedding model in the `_embedding_models` registry table.
@@ -1279,6 +1404,14 @@ fn ann_root_for(path: &std::path::Path) -> Option<std::path::PathBuf> {
     file.push(".ann");
     path.parent().map(|p| p.join(file))
 }
+
+#[cfg(test)]
+#[path = "backend/store_accessor_tests.rs"]
+mod store_accessor_tests;
+
+#[cfg(test)]
+#[path = "backend/store_accessor_index_tests.rs"]
+mod store_accessor_index_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1942,6 +2075,226 @@ mod tests {
 
         let count = store2.count().await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// DDL for a vec0 table that predates the `field` and `embedding_model`
+    /// columns, which `ensure_vector_tables` must reject.
+    #[cfg(feature = "vectors")]
+    fn legacy_vector_table_ddl(model_key: &str) -> String {
+        format!(
+            "CREATE VIRTUAL TABLE vec_{model_key} USING vec0(\
+             subject_id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL, \
+             embedding float[3] distance_metric=cosine)"
+        )
+    }
+
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn repeated_vector_store_fetches_take_the_writer_once_per_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StorageBackend::sqlite_for_test(dir.path().join("vector_once.db")).unwrap();
+
+        let before = backend.pool.writer_acquisition_snapshot();
+        for namespace in ["local", "tenant_a", "tenant_b", "local"] {
+            backend
+                .vectors_for_namespace("fetched_once", "fetched-once", 3, namespace)
+                .expect("vector store");
+        }
+        let after = backend.pool.writer_acquisition_snapshot();
+        assert_eq!(
+            after.pooled_acquisitions - before.pooled_acquisitions,
+            1,
+            "only the first fetch of a model may check out the writer"
+        );
+        assert_eq!(
+            after.writer_task_acquisitions,
+            before.writer_task_acquisitions
+        );
+        assert_eq!(
+            after.standalone_acquisitions,
+            before.standalone_acquisitions
+        );
+
+        // The first fetch still created the vector table and its sidecars.
+        {
+            let reader = backend.pool.reader().unwrap();
+            assert!(sqlite_table_exists(reader.conn(), "vec_fetched_once").unwrap());
+            assert!(sqlite_table_exists(reader.conn(), "_embedding_models").unwrap());
+            assert!(sqlite_table_exists(reader.conn(), "ann_write_log").unwrap());
+        }
+
+        // A model the backend has not prepared yet is still cold.
+        let before = backend.pool.writer_acquisition_snapshot();
+        backend
+            .vectors("fetched_second", "fetched-second", 3)
+            .expect("second model");
+        backend
+            .vectors("fetched_second", "fetched-second", 3)
+            .expect("second model again");
+        let after = backend.pool.writer_acquisition_snapshot();
+        assert_eq!(
+            after.pooled_acquisitions - before.pooled_acquisitions,
+            1,
+            "a second model is prepared once, independently of the first"
+        );
+        let reader = backend.pool.reader().unwrap();
+        assert!(sqlite_table_exists(reader.conn(), "vec_fetched_second").unwrap());
+    }
+
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn ensure_vector_tables_prepares_only_models_that_are_not_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StorageBackend::sqlite_for_test(dir.path().join("vector_batch.db")).unwrap();
+        let checkouts = || {
+            backend
+                .pool
+                .writer_acquisition_snapshot()
+                .pooled_acquisitions
+        };
+
+        let start = checkouts();
+        backend
+            .ensure_vector_tables(&[("batch_a", 3), ("batch_b", 3)])
+            .expect("cold batch");
+        assert_eq!(checkouts() - start, 1, "a cold batch shares one checkout");
+
+        backend
+            .ensure_vector_tables(&[("batch_b", 3), ("batch_a", 3)])
+            .expect("ready batch");
+        assert_eq!(checkouts() - start, 1, "a ready batch takes no writer");
+
+        backend
+            .ensure_vector_tables(&[("batch_a", 3), ("batch_c", 3)])
+            .expect("partly cold batch");
+        assert_eq!(
+            checkouts() - start,
+            2,
+            "a batch with one cold model takes the writer once"
+        );
+        let reader = backend.pool.reader().unwrap();
+        assert!(sqlite_table_exists(reader.conn(), "vec_batch_c").unwrap());
+    }
+
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn warm_vector_store_fetch_finishes_while_the_pool_writer_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend =
+            Arc::new(StorageBackend::sqlite_for_test(dir.path().join("vector_warm.db")).unwrap());
+        backend
+            .vectors("held_writer", "held-writer", 3)
+            .expect("cold fetch");
+
+        let writer = backend.pool.try_writer().unwrap();
+        let before = backend.pool.writer_acquisition_snapshot();
+        let worker_backend = Arc::clone(&backend);
+        let (finished, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let fetched = worker_backend
+                .vectors_for_namespace("held_writer", "held-writer", 3, "tenant_a")
+                .map(|_| ());
+            finished.send(fetched).unwrap();
+        });
+        let while_held = result.recv_timeout(std::time::Duration::from_secs(2));
+        // Release before joining even when the fetch incorrectly waits.
+        drop(writer);
+        worker.join().unwrap();
+        while_held
+            .expect("a warm vector store fetch must return while the pool writer is held")
+            .expect("warm vector store fetch");
+        assert_eq!(
+            backend
+                .pool
+                .writer_acquisition_snapshot()
+                .pooled_acquisitions,
+            before.pooled_acquisitions
+        );
+    }
+
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn failed_vector_table_check_is_retried_and_not_recorded_as_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StorageBackend::sqlite_for_test(dir.path().join("vector_retry.db")).unwrap();
+        backend
+            .pool
+            .try_writer()
+            .unwrap()
+            .conn()
+            .execute_batch(&legacy_vector_table_ddl("retried"))
+            .unwrap();
+
+        let before = backend.pool.writer_acquisition_snapshot();
+        for _ in 0..2 {
+            let error = match backend.vectors("retried", "retried", 3) {
+                Ok(_) => panic!("a vec0 table without the required columns must be rejected"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(&error, SqliteError::InvalidData(message)
+                    if message.contains("vec_retried")
+                        && message.contains("missing required column")),
+                "unexpected error: {error}"
+            );
+        }
+        let after = backend.pool.writer_acquisition_snapshot();
+        assert_eq!(
+            after.pooled_acquisitions - before.pooled_acquisitions,
+            2,
+            "a failed check must be repeated by the next fetch"
+        );
+
+        // Once the table is replaced the next fetch passes and is recorded.
+        backend
+            .pool
+            .try_writer()
+            .unwrap()
+            .conn()
+            .execute_batch("DROP TABLE vec_retried")
+            .unwrap();
+        backend
+            .vectors("retried", "retried", 3)
+            .expect("fetch after the legacy table is gone");
+        let before = backend.pool.writer_acquisition_snapshot();
+        backend
+            .vectors("retried", "retried", 3)
+            .expect("warm fetch after the check passed");
+        assert_eq!(
+            backend
+                .pool
+                .writer_acquisition_snapshot()
+                .pooled_acquisitions,
+            before.pooled_acquisitions
+        );
+    }
+
+    #[cfg(feature = "vectors")]
+    #[test]
+    fn vector_table_created_after_open_is_validated_before_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vector_late.db");
+        let backend = StorageBackend::sqlite_for_test(&path).unwrap();
+        backend
+            .vectors("known_model", "known-model", 3)
+            .expect("prepare one model");
+
+        // Another connection adds a legacy-schema table after the backend opened.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch(&legacy_vector_table_ddl("late_model"))
+            .unwrap();
+
+        let error = match backend.vectors("late_model", "late-model", 3) {
+            Ok(_) => panic!("a late legacy vec0 table must be validated before use"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, SqliteError::InvalidData(message)
+                if message.contains("vec_late_model")
+                    && message.contains("missing required column")),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
@@ -3161,7 +3514,9 @@ mod tests {
             pool: Arc::new(pool),
             is_file_backed: true,
             path: Some(path),
+            vector_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         };
         (dir, backend)
     }
@@ -3252,14 +3607,18 @@ mod tests {
             pool: Arc::new(pool_a),
             is_file_backed: true,
             path: Some(path.clone()),
+            vector_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         };
         let pool_b = ConnectionPool::new(cfg(path.clone())).expect("pool B should open");
         let backend_b = StorageBackend {
             pool: Arc::new(pool_b),
             is_file_backed: true,
             path: Some(path),
+            vector_tables_ready: Default::default(),
             notes_seq_repair_runs: AtomicUsize::new(0),
+            store_schemas: std::array::from_fn(|_| Arc::new(StoreSchemaGate::default())),
         };
 
         let entities = backend_a

@@ -70,6 +70,23 @@ pub fn cosine_from_l2sq(l2sq: f32) -> f32 {
     1.0 - (0.5 * l2sq)
 }
 
+/// Normalize a vector in place using sequential `f32` squared-sum arithmetic.
+///
+/// Vectors whose norm is at most `1e-8` remain unchanged. This helper does not
+/// validate finite inputs; callers retain their existing validation policy.
+pub fn l2_normalize(v: &mut [f32]) {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        for x in v.iter_mut() {
+            *x /= norm;
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "distance/normalization_tests.rs"]
+mod normalization_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
