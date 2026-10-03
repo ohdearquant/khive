@@ -2793,6 +2793,26 @@ impl VerbRegistry {
         F: FnOnce(Namespace) -> Fut,
         Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
     {
+        self.dispatch_intercepted_with_token_and_disposition(verb, params, identity, |token| {
+            dispatch(token.gate_namespace().clone())
+        })
+        .await
+    }
+
+    /// Intercept an operation with the sealed caller token minted after the
+    /// gate decision. Coordinated reads retain the resolved actor and their
+    /// existing namespace selection without reconstructing identity from args.
+    pub async fn dispatch_intercepted_with_token_and_disposition<M, F, Fut>(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+        dispatch: F,
+    ) -> Result<InterceptedDispatchResult<M>, DispatchError>
+    where
+        F: FnOnce(NamespaceToken) -> Fut,
+        Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
+    {
         let request_id = identity.and_then(|id| id.request_id);
         let gate_req = self
             .gate_request_with_identity(verb, params, identity)
@@ -2844,7 +2864,8 @@ impl VerbRegistry {
         };
 
         let started = Instant::now();
-        let mut result = dispatch(gate_req.namespace.clone()).await;
+        let token = self.mint_intercepted_read_token(&gate_req, params, identity);
+        let mut result = dispatch(token).await;
         let domain_succeeded = result.is_ok();
         let duration_us = started.elapsed().as_micros() as i64;
         let receipt_outcome = if verb == "git.digest" && result.is_ok() {
@@ -3008,6 +3029,47 @@ impl VerbRegistry {
         self.gate
             .check(&request)
             .is_ok_and(|decision| decision.is_allow())
+    }
+
+    fn mint_intercepted_read_token(
+        &self,
+        gate_req: &GateRequest,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+    ) -> NamespaceToken {
+        // Preserve the coordinator's existing namespace selection: the gate
+        // namespace is primary, and explicit namespace input stays narrow.
+        let visible = if params.get("namespace").is_some() {
+            Vec::new()
+        } else {
+            let mut visible = match identity {
+                Some(identity) => identity
+                    .visible_namespaces
+                    .iter()
+                    .filter_map(|namespace| Namespace::parse(namespace).ok())
+                    .collect(),
+                None => self.visible_namespaces.clone(),
+            };
+            visible.push(Namespace::local());
+            visible
+        };
+        NamespaceToken::mint_with_visibility(
+            gate_req.namespace.clone(),
+            visible,
+            gate_req.actor.clone(),
+        )
+        .with_gate_namespace(gate_req.namespace.clone())
+        .with_gate_explicit_namespace(
+            params
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+        .with_request_id(identity.and_then(|identity| identity.request_id))
+        .with_process_ref(match identity {
+            Some(identity) => identity.process_ref.clone(),
+            None => crate::config::process_ref_from_env(),
+        })
     }
 
     fn gate_request_with_identity(

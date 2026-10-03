@@ -2462,6 +2462,61 @@ async fn pooled_entity_read_classifies_exhaustion_and_cancellation_distinctly() 
     );
 }
 
+/// A typed-store read that SQLite refuses with SQLITE_BUSY after the busy
+/// handler gives up is counted per pool, separately from reader-slot
+/// exhaustion. WAL readers are never blocked by a writer, so the fixture uses a
+/// rollback-journal database, where a connection holding an exclusive lock
+/// refuses every other reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pooled_entity_read_counts_busy_handler_timeouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("entity_busy_timeouts.db");
+    let config = PoolConfig {
+        path: Some(path.clone()),
+        wal_mode: false,
+        write_queue_enabled: Some(false),
+        busy_timeout: Duration::from_millis(50),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+        .unwrap();
+    let store = SqlEntityStore::new(Arc::clone(&pool), true);
+
+    // Control: with no lock held the read succeeds and nothing is counted.
+    assert!(store.get_entity(Uuid::new_v4()).await.unwrap().is_none());
+    assert_eq!(pool.reader_acquisition_snapshot().busy_timeouts, 0);
+
+    let holder = rusqlite::Connection::open(&path).unwrap();
+    holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let refused = store.get_entity(Uuid::new_v4()).await.unwrap_err();
+    assert!(
+        matches!(
+            &refused,
+            StorageError::Driver { source, .. }
+                if source
+                    .downcast_ref::<rusqlite::Error>()
+                    .and_then(|error| error.sqlite_error_code())
+                    == Some(rusqlite::ErrorCode::DatabaseBusy)
+        ),
+        "a read behind an exclusive lock must surface SQLITE_BUSY, got {refused:?}"
+    );
+    let snapshot = pool.reader_acquisition_snapshot();
+    assert_eq!(snapshot.busy_timeouts, 1);
+    assert_eq!(
+        snapshot.checkout_timeouts, 0,
+        "a busy-handler refusal after checkout is not a checkout timeout"
+    );
+
+    // Releasing the lock restores reads and leaves the monotonic count at 1.
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert!(store.get_entity(Uuid::new_v4()).await.unwrap().is_none());
+    assert_eq!(pool.reader_acquisition_snapshot().busy_timeouts, 1);
+}
+
 #[tokio::test]
 async fn issue2673_entity_versions_cover_typed_storage_writers() {
     let store = setup_memory_store();

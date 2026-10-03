@@ -34,6 +34,8 @@ pub mod pool;
 mod read_cancellation;
 /// `SqlAccess` trait bridge to `ConnectionPool`.
 pub mod sql_bridge;
+#[cfg(any(test, feature = "test-support"))]
+mod statement_observer;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).
 pub mod stores;
 /// Append-only NDJSON writer-timeout event sink (crate-internal).
@@ -80,6 +82,8 @@ pub use pool::{
 pub use read_cancellation::scope_test_read_progress;
 pub use read_cancellation::{sqlite_interrupt_grace_from_env, DEFAULT_SQLITE_INTERRUPT_GRACE_MS};
 pub use sql_bridge::SqlBridge;
+#[cfg(any(test, feature = "test-support"))]
+pub use statement_observer::{StartedStatement, StatementStartObservation};
 pub use writer_task::WriterTaskHandle;
 
 #[cfg(test)]

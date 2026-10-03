@@ -97,7 +97,7 @@ fn stopped_acquisition_releases_the_blocking_worker(stop: AcquisitionStop, store
         let token = runtime
             .authorize(Namespace::local())
             .expect("authorize local");
-        runtime.notes(&token).expect("initialize notes store");
+        // No accessor for this store kind has run on this backend: cold acquisition.
         let pool = runtime.backend().pool();
         let checkout_timeout = pool.config().checkout_timeout;
         let release_bound = Duration::from_secs(1).min(checkout_timeout / 2);
@@ -210,7 +210,7 @@ fn uncancelled_store_acquisition_waits_for_writer_and_succeeds() {
         let token = runtime
             .authorize(Namespace::local())
             .expect("authorize local");
-        runtime.notes(&token).expect("initialize notes store");
+        // No accessor for this store kind has run on this backend: cold acquisition.
         let pool = runtime.backend().pool();
         let checkout_timeout = pool.config().checkout_timeout;
         let release_bound = Duration::from_secs(1).min(checkout_timeout / 2);
@@ -245,4 +245,82 @@ fn uncancelled_store_acquisition_waits_for_writer_and_succeeds() {
             .expect("ordinary contention must still acquire its store");
         assert_eq!(pool.writer_acquisition_snapshot().timeouts, before.timeouts);
     });
+}
+
+fn warm_acquisition_finishes_with_writer_held(cancellation_scoped: bool) {
+    use khive_storage::scope_request_read_cancellation;
+    use std::time::Duration;
+
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("single-worker runtime");
+    executor.block_on(async {
+        // Vector model construction has a separate, writer-taking schema path.
+        for store in ["notes", "events"] {
+            let runtime = KhiveRuntime::memory().expect("runtime");
+            let token = runtime.authorize(Namespace::local()).unwrap();
+            match store {
+                "notes" => runtime.notes(&token).map(|_| ()),
+                "events" => runtime.events(&token).map(|_| ()),
+                _ => unreachable!(),
+            }
+            .expect("first real accessor initializes the tested kind");
+            let pool = runtime.backend().pool();
+            let bound = Duration::from_secs(1).min(pool.config().checkout_timeout / 2);
+            assert!(bound >= Duration::from_millis(100));
+            let writer = pool.writer().expect("hold writer after warming kind");
+            let before = pool.writer_acquisition_snapshot();
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            let acquiring_runtime = runtime.clone();
+            let mut acquiring = tokio::spawn(async move {
+                let future = acquire_store("memory.recall.store", move || match store {
+                    "notes" => acquiring_runtime.notes(&token).map(|_| ()),
+                    "events" => acquiring_runtime.events(&token).map(|_| ()),
+                    _ => unreachable!(),
+                });
+                if cancellation_scoped {
+                    scope_request_read_cancellation(cancel_rx, future).await
+                } else {
+                    future.await
+                }
+            });
+            let while_held = tokio::time::timeout(bound, &mut acquiring).await;
+            // A negative witness still releases the writer and settles its worker.
+            drop(writer);
+            let result = match while_held {
+                Ok(joined) => joined.expect("warm task joins"),
+                Err(_) => {
+                    let _ = tokio::time::timeout(bound, acquiring).await;
+                    panic!("{store}: warm acquisition must finish before writer release");
+                }
+            };
+            result
+                .and_then(std::convert::identity)
+                .expect("warm accessor succeeds");
+            let after = pool.writer_acquisition_snapshot();
+            assert_eq!(
+                after.timeouts, before.timeouts,
+                "{store}: no checkout timeout"
+            );
+            assert_eq!(
+                after.pooled_acquisitions, before.pooled_acquisitions,
+                "{store}: warm constructor must not check out a writer"
+            );
+            // This arm proves completion before any stop signal; it does not
+            // waive cancellation admission for an already-cancelled request.
+            drop(cancel_tx);
+        }
+    });
+}
+
+#[test]
+fn warm_uncancelled_store_acquisition_finishes_while_writer_is_held() {
+    warm_acquisition_finishes_with_writer_held(false);
+}
+
+#[test]
+fn warm_cancellation_scoped_store_acquisition_finishes_while_writer_is_held() {
+    warm_acquisition_finishes_with_writer_held(true);
 }

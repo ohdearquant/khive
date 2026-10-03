@@ -266,6 +266,7 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 
 Amendments to accepted records:
 
+- [ADR-005 amendment: shared streaming event cursor walk](ADR-005-storage-capability-traits.md#amendment-shared-streaming-event-cursor-walk-2026-10-01) (2026-10-01): proposed runtime cursor walk over the existing EventStore capability, shared by brain and moodboard (#3709, #3729).
 - [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
 - [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-proposed-2026-09-14-additive-task-query-filters-2678) (2026-09-14): additive task-query filters (#2678).
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-an-independently-installed-distribution-is-a-pack-2026-09-12) (2026-09-12): an independently installed distribution is a pack.
@@ -274,9 +275,11 @@ Amendments to accepted records:
 - [ADR-027 Amendment 4](ADR-027-dynamic-pack-loading.md#amendment-4-2026-09-12-installable-pack-distributions-and-what-stays-rejected) (2026-09-12): installable pack distributions, and what stays rejected.
 - [ADR-028 Amendment A3](ADR-028-pack-scoped-backends.md#amendment-a3-backend-route-validation-and-search-runtime-selection-2026-09-14) (2026-09-14): backend route validation and search runtime selection.
 - [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14) (2026-09-14): inbox and thread limit disclosure.
+- [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-comm-message-file-attachments-2026-10-02) (2026-10-02): comm message file attachments, with confined `blob.import` and `blob.export`.
 - [ADR-051 Amendment 1](ADR-051-section-embeddings-hybrid-compose.md#amendment-1-blend-kg-entities-into-the-compose-candidate-pool): blend KG entities into the compose candidate pool.
 - [ADR-061 Amendment 1](ADR-061-pack-extensible-by-id-resolution.md#amendment-1-unsupported-generic-mutation-of-pack-private-records) (2026-09-14): unsupported generic mutation of pack-private records.
 - [ADR-085 Amendment 13](ADR-085-code-pack.md#amendment-13-2026-09-30-native-routing-for-in-process-code-map-clients) (2026-09-30): proposed code-map ownership boundary, five core opener classes and bidirectional lock acceptance, including the [Proposed Amendment 12 lifetime clarification](ADR-085-code-pack.md#proposed-clarification-guarded-identity-lifetime); architecture fork unchosen. PR #3674 is held, as a merge-sequencing statement that applies when this text lands. The hold releases only when the executed acceptance of this amendment has passed for the full census population under the selected architecture, the `code.ingest` native constructor included, and the amendment is ratified on that executed evidence; a status change without that executed evidence does not release the hold.
+- [ADR-085 Amendment 14](ADR-085-code-pack.md#amendment-14-2026-10-02-sequential-recovery-of-interrupted-l2-sweeps) (2026-10-02): proposed sequential recovery markers for interrupted L2 sweeps (#3736).
 - [ADR-087 Amendment 1](ADR-087-workspace-mirror.md#amendment-1-2026-07-15-self-standing-content-convention-blob-backed-binaries-durability-separation) (2026-07-15): self-standing content convention, blob-backed binaries, durability separation.
 - [ADR-088 Amendment 1, operational rider](ADR-088-amendment-1-git-digest.md#proposed-operational-rider-persisted-cursor-inspection-2026-09-10) (2026-09-10): persisted cursor inspection. Its heading marks it Proposed; it has no separate status line.
 - [ADR-104 Amendment 1](ADR-104-posterior-serving-recall.md#amendment-1-2026-07-12-prior-preserving-evidence-decay-for-per-entity-posteriors) (2026-07-12): prior-preserving evidence decay for per-entity posteriors.

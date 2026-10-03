@@ -18,6 +18,7 @@ pub mod blob_s3;
 pub mod entity;
 pub mod event;
 pub mod graph;
+pub(crate) mod index_repair;
 pub mod note;
 pub mod sparse;
 pub mod text;
@@ -78,7 +79,11 @@ where
             operation,
             pool.reader_until(|| scope.should_stop()),
         )?;
-        scope.run_pooled_reader(&mut guard, read)
+        let result = scope.run_pooled_reader(&mut guard, read);
+        if let Err(error) = &result {
+            pool.record_reader_query_error(error);
+        }
+        result
     })
     .await
 }

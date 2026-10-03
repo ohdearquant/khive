@@ -193,12 +193,15 @@ pub fn resource_payload(
 /// built immediately before the enclosing audit row is appended, which is
 /// exactly the amendment's snapshot point — the same frozen object is what
 /// the response envelope later reads. No armed context (direct registry
-/// callers, background work) means no `units` key; reporting never fails the
-/// dispatch.
+/// callers, background work), or an unmeasured context, means no `units` key;
+/// reporting never fails the dispatch.
 fn stamp_usage_units(payload: &mut Value) {
     if let Some(ctx) = crate::usage::current() {
+        ctx.freeze();
         if let Value::Object(map) = payload {
-            map.insert("units".to_string(), ctx.freeze());
+            if let Some(snapshot) = ctx.shipping_snapshot() {
+                map.insert("units".to_string(), snapshot);
+            }
         }
     }
 }
@@ -473,5 +476,44 @@ mod tests {
             base_resource_payload(Some(7)),
             json!({"work_class": "interactive", "request_id": 7}),
         );
+    }
+
+    #[tokio::test]
+    async fn unmeasured_context_omits_audit_units_for_success_and_failure() {
+        for succeeded in [false, true] {
+            let ctx = crate::usage::UsageContext::new();
+            ctx.add(crate::usage::UsageUnit::EventRows, 1);
+            ctx.mark_unmeasured();
+            let payload = crate::usage::scope(ctx.clone(), async {
+                if succeeded {
+                    resource_payload(
+                        "stats",
+                        &json!({}),
+                        &json!({}),
+                        unreachable_model_count,
+                        Some(7),
+                    )
+                } else {
+                    base_resource_payload(Some(7))
+                }
+            })
+            .await;
+            assert!(payload.get("units").is_none(), "{payload}");
+            assert_eq!(payload["work_class"], "interactive");
+            assert_eq!(payload["request_id"], 7);
+            assert_eq!(payload.get("cost_unit").is_some(), succeeded);
+            assert_eq!(ctx.freeze(), json!({"event_rows": 1}));
+            assert_eq!(ctx.shipping_snapshot(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn measured_audit_units_keep_the_frozen_shipping_snapshot() {
+        let ctx = crate::usage::UsageContext::new();
+        ctx.add(crate::usage::UsageUnit::EventRows, 2);
+        let payload = crate::usage::scope(ctx.clone(), async { base_resource_payload(None) }).await;
+        assert_eq!(payload["units"], json!({"event_rows": 2}));
+        ctx.add(crate::usage::UsageUnit::EventRows, 1);
+        assert_eq!(ctx.shipping_snapshot(), Some(payload["units"].clone()));
     }
 }

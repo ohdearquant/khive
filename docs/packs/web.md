@@ -138,6 +138,11 @@ is opened through a descriptor walk that refuses symlinks and checks the opened 
 symlink planted inside an allowed root cannot serve content from outside it. Each already-confined
 file is read on a blocking worker through a `max_bytes_default + 1` byte bound. A file larger than the configured
 `[web] max_bytes_default` refuses with `ingest_file_too_large` before its document or blob is written.
+Descriptor exhaustion during disk admission (`EMFILE` or `ENFILE`) refuses with
+`ingest_descriptor_exhausted` before any site, document, or blob is written. A
+configured root that successfully admits the source still wins; if no root
+admits it, the first descriptor exhaustion is reported instead of an outside-root
+refusal. Other inaccessible roots retain the existing ignored-root behavior.
 
 The URL-crawl mode's reply carries `ingested` (the minted document ids) and `refused` (one
 `{url, error}` entry per URL that `web.fetch` refused — an egress refusal, a transport error, or

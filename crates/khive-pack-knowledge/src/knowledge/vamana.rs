@@ -21,8 +21,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority};
+use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_vamana::distance::l2_normalize;
 use khive_vamana::{
     read_commit_fingerprint, read_commit_info, read_external_ids_sidecar, segment_commit_digest,
     write_external_ids_sidecar, CorpusFingerprint, VamanaConfig, VamanaIndex, VamanaSnapshot,
@@ -1122,15 +1124,6 @@ async fn acquire_bridge_checkpoint_lock_async(
         .map_err(|error| format!("ANN bridge lock task failed: {error}"))?
 }
 
-fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-8 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
-    }
-}
-
 // ── persistence helpers ───────────────────────────────────────────────────────
 
 /// Namespace key used in `retrieval_snapshots` for a given ns+model pair.
@@ -1229,19 +1222,6 @@ fn persist_ann_v2_locked(
 /// so the same predicate always maps to the same `ann_consumer_watermark`
 /// row across restarts.
 const ANN_CONSUMER: &str = "knowledge:knowledge.atom";
-
-const ANN_REBUILD_THRESHOLD_DEFAULT: f64 = 0.20;
-
-/// `ann_rebuild_threshold` (ADR-079 Amendment 1 §5): the tail fraction of the
-/// live vector count above which replay costs more than a full rebuild.
-/// Values outside `(0, 1]` fall back to the default.
-fn ann_rebuild_threshold() -> f64 {
-    std::env::var("KHIVE_ANN_REBUILD_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0 && *v <= 1.0)
-        .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
-}
 
 /// Durably register this consumer's watermark row as pending (`-2`).
 ///
@@ -1822,19 +1802,16 @@ struct FreshTailSnapshot {
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
 }
 
-/// Read the registry guard, optional live-count cap, selected log suffix, and
-/// every final upsert embedding in one SQLite statement.  A single statement
-/// is the snapshot primitive on every backend, including the in-memory
-/// pool-backed reader whose separate calls may use separate connections.
-async fn fetch_fresh_tail_snapshot(
-    rt: &KhiveRuntime,
+/// The snapshot statement.  `finals` reduces the selected log suffix to one row
+/// per subject (its last operation, at the position of its first appearance)
+/// before the vector join, so the join reads one embedding per distinct
+/// subject rather than one per raw log row.
+fn fresh_tail_snapshot_statement(
     ns: &str,
     model: &str,
-    watermark: u64,
+    watermark: i64,
     live_threshold: Option<f64>,
-) -> Result<FreshTailSnapshot, String> {
-    let watermark = i64::try_from(watermark)
-        .map_err(|_| "fresh-tail watermark exceeds SQLite INTEGER range".to_string())?;
+) -> SqlStatement {
     let table_name = format!("vec_{}", sanitize_model_key(model));
     let (live_cte, selected_order, live_join, live_column) = match live_threshold {
         Some(_) => (
@@ -1863,49 +1840,76 @@ async fn fetch_fresh_tail_snapshot(
     if let Some(threshold) = live_threshold {
         params.push(SqlValue::Float(threshold));
     }
+    SqlStatement {
+        sql: format!(
+            "WITH \
+             registry AS (\
+               SELECT MIN(watermark) AS registry_min \
+               FROM ann_consumer_watermark \
+               WHERE (namespace = ?1 OR namespace = '*') \
+                 AND embedding_model = ?2\
+             ), \
+             own AS (\
+               SELECT (SELECT watermark FROM ann_consumer_watermark \
+                       WHERE consumer = ?4 AND namespace = ?1 \
+                         AND embedding_model = ?2) AS own_watermark\
+             ), \
+             {live_cte} \
+             selected AS (\
+               SELECT seq, subject_id, op FROM ann_write_log \
+               WHERE namespace = ?1 AND embedding_model = ?2 \
+                 AND field = 'knowledge.atom' \
+                 AND seq > MAX(\
+                   ?3, COALESCE((SELECT registry_min FROM registry), ?3)\
+                 ) \
+               {selected_order}\
+             ), \
+             finals AS (\
+               SELECT first_seq AS seq, subject_id, op FROM (\
+                 SELECT MIN(seq) OVER (PARTITION BY subject_id) AS first_seq, \
+                        subject_id, op, \
+                        ROW_NUMBER() OVER (\
+                          PARTITION BY subject_id ORDER BY seq DESC\
+                        ) AS final_rank \
+                 FROM selected\
+               ) WHERE final_rank = 1\
+             ) \
+             SELECT finals.seq, finals.subject_id, finals.op, \
+                    vectors.namespace AS vector_namespace, \
+                    vectors.embedding_model AS vector_model, \
+                    vectors.field AS vector_field, \
+                    vectors.embedding, registry.registry_min, \
+                    own.own_watermark, {live_column} AS live_count \
+             FROM registry CROSS JOIN own {live_join} \
+             LEFT JOIN finals ON 1 = 1 \
+             LEFT JOIN {table_name} AS vectors \
+               ON vectors.subject_id = finals.subject_id \
+             ORDER BY finals.seq"
+        ),
+        params,
+        label: Some("knowledge_ann_fresh_tail_snapshot".into()),
+    }
+}
+
+/// Read the registry guard, optional live-count cap, selected log suffix, and
+/// every final upsert embedding in one SQLite statement.  A single statement
+/// is the snapshot primitive on every backend, including the in-memory
+/// pool-backed reader whose separate calls may use separate connections.
+async fn fetch_fresh_tail_snapshot(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+    watermark: u64,
+    live_threshold: Option<f64>,
+) -> Result<FreshTailSnapshot, String> {
+    let watermark = i64::try_from(watermark)
+        .map_err(|_| "fresh-tail watermark exceeds SQLite INTEGER range".to_string())?;
+    let statement = fresh_tail_snapshot_statement(ns, model, watermark, live_threshold);
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|error| error.to_string())?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "WITH \
-                 registry AS (\
-                   SELECT MIN(watermark) AS registry_min \
-                   FROM ann_consumer_watermark \
-                   WHERE (namespace = ?1 OR namespace = '*') \
-                     AND embedding_model = ?2\
-                 ), \
-                 own AS (\
-                   SELECT (SELECT watermark FROM ann_consumer_watermark \
-                           WHERE consumer = ?4 AND namespace = ?1 \
-                             AND embedding_model = ?2) AS own_watermark\
-                 ), \
-                 {live_cte} \
-                 selected AS (\
-                   SELECT seq, subject_id, op FROM ann_write_log \
-                   WHERE namespace = ?1 AND embedding_model = ?2 \
-                     AND field = 'knowledge.atom' \
-                     AND seq > MAX(\
-                       ?3, COALESCE((SELECT registry_min FROM registry), ?3)\
-                     ) \
-                   {selected_order}\
-                 ) \
-                 SELECT selected.seq, selected.subject_id, selected.op, \
-                        vectors.namespace AS vector_namespace, \
-                        vectors.embedding_model AS vector_model, \
-                        vectors.field AS vector_field, \
-                        vectors.embedding, registry.registry_min, \
-                        own.own_watermark, {live_column} AS live_count \
-                 FROM registry CROSS JOIN own {live_join} \
-                 LEFT JOIN selected ON 1 = 1 \
-                 LEFT JOIN {table_name} AS vectors \
-                   ON vectors.subject_id = selected.subject_id \
-                 ORDER BY selected.seq"
-            ),
-            params,
-            label: Some("knowledge_ann_fresh_tail_snapshot".into()),
-        })
+        .query_all(statement)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -3668,6 +3672,10 @@ pub(crate) fn simulate_warming_in_flight(ann: &SharedAnn, key: AnnKey) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod helper_reuse {
+        include!("vamana/helper_reuse_tests.rs");
+    }
     use khive_runtime::KhiveRuntime;
     use khive_storage::types::{SqlStatement, SqlValue};
     use serde_json::json;
@@ -5536,6 +5544,190 @@ mod tests {
             "two newest writes coalesce to one subject"
         );
         assert_eq!(repeated.ops[0].0, newest[0]);
+    }
+
+    async fn append_warm_log_row(rt: &KhiveRuntime, subject: Uuid, op: &str) {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      VALUES ('local', ?1, 'concept', 'knowledge.atom', ?2, ?3)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(WARM_TEST_MODEL.into()),
+                    SqlValue::Text(subject.to_string()),
+                    SqlValue::Text(op.into()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("append log row");
+    }
+
+    /// A tail whose raw rows outnumber its subjects: the first subject is
+    /// written `repeats` more times and stays an upsert, the second ends as a
+    /// delete, the third is deleted and then upserted again, and `singles` more
+    /// subjects are written once. Returns every subject's embedding.
+    async fn seed_repeated_tail(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        repeats: usize,
+        singles: usize,
+    ) -> HashMap<Uuid, Vec<f32>> {
+        let mut embeddings = HashMap::new();
+        let mut subjects = Vec::new();
+        for index in 0..3 + singles {
+            let mut embedding = [0.0_f32; WARM_DIMS];
+            embedding[index] = 1.0;
+            let subject = append_warm_vector(rt, token, embedding).await;
+            embeddings.insert(subject, embedding.to_vec());
+            subjects.push(subject);
+        }
+        for _ in 0..repeats {
+            append_warm_log_row(rt, subjects[0], "upsert").await;
+        }
+        append_warm_log_row(rt, subjects[1], "delete").await;
+        append_warm_log_row(rt, subjects[2], "delete").await;
+        append_warm_log_row(rt, subjects[2], "upsert").await;
+        embeddings
+    }
+
+    /// Final states of the newest `limit` raw log rows (all rows when `None`),
+    /// coalesced by a plain pass over the rows in `seq` order: the position of
+    /// a subject's first row, the operation of its last.
+    async fn reference_tail_ops(
+        rt: &KhiveRuntime,
+        embeddings: &HashMap<Uuid, Vec<f32>>,
+        limit: Option<usize>,
+    ) -> Vec<(Uuid, Option<Vec<f32>>)> {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT subject_id, op FROM ann_write_log \
+                      WHERE namespace = 'local' AND embedding_model = ?1 \
+                        AND field = 'knowledge.atom' \
+                      ORDER BY seq DESC"
+                    .into(),
+                params: vec![SqlValue::Text(WARM_TEST_MODEL.into())],
+                label: None,
+            })
+            .await
+            .expect("raw tail");
+        let mut raw: Vec<(Uuid, bool)> = rows
+            .iter()
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|row| match (row.get("subject_id"), row.get("op")) {
+                (Some(SqlValue::Text(subject)), Some(SqlValue::Text(op))) => {
+                    (Uuid::parse_str(subject).expect("UUID"), op == "delete")
+                }
+                other => panic!("unexpected log row: {other:?}"),
+            })
+            .collect();
+        raw.reverse();
+
+        let mut order = Vec::new();
+        let mut last_is_delete = HashMap::new();
+        for (subject, is_delete) in raw {
+            if last_is_delete.insert(subject, is_delete).is_none() {
+                order.push(subject);
+            }
+        }
+        order
+            .into_iter()
+            .map(|subject| {
+                let is_live = !last_is_delete[&subject];
+                (subject, is_live.then(|| embeddings[&subject].clone()))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fresh_tail_snapshot_statement_joins_one_row_per_distinct_subject() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        // 30 raw log rows over 7 subjects.
+        let embeddings = seed_repeated_tail(&rt, &token, 20, 4).await;
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let statement = fresh_tail_snapshot_statement("local", WARM_TEST_MODEL, 0, None);
+        let rows = reader.query_all(statement).await.expect("snapshot rows");
+        let tail_rows = rows
+            .iter()
+            .filter(|row| matches!(row.get("seq"), Some(SqlValue::Integer(_))))
+            .count();
+        let joined = rows
+            .iter()
+            .filter(|row| matches!(row.get("embedding"), Some(SqlValue::Blob(_))))
+            .count();
+        assert_eq!(
+            tail_rows,
+            embeddings.len(),
+            "one tail row per distinct subject, not per raw log row"
+        );
+        assert_eq!(
+            joined,
+            embeddings.len(),
+            "one embedding joined per distinct subject, not per raw log row"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tail_snapshot_ops_match_per_row_coalescing_of_the_raw_log() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let embeddings = seed_repeated_tail(&rt, &token, 20, 4).await;
+
+        let full = fetch_fresh_tail_snapshot(&rt, "local", WARM_TEST_MODEL, 0, None)
+            .await
+            .expect("full snapshot");
+        assert_eq!(full.ops, reference_tail_ops(&rt, &embeddings, None).await);
+
+        // The cap keeps the newest raw rows before coalescing: 7 live vectors at
+        // 0.5 keep ceil(3.5) = 4 rows, which are the last repeat of the first
+        // subject, a delete, and a delete-then-upsert pair.
+        let capped = fetch_fresh_tail_snapshot(&rt, "local", WARM_TEST_MODEL, 0, Some(0.5))
+            .await
+            .expect("capped snapshot");
+        assert_eq!(capped.live_count, Some(7));
+        assert_eq!(
+            capped.ops,
+            reference_tail_ops(&rt, &embeddings, Some(4)).await
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tail_snapshot_statement_probes_the_vector_table_by_point_lookup() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 1).await;
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        for threshold in [None, Some(0.2)] {
+            let statement = fresh_tail_snapshot_statement("local", WARM_TEST_MODEL, 0, threshold);
+            let rows = reader.explain(statement).await.expect("explain");
+            // sqlite-vec reports idxStr '2!...' for its primary-key POINT plan and
+            // '1' for a full scan. The capped form also scans the table once to
+            // count live vectors, so only the join's plan may be a point plan.
+            let mut point_plans = 0;
+            for row in &rows {
+                let Some(SqlValue::Text(detail)) = row.get("detail") else {
+                    continue;
+                };
+                if let Some((_, index)) = detail.rsplit_once(':') {
+                    if detail.contains("VIRTUAL TABLE INDEX ") && index.starts_with("2!") {
+                        point_plans += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                point_plans, 1,
+                "the vector join must be one point lookup per tail subject: {rows:?}"
+            );
+        }
     }
 
     /// `ann_segment_dir` encodes a round-trippable hex key that `decode_ann_dir_name` reverses.

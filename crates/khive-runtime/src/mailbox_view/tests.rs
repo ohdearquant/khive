@@ -104,6 +104,33 @@ fn gate_mailbox_direct_api_preserves_actor_and_rechecks_base_policy() {
 }
 
 #[test]
+fn generic_note_reads_keep_the_callers_mailbox_and_base_policy() {
+    let reader = token("lambda:reader");
+    let allowed = KhiveRuntime::new(config(policy(Arc::new(AllowAllGate)))).unwrap();
+    let denied = KhiveRuntime::new(config(policy(Arc::new(CallerEnrollmentGate::new(
+        vec![],
+        false,
+    )))))
+    .unwrap();
+    for verb in ["search", "get", "context", "neighbors"] {
+        let args = json!({"mailbox_actor":"lambda:owner"});
+        let view = allowed
+            .authorize_mailbox_view(&reader, verb, None, &args)
+            .unwrap();
+        assert_eq!(view.actor_id, "lambda:reader");
+        assert!(!view.delegated);
+        assert!(matches!(
+            allowed.authorize_mailbox_view(&reader, verb, Some("lambda:owner"), &args),
+            Err(RuntimeError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            denied.authorize_mailbox_view(&reader, verb, None, &args),
+            Err(RuntimeError::PermissionDenied { .. })
+        ));
+    }
+}
+
+#[test]
 fn gate_mailbox_direct_api_validates_original_null_and_mismatched_selector() {
     let runtime = KhiveRuntime::new(config(Arc::new(AllowAllGate))).unwrap();
     let reader = token("lambda:reader");

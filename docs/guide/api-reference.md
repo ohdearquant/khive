@@ -1148,6 +1148,9 @@ raw-SQL deferred-transaction exception share it. `reader_acquisitions` is the su
 `infrastructure_standalone_reader_opens` is deliberately separate. Ordinary file-backed reads
 must leave `standalone_reader_opens` flat. `reader_checkout_timeouts` counts admission waits that
 exhausted `KHIVE_CHECKOUT_TIMEOUT_SECS` before work began, not cooperative request cancellation.
+`reader_busy_timeouts` counts queries on an already checked-out pooled reader that SQLite refused
+with `SQLITE_BUSY` after the busy timeout (`KHIVE_BUSY_TIMEOUT_SECS`) elapsed; it is disjoint from
+`reader_checkout_timeouts` and excludes writer refusals.
 `active_pooled_reader_checkouts`, `peak_active_pooled_reader_checkouts`,
 `completed_pooled_reader_checkouts`, and `max_completed_reader_hold_micros` expose concurrency
 and lifecycle evidence; completed hold includes connection reset/replacement before reuse.
