@@ -833,26 +833,7 @@ pub(super) fn source_from_meta(meta: &CandidateMeta) -> SearchSource {
 pub(super) fn combine_vector_sources_union(
     sources: Vec<Vec<(Uuid, DeterministicScore)>>,
 ) -> Vec<(Uuid, DeterministicScore)> {
-    use std::collections::hash_map::Entry;
-    let capacity: usize = sources.iter().map(|s| s.len()).sum();
-    let mut combined: HashMap<Uuid, DeterministicScore> = HashMap::with_capacity(capacity);
-    for source in sources {
-        for (id, score) in source {
-            match combined.entry(id) {
-                Entry::Occupied(mut e) => {
-                    if score > *e.get() {
-                        *e.get_mut() = score;
-                    }
-                }
-                Entry::Vacant(e) => {
-                    e.insert(score);
-                }
-            }
-        }
-    }
-    let mut result: Vec<(Uuid, DeterministicScore)> = combined.into_iter().collect();
-    result.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then(a.cmp(b)));
-    result
+    khive_fusion::union_fusion(sources)
 }
 
 pub(super) fn fuse_candidates(
@@ -2098,6 +2079,10 @@ async fn collect_model_ann_hits_inner(
         session_unmet: false,
     })
 }
+
+#[cfg(test)]
+#[path = "union_reuse_tests.rs"]
+mod union_reuse_tests;
 
 #[cfg(test)]
 mod request_cancellation_tests {
