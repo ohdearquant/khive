@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
 use crate::curation::note_fts_document;
+use crate::embedder_registry::with_embedding_admission;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
@@ -244,8 +245,8 @@ impl KhiveRuntime {
         // was handed to the provider is counted even if this task is aborted
         // while parked on the await (drain_embed_join_set cancellation path).
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
-        let out = service.embed_one(text, emb_model).await;
-        Ok(out?)
+        let out = with_embedding_admission(service.embed_one(text, emb_model)).await;
+        out
     }
 
     /// Embed a document/passage for indexing using the named model.
@@ -313,7 +314,8 @@ impl KhiveRuntime {
         let embedded_bytes = text.len();
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
-        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
+        let embeddings =
+            with_embedding_admission(service.embed_passage(&[text.to_string()], emb_model)).await;
         let mut vectors = embeddings?;
         if vectors.len() != 1 {
             return Err(RuntimeError::Internal(format!(
@@ -381,8 +383,10 @@ impl KhiveRuntime {
         let embeddings = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await,
-            _ => service.embed_query(&texts, emb_model).await,
+            | EmbeddingModel::BgeLargeEnV15 => {
+                with_embedding_admission(service.embed(&texts, emb_model)).await
+            }
+            _ => with_embedding_admission(service.embed_query(&texts, emb_model)).await,
         };
         let out = embeddings?
             .into_iter()
@@ -465,9 +469,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = service.embed(texts, emb_model).await;
+        let out = with_embedding_admission(service.embed(texts, emb_model)).await;
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
-        Ok(out?)
+        out
     }
 
     /// Embed a batch of documents for indexing using the named model.
@@ -536,13 +540,13 @@ impl KhiveRuntime {
             crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
         }
         let out = if texts.iter().all(|text| text.len() <= budget) {
-            service.embed_passage(texts, emb_model).await
+            with_embedding_admission(service.embed_passage(texts, emb_model)).await
         } else {
             let bounded_texts: Vec<String> = texts
                 .iter()
                 .map(|text| bounded_embedding_input(text, budget).0.to_owned())
                 .collect();
-            service.embed_passage(&bounded_texts, emb_model).await
+            with_embedding_admission(service.embed_passage(&bounded_texts, emb_model)).await
         };
         if token.is_none() {
             crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
@@ -627,11 +631,13 @@ impl KhiveRuntime {
         let out = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => service.embed(texts, emb_model).await,
-            _ => service.embed_query(texts, emb_model).await,
+            | EmbeddingModel::BgeLargeEnV15 => {
+                with_embedding_admission(service.embed(texts, emb_model)).await
+            }
+            _ => with_embedding_admission(service.embed_query(texts, emb_model)).await,
         };
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
-        Ok(out?)
+        out
     }
 
     /// Search vectors using either a caller-provided embedding or query text.
@@ -678,7 +684,7 @@ impl KhiveRuntime {
             })
             .await;
         crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
-        Ok(hits?)
+        hits.map_err(RuntimeError::from)
     }
 
     /// The note-search vector leg uses the pack-owned graph when that model
