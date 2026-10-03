@@ -2056,6 +2056,14 @@ impl KhiveMcpServer {
             .and_then(|rt| rt.config().events_split.as_ref())
     }
 
+    /// Events storage inherits the resolved main-backend policy, including its
+    /// source. The server's checkpoint pool may be overridden independently.
+    pub(crate) fn events_wal_ceiling_policy(&self) -> Option<khive_db::WalCeilingPolicy> {
+        self.runtime
+            .as_ref()
+            .map(|rt| rt.core().backend().pool().config().wal_ceiling)
+    }
+
     /// Whether the default-backend runtime is read-only. Daemon supervision
     /// asks this before spawning an events daemon: the supervised daemon
     /// opens the events sidecar writable, which a read-only deployment must
@@ -6243,6 +6251,10 @@ impl ServerHandler for KhiveMcpServer {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "server/events_wal_policy_tests.rs"]
+mod events_wal_policy_tests;
 
 #[cfg(test)]
 mod tests {
