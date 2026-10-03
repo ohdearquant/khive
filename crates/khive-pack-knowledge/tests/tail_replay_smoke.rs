@@ -2,7 +2,8 @@
 mod support;
 
 #[tokio::test]
-#[serial_test::serial(background_tasks, config_ledger)]
+#[serial_test::serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
 async fn knowledge_tail_replay_one_index_write_replays_one_subject() {
     let sample = support::measure(64, support::Arm::OneIndex, 1, 1000.0, true).await;
     assert!(
@@ -22,7 +23,8 @@ async fn knowledge_tail_replay_one_index_write_replays_one_subject() {
 }
 
 #[tokio::test]
-#[serial_test::serial(background_tasks, config_ledger)]
+#[serial_test::serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
 async fn knowledge_tail_rewrites_coalesce_by_subject_without_losing_raw_rows() {
     let same = support::measure(64, support::Arm::SameSubject, 4, 1000.0, true).await;
     let distinct = support::measure(64, support::Arm::DistinctSubjects, 4, 1000.0, true).await;
@@ -35,7 +37,8 @@ async fn knowledge_tail_rewrites_coalesce_by_subject_without_losing_raw_rows() {
 }
 
 #[tokio::test]
-#[serial_test::serial(background_tasks, config_ledger)]
+#[serial_test::serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
 async fn knowledge_tail_delete_distinguishes_atom_verb_from_vector_tail() {
     let verb = support::measure(64, support::Arm::VerbDelete, 1, 1000.0, true).await;
     let composed = support::measure(64, support::Arm::ComposedVectorDelete, 1, 1000.0, true).await;
