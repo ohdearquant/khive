@@ -4,6 +4,8 @@ import contextlib
 import io
 import json
 import unittest
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
 
 from scripts.perf import bench_load_harness as harness
@@ -164,19 +166,53 @@ class OpenLoopLifecycleTests(unittest.TestCase):
         self.assertEqual(pool.shutdowns, [{"wait": False, "cancel_futures": True}, {"wait": True, "cancel_futures": True}])
 
     def test_setup_failure_kills_registered_process_before_pool_join(self):
-        proc, pool = Mock(), ImmediatePool()
-        proc.poll.return_value = 0
-        registry = {}
-        with patch.object(harness, "ThreadPoolExecutor", return_value=pool), \
-                patch.object(harness, "_spawn_worker_proc", return_value=proc), \
-                patch.object(harness.bpd, "_handshake", side_effect=RuntimeError("fake handshake failed")), \
-                patch.object(harness, "_drive_open_loop") as drive:
-            with self.assertRaisesRegex(RuntimeError, "fake handshake failed"):
-                harness._run_open_workers("fake", [(0, 0)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
+        failed, blocked = Mock(), Mock()
+        failed.poll.return_value = 0
+        blocked.poll.return_value = None
+        entered, release = threading.Event(), threading.Event()
+        order, registry = [], {}
+        pool = ThreadPoolExecutor(max_workers=2)
+        shutdown = pool.shutdown
+
+        def handshake(proc):
+            if proc is blocked:
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError("blocked handshake cleanup watchdog expired")
+            else:
+                if not entered.wait(5):
+                    raise AssertionError("sibling handshake never started")
+                raise RuntimeError("fake handshake failed")
+
+        def kill_blocked():
+            order.append("kill")
+            blocked.poll.return_value = -9
+            release.set()
+
+        def join_pool(**kwargs):
+            if kwargs["wait"]:
+                order.append("join")
+                # Release the fixture even when the kill loop is removed.
+                release.set()
+            shutdown(**kwargs)
+
+        blocked.kill.side_effect = kill_blocked
+        try:
+            with patch.object(harness, "ThreadPoolExecutor", return_value=pool), \
+                    patch.object(pool, "shutdown", side_effect=join_pool), \
+                    patch.object(harness, "_spawn_worker_proc", side_effect=lambda *args: failed if args[-1].endswith("w0.stderr.log") else blocked), \
+                    patch.object(harness.bpd, "_handshake", side_effect=handshake), \
+                    patch.object(harness, "_drive_open_loop") as drive:
+                with self.assertRaisesRegex(RuntimeError, "fake handshake failed"):
+                    harness._run_open_workers("fake", [(0, 0), (0, 1)], {}, "warn", "/fake", registry, 4, 10.0, 1.0)
+        finally:
+            release.set()
+            shutdown(wait=True, cancel_futures=True)
         drive.assert_not_called()
-        proc.kill.assert_called_once()
-        self.assertEqual(registry, {(0, 0): proc})
-        self.assertEqual(pool.shutdowns[-1], {"wait": True, "cancel_futures": True})
+        self.assertTrue(entered.is_set())
+        blocked.kill.assert_called_once()
+        self.assertEqual(order, ["kill", "join"])
+        self.assertEqual(registry, {(0, 0): failed, (0, 1): blocked})
 
 
 # Fixed synthetic values, with the complete legacy report shape and field order.
