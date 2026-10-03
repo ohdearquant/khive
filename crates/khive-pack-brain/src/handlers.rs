@@ -2108,7 +2108,6 @@ impl BrainPack {
                     "serve_attribution": serve_attribution,
                 }));
             };
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
 
             // lattice-router: build the context vector from the now-published live
             // state and forward through the fann network. This is a best-effort
@@ -2228,10 +2227,7 @@ impl BrainPack {
                         "serve_attribution": serve_attribution,
                     }));
                 }
-                crate::fold_gate::GateAndAppendOutcome::Applied(result) => {
-                    khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-                    result.event
-                }
+                crate::fold_gate::GateAndAppendOutcome::Applied(result) => result.event,
             }
         };
 

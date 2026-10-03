@@ -1714,6 +1714,7 @@ impl KhiveRuntime {
                     })
                 })
                 .await
+                .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)))
                 .map_err(map_merge_entity_storage_error)?
         } else {
             tokio::task::spawn_blocking(move || {
@@ -1757,7 +1758,7 @@ impl KhiveRuntime {
 
         // Count only committed event rows; dry-run never inserts an event.
         if !dry_run {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+            khive_storage::usage::account_event_write(Ok(1));
             tracing::info!(
                 into_id = %summary.kept_id,
                 from_id = %summary.removed_id,
@@ -3543,6 +3544,7 @@ impl KhiveRuntime {
                     })
                 })
                 .await
+                .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)))
                 .map_err(map_merge_note_storage_error)?
         } else {
             tokio::task::spawn_blocking(move || {
@@ -3585,7 +3587,7 @@ impl KhiveRuntime {
 
         // Count only committed event rows; dry-run never inserts an event.
         if !dry_run {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
+            khive_storage::usage::account_event_write(Ok(1));
             tracing::info!(
                 into_id = %summary.kept_id,
                 from_id = %summary.removed_id,
