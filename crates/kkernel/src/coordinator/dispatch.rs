@@ -1,6 +1,6 @@
 //! SubstrateCoordinator — cross-backend dispatch (D2-D4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1352,9 +1352,15 @@ fn rrf_merge_entity_hits_filtered(
     let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
 
     for list in &lists {
+        // A list votes once per id: a repeated id scores only at the position of its
+        // first occurrence, as in `khive_fusion::reciprocal_rank_fusion`. Its later
+        // copies still contribute source, title and snippet.
+        let mut seen = HashSet::with_capacity(list.len());
         for (i, hit) in list.iter().enumerate() {
             let entry = scores.entry(hit.entity_id).or_default();
-            entry.score = entry.score + rrf_score(i + 1, K);
+            if seen.insert(hit.entity_id) {
+                entry.score = entry.score + rrf_score(i + 1, K);
+            }
             if entry.evidence_rank.is_none_or(|best_rank| i < best_rank) {
                 entry.evidence_rank = Some(i);
                 entry.signals = hit.signals;
@@ -1415,9 +1421,15 @@ fn rrf_merge_note_hits_filtered(
     let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
 
     for list in &lists {
+        // A list votes once per id: a repeated id scores only at the position of its
+        // first occurrence, as in `khive_fusion::reciprocal_rank_fusion`. Its later
+        // copies still contribute source, title and snippet.
+        let mut seen = HashSet::with_capacity(list.len());
         for (i, hit) in list.iter().enumerate() {
             let entry = scores.entry(hit.note_id).or_default();
-            entry.score = entry.score + rrf_score(i + 1, K);
+            if seen.insert(hit.note_id) {
+                entry.score = entry.score + rrf_score(i + 1, K);
+            }
             if entry.evidence_rank.is_none_or(|best_rank| i < best_rank) {
                 entry.evidence_rank = Some(i);
                 entry.signals = hit.signals;
