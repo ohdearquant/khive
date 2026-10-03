@@ -36,6 +36,7 @@ struct Probe {
 }
 
 static NEXT_HUB: AtomicUsize = AtomicUsize::new(1);
+static ACTIVE_OBSERVERS: AtomicUsize = AtomicUsize::new(0);
 static HUBS: OnceLock<Mutex<HashMap<usize, Weak<StatementObserverHub>>>> = OnceLock::new();
 
 fn hubs() -> &'static Mutex<HashMap<usize, Weak<StatementObserverHub>>> {
@@ -99,6 +100,8 @@ impl StatementObserverHub {
             records: Mutex::new(Records::default()),
         });
         *active = Some(Arc::clone(&probe));
+        // Publish under the slot lock before the guard can leave observe.
+        ACTIVE_OBSERVERS.fetch_add(1, Ordering::Release);
         Ok(StatementStartObservation {
             hub: Arc::clone(self),
             probe,
@@ -136,6 +139,8 @@ impl Drop for StatementStartObservation {
             .is_some_and(|probe| Arc::ptr_eq(probe, &self.probe))
         {
             *active = None;
+            // Keep removal and the count change indivisible to registration.
+            ACTIVE_OBSERVERS.fetch_sub(1, Ordering::Release);
         }
     }
 }
@@ -177,15 +182,24 @@ unsafe extern "C" fn trace(
     if event != ffi::SQLITE_TRACE_STMT as c_uint {
         return 0;
     }
+    if ACTIVE_OBSERVERS.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
     let hub = {
+        #[cfg(test)]
+        trace_counters::lock_acquired();
         let registry = hubs().lock();
         registry.get(&(context as usize)).and_then(Weak::upgrade)
     };
     let Some(hub) = hub else { return 0 };
+    #[cfg(test)]
+    trace_counters::lock_acquired();
     let active = hub.active.lock();
     let Some(probe) = active.as_ref() else {
         return 0;
     };
+    #[cfg(test)]
+    trace_counters::lock_acquired();
     let mut records = probe.records.lock();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let stmt = statement.cast::<ffi::sqlite3_stmt>();
@@ -211,11 +225,44 @@ unsafe extern "C" fn trace(
             sql: original.to_string_lossy().into_owned(),
             readonly: unsafe { ffi::sqlite3_stmt_readonly(stmt) != 0 },
         });
+        #[cfg(test)]
+        trace_counters::record_added();
     }));
     if result.is_err() {
         records.lost = true;
     }
     0
+}
+
+#[cfg(test)]
+mod trace_counters {
+    use std::cell::Cell;
+
+    std::thread_local! {
+        static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(super) fn lock_acquired() {
+        let _ = COUNTS.try_with(|counts| {
+            let (locks, records) = counts.get();
+            counts.set((locks.saturating_add(1), records));
+        });
+    }
+
+    pub(super) fn record_added() {
+        let _ = COUNTS.try_with(|counts| {
+            let (locks, records) = counts.get();
+            counts.set((locks, records.saturating_add(1)));
+        });
+    }
+
+    pub(super) fn reset() {
+        COUNTS.with(|counts| counts.set((0, 0)));
+    }
+
+    pub(super) fn snapshot() -> (usize, usize) {
+        COUNTS.with(Cell::get)
+    }
 }
 
 #[cfg(test)]
