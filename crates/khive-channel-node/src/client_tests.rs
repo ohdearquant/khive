@@ -1859,3 +1859,6 @@ async fn poll_version_and_ciphertext_refusals_keep_later_delivery_and_cursor() {
 
 #[path = "client_r2_rejection_tests.rs"]
 mod r2_rejection_tests;
+
+#[path = "client_r3_regression_tests.rs"]
+mod r3_regression_tests;

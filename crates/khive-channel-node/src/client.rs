@@ -9,8 +9,8 @@ use crate::response::*;
 use crate::source::{NodeClientBinding, OutboundSource, PersistedSubmission};
 use crate::submit::serialize_submission;
 use crate::wire::{
-    AcknowledgeResponse, AdmissionResponse, ContactResponse, Delivery, MessageState, PollResponse,
-    RefusalCode, RefusalResponse, StatusResponse,
+    AcknowledgeResponse, AdmissionResponse, BoundedList, ContactResponse, Delivery, MessageState,
+    ReceiptItem, RefusalCode, RefusalResponse, ServerTimestamp, StatusResponse,
 };
 use khive_channel::{ChannelError, HoldReason, PendingDetail, ReceiptDisposition, SendOutcome};
 use reqwest::{Client, Method, Url};
@@ -47,12 +47,15 @@ struct HttpResponse {
     diagnostic: RemoteDiagnostic,
 }
 
-// This extracts bytes only. PollResponse owns all page fields and wire limits;
-// never serialize its typed items to reconstruct their original JSON.
+// Keep item bytes until each item's own decoder runs. Page members remain
+// strict and use the wire model's scalar and bounded-list wrappers.
 #[derive(Deserialize)]
-struct RawPollItems {
-    deliveries: Vec<Box<RawValue>>,
-    receipts: Vec<Box<RawValue>>,
+#[serde(deny_unknown_fields)]
+struct RawPollPage {
+    deliveries: BoundedList<Box<RawValue>, 16>,
+    receipts: BoundedList<Box<RawValue>, 64>,
+    receipts_cursor: JsonInteger,
+    server_time: ServerTimestamp,
 }
 
 impl NodeClient {
@@ -425,43 +428,27 @@ impl NodeClient {
         if r.status != 200 {
             return Err(refusal_error(&r));
         }
-        let page: PollResponse = decode(&r.body)?;
-        let raw: RawPollItems = decode(&r.body)?;
-        if page.deliveries.as_slice().len() != raw.deliveries.len()
-            || page.receipts.as_slice().len() != raw.receipts.len()
-        {
-            return Err(NodeError::transport(
-                "poll item byte positions are inconsistent",
-            ));
-        }
+        let page: RawPollPage = decode(&r.body)?;
         let mut deliveries = Vec::new();
         let mut rejected_deliveries = Vec::new();
-        for (item, raw) in page.deliveries.into_vec().into_iter().zip(raw.deliveries) {
+        for (index, raw) in page.deliveries.into_vec().into_iter().enumerate() {
             let original = raw.get().as_bytes().to_vec();
             if original.len() > MAX_REQUEST_BODY_BYTES {
                 rejected_deliveries.push(NodePollRejection {
-                    index: item.index,
+                    index,
                     code: RefusalCode::PayloadTooLarge,
                     original,
                 });
                 continue;
             }
-            // The raw entry point preserves typed version/size refusals; the
-            // shared item's validity remains authoritative for all wire fields.
-            let delivery = match (item.result, Delivery::parse(&original)) {
-                (Ok(_), Ok(delivery)) => delivery,
-                (_, Err(error)) => {
+            // The explicit entry point preserves typed version/size refusals
+            // without decoding any neighbouring item first.
+            let delivery = match Delivery::parse(&original) {
+                Ok(delivery) => delivery,
+                Err(error) => {
                     rejected_deliveries.push(NodePollRejection {
-                        index: item.index,
+                        index,
                         code: error.refusal_code(),
-                        original,
-                    });
-                    continue;
-                }
-                (Err(failure), Ok(_)) => {
-                    rejected_deliveries.push(NodePollRejection {
-                        index: item.index,
-                        code: failure.code,
                         original,
                     });
                     continue;
@@ -469,7 +456,7 @@ impl NodeClient {
             };
             let opening = self.open_delivery(&delivery).await;
             deliveries.push(NodeDelivery {
-                index: item.index,
+                index,
                 delivery,
                 original,
                 opening,
@@ -477,13 +464,13 @@ impl NodeClient {
         }
         let mut receipts = Vec::new();
         let mut rejected_receipts = Vec::new();
-        for (item, raw) in page.receipts.into_vec().into_iter().zip(raw.receipts) {
-            let receipt = match item.result {
+        for (index, raw) in page.receipts.into_vec().into_iter().enumerate() {
+            let receipt = match serde_json::from_str::<ReceiptItem>(raw.get()) {
                 Ok(receipt) => receipt,
-                Err(failure) => {
+                Err(_) => {
                     rejected_receipts.push(NodePollRejection {
-                        index: item.index,
-                        code: failure.code,
+                        index,
+                        code: RefusalCode::InvalidRequest,
                         original: raw.get().as_bytes().to_vec(),
                     });
                     continue;
@@ -491,7 +478,7 @@ impl NodeClient {
             };
             let verification = self.verify_sender_receipt(&receipt.receipt, None).await;
             receipts.push(NodeReceiptResult {
-                index: item.index,
+                index,
                 item: receipt,
                 verification,
             });
@@ -611,7 +598,13 @@ impl NodeClient {
             return Err(NodeError::transport("status names another logical message"));
         }
         let receipt = match status.receipt {
-            Some(ref receipt) => Some(self.verify_sender_receipt(receipt, None).await),
+            Some(ref receipt) => Some(
+                if receipt.binding.logical_message_id.into_uuid() != logical_id {
+                    rejected(ReceiptRejection::BindingMismatch)
+                } else {
+                    self.verify_sender_receipt(receipt, None).await
+                },
+            ),
             None => None,
         };
         if matches!(
@@ -708,7 +701,11 @@ fn refusal_error(r: &HttpResponse) -> NodeError {
     {
         ChannelError::Transport(format!("node refusal {code:?}"))
     } else if refusal.is_none() {
-        ChannelError::Transport("invalid node refusal response".into())
+        if (400..500).contains(&r.status) && !matches!(r.status, 408 | 429) {
+            ChannelError::PermanentTransport("invalid node refusal response".into())
+        } else {
+            ChannelError::Transport("invalid node refusal response".into())
+        }
     } else {
         ChannelError::PermanentTransport(format!("node refusal {code:?}"))
     };
