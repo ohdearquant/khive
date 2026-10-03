@@ -492,6 +492,10 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         dims: 16,
     });
     let (registry, shared_ann) = registry_with_ann(&rt);
+    let ann_key = AnnKey::from_token(MODEL);
+    // Keep both replay and the session exact-tail read in the unpublished phase.
+    let publication_guard = ann::hold_model_warm_lock_for_test(&shared_ann, &ann_key).await;
+    let warm_started = shared_ann.attempt_floor_notify.notified();
     let source = "visibility-move-source";
     let target = "visibility-move-target";
     let identity = |namespace: &str| RequestIdentity {
@@ -519,6 +523,9 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         )
         .await
         .expect("keyed source remember");
+    tokio::time::timeout(std::time::Duration::from_secs(10), warm_started)
+        .await
+        .expect("original remember starts its background ANN attempt");
     let old_seq = original["visibility_token"]["fences"][0]["ann_write_log_seq"]
         .as_u64()
         .expect("original write fence");
@@ -543,14 +550,18 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         }).expect("move transaction")
     };
     assert!(u64::try_from(destination_seq).unwrap() > old_seq);
-    let log_rows_before_replay = {
+    {
         let connection = backend.pool().reader().expect("log reader");
-        connection
-            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .expect("log count")
-    };
+        let replacement_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log \
+                 WHERE subject_id = ?1 AND namespace = ?2 AND seq > ?3",
+                (original["id"].as_str().unwrap(), target, destination_seq),
+                |row| row.get(0),
+            )
+            .expect("pre-replay subject log count");
+        assert_eq!(replacement_rows, 0, "move has no later subject log row");
+    }
     let replay = registry
         .dispatch_with_identity(
             "memory.remember",
@@ -563,16 +574,19 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
     assert_eq!(replay["replayed"], true);
     let receipt = replay["visibility_token"].clone();
     assert_eq!(receipt["namespace"], target);
+    assert_eq!(receipt["fences"][0]["model"], MODEL);
     assert_eq!(receipt["fences"][0]["ann_write_log_seq"], destination_seq);
     {
         let connection = backend.pool().reader().expect("replay log reader");
-        let log_rows_after_replay: i64 = connection
-            .query_row("SELECT COUNT(*) FROM ann_write_log", [], |row| row.get(0))
-            .expect("post-replay log count");
-        assert_eq!(
-            log_rows_after_replay, log_rows_before_replay,
-            "replay writes no replacement log row"
-        );
+        let replacement_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM ann_write_log \
+                 WHERE subject_id = ?1 AND namespace = ?2 AND seq > ?3",
+                (original["id"].as_str().unwrap(), target, destination_seq),
+                |row| row.get(0),
+            )
+            .expect("post-replay subject log count");
+        assert_eq!(replacement_rows, 0, "replay writes no replacement log row");
     }
     let target_token = rt
         .authorize(Namespace::parse(target).unwrap())
@@ -603,6 +617,19 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         .await
         .expect("unapplied destination row proves its exact live tail snapshot");
     assert!(contains_id(&recalled, &original["id"]));
+
+    assert_eq!(
+        ann::bridge_applied_seq(&shared_ann, &AnnKey::from_token(MODEL)).await,
+        None
+    );
+
+    drop(publication_guard);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ann::wait_until_warm_idle(&shared_ann, &ann_key),
+    )
+    .await
+    .expect("remember's background ANN publication finishes after release");
 
     ann::ensure_ann_for_model(&rt, &target_token, &shared_ann, MODEL)
         .await
