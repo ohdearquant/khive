@@ -9,7 +9,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_runtime::{
-    hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
+    hex_prefix_to_uuid_pattern, KhiveRuntime, MailboxView, NamespaceToken, Resolved, RuntimeError,
+    VerbRegistry,
 };
 use khive_storage::event::Event;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
@@ -34,6 +35,9 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params.clone())?;
+        let mailbox = self
+            .runtime
+            .authorize_mailbox_view(token, "get", None, &params)?;
         if let Some(key) = &p.key {
             if p.id.is_some() || p.include_deleted == Some(true) {
                 return Err(RuntimeError::InvalidInput(
@@ -59,7 +63,13 @@ impl KgPack {
             )?;
             let note = self
                 .runtime
-                .get_note_by_key(token, key, kind.as_deref(), false)
+                .get_note_by_key_in_scope(
+                    token,
+                    key,
+                    kind.as_deref(),
+                    false,
+                    Some(&mailbox.note_scope(token)),
+                )
                 .await?;
             return flatten_get_result(
                 "note",
@@ -86,14 +96,12 @@ impl KgPack {
         let resolved_id = if let Ok(id) = Uuid::parse_str(id_ref) {
             Some(id)
         } else if id_ref.len() >= 8 && id_ref.chars().all(|c| c.is_ascii_hexdigit()) {
-            match registry
-                .resolve_kg_read_prefix(&self.runtime, token, id_ref, false)
+            match resolve_get_prefix(&self.runtime, registry, token, &mailbox, id_ref, false)
                 .await?
             {
                 Some(id) => Some(id),
                 None => {
-                    registry
-                        .resolve_kg_read_prefix(&self.runtime, token, id_ref, true)
+                    resolve_get_prefix(&self.runtime, registry, token, &mailbox, id_ref, true)
                         .await?
                 }
             }
@@ -141,13 +149,16 @@ impl KgPack {
                 );
             }
             Some(Resolved::Note(note)) => {
+                if !mailbox.permits_message_note(token, &note) {
+                    return Err(RuntimeError::NotFound(id_ref.to_string()));
+                }
                 return flatten_get_result(
                     "note",
                     parse_note_content(
                         remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
                         p.parse_content,
                     )?,
-                )
+                );
             }
             _ => {}
         }
@@ -178,6 +189,9 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?
         {
+            if !mailbox.permits_message_note(token, &note) {
+                return Err(RuntimeError::NotFound(id_ref.to_string()));
+            }
             let note_val = normalize_entity_timestamps(to_json(&note)?);
             let remapped = remap_note_status(note_val);
             return flatten_get_result("note", parse_note_content(remapped, p.parse_content)?);
@@ -187,7 +201,10 @@ impl KgPack {
                 .runtime
                 .get_note_including_deleted(token, id)
                 .await?
-                .filter(|deleted| deleted.namespace == token.namespace().as_str())
+                .filter(|deleted| {
+                    deleted.namespace == token.namespace().as_str()
+                        && mailbox.permits_message_note(token, deleted)
+                })
             {
                 let note_val = normalize_entity_timestamps(to_json(&deleted)?);
                 let remapped = remap_note_status(note_val);
@@ -197,8 +214,29 @@ impl KgPack {
 
         // PR-A1: by-ID edge get returns the edge regardless of namespace.
         if let Some(edge) = self.runtime.get_edge(token, id).await? {
+            if !super::message_scope::message_endpoint_permitted(
+                &self.runtime,
+                registry,
+                token,
+                &mailbox,
+                edge.source_id,
+            )
+            .await?
+                || !super::message_scope::message_endpoint_permitted(
+                    &self.runtime,
+                    registry,
+                    token,
+                    &mailbox,
+                    edge.target_id,
+                )
+                .await?
+            {
+                return Err(RuntimeError::NotFound(id_ref.to_string()));
+            }
             let mut edge_val = to_json(&edge)?;
-            let annotations = self.fetch_edge_annotations(token, id).await?;
+            let annotations = self
+                .fetch_edge_annotations(token, registry, &mailbox, id)
+                .await?;
             if let Some(obj) = edge_val.as_object_mut() {
                 obj.insert("annotations".to_string(), Value::Array(annotations));
             }
@@ -211,8 +249,29 @@ impl KgPack {
                 .await?
                 .filter(|deleted| deleted.namespace == token.namespace().as_str())
             {
+                if !super::message_scope::message_endpoint_permitted(
+                    &self.runtime,
+                    registry,
+                    token,
+                    &mailbox,
+                    deleted.source_id,
+                )
+                .await?
+                    || !super::message_scope::message_endpoint_permitted(
+                        &self.runtime,
+                        registry,
+                        token,
+                        &mailbox,
+                        deleted.target_id,
+                    )
+                    .await?
+                {
+                    return Err(RuntimeError::NotFound(id_ref.to_string()));
+                }
                 let mut edge_val = to_json(&deleted)?;
-                let annotations = self.fetch_edge_annotations(token, id).await?;
+                let annotations = self
+                    .fetch_edge_annotations(token, registry, &mailbox, id)
+                    .await?;
                 if let Some(obj) = edge_val.as_object_mut() {
                     obj.insert("annotations".to_string(), Value::Array(annotations));
                 }
@@ -251,6 +310,8 @@ impl KgPack {
     async fn fetch_edge_annotations(
         &self,
         token: &NamespaceToken,
+        registry: &VerbRegistry,
+        mailbox: &MailboxView,
         edge_id: Uuid,
     ) -> Result<Vec<Value>, RuntimeError> {
         let hits = self
@@ -268,13 +329,26 @@ impl KgPack {
             .get_notes_batch(&note_ids)
             .await
             .map_err(RuntimeError::Storage)?;
-        let note_map: HashMap<Uuid, _> = notes.into_iter().map(|n| (n.id, n)).collect();
+        let mut note_map: HashMap<Uuid, _> = notes.into_iter().map(|n| (n.id, n)).collect();
+        for note_id in note_ids {
+            if let std::collections::hash_map::Entry::Vacant(entry) = note_map.entry(note_id) {
+                if let Some(Resolved::Note(note)) = registry
+                    .resolve_kg_read_by_id(&self.runtime, token, note_id, false)
+                    .await?
+                {
+                    entry.insert(note);
+                }
+            }
+        }
 
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
             let Some(note) = note_map.get(&hit.node_id) else {
                 continue;
             };
+            if !mailbox.permits_message_note(token, note) {
+                continue;
+            }
             let mut note_val = remap_note_status(normalize_entity_timestamps(to_json(note)?));
             if let Some(obj) = note_val.as_object_mut() {
                 obj.insert(
@@ -496,6 +570,84 @@ impl KgPack {
         }
 
         Ok(Some(result))
+    }
+}
+
+/// Scope prefix candidates before a resolver can return their IDs. The
+/// lower resolver bounds its ambiguity sample, so a sample containing a
+/// message cannot establish uniqueness after mailbox filtering.
+async fn resolve_get_prefix(
+    runtime: &KhiveRuntime,
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    mailbox: &MailboxView,
+    prefix: &str,
+    include_deleted: bool,
+) -> Result<Option<Uuid>, RuntimeError> {
+    let mut ambiguous = false;
+    let candidates = match registry
+        .resolve_kg_read_prefix(runtime, token, prefix, include_deleted)
+        .await
+    {
+        Ok(Some(id)) => vec![id],
+        Ok(None) => return Ok(None),
+        Err(RuntimeError::AmbiguousPrefix { matches, .. }) => {
+            ambiguous = true;
+            matches
+        }
+        Err(error) => return Err(error),
+    };
+    let mut visible = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        let record = registry
+            .resolve_kg_read_by_id(runtime, token, id, include_deleted)
+            .await?;
+        if let Some(Resolved::Note(note)) = record {
+            if ambiguous && note.kind == "message" {
+                return Err(RuntimeError::InvalidInput(
+                    "get: message prefixes matching multiple records require a full UUID; use comm.inbox to find messages".into(),
+                ));
+            }
+            if !mailbox.permits_message_note(token, &note) {
+                continue;
+            }
+        } else if record.is_none() {
+            if let Some(edge) = runtime.get_edge_including_deleted(token, id).await? {
+                if !super::message_scope::message_endpoint_permitted(
+                    runtime,
+                    registry,
+                    token,
+                    mailbox,
+                    edge.source_id,
+                )
+                .await?
+                    || !super::message_scope::message_endpoint_permitted(
+                        runtime,
+                        registry,
+                        token,
+                        mailbox,
+                        edge.target_id,
+                    )
+                    .await?
+                {
+                    if ambiguous {
+                        return Err(RuntimeError::InvalidInput(
+                        "get: this prefix requires a full UUID; use comm.inbox to find messages".into(),
+                    ));
+                    }
+                    continue;
+                }
+            }
+        }
+        visible.push(id);
+    }
+    match visible.len() {
+        0 => Ok(None),
+        1 => Ok(visible.pop()),
+        _ => Err(RuntimeError::AmbiguousPrefix {
+            prefix: prefix.to_string(),
+            matches: visible,
+        }),
     }
 }
 

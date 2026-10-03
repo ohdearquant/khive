@@ -2056,6 +2056,14 @@ impl KhiveMcpServer {
             .and_then(|rt| rt.config().events_split.as_ref())
     }
 
+    /// Events storage inherits the resolved main-backend policy, including its
+    /// source. The server's checkpoint pool may be overridden independently.
+    pub(crate) fn events_wal_ceiling_policy(&self) -> Option<khive_db::WalCeilingPolicy> {
+        self.runtime
+            .as_ref()
+            .map(|rt| rt.core().backend().pool().config().wal_ceiling)
+    }
+
     /// Whether the default-backend runtime is read-only. Daemon supervision
     /// asks this before spawning an events daemon: the supervised daemon
     /// opens the events sidecar writable, which a read-only deployment must
@@ -3317,22 +3325,22 @@ async fn dispatch_via_coordinator_inner(
             if let Some(fields) = handler_args.as_object_mut() {
                 fields.remove("namespace");
             }
-            // MAJ-3: widen the fan-out's read-visibility scope to match the
-            // normal registry dispatch path — see `coordinator_search_visibility`.
+            // Preserve the coordinated read scope and the actor resolved by
+            // the gate in one sealed token through backend fan-out.
             let extra_visible = coordinator_search_visibility(registry, args_value, identity);
             let result = registry
-                .dispatch_intercepted_with_metadata_and_disposition(
+                .dispatch_intercepted_with_token_and_disposition(
                     tool,
                     args_value,
                     identity,
-                    |namespace| async move {
+                    |token| async move {
                         // Match normal registry dispatch ordering: the gate has
                         // already authorized this namespace before handler-level
                         // search validation runs inside the intercepted closure.
                         let request = ValidatedSearchRequest::from_value(handler_args, registry)?;
                         let coord_result = coord
-                            .fan_out_search(&request, &namespace, &extra_visible)
-                            .await;
+                            .fan_out_search_scoped(&request, &token, args_value, &extra_visible)
+                            .await?;
                         khive_storage::ensure_request_read_active("search")?;
                         // Preserve the coordinator search response's compatibility
                         // fields, and add the KG single-backend handler's canonical
@@ -6243,6 +6251,10 @@ impl ServerHandler for KhiveMcpServer {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "server/events_wal_policy_tests.rs"]
+mod events_wal_policy_tests;
 
 #[cfg(test)]
 mod tests {

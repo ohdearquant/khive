@@ -1934,8 +1934,6 @@ impl SqliteVecStore {
 #[cfg(all(test, feature = "vectors"))]
 mod point_lookup_tests {
     use std::collections::HashMap;
-    use std::ffi::{c_int, c_uint, c_void, CStr};
-    use std::sync::Mutex;
 
     use super::*;
     use crate::pool::PoolConfig;
@@ -2101,85 +2099,30 @@ mod point_lookup_tests {
     }
 
     // Capture statements executed by the public operations, so planner checks
-    // cannot accidentally exercise a separate copy of their SQL.
+    // cannot accidentally exercise a separate copy of their SQL. This rides the
+    // pool's shared statement observer: SQLite keeps one trace callback per
+    // connection, so a second hook here would silence the observer.
     struct StatementCapture {
-        pool: Arc<ConnectionPool>,
-        statements: Box<Mutex<Vec<String>>>,
-    }
-
-    unsafe extern "C" fn capture_statement(
-        event: c_uint,
-        context: *mut c_void,
-        statement: *mut c_void,
-        _detail: *mut c_void,
-    ) -> c_int {
-        if event != rusqlite::ffi::SQLITE_TRACE_STMT || statement.is_null() {
-            return 0;
-        }
-        let _ = std::panic::catch_unwind(|| {
-            // SAFETY: StatementCapture owns this boxed context until its Drop
-            // unregisters the callback on the same guarded connection. SQLite
-            // supplies a live statement for SQLITE_TRACE_STMT; sqlite3_sql is
-            // read-only and its string is copied before the callback returns.
-            let statements = unsafe { &*context.cast::<Mutex<Vec<String>>>() };
-            let sql = unsafe { rusqlite::ffi::sqlite3_sql(statement.cast()) };
-            if !sql.is_null() {
-                let sql = unsafe { CStr::from_ptr(sql) }
-                    .to_string_lossy()
-                    .into_owned();
-                if let Ok(mut statements) = statements.lock() {
-                    statements.push(sql);
-                }
-            }
-        });
-        0
+        observation: crate::StatementStartObservation,
     }
 
     impl StatementCapture {
         fn new(pool: Arc<ConnectionPool>) -> Self {
-            let mut capture = Self {
-                pool,
-                statements: Box::new(Mutex::new(Vec::new())),
-            };
-            {
-                let writer = capture.pool.try_writer().expect("pool writer");
-                // SAFETY: the in-memory pool uses this single connection for
-                // reads and writes. The writer guard serializes registration;
-                // the boxed callback context stays at a stable address.
-                let result = unsafe {
-                    rusqlite::ffi::sqlite3_trace_v2(
-                        writer.conn().handle(),
-                        rusqlite::ffi::SQLITE_TRACE_STMT,
-                        Some(capture_statement),
-                        (&mut *capture.statements as *mut Mutex<Vec<String>>).cast(),
-                    )
-                };
-                assert_eq!(result, rusqlite::ffi::SQLITE_OK, "install SQL capture");
-            }
-            capture
+            // The bound turns an unexpectedly long run into an error rather
+            // than a silently short list.
+            let observation = pool
+                .observe_test_statement_starts(100_000)
+                .expect("observe statement starts");
+            Self { observation }
         }
 
         fn finish(self) -> Vec<String> {
-            let statements = self.statements.lock().expect("captured statements").clone();
-            drop(self);
-            statements
-        }
-    }
-
-    impl Drop for StatementCapture {
-        fn drop(&mut self) {
-            let writer = self.pool.try_writer().expect("pool writer");
-            // SAFETY: the writer guard excludes concurrent statement execution;
-            // clear the callback before freeing its boxed context.
-            let result = unsafe {
-                rusqlite::ffi::sqlite3_trace_v2(
-                    writer.conn().handle(),
-                    0,
-                    None,
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(result, rusqlite::ffi::SQLITE_OK, "remove SQL capture");
+            self.observation
+                .started_statements()
+                .expect("captured statements")
+                .into_iter()
+                .map(|statement| statement.sql)
+                .collect()
         }
     }
 
@@ -2436,6 +2379,33 @@ mod point_lookup_tests {
         }
         assert_point_plans(&fixture.pool, &statements, "INSERT INTO ann_write_log ");
         assert_point_plans(&fixture.pool, &statements, "DELETE FROM vec_point_lookup ");
+    }
+
+    #[tokio::test]
+    async fn observer_still_records_after_a_statement_capture_is_dropped() {
+        let fixture = Fixture::new();
+        drop(StatementCapture::new(Arc::clone(&fixture.pool)));
+        let observation = fixture
+            .pool
+            .observe_test_statement_starts(8)
+            .expect("observe after capture");
+        let sql = "SELECT 17 AS after_capture";
+        {
+            let writer = fixture.pool.try_writer().expect("pool writer");
+            let value: i64 = writer
+                .conn()
+                .query_row(sql, [], |row| row.get(0))
+                .expect("run statement");
+            assert_eq!(value, 17);
+        }
+        assert_eq!(
+            observation.started_statements().expect("observed starts"),
+            vec![crate::StartedStatement {
+                sql: sql.to_owned(),
+                readonly: true,
+            }],
+            "a dropped capture must leave the shared observer recording"
+        );
     }
 }
 

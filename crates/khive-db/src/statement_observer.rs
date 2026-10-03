@@ -142,9 +142,11 @@ impl Drop for StatementStartObservation {
 
 /// Install once on a newly opened connection, before it is shared.
 ///
-/// No other khive connection trace hook exists at the source base. This
-/// test-only instrumentation owns SQLite's one trace slot for this connection.
-/// Replacing that slot externally is unsupported.
+/// SQLite keeps one trace callback per connection, and this test-only
+/// instrumentation owns it. Test code that needs statement text must go
+/// through `ConnectionPool::observe_test_statement_starts` instead of
+/// installing its own `sqlite3_trace_v2` hook: replacing or clearing the slot
+/// silently stops this observer, and its records then read as an empty success.
 pub(crate) fn install(
     conn: &Connection,
     hub: &Arc<StatementObserverHub>,

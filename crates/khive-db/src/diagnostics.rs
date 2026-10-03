@@ -834,6 +834,11 @@ pub struct ReaderContentionDiagnostics {
     /// Pool-wide reader-admission waits that exhausted `checkout_timeout`
     /// before work began. Cooperative request cancellation is excluded.
     pub reader_checkout_timeouts: u64,
+    /// Queries on a checked-out pooled reader that SQLite refused with
+    /// `SQLITE_BUSY` after `configured_busy_timeout_ms` elapsed. Counted after
+    /// checkout succeeded, so it is disjoint from `reader_checkout_timeouts`.
+    /// Writer refusals are not included; see `writer_task_begin_busy`.
+    pub reader_busy_timeouts: u64,
     /// Pooled reader guards live when the snapshot was captured.
     pub active_pooled_reader_checkouts: u64,
     /// Highest observed concurrent pooled-reader guard count.
@@ -872,6 +877,7 @@ impl ReaderContentionDiagnostics {
             standalone_reader_opens: reader.standalone_opens,
             infrastructure_standalone_reader_opens: reader.infrastructure_standalone_opens,
             reader_checkout_timeouts: reader.checkout_timeouts,
+            reader_busy_timeouts: reader.busy_timeouts,
             active_pooled_reader_checkouts: reader.active_pooled_checkouts,
             peak_active_pooled_reader_checkouts: reader.peak_active_pooled_checkouts,
             completed_pooled_reader_checkouts: reader.completed_pooled_checkouts,
@@ -3231,6 +3237,7 @@ mod tests {
                 standalone_reader_opens: 0,
                 infrastructure_standalone_reader_opens: 0,
                 reader_checkout_timeouts: 0,
+                reader_busy_timeouts: 0,
                 active_pooled_reader_checkouts: 0,
                 peak_active_pooled_reader_checkouts: 0,
                 completed_pooled_reader_checkouts: 0,
@@ -3340,6 +3347,78 @@ mod tests {
             json.pointer("/reader_contention/max_completed_reader_hold_micros")
                 .is_some(),
             "the operator wire payload must expose completed hold-time evidence"
+        );
+    }
+
+    /// A query refused with SQLITE_BUSY after the busy handler gives up shows up
+    /// in `reader_busy_timeouts`, apart from `reader_checkout_timeouts`. WAL
+    /// readers are never blocked by a writer, so the fixture uses a
+    /// rollback-journal database, where a connection holding an exclusive lock
+    /// refuses every other reader.
+    #[test]
+    fn diagnostics_counts_reader_busy_handler_timeouts_apart_from_checkout_timeouts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reader_busy_timeouts.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            busy_timeout: Duration::from_millis(50),
+            ..PoolConfig::default()
+        })
+        .expect("rollback-journal file-backed pool");
+        pool.writer()
+            .expect("writer")
+            .conn()
+            .execute_batch("CREATE TABLE busy_fixture (id INTEGER PRIMARY KEY)")
+            .expect("fixture table");
+
+        // Control: with no lock held the read succeeds and nothing is counted.
+        let reader = pool.reader().expect("reader checkout");
+        let rows = reader
+            .query_row("SELECT count(*) FROM busy_fixture", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("unlocked read");
+        assert_eq!(rows, 0);
+        drop(reader);
+        assert_eq!(
+            ReaderContentionDiagnostics::snapshot(&pool).reader_busy_timeouts,
+            0
+        );
+
+        let holder = Connection::open(&path).expect("second connection");
+        holder
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("exclusive lock");
+        let reader = pool.reader().expect("reader checkout");
+        let refused = reader
+            .query_row("SELECT count(*) FROM busy_fixture", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect_err("a read behind an exclusive lock must be refused");
+        assert!(
+            matches!(
+                &refused,
+                crate::SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                    if code.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "the refusal must be SQLITE_BUSY: {refused}"
+        );
+        holder.execute_batch("ROLLBACK").expect("release lock");
+        drop(reader);
+
+        let snapshot = ReaderContentionDiagnostics::snapshot(&pool);
+        assert_eq!(snapshot.reader_busy_timeouts, 1);
+        assert_eq!(
+            snapshot.reader_checkout_timeouts, 0,
+            "a busy-handler refusal after checkout is not a checkout timeout"
+        );
+        let json = serde_json::to_value(snapshot).expect("snapshot serializes");
+        assert_eq!(
+            json.pointer("/reader_busy_timeouts"),
+            Some(&serde_json::json!(1)),
+            "the operator wire payload must expose the busy-handler count"
         );
     }
 
