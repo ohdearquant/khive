@@ -6,13 +6,12 @@
 //! checked against the owner's pinned recipient key before durable state changes.
 use crate::error::RuntimeResult;
 use crate::{KhiveRuntime, NamespaceToken};
-use khive_channel::DeliveryReceipt;
+use khive_channel::{receipt_signing_input, DeliveryReceipt, ReceiptSigningPublicKey};
 use khive_db::stores::note::transport::SenderTransportStore;
 pub use khive_db::stores::note::transport::{
     EnvelopeKey, FailureClass, HoldReason, PolicyMode, SenderAssurance, SenderEnvelope,
     SenderRecord, TransportState,
 };
-use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ReceiptVerificationError {
@@ -22,34 +21,6 @@ pub enum ReceiptVerificationError {
     InvalidSignatureLength,
     #[error("recipient receipt signature is invalid")]
     InvalidSignature,
-}
-
-fn canonical_agent_id(value: &str) -> Result<Uuid, ReceiptVerificationError> {
-    let id = Uuid::parse_str(value).map_err(|_| ReceiptVerificationError::InvalidAgentId)?;
-    if id.to_string() != value {
-        return Err(ReceiptVerificationError::InvalidAgentId);
-    }
-    Ok(id)
-}
-
-fn receipt_signing_input(receipt: &DeliveryReceipt) -> Result<Vec<u8>, ReceiptVerificationError> {
-    let binding = &receipt.binding;
-    let sender_agent_id = canonical_agent_id(&binding.sender_agent_id)?;
-    let recipient_agent_id = canonical_agent_id(&binding.recipient_agent_id)?;
-    let mut input = b"khive-node-v1/receipt\0".to_vec();
-    input.extend_from_slice(&binding.protocol_version.to_be_bytes());
-    input.extend_from_slice(binding.logical_message_id.as_bytes());
-    input.extend_from_slice(sender_agent_id.as_bytes());
-    input.extend_from_slice(recipient_agent_id.as_bytes());
-    input.extend_from_slice(binding.recipient_device_id.as_bytes());
-    input.extend_from_slice(&binding.recipient_key_epoch.to_be_bytes());
-    input.extend_from_slice(&binding.contact_generation.to_be_bytes());
-    input.extend_from_slice(binding.delivery_attempt_id.as_bytes());
-    input.push(match receipt.disposition {
-        khive_channel::ReceiptDisposition::Stored => 1,
-        khive_channel::ReceiptDisposition::Quarantined => 2,
-    });
-    Ok(input)
 }
 
 /// A receipt whose signature was checked with the owner's pinned recipient key.
@@ -66,13 +37,18 @@ impl VerifiedRecipientReceipt {
         if receipt.signature.len() != 64 {
             return Err(ReceiptVerificationError::InvalidSignatureLength);
         }
-        let input = receipt_signing_input(&receipt)?;
-        ring::signature::UnparsedPublicKey::new(
-            &ring::signature::ED25519,
-            pinned_signing_public_key,
-        )
-        .verify(&input, &receipt.signature)
-        .map_err(|_| ReceiptVerificationError::InvalidSignature)?;
+        let input = receipt_signing_input(&receipt)
+            .map_err(|_| ReceiptVerificationError::InvalidAgentId)?;
+        let signing_key = ReceiptSigningPublicKey::new(*pinned_signing_public_key)
+            .map_err(|_| ReceiptVerificationError::InvalidSignature)?;
+        let signature = receipt
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| ReceiptVerificationError::InvalidSignatureLength)?;
+        signing_key
+            .verify(&input, signature)
+            .map_err(|_| ReceiptVerificationError::InvalidSignature)?;
         Ok(Self(receipt))
     }
 }
@@ -242,6 +218,44 @@ mod tests {
         (receipt, pinned_key)
     }
 
+    fn assert_identity_key_refused(pinned_key: [u8; 32]) {
+        let recipient_key =
+            vector_key("a914d2b78bbef06e728db06ad577d1c09d04dae4a078ab7b7574187d9dc5d032");
+        for disposition in [ReceiptDisposition::Stored, ReceiptDisposition::Quarantined] {
+            VerifiedRecipientReceipt::verify(vector_receipt(disposition), &recipient_key)
+                .expect("the valid receipt must verify before the forged-key assertion");
+            let mut forged = vector_receipt(disposition);
+            forged.signature = vec![0; 64];
+            forged.signature[0] = 1;
+            assert!(
+                !receipt_signing_input(&forged).unwrap().is_empty(),
+                "the forgery must target an actual valid receipt binding"
+            );
+            assert!(
+                matches!(
+                    VerifiedRecipientReceipt::verify(forged, &pinned_key),
+                    Err(ReceiptVerificationError::InvalidSignature)
+                ),
+                "a degenerate pinned key must not produce a verified {disposition:?} receipt"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_pinned_recipient_key_cannot_verify_forged_receipts() {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        assert_identity_key_refused(identity);
+    }
+
+    #[test]
+    fn identity_sign_bit_variant_cannot_verify_forged_receipts() {
+        let mut identity_with_sign_bit = [0; 32];
+        identity_with_sign_bit[0] = 1;
+        identity_with_sign_bit[31] = 0x80;
+        assert_identity_key_refused(identity_with_sign_bit);
+    }
+
     #[test]
     fn recipient_receipt_vectors_match_signing_input_and_verify() {
         let recipient_key =
@@ -264,6 +278,17 @@ mod tests {
             VerifiedRecipientReceipt::verify(receipt, &recipient_key)
                 .expect("recipient receipt vector must verify");
         }
+    }
+
+    #[test]
+    fn stored_node_receipt_verifies_with_pinned_recipient_key() {
+        let recipient_key =
+            vector_key("a914d2b78bbef06e728db06ad577d1c09d04dae4a078ab7b7574187d9dc5d032");
+        VerifiedRecipientReceipt::verify(
+            vector_receipt(ReceiptDisposition::Stored),
+            &recipient_key,
+        )
+        .expect("stored node receipt must verify with its pinned recipient key");
     }
 
     #[test]

@@ -116,10 +116,17 @@ fn parse_number(text: &str, start: usize) -> Option<(u64, usize)> {
 fn preceded_by_closing_keyword(text: &str, hash_idx: usize) -> bool {
     let before = &text[..hash_idx];
     let trimmed = before.trim_end_matches(|c: char| c.is_whitespace() || c == ':');
-    let lower = trimmed.to_ascii_lowercase();
     for kw in CLOSING_KEYWORDS {
-        if let Some(prefix) = lower.strip_suffix(*kw) {
-            let prev_char = prefix.chars().next_back();
+        let Some(start) = trimmed.len().checked_sub(kw.len()) else {
+            continue;
+        };
+        let suffix = &trimmed.as_bytes()[start..];
+        if suffix.iter().zip(kw.bytes()).all(|(left, right)| {
+            observe_keyword_byte();
+            left.eq_ignore_ascii_case(&right)
+        }) {
+            // A successful ASCII suffix match proves this is a UTF-8 boundary.
+            let prev_char = trimmed[..start].chars().next_back();
             if prev_char
                 .map(|c| !c.is_ascii_alphanumeric())
                 .unwrap_or(true)
@@ -129,6 +136,17 @@ fn preceded_by_closing_keyword(text: &str, hash_idx: usize) -> bool {
         }
     }
     false
+}
+
+#[inline]
+fn observe_keyword_byte() {
+    #[cfg(test)]
+    KEYWORD_BYTES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static KEYWORD_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Truncate `s` to at most `max_chars` characters (char-boundary safe, no
@@ -143,6 +161,59 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_keyword_work_ignores_unrelated_prefix_length() {
+        for length in [64, 4096, 65536] {
+            let text = format!("{} See #13; Fixes :\u{2003}#17", "界".repeat(length));
+            KEYWORD_BYTES.with(|count| count.set(0));
+            let references = extract_references(&text);
+            assert_eq!(
+                references,
+                vec![
+                    RefMention {
+                        number: 13,
+                        kind: RefKind::Mentions
+                    },
+                    RefMention {
+                        number: 17,
+                        kind: RefKind::Closes
+                    },
+                ]
+            );
+            let compared = KEYWORD_BYTES.with(std::cell::Cell::get);
+            let per_reference: usize = CLOSING_KEYWORDS.iter().map(|word| word.len()).sum();
+            assert!(compared <= 2 * per_reference, "actual byte work {compared}");
+            assert!(compared > 0, "production comparator must be observed");
+        }
+    }
+
+    #[test]
+    fn closing_keyword_suffix_matches_original_ascii_and_unicode_boundaries() {
+        for prefix in ["", "a", "界", "—", "é", "\u{2003}"] {
+            for word in CLOSING_KEYWORDS {
+                for separator in ["", ":", "\t:\u{2003}"] {
+                    let text = format!("{prefix}{}{separator}#41", word.to_ascii_uppercase());
+                    let hash = text.find('#').unwrap();
+                    let trimmed =
+                        text[..hash].trim_end_matches(|c: char| c.is_whitespace() || c == ':');
+                    let lower = trimmed.to_ascii_lowercase();
+                    let original = CLOSING_KEYWORDS.iter().any(|word| {
+                        lower.strip_suffix(*word).is_some_and(|rest| {
+                            rest.chars()
+                                .next_back()
+                                .is_none_or(|c| !c.is_ascii_alphanumeric())
+                        })
+                    });
+                    assert_eq!(
+                        preceded_by_closing_keyword(&text, hash),
+                        original,
+                        "{text:?}"
+                    );
+                }
+            }
+        }
+    }
 
     fn numbers_of(kind: RefKind, mentions: &[RefMention]) -> Vec<u64> {
         mentions
