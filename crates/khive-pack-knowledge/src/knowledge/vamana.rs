@@ -812,7 +812,7 @@ impl AnnBridge {
             l2_normalize(row);
         }
         let cfg = VamanaConfig::with_dimensions(dim);
-        let index = VamanaIndex::build(&vectors, cfg).map_err(|e| format!("{e}"))?;
+        let index = VamanaIndex::build_owned(vectors, cfg).map_err(|e| format!("{e}"))?;
         Ok(Self {
             index,
             id_map,
@@ -3668,6 +3668,10 @@ pub(crate) fn simulate_warming_in_flight(ann: &SharedAnn, key: AnnKey) {
         .expect("fresh test ANN state must accept a warm")
         .leave_in_flight_for_test();
 }
+
+#[cfg(test)]
+#[path = "vamana_owned_build_tests.rs"]
+mod owned_build_tests;
 
 #[cfg(test)]
 mod tests {
