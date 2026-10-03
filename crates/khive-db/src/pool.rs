@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+use crate::database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
 use crate::error::SqliteError;
 #[cfg(windows)]
 use crate::file_identity::sqlite_opened_file_identity;
@@ -2527,6 +2528,43 @@ impl ConnectionPool {
         self.opened_file_identity
     }
 
+    /// Ownership evidence captured through the database SQLite opened.
+    /// This does not select the topology's main backend or establish a root binding.
+    /// Legacy read-only and low-space opens without a stored UUID must reopen
+    /// after installation; this accessor never installs or re-mints an identity.
+    pub fn database_owner_identity(
+        &self,
+    ) -> Result<DatabaseOwnerIdentity, DatabaseOwnerIdentityError> {
+        if self.identity_path.is_none() {
+            return Err(DatabaseOwnerIdentityError::InMemory);
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let durable_id = self
+                .opened_database_id
+                .ok_or(DatabaseOwnerIdentityError::DurableIdentityUnavailable)?;
+            let file_identity = self
+                .opened_file_identity
+                .ok_or(DatabaseOwnerIdentityError::PhysicalIdentityUnavailable)?;
+            Ok(DatabaseOwnerIdentity {
+                durable_id,
+                file_identity,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(DatabaseOwnerIdentityError::UnsupportedPlatform)
+        }
+    }
+
+    /// Require both this opened database's UUID and physical file to match.
+    pub fn verify_database_owner(
+        &self,
+        expected: &DatabaseOwnerIdentity,
+    ) -> Result<(), DatabaseOwnerIdentityError> {
+        self.database_owner_identity()?.verify_owner(expected)
+    }
+
     /// Whether the write queue is effectively enabled for this pool: the
     /// resolved `write_queue_enabled` flag AND file-backed.
     ///
@@ -3959,6 +3997,10 @@ fn pool_exhausted_error(timeout: Duration, max_readers: usize) -> SqliteError {
 #[cfg(test)]
 #[path = "runtime_write_routing_tests.rs"]
 mod runtime_write_routing_tests;
+
+#[cfg(test)]
+#[path = "database_owner_identity_pool_tests.rs"]
+mod database_owner_identity_pool_tests;
 
 #[cfg(test)]
 mod tests {
