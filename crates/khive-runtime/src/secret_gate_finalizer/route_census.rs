@@ -442,12 +442,12 @@ fn runtime_table_write_count(literal: &str) -> usize {
         for at in 0..tokens.len() {
             let insert = word_at(at, "INSERT");
             let replace = word_at(at, "REPLACE") && (at == 0 || !word_at(at - 1, "OR"));
-            let update = word_at(at, "UPDATE");
-            if !insert && !replace && !update {
+            let is_update = word_at(at, "UPDATE");
+            if !insert && !replace && !is_update {
                 continue;
             }
             let mut target = at + 1;
-            if (insert || update) && word_at(target, "OR") {
+            if (insert || is_update) && word_at(target, "OR") {
                 target += 2;
             }
             if insert || replace {
