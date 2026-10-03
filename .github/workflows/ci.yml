@@ -1328,9 +1328,17 @@ jobs:
         # nothing left for a runner slower than any in that sample. Since a miss
         # is now a red required check rather than a silent skip, the cost of
         # being tight is a blocked merge and another half hour, while the cost of
-        # being loose is wall clock on a genuine hang. 40 is 1.37x the
+        # being loose is wall clock on a genuine hang. 40 was 1.37x the
         # measurement and still well under the job budget above.
-        timeout-minutes: 40
+        #
+        # Re-measured once the suite had grown into that budget: three main
+        # pushes took 34m33s, 39m00s and 39m32s, and a pull request run that
+        # finished took 39m39s, while five pull request attempts were cut at 40
+        # minutes (one of them was 1.5 minutes behind the 39m39s run at the same
+        # test, with no test failing). The same 1.37x margin over 39m30s is 54
+        # minutes, so 55. Setup before this step took one to three minutes in
+        # the runs measured, which keeps the job budget above it.
+        timeout-minutes: 55
         working-directory: crates
         # Keep #705's instrumented replay-test margin local to that test.
         # A global checkout override made unrelated recall tests wait 300s
