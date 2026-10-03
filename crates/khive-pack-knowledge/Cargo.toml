@@ -68,6 +68,10 @@ harness = false
 name = "search_latency"
 harness = false
 
+[[bench]]
+name = "tail_replay"
+harness = false
+
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
