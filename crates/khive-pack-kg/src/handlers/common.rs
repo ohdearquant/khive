@@ -15,7 +15,7 @@ use khive_runtime::{
 use khive_storage::types::{Direction, SqlValue};
 use khive_storage::{EdgeRelation, EntityFilter, EventFilter, EventOutcome, SubstrateKind};
 
-use khive_types::{EntityKind, EventKind};
+use khive_types::{json_type_name, EntityKind, EventKind};
 
 use crate::entity_type_registry::EntityTypeRegistry;
 use crate::vocab::NoteKind;
@@ -1349,18 +1349,6 @@ pub(crate) fn render_query_result(result: QueryResult) -> Value {
     Value::Object(out)
 }
 
-/// Name a JSON value's type the way a caller's schema names it.
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 /// Refuse a value for a parameter this pack declares as an object.
 ///
 /// `param_type` is a promise to the caller and nothing was checking it. It is
@@ -1399,7 +1387,12 @@ mod param_contract_tests {
         // An array is the near miss a caller is most likely to send next, so it
         // must be refused by type rather than by a map-specific probe.
         assert!(require_object_param(Some(&json!([1, 2])), "properties").is_err());
-        assert!(require_object_param(Some(&json!(7)), "properties").is_err());
+        let err = require_object_param(Some(&json!(7)), "properties")
+            .expect_err("a number is not an object");
+        assert_eq!(
+            err.to_string(),
+            "invalid input: properties must be an object; got number"
+        );
         assert!(require_object_param(Some(&json!(true)), "properties").is_err());
     }
 
