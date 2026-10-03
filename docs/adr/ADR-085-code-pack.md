@@ -2227,3 +2227,84 @@ is not an executed proof.
 
 Ratification releases the dependent recovery change (#3736) to its normal
 review. No implementation or native acceptance is asserted by this amendment.
+
+## Amendment 15 (2026-10-03): owners without a manifest never grant L2 reuse authority
+
+**Status: Proposed.**
+
+**Clarifies:** Amendment 14's whole-owner rule. **Retains:** Amendment 10's read
+boundary, project/module/symbol identities, the Amendment 14 marker shape and
+every other Amendment 14 rule. No project property is added.
+
+### The gap
+
+Amendment 14 lets an invocation write an owner's completed marker only when that
+owner's project root, the directory of its manifest, lies inside the
+invocation's ingest `path`. When no governing manifest is found inside the
+ingest root, source ingest assigns the files to an owner named after the ingest
+root's basename and uses the ingest root itself as the project root. That
+fallback root always lies inside the invocation's `path`, so the whole-owner
+test cannot fail for it, and a subtree invocation can reach the same owner as a
+whole-owner invocation.
+
+A witness with a single manifest:
+
+```text
+/repo/Cargo.toml     [package] name = "src"
+/repo/src/alpha.rs
+/repo/other.rs
+```
+
+A whole `/repo` invocation assigns both files to owner `src` with project root
+`/repo`. An invocation whose `path` is `/repo/src` cannot read
+`/repo/Cargo.toml`, because Amendment 10 confines manifest reads to the ingest
+root. It falls back to the basename `src` and reaches the same project identity,
+and the Rust leading-`src/` rule gives `alpha.rs` the same module path under
+both invocations. Its fallback root equals its own `path`, so under Amendment 14
+alone it would write a completed marker, and the next whole invocation would
+take the unchanged-file fast path for `other.rs` while that file's edges carry
+older stamps. There is one manifest here, so the multiple-root limitation
+(#3752) does not cover this case.
+
+### Decision
+
+An owner obtained through the basename fallback has no project root in
+Amendment 14's sense, so no invocation covers it whole. An invocation writes
+such an owner's attempted marker as Amendment 14 requires and never its
+completed marker. The fallback is recorded when the governing-manifest lookup
+returns no manifest, and is carried for the rest of that invocation. It is not
+inferred afterwards by comparing the project root with the ingest root: for a
+fallback owner the two are equal by construction, so that comparison cannot
+separate a whole invocation from a subtree one. Owners resolved through a
+manifest keep Amendment 14's rule unchanged.
+
+In the witness above, the subtree invocation replaces the owner's attempted
+marker with its own run ID and leaves the earlier completed marker in place.
+The two run IDs then differ, so the next whole invocation finds no completed
+predecessor and re-observes every file.
+
+The cost is stated rather than hidden. An owner without a manifest never has a
+completed predecessor, so every L2 invocation for it re-observes every
+encountered file through the real read, parse and re-resolution path; such
+owners lose the unchanged-file fast path. Durable owner-root provenance, which
+could restore that fast path, is not specified here. It would be a separate
+amendment, proposed only with a measured cost.
+
+### Acceptance
+
+These arms join Amendment 14's acceptance under the same executed-evidence
+rules.
+
+- Run the single-manifest witness: a whole invocation, a subtree invocation,
+  then an unchanged whole invocation. The subtree invocation leaves no completed
+  marker that matches its attempt, and the final invocation parses every file
+  outside the subtree for real. Removing the fallback rule must fail this arm.
+- A manifest-governed whole invocation followed by an unchanged whole invocation
+  still writes its completed marker and takes the unchanged-file fast path.
+- A manifestless whole invocation followed by an unchanged whole invocation
+  parses for real both times, asserting the stated cost.
+
+The multiple-root limitation (#3752) remains outside the whole-owner guarantee.
+Ratifying this amendment, with Amendment 14, releases the dependent recovery
+change (#3736) to its normal review. No implementation or native acceptance is
+asserted by this amendment.
