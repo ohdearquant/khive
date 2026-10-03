@@ -2,7 +2,7 @@
 //! See `crates/khive-pack-memory/docs/api/scoring.md` for the complete scoring model.
 use std::collections::{HashMap, HashSet};
 
-pub use khive_text::is_cjk_char;
+pub use khive_text::{contains_cjk_f32 as contains_cjk, is_cjk_char};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -564,17 +564,6 @@ impl ScoringConfig {
 }
 
 // ── Utility functions ─────────────────────────────────────────────────────────
-
-/// Returns `true` when >15% of the query's characters are CJK.
-// Keep the f32 boundary: the shared f64 ratio can classify near-threshold queries differently.
-pub fn contains_cjk(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return false;
-    }
-    let cjk = chars.iter().filter(|&&c| is_cjk_char(c)).count();
-    (cjk as f32) / (chars.len() as f32) > 0.15
-}
 
 /// Normalize `min_score`: 0–1 passes through, 1–100 divides by 100, others return Err.
 pub fn normalize_min_score(score: f64) -> Result<f32, crate::config::MinScoreError> {

@@ -20,7 +20,9 @@ it occupies multiple UTF-8 bytes.
 
 `is_cjk_char` covers unified ideographs (including extensions A/B and compatibility), Hiragana,
 Katakana, and Hangul. `contains_cjk` returns true when more than 15% of characters are CJK; exactly
-15% is false.
+15% is false. It computes the ratio in `f64`. `contains_cjk_f32` keeps the memory pack's existing
+`f32` ratio at its public `scoring::contains_cjk` path. Both use the same character counts, but
+can differ near the threshold because of rounding; choose the precision required by the caller.
 
 `ScriptProfile::analyze` returns CJK fraction, ASCII-letter fraction, and total character count.
 Empty input produces zero fractions. `is_cjk_dominant` uses the same strict 15% threshold.
