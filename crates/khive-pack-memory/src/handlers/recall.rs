@@ -1481,6 +1481,13 @@ mod tests {
 
     use crate::MemoryPack;
 
+    mod timing {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_support/timing.rs"
+        ));
+    }
+
     #[test]
     fn session_retry_deadline_obeys_caller_window_but_first_attempt_does_not() {
         let now = std::time::Instant::now();
@@ -1841,8 +1848,8 @@ mod tests {
 
         // Coverage retains the watchdog and result assertions without making
         // instrumented scheduling part of the caller-latency contract.
-        if std::env::var_os("LLVM_PROFILE_FILE").is_none() {
-            let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 2;
+        let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 2;
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
             assert!(
                 elapsed < caller_bound,
                 "#836 recall exceeded its caller-derived completion bound \
@@ -4321,10 +4328,16 @@ mod tests {
             "[ADR-081 §5 latency] recall without brain pack: {without_brain:?}; \
              recall with brain pack (profile resolution + async ledger dispatch): {with_brain:?}"
         );
-        assert!(
-            with_brain < Duration::from_secs(2),
-            "profile resolution must not introduce unbounded latency, got {with_brain:?}"
-        );
+        // Dispatch uses this same cached deadline when the request has no override.
+        let caller_bound =
+            Duration::from_millis(crate::pack::recall_deadline_ms()).saturating_mul(2);
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
+            assert!(
+                with_brain < caller_bound,
+                "profile resolution exceeded its configured caller-derived completion bound \
+                 {caller_bound:?}, got {with_brain:?}"
+            );
+        }
     }
 
     // ── ADR-104 Stage A: serve-time profile projection ─────────────────────
@@ -7019,10 +7032,9 @@ mod tests {
         }
     }
 
-    /// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
-    #[tokio::test]
-    #[serial_test::serial(config_ledger)]
-    async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+    async fn held_embed_deadline_result_with_caller_delay(
+        caller_delay: Option<std::time::Duration>,
+    ) {
         const MODEL: &str = "recall-889-slow-model";
         const CALLER_DEADLINE_MS: u64 = 50;
         let hold = Arc::new(Notify::new());
@@ -7068,6 +7080,10 @@ mod tests {
             ),
         )
         .await;
+        // Simulate an instrumented caller resuming after the real recall outcome.
+        if let Some(delay) = caller_delay {
+            tokio::time::sleep(delay).await;
+        }
         let elapsed = start.elapsed();
 
         // Release the timed-out worker so it does not occupy a blocking-pool slot.
@@ -7091,14 +7107,68 @@ mod tests {
             }
         }
 
-        if std::env::var_os("LLVM_PROFILE_FILE").is_none() {
-            let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 10;
+        let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 10;
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
             assert!(
                 elapsed < caller_bound,
                 "#889 recall exceeded its caller-derived completion bound \
                  {caller_bound:?}, took {elapsed:?}"
             );
         }
+    }
+
+    /// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+        held_embed_deadline_result_with_caller_delay(None).await;
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn recall_889_coverage_delay_retains_typed_deadline_outcome() {
+        const CHILD: &str = "KHIVE_RECALL_TIMING_COVERAGE_CHILD";
+        const NAME: &str =
+            "handlers::recall::tests::recall_889_coverage_delay_retains_typed_deadline_outcome";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os("LLVM_PROFILE_FILE").is_some());
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                held_embed_deadline_result_with_caller_delay(Some(
+                    std::time::Duration::from_millis(750),
+                )),
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("child-output.txt");
+        let output = std::fs::File::create(&output_path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("LLVM_PROFILE_FILE", dir.path().join("recall-%p.profraw"))
+            .stdout(std::process::Stdio::from(output.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(output))
+            .spawn()
+            .unwrap();
+        let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= watchdog {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("coverage fixture watchdog expired; no semantic outcome");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let output = std::fs::read_to_string(output_path).unwrap();
+        assert!(status.success(), "coverage recall child failed:\n{output}");
+        assert!(
+            output.contains("1 passed; 0 failed"),
+            "coverage recall requires nonzero exact child selection: {output}"
+        );
     }
 
     // ── #30/#889: tracing-capture harness for the deadline-exceeded WARN ──────
