@@ -17,9 +17,10 @@ use khive_storage::graph::{
 use khive_storage::usage::{scope, UsageContext};
 use khive_storage::{
     DeleteMode, Edge, EdgeRelation, EdgeUpsertDisposition, Entity, Event, EventFilter, LinkId,
-    Note, PageRequest, SqlStatement, SqlValue,
+    Note, PageRequest, SqlStatement, SqlValue, StorageError, WriterTaskRequestState,
 };
 use khive_types::{EventKind, OperationAttribution, RefResolution, SubstrateKind};
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -798,6 +799,121 @@ async fn guarded_web_reconciliation_usage() {
         .is_some());
 }
 
+async fn unknown_link_usage() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let f = Fixture::new().await;
+    let usage = UsageContext::new();
+    scope(usage.clone(), attempt(&f, Path::Single, None))
+        .await
+        .expect("prime link commits");
+    assert_eq!(usage.shipping_snapshot().unwrap()["event_rows"], 1);
+    assert_eq!(
+        f.link_events().await.len(),
+        1,
+        "prime event actually persisted"
+    );
+    let commit_denied = Arc::new(AtomicBool::new(false));
+    let rollback_denied = Arc::new(AtomicBool::new(false));
+    let commit = Arc::clone(&commit_denied);
+    let rollback = Arc::clone(&rollback_denied);
+    let deny = move |context: AuthContext<'_>| match context.action {
+        // The pinned rusqlite reports SQLite COMMIT as Unknown.
+        AuthAction::Transaction {
+            operation: TransactionOperation::Unknown,
+        } => {
+            commit.store(true, Ordering::SeqCst);
+            Authorization::Deny
+        }
+        AuthAction::Transaction {
+            operation: TransactionOperation::Rollback,
+        } => {
+            rollback.store(true, Ordering::SeqCst);
+            Authorization::Deny
+        }
+        _ => Authorization::Allow,
+    };
+    let pool = f.runtime.backend().pool();
+    if std::env::var(ROUTE_ENV).as_deref() == Ok("writer") {
+        pool.writer_task_handle()
+            .unwrap()
+            .expect("real writer-task route")
+            .send_top_level(move |connection| {
+                connection
+                    .authorizer(Some(deny))
+                    .map_err(|error| StorageError::Pool {
+                        operation: "link_usage_authorizer".into(),
+                        message: error.to_string(),
+                    })
+            })
+            .await
+            .expect("install authorizer on the real writer connection");
+    } else {
+        assert_eq!(std::env::var(ROUTE_ENV).as_deref(), Ok("memory"));
+        assert!(pool.writer_task_handle().unwrap().is_none());
+        // The direct memory route uses this same pooled connection; a direct
+        // file-backed route opens an independent standalone writer instead.
+        pool.writer()
+            .unwrap()
+            .conn()
+            .authorizer(Some(deny))
+            .unwrap();
+    }
+    let error = scope(
+        usage.clone(),
+        f.runtime.link_observed(
+            &f.token,
+            id(1),
+            id(3),
+            EdgeRelation::Extends,
+            0.5,
+            None,
+            false,
+        ),
+    )
+    .await
+    .expect_err("actual COMMIT and ROLLBACK refusal");
+    assert!(
+        matches!(
+            error,
+            RuntimeError::Storage(StorageError::WriterTaskTerminated {
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+            })
+        ),
+        "real transaction finality must be unknown: {error:?}"
+    );
+    assert!(commit_denied.load(Ordering::SeqCst));
+    assert!(rollback_denied.load(Ordering::SeqCst));
+    assert_eq!(
+        usage.snapshot()["event_rows"],
+        1,
+        "uncertain event rows are not counted"
+    );
+    assert_eq!(usage.shipping_snapshot(), None, "unknown graph outcome makes the dispatch context unmeasured, including earlier committed rows");
+}
+
+async fn committed_link_usage() {
+    let f = Fixture::new().await;
+    let usage = UsageContext::new();
+    let rows = scope(
+        usage.clone(),
+        f.runtime
+            .link_many_observed(&f.token, vec![spec(id(2)), spec(id(3))]),
+    )
+    .await
+    .expect("healthy composed link batch commits");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        f.link_events().await.len(),
+        2,
+        "actual committed lifecycle rows"
+    );
+    assert_eq!(
+        usage.shipping_snapshot().unwrap()["event_rows"],
+        2,
+        "committed links still count exactly their event rows"
+    );
+}
+
 async fn exercise(name: &str) {
     match name {
         "link_observed_event_failure_rolls_back_and_retry_creates_once" => {
@@ -828,17 +944,23 @@ async fn exercise(name: &str) {
         "guarded_web_reconciliation_counts_upserts_and_retirements" => {
             guarded_web_reconciliation_usage().await
         }
+        "link_unknown_writer_outcome_omits_partial_usage"
+        | "link_unknown_direct_outcome_omits_partial_usage" => unknown_link_usage().await,
+        "link_committed_outcome_counts_exact_event_rows" => committed_link_usage().await,
         _ => panic!("unknown fixture case {name}"),
     }
 }
 fn run_case(name: &str) {
+    run_case_routes(name, &["memory", "compat", "writer"]);
+}
+fn run_case_routes(name: &str, routes: &[&str]) {
     if std::env::var(CASE_ENV).as_deref() == Ok(name) {
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(exercise(name));
         return;
     }
-    for route in ["memory", "compat", "writer"] {
+    for &route in routes {
         let dir = tempfile::tempdir().unwrap();
         let output_path = dir.path().join("child-output.txt");
         let output = File::create(&output_path).unwrap();
@@ -926,4 +1048,23 @@ fn link_attribution_and_note_event_projection_stay_on_source() {
 #[test]
 fn guarded_web_reconciliation_counts_upserts_and_retirements() {
     run_case("guarded_web_reconciliation_counts_upserts_and_retirements")
+}
+
+#[test]
+fn link_unknown_writer_outcome_omits_partial_usage() {
+    run_case_routes(
+        "link_unknown_writer_outcome_omits_partial_usage",
+        &["writer"],
+    );
+}
+#[test]
+fn link_unknown_direct_outcome_omits_partial_usage() {
+    run_case_routes(
+        "link_unknown_direct_outcome_omits_partial_usage",
+        &["memory"],
+    );
+}
+#[test]
+fn link_committed_outcome_counts_exact_event_rows() {
+    run_case("link_committed_outcome_counts_exact_event_rows");
 }
