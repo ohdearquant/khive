@@ -49,8 +49,17 @@ impl Fixture {
         for name in ["Context A", "Context B", "Independent annotation"] {
             ids.push(
                 runtime
-                    .create_entity(&token, "concept", None, name, None, None, vec![])
+                    .create_entity_with_embedding_report(
+                        &token,
+                        "concept",
+                        None,
+                        name,
+                        None,
+                        None,
+                        vec![],
+                    )
                     .await
+                    .map(|(row, _report)| row)
                     .expect("seed context entity")
                     .id,
             );

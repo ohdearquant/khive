@@ -138,9 +138,19 @@ mod search_text_reason_tests {
 
         let runtime = server.runtime.as_ref().expect("single runtime");
         let token = runtime.authorize(Namespace::local()).expect("local namespace");
-        let entity = runtime.create_entity(
-            &token, "concept", None, "quartzfixture", Some("indexed local reference"), None, vec![],
-        ).await.expect("seed indexed entity");
+        let entity = runtime
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "quartzfixture",
+                Some("indexed local reference"),
+                None,
+                vec![],
+            )
+            .await
+            .map(|(row, _report)| row)
+            .expect("seed indexed entity");
         for (label, query, limit, count) in [
             ("positive", "quartzfixture", 10, 1),
             ("no matching token", "unmatchedquartz", 10, 0),
@@ -371,9 +381,19 @@ mod search_text_reason_tests {
             ];
             let mut ids = Vec::new();
             for (name, description) in names.iter().zip(&descriptions) {
-                let entity = runtime.create_entity(
-                    &token, "concept", None, name, Some(description), None, vec![],
-                ).await.expect("entity and its real FTS/vector indexes");
+                let entity = runtime
+                    .create_entity_with_embedding_report(
+                        &token,
+                        "concept",
+                        None,
+                        name,
+                        Some(description),
+                        None,
+                        vec![],
+                    )
+                    .await
+                    .map(|(row, _report)| row)
+                    .expect("entity and its real FTS/vector indexes");
                 ids.push(entity.id);
             }
             assert_eq!(ids.len(), 3);

@@ -1208,11 +1208,10 @@ mod tests {
             let result = khive_storage::scope_request_read_deadline(Duration::ZERO, async {
                 match family {
                     0 => runtime.embed_with_model("queue-test", "later").await,
-                    1 => {
-                        runtime
-                            .embed_document_with_model("queue-test", "later")
-                            .await
-                    }
+                    1 => runtime
+                        .embed_document_with_model_outcome("queue-test", "later")
+                        .await
+                        .map(|outcome| outcome.vector),
                     2 => runtime.embed_query_with_model("queue-test", "later").await,
                     3 => runtime
                         .embed_batch_with_model("queue-test", &texts)

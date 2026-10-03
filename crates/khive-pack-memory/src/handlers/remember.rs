@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::keyed_memory::{
-    create_keyed_memory_with_receipt, validate_memory_key, KeyedMemorySpec,
+    create_keyed_memory_with_receipt_and_report, validate_memory_key, KeyedMemorySpec,
 };
 use khive_runtime::{micros_to_iso, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{Direction, NeighborQuery};
@@ -119,38 +119,41 @@ impl MemoryPack {
 
         let annotates_target = annotates.first().copied();
 
-        let (note, keyed_edge_id, replayed, vector_fences) = if let Some(key) = p.key.as_deref() {
-            create_keyed_memory_with_receipt(
-                &self.runtime,
-                write_token,
-                KeyedMemorySpec {
-                    content: &p.content,
-                    key,
-                    salience,
-                    decay_factor,
-                    properties: props,
-                    source_id: annotates_target,
-                    embedding_model: p.embedding_model.as_deref(),
-                },
-            )
-            .await?
-        } else {
-            let (note, fences) = self
-                .runtime
-                .create_note_with_decay_for_embedding_model_with_visibility(
+        let (note, keyed_edge_id, replayed, vector_fences, embedding_truncation) =
+            if let Some(key) = p.key.as_deref() {
+                create_keyed_memory_with_receipt_and_report(
+                    &self.runtime,
                     write_token,
-                    "memory",
-                    None,
-                    &p.content,
-                    Some(salience),
-                    decay_factor,
-                    Some(props),
-                    annotates,
-                    p.embedding_model.as_deref(),
+                    KeyedMemorySpec {
+                        content: &p.content,
+                        key,
+                        salience,
+                        decay_factor,
+                        properties: props,
+                        source_id: annotates_target,
+                        embedding_model: p.embedding_model.as_deref(),
+                    },
                 )
-                .await?;
-            (note, None, false, fences)
-        };
+                .await?
+            } else {
+                // Retain both diagnostics after the committed write so bounded
+                // embedding input does not skip the ANN generation bump below.
+                let (note, fences, truncation) = self
+                    .runtime
+                    .create_note_with_decay_for_embedding_model_with_visibility_and_report(
+                        write_token,
+                        "memory",
+                        None,
+                        &p.content,
+                        Some(salience),
+                        decay_factor,
+                        Some(props),
+                        annotates,
+                        p.embedding_model.as_deref(),
+                    )
+                    .await?;
+                (note, None, false, fences, truncation)
+            };
 
         if !replayed {
             // Preserve the stale graph as a fast fallback; generation is the invalidation signal.
@@ -239,6 +242,10 @@ impl MemoryPack {
         }
         if replayed {
             response["replayed"] = json!(true);
+        }
+        if embedding_truncation.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
         to_json(&response)
     }
@@ -444,8 +451,17 @@ mod tests {
         let registry = builder.build().expect("registry");
 
         let source = rt
-            .create_entity(&token, "concept", None, "replay source", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "replay source",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(row, _report)| row)
             .expect("source entity");
         let args = serde_json::json!({
             "content": "replayed memory answers from the store",
