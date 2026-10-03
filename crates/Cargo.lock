@@ -2645,6 +2645,7 @@ dependencies = [
  "khive-runtime",
  "khive-score",
  "khive-storage",
+ "khive-text",
  "khive-types",
  "khive-vamana",
  "lattice-embed",
