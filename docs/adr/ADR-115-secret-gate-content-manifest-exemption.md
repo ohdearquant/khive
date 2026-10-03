@@ -1578,3 +1578,326 @@ both the new unmapped repair and the obsolete orphan. Real-path replay acceptanc
 
 Source classification and authored fixtures are not executed acceptance; stamp activation
 remains subject to the existing finalizer gates.
+
+## Proposed amendment (2026-10-03): masking third-party channel text
+
+**Status**: Proposed. Refs [#1840](https://github.com/ohdearquant/khive/issues/1840).
+No masking policy or new admission surface is activated by this proposal.
+
+### Ownership and the decision still required
+
+ADR-115 owns the canonical detector, permanent masking surfaces, final stored candidate,
+reserved posture and later-write inventory. It therefore owns this proposed change from refusing
+channel text to storing a transformed candidate. [ADR-056](ADR-056-channel-transport-layer.md)
+continues to own transport authentication, channel attribution, deduplication and polling progress.
+Its rule that adapter credentials stay out of notes is distinct from handling credentials supplied
+by a third party in message content. This proposal changes neither that rule nor sender trust.
+
+An actor authoring a write can redact a refused candidate and retry. A recipient cannot rewrite
+mail already delivered by another person. Quarantine contains that delivery failure without
+making the original message readable as an ordinary message. The issue asks whether permanent
+masking can preserve more useful text. That tradeoff is unresolved: storing a masked message and
+archiving an original are two decisions, with different disclosure and retention consequences.
+The shipped quarantine disposition remains the baseline until ratification and implementation
+acceptance. Existing accepted text, manifest activation gates and ordinary actor refusal remain
+in force.
+
+This account is pinned to source revision `e534fc35`. It describes source behavior, not a measured
+runtime result. Future adapters and other source revisions need their own route evidence.
+
+### Actual acquisition routes and the trust boundary
+
+The allocated source contains two external channel adapters and daemon poll registrations:
+
+| Acquisition path | Normalized stored candidate                                             | Available replay bytes                                                                  | Attribution remains separate                                                                                                                                      |
+| ---------------- | ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Email polling    | MIME-decoded text body, normalized subject, addresses and wire metadata | Fetched RFC message bytes, including headers and body, when fetched bytes are available | Authentication alignment and sender allowlist are checked first; attribution failure may enter an explicitly quarantined envelope, or be dropped by configuration |
+| Telegram polling | Actionable `message.text` from the configured chat and allowed sender   | UTF-8 text only                                                                         | Chat/sender filtering remains mandatory; replay is not the Bot API update, HTTP response or authentication wrapper                                                |
+
+Sources: [email normalization and attribution](../../crates/khive-channel-email/src/channel.rs)
+(lines 255–340 and 441–532), [IMAP byte acquisition](../../crates/khive-channel-email/src/connector/imap.rs)
+(lines 346–405 and 628–678), [Telegram acquisition](../../crates/khive-channel-telegram/src/channel.rs)
+(lines 79–128), and [daemon composition](../../crates/khive-mcp/src/serve.rs)
+(lines 610–675 and 2073–2156). The Telegram dispatch currently omits envelope metadata, subject and
+wire headers (lines 2296–2307); its replay text does not preserve those missing fields. Neither an
+iMessage nor a node-channel implementation is present in this source tree. ADR descriptions or
+separate future implementations do not establish an eligible route here.
+
+`comm.ingest` is an in-process `Subhandler`, requires a held capability and still reaches the
+ordinary content gate. The capability can also be granted by a direct composition root
+([pack.rs](../../crates/khive-runtime/src/pack.rs), lines 4676–4714). It proves permission to compose
+that write surface, not acquisition from a third party or authentication of its sender. A verb
+name, `channel_kind`, actor prefix, namespace, JSON metadata flag or caller assertion must not
+select a redact-instead-of-refuse policy. The ordinary public send, reply, create and update
+surfaces remain refusal surfaces, including when an actor copies external text into a request.
+
+If ratification adds an eligible masking path, its acquisition evidence must be created inside
+the registered adapter/composition path, bound to the actual envelope and delivery identity,
+and unavailable to request deserialization or caller property writes. A possible design is a
+non-serializable typed acquisition capability consumed at that boundary; its API and all issuance
+sites require an explicit decision. The existing generic ingest capability alone is insufficient.
+This is an application composition boundary, not a new security boundary against code controlling
+the trusted same-user process. Masking must never promote an attribution-quarantined email into an
+authenticated sender's ordinary message. Its quarantined attribution must remain visible even if
+its display text can be made safe.
+
+### Where original bytes live today
+
+The permanent ingest-failure path in [serve.rs](../../crates/khive-mcp/src/serve.rs), lines 932–936,
+selects bytes independently of the display string:
+
+```rust
+let (replay_bytes, notification_to) = envelope
+    .quarantine_replay
+    .as_ref()
+    .map(|replay| (replay.bytes.as_slice(), replay.notification_to.as_str()))
+    .unwrap_or_else(|| (envelope.content.as_bytes(), envelope.to.as_str()));
+```
+
+Within the retention bound it publishes those bytes using
+`.dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))` (lines 948–950), then writes
+a body-free notification with `quarantine_content_ref` and a `quarantine-original` attachment.
+The runtime validates the published blob and commits the note and attachment owner together
+([operations.rs](../../crates/khive-runtime/src/operations.rs), lines 4511–4537 and 4560–4630).
+A property reference alone is not durable ownership. If the count cap is reached, the source
+instead says: “quarantine retention limit reached; recording the refused message without its
+original bytes” (serve.rs, lines 963–968). That safe notification is still gated before the item
+counts as handled. Publication or notification failures hold progress rather than certify delivery.
+
+The word _original_ is route-specific. Normal and parse-failed fetched email can retain fetched
+RFC bytes; oversized or missing-body email may have no fetched payload and produce an empty
+replay vector. Telegram retains text, not its full transport record. Content fallback is only the
+normalized UTF-8 body. None of these byte vectors is an IMAP session or a copy of adapter credentials.
+A proposal must record byte extent and absence rather than promise universal lossless replay.
+
+[blob.rs](../../crates/khive-db/src/stores/blob.rs) lays objects out as
+`<root>/<hex[0..2]>/<hex[2..4]>/<hex>` (line 3; the Unix lookup opens the same two shard levels
+without following links, lines 192–193). The content reference is a BLAKE3 digest of the
+original bytes, and publication writes those raw bytes without an encryption transform at this
+seam (lines 1090–1141). Root precedence is `KHIVE_BLOB_ROOT`, configured root, then `<db_dir>/blobs`
+(lines 814–838). Unix temporary publication uses mode `0o600`; this does not prove deployment-wide
+ACLs, encrypted storage, backup deletion or isolation from other processes under the same account.
+The reference itself also reveals equality of identical retained objects.
+
+[CommPack](../../crates/khive-pack-comm/src/pack.rs), line 65, initializes
+`quarantine_retention: std::time::Duration::from_secs(14 * 24 * 60 * 60)`, with an explicit retention
+setter. Email's retained-record limit defaults to 256 and counts live quarantined notes across the
+ingest namespace, not bytes or only notes owning originals; Telegram has no equivalent count cap.
+A matching quarantine replay can extend expiry. Cleanup is bounded and runs before polling, so
+outages or cleanup errors can delay it. Current source runs both named-channel and legacy-slugless
+cleanup passes (serve.rs, lines 1083–1115); older lifecycle prose excluding slugless records is not
+the current source contract.
+
+Expiry detaches ownership and hard-deletes the note; it does not directly erase the CAS object.
+Physical sweep has separate admission and grace rules. At this revision its gate admits only an
+exact completed contiguous V21 schema epoch and refuses later epochs, including report-only sweep
+(blob.rs, lines 1624–1681 and 2920–2935). Fourteen days is therefore not a physical-byte deletion
+promise. Copies in provider storage, backups, replicas, logs or prior derived data require separate
+retention decisions.
+
+The current [blob.get handler](../../crates/khive-pack-blob/src/handlers.rs), lines 332–420, accepts a
+known reference and returns verified bytes as base64. It does not use its local namespace token
+for a per-reference recipient or quarantine-operator ACL. General gate/composition policy may
+restrict the verb, but “replay-only” or “operator-only” access is not established by this handler.
+Message properties disclose the reference. A masked body cannot by itself make that original
+private.
+
+Failure warnings omit the body and `QuarantineReplay` debug output exposes only byte length, but
+`ChannelEnvelope` derives `Debug` and includes normalized content
+([channel types](../../crates/khive-channel/src/lib.rs), lines 25–77). This does not prove that a
+particular deployment logs bodies; it prevents a universal no-body-log claim. Effective logging
+and all additional copies remain separate evidence obligations.
+
+### Read, search and embedding surfaces
+
+`comm.read` is not acknowledgement-only by default: [ReadParams](../../crates/khive-pack-comm/src/params.rs),
+lines 91–104, sets `#[serde(default = "read_body_by_default")]`, and that function returns `true`.
+The read handler returns stored content, subject, addresses, direction and creation time; `body=false`
+omits those body fields while retaining the acknowledgement/properties shape. Thread rendering
+also exposes stored content and properties, after its visibility and canonical-copy selection.
+Neither path hydrates a replay blob ([handlers.rs](../../crates/khive-pack-comm/src/handlers.rs),
+lines 1071–1098 and 1239–1258; [message.rs](../../crates/khive-pack-comm/src/message.rs), lines 158–220).
+Generic authorized `get` also returns the stored note.
+
+For a future message masked **before persistence**, these body views would show the replacement
+text and its ratified report, while `body=false` would retain its existing acknowledgement behavior.
+The quarantine baseline instead shows the neutral notification, optional original reference and
+quarantine disposition. A display-only mask applied after retrieving unmasked storage would leave
+other storage readers and derived copies exposed and is not equivalent to masked persistence.
+
+Current trusted insertion scans the final content, name and whole JSON properties before writing.
+FTS derives from stored name/content, and the message DefaultModel embedding derives from stored
+content ([operations.rs](../../crates/khive-runtime/src/operations.rs), lines 4551–4559 and 4635–4696;
+[pack.rs](../../crates/khive-pack-comm/src/pack.rs), lines 44–48). Raw replay bytes do not enter that
+ordinary path. However, atomic note preparation has a separate explicit `embedding_content` input
+([atomic_message.rs](../../crates/khive-runtime/src/atomic_message.rs), lines 479–558). A new path
+must not retain an unmasked embedding override, alternate body, property, event payload or log
+copy. The full writer/event/embedding-error inventory has not been established by this proposal;
+ratification cannot infer it from the body path alone.
+
+### Options and their disclosure consequences
+
+These are alternatives for ratification, not four newly supported modes.
+
+**A. Persist a permanent mask and a detector report, without adding a raw archive.** Transform
+approved display strings, pass the final candidate through the ordinary gate, and store only that
+candidate plus a runtime-owned report. Reads, FTS, recall snippets and embeddings see the masked
+candidate. An operator sees the safe text and bounded categories, not the removed bytes. Any
+previously published original remains subject to its existing retention/access rules; this option
+must not claim to erase historical CAS or provider copies. Replay must come from whatever the
+provider retains, with availability and byte extent recorded as unknown unless established. If
+operators require local exact originals for future recovery, that requirement selects option C.
+A heuristic false positive loses useful text in this option; a true credential is absent from the
+new searchable row but may still be present at its provider. Later edits may add clean text, but
+must preserve masking history and cannot use a report flag to bypass refusal on new content.
+
+**B. Keep the shipped quarantine disposition.** Store a neutral alert and conditionally retain
+route-specific bytes in CAS with the existing owner. Search, recall and embedding of that alert do
+not expose the refused body. Operators with raw-reference access can retrieve the original,
+including a real credential; quarantine does not turn CAS into a vault. Retention/caps/cleanup
+limitations above remain. Matching duplicates preserve the stored body, may repair only a matching
+original owner and extend expiry; conflicting originals refuse. No supported automatic promotion,
+release or raw-reingest handler was found at this revision. Any future recovery path must retain
+ordinary gate refusal or obtain its own accepted masking contract. Current actor updates cannot
+legitimately unmask via an exemption; they do not establish an immutable future masking-history
+field. This option contains polling failure but does not deliver the original message's useful text.
+
+**C. Persist a masked message and retain an original only in a controlled replay store.** The
+ordinary searchable, readable and embedded copy is the same as A. The operator replay copy is
+verbatim within its declared byte extent, so a real inbound credential is still stored locally.
+This most closely matches the issue's display-copy intent, but accepted masked messages do not
+currently all publish originals: adding that archive is a new behavior, not reuse of a universal
+existing guarantee. It also requires an explicit relationship to Amendment 2's
+permanent mask-only stored-target contract: its wrappers cannot acquire admission, an alternate
+raw payload or a new exemption event merely by being called from a channel. Ratification must choose the store, reader authorization, encryption/key
+policy, retention and effective deletion limits, backup treatment, resource bounds and durable
+owner. Using today's CAS plus a disclosed ref alone does not provide replay-only access. Required
+owner/report/message writes must commit coherently, and failed archive publication must not be
+reported as a successfully archived message. Replay must be explicit and must never hydrate
+ordinary reads, search or embedding. Re-ingest transforms again under a versioned policy; it must
+not silently restore the original into stored content or clear masking history.
+
+**D. Store a body-free notification without a new local raw archive.** This is informed by the
+current retention-cap fallback. Search and embeddings see only safe disposition metadata; there
+is no new local original for a raw-lookup reader to disclose. Operators must retrieve provider-side
+content or request a manual redacted resend, subject to provider retention/access that this source
+does not establish. A notification link or metadata token is itself a gate surface and cannot
+smuggle a credential. Existing raw copies are not erased. Later notification edits remain ordinary
+actor writes, while any future import of recovered content must re-enter its designated gate.
+This minimizes local retention but sacrifices offline lossless replay and more message utility
+than A or C.
+
+All four options need a stated scope for previously stored rows, historical embeddings, exports
+and backups. Prospective masking cannot certify retroactive cleansing. A masked record must be
+described as a transformed, potentially lossy acquisition record, not a byte-exact original. This
+is a deliberate write/retention policy decision, not permission to rewrite existing history just
+to improve a view; retroactive migration or deletion requires its own authority and contract. Resource limits and failure
+dispositions must be explicit rather than silently changing quarantine retention or schema admission.
+
+### Requirements proposed for any permanent masked-message path
+
+These obligations describe what would need acceptance; they do not allocate an implementation.
+
+1. **One detector and a truthful report.** Use the canonical detector semantics, not a new channel
+   recognizer. The public `SecretMatch` reports a first detector, diagnostic excerpt and containing
+   field, not all offsets. The existing private span collector discards detector labels, selects
+   nonoverlapping leftmost matches and can conservatively redact the remaining tail at its work
+   cap ([secret_gate.rs](../../crates/khive-runtime/src/secret_gate.rs), lines 66–79, 243–365 and
+   586–657). It cannot supply a complete class report as-is. Ratify a typed result with field paths,
+   transformation version, categories for actual detected matches and an explicit work-limit or
+   conservative-tail disposition. Decide overlap attribution; never label every removed tail byte
+   as a confirmed credential. Retain bounded work and valid UTF-8 boundaries. If the required
+   truthful report cannot be produced, keep quarantine rather than invent provenance.
+2. **A replacement without original fragments.** The diagnostic first-six-character preview is
+   not a stored mask: it retains original characters. The current whole-span `***MASKED***` marker
+   is a candidate format, not executed proof that every resulting message passes the gate. Marker,
+   surrounding context and new report strings must pass the ordinary final scan. A report carrying
+   long source hashes, opaque IDs, class labels or trigger words can itself retrigger a contextual
+   detector. Masking must have a bounded post-pass/failure disposition; no exemption or repeated
+   unbounded remasking may rescue a failing candidate.
+3. **All final string surfaces.** Define which display fields may be transformed: body, subject,
+   names and designated metadata values. The gate scans JSON keys as well as recursive string
+   leaves, and ingest includes address/actor/thread/wire identity strings. Do not blindly rename
+   JSON keys, mask IDs or rewrite routing/authentication controls: collisions and broken delivery
+   identity are possible. Refuse or isolate unresolved structural fields according to a ratified
+   rule. Scan final stored fields and every derived-text input, including any embedding override;
+   never retain an unmasked alternate payload in properties, diagnostics or audit events.
+4. **Separate provenance from admission.** A durable masking report is runtime-owned history,
+   not `khive:secret_gate` manifest admission, `khive:web_receipt`, a success exemption event or a
+   caller-forgeable flag. Its field name, schema and protection are not chosen here. Current
+   finalizer scaffolding is explicitly unwired, and a reserved-looking name does not protect a new
+   field. The future contract must inventory create, bulk/atomic, update, whole-object carry,
+   patch/removal, merge, restore/copy and proposal application; forbid forging or clearing history
+   through these routes. Ordinary refusal prevents newly detected content from being written; it
+   is not a proof that provenance survives every later edit. A legitimate clean edit may replace
+   text only under the ratified history rule, with no silent unmask or automatic original hydration.
+5. **Stable identity and replay.** Transport external/channel identity must remain independent of
+   transformed display text. Do not derive delivery IDs from a masked body. Pin or otherwise
+   specify transform-version behavior so identical deliveries retry deterministically. A matching
+   stored duplicate is not authorization to overwrite its body or conflicting raw owner. Distinguish
+   transport dedup from actor-keyed messages, whose exact content/subject/tags/idempotency payload
+   checks must remain intact. Any re-ingest, algorithm upgrade or repair policy needs an explicit
+   conflict/version rule rather than changing these equalities implicitly.
+6. **Coherent publication and polling progress.** Commit the final note, required report and any
+   required original ownership with the existing transaction discipline. Search/embedding must
+   derive safe fields; optional derived-work failure must not create an unmasked side copy. Preserve
+   typed retryable failure, permanent quarantine, unknown-failure bounds and actual checkpoint/offset
+   semantics. A masker, post-pass, report, byte publication or note failure cannot certify terminal
+   success or advance progress merely because a replacement string was constructed. Do not run
+   model-based redaction or other unbounded work inside the writer transaction.
+
+### Refutation and limits
+
+- “`comm.ingest` is internal, therefore its input is externally acquired” confuses composition
+  authorization with origin. Direct roots can grant it; callers cannot obtain mask privilege by
+  labeling their request as email or Telegram.
+- “The original is already stored exactly, so retention and privacy do not change” is false for
+  empty/unavailable email replay, text-only Telegram, cap fallback and accepted messages that never
+  entered quarantine. A new accepted-message archive expands retained sensitive data.
+- “The blob is only an operator replay copy” is not an enforced property of the current raw-ref
+  handler. A safe note with an exposed ref can coexist with recoverable raw credentials.
+- “Expiry means erasure” ignores delayed cleanup, duplicate extension, separate sweep admission,
+  grace, shared ownership and external copies. Note expiry cannot promise a deletion deadline.
+- “Mask the body at read time” leaves storage, other readers, FTS/embedding inputs and exports
+  potentially unmasked. Persisted masking still needs a raw-store policy and alternate-field census.
+- “First-six preview is enough” retains original material and is not the canonical replacement.
+  “The canonical masker already returns classes” overlooks discarded labels, overlap selection and
+  conservative tail redaction. Neither proves a durable class report or idempotent final candidate.
+- “A mask flag prevents unmasking later” is false until all relevant mutation routes protect its
+  provenance and final stored candidate. Detection is heuristic; passing the scanner is not proof
+  that no unknown credential remains. This proposal changes no detector or exemption policy.
+- “Quarantine solved delivery” equates a terminal safe alert with delivery of useful third-party
+  text. Conversely, “masking authenticates the sender” is false: authentication/quarantine state
+  must remain independent of the content transformation.
+
+### Questions that ratification must answer
+
+1. Which option governs new and historical records? If A or C is chosen, which exact adapter
+   issuance sites and attribution states are eligible, and what non-wire evidence binds them?
+2. Which original byte extent is promised per route, what happens when bytes are absent/oversized,
+   and may ingestion succeed without a replay copy? Does retaining true credentials locally serve
+   a necessary recovery purpose, and is irreversible loss of false-positive text acceptable?
+3. For retained originals, who may read them and through which authorization boundary? What store,
+   encryption/key ownership, caps, expiry, shared-owner handling, GC prerequisite and backup policy
+   make those claims enforceable? What happens when effective deletion cannot be promised?
+4. Which fields may be transformed, and which identity/control fields or JSON keys must refuse?
+   What are the byte/work limits, overlap policy, conservative-tail and final-rescan outcomes?
+5. What is the report schema/version, complete class semantics, runtime-owned write protection and
+   later-edit history rule? What metadata can be disclosed without copying original fragments or
+   producing another gate refusal? Which event/log/embedding surfaces require additional inventory?
+6. How are transform upgrades, duplicate deliveries, keyed replay, conflicting original bytes,
+   repair and explicit re-ingest handled without breaking identity or restoring unmasked storage?
+7. Which ordinary views expose the report or raw reference? Will raw access be independently
+   restricted, and how will operator recovery avoid automatic hydration into search/read/embed paths?
+8. What synthetic real-path acceptance and independent must-refuse controls are required before
+   activation, and who approves the completed writer/access/retention contract?
+
+Required acceptance would cover actual email and Telegram acquisition paths with synthetic true
+credentials and benign detector matches; forged origin metadata and ordinary actor refusal;
+attribution-quarantined email; multiple/overlapping spans, Unicode bridges and bounded tail behavior;
+all final string fields and marker/report rescanning; exact replay/version conflicts; body-default
+and acknowledgement-only reads, thread/get/search/embedding views; raw-access refusal if promised;
+publication/commit/checkpoint faults; delayed cleanup/unsupported GC; and later edit, merge, atomic
+and proposal routes. Controls must reach the relevant runtime boundary after a selected normal
+passes, then fail semantically rather than through an absent API or setup error. This docs-only
+proposal supplies no executable acceptance or native verdict and selects no option for activation.
