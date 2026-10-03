@@ -36,6 +36,13 @@ pub(crate) struct DeliveredParams {
     pub id: String,
 }
 
+/// Exact outbound UUID for the sender-local transport status read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransportStatusParams {
+    pub id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboxParams {

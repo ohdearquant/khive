@@ -14,7 +14,7 @@ use crate::handlers;
 use crate::inbox_signal::InboxSignal;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
-/// Communication pack providing ten public `comm.*` verbs.
+/// Communication pack providing eleven public `comm.*` verbs.
 ///
 /// Stores and queries `message` notes in the standard notes table; message
 /// metadata lives in the `properties` JSON column.
@@ -411,6 +411,9 @@ impl PackRuntime for CommPack {
                 handlers::handle_send(self.runtime(), &self.inbox_signal, token, params).await
             }
             "comm.delivered" => handlers::handle_delivered(self.runtime(), token, params).await,
+            "comm.transport_status" => {
+                handlers::handle_transport_status(self.runtime(), token, params).await
+            }
             "comm.inbox" => {
                 handlers::handle_inbox(self.runtime(), &self.inbox_signal, token, params).await
             }
