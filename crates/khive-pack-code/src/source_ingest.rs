@@ -1535,7 +1535,7 @@ async fn reresolve_pass(
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT id, kind, properties FROM entities WHERE namespace=?1 \
+            sql: "SELECT id FROM entities WHERE namespace=?1 \
                   AND deleted_at IS NULL \
                   AND json_extract(properties,'$.unresolved_specifiers') IS NOT NULL"
                 .into(),
@@ -4733,6 +4733,10 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
 #[cfg(test)]
 #[path = "source_ingest/owner_alias_tests.rs"]
 mod owner_alias_tests;
+
+#[cfg(test)]
+#[path = "source_ingest/reresolve_projection_tests.rs"]
+mod reresolve_projection_tests;
 
 #[cfg(test)]
 mod l2_batch_tests;
