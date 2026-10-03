@@ -5,14 +5,11 @@
 //! needed — pack-memory owns its own posterior lifecycle.
 //! See `crates/khive-pack-memory/docs/api/memory-lifecycle.md`.
 
-use khive_brain_core::{BalancedRecallState, BetaPosterior, FeedbackEventKind, FeedbackSignal};
+use khive_brain_core::{
+    BalancedRecallState, BetaPosterior, BrainSignal, FeedbackEventKind, FeedbackSignal,
+    ServeAttribution,
+};
 use uuid::Uuid;
-
-/// Threshold below which a recall is considered "fast" for temporal posterior updates.
-///
-/// 50 000 µs = 50 ms. Local SQLite FTS5 completes in 1–20 ms under normal conditions;
-/// 50 ms provides headroom for contention while staying below the 250 ms rerank budget.
-const FAST_US: i64 = 50_000;
 
 /// Called after a successful `memory.recall` that returned at least one result.
 ///
@@ -20,17 +17,12 @@ const FAST_US: i64 = 50_000;
 /// - `temporal`: success if `latency_us` ≤ 50 ms, failure otherwise
 /// - per-entity posterior: success for `target_id`
 pub fn on_recall_hit(state: &mut BalancedRecallState, target_id: Uuid, latency_us: i64) {
-    state.total_events += 1;
-    state.relevance.update_success();
-    if latency_us <= FAST_US {
-        state.temporal.update_success();
-    } else {
-        state.temporal.update_failure();
-    }
-    let posterior = state
-        .entity_posteriors
-        .get_or_insert(target_id, || BetaPosterior::new(1.0, 1.0));
-    posterior.update_success();
+    state.apply_signal(&BrainSignal::RecallHit {
+        target_id,
+        latency_us,
+        served_by_profile_id: None,
+        serve_attribution: ServeAttribution::Unspecified,
+    });
 }
 
 /// Called after a `memory.recall` that returned no results.
@@ -38,9 +30,7 @@ pub fn on_recall_hit(state: &mut BalancedRecallState, target_id: Uuid, latency_u
 /// - `relevance`: failure
 /// - `temporal`: failure
 pub fn on_recall_miss(state: &mut BalancedRecallState) {
-    state.total_events += 1;
-    state.relevance.update_failure();
-    state.temporal.update_failure();
+    state.apply_signal(&BrainSignal::RecallMiss);
 }
 
 /// Called when an agent provides explicit feedback on a recalled entity.

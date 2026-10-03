@@ -67,6 +67,40 @@ fn assert_row_driver(error: &RuntimeError, expected_source: &str) {
     assert!(source.to_string().contains(expected_source), "{error:?}");
 }
 
+fn refuse_cold_graph_accessor(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+) -> RuntimeResult<std::sync::Arc<dyn khive_storage::GraphStore>> {
+    // Schema readiness belongs to a backend, so use a fresh backend for the
+    // actual constructor refusal rather than asking a warmed accessor to run DDL.
+    let backend = khive_db::StorageBackend::sqlite_for_test(
+        runtime
+            .config()
+            .db_path
+            .as_ref()
+            .expect("file-backed fixture"),
+    )
+    .expect("fresh backend for the existing fixture database");
+    {
+        let writer = backend.pool().try_writer().expect("cold backend writer");
+        writer
+            .conn()
+            .execute_batch("DROP INDEX IF EXISTS idx_graph_edges_ns_src_rel; PRAGMA query_only=ON")
+            .expect("arm actual constructor DDL refusal");
+    }
+    let result = backend
+        .graph_for_namespace(token.namespace().as_str())
+        .map_err(RuntimeError::from);
+    {
+        let writer = backend.pool().try_writer().expect("cold backend writer");
+        writer
+            .conn()
+            .execute_batch("PRAGMA query_only=OFF")
+            .expect("clear constructor DDL refusal");
+    }
+    result
+}
+
 #[tokio::test]
 async fn batch_edges_align_foreign_missing_deleted_and_duplicate_ids() {
     let (_dir, runtime, token) = fixture();
@@ -224,15 +258,7 @@ async fn batch_edge_decode_error_beats_later_actual_accessor_refusal() {
     let mut accessor_refused = false;
     let error = KhiveRuntime::hydrate_edge_read_window(&ids, window, |record_token| {
         if record_token.namespace().as_str() == "second-refused" {
-            let writer = runtime.backend().pool().try_writer().unwrap();
-            writer
-                .conn()
-                .execute_batch(
-                    "DROP INDEX IF EXISTS idx_graph_edges_ns_src_rel; PRAGMA query_only=ON",
-                )
-                .unwrap();
-            drop(writer);
-            let result = runtime.graph(record_token);
+            let result = refuse_cold_graph_accessor(&runtime, record_token);
             accessor_refused = result.is_err();
             return result;
         }
@@ -240,13 +266,6 @@ async fn batch_edge_decode_error_beats_later_actual_accessor_refusal() {
     })
     .await
     .unwrap_err();
-    {
-        let writer = runtime.backend().pool().try_writer().unwrap();
-        writer
-            .conn()
-            .execute_batch("PRAGMA query_only=OFF")
-            .unwrap();
-    }
     assert!(
         accessor_refused,
         "actual SQLite DDL refusal must be observed"
@@ -273,30 +292,16 @@ async fn batch_edge_accessor_failure_keeps_group_first_index_when_group_order_re
             window.groups.reverse();
         }
         let mut actual_refusal = false;
-        let error =
-            KhiveRuntime::hydrate_edge_read_window(&ids, window, |record_token| {
-                if record_token.namespace().as_str() == "first-refused" {
-                    {
-                        let writer = runtime.backend().pool().try_writer().unwrap();
-                        writer.conn().execute_batch(
-                        "DROP INDEX IF EXISTS idx_graph_edges_ns_src_rel; PRAGMA query_only=ON"
-                    ).unwrap();
-                    }
-                    let result = runtime.graph(record_token);
-                    actual_refusal = result.is_err();
-                    {
-                        let writer = runtime.backend().pool().try_writer().unwrap();
-                        writer
-                            .conn()
-                            .execute_batch("PRAGMA query_only=OFF")
-                            .unwrap();
-                    }
-                    return result;
-                }
-                runtime.graph(record_token)
-            })
-            .await
-            .unwrap_err();
+        let error = KhiveRuntime::hydrate_edge_read_window(&ids, window, |record_token| {
+            if record_token.namespace().as_str() == "first-refused" {
+                let result = refuse_cold_graph_accessor(&runtime, record_token);
+                actual_refusal = result.is_err();
+                return result;
+            }
+            runtime.graph(record_token)
+        })
+        .await
+        .unwrap_err();
         assert!(actual_refusal);
         assert!(
             error.to_string().contains("readonly"),

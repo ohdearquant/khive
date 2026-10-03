@@ -416,7 +416,7 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let search_start = Instant::now();
-        let request = ValidatedSearchRequest::from_value(params, registry)?;
+        let request = ValidatedSearchRequest::from_value(params.clone(), registry)?;
         match request.substrate() {
             SearchSubstrate::Entity => {
                 let props_filter = request.properties();
@@ -560,6 +560,9 @@ impl KgPack {
                 to_json(&result)
             }
             SearchSubstrate::Note => {
+                let mailbox = self
+                    .runtime
+                    .authorize_mailbox_view(token, "search", None, &params)?;
                 let props_filter = request.properties();
                 let tag_filter = (!request.tags().is_empty()).then_some(request.tags());
                 let source_filter = request.source();
@@ -596,6 +599,13 @@ impl KgPack {
                         .map(|n| (n.id, n))
                         .collect()
                 };
+                // Broad note searches use the same message partition as an
+                // explicit message search, before ordering or rendering hits.
+                hits.retain(|hit| {
+                    note_meta
+                        .get(&hit.note_id)
+                        .is_some_and(|note| mailbox.permits_message_note(token, note))
+                });
 
                 let mut filtered_hits: Vec<_> =
                     if props_filter.is_some() || tag_filter.is_some() || source_filter.is_some() {

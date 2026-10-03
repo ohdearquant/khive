@@ -399,6 +399,7 @@ pub fn note_hard_delete_statement(id: Uuid) -> SqlStatement {
 /// constructor's legacy file-backed flag is retained for API compatibility.
 pub struct SqlNoteStore {
     pool: Arc<ConnectionPool>,
+    index_repair: Option<super::index_repair::IndexRepairContext>,
     writer_task: Option<WriterTaskHandle>,
 }
 
@@ -413,7 +414,34 @@ impl SqlNoteStore {
         // re-resolves it and applies strict/compatibility policy then.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
-        Self { pool, writer_task }
+        Self {
+            pool,
+            writer_task,
+            index_repair: None,
+        }
+    }
+
+    pub(crate) fn with_index_repair(
+        mut self,
+        repair: super::index_repair::IndexRepairContext,
+    ) -> Self {
+        self.index_repair = Some(repair);
+        self
+    }
+
+    async fn with_indexed_reader<F, R>(&self, op: &'static str, read: F) -> Result<R, StorageError>
+    where
+        F: FnMut(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        super::index_repair::run_indexed_read(
+            Arc::clone(&self.pool),
+            self.index_repair.clone(),
+            StorageCapability::Notes,
+            op,
+            read,
+        )
+        .await
     }
 
     fn current_writer_task(
@@ -2203,7 +2231,7 @@ impl NoteStore for SqlNoteStore {
             ),
         })?;
 
-        self.with_reader("query_notes_filtered", move |conn| {
+        self.with_indexed_reader("query_notes_filtered", move |conn| {
             let (count_sql, count_params) = build_note_filter_read_clause(&namespace, &filter)?;
             let count_sql = format!("SELECT COUNT(*) FROM notes{count_sql}");
 
@@ -2309,7 +2337,7 @@ impl NoteStore for SqlNoteStore {
             ),
         })?;
 
-        self.with_reader("query_notes_filtered_count_free", move |conn| {
+        self.with_indexed_reader("query_notes_filtered_count_free", move |conn| {
             if let Some(after) = &filter.after_instant {
                 let mut base_filter = filter.clone();
                 base_filter.after_instant = None;
@@ -2369,7 +2397,7 @@ impl NoteStore for SqlNoteStore {
 
         let namespace = namespace.to_string();
         let filters = filters.to_vec();
-        self.with_reader("count_notes_filtered_in_snapshot", move |conn| {
+        self.with_indexed_reader("count_notes_filtered_in_snapshot", move |conn| {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Deferred,
@@ -2411,7 +2439,7 @@ impl NoteStore for SqlNoteStore {
         let filters = filters.to_vec();
         let cap_u64 = u64::from(cap);
         let probe_limit_i64 = i64::from(cap) + 1;
-        self.with_reader("count_notes_filtered_bounded_in_snapshot", move |conn| {
+        self.with_indexed_reader("count_notes_filtered_bounded_in_snapshot", move |conn| {
             let tx = rusqlite::Transaction::new_unchecked(
                 conn,
                 rusqlite::TransactionBehavior::Deferred,
@@ -2546,7 +2574,7 @@ impl NoteStore for SqlNoteStore {
         let filter = filter.clone();
         let limit_i64 = i64::from(max_rows) + 1;
 
-        self.with_reader("query_notes_filtered_bounded", move |conn| {
+        self.with_indexed_reader("query_notes_filtered_bounded", move |conn| {
             let (where_sql, mut data_params) = build_note_filter_read_clause(&namespace, &filter)?;
             data_params.push(Box::new(limit_i64));
             let limit_idx = data_params.len();

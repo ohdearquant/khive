@@ -421,7 +421,7 @@ a signing key applies the same rule, so a degenerate key is refused where it is 
 where it is enrolled. A verifier refuses a signature whose `S` is not below the group order L or whose
 `R` is not a canonical point encoding, and accepts it only when `[S]B = R + [k]A` holds without
 multiplying by the cofactor (the cofactorless check of RFC 8032 section 5.1.7), so two verifiers built
-from this text agree on every signature. The service also refuses a bundle whose KEM key or
+from this text agree on every signature. It also refuses a bundle whose KEM key or
 signing key is already enrolled for any device in the realm, so no two devices share a fingerprint.
 A device enrolled with a KEM key and no signing key cannot authenticate under A.4; its owner enrols
 it again with a new pair of keys, because its old KEM key is already enrolled in the realm and would
@@ -521,13 +521,11 @@ The plaintext is a UTF-8 JSON object: `v` (1), `subject` (string or null), `body
 `sent_at` (RFC 3339, UTC, in the A.2 timestamp profile), `thread_id` (a UUID or null), `in_reply_to` (a logical message
 identifier or null) and, optionally, `kind` (`announce`, `report` or `ask`: the sender's declared
 purpose under runtime ADR-195 D4). A sender writes `kind` only with one of those three values and
-otherwise omits it; absent means unspecified. A recipient ignores members it does not know.
-A plaintext with a duplicated member at the top level or inside any nested object, including the
-value of a member it ignores, is invalid and is quarantined (A.8).
-A plaintext with any of the reserved identity members `from`, `sender`, `to`, `recipient`, `tenant`,
-`namespace`, `actor`, `project`, `device` or `delegation` at its top level is likewise invalid and
-quarantined: identity comes from the authenticated envelope, never from the plaintext.
-A `kind` with any other value, `null`,
+otherwise omits it; absent means unspecified. A recipient ignores members it does not know, except that a plaintext with a duplicated member,
+at the top level or inside any nested object including the value of a member it ignores,
+or with any of the reserved identity members `from`, `sender`, `to`, `recipient`, `tenant`,
+`namespace`, `actor`, `project`, `device` or `delegation`, is invalid and is quarantined (A.8): identity comes from the
+authenticated envelope, never from the plaintext. A `kind` with any other value, `null`,
 `unspecified` and `reply` included, is likewise invalid and quarantined: a reply is never declared.
 A message is a reply when its `in_reply_to` names a verified parent: a message this recipient agent
 (the delivery's `recipient_agent_id`) sent to this sender agent (`sender_agent_id`), committed in the

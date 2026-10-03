@@ -818,6 +818,8 @@ pub struct SearchMechanismSnapshot {
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    #[cfg(any(test, feature = "test-support"))]
+    statement_observer: Arc<crate::statement_observer::StatementObserverHub>,
     main_pool_generation: OnceLock<u64>,
     /// Three-state gate for whether the ADR-091 scheduled task has claimed
     /// routine WAL reclamation for this pool. Until claimed, every
@@ -1080,20 +1082,23 @@ impl<'pool> ReaderGuard<'pool> {
                 StorageError::driver(StorageCapability::Sql, "reader_guard.query_row", error)
             })
         })
-        .map_err(|error| match error {
-            StorageError::Driver {
-                capability,
-                operation,
-                source,
-            } => match source.downcast::<rusqlite::Error>() {
-                Ok(error) => SqliteError::Rusqlite(*error),
-                Err(source) => SqliteError::RequestReadStopped(StorageError::Driver {
+        .map_err(|error| {
+            self.pool.record_reader_query_error(&error);
+            match error {
+                StorageError::Driver {
                     capability,
                     operation,
                     source,
-                }),
-            },
-            other => SqliteError::RequestReadStopped(other),
+                } => match source.downcast::<rusqlite::Error>() {
+                    Ok(error) => SqliteError::Rusqlite(*error),
+                    Err(source) => SqliteError::RequestReadStopped(StorageError::Driver {
+                        capability,
+                        operation,
+                        source,
+                    }),
+                },
+                other => SqliteError::RequestReadStopped(other),
+            }
         })
     }
 
@@ -1362,6 +1367,14 @@ pub struct ReaderAcquisitionSnapshot {
     /// query began. Covers pooled checkout and the closed raw-SQL exception;
     /// cooperative request cancellation is intentionally excluded.
     pub checkout_timeouts: u64,
+    /// Queries on a checked-out pooled reader that SQLite refused with
+    /// `SQLITE_BUSY` after the connection's busy handler gave up (typed-store
+    /// reads, pooled raw-SQL reads, and [`ReaderGuard::query_row`]). Counted
+    /// after checkout succeeded, so it never overlaps `checkout_timeouts`;
+    /// `SQLITE_LOCKED` and cooperative cancellation are excluded. Writer
+    /// refusals are not counted here; the writer task's are in
+    /// [`WriterAcquisitionSnapshot::writer_task_begin_busy`].
+    pub busy_timeouts: u64,
     /// Pooled checkouts live at the instant this snapshot was taken.
     pub active_pooled_checkouts: u64,
     /// High-water mark of concurrent pooled checkouts.
@@ -1399,6 +1412,7 @@ struct ReaderAcquisitionCounters {
     standalone_opens: AtomicU64,
     infrastructure_standalone_opens: AtomicU64,
     checkout_timeouts: AtomicU64,
+    busy_timeouts: AtomicU64,
     active_pooled_checkouts: AtomicU64,
     peak_active_pooled_checkouts: AtomicU64,
     completed_pooled_checkouts: AtomicU64,
@@ -1419,6 +1433,10 @@ impl ReaderAcquisitionCounters {
 
     fn record_checkout_timeout(&self) {
         self.checkout_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_busy_timeout(&self) {
+        self.busy_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_reader_replacement_open_failure(&self) {
@@ -1469,6 +1487,7 @@ impl ReaderAcquisitionCounters {
                 .infrastructure_standalone_opens
                 .load(Ordering::Relaxed),
             checkout_timeouts: self.checkout_timeouts.load(Ordering::Relaxed),
+            busy_timeouts: self.busy_timeouts.load(Ordering::Relaxed),
             active_pooled_checkouts: self.active_pooled_checkouts.load(Ordering::Relaxed),
             peak_active_pooled_checkouts: self.peak_active_pooled_checkouts.load(Ordering::Relaxed),
             completed_pooled_checkouts: self.completed_pooled_checkouts.load(Ordering::Relaxed),
@@ -1878,8 +1897,15 @@ impl ConnectionPool {
 
         let readers = ArrayQueue::new(max_readers.max(1));
 
+        #[cfg(any(test, feature = "test-support"))]
+        let statement_observer = crate::statement_observer::StatementObserverHub::new()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&writer, &statement_observer)?;
+
         let mut pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            #[cfg(any(test, feature = "test-support"))]
+            statement_observer,
             main_pool_generation: OnceLock::new(),
             checkpoint_ownership: CheckpointOwnershipGate::new(),
             pooled_writer_retired: AtomicBool::new(false),
@@ -2301,6 +2327,19 @@ impl ConnectionPool {
         self.reader_acquisition_counters.record_checkout_timeout();
     }
 
+    /// Count a query error from an already checked-out pooled reader when it is
+    /// SQLite's `SQLITE_BUSY` surfacing after the busy handler gave up. Every
+    /// other error, including `SQLITE_LOCKED`, is ignored. Checkout exhaustion
+    /// is counted by [`Self::reader_until`] before any query runs, so the two
+    /// classes cannot overlap.
+    pub(crate) fn record_reader_query_error(&self, error: &StorageError) {
+        if crate::read_cancellation::storage_error_sqlite_code(error)
+            == Some(rusqlite::ErrorCode::DatabaseBusy)
+        {
+            self.reader_acquisition_counters.record_busy_timeout();
+        }
+    }
+
     /// Clone the pool-scoped counter set for the lifetime-owned writer task.
     pub(crate) fn writer_acquisition_counters(&self) -> Arc<WriterAcquisitionCounters> {
         Arc::clone(&self.writer_acquisition_counters)
@@ -2341,6 +2380,23 @@ impl ConnectionPool {
     /// Return the pool configuration.
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    /// Observe actual SQLite statement starts on this private test pool.
+    ///
+    /// The limit bounds retained SQL records. Failed steps count as attempts;
+    /// preparation alone does not count. The guard observes every pool-owned
+    /// connection, including the queued writer. Do not run unrelated background
+    /// work on the fixture pool; see the guard documentation for limitations.
+    /// Connection setup runs before observation begins on each connection and
+    /// is never recorded, including for opens during an active observation.
+    /// Reader connection opens use the existing reader acquisition counters instead.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_test_statement_starts(
+        &self,
+        limit: usize,
+    ) -> Result<crate::statement_observer::StatementStartObservation, SqliteError> {
+        self.statement_observer.observe(limit)
     }
 
     /// Identify this pool's counter window when it is designated as main.
@@ -2712,6 +2768,8 @@ impl ConnectionPool {
             self.verify_connection_file_identity(&conn, identity_path)?;
         }
         self.verify_opened_database_id(&conn)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
         Ok(conn)
     }
 
@@ -2810,6 +2868,8 @@ impl ConnectionPool {
             )?;
         }
 
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
         Ok(conn)
     }
 
@@ -2963,6 +3023,8 @@ impl ConnectionPool {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         self.reader_acquisition_counters
             .record_standalone_open(purpose);
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
         Ok(conn)
     }
 

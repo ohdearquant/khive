@@ -2537,7 +2537,11 @@ where
             // checkout pays the pristine-state scan on return regardless of
             // which `SqlReader` wrapper (reader or writer capability) drew it.
             guard.mark_dirty();
-            scope.with_pooled_reader(&mut guard, |conn| query(scope, conn))
+            let result = scope.with_pooled_reader(&mut guard, |conn| query(scope, conn));
+            if let Err(error) = &result {
+                pool.record_reader_query_error(error);
+            }
+            result
         },
     )
     .await
@@ -5391,6 +5395,65 @@ mod tests {
         assert_eq!(snapshot.active_pooled_checkouts, 1);
         assert_eq!(snapshot.available_reader_admission_slots, 0);
         drop(held);
+    }
+
+    /// A pooled raw-SQL read that SQLite refuses with SQLITE_BUSY after the
+    /// busy handler gives up is counted per pool. WAL readers are never
+    /// blocked by a writer, so the fixture uses a rollback-journal database,
+    /// where a connection holding an exclusive lock refuses every other reader.
+    #[tokio::test]
+    async fn pooled_raw_sql_read_counts_busy_handler_timeouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sql_bridge_busy_timeouts.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path.clone()),
+                wal_mode: false,
+                write_queue_enabled: Some(false),
+                busy_timeout: std::time::Duration::from_millis(50),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        );
+        pool.writer()
+            .unwrap()
+            .conn()
+            .execute_batch("CREATE TABLE busy_fixture (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        let mut reader = bridge.reader().await.unwrap();
+        let count = || SqlStatement {
+            sql: "SELECT count(*) FROM busy_fixture".into(),
+            params: vec![],
+            label: None,
+        };
+
+        // Control: with no lock held the read succeeds and nothing is counted.
+        let value = reader.query_scalar(count()).await.unwrap();
+        assert!(matches!(value, Some(SqlValue::Integer(0))), "{value:?}");
+        assert_eq!(pool.reader_acquisition_snapshot().busy_timeouts, 0);
+
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let refused = reader.query_scalar(count()).await.unwrap_err();
+        assert!(
+            matches!(
+                &refused,
+                StorageError::Driver { source, .. }
+                    if source
+                        .downcast_ref::<rusqlite::Error>()
+                        .and_then(|error| error.sqlite_error_code())
+                        == Some(rusqlite::ErrorCode::DatabaseBusy)
+            ),
+            "a read behind an exclusive lock must surface SQLITE_BUSY, got {refused:?}"
+        );
+        let snapshot = pool.reader_acquisition_snapshot();
+        assert_eq!(snapshot.busy_timeouts, 1);
+        assert_eq!(
+            snapshot.checkout_timeouts, 0,
+            "a busy-handler refusal after checkout is not a checkout timeout"
+        );
+        holder.execute_batch("ROLLBACK").unwrap();
     }
 
     #[tokio::test]
