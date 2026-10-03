@@ -405,23 +405,54 @@ impl KgPack {
 
         Ok(Some(Event {
             id: parse_uuid_column(&row, "id")?,
-            namespace: sql_text(&row, "namespace")?,
-            verb: sql_text(&row, "verb")?,
-            substrate: parse_event_substrate(&sql_text(&row, "substrate")?)
-                .map_err(|_| RuntimeError::Internal("stored event substrate is invalid".into()))?,
-            actor: sql_text(&row, "actor")?,
-            kind: parse_event_kind(&sql_text(&row, "kind")?)
-                .map_err(|_| RuntimeError::Internal("stored event kind is invalid".into()))?,
-            outcome: parse_event_outcome(&sql_text(&row, "outcome")?)
-                .map_err(|_| RuntimeError::Internal("stored event outcome is invalid".into()))?,
-            payload: serde_json::from_str(&sql_text(&row, "payload")?).map_err(|e| {
+            namespace: row
+                .text("namespace")
+                .map(str::to_owned)
+                .map_err(|_| event_column_error(&row, "namespace"))?,
+            verb: row
+                .text("verb")
+                .map(str::to_owned)
+                .map_err(|_| event_column_error(&row, "verb"))?,
+            substrate: parse_event_substrate(
+                &row.text("substrate")
+                    .map(str::to_owned)
+                    .map_err(|_| event_column_error(&row, "substrate"))?,
+            )
+            .map_err(|_| RuntimeError::Internal("stored event substrate is invalid".into()))?,
+            actor: row
+                .text("actor")
+                .map(str::to_owned)
+                .map_err(|_| event_column_error(&row, "actor"))?,
+            kind: parse_event_kind(
+                &row.text("kind")
+                    .map(str::to_owned)
+                    .map_err(|_| event_column_error(&row, "kind"))?,
+            )
+            .map_err(|_| RuntimeError::Internal("stored event kind is invalid".into()))?,
+            outcome: parse_event_outcome(
+                &row.text("outcome")
+                    .map(str::to_owned)
+                    .map_err(|_| event_column_error(&row, "outcome"))?,
+            )
+            .map_err(|_| RuntimeError::Internal("stored event outcome is invalid".into()))?,
+            payload: serde_json::from_str(
+                &row.text("payload")
+                    .map(str::to_owned)
+                    .map_err(|_| event_column_error(&row, "payload"))?,
+            )
+            .map_err(|e| {
                 RuntimeError::Internal(format!("stored event payload is invalid JSON: {e}"))
             })?,
-            payload_schema_version: u32::try_from(sql_i64(&row, "payload_schema_version")?)
-                .map_err(|_| {
-                    RuntimeError::Internal("stored event payload_schema_version is invalid".into())
-                })?,
-            profile_state_version: sql_optional_i64(&row, "profile_state_version")?
+            payload_schema_version: u32::try_from(
+                row.i64("payload_schema_version")
+                    .map_err(|_| event_column_error(&row, "payload_schema_version"))?,
+            )
+            .map_err(|_| {
+                RuntimeError::Internal("stored event payload_schema_version is invalid".into())
+            })?,
+            profile_state_version: row
+                .opt_i64_or_absent("profile_state_version")
+                .map_err(|_| event_column_error(&row, "profile_state_version"))?
                 .map(|v| {
                     u64::try_from(v).map_err(|_| {
                         RuntimeError::Internal(
@@ -430,20 +461,32 @@ impl KgPack {
                     })
                 })
                 .transpose()?,
-            duration_us: sql_i64(&row, "duration_us")?,
+            duration_us: row
+                .i64("duration_us")
+                .map_err(|_| event_column_error(&row, "duration_us"))?,
             target_id: sql_optional_uuid(&row, "target_id")?,
             session_id: sql_optional_uuid(&row, "session_id")?,
-            aggregate_kind: sql_optional_text(&row, "aggregate_kind")?,
+            aggregate_kind: row
+                .opt_text_or_absent("aggregate_kind")
+                .map(|value| value.map(str::to_owned))
+                .map_err(|_| event_column_error(&row, "aggregate_kind"))?,
             aggregate_id: sql_optional_uuid(&row, "aggregate_id")?,
-            created_at: sql_i64(&row, "created_at")?,
-            op_index: sql_optional_i64(&row, "op_index")?
+            created_at: row
+                .i64("created_at")
+                .map_err(|_| event_column_error(&row, "created_at"))?,
+            op_index: row
+                .opt_i64_or_absent("op_index")
+                .map_err(|_| event_column_error(&row, "op_index"))?
                 .map(|value| {
                     u32::try_from(value).map_err(|_| {
                         RuntimeError::Internal("stored event op_index is invalid".into())
                     })
                 })
                 .transpose()?,
-            ref_resolution: sql_optional_text(&row, "ref_resolution")?
+            ref_resolution: row
+                .opt_text_or_absent("ref_resolution")
+                .map(|value| value.map(str::to_owned))
+                .map_err(|_| event_column_error(&row, "ref_resolution"))?
                 .map(|value| {
                     value.parse().map_err(|_| {
                         RuntimeError::Internal("stored event ref_resolution is invalid".into())
@@ -706,56 +749,35 @@ async fn resolve_id_through_arms(
     }
 }
 
-fn sql_text(row: &SqlRow, name: &str) -> Result<String, RuntimeError> {
-    match row.get(name) {
-        Some(SqlValue::Text(v)) => Ok(v.clone()),
-        Some(other) => Err(RuntimeError::Internal(format!(
-            "events.{name} has unexpected SQL value {other:?}"
-        ))),
-        None => Err(RuntimeError::Internal(format!("events row missing {name}"))),
-    }
-}
-
-fn sql_optional_text(row: &SqlRow, name: &str) -> Result<Option<String>, RuntimeError> {
-    match row.get(name) {
-        Some(SqlValue::Null) | None => Ok(None),
-        Some(SqlValue::Text(v)) => Ok(Some(v.clone())),
-        Some(other) => Err(RuntimeError::Internal(format!(
-            "events.{name} has unexpected SQL value {other:?}"
-        ))),
-    }
-}
-
-fn sql_i64(row: &SqlRow, name: &str) -> Result<i64, RuntimeError> {
-    match row.get(name) {
-        Some(SqlValue::Integer(v)) => Ok(*v),
-        Some(other) => Err(RuntimeError::Internal(format!(
-            "events.{name} has unexpected SQL value {other:?}"
-        ))),
-        None => Err(RuntimeError::Internal(format!("events row missing {name}"))),
-    }
-}
-
-fn sql_optional_i64(row: &SqlRow, name: &str) -> Result<Option<i64>, RuntimeError> {
-    match row.get(name) {
-        Some(SqlValue::Null) | None => Ok(None),
-        Some(SqlValue::Integer(v)) => Ok(Some(*v)),
-        Some(other) => Err(RuntimeError::Internal(format!(
-            "events.{name} has unexpected SQL value {other:?}"
-        ))),
-    }
-}
-
 fn parse_uuid_column(row: &SqlRow, name: &str) -> Result<Uuid, RuntimeError> {
-    Uuid::from_str(&sql_text(row, name)?)
-        .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
+    Uuid::from_str(
+        &row.text(name)
+            .map(str::to_owned)
+            .map_err(|_| event_column_error(row, name))?,
+    )
+    .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
 }
 
 fn sql_optional_uuid(row: &SqlRow, name: &str) -> Result<Option<Uuid>, RuntimeError> {
-    sql_optional_text(row, name)?
+    row.opt_text_or_absent(name)
+        .map(|value| value.map(str::to_owned))
+        .map_err(|_| event_column_error(row, name))?
         .map(|v| {
             Uuid::from_str(&v)
                 .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
         })
         .transpose()
 }
+
+fn event_column_error(row: &SqlRow, name: &str) -> RuntimeError {
+    match row.get(name) {
+        Some(other) => {
+            RuntimeError::Internal(format!("events.{name} has unexpected SQL value {other:?}"))
+        }
+        None => RuntimeError::Internal(format!("events row missing {name}")),
+    }
+}
+
+#[cfg(test)]
+#[path = "get_column_tests.rs"]
+mod column_tests;

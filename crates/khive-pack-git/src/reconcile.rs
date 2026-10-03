@@ -9,7 +9,7 @@ use khive_runtime::{KhiveRuntime, NamespaceToken};
 use khive_storage::graph::{
     CommitAnnotationCursorValue, CommitAnnotationGuard, CommitAnnotationInsertOutcome,
 };
-use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
+use khive_storage::types::{SqlStatement, SqlValue};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -91,20 +91,6 @@ struct CommitCheckpoint {
     last_completed_sha: String,
 }
 
-fn text<'a>(row: &'a SqlRow, key: &str) -> Result<&'a str> {
-    match row.get(key) {
-        Some(SqlValue::Text(value)) => Ok(value),
-        _ => bail!("stored {key} has an invalid type"),
-    }
-}
-
-fn integer(row: &SqlRow, key: &str) -> Result<i64> {
-    match row.get(key) {
-        Some(SqlValue::Integer(value)) => Ok(*value),
-        _ => bail!("stored {key} has an invalid type"),
-    }
-}
-
 fn oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -123,8 +109,14 @@ async fn cursor_snapshot(runtime: &KhiveRuntime, project_id: Uuid) -> Result<Vec
         .await?;
     let mut snapshot = Vec::with_capacity(rows.len());
     for row in rows {
-        let kind = text(&row, "kind")?.to_owned();
-        let value_type = text(&row, "value_type")?.to_owned();
+        let kind = row
+            .text("kind")
+            .map_err(|_| anyhow!("stored kind has an invalid type"))?
+            .to_owned();
+        let value_type = row
+            .text("value_type")
+            .map_err(|_| anyhow!("stored value_type has an invalid type"))?
+            .to_owned();
         let value_bytes = match row.get("value_bytes") {
             Some(SqlValue::Integer(value)) if *value >= 0 => Some(*value),
             Some(SqlValue::Null) => None,
@@ -140,7 +132,9 @@ async fn cursor_snapshot(runtime: &KhiveRuntime, project_id: Uuid) -> Result<Vec
         };
         snapshot.push(CursorRow {
             kind,
-            updated_at: integer(&row, "updated_at")?,
+            updated_at: row
+                .i64("updated_at")
+                .map_err(|_| anyhow!("stored updated_at has an invalid type"))?,
             value_type,
             value,
         });

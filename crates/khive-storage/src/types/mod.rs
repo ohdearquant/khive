@@ -26,7 +26,7 @@ pub use pagination::{BoundedCount, LimitReport, Page, PageRequest, SeekCursor, S
 pub use sparse::{
     SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, MAX_SPARSE_SEARCH_TOP_K,
 };
-pub use sql::{SqlColumn, SqlRow, SqlStatement, SqlValue};
+pub use sql::{SqlColumn, SqlColumnError, SqlRow, SqlStatement, SqlValue};
 pub use text::{
     IndexRebuildScope, TextDocument, TextFilter, TextGatherMode, TextIndexStats, TextQueryMode,
     TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats, TextTermStatsRequest,

@@ -221,50 +221,50 @@ fn validate(params: Value) -> Result<ValidatedSearch, RuntimeError> {
     })
 }
 
-fn required_text(row: &SqlRow, column: &str) -> Result<String, RuntimeError> {
-    match row.get(column) {
-        Some(SqlValue::Text(value)) => Ok(value.clone()),
-        _ => Err(RuntimeError::Internal(format!(
-            "{VERB}: malformed mirror search row: {column} must be text"
-        ))),
-    }
-}
-
-fn optional_text(row: &SqlRow, column: &str) -> Result<Option<String>, RuntimeError> {
-    match row.get(column) {
-        Some(SqlValue::Text(value)) => Ok(Some(value.clone())),
-        Some(SqlValue::Null) => Ok(None),
-        _ => Err(RuntimeError::Internal(format!(
-            "{VERB}: malformed mirror search row: {column} must be text or null"
-        ))),
-    }
-}
-
-fn optional_integer(row: &SqlRow, column: &str) -> Result<Option<i64>, RuntimeError> {
-    match row.get(column) {
-        Some(SqlValue::Integer(value)) => Ok(Some(*value)),
-        Some(SqlValue::Null) => Ok(None),
-        _ => Err(RuntimeError::Internal(format!(
-            "{VERB}: malformed mirror search row: {column} must be integer or null"
-        ))),
-    }
-}
-
 fn decode_hit(row: &SqlRow, rank: usize) -> Result<SearchHit, RuntimeError> {
-    let snippets_json = required_text(row, "snippets")?;
+    let snippets_json = row.text("snippets").map(str::to_owned).map_err(|_| {
+        RuntimeError::Internal(format!(
+            "{VERB}: malformed mirror search row: snippets must be text"
+        ))
+    })?;
     let snippets: Vec<String> = serde_json::from_str(&snippets_json).map_err(|e| {
         RuntimeError::Internal(format!("{VERB}: malformed mirror search snippets: {e}"))
     })?;
     let one_based = NonZeroUsize::new(rank + 1).expect("enumerate index plus one is nonzero");
     Ok(SearchHit {
         session: SearchSession {
-            provider_session_id: required_text(row, "provider_session_id")?,
-            source: required_text(row, "source")?,
-            namespace: required_text(row, "namespace")?,
-            cwd: optional_text(row, "cwd")?,
-            first_seen_at: optional_integer(row, "first_seen_at")?.map(micros_to_iso),
-            last_seen_at: optional_integer(row, "last_seen_at")?.map(micros_to_iso),
-            message_count: optional_integer(row, "message_count")?,
+            provider_session_id: row.text("provider_session_id").map(str::to_owned).map_err(
+                |_| {
+                    RuntimeError::Internal(format!("{VERB}: malformed mirror search row: provider_session_id must be text"))
+                },
+            )?,
+            source: row.text("source").map(str::to_owned).map_err(|_| {
+                RuntimeError::Internal(format!("{VERB}: malformed mirror search row: source must be text"))
+            })?,
+            namespace: row.text("namespace").map(str::to_owned).map_err(|_| {
+                RuntimeError::Internal(format!("{VERB}: malformed mirror search row: namespace must be text"))
+            })?,
+            cwd: row
+                .opt_text("cwd")
+                .map(|value| value.map(str::to_owned))
+                .map_err(|_| {
+                    RuntimeError::Internal(format!("{VERB}: malformed mirror search row: cwd must be text or null"))
+                })?,
+            first_seen_at: row
+                .opt_i64("first_seen_at")
+                .map_err(|_| {
+                    RuntimeError::Internal(format!("{VERB}: malformed mirror search row: first_seen_at must be integer or null"))
+                })?
+                .map(micros_to_iso),
+            last_seen_at: row
+                .opt_i64("last_seen_at")
+                .map_err(|_| {
+                    RuntimeError::Internal(format!("{VERB}: malformed mirror search row: last_seen_at must be integer or null"))
+                })?
+                .map(micros_to_iso),
+            message_count: row.opt_i64("message_count").map_err(|_| {
+                RuntimeError::Internal(format!("{VERB}: malformed mirror search row: message_count must be integer or null"))
+            })?,
         },
         score: rrf_score_one_based(one_based, RRF_K).to_f64(),
         snippets,
