@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use rusqlite::OptionalExtension;
 
+use crate::database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy};
 use crate::sql_bridge::SqlBridge;
@@ -1387,6 +1388,22 @@ impl StorageBackend {
     /// Access the underlying pool (escape hatch).
     pub fn pool(&self) -> &ConnectionPool {
         &self.pool
+    }
+
+    /// Durable owner evidence for this backend, captured at pool construction.
+    /// The caller must choose the effective main backend before comparing it.
+    pub fn database_owner_identity(
+        &self,
+    ) -> Result<DatabaseOwnerIdentity, DatabaseOwnerIdentityError> {
+        self.pool.database_owner_identity()
+    }
+
+    /// Refuse a secondary or copied database as the supplied database owner.
+    pub fn verify_database_owner(
+        &self,
+        expected: &DatabaseOwnerIdentity,
+    ) -> Result<(), DatabaseOwnerIdentityError> {
+        self.pool.verify_database_owner(expected)
     }
 
     /// Clone the underlying pool Arc.
