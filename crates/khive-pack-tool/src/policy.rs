@@ -14,6 +14,20 @@ use khive_types::{EventKind, SubstrateKind, ToolCheckDecidedPayload};
 use crate::pin::{invalidating_registration, registration_snapshot, visible_registration};
 use crate::RegistryPin;
 
+/// Read a bounded non-negative integer; absent or null returns the supplied default.
+/// The caller supplies a maximum of at least one.
+pub fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
+            }),
+    }
+}
+
 pub fn now_micros() -> i64 {
     Utc::now().timestamp_micros()
 }
