@@ -39,17 +39,18 @@ class SqlLintTests(unittest.TestCase):
         )
 
     def copy_git_fragments(self):
-        """Copy khive-pack-git's schema fragments, and only those.
-
-        This copied the whole `sql/` directory until that directory also held
-        query statements extracted out of Rust. A query is prepared against the
-        migration chain, which an isolated tree does not carry, so copying
-        everything reddened the fixture over eleven tables the chain declares —
-        a true statement about the fixture and nothing at all about the question
-        these tests ask. The population here is the fragments: select them by the
-        linter's own rule, and count what was copied instead of a literal that
-        goes stale the next time a statement lands in that directory.
-        """
+        """Git auxiliary DDL and live-note indexes depend on the core notes table."""
+        core = self.root / "crates/khive-db/sql"
+        core.mkdir(parents=True)
+        (core / "schema.sql").write_text(
+            "CREATE TABLE notes (\n"
+            "    id TEXT PRIMARY KEY,\n"
+            "    namespace TEXT,\n"
+            "    kind TEXT,\n"
+            "    properties TEXT,\n"
+            "    deleted_at INTEGER\n"
+            ");\n"
+        )
         source = ROOT / "crates/khive-pack-git/sql"
         destination = self.root / "crates/khive-pack-git/sql"
         destination.mkdir(parents=True)
@@ -66,7 +67,7 @@ class SqlLintTests(unittest.TestCase):
             f"no index fragment among {names}, so this fixture cannot show "
             "one file resolving a table another file declares",
         )
-        return len(names)
+        return len(names) + 1
 
     def test_real_git_indexes_see_their_table(self):
         copied = self.copy_git_fragments()
@@ -86,6 +87,33 @@ class SqlLintTests(unittest.TestCase):
         result = self.run_lint()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("zz-broken.sql: FAILED", result.stdout)
+        self.assertIn("no such table", result.stdout)
+
+    def test_git_core_fixture_is_scoped_and_queries_remain_prepared(self):
+        copied = self.copy_git_fragments()
+        git = self.root / "crates/khive-pack-git/sql"
+        shutil.copy2(
+            ROOT / "crates/khive-pack-git/sql/commits_by_sha_select.sql",
+            git / "commits_by_sha_select.sql",
+        )
+        shutil.copy2(
+            ROOT / "crates/khive-pack-git/sql/notes_by_number_select.sql",
+            git / "notes_by_number_select.sql",
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            f"SQL lint: {copied + 2} file(s) OK (2 prepared, {copied} executed)",
+            result.stdout,
+        )
+        unrelated = self.root / "crates/unrelated/sql"
+        unrelated.mkdir(parents=True)
+        (unrelated / "unexpected_core_visibility.sql").write_text(
+            "CREATE INDEX unexpected_core_visibility ON notes(id);\n"
+        )
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected_core_visibility.sql: FAILED to load", result.stdout)
         self.assertIn("no such table", result.stdout)
 
     def test_a_query_file_is_prepared_against_the_schema_it_reads(self):
