@@ -49,12 +49,14 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 import pathlib
 import random
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -273,6 +275,13 @@ _OP_MENU = [
     (_op_create_entity, 0.10),
 ]
 _OP_MENU_WEIGHTS_SUM = sum(w for _, w in _OP_MENU)
+_OP_NAMES = {
+    _op_recall: "memory.recall",
+    _op_knowledge_search: "knowledge.search",
+    _op_knowledge_compose: "knowledge.compose",
+    _op_remember: "memory.remember",
+    _op_create_entity: "create",
+}
 
 
 def _pick_op():
@@ -402,6 +411,173 @@ def _run_worker(binary, tenant, idx, base_env, log_level, tmpdir, ops_per_worker
     return result
 
 
+def _execute_arrival(worker, fn, sequence, clock):
+    proc, result = worker
+    started = clock()
+    try:
+        outcome = fn(proc, result.tenant, sequence)
+    except Exception as exc:
+        outcome = OpOutcome(_OP_NAMES[fn], False, (clock() - started) * 1_000_000, repr(exc))
+    return outcome, started, clock()
+
+
+def _drive_open_loop(workers, pool, rate, operations, drain_timeout, *,
+                     pick_op=_pick_op, clock=time.monotonic, sleep=time.sleep):
+    if (not math.isfinite(rate) or rate <= 0 or operations < 0
+            or not math.isfinite(drain_timeout) or drain_timeout < 0):
+        raise ValueError("arrival rate must be finite and positive; operation count and drain timeout nonnegative")
+    started = clock()
+    offered_duration = operations / rate
+    records = []
+    pending = {}
+    idle = list(range(len(workers)))
+
+    def reap():
+        for future, (slot, record) in list(pending.items()):
+            if not future.done():
+                continue
+            try:
+                outcome, began, ended = future.result()
+                workers[slot][1].outcomes.append(outcome)
+                record.update(state="completed" if outcome.ok else "failed",
+                              started_s=began - started, finished_s=ended - started,
+                              latency_us=outcome.latency_us, error=outcome.error)
+            except Exception as exc:
+                record.update(state="failed", finished_s=clock() - started, error=repr(exc))
+            idle.append(slot)
+            del pending[future]
+
+    for sequence in range(operations):
+        scheduled = started + sequence / rate
+        sleep(max(0.0, scheduled - clock()))
+        reap()
+        fn = pick_op()
+        record = dict(sequence=sequence, op=_OP_NAMES[fn], scheduled_s=scheduled - started,
+                      offered_s=clock() - started, started_s=None, finished_s=None,
+                      tenant=None, worker=None, latency_us=None, state="outstanding", error=None)
+        records.append(record)
+        if not idle:
+            record.update(state="refused", finished_s=clock() - started,
+                          error="client concurrency capacity exhausted")
+            continue
+        slot = idle.pop(0)
+        record.update(tenant=workers[slot][1].tenant, worker=workers[slot][1].idx)
+        try:
+            future = pool.submit(_execute_arrival, workers[slot], fn, sequence, clock)
+            pending[future] = (slot, record)
+        except Exception as exc:
+            idle.append(slot)
+            record.update(state="failed", finished_s=clock() - started, error=repr(exc))
+
+    sleep(max(0.0, started + offered_duration - clock()))
+    drain_deadline = clock() + drain_timeout
+    while pending:
+        reap()
+        if not pending or clock() >= drain_deadline:
+            break
+        sleep(min(0.01, drain_deadline - clock()))
+    finished = clock()
+    observed_duration = max(offered_duration, finished - started)
+    counts = {state: sum(row["state"] == state for row in records)
+              for state in ("completed", "failed", "refused", "outstanding")}
+    counts["submitted"] = len(records)
+    by_class = {}
+    for fn, weight in _OP_MENU:
+        op = _OP_NAMES[fn]
+        rows = [row for row in records if row["op"] == op]
+        by_class[op] = {
+            "submitted": len(rows),
+            **{state: sum(row["state"] == state for row in rows)
+               for state in ("completed", "failed", "refused", "outstanding")},
+            "configured_offered_rate_per_s": rate * weight / _OP_MENU_WEIGHTS_SUM,
+            "offered_rate_per_s": len(rows) / offered_duration if offered_duration else 0.0,
+            "achieved_rate_per_s": sum(row["state"] == "completed" for row in rows) / observed_duration
+            if observed_duration else 0.0,
+        }
+    return {
+        "mode": "open-loop", "configured_rate_per_s": rate,
+        "status": "drain_timeout" if counts["outstanding"] else "drained",
+        "max_in_flight": len(workers), "overflow_policy": "refuse immediately; no client queue",
+        "counts": counts, "classes": by_class, "records": records,
+        "offered_duration_s": offered_duration, "observed_duration_s": observed_duration,
+        "measurement_stop_monotonic_s": finished,
+        "drain_timeout_s": drain_timeout,
+        "warmup_boundary": {
+            "monotonic_s": started, "discarded_arrivals": 0,
+            "condition": "bootstrap remember/recall and daemon engagement; every worker handshake and leader attribution probe complete",
+        },
+        "cache_state": {
+            "process": "warm daemon; front-ends handshaken before arrival zero",
+            "sqlite": "daemon pooled connections; SQLite page cache uncontrolled",
+            "os_page_cache": "uncontrolled",
+        },
+        "write_workload": {
+            "classes": ["memory.remember", "create"],
+            "backpressure": "client capacity refusal; daemon errors remain failed outcomes",
+            "residency_mode": "one shared warmed daemon",
+            "embedding_status": "mode-selected daemon embedder; no text-only write override",
+            "vector_dimensionality": "UNMEASURED", "tail_cap_parameters": "UNMEASURED",
+            "evidence_status": "exploratory until dimensionality and all tail caps are recorded with the run plan",
+        },
+    }
+
+
+def _prepare_open_worker(binary, tenant, idx, base_env, log_level, tmpdir, proc_registry, stop):
+    result = WorkerResult(tenant, idx)
+    result.stderr_path = os.path.join(tmpdir, f"worker-t{tenant}-w{idx}.stderr.log")
+    proc = _spawn_worker_proc(binary, tenant, base_env, log_level, result.stderr_path)
+    proc_registry[(tenant, idx)] = proc
+    try:
+        if stop.is_set():
+            raise RuntimeError("open-loop setup stopped")
+        bpd._handshake(proc)
+        if idx == 0:
+            result.attribution = _attribution_probe(proc, tenant)
+    except BaseException:
+        with contextlib.suppress(Exception):
+            proc.kill()
+            proc.wait(timeout=5)
+        raise
+    return proc, result
+
+
+def _run_open_workers(binary, jobs, base_env, log_level, tmpdir, proc_registry,
+                      operations, rate, worker_timeout):
+    pool = ThreadPoolExecutor(max_workers=len(jobs))
+    stop = threading.Event()
+    workers = []
+    try:
+        futures = [pool.submit(_prepare_open_worker, binary, tenant, idx, base_env,
+                               log_level, tmpdir, proc_registry, stop) for tenant, idx in jobs]
+        setup_deadline = time.monotonic() + worker_timeout
+        for future in futures:
+            workers.append(future.result(timeout=max(0.0, setup_deadline - time.monotonic())))
+        arrival = _drive_open_loop(workers, pool, rate, operations, worker_timeout)
+        if arrival["counts"]["outstanding"]:
+            # Kill pipes before joining threads so a wedged MCP read can finish.
+            outstanding = {(row["tenant"], row["worker"]) for row in arrival["records"]
+                           if row["state"] == "outstanding"}
+            for _, result in workers:
+                if (result.tenant, result.idx) in outstanding:
+                    result.crashed = "open-loop drain exceeded --worker-timeout"
+        return [result for _, result in workers], arrival
+    finally:
+        stop.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        for tenant, idx in jobs:
+            proc = proc_registry.get((tenant, idx))
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    if proc.poll() is None:
+                        proc.kill()
+        pool.shutdown(wait=True, cancel_futures=True)
+        for tenant, idx in jobs:
+            proc = proc_registry.get((tenant, idx))
+            if proc is not None:
+                with contextlib.suppress(Exception):
+                    proc.wait(timeout=5)
+
+
 # ── main driver ────────────────────────────────────────────────────────────────
 
 
@@ -449,6 +625,8 @@ def main() -> int:
     ap.add_argument("--tenants", type=int, default=20)
     ap.add_argument("--ops-per-worker", type=int, default=20)
     ap.add_argument("--worker-timeout", type=float, default=120.0)
+    ap.add_argument("--arrival-rate", type=float, default=None,
+                    help="open-loop total operations/second; refuses arrivals when all worker connections are busy")
     ap.add_argument("--log-level", default="warn")
     ap.add_argument(
         "--packs",
@@ -463,6 +641,13 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="do not tear down the scratch daemon/dir on exit")
     ap.add_argument("--report", default=None, help="optional path to also write the JSON report")
     args = ap.parse_args()
+
+    if args.arrival_rate is not None and (
+        not math.isfinite(args.arrival_rate) or args.arrival_rate <= 0
+        or args.workers <= 0 or args.tenants <= 0 or args.ops_per_worker < 0
+        or not math.isfinite(args.worker_timeout) or args.worker_timeout <= 0
+    ):
+        ap.error("open-loop rate, workers, tenants and timeout must be finite/positive; ops-per-worker nonnegative")
 
     if args.workers % args.tenants != 0:
         print(
@@ -526,6 +711,11 @@ def main() -> int:
         "smoke_result": "FAIL",
         "smoke_errors": [],
     }
+    if args.arrival_rate is not None:
+        report["arrival"] = {
+            "mode": "open-loop", "status": "setup_incomplete", "warmup_boundary": None,
+            "counts": {"submitted": 0, "completed": 0, "failed": 0, "refused": 0, "outstanding": 0},
+        }
 
     bootstrap_proc = None
     worker_procs: dict = {}
@@ -579,38 +769,44 @@ def main() -> int:
                 jobs.append((tenant, idx))
 
         worker_results: list[WorkerResult] = []
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {
-                pool.submit(
-                    _run_worker,
-                    binary,
-                    tenant,
-                    idx,
-                    base_env,
-                    args.log_level,
-                    tmpdir,
-                    args.ops_per_worker,
-                    idx == 0,
-                    worker_procs,
-                ): (tenant, idx)
-                for tenant, idx in jobs
-            }
-            for fut in futures:
-                tenant, idx = futures[fut]
-                try:
-                    worker_results.append(fut.result(timeout=args.worker_timeout))
-                except FutureTimeoutError:
-                    # Kill this worker's front-end so its wedged stdout read returns and the
-                    # thread exits — otherwise ThreadPoolExecutor.__exit__ (shutdown(wait=True))
-                    # blocks forever on the hung worker and never reaches teardown, leaking the
-                    # scratch daemon + the Metal GPU lock.
-                    wedged = worker_procs.get((tenant, idx))
-                    if wedged is not None:
-                        with contextlib.suppress(Exception):
-                            wedged.kill()
-                    hung = WorkerResult(tenant, idx)
-                    hung.crashed = f"worker exceeded --worker-timeout={args.worker_timeout}s (possible silent hang)"
-                    worker_results.append(hung)
+        if args.arrival_rate is not None:
+            worker_results, report["arrival"] = _run_open_workers(
+                binary, jobs, base_env, args.log_level, tmpdir, worker_procs,
+                args.workers * args.ops_per_worker, args.arrival_rate, args.worker_timeout,
+            )
+        else:
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futures = {
+                    pool.submit(
+                        _run_worker,
+                        binary,
+                        tenant,
+                        idx,
+                        base_env,
+                        args.log_level,
+                        tmpdir,
+                        args.ops_per_worker,
+                        idx == 0,
+                        worker_procs,
+                    ): (tenant, idx)
+                    for tenant, idx in jobs
+                }
+                for fut in futures:
+                    tenant, idx = futures[fut]
+                    try:
+                        worker_results.append(fut.result(timeout=args.worker_timeout))
+                    except FutureTimeoutError:
+                        # Kill this worker's front-end so its wedged stdout read returns and the
+                        # thread exits — otherwise ThreadPoolExecutor.__exit__ (shutdown(wait=True))
+                        # blocks forever on the hung worker and never reaches teardown, leaking the
+                        # scratch daemon + the Metal GPU lock.
+                        wedged = worker_procs.get((tenant, idx))
+                        if wedged is not None:
+                            with contextlib.suppress(Exception):
+                                wedged.kill()
+                        hung = WorkerResult(tenant, idx)
+                        hung.crashed = f"worker exceeded --worker-timeout={args.worker_timeout}s (possible silent hang)"
+                        worker_results.append(hung)
 
         # ── oracle probe: post-load sample ──
         oracle_post = probe_oracle_channel(sock_path)

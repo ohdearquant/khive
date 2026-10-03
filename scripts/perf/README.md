@@ -51,6 +51,32 @@ achieved write rate, overflow or backpressure policy, residency mode, vector
 dimensionality, and every tail-cap parameter. A write-workload result missing
 any of these fields is exploratory, not decision evidence.
 
+### Load-harness arrivals
+
+`bench_load_harness.py --arrival-rate RATE` offers a finite schedule of
+`workers * ops-per-worker` arrivals at a total rate of RATE operations/second.
+The schedule uses absolute monotonic timestamps; completion latency does not
+move later offers. Persistent MCP connections form the concurrency limit.
+An arrival finding every connection busy is refused immediately, with no
+client queue. Omitting `--arrival-rate` retains the closed-loop report format.
+
+The `arrival` report records every scheduled/actual offer, dispatch and
+completion, terminal counts, per-class configured/observed offered rates,
+and achieved successful-completion rates. Offered rates use the declared
+schedule duration; achieved rates use the observation window including the
+bounded drain. Refused arrivals count as submitted. At the measurement stop,
+`submitted = completed + failed + refused + outstanding`; teardown terminates
+any calls still outstanding without rewriting that snapshot.
+
+Arrival zero follows bootstrap warm-up, daemon engagement, all worker
+handshakes and the leader attribution probes. The enclosing cache-state
+record labels the warm process and uncontrolled SQLite/OS caches. Vector
+dimensionality and tail caps are explicitly `UNMEASURED`: the existing
+`memory.remember` and entity `create` calls retain the daemon's configured
+embedding behavior. Record those fields with the plan before treating write
+rates as decision evidence. See [the load runbook](LOAD_HARNESS_RUNBOOK.md)
+for commands and refusal semantics.
+
 ## Trend ledger (`bench_track.py`)
 
 `bench_track.py` is a stdlib-only companion to `bench_calibrate.py`. Where
