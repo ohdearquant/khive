@@ -39,11 +39,13 @@ pub use adapters::{StorageKeywordSearch, StorageVectorSearch};
 // Re-export core types
 pub use error::{ErrorKind, Result, RetrievalError};
 
+#[cfg(feature = "bm25")]
 pub use khive_bm25::{Bm25Config, Bm25Index, Bm25Stats, DocumentId, SearchContext};
 pub use khive_fusion::{
     fuse, normalize_weights, reciprocal_rank_fusion, weighted_fusion, weights_are_normalized,
     FusionStrategy, DEFAULT_RRF_K,
 };
+#[cfg(feature = "hnsw")]
 pub use khive_hnsw::{
     DistanceMetric, HnswCheckpointConfig, HnswConfig, HnswIndex, HnswSearchContext, HnswSnapshot,
     NodeId, RebuildStats, TombstoneStats,
