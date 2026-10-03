@@ -26,10 +26,24 @@ paths = ['''^crates/khive-runtime/src/secret_gate\.rs$''']
 
 # The node wire protocol appendix publishes an HPKE test vector, and its shared secret is an
 # intermediate derived from test seeds the appendix also publishes. It is a specification value,
-# not a credential. Exempted by value and by path, as above.
+# not a credential, and the node crate's vector fixture carries the same value. Exempted by value
+# and by path, as above.
 [[rules.allowlists]]
 description = "The HPKE shared secret in the node wire protocol appendix's published test vector"
 condition = "AND"
 regexTarget = "secret"
 regexes = ['''^04dc45cdbcefd4a719ecf0c58b31ec795288097ed994e1a8b106405f6e502a48$''']
-paths = ['''^docs/adr/ADR-105-cross-node-comm-transport\.md$''']
+paths = [
+  '''^docs/adr/ADR-105-cross-node-comm-transport\.md$''',
+  '''^crates/khive-channel-node/tests/fixtures/node-v1-vectors\.json$''',
+]
+
+# The node crate's HPKE conformance fixture copies RFC 9180 Appendix A.2.3 verbatim, and its
+# shared secret is derived from seeds the same appendix publishes. It is a specification value,
+# not a credential. Exempted by value and by path, as above.
+[[rules.allowlists]]
+description = "The HPKE shared secret in the RFC 9180 conformance fixture"
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^d2d67828c8bc9fa661cf15a31b3ebf1febe0cafef7abfaaca580aaf6d471e3eb$''']
+paths = ['''^crates/khive-channel-node/tests/fixtures/rfc9180-auth-x25519-chacha\.json$''']
