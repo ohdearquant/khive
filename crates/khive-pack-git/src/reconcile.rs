@@ -193,12 +193,17 @@ fn annotation_guard(
     })
 }
 
-fn git_command(repo: &Path, args: &[&str]) -> Command {
-    crate::local_git::git_command(Path::new("git"), repo, args, None)
+fn git_command(repo: &Path, args: &[&str]) -> Result<Command> {
+    Ok(crate::local_git::git_command(
+        Path::new("git"),
+        repo,
+        args,
+        None,
+    )?)
 }
 
 fn git_status(repo: &Path, args: &[&str]) -> Result<bool> {
-    let status = git_command(repo, args)
+    let status = git_command(repo, args)?
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -215,7 +220,7 @@ fn git_commit_exists(repo: &Path, sha: &str) -> Result<bool> {
     if !oid(sha) {
         return Ok(false);
     }
-    let output = git_command(repo, &["cat-file", "-t", sha])
+    let output = git_command(repo, &["cat-file", "-t", sha])?
         .stdin(Stdio::null())
         .output()
         .context("checking frozen git object")?;
@@ -223,7 +228,7 @@ fn git_commit_exists(repo: &Path, sha: &str) -> Result<bool> {
 }
 
 fn git_repository_is_shallow(repo: &Path) -> Result<bool> {
-    let output = git_command(repo, &["rev-parse", "--is-shallow-repository"])
+    let output = git_command(repo, &["rev-parse", "--is-shallow-repository"])?
         .stdin(Stdio::null())
         .output()
         .context("checking repository history depth")?;
@@ -249,7 +254,7 @@ fn acknowledged_prefix(repo: &Path, checkpoint: &CommitCheckpoint) -> Result<Vec
             &checkpoint.snapshot_head,
             "--",
         ],
-    )
+    )?
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::null())
@@ -731,7 +736,10 @@ mod tests {
     use crate::GitPack;
 
     fn git(repo: &Path, args: &[&str]) -> String {
-        let output = git_command(repo, args).output().expect("start git");
+        let output = git_command(repo, args)
+            .expect("enumerate fixture filters")
+            .output()
+            .expect("start git");
         assert!(
             output.status.success(),
             "git {args:?}: {}",
@@ -745,6 +753,7 @@ mod tests {
 
     fn git_with_input(repo: &Path, args: &[&str], input: &[u8]) -> String {
         let mut child = git_command(repo, args)
+            .expect("enumerate fixture filters")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1536,6 +1545,7 @@ mod tests {
             "false"
         );
         let grafted_walk = git_command(fixture.repo.path(), &["log", "--format=%H", "HEAD"])
+            .expect("enumerate fixture filters")
             .env_remove("GIT_GRAFT_FILE")
             .output()
             .expect("grafted walk");
@@ -1554,6 +1564,7 @@ mod tests {
         assert!(fixture.edge_bytes(fixture.first_note).await.is_some());
 
         let restored_walk = git_command(fixture.repo.path(), &["log", "--format=%H", "HEAD"])
+            .expect("enumerate fixture filters")
             .output()
             .expect("ungrafted walk");
         assert!(restored_walk.status.success());

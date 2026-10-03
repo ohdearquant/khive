@@ -4920,3 +4920,7 @@ mod module_index_loader_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ingest/property_index_tests.rs"]
+mod property_index_tests;
