@@ -66,6 +66,7 @@ const NON_PROPERTIES_STORE_METHODS: &[&str] = &[
     "count_notes",
     "count_notes_in_namespaces",
     "get_notes_batch",
+    "get_notes_batch_including_deleted",
     "get_note_visibility_batch",
 ];
 
