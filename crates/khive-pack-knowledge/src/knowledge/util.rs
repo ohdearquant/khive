@@ -345,11 +345,16 @@ pub(super) async fn resolve_atom_id(
         .await
         .map_err(|e| sql_err("resolve_atom_id reader", e))?;
     let id = id_or_slug.trim().to_string();
-    let row = if id.parse::<Uuid>().is_ok() {
+    let row = if let Ok(uuid) = id.parse::<Uuid>() {
+        // Atom ids are stored as lowercase hyphenated text, so bind the parsed
+        // value's canonical form, not the spelling the caller used.
         reader
             .query_row(SqlStatement {
                 sql: "SELECT id FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
-                params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
+                params: vec![
+                    SqlValue::Text(uuid.as_hyphenated().to_string()),
+                    SqlValue::Text(ns.to_owned()),
+                ],
                 label: None,
             })
             .await
