@@ -3433,91 +3433,141 @@ impl GraphStore for SqlGraphStore {
             return Ok(Vec::new());
         }
 
-        let mut distinct_roots = HashSet::with_capacity(request.roots.len());
-        let roots = request
-            .roots
-            .iter()
-            .copied()
-            .filter(|root| distinct_roots.insert(*root))
-            .collect::<Vec<_>>();
-        let opts = request.options;
-        if self
-            .index_repair
-            .as_ref()
-            .is_some_and(super::index_repair::IndexRepairContext::is_writable)
-        {
-            // Prepare the actual indexed adjacency statements before BFS takes
-            // its long-lived reader. This preparation consumes no walk rows or
-            // query counters. A schema change during the walk remains its
-            // original typed failure; we never restart BFS or renew its budget.
-            let directions = match opts.direction {
-                Direction::Out => vec![Direction::Out],
-                Direction::In => vec![Direction::In],
-                Direction::Both => vec![Direction::Out, Direction::In],
-            };
-            let relation_count = opts.relations.as_ref().map_or(0, Vec::len);
-            let statements = directions
-                .into_iter()
-                .map(|direction| {
-                    traversal_neighbor_sql(direction, relation_count, opts.min_weight.is_some())
-                })
-                .collect::<Vec<_>>();
-            self.with_indexed_reader("traverse", move |conn| {
-                for sql in &statements {
-                    let _statement = conn.prepare(sql)?;
-                }
-                Ok(())
-            })
-            .await?;
-        }
-        let include_roots = request.include_roots;
-        let namespace = self.namespace.clone();
-        let origin = self.pool.origin();
         let budget = request.execution_budget;
-        // Shared with the blocking closure so the counts survive an error.
-        // `with_reader` runs the closure on a blocking thread where the
-        // task-local usage context is invisible, so it cannot call
-        // `usage::count` itself; returning the totals in the Ok value would
-        // lose every round trip already issued when a later statement fails.
-        let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let closure_rows = Arc::clone(&counted_rows);
-        let closure_queries = Arc::clone(&counted_queries);
-        let result = self
-            .with_reader("traverse", move |conn| {
-                Ok(run_bounded_traversal(
-                    conn,
-                    roots,
-                    opts,
-                    include_roots,
-                    namespace,
-                    origin,
-                    budget,
-                    closure_rows.as_ref(),
-                    closure_queries.as_ref(),
-                ))
-            })
-            .await
-            .and_then(|inner| inner);
+        let outer_context = khive_storage::capture_request_read_context();
+        let execution_deadline =
+            khive_storage::RequestReadDeadline::after(budget.remaining_duration());
+        khive_storage::scope_request_read_deadline_at(execution_deadline, async {
+            if outer_context.stop_reason().is_some() {
+                return Err(StorageError::Timeout {
+                    operation: "traverse".into(),
+                });
+            }
+            if budget.is_expired() {
+                return Err(traversal_timeout_error(&budget));
+            }
+            let mut distinct_roots = HashSet::with_capacity(request.roots.len());
+            let roots = request
+                .roots
+                .iter()
+                .copied()
+                .filter(|root| distinct_roots.insert(*root))
+                .collect::<Vec<_>>();
+            let opts = request.options;
+            if self
+                .index_repair
+                .as_ref()
+                .is_some_and(super::index_repair::IndexRepairContext::is_writable)
+            {
+                // Prepare and step the actual indexed adjacency statements with
+                // LIMIT 0 before BFS takes its long-lived reader. This checks the
+                // schema cookie without consuming walk rows or query counters.
+                // A schema change during the walk remains its original typed
+                // failure; we never restart BFS or renew its budget.
+                let directions = match opts.direction {
+                    Direction::Out => vec![Direction::Out],
+                    Direction::In => vec![Direction::In],
+                    Direction::Both => vec![Direction::Out, Direction::In],
+                };
+                let relation_count = opts.relations.as_ref().map_or(0, Vec::len);
+                let statements = directions
+                    .into_iter()
+                    .map(|direction| {
+                        traversal_neighbor_sql(direction, relation_count, opts.min_weight.is_some())
+                    })
+                    .collect::<Vec<_>>();
+                // Dropping preflight stops pending repair admission. Already admitted
+                // constructor DDL keeps its completion ownership outside this await.
+                let preflight = self.with_indexed_reader("traverse", move |conn| {
+                    for sql in &statements {
+                        let mut statement = conn.prepare(sql)?;
+                        statement.raw_bind_parameter(3, 0_i64)?;
+                        let _ = statement.raw_query().next()?;
+                    }
+                    Ok(())
+                });
+                let preflight_result = tokio::select! {
+                    biased;
+                    _ = outer_context.clone().wait_for_stop() => Err(StorageError::Timeout {
+                        operation: "traverse".into(),
+                    }),
+                    result = tokio::time::timeout_at(execution_deadline.async_at(), preflight) => {
+                        match result {
+                            Ok(result) => result,
+                            Err(_) => Err(traversal_timeout_error(&budget)),
+                        }
+                    },
+                };
+                preflight_result.map_err(|error| match error {
+                    StorageError::Timeout { .. }
+                        if budget.is_expired() && outer_context.stop_reason().is_none() =>
+                    {
+                        traversal_timeout_error(&budget)
+                    }
+                    error => error,
+                })?;
+                if budget.is_expired() {
+                    return Err(traversal_timeout_error(&budget));
+                }
+            }
+            let include_roots = request.include_roots;
+            let namespace = self.namespace.clone();
+            let origin = self.pool.origin();
+            let closure_budget = budget.clone();
+            // Shared with the blocking closure so the counts survive an error.
+            // `with_reader` runs the closure on a blocking thread where the
+            // task-local usage context is invisible, so it cannot call
+            // `usage::count` itself; returning the totals in the Ok value would
+            // lose every round trip already issued when a later statement fails.
+            let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let closure_rows = Arc::clone(&counted_rows);
+            let closure_queries = Arc::clone(&counted_queries);
+            let result = self
+                .with_reader("traverse", move |conn| {
+                    Ok(run_bounded_traversal(
+                        conn,
+                        roots,
+                        opts,
+                        include_roots,
+                        namespace,
+                        origin,
+                        closure_budget,
+                        closure_rows.as_ref(),
+                        closure_queries.as_ref(),
+                    ))
+                })
+                .await
+                .and_then(|inner| inner)
+                .map_err(|error| match error {
+                    StorageError::Timeout { .. }
+                        if budget.is_expired() && outer_context.stop_reason().is_none() =>
+                    {
+                        traversal_timeout_error(&budget)
+                    }
+                    error => error,
+                });
 
-        // Accounted on BOTH outcomes. `db_round_trips` counts round trips
-        // *issued* and `graph_hops` counts adjacency rows storage *returned*,
-        // so work already done before a later statement errors is real work and
-        // must appear. Reading the shared counters here rather than off the
-        // Ok value is what makes that possible: the closure runs on a blocking
-        // thread where the task-local usage context is not visible, so it
-        // cannot count for itself, and a value returned only on success
-        // reports nothing at all when the traversal fails partway.
-        khive_storage::usage::count(
-            khive_storage::usage::UsageUnit::DbRoundTrips,
-            counted_queries.load(std::sync::atomic::Ordering::Relaxed),
-        );
-        khive_storage::usage::count(
-            khive_storage::usage::UsageUnit::GraphHops,
-            counted_rows.load(std::sync::atomic::Ordering::Relaxed),
-        );
+            // Accounted on BOTH outcomes. `db_round_trips` counts round trips
+            // *issued* and `graph_hops` counts adjacency rows storage *returned*,
+            // so work already done before a later statement errors is real work and
+            // must appear. Reading the shared counters here rather than off the
+            // Ok value is what makes that possible: the closure runs on a blocking
+            // thread where the task-local usage context is not visible, so it
+            // cannot count for itself, and a value returned only on success
+            // reports nothing at all when the traversal fails partway.
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::DbRoundTrips,
+                counted_queries.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::GraphHops,
+                counted_rows.load(std::sync::atomic::Ordering::Relaxed),
+            );
 
-        result
+            result
+        })
+        .await
     }
 
     async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {

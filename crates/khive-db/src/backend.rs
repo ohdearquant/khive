@@ -218,6 +218,18 @@ pub(crate) enum StoreSchemaKind {
     Agents,
 }
 
+impl StoreSchemaKind {
+    fn initializer(self) -> fn(&rusqlite::Connection) -> Result<(), rusqlite::Error> {
+        match self {
+            Self::Entities => entity::ensure_entities_schema,
+            Self::Graph => graph::ensure_graph_schema,
+            Self::Notes => note::ensure_notes_schema,
+            Self::Events => event::ensure_events_schema,
+            Self::Agents => agents::ensure_agents_schema,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct StoreSchemaGate {
     pub(crate) ready: AtomicBool,
@@ -703,7 +715,7 @@ impl StorageBackend {
                 "entities namespace must be non-empty".to_string(),
             ));
         }
-        self.ensure_store_schema(StoreSchemaKind::Entities, entity::ensure_entities_schema)?;
+        self.ensure_store_schema(StoreSchemaKind::Entities)?;
 
         Ok(Arc::new(entity::SqlEntityStore::new(
             Arc::clone(&self.pool),
@@ -742,7 +754,7 @@ impl StorageBackend {
                 "graph namespace must be non-empty".to_string(),
             ));
         }
-        self.ensure_store_schema(StoreSchemaKind::Graph, graph::ensure_graph_schema)?;
+        self.ensure_store_schema(StoreSchemaKind::Graph)?;
 
         Ok(Arc::new(
             graph::SqlGraphStore::new_scoped(
@@ -758,11 +770,7 @@ impl StorageBackend {
         ))
     }
 
-    fn ensure_store_schema(
-        &self,
-        kind: StoreSchemaKind,
-        ensure: fn(&rusqlite::Connection) -> Result<(), rusqlite::Error>,
-    ) -> Result<(), SqliteError> {
+    fn ensure_store_schema(&self, kind: StoreSchemaKind) -> Result<(), SqliteError> {
         if self.is_read_only()
             || self.store_schemas[kind as usize]
                 .ready
@@ -771,16 +779,15 @@ impl StorageBackend {
             return Ok(());
         }
         let writer = self.constructor_writer()?;
-        self.ensure_store_schema_with_writer(kind, writer.conn(), ensure)
+        self.ensure_store_schema_with_writer(kind, writer.conn())
     }
 
     fn ensure_store_schema_with_writer(
         &self,
         kind: StoreSchemaKind,
         conn: &rusqlite::Connection,
-        ensure: fn(&rusqlite::Connection) -> Result<(), rusqlite::Error>,
     ) -> Result<(), SqliteError> {
-        self.store_schemas[kind as usize].ensure(conn, ensure)?;
+        self.store_schemas[kind as usize].ensure(conn, kind.initializer())?;
         Ok(())
     }
 
@@ -824,11 +831,7 @@ impl StorageBackend {
                 || self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0)
         {
             let writer = self.constructor_writer()?;
-            self.ensure_store_schema_with_writer(
-                StoreSchemaKind::Notes,
-                writer.conn(),
-                note::ensure_notes_schema,
-            )?;
+            self.ensure_store_schema_with_writer(StoreSchemaKind::Notes, writer.conn())?;
 
             // The anti-join repair is a full `notes` scan -- gate it to run at
             // most once per backend/pool. `try_writer()` blocks for exclusive
@@ -879,7 +882,7 @@ impl StorageBackend {
                 "events namespace must be non-empty".to_string(),
             ));
         }
-        self.ensure_store_schema(StoreSchemaKind::Events, event::ensure_events_schema)?;
+        self.ensure_store_schema(StoreSchemaKind::Events)?;
 
         Ok(Arc::new(event::SqlEventStore::new_scoped(
             Arc::clone(&self.pool),
@@ -893,7 +896,7 @@ impl StorageBackend {
     /// other stores here, agent-process records are not namespace-scoped, so
     /// there is no `_for_namespace` variant.
     pub fn agents(&self) -> Result<Arc<dyn khive_storage::AgentStore>, SqliteError> {
-        self.ensure_store_schema(StoreSchemaKind::Agents, agents::ensure_agents_schema)?;
+        self.ensure_store_schema(StoreSchemaKind::Agents)?;
 
         Ok(Arc::new(agents::SqlAgentStore::new(
             Arc::clone(&self.pool),
