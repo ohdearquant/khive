@@ -846,3 +846,270 @@ async fn malformed_first_row_keeps_the_original_scalar_get_note_error_bytes() {
         expected.to_string().as_bytes()
     );
 }
+
+#[tokio::test]
+async fn attachment_bearing_thread_and_inbox_pages_keep_bounded_reader_acquisitions() {
+    use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
+
+    for count in [3_u32, 201] {
+        let (runtime, _, registry) = fixture();
+        let root = id(1);
+        seed(
+            &runtime,
+            (1..=count)
+                .map(|index| {
+                    let mut note = message(index);
+                    note.properties.as_mut().unwrap()["thread_id"] = json!(root.to_string());
+                    note
+                })
+                .collect(),
+        )
+        .await;
+        let attachments = runtime.attachments().expect("canonical attachment store");
+        for index in 1..=count {
+            for position in [1_u32, 0] {
+                attachments
+                    .upsert_attachment(Attachment::from_new(
+                        id(index),
+                        AttachmentSubstrate::Note,
+                        NewAttachment {
+                            role: format!("message-attachment:{position}"),
+                            content_ref: ContentRef::from_hex(format!(
+                                "{:064x}",
+                                u64::from(index) * 2 + u64::from(position)
+                            ))
+                            .unwrap(),
+                            media_type: Some(format!("application/fixture-{position}")),
+                            size_bytes: Some(u64::from(index) + u64::from(position)),
+                        },
+                        1_000_000,
+                    ))
+                    .await
+                    .expect("seed real attachment row");
+            }
+        }
+        for verb in ["comm.thread", "comm.inbox"] {
+            let args = if verb == "comm.thread" {
+                json!({"id":root.to_string(),"limit":500,"order":"asc"})
+            } else {
+                json!({"limit":200})
+            };
+            let before = reader_acquisitions(&runtime);
+            let response = registry.dispatch(verb, args).await.unwrap();
+            let acquired = reader_acquisitions(&runtime) - before;
+            let rows = response["messages"].as_array().unwrap();
+            assert_eq!(
+                rows.len(),
+                if verb == "comm.thread" {
+                    count as usize
+                } else {
+                    count.min(200) as usize
+                }
+            );
+            for row in rows {
+                let owner: Uuid = row["full_id"].as_str().unwrap().parse().unwrap();
+                let index = (owner.as_u128() >> 96) as u64;
+                assert_eq!(
+                    row["attachments"],
+                    json!([
+                        {"content_ref":format!("{:064x}",index*2),"size":index,"media_type":"application/fixture-0"},
+                        {"content_ref":format!("{:064x}",index*2+1),"size":index+1,"media_type":"application/fixture-1"},
+                    ]),
+                    "{verb} keeps owner identity and numeric attachment order"
+                );
+                assert!(row.get("attachments_error").is_none());
+            }
+            assert!(
+                acquired <= 6,
+                "{verb} must read attachment-bearing pages in bounded windows, count={count}, acquisitions={acquired}"
+            );
+            assert!(
+                acquired >= 2,
+                "real note and attachment readers were acquired"
+            );
+        }
+        let mut ids: Vec<_> = (1..=count)
+            .rev()
+            .map(|index| id(index).to_string())
+            .collect();
+        ids.push(id(count).simple().to_string());
+        let before = reader_acquisitions(&runtime);
+        let acknowledgement = registry
+            .dispatch("comm.read", json!({"ids":ids,"body":false}))
+            .await
+            .expect("actual acknowledgement baseline");
+        let baseline_reads = reader_acquisitions(&runtime) - before;
+        assert_eq!(acknowledgement["requested_count"], count + 1);
+        assert_eq!(acknowledgement["unique_count"], count);
+        assert_eq!(acknowledgement["marked_count"], count);
+        for row in acknowledgement["results"].as_array().unwrap() {
+            assert_eq!(row["status"], "success");
+            assert_eq!(row["read"], true);
+            assert!(row.get("attachments").is_none());
+            assert!(row.get("content").is_none());
+        }
+        let before = reader_acquisitions(&runtime);
+        let response = registry
+            .dispatch("comm.read", json!({"ids":ids,"body":true}))
+            .await
+            .expect("actual body-bearing bulk read");
+        let body_reads = reader_acquisitions(&runtime) - before;
+        assert_eq!(response["requested_count"], count + 1);
+        assert_eq!(response["unique_count"], count);
+        assert_eq!(response["marked_count"], count);
+        assert_eq!(
+            full_ids(&response),
+            (1..=count)
+                .rev()
+                .map(|index| id(index).to_string())
+                .collect::<Vec<_>>()
+        );
+        for row in response["results"].as_array().unwrap() {
+            let owner: Uuid = row["full_id"].as_str().unwrap().parse().unwrap();
+            let index = (owner.as_u128() >> 96) as u64;
+            assert_eq!(row["status"], "success");
+            assert_eq!(row["read"], true);
+            assert_eq!(row["content"], format!("message {index}"));
+            assert_eq!(
+                row["attachments"],
+                json!([
+                    {"content_ref":format!("{:064x}",index*2),"size":index,"media_type":"application/fixture-0"},
+                    {"content_ref":format!("{:064x}",index*2+1),"size":index+1,"media_type":"application/fixture-1"},
+                ])
+            );
+            assert!(row.get("attachments_error").is_none());
+        }
+        assert!(
+            baseline_reads >= u64::from(count) * 2 + u64::from(count + 1).div_ceil(128),
+            "baseline includes the existing per-target policy and successful mark readback readers"
+        );
+        assert_eq!(
+            body_reads.checked_sub(baseline_reads),
+            Some(1),
+            "body-bearing bulk read must add one physical attachment reader, count={count}, baseline={baseline_reads}, body={body_reads}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn attachment_page_batch_keeps_readable_siblings_and_owner_diagnostics() {
+    use khive_storage::{Attachment, AttachmentSubstrate, ContentRef, NewAttachment};
+
+    let (runtime, _, registry) = fixture();
+    let root = id(1);
+    seed(
+        &runtime,
+        (1..=3)
+            .map(|index| {
+                let mut note = message(index);
+                note.properties.as_mut().unwrap()["thread_id"] = json!(root.to_string());
+                note
+            })
+            .collect(),
+    )
+    .await;
+    let content_ref = ContentRef::from_hex("11".repeat(32)).unwrap();
+    let store = runtime.attachments().unwrap();
+    for (owner, position) in [(id(1), 0), (id(2), 0), (id(2), 1)] {
+        store
+            .upsert_attachment(Attachment::from_new(
+                owner,
+                AttachmentSubstrate::Note,
+                NewAttachment {
+                    role: format!("message-attachment:{position}"),
+                    content_ref: content_ref.clone(),
+                    media_type: None,
+                    size_bytes: Some(7),
+                },
+                1_000_000,
+            ))
+            .await
+            .unwrap();
+    }
+    let mut writer = runtime.sql().writer().await.unwrap();
+    writer
+        .execute(SqlStatement {
+            sql: "PRAGMA ignore_check_constraints = ON".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .unwrap();
+    writer
+        .execute(SqlStatement {
+            sql: "UPDATE attachments SET content_ref = 'invalid-ref' WHERE record_uuid = ?1 AND role = 'message-attachment:1'".into(),
+            params: vec![SqlValue::Text(id(2).to_string())],
+            label: Some("comm-page-fixture-unreadable-attachment".into()),
+        })
+        .await
+        .unwrap();
+    writer
+        .execute(SqlStatement {
+            sql: "PRAGMA ignore_check_constraints = OFF".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .unwrap();
+    drop(writer);
+    for role in ["", "\n"] {
+        runtime
+            .sql()
+            .writer()
+            .await
+            .unwrap()
+            .execute(SqlStatement {
+                sql: "INSERT INTO attachment_quarantine (record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at, reason) VALUES (?1, 'note', ?2, ?3, NULL, 7, 1000000, 'invalid_role')".into(),
+                params: vec![
+                    SqlValue::Text(id(3).to_string()),
+                    SqlValue::Text(role.into()),
+                    SqlValue::Text(content_ref.to_string()),
+                ],
+                label: Some("comm-page-fixture-quarantined-attachment".into()),
+            })
+            .await
+            .unwrap();
+    }
+    for verb in ["comm.thread", "comm.inbox"] {
+        let args = if verb == "comm.thread" {
+            json!({"id":root.to_string(),"limit":500})
+        } else {
+            json!({"limit":200})
+        };
+        let before = reader_acquisitions(&runtime);
+        let response = registry.dispatch(verb, args).await;
+        assert!(
+            response.is_ok(),
+            "{verb} must retain readable message views: {response:?}"
+        );
+        let response = response.unwrap();
+        let acquired = reader_acquisitions(&runtime) - before;
+        let rows = response["messages"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        for index in 1..=3 {
+            let row = rows
+                .iter()
+                .find(|row| row["full_id"] == id(index).to_string())
+                .unwrap();
+            let expected = if index == 3 {
+                json!([])
+            } else {
+                json!([{"content_ref":content_ref,"size":7,"media_type":null}])
+            };
+            assert_eq!(row["attachments"], expected, "{verb} owner {index}");
+            if index == 1 {
+                assert!(row.get("attachments_error").is_none());
+            } else {
+                assert_eq!(
+                    row["attachments_error"],
+                    json!({"count":index-1,"reason":"unreadable_attachment"}),
+                    "{verb} reports only this owner's unreadable and quarantined rows"
+                );
+            }
+        }
+        assert!(
+            acquired <= 6,
+            "{verb} diagnostics page acquisitions: {acquired}"
+        );
+    }
+}

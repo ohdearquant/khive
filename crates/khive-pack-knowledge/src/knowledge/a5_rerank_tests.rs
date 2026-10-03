@@ -134,6 +134,7 @@ fn runtime(calls: &Arc<Calls>) -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("in-memory runtime");
     rt.register_embedder(RoleProvider(calls.clone()));

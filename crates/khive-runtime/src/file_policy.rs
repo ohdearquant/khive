@@ -186,10 +186,7 @@ pub fn validate_import(root: &Path, requested: &Path) -> anyhow::Result<PathBuf>
     } else {
         root.join(requested)
     };
-    let canonical = joined.canonicalize().map_err(|error| {
-        anyhow::anyhow!("canonicalize import file {}: {error}", joined.display())
-    })?;
-    if !canonical.starts_with(root) || !joined.starts_with(root) {
+    if !joined.starts_with(root) {
         anyhow::bail!(
             "import path escapes the allowed import root ({})",
             root.display()
@@ -207,6 +204,15 @@ pub fn validate_import(root: &Path, requested: &Path) -> anyhow::Result<PathBuf>
                 current.display()
             );
         }
+    }
+    let canonical = joined.canonicalize().map_err(|error| {
+        anyhow::anyhow!("canonicalize import file {}: {error}", joined.display())
+    })?;
+    if !canonical.starts_with(root) {
+        anyhow::bail!(
+            "import path escapes the allowed import root ({})",
+            root.display()
+        );
     }
     if !std::fs::metadata(&canonical)?.is_file() {
         anyhow::bail!("import source must be a regular file: {}", joined.display());

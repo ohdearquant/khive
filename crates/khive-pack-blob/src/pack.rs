@@ -216,6 +216,11 @@ impl PackRuntime for BlobPack {
         _registry: &VerbRegistry,
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
+        if matches!(verb, "blob.import" | "blob.export") && !self.file_transfers_enabled {
+            return Err(RuntimeError::InvalidInput(format!(
+                "{verb}: server file transfers are disabled; enable [blob] file_transfers = true or KHIVE_FILE_TRANSFERS=1"
+            )));
+        }
         match verb {
             "blob.import" => {
                 crate::file_handlers::handle_import(self.runtime(), &self.uploads, token, params)

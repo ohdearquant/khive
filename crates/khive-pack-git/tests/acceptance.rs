@@ -8359,6 +8359,7 @@ async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime with a configured default model");
     rt.register_embedder(FixtureEmbedProvider { dims });

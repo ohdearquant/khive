@@ -564,6 +564,7 @@ mod tests {
             allowed_outbound_namespaces: vec![Namespace::parse(&recipient_ns).unwrap()],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
 
@@ -652,6 +653,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -805,6 +807,7 @@ mod tests {
             allowed_outbound_namespaces: vec![Namespace::parse(&recipient_ns).unwrap()],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         runtime.register_embedder(StubProvider);
@@ -977,6 +980,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         let caller_token = runtime

@@ -101,10 +101,14 @@ impl BlobStore for BoundedOnlyBlobStore {
 }
 
 fn build_registry() -> (VerbRegistry, KhiveRuntime, tempfile::TempDir) {
+    build_registry_with_runtime(KhiveRuntime::memory().expect("in-memory runtime"))
+}
+
+fn build_registry_with_runtime(
+    runtime: KhiveRuntime,
+) -> (VerbRegistry, KhiveRuntime, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = FsBlobStore::new(dir.path().to_path_buf(), 0).expect("fs blob store");
-
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     runtime
         .install_blob_store(std::sync::Arc::new(store))
         .expect("install blob store");
@@ -726,7 +730,16 @@ fn blob_files(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>
 #[tokio::test]
 async fn every_blob_verb_rejects_unknown_arguments_before_side_effects() {
     use serde_json::json;
-    let (registry, _runtime, dir) = build_registry();
+    let file_policy: khive_runtime::KhiveConfig =
+        serde_json::from_value(json!({"blob": {"file_transfers": true}})).unwrap();
+    let mut base = khive_runtime::RuntimeConfig::no_embeddings();
+    base.db_path = None;
+    base.packs = vec!["kg".to_owned()];
+    base.brain_profile = None;
+    base.actor_id = None;
+    let config = khive_runtime::runtime::runtime_config_from_khive_config(&file_policy, base);
+    let runtime = KhiveRuntime::new(config).expect("in-memory runtime with file transfers");
+    let (registry, _runtime, dir) = build_registry_with_runtime(runtime);
     let existing = registry
         .dispatch("blob.put", json!({"bytes": BASE64.encode(b"existing")}))
         .await

@@ -41,6 +41,7 @@ fn actor_registry(
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some(actor.to_string()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         },
     );
     let mut builder = VerbRegistryBuilder::new();

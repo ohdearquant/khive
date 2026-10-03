@@ -2578,6 +2578,7 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime");
     rt.register_embedder(RecordingEmbedProvider {
@@ -2803,6 +2804,7 @@ async fn knowledge_index_persists_audited_bounded_prefixed_fingerprint() {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime");
     rt.register_test_audited_embedder(MODEL, RecordingProvider(Arc::clone(&recorded)));
@@ -5622,6 +5624,7 @@ mod kg_blend {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(MarkerEmbedProvider { recorded, pause });
@@ -6361,6 +6364,7 @@ mod kg_blend {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(CountingEmbedProvider {
@@ -6789,6 +6793,7 @@ mod kg_blend {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(FailingBlendEmbedProvider);

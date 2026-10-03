@@ -1079,7 +1079,16 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         .map(|cfg| encode_backend_topology(cfg, config))
         .unwrap_or_default();
 
-    format!("{base}{topology}")
+    // Default-disabled callers retain the established daemon identity. An
+    // enabled host must not serve a caller whose boot policy disables local
+    // filesystem transfers. Use the captured runtime policy, never the live
+    // environment, so forwarding and pack initialization agree.
+    let blob_file_transfers = if config.blob.file_transfers {
+        ";blob_file_transfers=true"
+    } else {
+        ""
+    };
+    format!("{base}{topology}{blob_file_transfers}")
 }
 
 /// Reserved syntax in the legacy topology spelling.

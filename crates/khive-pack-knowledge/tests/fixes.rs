@@ -1956,6 +1956,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime with default embedder")
 }
@@ -2643,6 +2644,7 @@ mod embed_failure_tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         // Override the lattice provider with our fake — same key, last-writer wins.
@@ -2841,6 +2843,7 @@ mod embed_failure_tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(FixedVecProvider {
@@ -3167,6 +3170,7 @@ mod ann_bypass_regression {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(CorrectDimProvider);
@@ -3777,6 +3781,7 @@ mod edit_inline_reembed {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(EmbedProvider);
@@ -4192,6 +4197,7 @@ mod ann_type_filter_regression {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(CorrectDimProvider);
@@ -4608,6 +4614,7 @@ mod compose_explain_sections {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(UnitVecProvider);

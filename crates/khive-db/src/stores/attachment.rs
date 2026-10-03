@@ -1,5 +1,6 @@
 //! SQL-backed `AttachmentStore` implementation.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -312,6 +313,70 @@ impl AttachmentStore for SqlAttachmentStore {
                 report.unreadable_reason = Some("unreadable_attachment".to_string());
             }
             Ok(report)
+        })
+        .await
+    }
+
+    async fn list_attachments_reports(
+        &self,
+        record_uuids: &[Uuid],
+    ) -> Result<Vec<AttachmentReadReport>, StorageError> {
+        if record_uuids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let record_uuids = record_uuids.to_vec();
+        self.with_reader("list_attachments_reports", move |conn| {
+            let mut indices = HashMap::new();
+            let mut unique = Vec::new();
+            let mut input_indices = Vec::with_capacity(record_uuids.len());
+            for record_uuid in record_uuids {
+                let key = record_uuid.to_string();
+                let index = *indices.entry(key.clone()).or_insert_with(|| {
+                    let index = unique.len();
+                    unique.push(key);
+                    index
+                });
+                input_indices.push(index);
+            }
+            let mut reports = vec![AttachmentReadReport::default(); unique.len()];
+            for owners in unique.chunks(128) {
+                let placeholders = vec!["?"; owners.len()].join(",");
+                let mut quarantine = conn.prepare(&format!(
+                    "SELECT record_uuid, COUNT(*) FROM attachment_quarantine \
+                     WHERE record_uuid IN ({placeholders}) GROUP BY record_uuid"
+                ))?;
+                let mut rows = quarantine.query(rusqlite::params_from_iter(owners.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let owner: String = row.get(0)?;
+                    let count: i64 = row.get(1)?;
+                    let index = *indices.get(&owner).ok_or(rusqlite::Error::InvalidQuery)?;
+                    reports[index].unreadable_count = u64::try_from(count)
+                        .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, count))?;
+                }
+                let mut attachments = conn.prepare(&format!(
+                    "SELECT record_uuid, substrate, role, content_ref, media_type, size_bytes, created_at \
+                     FROM attachments WHERE record_uuid IN ({placeholders}) \
+                     ORDER BY record_uuid ASC, role ASC"
+                ))?;
+                let mut rows = attachments.query(rusqlite::params_from_iter(owners.iter()))?;
+                while let Some(row) = rows.next()? {
+                    let owner: String = row.get(0)?;
+                    let index = *indices.get(&owner).ok_or(rusqlite::Error::InvalidQuery)?;
+                    match read_attachment(row) {
+                        Ok(attachment) => reports[index].attachments.push(attachment),
+                        Err(_) => reports[index].unreadable_count += 1,
+                    }
+                }
+            }
+            for report in &mut reports {
+                if report.unreadable_count > 0 {
+                    report.unreadable_reason = Some("unreadable_attachment".to_string());
+                }
+            }
+            Ok(input_indices
+                .into_iter()
+                .map(|index| reports[index].clone())
+                .collect())
         })
         .await
     }

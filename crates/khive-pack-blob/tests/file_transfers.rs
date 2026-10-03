@@ -16,6 +16,7 @@ struct Roots {
     directory: tempfile::TempDir,
     old_import: Option<OsString>,
     old_export: Option<OsString>,
+    old_transfers: Option<OsString>,
 }
 
 impl Roots {
@@ -24,6 +25,8 @@ impl Roots {
         let root = directory.path().canonicalize().unwrap();
         let old_import = std::env::var_os("KHIVE_IMPORT_FROM_ROOT");
         let old_export = std::env::var_os("KHIVE_SAVE_TO_ROOT");
+        let old_transfers = std::env::var_os("KHIVE_FILE_TRANSFERS");
+        std::env::set_var("KHIVE_FILE_TRANSFERS", "1");
         std::env::set_var("KHIVE_IMPORT_FROM_ROOT", root.join("imports"));
         std::env::set_var("KHIVE_SAVE_TO_ROOT", root.join("exports"));
         std::fs::create_dir_all(root.join("imports")).unwrap();
@@ -32,6 +35,7 @@ impl Roots {
             directory,
             old_import,
             old_export,
+            old_transfers,
         }
     }
 
@@ -45,6 +49,7 @@ impl Drop for Roots {
         for (name, old) in [
             ("KHIVE_IMPORT_FROM_ROOT", &self.old_import),
             ("KHIVE_SAVE_TO_ROOT", &self.old_export),
+            ("KHIVE_FILE_TRANSFERS", &self.old_transfers),
         ] {
             match old {
                 Some(value) => std::env::set_var(name, value),
@@ -134,6 +139,34 @@ async fn import_outside_root_refuses() {
 }
 
 #[tokio::test]
+async fn missing_outside_import_refuses_before_path_inspection() {
+    let _guard = FILE_ENV.lock().await;
+    let roots = Roots::new();
+    let (registry, _) = registry(&roots);
+    let existing = roots.path("outside.bin");
+    let missing = roots.path("missing-outside.bin");
+    std::fs::write(&existing, b"outside file").unwrap();
+    assert!(!missing.exists());
+    let expected = format!(
+        "blob.import: import path escapes the allowed import root ({})",
+        roots.path("imports").display()
+    );
+    for outside in [&existing, &missing] {
+        let error = registry
+            .dispatch("blob.import", json!({"path": outside}))
+            .await
+            .expect_err("outside paths must refuse before inspection");
+        match error {
+            khive_runtime::RuntimeError::InvalidInput(text) => assert_eq!(text, expected),
+            other => panic!("expected confined-path InvalidInput, got {other}"),
+        }
+    }
+    assert!(!missing.exists());
+    assert_eq!(std::fs::read(&existing).unwrap(), b"outside file");
+    assert_eq!(std::fs::read_dir(roots.path("cas")).unwrap().count(), 0);
+}
+
+#[tokio::test]
 async fn import_traversal_directory_and_size_refuse() {
     let _guard = FILE_ENV.lock().await;
     let roots = Roots::new();
@@ -175,7 +208,7 @@ async fn import_symlinks_inside_and_outside_root_refuse() {
     import_refusal(
         &registry,
         Path::new("outside-link"),
-        "escapes the allowed import root",
+        "must not contain a symlink",
     )
     .await;
     std::fs::create_dir_all(roots.path("imports/subdirectory")).unwrap();
@@ -305,4 +338,143 @@ async fn unsupported_staged_import_refuses_without_whole_file_put() {
         "specific backend capability refusal: {error}"
     );
     assert_eq!(store.puts.load(Ordering::Relaxed), 0);
+}
+
+async fn transfers_disabled(registry: &VerbRegistry, reference: &ContentRef) {
+    for (verb, params) in [
+        ("blob.import", json!({"path": "source.bin"})),
+        (
+            "blob.export",
+            json!({"content_ref": reference, "path": "output.bin"}),
+        ),
+    ] {
+        let error = registry
+            .dispatch(verb, params)
+            .await
+            .expect_err("file transfers must require explicit opt-in");
+        match error {
+            khive_runtime::RuntimeError::InvalidInput(text) => {
+                assert!(
+                    text.contains("server file transfers are disabled"),
+                    "{text}"
+                );
+                assert!(text.contains("[blob] file_transfers = true"), "{text}");
+                assert!(text.contains("KHIVE_FILE_TRANSFERS=1"), "{text}");
+            }
+            other => panic!("expected explicit opt-in InvalidInput, got {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn file_transfers_refuse_when_opt_in_is_unset_without_disabling_put() {
+    let _guard = FILE_ENV.lock().await;
+    let roots = Roots::new();
+    std::env::remove_var("KHIVE_FILE_TRANSFERS");
+    std::fs::remove_dir(roots.path("imports")).unwrap();
+    std::fs::remove_dir(roots.path("exports")).unwrap();
+    let (registry, store) = registry(&roots);
+    let put = registry
+        .dispatch("blob.put", json!({"bytes": "c3RpbGwgcHV0"}))
+        .await
+        .unwrap();
+    let reference = ContentRef::from_hex(put["content_ref"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        put["content_ref"],
+        blake3::hash(b"still put").to_hex().as_str()
+    );
+    assert_eq!(store.size(&reference).await.unwrap(), Some(9));
+    transfers_disabled(&registry, &reference).await;
+    assert!(!roots.path("imports").exists());
+    assert!(!roots.path("exports").exists());
+}
+
+#[tokio::test]
+async fn file_transfer_environment_opt_in_is_exact_and_captured_at_runtime_construction() {
+    let _guard = FILE_ENV.lock().await;
+    let roots = Roots::new();
+    std::fs::write(roots.path("imports/source.bin"), b"captured opt-in").unwrap();
+    let (enabled, store) = registry(&roots);
+    std::env::remove_var("KHIVE_FILE_TRANSFERS");
+    let imported = enabled
+        .dispatch("blob.import", json!({"path": "source.bin"}))
+        .await
+        .unwrap();
+    let reference = ContentRef::from_hex(imported["content_ref"].as_str().unwrap()).unwrap();
+    enabled
+        .dispatch(
+            "blob.export",
+            json!({"content_ref": reference, "path": "captured.bin"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(roots.path("exports/captured.bin")).unwrap(),
+        b"captured opt-in"
+    );
+    assert_eq!(store.size(&reference).await.unwrap(), Some(15));
+    let disabled_runtime = KhiveRuntime::memory().unwrap();
+    disabled_runtime.install_blob_store(store).unwrap();
+    std::env::set_var("KHIVE_FILE_TRANSFERS", "1");
+    let mut builder = VerbRegistryBuilder::new();
+    PackRegistry::register_packs(&["blob".into()], disabled_runtime, &mut builder).unwrap();
+    transfers_disabled(&builder.build().unwrap(), &reference).await;
+    for value in ["", "0", "true", " 1", "1 "] {
+        std::env::set_var("KHIVE_FILE_TRANSFERS", value);
+        let (registry, _) = registry(&roots);
+        transfers_disabled(&registry, &reference).await;
+    }
+}
+
+#[tokio::test]
+async fn configured_file_transfer_opt_in_reaches_both_runtime_conversion_paths() {
+    let _guard = FILE_ENV.lock().await;
+    let roots = Roots::new();
+    std::env::remove_var("KHIVE_FILE_TRANSFERS");
+    std::fs::write(roots.path("imports/source.bin"), b"configured opt-in").unwrap();
+    for (index, engines) in [
+        "",
+        "[[engines]]\nname = \"default\"\nmodel = \"all-minilm-l6-v2\"\ndefault = true\n",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (opt_in, environment) in [(true, None), (true, Some("0")), (false, Some("1"))] {
+            match environment {
+                Some(value) => std::env::set_var("KHIVE_FILE_TRANSFERS", value),
+                None => std::env::remove_var("KHIVE_FILE_TRANSFERS"),
+            }
+            let path = roots.path(&format!("config-{index}.toml"));
+            std::fs::write(
+                &path,
+                format!("{engines}[blob]\nfile_transfers = {opt_in}\n"),
+            )
+            .unwrap();
+            let config = khive_runtime::KhiveConfig::load(Some(&path))
+                .unwrap()
+                .unwrap();
+            let mut resolved = khive_runtime::runtime_config_from_khive_config(
+                &config,
+                khive_runtime::RuntimeConfig::no_embeddings(),
+            );
+            resolved.db_path = None;
+            resolved.embedding_model = None;
+            resolved.additional_embedding_models.clear();
+            let runtime = KhiveRuntime::new(resolved).unwrap();
+            let store = Arc::new(FsBlobStore::new(roots.path(&format!("cas-{index}")), 0).unwrap());
+            runtime.install_blob_store(store).unwrap();
+            let mut builder = VerbRegistryBuilder::new();
+            PackRegistry::register_packs(&["blob".into()], runtime, &mut builder).unwrap();
+            let registry = builder.build().unwrap();
+            let imported = registry
+                .dispatch("blob.import", json!({"path": "source.bin"}))
+                .await
+                .unwrap();
+            registry.dispatch("blob.export", json!({"content_ref": imported["content_ref"], "path": format!("configured-{index}.bin")})).await.unwrap();
+            assert_eq!(
+                std::fs::read(roots.path(&format!("exports/configured-{index}.bin"))).unwrap(),
+                b"configured opt-in"
+            );
+        }
+    }
 }

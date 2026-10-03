@@ -924,9 +924,7 @@ async fn query_inbox_response(
     if has_more {
         messages.truncate(limit);
     }
-    for message in &mut messages {
-        crate::file_attachments::enrich(runtime, message).await?;
-    }
+    crate::file_attachments::enrich_many(runtime, messages.iter_mut().collect()).await?;
     let count = messages.len();
     // This is a mailbox-wide signal; page and status filters only shape `messages`.
     let unread = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
@@ -1223,13 +1221,19 @@ async fn mark_read_targets_best_effort(
 ) -> Result<Value, RuntimeError> {
     // Read every target's fields before marking any target, so a failed field
     // lookup cannot leave earlier messages marked as read.
+    let attachment_fields: Vec<Option<Value>> = if include_body {
+        let ids: Vec<_> = targets.iter().map(|(id, _)| *id).collect();
+        crate::file_attachments::metadata_many(runtime, &ids)
+            .await?
+            .into_iter()
+            .map(Some)
+            .collect()
+    } else {
+        vec![None; targets.len()]
+    };
     let mut prepared_targets = Vec::with_capacity(targets.len());
-    for (id, note) in targets {
-        let message = if include_body {
-            Some(read_message_fields(runtime, &note).await?)
-        } else {
-            None
-        };
+    for ((id, note), fields) in targets.into_iter().zip(attachment_fields) {
+        let message = fields.map(|fields| read_message_fields_prepared(&note, fields));
         prepared_targets.push((id, note, message));
     }
 
@@ -1263,8 +1267,12 @@ async fn mark_read_targets_best_effort(
 }
 
 async fn read_message_fields(runtime: &KhiveRuntime, note: &Note) -> Result<Value, RuntimeError> {
-    let message = note_to_message_json(note);
     let attachment_fields = crate::file_attachments::metadata(runtime, note.id).await?;
+    Ok(read_message_fields_prepared(note, attachment_fields))
+}
+
+fn read_message_fields_prepared(note: &Note, attachment_fields: Value) -> Value {
+    let message = note_to_message_json(note);
     let mut fields = json!({
         "subject": message["subject"],
         "content": message["content"],
@@ -1278,7 +1286,7 @@ async fn read_message_fields(runtime: &KhiveRuntime, note: &Note) -> Result<Valu
     {
         fields.extend(attachment_fields);
     }
-    Ok(fields)
+    fields
 }
 
 fn read_result_with_body(mut result: Value, message: Option<Value>) -> Value {
@@ -2293,9 +2301,11 @@ pub(crate) async fn handle_thread(
         }
     });
     rows.truncate(limit);
-    for row in &mut rows {
-        crate::file_attachments::enrich(runtime, &mut row.json).await?;
-    }
+    crate::file_attachments::enrich_many(
+        runtime,
+        rows.iter_mut().map(|row| &mut row.json).collect(),
+    )
+    .await?;
     let count = rows.len();
     let messages: Vec<Value> = rows
         .into_iter()
@@ -4893,6 +4903,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -4984,6 +4995,7 @@ mod tests {
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
                 exec: Default::default(),
+                ..khive_runtime::RuntimeConfig::no_embeddings()
             })
             .expect("in-memory runtime"),
         );
@@ -6339,6 +6351,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -6468,6 +6481,7 @@ mod tests {
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
                 exec: Default::default(),
+                ..khive_runtime::RuntimeConfig::no_embeddings()
             })
             .expect("in-memory runtime");
             let token = runtime

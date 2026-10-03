@@ -7727,6 +7727,7 @@ mod tests {
             allowed_outbound_namespaces: Vec::new(),
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         runtime.register_embedder(RecordingProvider {
@@ -7918,6 +7919,7 @@ mod tests {
             allowed_outbound_namespaces: Vec::new(),
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         runtime.register_embedder(RoleAwareRecordingProvider {

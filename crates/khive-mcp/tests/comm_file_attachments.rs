@@ -43,7 +43,18 @@ fn fixture() -> (
 ) {
     let root = tempfile::tempdir().expect("private blob root");
     let store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).expect("blob store"));
-    let runtime = KhiveRuntime::memory().expect("message runtime");
+    let file_policy: khive_runtime::KhiveConfig =
+        serde_json::from_value(json!({"blob": {"file_transfers": true}}))
+            .expect("explicit file transfer policy");
+    let base = khive_runtime::RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".into()],
+        brain_profile: None,
+        actor_id: None,
+        ..khive_runtime::RuntimeConfig::no_embeddings()
+    };
+    let config = khive_runtime::runtime::runtime_config_from_khive_config(&file_policy, base);
+    let runtime = KhiveRuntime::new(config).expect("message runtime");
     runtime
         .install_blob_store(store.clone())
         .expect("install message blob store");
@@ -442,4 +453,152 @@ impl Drop for FileRoots {
             }
         }
     }
+}
+
+async fn attachment_publication_snapshot(runtime: &KhiveRuntime) -> Value {
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .expect("publication snapshot reader");
+    let mut rows = Vec::new();
+    for sql in [
+        "SELECT * FROM notes ORDER BY id",
+        "SELECT * FROM attachments ORDER BY record_uuid COLLATE BINARY, role COLLATE BINARY",
+        "SELECT * FROM events ORDER BY id",
+        "SELECT * FROM event_observations ORDER BY event_id, role, position",
+    ] {
+        rows.push(
+            serde_json::to_value(
+                reader
+                    .query_all(SqlStatement {
+                        sql: sql.into(),
+                        params: vec![],
+                        label: Some("attachment-refusal-publication-snapshot".into()),
+                    })
+                    .await
+                    .expect("publication snapshot query"),
+            )
+            .expect("snapshot SQL column values"),
+        );
+    }
+    json!(rows)
+}
+
+#[tokio::test]
+async fn reply_to_email_ingested_message_refuses_attachments_before_publication() {
+    // A local reply must reach the actual attachment publication path first.
+    let (local_registry, local_runtime, local_store, _local_root) = fixture();
+    let local_root = local_registry.dispatch_with_identity(
+        "comm.send",
+        json!({"to": "actor:recipient", "content": "local root", "idempotency_key": "local-root"}),
+        Some(identity("actor:sender")),
+    ).await.expect("local keyed root");
+    let local_ref = local_store
+        .put(b"local reply file".to_vec())
+        .await
+        .expect("local reply blob");
+    let local_reply = local_registry.dispatch_with_identity(
+        "comm.reply",
+        json!({"id": local_root["recipient_id"], "content": "local reply", "attachments": [local_ref], "idempotency_key": "local-reply"}),
+        Some(identity("actor:recipient")),
+    ).await.expect("local reply accepts the actual file");
+    assert_eq!(count(&local_runtime, "notes").await, 4);
+    assert_eq!(count(&local_runtime, "attachments").await, 2);
+    for field in ["full_id", "recipient_id"] {
+        let id =
+            Uuid::parse_str(local_reply[field].as_str().expect("local reply copy UUID")).unwrap();
+        let rows = local_runtime
+            .attachments()
+            .unwrap()
+            .list_attachments(id)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, "message-attachment:0");
+        assert_eq!(rows[0].content_ref, local_ref);
+        assert_eq!(rows[0].size_bytes, Some(16));
+    }
+
+    let (registry, runtime, store, _root) = fixture();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("ingest namespace");
+    let pack = khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+        runtime.clone(),
+        khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+    );
+    let recipient = "email:sender@example.com";
+    // Channel ingestion is an internal subhandler, invoked by a trusted
+    // composition rather than exposed as an ordinary request verb.
+    let ingested = khive_runtime::pack::PackRuntime::dispatch(
+        &pack,
+        "comm.ingest",
+        json!({
+            "from": recipient, "to": "local", "default_inbound_actor": "actor:recipient",
+            "content": "external reply root", "subject": "email root",
+            "channel_kind": "email", "channel_slug": "attachment-reply-email",
+            "external_id": "imap:attachment-reply-email:1:1",
+        }),
+        &registry,
+        &token,
+    )
+    .await
+    .expect("actual email-channel ingest");
+    assert_eq!(ingested["deduplicated"], false);
+    let id = Uuid::parse_str(ingested["full_id"].as_str().expect("ingested UUID")).unwrap();
+    let original = runtime
+        .notes(&token)
+        .unwrap()
+        .get_note(id)
+        .await
+        .unwrap()
+        .expect("stored inbound root");
+    let properties = original
+        .properties
+        .as_ref()
+        .expect("ingested message properties");
+    assert_eq!(properties["from_actor"], recipient);
+    assert_eq!(properties["to_actor"], "actor:recipient");
+    assert_eq!(properties["direction"], "inbound");
+    let reference = store
+        .put(b"external reply file".to_vec())
+        .await
+        .expect("external reply blob");
+    assert_eq!(store.size(&reference).await.unwrap(), Some(19));
+    assert_eq!(count(&runtime, "notes").await, 1);
+    assert_eq!(count(&runtime, "attachments").await, 0);
+    let before = attachment_publication_snapshot(&runtime).await;
+    let result = registry.dispatch_with_identity(
+        "comm.reply",
+        json!({"id": ingested["full_id"], "content": "reply with a file", "attachments": [reference], "idempotency_key": "external-reply-file"}),
+        Some(identity("actor:recipient")),
+    ).await;
+    assert!(
+        result.is_err(),
+        "an email reply must refuse its file before publication: {result:?}"
+    );
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error.refusal_source(), RuntimeError::InvalidInput(_)),
+        "typed attachment policy refusal: {error:?}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("attachments require a local recipient"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(recipient),
+        "the actual reply recipient must be named: {rendered}"
+    );
+    assert!(
+        !rendered.contains("unknown field"),
+        "a parser refusal is not the channel policy: {rendered}"
+    );
+    assert_eq!(
+        attachment_publication_snapshot(&runtime).await,
+        before,
+        "refusal leaves notes, attachments, keys, versions, events and projections unchanged"
+    );
 }

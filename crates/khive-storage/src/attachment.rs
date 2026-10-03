@@ -179,6 +179,18 @@ pub trait AttachmentStore: Send + Sync + 'static {
             ..AttachmentReadReport::default()
         })
     }
+    /// Return reports in input order, including repeated records.
+    /// Backends may batch the reads; the default preserves scalar behavior.
+    async fn list_attachments_reports(
+        &self,
+        record_uuids: &[Uuid],
+    ) -> StorageResult<Vec<AttachmentReadReport>> {
+        let mut reports = Vec::with_capacity(record_uuids.len());
+        for record_uuid in record_uuids {
+            reports.push(self.list_attachments_report(*record_uuid).await?);
+        }
+        Ok(reports)
+    }
     /// Remove one attachment role without touching the referenced blob.
     async fn delete_attachment(&self, record_uuid: Uuid, role: &str) -> StorageResult<bool>;
 }

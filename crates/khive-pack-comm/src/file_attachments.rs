@@ -92,16 +92,47 @@ pub(crate) async fn rows(
     }
     // An unreadable row is reported on its message. A failure of the lookup
     // itself still returns an error, before comm.read marks any message.
-    let mut report = runtime.attachments()?.list_attachments_report(id).await?;
+    let report = runtime.attachments()?.list_attachments_report(id).await?;
+    Ok(message_report(report))
+}
+
+fn message_report(mut report: AttachmentReadReport) -> AttachmentReadReport {
     report.attachments.retain(|row| {
         row.substrate == AttachmentSubstrate::Note && role_index(&row.role).is_some()
     });
     report.attachments.sort_by_key(|row| role_index(&row.role));
-    Ok(report)
+    report
 }
 
 pub(crate) async fn metadata(runtime: &KhiveRuntime, id: Uuid) -> Result<Value, RuntimeError> {
     let report = rows(runtime, id).await?;
+    Ok(report_metadata(report))
+}
+
+pub(crate) async fn metadata_many(
+    runtime: &KhiveRuntime,
+    ids: &[Uuid],
+) -> Result<Vec<Value>, RuntimeError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let reports = if runtime.backend_id().as_str() == khive_runtime::BackendId::MAIN {
+        runtime.attachments()?.list_attachments_reports(ids).await?
+    } else {
+        vec![AttachmentReadReport::default(); ids.len()]
+    };
+    if reports.len() != ids.len() {
+        return Err(RuntimeError::Internal(
+            "attachment batch returned a different number of owner reports".into(),
+        ));
+    }
+    Ok(reports
+        .into_iter()
+        .map(|report| report_metadata(message_report(report)))
+        .collect())
+}
+
+fn report_metadata(report: AttachmentReadReport) -> Value {
     let attachments = report.attachments
         .into_iter()
         .map(|row| json!({
@@ -115,23 +146,50 @@ pub(crate) async fn metadata(runtime: &KhiveRuntime, id: Uuid) -> Result<Value, 
             "reason": report.unreadable_reason.as_deref().unwrap_or("unreadable_attachment"),
         });
     }
-    Ok(fields)
+    fields
+}
+
+fn message_id(message: &Value) -> Result<Uuid, RuntimeError> {
+    message["full_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(|| {
+            RuntimeError::Internal("message attachment view has no canonical owner UUID".into())
+        })
 }
 
 pub(crate) async fn enrich(
     runtime: &KhiveRuntime,
     message: &mut Value,
 ) -> Result<(), RuntimeError> {
-    let id = message["full_id"]
-        .as_str()
-        .and_then(|id| id.parse().ok())
-        .ok_or_else(|| {
-            RuntimeError::Internal("message attachment view has no canonical owner UUID".into())
-        })?;
+    let id = message_id(message)?;
     if let (Some(message), Value::Object(fields)) =
         (message.as_object_mut(), metadata(runtime, id).await?)
     {
         message.extend(fields);
+    }
+    Ok(())
+}
+
+pub(crate) async fn enrich_many(
+    runtime: &KhiveRuntime,
+    mut messages: Vec<&mut Value>,
+) -> Result<(), RuntimeError> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    if let [message] = messages.as_mut_slice() {
+        return enrich(runtime, message).await;
+    }
+    let ids = messages
+        .iter()
+        .map(|message| message_id(message))
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = metadata_many(runtime, &ids).await?;
+    for (message, fields) in messages.into_iter().zip(fields) {
+        if let (Some(message), Value::Object(fields)) = (message.as_object_mut(), fields) {
+            message.extend(fields);
+        }
     }
     Ok(())
 }

@@ -30,6 +30,7 @@ pub(crate) const PACK_NAME: &str = "blob";
 pub struct BlobPack {
     runtime: KhiveRuntime,
     uploads: Arc<UploadManager>,
+    file_transfers_enabled: bool,
 }
 
 impl Pack for BlobPack {
@@ -43,7 +44,12 @@ impl Pack for BlobPack {
 impl BlobPack {
     pub fn new(runtime: KhiveRuntime) -> Self {
         let uploads = Arc::new(UploadManager::new(runtime.clone()));
-        Self { runtime, uploads }
+        let file_transfers_enabled = runtime.config().blob.file_transfers;
+        Self {
+            runtime,
+            uploads,
+            file_transfers_enabled,
+        }
     }
 
     pub(crate) fn runtime(&self) -> &KhiveRuntime {

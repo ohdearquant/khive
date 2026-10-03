@@ -36,6 +36,7 @@ fn runtime_with_actor(actor_id: Option<&str>) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: actor_id.map(str::to_owned),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime")
 }
