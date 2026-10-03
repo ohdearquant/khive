@@ -3744,10 +3744,8 @@ async fn test_recall_rejects_degenerate_and_overflowing_token_budgets() {
     }
 }
 
-/// More matching supersedes edges than ranked candidates must not truncate the
-/// inbound-edge check. More than one storage page targets A and the following
-/// edge targets B, so both the page loop and the old candidate-count leak are
-/// exercised deterministically.
+/// High inbound fan-in on one candidate must not hide another target. The
+/// same suppression fixture also observes and plans the actual recall SQL.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
@@ -3842,7 +3840,7 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
     assert_eq!(inserted_b, 1, "fixture must add the page-two edge");
     drop(writer);
 
-    let registry = make_registry(rt);
+    let registry = make_registry(rt.clone());
     let baseline = registry
         .dispatch(
             "memory.recall",
@@ -3870,6 +3868,12 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
     assert!(baseline_ids.contains(&target_a_id.as_str()));
     assert!(baseline_ids.contains(&target_b_id.as_str()));
 
+    let observation = rt
+        .core()
+        .backend()
+        .pool()
+        .observe_test_statement_starts(1024)
+        .expect("observe actual recall statements");
     let suppressed = registry
         .dispatch(
             "memory.recall",
@@ -3889,8 +3893,53 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
         .expect("suppressed recall");
     assert!(
         suppressed.as_array().is_some_and(Vec::is_empty),
-        "every targeted candidate must be suppressed after an exhaustive edge walk: {suppressed}"
+        "every targeted candidate must be suppressed after target lookups: {suppressed}"
     );
+    let statements = observation
+        .started_statements()
+        .expect("complete statement observation");
+    drop(observation);
+    let edge_lookups: Vec<_> = statements
+        .iter()
+        .filter(|statement| {
+            statement.sql.contains("target_id IN (") && statement.sql.contains("relation IN (")
+        })
+        .collect();
+    assert_eq!(
+        edge_lookups.len(),
+        2,
+        "one first-match lookup per candidate"
+    );
+    let mut reader = rt.sql().reader().await.expect("planner reader");
+    for statement in edge_lookups {
+        assert!(statement.readonly);
+        assert!(
+            !statement.sql.contains("graph_edges_seq"),
+            "SUPERSEDES_TARGET_LOOKUP: recall must not drive the global insertion ledger: {}",
+            statement.sql
+        );
+        let plan = reader
+            .explain(SqlStatement {
+                sql: statement.sql.clone(),
+                params: vec![
+                    SqlValue::Text("local".into()),
+                    SqlValue::Text(target_a_id.clone()),
+                    SqlValue::Text("supersedes".into()),
+                    SqlValue::Integer(1),
+                    SqlValue::Integer(0),
+                ],
+                label: Some("supersedes-actual-lookup-plan".into()),
+            })
+            .await
+            .expect("plan the executed production statement");
+        assert!(
+            plan.iter().any(|row| matches!(row.get("detail"), Some(SqlValue::Text(detail))
+                if detail.contains("SEARCH graph_edges")
+                    && detail.contains("idx_graph_edges_ns_tgt_rel")
+                    && detail.contains("target_id=?"))),
+            "SUPERSEDES_TARGET_LOOKUP: actual recall SQL must seek the target/relation index: {plan:?}"
+        );
+    }
 }
 
 // =============================================================================

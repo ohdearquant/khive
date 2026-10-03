@@ -364,11 +364,12 @@ pub struct VamanaSnapshot {
     pub external_ids: Vec<String>,
 }
 
+#[derive(Clone)]
 enum VectorStorage {
     Owned(Vec<f32>),
     #[cfg(feature = "mmap")]
     Mmap {
-        mmap: memmap2::Mmap,
+        mmap: std::sync::Arc<memmap2::Mmap>,
         len_f32: usize,
     },
 }
@@ -389,7 +390,7 @@ impl VectorStorage {
             Self::Owned(v) => Ok(v.as_slice()),
             #[cfg(feature = "mmap")]
             Self::Mmap { mmap, len_f32 } => {
-                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref())
+                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref().as_ref())
                     .map_err(|_| VamanaError::invalid_format("vector mmap cast failed".into()))?;
                 if floats.len() != *len_f32 {
                     return Err(VamanaError::invalid_format(format!(
@@ -412,11 +413,12 @@ const CODES_HEADER_LEN: usize = 8 + 8 + 8 + 4 + 4;
 /// Storage for the per-node SQ8 code table: owned per-vector allocations
 /// (build and mutation paths) or the flat, memory-mapped `codes.bin` segment
 /// (v2 load path). Mirrors `VectorStorage`'s Owned/Mmap split.
+#[derive(Clone)]
 enum CodeStore {
     Owned(Vec<GsEncodedVector>),
     #[cfg(feature = "mmap")]
     Mmap {
-        mmap: memmap2::Mmap,
+        mmap: std::sync::Arc<memmap2::Mmap>,
         dims: usize,
         len: usize,
     },
@@ -438,7 +440,7 @@ impl CodeStore {
             Self::Owned(v) => CodesView::Owned(v),
             #[cfg(feature = "mmap")]
             Self::Mmap { mmap, dims, len } => CodesView::Flat {
-                bytes: &mmap.as_ref()[CODES_HEADER_LEN + dims * 4..][..len * dims],
+                bytes: &mmap.as_ref().as_ref()[CODES_HEADER_LEN + dims * 4..][..len * dims],
                 dims: *dims,
             },
         }
@@ -1616,7 +1618,7 @@ impl VamanaIndex {
                 (
                     codec,
                     CodeStore::Mmap {
-                        mmap,
+                        mmap: std::sync::Arc::new(mmap),
                         dims: dimensions,
                         len: num_vectors,
                     },
@@ -1942,6 +1944,27 @@ impl VamanaIndex {
     /// Cumulative delete+insert churn since the last consolidation.
     pub fn ops_since_consolidation(&self) -> usize {
         self.ops_since_consolidation
+    }
+
+    /// Fork the complete mutable state for maintenance while retaining any
+    /// read-only vector and SQ8 mappings. Owned buffers are copied; mutation
+    /// promotes mappings through the same path as an ordinary insert.
+    pub fn fork_for_maintenance(&self) -> Self {
+        Self {
+            vectors: self.vectors.clone(),
+            graph: self.graph.clone(),
+            config: self.config.clone(),
+            num_vectors: self.num_vectors,
+            dimensions: self.dimensions,
+            tombstones: self.tombstones.clone(),
+            tombstone_count: self.tombstone_count,
+            ops_since_consolidation: self.ops_since_consolidation,
+            free_slots: self.free_slots.clone(),
+            consolidation_tau: self.consolidation_tau,
+            gs_codec: self.gs_codec.clone(),
+            gs_codes: self.gs_codes.clone(),
+            last_applied_seq: self.last_applied_seq,
+        }
     }
 
     /// True when `ops_since_consolidation >= consolidation_tau`.
@@ -2379,7 +2402,7 @@ impl VamanaIndex {
             VectorStorage::Owned(v) => v.as_slice(),
             #[cfg(feature = "mmap")]
             VectorStorage::Mmap { mmap, len_f32 } => {
-                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref())
+                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref().as_ref())
                     .map_err(|_| VamanaError::invalid_format("vector mmap cast failed".into()))?;
                 if floats.len() != *len_f32 {
                     return Err(VamanaError::invalid_format(format!(
@@ -4011,7 +4034,7 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
     let mmap = unsafe { MmapOptions::new().len(expected_bytes).map(&file)? };
 
     Ok(VectorStorage::Mmap {
-        mmap,
+        mmap: std::sync::Arc::new(mmap),
         len_f32: expected_len_f32,
     })
 }
@@ -6691,3 +6714,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "index_maintenance_tests.rs"]
+mod maintenance_tests;

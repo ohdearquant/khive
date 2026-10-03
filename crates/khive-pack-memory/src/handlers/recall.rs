@@ -15,7 +15,7 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::{Direction, EdgeFilter, NeighborQuery};
+use khive_storage::types::{Direction, EdgeFilter, NeighborQuery, PageRequest};
 use khive_storage::EdgeRelation;
 use khive_types::{Details, KhiveError};
 
@@ -34,11 +34,6 @@ use super::common::{
     DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID,
     RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
-
-/// Bounded storage page for inbound supersession checks. This is deliberately
-/// independent of recall candidate cardinality: one candidate may have any
-/// number of superseding edges.
-const SUPERSEDES_EDGE_PAGE_SIZE: u32 = 256;
 
 fn compare_rank_scores_desc(left: f32, right: f32) -> std::cmp::Ordering {
     match (left.is_nan(), right.is_nan()) {
@@ -977,32 +972,25 @@ impl MemoryPack {
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
             if !candidate_ids.is_empty() {
                 let graph = self.runtime.graph(token)?;
-                let filter = EdgeFilter {
-                    target_ids: candidate_ids,
-                    relations: vec![EdgeRelation::Supersedes],
-                    ..EdgeFilter::default()
-                };
-                let mut after = None;
-                loop {
-                    // Walk the immutable insertion sequence to exhaustion.
-                    // A single fixed-size query tied to candidate count can
-                    // omit targets when another candidate has many inbound
-                    // supersedes edges (#1749).
+                for candidate_id in candidate_ids {
                     let edges = graph
-                        .query_edges_sequence_after(
-                            filter.clone(),
-                            after,
-                            SUPERSEDES_EDGE_PAGE_SIZE,
+                        .query_edges(
+                            EdgeFilter {
+                                target_ids: vec![candidate_id],
+                                relations: vec![EdgeRelation::Supersedes],
+                                ..EdgeFilter::default()
+                            },
+                            vec![],
+                            PageRequest {
+                                offset: 0,
+                                limit: 1,
+                            },
                         )
                         .await?;
                     khive_storage::ensure_request_read_active("memory.recall")?;
-                    for edge in &edges.items {
-                        superseded_by_edge.insert(edge.target_id);
+                    if !edges.items.is_empty() {
+                        superseded_by_edge.insert(candidate_id);
                     }
-                    let Some(next_after) = edges.next_after else {
-                        break;
-                    };
-                    after = Some(next_after);
                 }
             }
 
