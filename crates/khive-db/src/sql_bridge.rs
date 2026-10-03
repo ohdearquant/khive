@@ -149,19 +149,22 @@ fn prepare_batch_statements<'conn>(
 #[derive(Default)]
 struct AtomicEventRows(AtomicU64);
 
+const COUNTED_EVENT_INSERT_LABELS: &[&str] = &[
+    "event_insert_on_writer",
+    "hard-delete-derived_from-warning",
+    "hard-delete-supersedes-warning",
+    "hard-delete-precedes-warning",
+    "hard-delete-supports-warning",
+    "hard-delete-refutes-warning",
+];
+
 impl AtomicEventRows {
     fn observe(&self, statement: &SqlStatement, affected: u64) {
-        if matches!(
-            statement.label.as_deref(),
-            Some(
-                "event_insert_on_writer"
-                    | "hard-delete-derived_from-warning"
-                    | "hard-delete-supersedes-warning"
-                    | "hard-delete-precedes-warning"
-                    | "hard-delete-supports-warning"
-                    | "hard-delete-refutes-warning"
-            )
-        ) {
+        if statement
+            .label
+            .as_deref()
+            .is_some_and(|label| COUNTED_EVENT_INSERT_LABELS.contains(&label))
+        {
             let _ = self
                 .0
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
@@ -174,6 +177,10 @@ impl AtomicEventRows {
         self.0.load(Ordering::Relaxed)
     }
 }
+
+#[cfg(test)]
+#[path = "atomic_event_usage_tests.rs"]
+mod atomic_event_usage_tests;
 
 /// Bind and execute handles returned by [`prepare_batch_statements`].
 fn execute_prepared_batch<'conn>(
