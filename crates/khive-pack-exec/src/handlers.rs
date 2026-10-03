@@ -31,6 +31,7 @@ use khive_storage::ContentRef;
 #[cfg(unix)]
 use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
 use crate::membership::{MembershipWork, SuppliedRefs};
+use crate::process_cleanup::{ProcessCleanup, TreeQuiescence};
 use crate::receipts;
 use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
@@ -366,6 +367,8 @@ struct Receipt {
     limiting_resource: Option<&'static str>,
     // Deadline outcome only; detached descendants can outlive the run (ADR-181 Amendment 11).
     timed_out: bool,
+    process_cleanup: ProcessCleanup,
+    tree_quiescence: TreeQuiescence,
     denied: bool,
     success: bool,
     reason: Option<String>,
@@ -417,6 +420,8 @@ impl Receipt {
             "exit_signal": self.exit_signal,
             "limiting_resource": self.limiting_resource,
             "timed_out": self.timed_out,
+            "process_cleanup": self.process_cleanup,
+            "tree_quiescence": self.tree_quiescence,
             "denied": self.denied,
             "success": self.success,
             "reason": self.reason,
@@ -809,6 +814,8 @@ fn refusal_error(reason: &str, receipt: &Receipt) -> RuntimeError {
         "effective_max_output_bytes".into(),
         json!(receipt.effective_max_output_bytes),
     );
+    detail.insert("process_cleanup".into(), json!(receipt.process_cleanup));
+    detail.insert("tree_quiescence".into(), json!(receipt.tree_quiescence));
     RuntimeError::RefusedWithReceipt(Box::new(khive_runtime::ReceiptRefusal {
         code: receipt.refusal_code,
         // Unchanged wording: the id stays inside the sentence for readers that
@@ -844,6 +851,8 @@ pub async fn run(
         exit_signal: None,
         limiting_resource: None,
         timed_out: false,
+        process_cleanup: ProcessCleanup::seatbelt_unobserved(),
+        tree_quiescence: TreeQuiescence::Unverified,
         denied: false,
         success: false,
         reason: None,
@@ -1993,6 +2002,10 @@ fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
         _ => json!({}),
     }
 }
+
+#[cfg(test)]
+#[path = "process_cleanup_tests.rs"]
+mod process_cleanup_tests;
 
 #[cfg(all(test, unix))]
 #[path = "grant_pin_tests.rs"]
