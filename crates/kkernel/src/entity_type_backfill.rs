@@ -15,6 +15,7 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use khive_runtime::curation::EntityPatch;
 use khive_runtime::pack::{IngestAuditStore, PackRegistry, VerbRegistry};
+use khive_runtime::retrieval::EmbeddingTruncationReport;
 use khive_runtime::{KhiveRuntime, NamespaceToken};
 use khive_storage::entity::{Entity, EntityFilter};
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -82,6 +83,8 @@ pub struct EntityTypeBackfillReport {
     pub after_count_basis: &'static str,
     pub promoted: u64,
     pub echo_removed: u64,
+    /// Aggregate of bounded embedding inputs from successfully applied rows.
+    pub embedding_truncation_report: EmbeddingTruncationReport,
     pub complete: bool,
     pub failures: Vec<BackfillFailure>,
 }
@@ -221,16 +224,21 @@ async fn scan(
                 }
             };
             if let Some((runtime, token)) = apply.zip(write_token.as_ref()) {
-                if let Err(error) = runtime
-                    .update_entity_if_unchanged(token, &entity, patch, removals)
+                match runtime
+                    .update_entity_if_unchanged_with_embedding_report(
+                        token, &entity, patch, removals,
+                    )
                     .await
                 {
-                    report.failures.push(BackfillFailure {
-                        id: Some(entity.id),
-                        error: error.to_string(),
-                        write_may_have_committed: true,
-                    });
-                    return Ok(());
+                    Ok((_, embedding)) => report.embedding_truncation_report.merge(embedding),
+                    Err(error) => {
+                        report.failures.push(BackfillFailure {
+                            id: Some(entity.id),
+                            error: error.to_string(),
+                            write_may_have_committed: true,
+                        });
+                        return Ok(());
+                    }
                 }
                 if removals.is_empty() {
                     report.promoted += 1;
@@ -297,7 +305,9 @@ async fn backfill_resolved(
         scanned: 0, eligible: 0, promote: 0, echo: 0, untouched: 0, wrong_kind: 0,
         nullable_before: before, nullable_after: Some(before), projected_nullable_after: before,
         after_count_basis: "unchanged dry-run snapshot",
-        promoted: 0, echo_removed: 0, complete: false, failures: Vec::new(),
+        promoted: 0, echo_removed: 0,
+        embedding_truncation_report: EmbeddingTruncationReport::default(),
+        complete: false, failures: Vec::new(),
     };
     if !args.apply {
         scan(&snapshot, &token, &types, None, &mut report, PAGE_SIZE).await?;
@@ -395,6 +405,162 @@ mod tests {
     use super::*;
     use khive_runtime::{Namespace, RuntimeConfig};
     use serde_json::json;
+
+    struct CapturingBackfillEmbedder(Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for CapturingBackfillEmbedder {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.0.lock().unwrap().extend_from_slice(texts);
+            Ok(texts.iter().map(|_| vec![1.0; 4]).collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "backfill-capture"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for CapturingBackfillEmbedder {
+        fn name(&self) -> &str {
+            "backfill-capture"
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(
+            &self,
+        ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+            Ok(Arc::new(Self(Arc::clone(&self.0))))
+        }
+    }
+
+    // Control: restore the legacy guarded call in scan (and discard its report).
+    // The first row commits then returns embedding_input_truncated, so scanned
+    // and promoted stay below two and the report disclosure assertions fail.
+    #[tokio::test]
+    async fn apply_scan_retains_truncation_report_and_continues_to_the_second_entity() {
+        let args = EntityTypeBackfillArgs::parse_from(["entity-type-backfill", "--apply"]);
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".into(), "git".into()],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let (_registry, types) = compose_registry(&runtime).unwrap();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let description = "d".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        {
+            let writer = runtime.backend().pool().writer().unwrap();
+            for (id, name, description) in [
+                (first, "First", description.as_str()),
+                (second, "Second", "short description"),
+            ] {
+                writer
+                    .execute(
+                        "INSERT INTO entities \
+                         (id, namespace, kind, name, description, properties, created_at, updated_at) \
+                         VALUES (?1, 'local', 'document', ?2, ?3, '{\"type\":\"paper\"}', 1, 1)",
+                        (id.to_string(), name, description),
+                    )
+                    .unwrap();
+            }
+        }
+        // Only this injected-provider fixture enables the latent embedding
+        // branch. Production target resolution remains model-free.
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime.register_embedder(CapturingBackfillEmbedder(Arc::clone(&captured)));
+        let mut report = EntityTypeBackfillReport {
+            mode: "apply",
+            namespace: "local".into(),
+            source_revision: khive_runtime::BUILD_INFO.source_revision,
+            loaded_packs: vec!["kg".into(), "git".into()],
+            registry_types: BTreeMap::new(),
+            target: PathBuf::from(":memory:"),
+            backend: "main".into(),
+            count_scope: "private injected-provider scan fixture",
+            effective_limit: MAX_SCAN,
+            scanned: 0,
+            eligible: 0,
+            promote: 0,
+            echo: 0,
+            untouched: 0,
+            wrong_kind: 0,
+            nullable_before: 2,
+            nullable_after: None,
+            projected_nullable_after: 0,
+            after_count_basis: "not yet observed",
+            promoted: 0,
+            echo_removed: 0,
+            embedding_truncation_report: EmbeddingTruncationReport::default(),
+            complete: false,
+            failures: Vec::new(),
+        };
+        scan(
+            &runtime,
+            &token,
+            &types,
+            args.apply.then_some(&runtime),
+            &mut report,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.scanned, 2);
+        assert_eq!(report.promoted, 2);
+        assert!(report.complete);
+        assert!(report.failures.is_empty());
+        let first_text = format!("First {description}");
+        assert_eq!(report.embedding_truncation_report.truncated, 1);
+        assert_eq!(
+            report.embedding_truncation_report.discarded_bytes,
+            (first_text.len() - lattice_embed::MAX_TEXT_BYTES) as u64
+        );
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            encoded["embedding_truncation_report"],
+            json!({"truncated": 1, "discarded_bytes": 7})
+        );
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            &[
+                first_text[..lattice_embed::MAX_TEXT_BYTES].to_string(),
+                "Second short description".to_string()
+            ]
+        );
+        for id in [first, second] {
+            assert_eq!(
+                runtime
+                    .get_entity(&token, id)
+                    .await
+                    .unwrap()
+                    .entity_type
+                    .as_deref(),
+                Some("paper")
+            );
+        }
+        assert_eq!(
+            runtime
+                .get_entity(&token, first)
+                .await
+                .unwrap()
+                .description
+                .as_deref(),
+            Some(description.as_str())
+        );
+    }
 
     #[test]
     fn classifier_uses_composed_types_and_preserves_raw_promotion_for_validation() {
@@ -509,7 +675,7 @@ mod tests {
         let tok = runtime.authorize(Namespace::local()).unwrap();
 
         let invalid = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &tok,
                 "workspace",
                 None,
@@ -519,9 +685,10 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let error = runtime
-            .update_entity(
+            .update_entity_with_embedding_report(
                 &tok,
                 invalid.id,
                 EntityPatch {
@@ -530,6 +697,7 @@ mod tests {
                 },
             )
             .await
+            .map(|(row, _report)| row)
             .expect_err(
                 "compose_registry must install the workspace KindHook onto this runtime, \
                  refusing an update that leaves properties.schema_version missing",
@@ -540,7 +708,7 @@ mod tests {
         );
 
         let valid = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &tok,
                 "workspace",
                 None,
@@ -550,9 +718,10 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let updated = runtime
-            .update_entity(
+            .update_entity_with_embedding_report(
                 &tok,
                 valid.id,
                 EntityPatch {
@@ -561,6 +730,7 @@ mod tests {
                 },
             )
             .await
+            .map(|(row, _report)| row)
             .expect("a workspace entity carrying a valid schema_version must update freely");
         assert_eq!(updated.name, "Renamed Valid Workspace");
     }

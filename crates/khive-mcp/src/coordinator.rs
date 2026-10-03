@@ -1602,8 +1602,17 @@ pub(crate) mod tests {
         let ns = RuntimeNamespace::local();
         let token = runtime.authorize(ns).expect("authorize");
         let entity = runtime
-            .create_entity(&token, "concept", None, "T6cEntity", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "T6cEntity",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(row, _report)| row)
             .expect("create entity");
         let _ = entity;
 

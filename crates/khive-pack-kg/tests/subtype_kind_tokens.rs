@@ -304,11 +304,20 @@ async fn subtype_qualified_by_id_verbs_accept_legacy_null_entity_type() {
 
     // Rows written before subtype persistence still carry the right base kind.
     let first = runtime
-        .create_entity(&token, "document", None, "Legacy Paper", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "document",
+            None,
+            "Legacy Paper",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("legacy document");
     let second = runtime
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "document",
             None,
@@ -318,6 +327,7 @@ async fn subtype_qualified_by_id_verbs_accept_legacy_null_entity_type() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("second legacy document");
 
     registry
@@ -360,8 +370,17 @@ async fn subtype_qualified_by_id_verbs_accept_legacy_null_entity_type() {
     assert_eq!(merge["dry_run"], true);
 
     let wrong_base = runtime
-        .create_entity(&token, "artifact", None, "Wrong Base", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "artifact",
+            None,
+            "Wrong Base",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("artifact without subtype");
     let error = registry
         .dispatch("update", json!({"id": wrong_base.id, "kind": "paper"}))
@@ -380,12 +399,30 @@ async fn resolve_subtype_filters_exact_name_candidates() {
 
     let name = "Shared Subtype Name";
     let report = runtime
-        .create_entity(&token, "document", Some("report"), name, None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "document",
+            Some("report"),
+            name,
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("report");
     let paper = runtime
-        .create_entity(&token, "document", Some("paper"), name, None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "document",
+            Some("paper"),
+            name,
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("paper");
     assert_ne!(report.id, paper.id);
 

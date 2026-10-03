@@ -9,12 +9,12 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "Node wire protocol v1 cryptography and strict message encodings"
+description = "Node wire protocol v1 cryptography, encodings, and HTTPS client"
 
 [dependencies]
 khive-channel = { path = "../khive-channel", version = "0.9.0" }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
@@ -27,6 +27,10 @@ x25519-dalek = { version = "=2.0.1", default-features = false, features = ["zero
 ed25519-dalek = { version = "=2.2.0", default-features = false, features = ["zeroize"] }
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 zeroize = "=1.9.0"
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+httpdate = "=1.0.3"
 
 [dev-dependencies]
 ring = "=0.17.14"

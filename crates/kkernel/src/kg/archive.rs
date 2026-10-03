@@ -507,8 +507,17 @@ mod tests {
         let runtime = KhiveRuntime::new(config).unwrap();
         let token = runtime.authorize(ns).unwrap();
         runtime
-            .create_entity(&token, "concept", None, "TestEntity", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "TestEntity",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
 
         let args = ExportArgs {
@@ -544,8 +553,17 @@ mod tests {
         let runtime = KhiveRuntime::new(config).unwrap();
         let token = runtime.authorize(ns).unwrap();
         runtime
-            .create_entity(&token, "concept", None, "Keep", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "Keep",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         drop(runtime);
         let before = std::fs::read(&db_path).unwrap();
@@ -584,8 +602,17 @@ mod tests {
         let runtime = KhiveRuntime::new(config).unwrap();
         let token = runtime.authorize(ns).unwrap();
         runtime
-            .create_entity(&token, "concept", None, "Keep", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "Keep",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         drop(runtime);
         let before = std::fs::read(&db_path).unwrap();

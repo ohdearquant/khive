@@ -2108,7 +2108,6 @@ impl BrainPack {
                     "serve_attribution": serve_attribution,
                 }));
             };
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
 
             // lattice-router: build the context vector from the now-published live
             // state and forward through the fann network. This is a best-effort
@@ -2228,10 +2227,7 @@ impl BrainPack {
                         "serve_attribution": serve_attribution,
                     }));
                 }
-                crate::fold_gate::GateAndAppendOutcome::Applied(result) => {
-                    khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-                    result.event
-                }
+                crate::fold_gate::GateAndAppendOutcome::Applied(result) => result.event,
             }
         };
 
@@ -3066,8 +3062,9 @@ impl BrainPack {
             }
         }
 
-        self.runtime
-            .create_entity(
+        let (_, embedding_report) = self
+            .runtime
+            .create_entity_with_embedding_report(
                 token,
                 "artifact",
                 Some("adapter"),
@@ -3078,12 +3075,17 @@ impl BrainPack {
             )
             .await?;
 
-        Ok(json!({
+        let mut response = json!({
             "registered": true,
             "adapter_id": p.adapter_id,
             "content_hash": p.content_hash,
             "base_model_revision": p.base_model_revision,
-        }))
+        });
+        if embedding_report.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+        }
+        Ok(response)
     }
 }
 

@@ -1290,6 +1290,7 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::watch;
 
     #[test]
     fn allowed_headers_keep_every_link_field_for_later_extraction() {
@@ -1477,21 +1478,33 @@ mod tests {
         out
     }
 
-    async fn spawn_once(response: Vec<u8>) -> (u16, Arc<AtomicUsize>) {
+    async fn wait_for_hits(accepted: &mut watch::Receiver<usize>, expected: usize) {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            accepted.wait_for(|count| *count >= expected),
+        )
+        .await
+        .expect("accept count acknowledgement exceeds the watchdog")
+        .expect("server closed before acknowledging the accept count");
+    }
+
+    async fn spawn_once(response: Vec<u8>) -> (u16, Arc<AtomicUsize>, watch::Receiver<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("local addr").port();
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_task = hits.clone();
+        let (accepted_task, accepted) = watch::channel(0);
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                hits_task.fetch_add(1, Ordering::SeqCst);
+                let count = hits_task.fetch_add(1, Ordering::SeqCst) + 1;
+                accepted_task.send_replace(count);
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf).await;
                 let _ = stream.write_all(&response).await;
                 let _ = stream.shutdown().await;
             }
         });
-        (port, hits)
+        (port, hits, accepted)
     }
 
     /// Serve `responses` in order across sequential connections on ONE
@@ -1499,15 +1512,19 @@ mod tests {
     /// the SAME address twice and get two different canned responses — the
     /// shape the repeat-fetch test below needs to hit the identical url on
     /// both requests.
-    async fn spawn_sequence(responses: Vec<Vec<u8>>) -> (u16, Arc<AtomicUsize>) {
+    async fn spawn_sequence(
+        responses: Vec<Vec<u8>>,
+    ) -> (u16, Arc<AtomicUsize>, watch::Receiver<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("local addr").port();
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_task = hits.clone();
+        let (accepted_task, accepted) = watch::channel(0);
         tokio::spawn(async move {
             for response in responses {
                 if let Ok((mut stream, _)) = listener.accept().await {
-                    hits_task.fetch_add(1, Ordering::SeqCst);
+                    let count = hits_task.fetch_add(1, Ordering::SeqCst) + 1;
+                    accepted_task.send_replace(count);
                     let mut buf = [0u8; 4096];
                     let _ = stream.read(&mut buf).await;
                     let _ = stream.write_all(&response).await;
@@ -1515,20 +1532,22 @@ mod tests {
                 }
             }
         });
-        (port, hits)
+        (port, hits, accepted)
     }
 
     async fn spawn_once_delayed(
         response: Vec<u8>,
         delay: std::time::Duration,
-    ) -> (u16, Arc<AtomicUsize>) {
+    ) -> (u16, Arc<AtomicUsize>, watch::Receiver<usize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("local addr").port();
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_task = hits.clone();
+        let (accepted_task, accepted) = watch::channel(0);
         tokio::spawn(async move {
             if let Ok((mut stream, _)) = listener.accept().await {
-                hits_task.fetch_add(1, Ordering::SeqCst);
+                let count = hits_task.fetch_add(1, Ordering::SeqCst) + 1;
+                accepted_task.send_replace(count);
                 let mut buf = [0u8; 4096];
                 let _ = stream.read(&mut buf).await;
                 tokio::time::sleep(delay).await;
@@ -1536,7 +1555,7 @@ mod tests {
                 let _ = stream.shutdown().await;
             }
         });
-        (port, hits)
+        (port, hits, accepted)
     }
 
     fn plain_client(timeout: std::time::Duration) -> reqwest::Client {
@@ -1691,10 +1710,11 @@ mod tests {
             &[("Content-Type", "text/html".to_string())],
             &body,
         );
-        let (port, hits) = spawn_sequence(vec![response.clone(), response]).await;
+        let (port, hits, mut accepted) = spawn_sequence(vec![response.clone(), response]).await;
         let url = local_url(port, "/page");
         let (_outcome, reply) =
             run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url, 10_000).await;
+        wait_for_hits(&mut accepted, 1).await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let id = reply["id"].as_str().expect("entity id").to_string();
         let content_ref = reply["content_ref"].as_str().unwrap().to_string();
@@ -1722,6 +1742,7 @@ mod tests {
         let before_entities = entity_count(&runtime, &token).await;
         let (_outcome2, reply2) =
             run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url, 10_000).await;
+        wait_for_hits(&mut accepted, 2).await;
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
@@ -1747,7 +1768,8 @@ mod tests {
 
         // Control: a different body, at a different address, yields a
         // different reference.
-        let (port3, _hits3) = spawn_once(http_response(200, "OK", &[], b"different body")).await;
+        let (port3, _hits3, _accepted3) =
+            spawn_once(http_response(200, "OK", &[], b"different body")).await;
         let url3 = local_url(port3, "/other");
         let (_outcome3, reply3) =
             run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url3, 10_000).await;
@@ -1859,7 +1881,7 @@ mod tests {
         let full_body = vec![b'x'; 100];
         let max_bytes = 40u64;
         let response = http_response(200, "OK", &[], &full_body);
-        let (port, hits) = spawn_once(response).await;
+        let (port, hits, mut accepted) = spawn_once(response).await;
         let url = local_url(port, "/big");
         let client = plain_client(Duration::from_secs(5));
         let outcome = run_one_hop(
@@ -1872,6 +1894,7 @@ mod tests {
         )
         .await
         .expect("hop succeeds");
+        wait_for_hits(&mut accepted, 1).await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(outcome.status, 200);
         let (buffer, truncated) = outcome.body.clone().expect("GET carries a body slot");
@@ -1911,7 +1934,8 @@ mod tests {
 
         // Positive control: within-bound is not truncated.
         let small_body = vec![b'y'; 10];
-        let (port2, _hits2) = spawn_once(http_response(200, "OK", &[], &small_body)).await;
+        let (port2, _hits2, _accepted2) =
+            spawn_once(http_response(200, "OK", &[], &small_body)).await;
         let url2 = local_url(port2, "/small");
         let outcome2 = run_one_hop(
             &client,
@@ -1944,7 +1968,7 @@ mod tests {
         assert_eq!(count_blob_files(dir.path()), 0, "blob dir starts empty");
 
         let body = b"too slow".to_vec();
-        let (port, hits) = spawn_once_delayed(
+        let (port, hits, mut accepted) = spawn_once_delayed(
             http_response(200, "OK", &[], &body),
             Duration::from_millis(300),
         )
@@ -1963,6 +1987,7 @@ mod tests {
         .expect_err("a hop past the deadline refuses");
         let message = err.to_string();
         assert!(message.contains("response_too_slow"), "{message}");
+        wait_for_hits(&mut accepted, 1).await;
         assert_eq!(hits.load(Ordering::SeqCst), 1, "the connection was made");
         assert_eq!(
             count_blob_files(dir.path()),
@@ -1970,7 +1995,7 @@ mod tests {
             "no object stored on a timed-out hop"
         );
 
-        let (port2, _hits2) = spawn_once(http_response(200, "OK", &[], b"fast")).await;
+        let (port2, _hits2, _accepted2) = spawn_once(http_response(200, "OK", &[], b"fast")).await;
         let url2 = local_url(port2, "/fast");
         let outcome = run_one_hop(
             &client,
@@ -1999,7 +2024,8 @@ mod tests {
             ("Content-Type", "text/plain".to_string()),
             ("X-Unlisted", "should-not-appear".to_string()),
         ];
-        let (port, hits) = spawn_once(http_head_response(200, "OK", &head_headers, 42)).await;
+        let (port, hits, mut accepted) =
+            spawn_once(http_head_response(200, "OK", &head_headers, 42)).await;
         let url = local_url(port, "/head");
         let client = plain_client(Duration::from_secs(5));
         let outcome = run_one_hop(
@@ -2012,6 +2038,7 @@ mod tests {
         )
         .await
         .expect("HEAD hop succeeds");
+        wait_for_hits(&mut accepted, 1).await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert!(outcome.body.is_none(), "HEAD never carries a body slot");
 
@@ -2061,7 +2088,8 @@ mod tests {
 
         // GET control: reads and stores its body.
         let get_body = b"actual bytes".to_vec();
-        let (port2, _hits2) = spawn_once(http_response(200, "OK", &[], &get_body)).await;
+        let (port2, _hits2, _accepted2) =
+            spawn_once(http_response(200, "OK", &[], &get_body)).await;
         let url2 = local_url(port2, "/get");
         let outcome2 = run_one_hop(
             &client,
@@ -2215,7 +2243,7 @@ mod tests {
             &[("Content-Encoding", "gzip".to_string())],
             &compressed,
         );
-        let (port, _hits) = spawn_once(response).await;
+        let (port, _hits, _accepted) = spawn_once(response).await;
         let url = local_url(port, "/gz");
         let client = plain_client(Duration::from_secs(5));
         let error = run_one_hop(
@@ -2238,14 +2266,14 @@ mod tests {
     // set refuses at that hop — hop 1 is made, hop 2 is not.
     #[tokio::test]
     async fn arm21_redirect_second_hop_outside_credential_set_refuses_hop2_never_dialed() {
-        let (hop1_port, hop1_hits) = spawn_once(http_response(
+        let (hop1_port, hop1_hits, mut hop1_accepted) = spawn_once(http_response(
             302,
             "Found",
             &[("Location", "https://elsewhere.test/next".to_string())],
             b"",
         ))
         .await;
-        let (_hop2_port, hop2_hits) =
+        let (_hop2_port, hop2_hits, _hop2_accepted) =
             spawn_once(http_response(200, "OK", &[], b"never reached")).await;
 
         let url = local_url(hop1_port, "/start");
@@ -2260,6 +2288,7 @@ mod tests {
         )
         .await
         .expect("hop 1 executes");
+        wait_for_hits(&mut hop1_accepted, 1).await;
         assert_eq!(hop1_hits.load(Ordering::SeqCst), 1, "hop 1 was made");
         assert_eq!(outcome.status, 302);
         let redirect_to = outcome
@@ -2276,6 +2305,7 @@ mod tests {
         let err =
             egress::check_credential(&cfg, "token", redirect_to.host_str().unwrap()).unwrap_err();
         assert_eq!(err.code, "credential_host_mismatch");
+        // The refusal never requests hop 2, so there is no accept to acknowledge.
         assert_eq!(hop2_hits.load(Ordering::SeqCst), 0, "hop 2 was not made");
 
         let mut cfg2 = WebSectionConfig::default();
@@ -2291,14 +2321,14 @@ mod tests {
     // before the next hop is ever requested.
     #[tokio::test]
     async fn arm24_redirect_to_userinfo_url_refuses_before_next_hop_is_dialed() {
-        let (hop1_port, hop1_hits) = spawn_once(http_response(
+        let (hop1_port, hop1_hits, mut hop1_accepted) = spawn_once(http_response(
             302,
             "Found",
             &[("Location", "https://user:pass@elsewhere.test/x".to_string())],
             b"",
         ))
         .await;
-        let (_hop2_port, hop2_hits) =
+        let (_hop2_port, hop2_hits, _hop2_accepted) =
             spawn_once(http_response(200, "OK", &[], b"never reached")).await;
 
         let url = local_url(hop1_port, "/start");
@@ -2313,6 +2343,7 @@ mod tests {
         )
         .await
         .expect("hop 1 executes");
+        wait_for_hits(&mut hop1_accepted, 1).await;
         assert_eq!(hop1_hits.load(Ordering::SeqCst), 1);
         let redirect_to = outcome
             .redirect_to
@@ -2321,6 +2352,7 @@ mod tests {
 
         let err = egress::check_scheme_and_userinfo(&redirect_to).unwrap_err();
         assert_eq!(err.code, "userinfo_present");
+        // The refusal never requests hop 2, so there is no accept to acknowledge.
         assert_eq!(
             hop2_hits.load(Ordering::SeqCst),
             0,
@@ -2457,7 +2489,7 @@ mod tests {
             .len();
 
         let body = b"never stored".to_vec();
-        let (port, hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let (port, hits, mut accepted) = spawn_once(http_response(200, "OK", &[], &body)).await;
         let url = local_url(port, "/fail");
         let client = plain_client(Duration::from_secs(5));
         let outcome = run_one_hop(
@@ -2470,6 +2502,7 @@ mod tests {
         )
         .await
         .expect("the transport hop itself succeeds");
+        wait_for_hits(&mut accepted, 1).await;
         assert_eq!(hits.load(Ordering::SeqCst), 1);
 
         let err = settle(
@@ -2495,6 +2528,7 @@ mod tests {
             1,
             "put attempted exactly once"
         );
+        wait_for_hits(&mut accepted, 1).await;
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
@@ -2533,7 +2567,7 @@ mod tests {
         let payload = b"identical bytes via either path".to_vec();
         let direct_ref = store.put(payload.clone()).await.expect("direct put");
 
-        let (port, _hits) = spawn_once(http_response(200, "OK", &[], &payload)).await;
+        let (port, _hits, _accepted) = spawn_once(http_response(200, "OK", &[], &payload)).await;
         let url = local_url(port, "/same-bytes");
         let (_outcome, reply) =
             run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url, 10_000).await;
@@ -2793,7 +2827,7 @@ mod tests {
             ],
             &body,
         );
-        let (port, _hits) = spawn_once(response).await;
+        let (port, _hits, _accepted) = spawn_once(response).await;
         let url = local_url(port, "/x");
         let (_outcome, reply) =
             run_hop_and_settle(&runtime, &token, reqwest::Method::GET, &url, 10_000).await;

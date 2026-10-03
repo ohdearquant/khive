@@ -12,7 +12,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use khive_storage::error::{StorageError, WriterTaskRequestState};
+use khive_storage::error::StorageError;
+#[cfg(test)]
+use khive_storage::error::WriterTaskRequestState;
 use khive_storage::event::{
     Event, EventAppendDisposition, EventFilter, EventObservation, IdempotentEventBatchResult,
     ObservationRole, ReferentKind,
@@ -35,20 +37,10 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     e.into_storage_error(StorageCapability::Events, op)
 }
 
+// Preserve the existing error-classification fixtures at their original seam.
+#[cfg(test)]
 fn mark_unknown_append_usage(error: &StorageError) {
-    if matches!(
-        error,
-        StorageError::WriterTaskRequestFailed {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-            ..
-        } | StorageError::WriterTaskTerminated {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-        }
-    ) {
-        if let Some(ctx) = khive_storage::usage::current() {
-            ctx.mark_unmeasured();
-        }
-    }
+    khive_storage::usage::account_event_write(Err(error));
 }
 
 /// An EventStore backed by SQLite tables.
@@ -1289,39 +1281,36 @@ impl EventStore for SqlEventStore {
         // instrumentation. The enclosing per-dispatch audit row is appended
         // only after the usage snapshot is frozen, so it never counts itself.
         if let Some(writer_task) = self.current_writer_task("append_event")? {
-            return writer_task
+            let result = writer_task
                 .send_bounded(move |conn| {
                     insert_event_with_observations(conn, &event)
                         .map_err(|e| map_err(e, "append_event"))
                 })
-                .await
-                .inspect(|()| {
-                    khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-                })
-                .inspect_err(mark_unknown_append_usage);
+                .await;
+            khive_storage::usage::account_event_write(result.as_ref().map(|()| 1));
+            return result;
         }
 
         // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
         let origin = self.pool.origin();
-        self.with_writer("append_event", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("event_append".to_string()),
-                origin,
-            );
-            if let Err(e) = insert_event_with_observations(conn, &event) {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            conn.execute_batch("COMMIT")?;
-            Ok(())
-        })
-        .await
-        .inspect(|()| {
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-        })
-        .inspect_err(mark_unknown_append_usage)
+        let result = self
+            .with_writer("append_event", move |conn| {
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                    Some("event_append".to_string()),
+                    origin,
+                );
+                if let Err(e) = insert_event_with_observations(conn, &event) {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+                conn.execute_batch("COMMIT")?;
+                Ok(())
+            })
+            .await;
+        khive_storage::usage::account_event_write(result.as_ref().map(|()| 1));
+        result
     }
 
     async fn append_events(&self, events: Vec<Event>) -> Result<BatchWriteSummary, StorageError> {
@@ -1333,50 +1322,43 @@ impl EventStore for SqlEventStore {
         // batch) — the WriterTask's run loop owns the enclosing transaction
         // and issues the ROLLBACK on `Err`.
         if let Some(writer_task) = self.current_writer_task("append_events")? {
-            return writer_task
+            let result = writer_task
                 .send_bounded(move |conn| {
                     batch_append_events_dml(conn, &events, attempted)
                         .map_err(|e| map_err(e, "append_events"))
                 })
-                .await
-                .inspect(|summary| {
-                    khive_storage::usage::count(
-                        khive_storage::usage::UsageUnit::EventRows,
-                        summary.affected,
-                    );
-                })
-                .inspect_err(mark_unknown_append_usage);
+                .await;
+            khive_storage::usage::account_event_write(
+                result.as_ref().map(|summary| summary.affected),
+            );
+            return result;
         }
 
         // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
         // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
         let origin = self.pool.origin();
-        self.with_writer("append_events", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("event_append_batch".to_string()),
-                origin,
-            );
+        let result = self
+            .with_writer("append_events", move |conn| {
+                conn.execute_batch("BEGIN IMMEDIATE")?;
+                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                    Some("event_append_batch".to_string()),
+                    origin,
+                );
 
-            let summary = match batch_append_events_dml(conn, &events, attempted) {
-                Ok(summary) => summary,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
-            };
+                let summary = match batch_append_events_dml(conn, &events, attempted) {
+                    Ok(summary) => summary,
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(e);
+                    }
+                };
 
-            conn.execute_batch("COMMIT")?;
-            Ok(summary)
-        })
-        .await
-        .inspect(|summary| {
-            khive_storage::usage::count(
-                khive_storage::usage::UsageUnit::EventRows,
-                summary.affected,
-            );
-        })
-        .inspect_err(mark_unknown_append_usage)
+                conn.execute_batch("COMMIT")?;
+                Ok(summary)
+            })
+            .await;
+        khive_storage::usage::account_event_write(result.as_ref().map(|summary| summary.affected));
+        result
     }
 
     async fn get_event(&self, id: Uuid) -> Result<Option<Event>, StorageError> {

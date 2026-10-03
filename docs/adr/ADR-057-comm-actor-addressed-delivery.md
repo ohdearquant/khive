@@ -163,7 +163,7 @@ addition to the stable-field table, requires a version bump. Existing rows are n
 A root send generates its canonical thread UUID before either note is written, so the outbound
 and inbound copies both carry the final `thread_id` and `comm_schema_version = 1` from their
 first (and only) write. Both notes commit through one atomic two-note transaction
-(`khive_runtime::create_notes_atomic`); a failure on either note rolls back the whole unit, so no
+(`khive_runtime::create_notes_atomic_with_report`); a failure on either note rolls back the whole unit, so no
 unversioned or partial row can be observed.
 
 The normative field table and reader rules live in

@@ -42,143 +42,18 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
-#[cfg(test)]
-mod reservation_tests {
-    use std::sync::Arc;
-
-    use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistryBuilder};
-    use khive_storage::types::{SqlStatement, SqlValue};
-    use serde_json::json;
-    use tokio::sync::Barrier;
-
-    use super::activation_seam::AFTER_CREATE;
-
-    #[tokio::test]
-    async fn public_schedule_verbs_refuse_reserved_key_on_staged_row() {
-        for (verb, params) in [
-            (
-                "schedule.remind",
-                json!({"content": "check status", "at": "2099-06-01T09:00:00Z"}),
-            ),
-            (
-                "schedule.schedule",
-                json!({"action": "create(kind=\"concept\", name=\"test\")", "at": "2099-06-01T09:00:00Z"}),
-            ),
-        ] {
-            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-            builder.register(crate::SchedulePack::new(runtime.clone()));
-            let registry = builder.build().expect("build registry");
-            let arrived = Arc::new(Barrier::new(2));
-            let resume = Arc::new(Barrier::new(2));
-            let task_arrived = Arc::clone(&arrived);
-            let task_resume = Arc::clone(&resume);
-            let dispatched = tokio::spawn(async move {
-                AFTER_CREATE
-                    .scope((task_arrived, task_resume), async move {
-                        registry.dispatch(verb, params).await
-                    })
-                    .await
-            });
-
-            arrived.wait().await;
-            let token = runtime.authorize(Namespace::local()).expect("local token");
-            let store = runtime.notes(&token).expect("notes");
-            let staged = runtime
-                .list_notes(&token, Some("scheduled_event"), 10, 0)
-                .await
-                .expect("staged notes");
-            assert_eq!(staged.len(), 1, "{verb}: expected one staged row");
-            let before = &staged[0];
-            let mut planted = before.properties.clone().expect("properties");
-            planted["khive:secret_gate"] = json!({"legacy": true});
-            let mut writer = runtime.sql().writer().await.expect("writer");
-            writer
-                .execute(SqlStatement {
-                    sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
-                    params: vec![
-                        SqlValue::Text(planted.to_string()),
-                        SqlValue::Text(before.id.to_string()),
-                    ],
-                    label: None,
-                })
-                .await
-                .expect("plant stored key");
-            drop(writer);
-            resume.wait().await;
-
-            let error = dispatched.await.expect("dispatch task").expect_err(verb);
-            assert!(
-                matches!(&error, RuntimeError::InvalidInput(_)),
-                "{verb}: {error}"
-            );
-            assert!(
-                error.to_string().contains("khive:secret_gate"),
-                "{verb}: {error}"
-            );
-            let after = store
-                .get_note(before.id)
-                .await
-                .expect("read row")
-                .expect("row");
-            assert_eq!(after.properties, Some(planted), "{verb}: row changed");
-            assert_eq!(
-                after.updated_at, before.updated_at,
-                "{verb}: revision changed"
-            );
-        }
+fn add_embedding_truncation_warning(
+    response: &mut Value,
+    report: &khive_runtime::retrieval::EmbeddingTruncationReport,
+) {
+    if !report.any_truncated() {
+        return;
     }
-
-    #[tokio::test]
-    async fn public_cancel_refuses_reserved_key_on_pending_row() {
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-        builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
-        builder.register(crate::SchedulePack::new(runtime.clone()));
-        let registry = builder.build().expect("build registry");
-        let created = registry
-            .dispatch(
-                "schedule.remind",
-                json!({"content": "check status", "at": "2099-06-01T09:00:00Z"}),
-            )
-            .await
-            .expect("create pending event");
-        let id = created["full_id"]
-            .as_str()
-            .expect("full id")
-            .parse()
-            .expect("UUID");
-        let token = runtime.authorize(Namespace::local()).expect("local token");
-        let store = runtime.notes(&token).expect("notes");
-        let before = store.get_note(id).await.expect("read row").expect("row");
-        let mut planted = before.properties.clone().expect("properties");
-        planted["khive:secret_gate"] = json!({"legacy": true});
-        let mut writer = runtime.sql().writer().await.expect("writer");
-        writer
-            .execute(SqlStatement {
-                sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
-                params: vec![
-                    SqlValue::Text(planted.to_string()),
-                    SqlValue::Text(id.to_string()),
-                ],
-                label: None,
-            })
-            .await
-            .expect("plant stored key");
-        drop(writer);
-
-        let error = registry
-            .dispatch("schedule.cancel", json!({"id": id.to_string()}))
-            .await
-            .expect_err("reserved key must refuse cancel");
-        assert!(matches!(&error, RuntimeError::InvalidInput(_)), "{error}");
-        assert!(error.to_string().contains("khive:secret_gate"), "{error}");
-        let after = store.get_note(id).await.expect("read row").expect("row");
-        assert_eq!(after.properties, Some(planted), "row changed");
-        assert_eq!(after.updated_at, before.updated_at, "revision changed");
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "warnings".to_string(),
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        );
     }
 }
 
@@ -414,6 +289,14 @@ async fn activate_with_creator_provenance(
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "create_refusal_tests.rs"]
+mod create_refusal_tests;
+
+#[cfg(test)]
+#[path = "resource_alias_drift_tests.rs"]
+mod resource_alias_drift_tests;
+
 /// Rejects scheduled actions known to fail a handler's *conditional*
 /// required param even though `describe_verb` marks none of the
 /// alternatives `required:true` (issue #461) — hard-codes the `create`
@@ -503,13 +386,24 @@ fn validate_conditional_requirements(
             )?;
         }
         CreateKindClass::Note { specific } => {
-            reconcile_specific_for_replay(
+            let canonical = reconcile_specific_for_replay(
                 "",
                 specific,
                 note_kind_arg,
                 |s| canonical_note_kind_for_replay(s, registry),
                 "note_kind",
             )?;
+            if canonical.as_deref() == Some("scheduled_event") {
+                // KG's refusal is private; the real dual-dispatch fixture
+                // keeps this reason aligned without expanding its public API.
+                return Err(RuntimeError::InvalidInput(
+                    "kind=scheduled_event is not creatable via `create` — its \
+                     `created_by_actor` is a trust boundary for replay dispatch and must \
+                     be derived from the authenticated caller, not caller-supplied \
+                     properties; use `schedule.remind` or `schedule.schedule` instead"
+                        .into(),
+                ));
+            }
             let content = args
                 .get("content")
                 .and_then(khive_request::ArgValue::as_value)
@@ -648,8 +542,9 @@ fn canonical_note_kind_for_replay(
 /// Hand-copied ADR-048 `resource`-kind alias set mirroring
 /// `khive-pack-kg::vocab::EntityKind`'s `FromStr` arm (that type is
 /// pack-private). `normalized` must already be trimmed + lowercased. Kept in
-/// sync with the CI-checked `entity_kind_resource_aliases_match_real_vocab`
-/// test. See `docs/api/replay-validation.md#resource_alias_for_replay`.
+/// sync with the source-reading `entity_kind_resource_aliases_match_real_vocab`
+/// test in `src/resource_alias_drift_tests.rs`. See
+/// `docs/api/replay-validation.md#resource_alias_for_replay`.
 fn resource_alias_for_replay(normalized: &str) -> bool {
     matches!(
         normalized,
@@ -962,12 +857,16 @@ pub(crate) async fn handle_remind(
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
 
-    let note = runtime
-        .create_note(
+    // The report-returning variant keeps a truncated embedding input from
+    // failing the call after the note is committed: the staged event must
+    // still be activated, and the truncation is disclosed in the response.
+    let (note, embedding_truncation) = runtime
+        .create_note_with_embedding_content_and_report(
             token,
             "scheduled_event",
             None,
             &p.content,
+            None,
             None,
             Some(properties.clone()),
             Vec::new(),
@@ -977,14 +876,16 @@ pub(crate) async fn handle_remind(
     activation_seam::pause_after_create().await;
     activate_with_creator_provenance(runtime, token, &note, "remind").await?;
 
-    Ok(json!({
+    let mut response = json!({
         "id": short_id(note.id),
         "full_id": note.id.as_hyphenated().to_string(),
         "event_type": "remind",
         "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "pending",
-    }))
+    });
+    add_embedding_truncation_warning(&mut response, &embedding_truncation);
+    Ok(response)
 }
 
 /// `schedule` — schedule a future verb dispatch.
@@ -1039,12 +940,15 @@ pub(crate) async fn handle_schedule(
     });
     store_monthly_anchor(&mut properties, p.repeat.as_deref(), &trigger_at_original);
 
-    let note = runtime
-        .create_note(
+    // See `handle_remind`: activation must follow a committed note even when
+    // its embedding input was truncated.
+    let (note, embedding_truncation) = runtime
+        .create_note_with_embedding_content_and_report(
             token,
             "scheduled_event",
             None,
             &p.action,
+            None,
             None,
             Some(properties.clone()),
             Vec::new(),
@@ -1054,14 +958,16 @@ pub(crate) async fn handle_schedule(
     activation_seam::pause_after_create().await;
     activate_with_creator_provenance(runtime, token, &note, "schedule").await?;
 
-    Ok(json!({
+    let mut response = json!({
         "id": short_id(note.id),
         "full_id": note.id.as_hyphenated().to_string(),
         "event_type": "schedule",
         "trigger_at": trigger_at_original,
         "repeat": p.repeat,
         "status": "pending",
-    }))
+    });
+    add_embedding_truncation_warning(&mut response, &embedding_truncation);
+    Ok(response)
 }
 
 /// `agenda` — list upcoming scheduled events.
@@ -1394,4 +1300,144 @@ async fn cancel_pending_event(
         .map_err(|e| RuntimeError::Internal(format!("cancel: conditional update: {e}")))?;
 
     Ok(rows == 1)
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use std::sync::Arc;
+
+    use khive_runtime::{KhiveRuntime, Namespace, RuntimeError, VerbRegistryBuilder};
+    use khive_storage::types::{SqlStatement, SqlValue};
+    use serde_json::json;
+    use tokio::sync::Barrier;
+
+    use super::activation_seam::AFTER_CREATE;
+
+    #[tokio::test]
+    async fn public_schedule_verbs_refuse_reserved_key_on_staged_row() {
+        for (verb, params) in [
+            (
+                "schedule.remind",
+                json!({"content": "check status", "at": "2099-06-01T09:00:00Z"}),
+            ),
+            (
+                "schedule.schedule",
+                json!({"action": "create(kind=\"concept\", name=\"test\")", "at": "2099-06-01T09:00:00Z"}),
+            ),
+        ] {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            builder.register(crate::SchedulePack::new(runtime.clone()));
+            let registry = builder.build().expect("build registry");
+            let arrived = Arc::new(Barrier::new(2));
+            let resume = Arc::new(Barrier::new(2));
+            let task_arrived = Arc::clone(&arrived);
+            let task_resume = Arc::clone(&resume);
+            let dispatched = tokio::spawn(async move {
+                AFTER_CREATE
+                    .scope((task_arrived, task_resume), async move {
+                        registry.dispatch(verb, params).await
+                    })
+                    .await
+            });
+
+            arrived.wait().await;
+            let token = runtime.authorize(Namespace::local()).expect("local token");
+            let store = runtime.notes(&token).expect("notes");
+            let staged = runtime
+                .list_notes(&token, Some("scheduled_event"), 10, 0)
+                .await
+                .expect("staged notes");
+            assert_eq!(staged.len(), 1, "{verb}: expected one staged row");
+            let before = &staged[0];
+            let mut planted = before.properties.clone().expect("properties");
+            planted["khive:secret_gate"] = json!({"legacy": true});
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            writer
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+                    params: vec![
+                        SqlValue::Text(planted.to_string()),
+                        SqlValue::Text(before.id.to_string()),
+                    ],
+                    label: None,
+                })
+                .await
+                .expect("plant stored key");
+            drop(writer);
+            resume.wait().await;
+
+            let error = dispatched.await.expect("dispatch task").expect_err(verb);
+            assert!(
+                matches!(&error, RuntimeError::InvalidInput(_)),
+                "{verb}: {error}"
+            );
+            assert!(
+                error.to_string().contains("khive:secret_gate"),
+                "{verb}: {error}"
+            );
+            let after = store
+                .get_note(before.id)
+                .await
+                .expect("read row")
+                .expect("row");
+            assert_eq!(after.properties, Some(planted), "{verb}: row changed");
+            assert_eq!(
+                after.updated_at, before.updated_at,
+                "{verb}: revision changed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_cancel_refuses_reserved_key_on_pending_row() {
+        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+        builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+        builder.register(crate::SchedulePack::new(runtime.clone()));
+        let registry = builder.build().expect("build registry");
+        let created = registry
+            .dispatch(
+                "schedule.remind",
+                json!({"content": "check status", "at": "2099-06-01T09:00:00Z"}),
+            )
+            .await
+            .expect("create pending event");
+        let id = created["full_id"]
+            .as_str()
+            .expect("full id")
+            .parse()
+            .expect("UUID");
+        let token = runtime.authorize(Namespace::local()).expect("local token");
+        let store = runtime.notes(&token).expect("notes");
+        let before = store.get_note(id).await.expect("read row").expect("row");
+        let mut planted = before.properties.clone().expect("properties");
+        planted["khive:secret_gate"] = json!({"legacy": true});
+        let mut writer = runtime.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+                params: vec![
+                    SqlValue::Text(planted.to_string()),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("plant stored key");
+        drop(writer);
+
+        let error = registry
+            .dispatch("schedule.cancel", json!({"id": id.to_string()}))
+            .await
+            .expect_err("reserved key must refuse cancel");
+        assert!(matches!(&error, RuntimeError::InvalidInput(_)), "{error}");
+        assert!(error.to_string().contains("khive:secret_gate"), "{error}");
+        let after = store.get_note(id).await.expect("read row").expect("row");
+        assert_eq!(after.properties, Some(planted), "row changed");
+        assert_eq!(after.updated_at, before.updated_at, "revision changed");
+    }
 }

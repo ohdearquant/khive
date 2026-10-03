@@ -33,7 +33,7 @@ mod search_text_mode_tests {
             .authorize(Namespace::local())
             .expect("local namespace");
         let entity = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "concept",
                 None,
@@ -43,6 +43,7 @@ mod search_text_mode_tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .expect("seed entity");
         let note = runtime
             .create_note(
@@ -145,7 +146,7 @@ mod search_text_mode_tests {
             .authorize(Namespace::local())
             .expect("local namespace");
         let entity = runtime
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "concept",
                 None,
@@ -155,6 +156,7 @@ mod search_text_mode_tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .expect("seed entity");
 
         let chain = server

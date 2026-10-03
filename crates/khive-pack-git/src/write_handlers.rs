@@ -130,6 +130,13 @@ pub(crate) fn repo_write_lock(repo: &Path) -> RepoLock {
     }
 }
 
+pub(crate) async fn repo_write_lock_async(repo: &Path) -> Result<RepoLock, RuntimeError> {
+    let repo = repo.to_path_buf();
+    tokio::task::spawn_blocking(move || repo_write_lock(&repo))
+        .await
+        .map_err(|_| RuntimeError::InvalidInput("repository lock worker did not complete".into()))
+}
+
 fn parse_repo_param(params: &Value) -> Result<PathBuf, RuntimeError> {
     match params.get("repo") {
         Some(Value::String(raw)) => Ok(PathBuf::from(raw)),
@@ -417,7 +424,21 @@ impl GitPack {
             }
         }
 
-        let lock = repo_write_lock(&repo);
+        let lock = match repo_write_lock_async(&repo).await {
+            Ok(lock) => lock,
+            Err(error) => {
+                return Err(self
+                    .audit_early_failure(
+                        token,
+                        "git.commit",
+                        &repo,
+                        None,
+                        EventOutcome::Error,
+                        error,
+                    )
+                    .await)
+            }
+        };
         let _guard = lock.lock().await;
         let CommitPreflight {
             branch,
@@ -607,6 +628,10 @@ impl GitPack {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "repo_lock_async_tests.rs"]
+mod repo_lock_async_tests;
 
 #[cfg(test)]
 mod repo_lock_tests {

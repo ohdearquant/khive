@@ -26,7 +26,10 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         // refused: the receipt exists precisely to record that nothing ran.
         RuntimeError::RefusedWithReceipt(_) => Some("not_committed"),
         RuntimeError::Khive(k) => match (k.kind(), k.details().and_then(|d| d.get("reason"))) {
-            (khive_types::ErrorKind::Internal, Some("post_commit_degraded")) => Some("committed"),
+            (
+                khive_types::ErrorKind::Internal,
+                Some("post_commit_degraded" | "embedding_input_truncated"),
+            ) => Some("committed"),
             (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
                 Some("not_committed")
             }
@@ -284,6 +287,22 @@ mod tests {
         let actual = runtime_error_value(source.into(), DomainDisposition::Unknown);
         assert_eq!(actual, expected);
         assert_eq!(serde_json::to_vec(&actual).unwrap(), expected_bytes);
+    }
+
+    #[test]
+    fn embedding_truncation_after_write_projects_committed_disposition() {
+        let error = KhiveError::internal("embedding input truncated").with_details(Details::new([
+            ("reason", "embedding_input_truncated"),
+            ("record_id", "00000000-0000-0000-0000-000000000001"),
+            ("committed", "true"),
+            ("retryable", "false"),
+        ]));
+        let value = runtime_error_value(error.into(), DomainDisposition::Unknown);
+        assert_eq!(value["domain_disposition"], "committed");
+        assert_eq!(
+            value["details"]["record_id"],
+            "00000000-0000-0000-0000-000000000001"
+        );
     }
 
     #[test]

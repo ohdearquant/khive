@@ -11,7 +11,9 @@ use crate::credentials;
 use crate::local_git::{self, LocalGitError};
 use crate::receipts::{self, Disposition, Receipt};
 use crate::write_argv::{validate_message, validate_ref_name, validate_repo_path};
+#[cfg(test)]
 use crate::write_handlers::repo_write_lock;
+use crate::write_handlers::repo_write_lock_async;
 use crate::write_policy::{GitWritePolicy, GitWritePolicyError};
 use crate::GitPack;
 
@@ -97,7 +99,7 @@ pub(crate) fn validate_keys(params: &Value, allowed: &[&str]) -> Result<(), Fail
 }
 
 pub(crate) fn oid(value: &str) -> Result<(), Failure> {
-    if value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if crate::object_id::is_40_hex(value.as_bytes()) {
         Ok(())
     } else {
         Err(Failure::refused("invalid_params"))
@@ -523,7 +525,14 @@ impl GitPack {
                 .finish_local(token, receipt, Err(Failure::refused("policy_denied")))
                 .await;
         }
-        let lock = repo_write_lock(&canonical);
+        let lock = match repo_write_lock_async(&canonical).await {
+            Ok(lock) => lock,
+            Err(_) => {
+                return self
+                    .finish_local(token, receipt, Err(Failure::refused("git_failed")))
+                    .await
+            }
+        };
         let _guard = lock.lock().await;
         let outcome = self
             .perform_local(verb, &params, &canonical, &mut receipt, prior)
