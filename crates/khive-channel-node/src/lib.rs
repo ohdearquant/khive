@@ -1,5 +1,11 @@
-//! Pure node wire protocol v1 inputs, encodings, and cryptographic operations.
-//! Network, contact policy, key persistence, and message commits belong to callers.
+//! Node wire protocol v1 encodings, cryptography, and HTTPS calls.
+//! Contact confirmation, key persistence, and message commits belong to callers.
+
+pub mod client;
+pub mod pins;
+pub mod response;
+pub mod source;
+pub mod submit;
 
 pub mod encoding;
 pub mod envelope;
@@ -39,6 +45,10 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod vectors;
 
+#[cfg(test)]
+mod client_test_server;
+#[cfg(test)]
+mod client_tests;
 #[cfg(test)]
 mod docs_r3_tests;
 #[cfg(test)]
