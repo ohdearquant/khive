@@ -2230,7 +2230,7 @@ review. No implementation or native acceptance is asserted by this amendment.
 
 ## Amendment 15 (2026-10-03): fallback owners neither grant nor use L2 reuse authority
 
-**Status: Proposed.**
+**Status: Accepted; ratified by the maintainer, 2026-10-03.**
 
 **Clarifies:** Amendment 14's whole-owner rule. **Retains:** Amendment 10's read
 boundary, project/module/symbol identities, the Amendment 14 marker shape and
