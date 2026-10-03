@@ -68,14 +68,22 @@ pub struct CandidateContext<'a> {
 
 /// Match a pre-lowercased name at non-alphanumeric outer boundaries.
 /// All-CJK names use substring matching because equivalent word boundaries are absent.
-fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
+fn contains_at_word_boundary_cached(
+    haystack: &str,
+    cached_chars: &mut Option<Vec<char>>,
+    needle: &str,
+) -> bool {
     if needle.is_empty() {
         return false;
     }
     if needle.chars().all(is_cjk_char) {
         return haystack.contains(needle);
     }
-    let haystack_chars: Vec<char> = haystack.chars().collect();
+    let haystack_chars = cached_chars.get_or_insert_with(|| {
+        #[cfg(test)]
+        loop_3711_tests::body_materialized();
+        haystack.chars().collect()
+    });
     let needle_chars: Vec<char> = needle.chars().collect();
     let n = needle_chars.len();
     if n == 0 || haystack_chars.len() < n {
@@ -94,6 +102,19 @@ fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
         }
     }
     false
+}
+
+fn matches_any_entity(ctx: &CandidateContext<'_>) -> bool {
+    let lower = ctx.content.to_lowercase();
+    let mut chars = None;
+    ctx.entity_names
+        .iter()
+        .any(|name| contains_at_word_boundary_cached(&lower, &mut chars, name))
+}
+
+#[cfg(test)]
+fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
+    contains_at_word_boundary_cached(haystack, &mut None, needle)
 }
 
 impl AdjustmentCondition {
@@ -131,19 +152,13 @@ impl AdjustmentCondition {
                 if ctx.entity_names.is_empty() {
                     return false;
                 }
-                let lower = ctx.content.to_lowercase();
-                ctx.entity_names
-                    .iter()
-                    .any(|e| contains_at_word_boundary(&lower, e))
+                matches_any_entity(ctx)
             }
             Self::EntityMiss => {
                 if ctx.entity_names.is_empty() {
                     return false;
                 }
-                let lower = ctx.content.to_lowercase();
-                !ctx.entity_names
-                    .iter()
-                    .any(|e| contains_at_word_boundary(&lower, e))
+                !matches_any_entity(ctx)
             }
             Self::All { conditions } => conditions.iter().all(|c| c.matches(ctx)),
         }
@@ -830,6 +845,10 @@ pub fn entity_posterior_term(entity_posterior_mean: Option<f64>, w_ent: f32) -> 
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "entity_loop_3711_tests.rs"]
+mod loop_3711_tests;
 
 #[cfg(test)]
 mod tests {

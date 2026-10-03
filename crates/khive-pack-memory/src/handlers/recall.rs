@@ -926,13 +926,10 @@ impl MemoryPack {
                 .map(|sn| sn.note.content.chars().take(prefix_len).collect::<String>())
                 .collect();
 
-            for i in 1..ranked.len() {
-                for j in 0..i {
-                    if prefixes[i] == prefixes[j] {
-                        ranked[i].rank_score =
-                            (ranked[i].rank_score - scoring_cfg.mmr_penalty).max(0.0);
-                        break;
-                    }
+            for (candidate, duplicate) in ranked.iter_mut().zip(duplicate_prefix_flags(&prefixes)) {
+                if duplicate {
+                    candidate.rank_score =
+                        (candidate.rank_score - scoring_cfg.mmr_penalty).max(0.0);
                 }
             }
         }
@@ -1460,6 +1457,20 @@ async fn emit_recall_executed_event(
         );
     }
 }
+
+/// One set insertion per prefix; the first occurrence keeps its original score.
+fn duplicate_prefix_flags(prefixes: &[String]) -> impl Iterator<Item = bool> + '_ {
+    let mut seen = HashSet::with_capacity(prefixes.len());
+    prefixes.iter().map(move |prefix| {
+        #[cfg(test)]
+        loop_3711_tests::visit();
+        !seen.insert(prefix.as_str())
+    })
+}
+
+#[cfg(test)]
+#[path = "recall_loop_3711_tests.rs"]
+mod loop_3711_tests;
 
 #[cfg(test)]
 mod tests {
