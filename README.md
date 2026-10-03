@@ -22,7 +22,7 @@ stdio, and `cargo test` finishes in 4 seconds.
 
 | Capability                  | How                                                                                                                                                      |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **142 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
+| **144 verbs, 14 packs**     | KG, GTD, memory, brain, comm, schedule, knowledge, session, tool, exec, git, code, workspace, blob: all load by default                                  |
 | **Typed entities**          | 9 closed kinds: concept, document, dataset, project, person, org, artifact, service, resource                                                            |
 | **Typed edges**             | 19 closed relations in 9 categories (structure, derivation, provenance, temporal, dependency, impl, lateral, annotation, epistemic)                      |
 | **Typed notes**             | 5 closed kinds: observation, insight, question, decision, reference                                                                                      |
@@ -60,8 +60,8 @@ request(ops="[v1(...), v2(...), v3(...)]")             # parallel batch (max 100
 request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]") # equivalent JSON form
 ```
 
-All 14 packs load by default, giving **142 verbs** out of the box (updated from the
-current handler declarations, 2026-09-24; verify again with `request(ops="verbs()")`
+All 14 packs load by default, giving **144 verbs** out of the box (updated from the
+current handler declarations; verify again with `request(ops="verbs()")`
 before editing this table):
 
 | Pack          | Prefix       | Verbs | What it does                                                                                                                                                                     |
@@ -79,7 +79,7 @@ before editing this table):
 | **git**       | `git.`       | 17    | Provenance ingest, branch/commit/update_ref/push writes (ADR-108), dev-loop verbs: checkout, diff, gates, receipts, reconcile, status, log, init, PR open/review/merge (ADR-182) |
 | **code**      | _(none)_     | 1     | `code.ingest`: L1 manifest + L1.5 import-scan source ingest (ADR-085 Amendment 2)                                                                                                |
 | **workspace** | _(none)_     | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                                                     |
-| **blob**      | `blob.`      | 7     | Content-addressed put/get/stat and staged uploads over `BlobStore` (ADR-111, ADR-173)                                                                                            |
+| **blob**      | `blob.`      | 9     | Content-addressed `put`/`get`/`stat`, staged `begin`/`put_part`/`commit`/`abort`, and opt-in `blob.import`/`blob.export` file transfers over `BlobStore` (ADR-111, ADR-173)      |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.
@@ -150,7 +150,7 @@ records what's connected, in which direction, and why.
 │  khive-pack-workspace: workspace entity + contains endpoint   │
 │                        rules (0 verbs)                        │
 │  khive-pack-blob:      content-addressed object storage       │
-│                        (7 verbs)                              │
+│                        (9 verbs)                              │
 │  khive-pack-tool:      tool/skill/plugin registry, capability │
 │                        discovery, use policy (14 verbs)       │
 │  khive-pack-exec:      sandboxed run over a materialized tree │
@@ -269,7 +269,7 @@ kkernel --version   # confirms the binary and version you just installed
 ```
 
 All 14 packs load by default, a background daemon auto-spawns to keep the runtime warm, and any
-MCP client discovers the `request` tool with the full 142-verb catalog.
+MCP client discovers the `request` tool with the full 144-verb catalog.
 
 ### Alternative: npm
 
@@ -401,7 +401,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**Main after v0.7.0.** 142 verbs across 14 packs, 9 entity kinds, 19 edge relations, daemon warm startup
+**Main after v0.7.0.** 144 verbs across 14 packs, 9 entity kinds, 19 edge relations, daemon warm startup
 (ADR-049), knowledge search with embedding rerank, Bayesian brain profiles, threaded messaging,
 scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.

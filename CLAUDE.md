@@ -65,7 +65,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 │  14 default packs (`RuntimeConfig::built_in_packs()`):        │
 │  kg, gtd, memory, brain, comm, schedule, knowledge, session, │
 │  tool, exec, git, code, workspace, blob — together exposing   │
-│  142 public verbs (see the verb-catalog paragraph below       │
+│  144 public verbs (see the verb-catalog paragraph below       │
 │  for the per-pack breakdown)                                   │
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
 │  khive-merge       — KG merge algorithm (ADR-039, forward-deployed,  │
@@ -215,10 +215,11 @@ shell to system git with hardened, allowlisted argv construction and uncondition
 (ADR-108); comm.probe (#644) added 2026-07-07; brain.event_counts (ADR-103 Stage 1, #724
 Ask A) added 2026-07-08; kg.resolve added 2026-07-09; workspace (#873) contributes zero verbs,
 adding only the `workspace` entity kind and `contains` endpoint rules to git/gtd/session notes;
-blob contributes seven verbs: blob.put/blob.get/blob.stat (ADR-111) and
-blob.begin/blob.put_part/blob.commit/blob.abort (ADR-173), over the `BlobStore`
-content-addressed storage trait; a normal file-backed boot installs a default `FsBlobStore`
-beside the database file with no config needed, and the verbs stay unconfigured only
+blob contributes nine verbs: blob.put/blob.get/blob.stat (ADR-111),
+blob.begin/blob.put_part/blob.commit/blob.abort (ADR-173), and blob.import/blob.export
+for opt-in local file transfers, over the `BlobStore` content-addressed storage trait;
+a normal file-backed boot installs a default `FsBlobStore`
+beside the database file with no config needed, and the storage verbs stay unconfigured only
 against an in-memory backend;
 regenerate via `request(ops="verbs()")` before editing this line).
 
