@@ -8,6 +8,22 @@ use std::path::PathBuf;
 use clap::Parser;
 use khive_runtime::Namespace;
 
+/// The immutable process lifetime selected by the daemon's launcher.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifetimeMode {
+    Demand,
+    Persistent,
+}
+
+impl From<LifetimeMode> for khive_runtime::daemon::DaemonLifetime {
+    fn from(mode: LifetimeMode) -> Self {
+        match mode {
+            LifetimeMode::Demand => Self::Demand,
+            LifetimeMode::Persistent => Self::Persistent,
+        }
+    }
+}
+
 /// Parsed serve-time arguments for the `kkernel mcp` subcommand.
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -71,13 +87,21 @@ pub struct Args {
     #[arg(long = "config", env = "KHIVE_CONFIG")]
     pub config: Option<PathBuf>,
 
-    /// Run as a persistent daemon over a Unix socket instead of a foreground transport.
+    /// Run as a daemon over a Unix socket instead of a foreground transport.
     ///
     /// The daemon owns the warm pack registry (ANN indexes) and serves request
     /// frames from thin stdio clients that auto-spawn it. Bound to
     /// `~/.khive/khived.sock`. Takes precedence over `--transport`.
     #[arg(long)]
     pub daemon: bool,
+
+    /// Daemon lifetime. Omitted means persistent; thin clients launch demand mode.
+    #[arg(long, value_enum, requires = "daemon")]
+    pub lifetime: Option<LifetimeMode>,
+
+    /// Demand daemon's positive idle interval, in seconds (default: 1800).
+    #[arg(long, requires = "daemon", value_parser = clap::value_parser!(u64).range(1..))]
+    pub idle_timeout_secs: Option<u64>,
 
     /// Foreground serving transport (registry name). Defaults to `stdio`.
     ///
@@ -125,6 +149,18 @@ pub struct Args {
     pub resumed_generation: Option<u32>,
 }
 
+impl Args {
+    pub(crate) fn daemon_options(&self) -> khive_runtime::daemon::DaemonOptions {
+        khive_runtime::daemon::DaemonOptions {
+            lifetime: self.lifetime.unwrap_or(LifetimeMode::Persistent).into(),
+            idle_interval: std::time::Duration::from_secs(
+                self.idle_timeout_secs
+                    .unwrap_or(khive_runtime::daemon::DEFAULT_DEMAND_IDLE_SECS),
+            ),
+        }
+    }
+}
+
 /// Resolve CLI namespace from `Args`. Returns `(explicit, namespace)`; errors on invalid namespace string.
 pub fn resolve_cli_namespace(args: &Args) -> Result<(bool, Namespace), String> {
     let explicit = args.actor.is_some() || args.namespace.is_some();
@@ -135,4 +171,34 @@ pub fn resolve_cli_namespace(args: &Args) -> Result<(bool, Namespace), String> {
         .unwrap_or("local");
     let ns = Namespace::parse(raw).map_err(|e| format!("invalid namespace {raw:?}: {e}"))?;
     Ok((explicit, ns))
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_lifetime_is_explicit_and_defaults_to_persistent() {
+        let persistent = Args::try_parse_from(["mcp", "--daemon"]).unwrap();
+        assert_eq!(
+            persistent.daemon_options().lifetime,
+            khive_runtime::daemon::DaemonLifetime::Persistent
+        );
+        let demand = Args::try_parse_from([
+            "mcp",
+            "--daemon",
+            "--lifetime",
+            "demand",
+            "--idle-timeout-secs",
+            "7",
+        ])
+        .unwrap();
+        assert_eq!(
+            demand.daemon_options().lifetime,
+            khive_runtime::daemon::DaemonLifetime::Demand
+        );
+        assert_eq!(demand.daemon_options().idle_interval.as_secs(), 7);
+        assert!(Args::try_parse_from(["mcp", "--lifetime", "demand"]).is_err());
+        assert!(Args::try_parse_from(["mcp", "--daemon", "--idle-timeout-secs", "0"]).is_err());
+    }
 }

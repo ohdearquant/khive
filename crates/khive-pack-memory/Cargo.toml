@@ -21,6 +21,7 @@ khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
 khive-retrieval = { version = "0.9.0", path = "../khive-retrieval" }
 khive-score = { version = "0.9.0", path = "../khive-score" }
 khive-brain-core = { version = "0.9.0", path = "../khive-brain-core" }
+khive-text = { version = "0.9.0", path = "../khive-text" }
 khive-vamana = { version = "0.9.0", path = "../khive-vamana" }
 blake3 = { workspace = true }
 inventory = { workspace = true }

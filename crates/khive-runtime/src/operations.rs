@@ -34,6 +34,14 @@ use khive_db::stores::text::insert_document_statements;
 use khive_db::{pool::RuntimeWriteOperation, SqliteError};
 use rusqlite::OptionalExtension;
 
+#[cfg(test)]
+mod batch_edge_tests;
+
+struct EdgeReadWindow {
+    outcomes: Vec<Option<RuntimeResult<Option<Edge>>>>,
+    groups: Vec<(khive_types::Namespace, Vec<usize>)>,
+}
+
 /// The restore unit committed the row and its text index; only the
 /// post-commit embedding rebuild failed. Name that, so the caller does not
 /// read an ordinary restore failure over a record that is already live.
@@ -3641,7 +3649,7 @@ impl KhiveRuntime {
         &self,
         token: &NamespaceToken,
         node_id: Uuid,
-        mut query: NeighborQuery,
+        query: NeighborQuery,
         after: Option<NeighborCursor>,
         neighbor_kinds: Option<Vec<String>>,
         enrich: bool,
@@ -3654,10 +3662,71 @@ impl KhiveRuntime {
             )));
         }
 
+        self.neighbors_for_resolved_kg_read(
+            token,
+            node_id,
+            crate::KgNeighborRead {
+                query,
+                after,
+                neighbor_kinds,
+                enrich,
+                namespace: None,
+            },
+        )
+        .await
+    }
+
+    /// Expand an already resolved live KG origin on this runtime's graph.
+    ///
+    /// The caller must verify the origin's existence and apply any record-kind
+    /// read scope before calling. The original caller token is retained for
+    /// namespace selection and enrichment; an optional namespace may only
+    /// narrow its visible set. Like the ordinary neighbor read, resolution and
+    /// adjacency are separate reads rather than an atomic record snapshot.
+    pub async fn neighbors_for_resolved_kg_read(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        options: crate::KgNeighborRead,
+    ) -> RuntimeResult<Vec<NeighborHit>> {
+        self.neighbors_for_resolved_kg_read_inner(token, node_id, options, false)
+            .await
+            .map(|(hits, _)| hits)
+    }
+
+    /// Expand a resolved origin and return visible live entity-kind hints for
+    /// mailbox endpoint checks. Lightweight projections obtain these hints in
+    /// the existing deletion-screen read, without enriching the returned hits.
+    /// Missing hints still require the owning message-note backend's policy read.
+    pub async fn neighbors_for_resolved_kg_read_with_entity_kinds(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        options: crate::KgNeighborRead,
+    ) -> RuntimeResult<(Vec<NeighborHit>, HashMap<Uuid, String>)> {
+        self.neighbors_for_resolved_kg_read_inner(token, node_id, options, true)
+            .await
+    }
+
+    async fn neighbors_for_resolved_kg_read_inner(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        options: crate::KgNeighborRead,
+        with_entity_kinds: bool,
+    ) -> RuntimeResult<(Vec<NeighborHit>, HashMap<Uuid, String>)> {
+        let crate::KgNeighborRead {
+            mut query,
+            after,
+            neighbor_kinds,
+            enrich,
+            namespace,
+        } = options;
+        let namespaces = crate::kg_read::neighbor_read_namespaces(token, namespace.as_ref())?;
         query.direction =
             normalize_symmetric_direction(query.direction, query.relations.as_deref());
         let mut hits = Vec::new();
-        for ns in token.visible_namespaces() {
+        for ns in namespaces {
             let temp = NamespaceToken::for_namespace(ns.clone());
             let mut ns_hits = self
                 .graph(&temp)?
@@ -3672,7 +3741,12 @@ impl KhiveRuntime {
         }
         // Filter out soft-deleted entity nodes.
         let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.node_id).collect();
-        let deleted = self.deleted_entity_ids(candidate_ids).await?;
+        let (deleted, entity_kinds) = self
+            .neighbor_node_screen(
+                candidate_ids,
+                (with_entity_kinds && !enrich).then_some(token),
+            )
+            .await?;
         if !deleted.is_empty() {
             hits.retain(|h| !deleted.contains(&h.node_id));
         }
@@ -3689,7 +3763,7 @@ impl KhiveRuntime {
                 .then(a.node_id.cmp(&b.node_id))
                 .then(a.edge_id.cmp(&b.edge_id))
         });
-        Ok(hits)
+        Ok((hits, entity_kinds))
     }
 
     /// Find live `annotates` edges targeting one record without applying a
@@ -3774,8 +3848,20 @@ impl KhiveRuntime {
             )));
         }
 
+        self.directed_neighbors_for_resolved_kg_read(token, node_id, query, None)
+            .await
+    }
+
+    pub(crate) async fn directed_neighbors_for_resolved_kg_read(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        query: NeighborQuery,
+        namespace: Option<&crate::Namespace>,
+    ) -> RuntimeResult<Vec<(NeighborHit, Direction)>> {
+        let namespaces = crate::kg_read::neighbor_read_namespaces(token, namespace)?;
         let mut hits: Vec<DirectedNeighborHit> = Vec::new();
-        for ns in token.visible_namespaces() {
+        for ns in namespaces {
             let temp = NamespaceToken::for_namespace(ns.clone());
             let mut ns_hits = self
                 .graph(&temp)?
@@ -3908,8 +3994,21 @@ impl KhiveRuntime {
         &self,
         ids: Vec<Uuid>,
     ) -> RuntimeResult<std::collections::HashSet<Uuid>> {
+        self.neighbor_node_screen(ids, None)
+            .await
+            .map(|(deleted, _)| deleted)
+    }
+
+    /// Share the deletion-screen statement with optional live entity-kind
+    /// hints. Only the caller's visible entity namespaces supply hints; note
+    /// kinds are not inferred from this backend when notes may route elsewhere.
+    async fn neighbor_node_screen(
+        &self,
+        ids: Vec<Uuid>,
+        kind_token: Option<&NamespaceToken>,
+    ) -> RuntimeResult<(std::collections::HashSet<Uuid>, HashMap<Uuid, String>)> {
         if ids.is_empty() {
-            return Ok(std::collections::HashSet::new());
+            return Ok((std::collections::HashSet::new(), HashMap::new()));
         }
         let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
         let n = id_strs.len();
@@ -3927,11 +4026,21 @@ impl KhiveRuntime {
             .map(|i| format!("?{}", n + i + 1))
             .collect::<Vec<_>>()
             .join(",");
-        let sql_str = format!(
-            "SELECT id FROM entities WHERE id IN ({entities_placeholders}) AND deleted_at IS NOT NULL \
-             UNION \
-             SELECT id FROM notes WHERE id IN ({notes_placeholders}) AND deleted_at IS NOT NULL"
-        );
+        let sql_str = if kind_token.is_some() {
+            format!(
+                "SELECT id, kind, namespace, deleted_at IS NOT NULL AS is_deleted \
+                 FROM entities WHERE id IN ({entities_placeholders}) \
+                 UNION ALL \
+                 SELECT id, NULL, NULL, 1 FROM notes \
+                 WHERE id IN ({notes_placeholders}) AND deleted_at IS NOT NULL"
+            )
+        } else {
+            format!(
+                "SELECT id FROM entities WHERE id IN ({entities_placeholders}) AND deleted_at IS NOT NULL \
+                 UNION \
+                 SELECT id FROM notes WHERE id IN ({notes_placeholders}) AND deleted_at IS NOT NULL"
+            )
+        };
         // Same id list bound twice — once per UNION arm's independent placeholder block.
         let params: Vec<SqlValue> = id_strs
             .iter()
@@ -3945,6 +4054,7 @@ impl KhiveRuntime {
             label: Some("deleted_entity_ids".into()),
         };
         let mut out = std::collections::HashSet::new();
+        let mut entity_kinds = HashMap::new();
         let sql = self.sql();
         let mut reader = sql.reader().await?;
         let rows = reader.query_all(stmt).await?;
@@ -3952,12 +4062,37 @@ impl KhiveRuntime {
             if let Some(col) = row.columns.first() {
                 if let SqlValue::Text(s) = &col.value {
                     if let Ok(u) = s.parse::<Uuid>() {
-                        out.insert(u);
+                        if kind_token.is_none()
+                            || matches!(
+                                row.columns.get(3).map(|col| &col.value),
+                                Some(SqlValue::Integer(1))
+                            )
+                        {
+                            out.insert(u);
+                        } else if let (
+                            Some(token),
+                            Some(SqlValue::Text(kind)),
+                            Some(SqlValue::Text(namespace)),
+                            Some(SqlValue::Integer(0)),
+                        ) = (
+                            kind_token,
+                            row.columns.get(1).map(|col| &col.value),
+                            row.columns.get(2).map(|col| &col.value),
+                            row.columns.get(3).map(|col| &col.value),
+                        ) {
+                            if token
+                                .visible_namespaces()
+                                .iter()
+                                .any(|ns| ns.as_str() == namespace.as_str())
+                            {
+                                entity_kinds.insert(u, kind.clone());
+                            }
+                        }
                     }
                 }
             }
         }
-        Ok(out)
+        Ok((out, entity_kinds))
     }
 
     /// Populate `name` and `kind` on each `NeighborHit` from the corresponding
@@ -5622,11 +5757,18 @@ impl KhiveRuntime {
         // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
         let search_pool = self.backend().pool_arc();
+        let mailbox_view = crate::MailboxView {
+            actor_id: token.actor().id.clone(),
+            delegated: false,
+        };
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
         for id in &candidate_ids {
             if let Some(note) = note_store.get_note(*id).await? {
                 search_pool.record_note_candidate_hydration_row();
                 if note.deleted_at.is_some() {
+                    continue;
+                }
+                if !mailbox_view.permits_message_note(token, &note) {
                     continue;
                 }
                 if let Some(want_kind) = note_kind {
@@ -7132,6 +7274,143 @@ impl KhiveRuntime {
             .graph(&record_tok)?
             .get_edge(LinkId::from(edge_id))
             .await?)
+    }
+
+    /// Read live edges by ID in input order, without a visibility predicate.
+    ///
+    /// Stored namespaces are validated before the corresponding edge decode.
+    /// Each namespace group uses its own graph capability; missing rows remain
+    /// `None`. Group failures belong to their first input, and the earliest
+    /// input error wins after all groups in that bounded window are observed.
+    /// Metadata statement failures are fatal batch errors. Windows are separate
+    /// read observations, not a snapshot of the whole request.
+    pub async fn get_edges_by_id(
+        &self,
+        _token: &NamespaceToken,
+        ids: &[Uuid],
+    ) -> RuntimeResult<Vec<Option<Edge>>> {
+        let mut edges = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(900) {
+            let window = self.prepare_edge_read_window(chunk).await?;
+            edges.extend(
+                Self::hydrate_edge_read_window(chunk, window, |record_token| {
+                    self.graph(record_token)
+                })
+                .await?,
+            );
+        }
+        Ok(edges)
+    }
+
+    async fn prepare_edge_read_window(&self, ids: &[Uuid]) -> RuntimeResult<EdgeReadWindow> {
+        let placeholders = (1..=ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut reader = self.sql().reader().await?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: format!(
+                    "SELECT id, namespace FROM graph_edges WHERE id IN ({placeholders}) AND deleted_at IS NULL"
+                ),
+                params: ids.iter().map(|id| SqlValue::Text(id.to_string())).collect(),
+                label: Some("get_edge_namespace".into()),
+            })
+            .await?;
+        let mut namespaces = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let Some(SqlValue::Text(id)) = row.columns.first().map(|column| &column.value) else {
+                return Err(RuntimeError::Internal(
+                    "edge namespace lookup returned an invalid id".into(),
+                ));
+            };
+            let id = Uuid::parse_str(id).map_err(|e| {
+                RuntimeError::Internal(format!("edge namespace lookup returned an invalid id: {e}"))
+            })?;
+            let value = row
+                .columns
+                .get(1)
+                .map(|column| column.value.clone())
+                .unwrap_or(SqlValue::Null);
+            namespaces.insert(id, value);
+        }
+        let mut window = EdgeReadWindow {
+            outcomes: (0..ids.len()).map(|_| Some(Ok(None))).collect(),
+            groups: Vec::new(),
+        };
+        let mut group_indices = HashMap::new();
+        for (index, id) in ids.iter().enumerate() {
+            let Some(SqlValue::Text(record_ns)) = namespaces.get(id) else {
+                continue;
+            };
+            match khive_types::Namespace::parse(record_ns) {
+                Ok(namespace) => {
+                    let next_group = window.groups.len();
+                    let group = *group_indices.entry(record_ns.clone()).or_insert(next_group);
+                    if group == next_group {
+                        window.groups.push((namespace, Vec::new()));
+                    }
+                    window.groups[group].1.push(index);
+                    window.outcomes[index] = None;
+                }
+                Err(error) => {
+                    window.outcomes[index] = Some(Err(RuntimeError::Internal(format!(
+                        "edge namespace invalid: {error}"
+                    ))));
+                }
+            }
+        }
+        Ok(window)
+    }
+
+    async fn hydrate_edge_read_window<F>(
+        ids: &[Uuid],
+        mut window: EdgeReadWindow,
+        mut graph: F,
+    ) -> RuntimeResult<Vec<Option<Edge>>>
+    where
+        F: FnMut(&NamespaceToken) -> RuntimeResult<std::sync::Arc<dyn khive_storage::GraphStore>>,
+    {
+        for (namespace, indices) in window.groups {
+            let record_token = NamespaceToken::for_namespace(namespace);
+            let group_ids: Vec<LinkId> = indices
+                .iter()
+                .map(|&index| LinkId::from(ids[index]))
+                .collect();
+            let outcomes = match graph(&record_token) {
+                Ok(store) => store
+                    .get_edge_read_outcomes(&group_ids)
+                    .await
+                    .map_err(RuntimeError::from),
+                Err(error) => Err(error),
+            };
+            match outcomes {
+                Ok(outcomes) if outcomes.len() == indices.len() => {
+                    for (index, outcome) in indices.into_iter().zip(outcomes) {
+                        window.outcomes[index] = Some(outcome.map_err(RuntimeError::from));
+                    }
+                }
+                Ok(_) => {
+                    window.outcomes[indices[0]] = Some(Err(RuntimeError::Internal(
+                        "edge batch returned an invalid outcome count".into(),
+                    )));
+                }
+                Err(error) => {
+                    window.outcomes[indices[0]] = Some(Err(error));
+                }
+            }
+        }
+        window
+            .outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.unwrap_or_else(|| {
+                    Err(RuntimeError::Internal(
+                        "edge batch omitted an input outcome".into(),
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// Fetch a single edge by id.

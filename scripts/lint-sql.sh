@@ -11,8 +11,9 @@
 #                   database. Other directories each load their fragments in sorted
 #                   filename order into one fresh database, so indexes see tables
 #                   declared by earlier fragments. One-file directories stand alone.
-#                   The tool pack's registry trigger additionally uses the core
-#                   migration chain as its schema fixture.
+#                   The tool pack's registry trigger and Git pack's live-note
+#                   indexes additionally use the core migration chain as their
+#                   schema fixture.
 #   1b. preparation — a QUERY file (one that does not start with DDL) is prepared,
 #                   not executed, against a database carrying the migration chain
 #                   plus every DDL fragment in the tree. Preparation is what
@@ -124,7 +125,9 @@ for directory in sorted(fragment_groups):
     con = sqlite3.connect(":memory:")
     try:
         fixtures = []
-        if directory.replace(os.sep, "/").endswith("/khive-pack-tool/sql"):
+        if directory.replace(os.sep, "/").endswith(
+            ("/khive-pack-tool/sql", "/khive-pack-git/sql")
+        ):
             fixtures = chain
         for path in fixtures + sorted(fragment_groups[directory]):
             with open(path) as fh:

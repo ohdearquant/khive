@@ -9,9 +9,9 @@ use std::fmt;
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use khive_pack_kg::handlers::ValidatedSearchRequest;
+use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_runtime::Namespace;
-use khive_runtime::{BackendId, NoteSearchHit, SearchHit};
+use khive_runtime::{BackendId, NamespaceToken, NoteSearchHit, RuntimeError, SearchHit};
 use khive_storage::{Edge, EdgeRelation, EdgeUpsertDisposition};
 
 /// Result of a cross-backend link operation.
@@ -222,6 +222,27 @@ pub trait CoordinatorService: Send + Sync {
         extra_visible: &[Namespace],
     ) -> CoordSearchResult;
 
+    /// Search with the gate-authorized caller token and original arguments.
+    /// Older coordinators can still serve entity searches. Note searches
+    /// require an implementation that preserves the caller's mailbox view.
+    async fn fan_out_search_scoped(
+        &self,
+        request: &ValidatedSearchRequest,
+        token: &NamespaceToken,
+        _args: &serde_json::Value,
+        extra_visible: &[Namespace],
+    ) -> Result<CoordSearchResult, RuntimeError> {
+        if request.substrate() == SearchSubstrate::Note {
+            return Err(RuntimeError::InvalidInput(
+                "this coordinator does not support scoped note search; use comm.inbox for messages"
+                    .into(),
+            ));
+        }
+        Ok(self
+            .fan_out_search(request, token.gate_namespace(), extra_visible)
+            .await)
+    }
+
     /// True when only one backend is registered (zero-change invariant check).
     fn is_single_backend(&self) -> bool;
 }
@@ -364,6 +385,20 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl CoordinatorService for MockCoordinator {
+        async fn fan_out_search_scoped(
+            &self,
+            request: &ValidatedSearchRequest,
+            token: &NamespaceToken,
+            _args: &serde_json::Value,
+            extra_visible: &[Namespace],
+        ) -> Result<CoordSearchResult, RuntimeError> {
+            // This fake only renders observation notes; message membership is
+            // exercised by the concrete coordinator's integration scenarios.
+            Ok(self
+                .fan_out_search(request, token.gate_namespace(), extra_visible)
+                .await)
+        }
+
         async fn locate(&self, _id: Uuid) -> Option<BackendId> {
             Some(BackendId::main())
         }

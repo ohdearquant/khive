@@ -169,9 +169,12 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
-            start_host_background_tasks(&args, server, schedule_rt)
-        })
+        khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
+            server,
+            boot_guard,
+            args.daemon_options(),
+            |server| start_host_background_tasks(&args, server, schedule_rt),
+        )
         .await?;
         return Ok(());
     }
@@ -191,16 +194,134 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     serve_with_session_sweep(server, &args, registry).await
 }
 
+fn daemon_startup_report(
+    args: &Args,
+    server: &KhiveMcpServer,
+    has_schedule: bool,
+) -> khive_runtime::daemon::DaemonStartupReport {
+    let mut report = khive_runtime::daemon::DaemonStartupReport::default();
+    if args.daemon
+        && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
+    {
+        #[cfg(feature = "channel-email")]
+        report.skipped_components.extend([
+            "email_channel_poll".to_owned(),
+            "email_channel_outbound".to_owned(),
+        ]);
+        #[cfg(feature = "channel-telegram")]
+        report.skipped_components.extend([
+            "telegram_channel_poll".to_owned(),
+            "telegram_channel_outbound".to_owned(),
+        ]);
+        if has_schedule {
+            report.skipped_components.push("schedule-tick".to_owned());
+        }
+        report.idle_ineligible_reasons = crate::components::idle_retirement_obligations(server);
+        #[cfg(unix)]
+        if !server.default_runtime_is_read_only()
+            && server
+                .events_split_config()
+                .is_some_and(|split| split.socket_path.is_some())
+        {
+            report
+                .idle_ineligible_reasons
+                .push("events_child_may_be_exclusively_owned".to_owned());
+        }
+    }
+    report
+}
+
 fn start_host_background_tasks(
     args: &Args,
     server: &KhiveMcpServer,
     schedule_rt: Option<KhiveRuntime>,
-) {
+) -> khive_runtime::daemon::DaemonStartupReport {
+    let report = daemon_startup_report(args, server, schedule_rt.is_some());
+    if args.daemon
+        && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
+    {
+        for component in &report.skipped_components {
+            tracing::info!(component, "demand daemon: background component skipped");
+        }
+        start_daemon_components_if_daemon(args, server, None);
+        return report;
+    }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(server, args);
     #[cfg(feature = "channel-telegram")]
     spawn_telegram_channel_loops_if_daemon(server, args);
     start_daemon_components_if_daemon(args, server, schedule_rt);
+    report
+}
+
+#[cfg(all(test, unix))]
+mod demand_startup_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn runtime_config() -> khive_runtime::RuntimeConfig {
+        khive_runtime::RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            actor_id: Some("test:demand-startup".to_owned()),
+            packs: vec!["kg".to_owned()],
+            events_split: None,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn configured_channels_and_schedule_are_skipped_by_real_startup() {
+        let runtime = KhiveRuntime::new(runtime_config()).unwrap();
+        let server = KhiveMcpServer::new(runtime.clone()).unwrap();
+        let demand = Args::parse_from(["mcp", "--daemon", "--lifetime", "demand"]);
+        let before = khive_runtime::daemon::background_task_count();
+        let report = start_host_background_tasks(&demand, &server, Some(runtime));
+        assert_eq!(
+            khive_runtime::daemon::background_task_count(),
+            before,
+            "a configured schedule must not create its supervised worker"
+        );
+        assert!(report
+            .skipped_components
+            .contains(&"schedule-tick".to_owned()));
+        #[cfg(feature = "channel-email")]
+        assert!(report
+            .skipped_components
+            .contains(&"email_channel_poll".to_owned()));
+        #[cfg(feature = "channel-telegram")]
+        assert!(report
+            .skipped_components
+            .contains(&"telegram_channel_poll".to_owned()));
+        let persistent = Args::parse_from(["mcp", "--daemon"]);
+        assert!(daemon_startup_report(&persistent, &server, true)
+            .skipped_components
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn events_supervision_configuration_is_idle_ineligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = runtime_config();
+        config.events_split = Some(khive_runtime::events_split::EventsSplitConfig {
+            db_path: dir.path().join("events.db"),
+            socket_path: Some(dir.path().join("events.sock")),
+        });
+        let server = KhiveMcpServer::new(KhiveRuntime::new(config).unwrap()).unwrap();
+        let demand = Args::parse_from(["mcp", "--daemon", "--lifetime", "demand"]);
+        let report = daemon_startup_report(&demand, &server, false);
+        assert!(report
+            .idle_ineligible_reasons
+            .contains(&"events_child_may_be_exclusively_owned".to_owned()));
+        assert!(
+            daemon_startup_report(&Args::parse_from(["mcp", "--daemon"]), &server, false)
+                .idle_ineligible_reasons
+                .is_empty()
+        );
+    }
 }
 
 /// Whether this process owns the email channel loops (#602).
@@ -440,11 +561,18 @@ fn start_daemon_components_if_daemon(
     #[cfg(unix)]
     if server.default_runtime_is_read_only() {
         tracing::info!("read-only deployment: events daemon supervision skipped");
-    } else if let Some(split) = server.events_split_config() {
+    } else if let (Some(split), Some(wal_ceiling)) = (
+        server.events_split_config(),
+        server.events_wal_ceiling_policy(),
+    ) {
         if let Some(socket) = split.socket_path.clone() {
             khive_runtime::daemon::track_named_background_task(
                 "events_daemon_supervision",
-                khive_runtime::events_split::supervise_events_daemon(split.db_path.clone(), socket),
+                khive_runtime::events_split::supervise_events_daemon_with_wal_ceiling(
+                    split.db_path.clone(),
+                    socket,
+                    wal_ceiling,
+                ),
             );
         }
     }
@@ -2320,9 +2448,12 @@ pub async fn serve_server(
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
-            start_host_background_tasks(args, server, schedule_rt)
-        })
+        khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
+            server,
+            boot_guard,
+            args.daemon_options(),
+            |server| start_host_background_tasks(args, server, schedule_rt),
+        )
         .await?;
         return Ok(());
     }
@@ -2804,7 +2935,12 @@ fn plan_configured_storage_targets(
                 canonical_backend_path(selected)?,
                 canonical_backend_path(main)?,
             ) {
-                (Some(selected), Some(main)) => selected == main,
+                (Some(selected), Some(main)) => same_database_target(
+                    &selected,
+                    &main,
+                    file_identity(&selected),
+                    file_identity(&main),
+                ),
                 // A force-memory override intentionally creates one distinct
                 // ephemeral backend per configured name; only the literal
                 // main name is the canonical-main target in that mode.
@@ -2818,6 +2954,25 @@ fn plan_configured_storage_targets(
         effective_backends,
         full_topology,
     })
+}
+
+/// Whether two backends resolve to one database file.
+///
+/// Equal canonical paths name the same file by construction, so a file
+/// identity read that disagrees (the file was replaced between the two reads)
+/// never separates them. A matching identity is an additional way to be equal,
+/// joining distinct paths such as hard links.
+fn same_database_target(
+    selected: &std::path::Path,
+    main: &std::path::Path,
+    selected_identity: Option<FileIdentity>,
+    main_identity: Option<FileIdentity>,
+) -> bool {
+    selected == main
+        || matches!(
+            (selected_identity, main_identity),
+            (Some(selected_id), Some(main_id)) if selected_id == main_id
+        )
 }
 
 /// Return the configured backend names a read-only schema check must inspect.
@@ -10748,6 +10903,49 @@ region = "us-east-1"
             vec!["alias".to_string()],
             "forced-memory configured names are distinct ephemeral databases"
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn equal_canonical_paths_stay_one_target_when_identity_reads_differ() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::fs::write(&a, b"").expect("first file");
+        std::fs::write(&b, b"").expect("second file");
+        let a_id = file_identity(&a).expect("first identity");
+        let b_id = file_identity(&b).expect("second identity");
+        assert_ne!(a_id, b_id);
+
+        // The file was replaced between the two identity reads: the paths are
+        // equal, so the identities must not separate them.
+        assert!(same_database_target(&a, &a, Some(a_id), Some(b_id)));
+        // One or both identity reads failed.
+        assert!(same_database_target(&a, &a, Some(a_id), None));
+        assert!(same_database_target(&a, &a, None, Some(a_id)));
+        assert!(same_database_target(&a, &a, None, None));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn matching_identity_joins_distinct_paths_but_a_missing_identity_does_not() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::fs::write(&a, b"").expect("first file");
+        std::fs::write(&b, b"").expect("second file");
+        let a_id = file_identity(&a).expect("first identity");
+        let b_id = file_identity(&b).expect("second identity");
+        assert_ne!(a_id, b_id);
+
+        // Distinct paths with one physical identity (a hard link) are one database.
+        assert!(same_database_target(&a, &b, Some(a_id), Some(a_id)));
+        // Distinct paths with distinct identities are two databases.
+        assert!(!same_database_target(&a, &b, Some(a_id), Some(b_id)));
+        // Distinct paths cannot be joined without both identities.
+        assert!(!same_database_target(&a, &b, Some(a_id), None));
+        assert!(!same_database_target(&a, &b, None, Some(b_id)));
+        assert!(!same_database_target(&a, &b, None, None));
     }
 
     fn memory_main_backend_config() -> KhiveConfig {

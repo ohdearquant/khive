@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
 use khive_runtime::{
-    BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, RuntimeError, SearchHit,
-    SearchSource,
+    BackendId, EdgeEndpointKind, KhiveRuntime, NamespaceToken, NoteSearchHit, Resolved,
+    RuntimeError, SearchHit, SearchSource,
 };
 use khive_score::{rrf_score, DeterministicScore};
 use khive_storage::EdgeRelation;
@@ -19,6 +19,10 @@ use khive_types::{namespace::Namespace, SubstrateKind};
 
 use super::locator::LocatorCache;
 use super::registry::BackendRegistry;
+
+#[cfg(test)]
+#[path = "message_search_scope_tests.rs"]
+mod message_search_scope_tests;
 
 /// Keep arbitrary configured backend identifiers safe and bounded before
 /// they reach persistent coordinator diagnostics.  The raw identifier stays
@@ -56,6 +60,47 @@ fn bounded_backend_id_for_log(backend_id: &str) -> String {
     let prefix_chars = MAX_OUTPUT_CHARS - suffix.chars().count();
     let prefix: String = sanitized.chars().take(prefix_chars).collect();
     format!("{prefix}{suffix}")
+}
+
+fn search_token(
+    runtime: &KhiveRuntime,
+    namespace: &Namespace,
+    visible: &[Namespace],
+    caller: Option<(&NamespaceToken, &serde_json::Value)>,
+    search_notes: bool,
+) -> Result<(NamespaceToken, Option<khive_runtime::MailboxView>), RuntimeError> {
+    // Retain the old primary and per-extra namespace admission checks even
+    // when message partitioning uses the sealed caller's actor.
+    let authorized = runtime.authorize_with_visibility(namespace.clone(), visible.to_vec())?;
+    if let Some((token, args)) = caller {
+        let view = if search_notes {
+            Some(runtime.authorize_mailbox_view(token, "search", None, args)?)
+        } else {
+            None
+        };
+        return Ok((token.clone(), view));
+    }
+    Ok((authorized, None))
+}
+
+async fn scope_note_search_hits(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    view: &khive_runtime::MailboxView,
+    hits: &mut Vec<NoteSearchHit>,
+) -> Result<(), RuntimeError> {
+    if hits.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<_> = hits.iter().map(|hit| hit.note_id).collect();
+    let notes = runtime.notes(token)?.get_notes_batch(&ids).await?;
+    let permitted: std::collections::HashSet<_> = notes
+        .iter()
+        .filter(|note| view.permits_message_note(token, note))
+        .map(|note| note.id)
+        .collect();
+    hits.retain(|hit| permitted.contains(&hit.note_id));
+    Ok(())
 }
 
 /// Bound and mask a backend failure cause before it reaches a warning.  This
@@ -644,9 +689,36 @@ impl SubstrateCoordinator {
         extra_visible: &[Namespace],
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
         let (mut entity_hits, mut note_hits, per_backend) = self
-            .fan_out_search_candidates_with_visibility(request, namespace, extra_visible)
+            .fan_out_search_candidates_with_visibility(request, namespace, extra_visible, None)
             .await;
         self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, namespace)
+            .await;
+        (entity_hits, note_hits, per_backend)
+    }
+
+    /// Coordinated search keeps the sealed actor and read scope from dispatch
+    /// across each backend, rather than using the backend's configured actor.
+    pub async fn fan_out_search_with_token(
+        &self,
+        request: &ValidatedSearchRequest,
+        token: &NamespaceToken,
+        args: &serde_json::Value,
+        extra_visible: &[Namespace],
+    ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
+        if request.substrate() == SearchSubstrate::Entity {
+            return self
+                .fan_out_search_with_visibility(request, token.gate_namespace(), extra_visible)
+                .await;
+        }
+        let (mut entity_hits, mut note_hits, per_backend) = self
+            .fan_out_search_candidates_with_visibility(
+                request,
+                token.namespace(),
+                extra_visible,
+                Some((token, args)),
+            )
+            .await;
+        self.finalize_search_hits(&mut entity_hits, &mut note_hits, request, token.namespace())
             .await;
         (entity_hits, note_hits, per_backend)
     }
@@ -656,6 +728,7 @@ impl SubstrateCoordinator {
         request: &ValidatedSearchRequest,
         namespace: &Namespace,
         extra_visible: &[Namespace],
+        caller: Option<(&NamespaceToken, &serde_json::Value)>,
     ) -> (Vec<SearchHit>, Vec<NoteSearchHit>, Vec<BackendSearchResult>) {
         let search_notes = request.substrate() == SearchSubstrate::Note;
         let requested_substrate = if search_notes {
@@ -696,25 +769,24 @@ impl SubstrateCoordinator {
 
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
-            let token = match runtime
-                .authorize_with_visibility(namespace.clone(), extra_visible.to_vec())
-            {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %bounded_backend_cause_for_log(&e.to_string()),
-                        "fan_out_search: authorization denied for namespace"
-                    );
-                    let backend_result = BackendSearchResult {
-                        backend_id: backend_id.clone(),
-                        hits: vec![],
-                        note_hits: vec![],
-                        error: Some(BackendSearchFailure::from_runtime_error(e)),
-                        vector_error: None,
-                    };
-                    return (vec![], vec![], vec![backend_result]);
-                }
-            };
+            let (token, mailbox) =
+                match search_token(runtime, namespace, extra_visible, caller, search_notes) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %bounded_backend_cause_for_log(&e.to_string()),
+                            "fan_out_search: authorization denied for namespace"
+                        );
+                        let backend_result = BackendSearchResult {
+                            backend_id: backend_id.clone(),
+                            hits: vec![],
+                            note_hits: vec![],
+                            error: Some(BackendSearchFailure::from_runtime_error(e)),
+                            vector_error: None,
+                        };
+                        return (vec![], vec![], vec![backend_result]);
+                    }
+                };
             // MAJ-2 (r2 follow-up): the single-backend early return has no
             // spawned task to bound with the fan-out timeout loop below, so
             // both awaits are wrapped directly in the same
@@ -738,7 +810,7 @@ impl SubstrateCoordinator {
                         .backend()
                         .pool_arc()
                         .record_search_dispatch(backend_id.as_str(), &requested_kind);
-                    runtime
+                    let mut outcome = runtime
                         .search_notes_outcome_with_text_mode(
                             &token,
                             request.query(),
@@ -749,7 +821,11 @@ impl SubstrateCoordinator {
                             props_filter_owned.as_ref(),
                             request.text_mode(),
                         )
-                        .await
+                        .await?;
+                    if let Some(view) = &mailbox {
+                        scope_note_search_hits(runtime, &token, view, &mut outcome.hits).await?;
+                    }
+                    Ok::<_, RuntimeError>(outcome)
                 };
                 let search_fut =
                     khive_storage::scope_request_read_deadline_at(request_deadline, search_fut);
@@ -890,6 +966,7 @@ impl SubstrateCoordinator {
         let query = request.query().to_string();
         let ns = namespace.clone();
         let extra_visible_owned = extra_visible.to_vec();
+        let caller_owned = caller.map(|(token, args)| (token.clone(), args.clone()));
 
         #[cfg(test)]
         let fail_id: Option<String> = self.fail_backend_id.clone();
@@ -920,6 +997,7 @@ impl SubstrateCoordinator {
             let tg = tags_owned.clone();
             let sl = search_limit;
             let text_mode = request.text_mode();
+            let caller = caller_owned.clone();
             let should_fail = fail_id
                 .as_deref()
                 .map(|id| id == backend_id.as_str())
@@ -971,14 +1049,23 @@ impl SubstrateCoordinator {
                         None,
                     );
                 }
-                if search_notes {
-                    if let Some(hits) = note_override {
-                        return (backend_id, Ok(vec![]), Some(hits), None);
+                if search_notes && caller.is_none() {
+                    if let Some(hits) = note_override.as_ref() {
+                        return (backend_id, Ok(vec![]), Some(hits.clone()), None);
                     }
-                } else if let Some(hits) = entity_override {
-                    return (backend_id, Ok(hits), None, None);
                 }
-                let token = match runtime.authorize_with_visibility(ns, extra_visible_task) {
+                if !search_notes {
+                    if let Some(hits) = entity_override {
+                        return (backend_id, Ok(hits), None, None);
+                    }
+                }
+                let (token, mailbox) = match search_token(
+                    &runtime,
+                    &ns,
+                    &extra_visible_task,
+                    caller.as_ref().map(|(token, args)| (token, args)),
+                    search_notes,
+                ) {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!(
@@ -988,6 +1075,18 @@ impl SubstrateCoordinator {
                         return (backend_id, Err(e), None, None);
                     }
                 };
+                if search_notes {
+                    if let Some(mut hits) = note_override {
+                        if let Some(view) = &mailbox {
+                            if let Err(error) =
+                                scope_note_search_hits(&runtime, &token, view, &mut hits).await
+                            {
+                                return (backend_id, Err(error), None, None);
+                            }
+                        }
+                        return (backend_id, Ok(vec![]), Some(hits), None);
+                    }
+                }
                 runtime
                     .backend()
                     .pool_arc()
@@ -1012,12 +1111,26 @@ impl SubstrateCoordinator {
                         // rank a hit that only places #2+ on any single backend.
                         // Finalization applies the floor and requested order
                         // before imposing the caller's limit.
-                        Ok(outcome) => (
-                            backend_id,
-                            Ok(vec![]),
-                            Some(outcome.hits),
-                            outcome.vector_error,
-                        ),
+                        Ok(mut outcome) => {
+                            if let Some(view) = &mailbox {
+                                if let Err(error) = scope_note_search_hits(
+                                    &runtime,
+                                    &token,
+                                    view,
+                                    &mut outcome.hits,
+                                )
+                                .await
+                                {
+                                    return (backend_id, Err(error), None, None);
+                                }
+                            }
+                            (
+                                backend_id,
+                                Ok(vec![]),
+                                Some(outcome.hits),
+                                outcome.vector_error,
+                            )
+                        }
                         Err(e) => (backend_id, Err(e), None, None),
                     }
                 } else {

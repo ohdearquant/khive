@@ -1174,6 +1174,17 @@ impl KhiveRuntime {
         ))
     }
 
+    /// The event sidecar inherits the already-open MAIN pool's WAL policy.
+    /// A secondary pack's config or pool does not govern this shared file.
+    fn events_wal_ceiling_policy(&self) -> khive_db::WalCeilingPolicy {
+        self.core_backend
+            .as_ref()
+            .unwrap_or(&self.backend)
+            .pool()
+            .config()
+            .wal_ceiling
+    }
+
     /// Build the undecorated event store used only by the registry's trusted
     /// audit composer, which stamps from each resolved `GateRequest` before
     /// enqueueing. Pack/runtime call sites must use [`Self::events`] instead.
@@ -1200,11 +1211,13 @@ impl KhiveRuntime {
                     if !split.db_path.exists() {
                         return Ok(legacy);
                     }
-                    let lane_backend = crate::events_split::direct_backend_with_max_readers(
-                        &split.db_path,
-                        true,
-                        Some(self.backend.pool().config().max_readers),
-                    )?;
+                    let lane_backend =
+                        crate::events_split::direct_backend_with_max_readers_and_wal_ceiling(
+                            &split.db_path,
+                            true,
+                            Some(self.backend.pool().config().max_readers),
+                            self.events_wal_ceiling_policy(),
+                        )?;
                     self.register_late_diagnostic_pool("events", &lane_backend.pool_arc());
                     let lane = lane_backend.events_for_namespace(namespace)?;
                     return Ok(Arc::new(crate::events_split::SplitEventStore::new(
@@ -1228,11 +1241,13 @@ impl KhiveRuntime {
                         ));
                     }
                     None => {
-                        let lane_backend = crate::events_split::direct_backend_with_max_readers(
-                            &split.db_path,
-                            false,
-                            Some(self.backend.pool().config().max_readers),
-                        )?;
+                        let lane_backend =
+                            crate::events_split::direct_backend_with_max_readers_and_wal_ceiling(
+                                &split.db_path,
+                                false,
+                                Some(self.backend.pool().config().max_readers),
+                                self.events_wal_ceiling_policy(),
+                            )?;
                         self.register_late_diagnostic_pool("events", &lane_backend.pool_arc());
                         lane_backend.events_for_namespace(namespace)?
                     }
@@ -1274,16 +1289,18 @@ impl KhiveRuntime {
                     return Ok(None);
                 }
                 let backend = if self.backend.is_read_only() {
-                    crate::events_split::direct_backend_with_max_readers(
+                    crate::events_split::direct_backend_with_max_readers_and_wal_ceiling(
                         &split.db_path,
                         true,
                         Some(self.backend.pool().config().max_readers),
+                        self.events_wal_ceiling_policy(),
                     )?
                 } else {
-                    crate::events_split::direct_backend_with_max_readers(
+                    crate::events_split::direct_backend_with_max_readers_and_wal_ceiling(
                         &split.db_path,
                         false,
                         Some(self.backend.pool().config().max_readers),
+                        self.events_wal_ceiling_policy(),
                     )?
                 };
                 self.register_late_diagnostic_pool("events", &backend.pool_arc());

@@ -15845,6 +15845,7 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
         "standalone_reader_opens",
         "infrastructure_standalone_reader_opens",
         "reader_checkout_timeouts",
+        "reader_busy_timeouts",
         "active_pooled_reader_checkouts",
         "peak_active_pooled_reader_checkouts",
         "completed_pooled_reader_checkouts",

@@ -638,8 +638,8 @@ impl AnnBridge {
             l2_normalize(row);
         }
         let cfg = VamanaConfig::with_dimensions(dim);
-        let index =
-            VamanaIndex::build(&vectors, cfg).map_err(|e| RuntimeError::Internal(e.to_string()))?;
+        let index = VamanaIndex::build_owned(vectors, cfg)
+            .map_err(|e| RuntimeError::Internal(e.to_string()))?;
         Ok(Self {
             index,
             id_map,
@@ -4336,6 +4336,10 @@ async fn classify_and_adopt_segment(
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "ann_owned_build_tests.rs"]
+mod owned_build_tests;
 
 #[cfg(test)]
 mod tests {

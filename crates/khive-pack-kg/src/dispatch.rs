@@ -210,9 +210,9 @@ impl PackRuntime for KgPack {
             }
             // Pure graph verbs: always use graph namespace.
             "link" => self.handle_link(graph_token, params, registry).await,
-            "neighbors" => self.handle_neighbors(graph_token, params).await,
+            "neighbors" => self.handle_neighbors(graph_token, params, registry).await,
             "traverse" => self.handle_traverse(graph_token, params).await,
-            "context" => self.handle_context(graph_token, params).await,
+            "context" => self.handle_context(graph_token, params, registry).await,
             "query" => self.handle_query(graph_token, params).await,
             "propose" => self.handle_propose(graph_token, params, registry).await,
             "review" => self.handle_review(graph_token, params, registry).await,
