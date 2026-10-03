@@ -2171,7 +2171,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 // Keep one namespace bind plus the ID binds comfortably below SQLite's
 // portable 999-variable ceiling.
-const HYDRATION_ID_CHUNK: usize = 900;
+pub(super) const HYDRATION_ID_CHUNK: usize = 900;
 
 /// Build the atom hydration statement for one id chunk.
 ///
