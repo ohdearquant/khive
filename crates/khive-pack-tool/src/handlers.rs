@@ -16,7 +16,9 @@ use khive_storage::{
 use khive_types::pack::pack_registry_tag;
 use khive_types::{EdgeRelation, VerbCategory, Visibility};
 
-use crate::policy::{self, actor_label, now_micros, Decision, DecisionCaller, DecisionInvocation};
+use crate::policy::{
+    self, actor_label, now_micros, opt_u32, Decision, DecisionCaller, DecisionInvocation,
+};
 use crate::vocab::{
     CAPABILITY_TAG, DECISIONS, KINDS, REGISTRY_ENTITY_KIND, REGISTRY_TAG, SIDE_EFFECTS,
     TRUST_ORIGINS,
@@ -52,18 +54,6 @@ fn opt_str(params: &Value, key: &str) -> Result<Option<String>, RuntimeError> {
 
 fn req_str(params: &Value, key: &str) -> Result<String, RuntimeError> {
     opt_str(params, key)?.ok_or_else(|| RuntimeError::InvalidInput(format!("{key} is required")))
-}
-
-fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
-    match params.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(v) => v
-            .as_u64()
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
-            }),
-    }
 }
 
 fn opt_i64(params: &Value, key: &str) -> Result<Option<i64>, RuntimeError> {
@@ -1113,6 +1103,10 @@ pub(crate) async fn policies(
         "policies": rows.iter().map(|p| p.to_json()).collect::<Vec<_>>(),
     }))
 }
+
+#[cfg(test)]
+#[path = "parameter_helpers_tests.rs"]
+mod parameter_helpers_tests;
 
 #[cfg(test)]
 #[path = "claim_tests.rs"]
