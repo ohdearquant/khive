@@ -310,6 +310,103 @@ fn fresh_standalone_connection_excludes_setup_statements() {
 }
 
 #[test]
+fn pooled_writer_records_only_the_known_statement() {
+    // The pool's own writer is installed while the pool opens, before any
+    // observation can exist, so no guard can span its setup statements. This
+    // pins that the install happened and that the pool adds no SQL of its own.
+    for (wal, file) in [(true, true), (false, true), (false, false)] {
+        let (_dir, pool) = fixture(wal, file, false);
+        let observation = pool.observe_test_statement_starts(256).unwrap();
+        let sql = "SELECT 281 AS pooled_writer_statement";
+        {
+            let writer = pool.writer().unwrap();
+            assert_eq!(
+                writer
+                    .conn()
+                    .query_row(sql, [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                281
+            );
+        }
+        assert_eq!(
+            observation.started_statements().unwrap(),
+            vec![StartedStatement {
+                sql: sql.to_owned(),
+                readonly: true,
+            }],
+            "only the known statement is observed on the pool writer"
+        );
+    }
+}
+
+#[test]
+fn initial_and_replacement_pooled_readers_exclude_setup_statements() {
+    // Pooled readers exist only when WAL is available. The replacement is
+    // opened while the observation is active, so its setup SQL would show.
+    let (_dir, pool) = fixture(true, true, false);
+    let observation = pool.observe_test_statement_starts(256).unwrap();
+    let initial_sql = "SELECT 282 AS initial_pooled_reader_statement";
+    let replacement_sql = "SELECT 283 AS replacement_pooled_reader_statement";
+    {
+        let reader = pool.reader().unwrap();
+        assert_eq!(
+            reader
+                .conn()
+                .query_row(initial_sql, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            282
+        );
+        reader.discard();
+    }
+    let reader = pool.reader().unwrap();
+    assert_eq!(
+        reader
+            .conn()
+            .query_row(replacement_sql, [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        283
+    );
+    assert_eq!(
+        observation.started_statements().unwrap(),
+        vec![
+            StartedStatement {
+                sql: initial_sql.to_owned(),
+                readonly: true,
+            },
+            StartedStatement {
+                sql: replacement_sql.to_owned(),
+                readonly: true,
+            },
+        ],
+        "only the known statements are observed, with no replacement setup SQL"
+    );
+}
+
+#[test]
+fn fresh_standalone_writer_excludes_setup_statements() {
+    for wal in [true, false] {
+        let (_dir, pool) = fixture(wal, true, false);
+        let observation = pool.observe_test_statement_starts(256).unwrap();
+        let writer = pool.open_standalone_writer_untracked().unwrap();
+        let sql = "SELECT 284 AS fresh_standalone_writer_statement";
+        assert_eq!(
+            writer
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            284
+        );
+        assert_eq!(
+            observation.started_statements().unwrap(),
+            vec![StartedStatement {
+                sql: sql.to_owned(),
+                readonly: true,
+            }],
+            "only the known statement is observed, with no connection setup SQL"
+        );
+    }
+}
+
+#[test]
 fn observation_off_is_zero_and_unwind_releases_the_guard() {
     let (_dir, pool) = fixture(false, false, false);
     let observation = pool.observe_test_statement_starts(128).unwrap();
