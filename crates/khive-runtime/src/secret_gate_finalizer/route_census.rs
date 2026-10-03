@@ -15,8 +15,9 @@ use syn::{
 };
 
 use super::declaration::{
-    Acceptance, Reservation, RouteInventoryEntry, Substrate, TransactionOwner, WriteClass,
-    PINNED_MISSING_ACCEPTANCE, ROUTE_INVENTORY,
+    Acceptance, Reservation, RouteInventoryEntry, RuntimeTableWriteInventoryEntry, Substrate,
+    TransactionOwner, WriteClass, PINNED_MISSING_ACCEPTANCE, ROUTE_INVENTORY,
+    RUNTIME_TABLE_WRITE_INVENTORY,
 };
 
 const STORE_WRITES: &[&str] = &[
@@ -140,8 +141,23 @@ struct Site {
     target: Substrate,
     route_class: RouteClass,
     class: DetectedClass,
+    write_count: usize,
     calls: BTreeSet<String>,
     evidence: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeTableSite {
+    key: String,
+    write_count: usize,
+    calls: BTreeSet<String>,
+    evidence: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+struct SourcePopulation {
+    properties: Vec<Site>,
+    runtime_tables: Vec<RuntimeTableSite>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +168,7 @@ struct SqlConstantReference {
 
 struct ScannedSource {
     sites: Vec<Site>,
+    runtime_tables: Vec<RuntimeTableSite>,
     /// Every expression path has an ordinal, whether or not it resolves. Both
     /// passes visit the same AST, so a sibling reference cannot stand in for it.
     constant_references: BTreeMap<usize, SqlConstantReference>,
@@ -259,11 +276,11 @@ fn entity_first(targets: &[Substrate]) -> Option<Substrate> {
 }
 
 /// Read every insert, replace and update statement in a literal that targets a
-/// guarded table. The first value is the substrate of a statement the census
-/// classifies as a route. The second is the substrate of a statement that
+/// guarded table. The first collection contains one substrate per classified
+/// write occurrence. The second contains one substrate per occurrence that
 /// names a guarded table in a spelling the census cannot read: the census must
 /// refuse it, because a write it cannot classify is a route it cannot inventory.
-fn sql_write_shapes(literal: &str) -> (Option<Substrate>, Option<Substrate>) {
+fn sql_write_occurrences(literal: &str) -> (Vec<Substrate>, Vec<Substrate>) {
     // Match SQL tokens rather than keeping SQL-shaped matcher literals in this
     // census: other source censuses must not mistake those for writer sites.
     // Comments are not SQL, so they are dropped before the words are read, and
@@ -282,6 +299,10 @@ fn sql_write_shapes(literal: &str) -> (Option<Substrate>, Option<Substrate>) {
     let mut routes = Vec::new();
     let mut unclassified = Vec::new();
     for (index, word) in words.iter().enumerate() {
+        // INSERT OR REPLACE is one write, not an INSERT plus a REPLACE.
+        if *word == "REPLACE" && index > 0 && words[index - 1] == "OR" {
+            continue;
+        }
         let mut at = index + 1;
         match *word {
             // REPLACE only starts a statement when INTO follows it.
@@ -345,6 +366,11 @@ fn sql_write_shapes(literal: &str) -> (Option<Substrate>, Option<Substrate>) {
             _ => {}
         }
     }
+    (routes, unclassified)
+}
+
+fn sql_write_shapes(literal: &str) -> (Option<Substrate>, Option<Substrate>) {
+    let (routes, unclassified) = sql_write_occurrences(literal);
     (entity_first(&routes), entity_first(&unclassified))
 }
 
@@ -354,6 +380,92 @@ fn sql_target(literal: &str) -> Option<Substrate> {
 
 fn sql_unclassified_write(literal: &str) -> Option<Substrate> {
     sql_write_shapes(literal).1
+}
+
+/// Count table-position placeholders without resolving their runtime values.
+fn runtime_table_write_count(literal: &str) -> usize {
+    let mut count = 0;
+    for statement in sql_statements(literal) {
+        // The flag distinguishes SQL words from quoted text and placeholders,
+        // so an UPDATE inside a value string is not a statement keyword.
+        let mut tokens: Vec<(String, bool)> = Vec::new();
+        let mut chars = statement.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch.is_whitespace() {
+                continue;
+            }
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                let mut word = String::from(ch);
+                while chars
+                    .peek()
+                    .is_some_and(|next| next.is_ascii_alphanumeric() || *next == '_')
+                {
+                    word.push(chars.next().expect("peeked word"));
+                }
+                tokens.push((word.to_ascii_uppercase(), true));
+            } else if matches!(ch, '\'' | '"' | '`' | '[' | '{') {
+                let closing = match ch {
+                    '[' => ']',
+                    '{' => '}',
+                    _ => ch,
+                };
+                let mut value = String::from(ch);
+                while let Some(next) = chars.next() {
+                    value.push(next);
+                    if next == closing {
+                        if ch != '{' && chars.peek() == Some(&closing) {
+                            value.push(chars.next().expect("peeked escaped quote"));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                tokens.push((value, false));
+            } else {
+                tokens.push((ch.to_string(), false));
+            }
+        }
+        let word_at = |at: usize, word: &str| {
+            tokens
+                .get(at)
+                .is_some_and(|(actual, is_word)| *is_word && actual == word)
+        };
+        let placeholder_at = |at: usize| {
+            tokens
+                .get(at)
+                .is_some_and(|(token, _)| token.contains('{') && token.contains('}'))
+                || (tokens.get(at + 1).is_some_and(|(token, _)| token == ".")
+                    && tokens
+                        .get(at + 2)
+                        .is_some_and(|(token, _)| token.contains('{') && token.contains('}')))
+        };
+        for at in 0..tokens.len() {
+            let insert = word_at(at, "INSERT");
+            let replace = word_at(at, "REPLACE") && (at == 0 || !word_at(at - 1, "OR"));
+            let update = word_at(at, "UPDATE");
+            if !insert && !replace && !update {
+                continue;
+            }
+            let mut target = at + 1;
+            if (insert || update) && word_at(target, "OR") {
+                target += 2;
+            }
+            if insert || replace {
+                if !word_at(target, "INTO") {
+                    continue;
+                }
+                target += 1;
+            } else if !(target..tokens.len()).any(|index| word_at(index, "SET")) {
+                // A display string such as "timing fixture update {id}" is
+                // not an UPDATE statement without its SET clause.
+                continue;
+            }
+            if placeholder_at(target) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1012,6 +1124,7 @@ struct SourceCollector<'modules> {
     path: String,
     scope: Vec<String>,
     sites: BTreeMap<String, Site>,
+    runtime_tables: BTreeMap<String, RuntimeTableSite>,
     all_calls: BTreeMap<String, BTreeSet<String>>,
     bindings: Vec<SqlBindings>,
     parent_module_bindings: Vec<SqlBindings>,
@@ -1036,9 +1149,18 @@ impl<'modules> SourceCollector<'modules> {
         if let Some(site) = self.sites.get_mut(&key) {
             site.calls.insert(function.to_owned());
         }
+        if let Some(site) = self.runtime_tables.get_mut(&key) {
+            site.calls.insert(function.to_owned());
+        }
     }
 
-    fn record(&mut self, target: Substrate, class: DetectedClass, evidence: String) {
+    fn record(
+        &mut self,
+        target: Substrate,
+        class: DetectedClass,
+        evidence: String,
+        write_count: usize,
+    ) {
         let key = self.key();
         let calls = self.all_calls.get(&key).cloned().unwrap_or_default();
         let site = self.sites.entry(key.clone()).or_insert_with(|| Site {
@@ -1046,9 +1168,11 @@ impl<'modules> SourceCollector<'modules> {
             target,
             route_class: RouteClass::Application,
             class: class.clone(),
+            write_count: 0,
             calls,
             evidence: BTreeSet::new(),
         });
+        site.write_count += write_count;
         // A single function that writes both substrates cannot be described
         // by the current target enum. Keep both observations visible rather
         // than silently selecting the first one.
@@ -1078,23 +1202,50 @@ impl<'modules> SourceCollector<'modules> {
             .cloned()
     }
 
-    fn record_sql(&mut self, literal: &str) {
+    fn record_sql(&mut self, literal: &str, observed: (usize, usize)) -> (usize, usize) {
         if self.path.starts_with("khive-db/") {
-            return;
+            return (0, 0);
         }
-        if let Some(target) = sql_target(literal) {
+        let (routes, unclassified) = sql_write_occurrences(literal);
+        let counts = (
+            routes.len() + unclassified.len(),
+            runtime_table_write_count(literal),
+        );
+        let mut already_observed = observed.0;
+        if let Some(target) = entity_first(&routes) {
             let class = sql_fixed_key_paths(literal)
                 .map(detected_key_class)
                 .unwrap_or(DetectedClass::WholeObject);
-            self.record(target, class, "SQL literal".into());
+            let additional = routes.len().saturating_sub(already_observed);
+            already_observed = already_observed.saturating_sub(routes.len());
+            self.record(target, class, "SQL literal".into(), additional);
         }
-        if let Some(target) = sql_unclassified_write(literal) {
+        if let Some(target) = entity_first(&unclassified) {
+            let additional = unclassified.len().saturating_sub(already_observed);
             self.record(
                 target,
                 DetectedClass::WholeObject,
                 format!("{UNCLASSIFIED_SQL} {literal:?}"),
+                additional,
             );
         }
+        if counts.1 > 0 {
+            let key = self.key();
+            let calls = self.all_calls.get(&key).cloned().unwrap_or_default();
+            let site = self
+                .runtime_tables
+                .entry(key.clone())
+                .or_insert_with(|| RuntimeTableSite {
+                    key,
+                    write_count: 0,
+                    calls,
+                    evidence: BTreeSet::new(),
+                });
+            site.write_count += counts.1.saturating_sub(observed.1);
+            site.evidence
+                .insert(format!("runtime-table SQL {literal:?}"));
+        }
+        counts
     }
 }
 
@@ -1243,7 +1394,7 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
             } else {
                 Substrate::Note
             };
-            self.record(target, class, format!("store.{name}"));
+            self.record(target, class, format!("store.{name}"), 1);
         }
         self.call(&name);
         syn::visit::visit_expr_method_call(self, expr);
@@ -1273,7 +1424,7 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
                         } else {
                             DetectedClass::WholeObject
                         };
-                        self.record(target, class, format!("builder.{name}"));
+                        self.record(target, class, format!("builder.{name}"), 1);
                     }
                 }
                 self.call(&name);
@@ -1344,6 +1495,7 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
                         Substrate::Note,
                         DetectedClass::WholeObject,
                         format!("{SQL_CONSTANT_EVIDENCE}{constant}"),
+                        1,
                     );
                 }
             }
@@ -1353,28 +1505,33 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
 
     fn visit_expr_lit(&mut self, expr: &'ast ExprLit) {
         if let Lit::Str(value) = &expr.lit {
-            self.record_sql(&value.value());
+            self.record_sql(&value.value(), (0, 0));
         }
         syn::visit::visit_expr_lit(self, expr);
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
-        let mut parts = Vec::new();
-        macro_strings(mac.tokens.clone(), &mut parts);
-        for part in &parts {
-            self.record_sql(part);
-        }
-        if mac.path.is_ident("format") || mac.path.is_ident("concat") {
-            self.record_sql(&parts.concat());
-        }
-        // syn visits a macro's path, not its token body. The atomic planners
-        // build PlanStatements inside vec!, so parse that standard expression
-        // syntax and visit its calls rather than silently orphaning routes.
+        // Visit vec! through its parsed expressions once. A preceding token
+        // literal pass would count the same SQL literal a second time.
         if mac.path.is_ident("vec") {
             let tokens = &mac.tokens;
             let expression = syn::parse2::<Expr>(quote::quote!([#tokens]))
                 .unwrap_or_else(|error| panic!("{}: invalid vec! body: {error}", self.key()));
             <Self as Visit<'_>>::visit_expr(self, &expression);
+        } else {
+            let mut parts = Vec::new();
+            macro_strings(mac.tokens.clone(), &mut parts);
+            let mut observed = (0, 0);
+            for part in &parts {
+                let counts = self.record_sql(part, (0, 0));
+                observed.0 += counts.0;
+                observed.1 += counts.1;
+            }
+            if mac.path.is_ident("format") || mac.path.is_ident("concat") {
+                // Preserve joined-string detection, including split writes,
+                // without counting its already observed literals twice.
+                self.record_sql(&parts.concat(), observed);
+            }
         }
         syn::visit::visit_macro(self, mac);
     }
@@ -1465,6 +1622,7 @@ fn scan_source(
         path: path.to_owned(),
         scope: Vec::new(),
         sites: BTreeMap::new(),
+        runtime_tables: BTreeMap::new(),
         all_calls: BTreeMap::new(),
         bindings: vec![bindings],
         parent_module_bindings: parents,
@@ -1477,6 +1635,7 @@ fn scan_source(
     collector.visit_file(&file);
     Ok(ScannedSource {
         sites: collector.sites.into_values().collect(),
+        runtime_tables: collector.runtime_tables.into_values().collect(),
         constant_references: collector.constant_references,
     })
 }
@@ -1574,6 +1733,7 @@ fn scan_migration_sources(sources: &[(String, String)]) -> Vec<Site> {
                     target,
                     route_class: RouteClass::Migration,
                     class: DetectedClass::WholeObject,
+                    write_count: 1,
                     calls: BTreeSet::new(),
                     evidence,
                 });
@@ -1939,7 +2099,7 @@ fn index_module_bindings(
     Ok((modules, traversal.file_modules))
 }
 
-fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
+fn scan_source_population(sources: &[(String, String)]) -> Result<SourcePopulation, String> {
     let (skipped, roots) = test_module_files(sources).map_err(|error| error.to_string())?;
     // The census resolves every path twice. The strict resolution stops at a
     // name that it cannot classify as a module, and the lenient one looks past
@@ -1948,6 +2108,7 @@ fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
     // type, so the census refuses it instead of choosing.
     let mut strict = BTreeMap::new();
     let mut strict_references = BTreeMap::new();
+    let mut runtime_tables = BTreeMap::new();
     let mut lenient = Vec::new();
     for is_strict in [true, false] {
         let (modules, file_modules) = index_module_bindings(sources, &skipped, &roots, is_strict)?;
@@ -1962,6 +2123,12 @@ fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
             let scanned = scan_source(path, source, module_id, &modules, is_strict)
                 .map_err(|error| format!("{path}: {error}"))?;
             if is_strict {
+                runtime_tables.extend(
+                    scanned
+                        .runtime_tables
+                        .into_iter()
+                        .map(|site| (site.key.clone(), site)),
+                );
                 strict.extend(
                     scanned
                         .sites
@@ -2002,8 +2169,124 @@ fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
                 .insert(format!("{UNRESOLVED_CONSTANT} {}", reference.constant));
         }
     }
-    // A map keyed by the site key is already in key order.
-    Ok(strict.into_values().collect())
+    // Maps keyed by the site key are already in key order.
+    Ok(SourcePopulation {
+        properties: strict.into_values().collect(),
+        runtime_tables: runtime_tables.into_values().collect(),
+    })
+}
+
+fn runtime_table_routes(
+    population: &SourcePopulation,
+    inventory: &[RouteInventoryEntry],
+    runtime_inventory: &[RuntimeTableWriteInventoryEntry],
+    require_all: bool,
+) -> Result<Vec<Site>, String> {
+    let mut failures = Vec::new();
+    let mut declarations = BTreeMap::new();
+    for row in runtime_inventory {
+        if declarations.insert(row.site, row).is_some() {
+            failures.push(format!("duplicate runtime-table write site {}", row.site));
+        }
+        if row.expected_writes == 0 {
+            failures.push(format!(
+                "{}: runtime-table expected write count must be nonzero",
+                row.site
+            ));
+        }
+        if let Some(id) = row.properties_route {
+            if !inventory
+                .iter()
+                .any(|route| route.id == id && route.site == row.site)
+            {
+                failures.push(format!(
+                    "{}: runtime-table properties route {id} is absent or names another site",
+                    row.site
+                ));
+            }
+        }
+    }
+    let mut properties = population
+        .properties
+        .iter()
+        .cloned()
+        .map(|site| (site.key.clone(), site))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    for site in &population.runtime_tables {
+        seen.insert(site.key.as_str());
+        let Some(row) = declarations.get(site.key.as_str()) else {
+            failures.push(format!(
+                "unmapped runtime-table write {}: {:?}",
+                site.key, site.evidence
+            ));
+            continue;
+        };
+        if site.write_count != row.expected_writes {
+            failures.push(format!(
+                "{}: runtime-table write count {} differs from declared {}",
+                site.key, site.write_count, row.expected_writes
+            ));
+        }
+        if let Some(id) = row.properties_route {
+            let Some(route) = inventory
+                .iter()
+                .find(|route| route.id == id && route.site == row.site)
+            else {
+                continue;
+            };
+            let combined = properties.entry(site.key.clone()).or_insert_with(|| Site {
+                key: site.key.clone(),
+                target: route.target,
+                route_class: RouteClass::Application,
+                class: DetectedClass::WholeObject,
+                write_count: 0,
+                calls: BTreeSet::new(),
+                evidence: BTreeSet::new(),
+            });
+            if combined.target != route.target {
+                combined
+                    .evidence
+                    .insert("MIXED_ENTITY_AND_NOTE_TARGETS".into());
+            }
+            combined.class = DetectedClass::WholeObject;
+            combined.write_count += site.write_count;
+            combined.calls.extend(site.calls.iter().cloned());
+            combined.evidence.extend(site.evidence.iter().cloned());
+        }
+    }
+    if require_all {
+        for row in runtime_inventory {
+            if !seen.contains(row.site) {
+                failures.push(format!("orphan runtime-table write at {}", row.site));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(properties.into_values().collect())
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
+fn scan_sources(sources: &[(String, String)]) -> Result<Vec<Site>, String> {
+    let population = scan_source_population(sources)?;
+    runtime_table_routes(
+        &population,
+        ROUTE_INVENTORY,
+        RUNTIME_TABLE_WRITE_INVENTORY,
+        false,
+    )
+}
+
+fn check_population(
+    population: &SourcePopulation,
+    inventory: &[RouteInventoryEntry],
+    runtime_inventory: &[RuntimeTableWriteInventoryEntry],
+    pinned_missing: usize,
+) -> Result<(), String> {
+    let sites = runtime_table_routes(population, inventory, runtime_inventory, true)?;
+    check_inventory(&sites, inventory, pinned_missing)
 }
 
 fn check_inventory(
@@ -2020,6 +2303,12 @@ fn check_inventory(
         }
         if rows.insert(row.site, row).is_some() {
             failures.push(format!("duplicate route site {}", row.site));
+        }
+        if row.expected_writes == 0 {
+            failures.push(format!(
+                "{}: expected write count must be nonzero",
+                row.site
+            ));
         }
     }
     let mut seen = BTreeSet::new();
@@ -2049,6 +2338,12 @@ fn check_inventory(
             failures.push(format!("unmapped {}: {:?}", site.key, site.evidence));
             continue;
         };
+        if site.write_count != row.expected_writes {
+            failures.push(format!(
+                "{}: write count {} differs from declared {}",
+                site.key, site.write_count, row.expected_writes
+            ));
+        }
         if site.evidence.contains("MIXED_ENTITY_AND_NOTE_TARGETS") || site.target != row.target {
             failures.push(format!(
                 "{}: target does not describe every write",
@@ -2274,21 +2569,42 @@ fn live_migration_sources() -> Vec<(String, String)> {
     sources
 }
 
+#[cfg(test)]
+#[path = "route_census_occurrence_tests.rs"]
+mod route_census_occurrence_tests;
+
+#[cfg(test)]
+#[path = "route_census_declaration_tests.rs"]
+mod route_census_declaration_tests;
+
 #[test]
 fn source_census_matches_closed_route_inventory() {
     let sources = live_workspace_sources();
     check_store_trait_methods(&sources).expect("store method surface drifted");
-    let mut sites = scan_sources(&sources).expect("parse workspace sources");
-    sites.extend(scan_migration_sources(&live_migration_sources()));
-    sites.sort_by(|a, b| a.key.cmp(&b.key));
-    for site in &sites {
+    let mut population = scan_source_population(&sources).expect("parse workspace sources");
+    population
+        .properties
+        .extend(scan_migration_sources(&live_migration_sources()));
+    population.properties.sort_by(|a, b| a.key.cmp(&b.key));
+    for site in &population.properties {
         eprintln!(
-            "ROUTE SITE | {} | {:?} | {:?} | {:?}",
-            site.key, site.target, site.class, site.evidence
+            "ROUTE SITE | {} | count={} | {:?} | {:?} | {:?}",
+            site.key, site.write_count, site.target, site.class, site.evidence
         );
     }
-    check_inventory(&sites, ROUTE_INVENTORY, PINNED_MISSING_ACCEPTANCE)
-        .unwrap_or_else(|failure| panic!("ADR-115 route census failed:\n{failure}"));
+    for site in &population.runtime_tables {
+        eprintln!(
+            "RUNTIME TABLE SITE | {} | count={} | {:?}",
+            site.key, site.write_count, site.evidence
+        );
+    }
+    check_population(
+        &population,
+        ROUTE_INVENTORY,
+        RUNTIME_TABLE_WRITE_INVENTORY,
+        PINNED_MISSING_ACCEPTANCE,
+    )
+    .unwrap_or_else(|failure| panic!("ADR-115 route census failed:\n{failure}"));
 }
 
 #[test]
@@ -2806,7 +3122,11 @@ fn each_note_sql_reference_requires_its_own_resolution() {
             "fn write(conn: &Connection) {{ reject_reserved_secret_gate_property(merged_props); {resolved} {resolved} }}"
         );
         let sites = scan_sources(&module_path_sources(&writer, &extra_refs)).unwrap();
-        assert!(check_inventory(&sites, &[route], 0).is_ok());
+        let both = RouteInventoryEntry {
+            expected_writes: 2,
+            ..route
+        };
+        assert!(check_inventory(&sites, &[both], 0).is_ok());
     }
 }
 
@@ -3240,7 +3560,11 @@ fn fixed_key_sql_routes_require_the_complete_literal_key_set() {
     let source = "fn write() { let first = \"UPDATE notes SET properties = json_set(properties, '$.channel_slug', ?1) WHERE id = ?2\"; let second = \"UPDATE notes SET properties = json_remove(properties, '$.quarantine_content_ref') WHERE id = ?2\"; }";
     let combined = scan_sources(&[("sample/src/lib.rs".into(), source.into())]).unwrap();
     assert_eq!(combined[0].class, DetectedClass::FixedKeySet(expected));
-    assert!(check_inventory(&combined, &[route], 0).is_ok());
+    let both = RouteInventoryEntry {
+        expected_writes: 2,
+        ..route
+    };
+    assert!(check_inventory(&combined, &[both], 0).is_ok());
 }
 
 #[test]
