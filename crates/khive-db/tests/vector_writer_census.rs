@@ -46,7 +46,7 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
         "khive-db/src/stores/vectors.rs",
         "orphan_sweep_dml",
         "DELETE",
-        "{t}",
+        "{table}",
         1,
     ),
     (
