@@ -1059,7 +1059,7 @@ Refs: #3322.
 
 ## Amendment (proposed): comm message file attachments (2026-10-02)
 
-**Status**: proposed. Acceptance is required before dependent implementation merges.
+**Status**: accepted (2026-10-02, ratified by the maintainer).
 
 The requirement is "file bytes never enter a tool result", with files moved on a local server by
 `blob.import(path)` and `blob.export(content_ref, path)` and on a remote MCP surface by "refs plus
