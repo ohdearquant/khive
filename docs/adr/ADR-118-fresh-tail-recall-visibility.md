@@ -160,6 +160,7 @@ one re-sorted list means quantization bias can systematically misorder fresh-vs-
 near ties. This is bounded and accepted; if it shows up in practice, the remedy is
 full-precision re-scoring of the ANN candidates within the merge window — explicitly a
 scoring refinement inside the leg, never a fusion change.
+Equal scores are ordered by ascending id: [ADR-079 Amendment 4, item 6](ADR-079-ann-persistence-warm-path-integration.md#amendment-4-2026-10-03-contract-for-a-shared-ann-lifecycle-host).
 
 ### 3. Cost shape and the no-index case
 
