@@ -135,6 +135,7 @@ pub use error_projection::runtime_error_value;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
+pub use kg_read::KgNeighborRead;
 pub use khive_db::{
     checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig,
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,

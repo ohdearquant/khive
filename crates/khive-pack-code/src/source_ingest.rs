@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::hash::Hash;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -645,11 +646,24 @@ fn declared_project_import_target_and_scope(
     }
     let normalized_target = target_project.replace('-', "_");
     let matches: Vec<_> = manifest_scopes
-        .iter()
-        .filter(|((source, declared_language, declared_target), _)| {
-            source == source_project
-                && declared_language == language
-                && declared_target.replace('-', "_") == normalized_target
+        .range(
+            (
+                source_project.to_owned(),
+                language.to_owned(),
+                String::new(),
+            )..,
+        )
+        .inspect(|_| {
+            #[cfg(test)]
+            l2_batch_tests::observe_manifest_visit();
+        })
+        .take_while(|((source, declared_language, _), _)| {
+            source == source_project && declared_language == language
+        })
+        .filter(|((_, _, declared_target), _)| {
+            #[cfg(test)]
+            l2_batch_tests::observe_manifest_normalization();
+            declared_target.replace('-', "_") == normalized_target
         })
         .collect();
 
@@ -795,6 +809,8 @@ async fn index_entity(
         .upsert_document(entity_fts_document(entity))
         .await
         .map_err(|e| CodeSourceIngestError::Storage(format!("entity FTS indexing: {e}")))?;
+    #[cfg(test)]
+    l2_batch_tests::observe_fts_write(entity.id);
     report.fts_indexed += 1;
     Ok(())
 }
@@ -842,6 +858,8 @@ where
             .await
             .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
         #[cfg(test)]
+        l2_batch_tests::observe_row_read(id);
+        #[cfg(test)]
         race_seam::pause_after_row_read().await;
         let Some(mut replacement) = apply(current.as_ref()) else {
             return Ok(RowMutationOutcome::Unchanged);
@@ -884,6 +902,8 @@ where
         };
 
         if let Some(outcome) = outcome {
+            #[cfg(test)]
+            l2_batch_tests::observe_row_write(id);
             index_entity(rt, token, &replacement, report).await?;
             return Ok(outcome);
         }
@@ -3023,7 +3043,7 @@ fn push_module_path_variants(paths: &mut Vec<String>, path: String) {
 /// *declaring* symbol entity (mirrors L1.5's `UnresolvedSpec` on
 /// project/module entities). Kept content-hash-free by the same design: only
 /// the fields needed to retry resolution are stored.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 struct L2UnresolvedRef {
     segments: Vec<String>,
     evidence: String,
@@ -3036,49 +3056,10 @@ fn read_l2_unresolved(properties: &Value) -> Vec<L2UnresolvedRef> {
         .unwrap_or_default()
 }
 
-/// Records `reference` on `entity_id`'s pending list (deduped). Returns
-/// `true` only when the reference was newly recorded — callers use this to
-/// count *unique* unresolved references, matching an already-pending
-/// reference re-observed on a later sweep costing nothing extra.
-async fn record_l2_unresolved(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    entity_id: Uuid,
-    reference: L2UnresolvedRef,
-    file_label: &str,
-    report: &mut CodeSourceIngestReport,
-) -> Result<bool, CodeSourceIngestError> {
-    let outcome = mutate_entity(rt, token, entity_id, file_label, report, |current| {
-        let mut entity = current?.clone();
-        let mut list = entity
-            .properties
-            .as_ref()
-            .map(read_l2_unresolved)
-            .unwrap_or_default();
-        if list.contains(&reference) {
-            return None;
-        }
-        list.push(reference.clone());
-        let mut props = entity
-            .properties
-            .clone()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        props.insert(
-            "l2_unresolved_references".into(),
-            serde_json::to_value(&list).expect("serializes"),
-        );
-        entity.properties = Some(Value::Object(props));
-        Some(entity)
-    })
-    .await?;
-    Ok(outcome.wrote())
-}
-
 /// Attempt immediate same-project resolution of one call/type reference
 /// declared by `declaring_id`; on success upserts (or refreshes) a
-/// `depends_on` edge with the given evidence, on failure records a pending
-/// reference for the reresolve pass. Nonfatal either way.
+/// `depends_on` edge with the given evidence, on failure stages a pending
+/// reference for the phase-local flush and reresolve pass. Nonfatal either way.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_l2_reference(
     rt: &KhiveRuntime,
@@ -3090,13 +3071,12 @@ async fn resolve_l2_reference(
     current_file_ids: &BTreeSet<Uuid>,
     segments: &[String],
     evidence: &str,
-    file_label: &str,
     sweep_time: DateTime<Utc>,
     state: &mut L2SweepState,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
+) -> Result<Option<L2UnresolvedRef>, CodeSourceIngestError> {
     if segments.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let mut target = None;
     let mut suppressed_self_type = false;
@@ -3136,11 +3116,11 @@ async fn resolve_l2_reference(
                 segments: segments.to_vec(),
                 evidence: evidence.to_string(),
             };
-            record_l2_unresolved(rt, token, declaring_id, reference, file_label, report).await?;
+            return Ok(Some(reference));
         }
         None => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Sorted-set-union evidence merge for one L2 `depends_on` edge — repeated
@@ -3263,7 +3243,7 @@ async fn upsert_l2_implements(
 /// Attempt immediate same-project resolution of one positive `impl Trait for
 /// Type`. Unlike a call/type reference, an impl has no declaring storage
 /// entity of its own, so a failed
-/// resolution is recorded as a pending impl on the *file module* instead,
+/// resolution is staged as a pending impl on the *file module* instead,
 /// for the reresolve pass to retry.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_l2_implements(
@@ -3271,18 +3251,16 @@ async fn resolve_l2_implements(
     token: &NamespaceToken,
     source_project: &str,
     language: &str,
-    module_id: Uuid,
     containing_module_path: &str,
     current_file_ids: &BTreeSet<Uuid>,
     type_path: &[String],
     trait_path: &[String],
-    file_label: &str,
     sweep_time: DateTime<Utc>,
     state: &mut L2SweepState,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
+) -> Result<Option<L2PendingImpl>, CodeSourceIngestError> {
     if type_path.is_empty() || trait_path.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let type_id = find_first_current(
         state,
@@ -3318,19 +3296,13 @@ async fn resolve_l2_implements(
             .await?;
         }
         _ => {
-            record_l2_pending_impl(
-                rt,
-                token,
-                module_id,
-                type_path.to_vec(),
-                trait_path.to_vec(),
-                file_label,
-                report,
-            )
-            .await?;
+            return Ok(Some(L2PendingImpl {
+                type_path: type_path.to_vec(),
+                trait_path: trait_path.to_vec(),
+            }));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn find_first_current(
@@ -3349,7 +3321,7 @@ fn find_first_current(
 /// module* entity that declared it (mirrors [`L2UnresolvedRef`] on symbol
 /// entities — see [`resolve_l2_implements`]'s doc comment for why the
 /// attachment point differs).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 struct L2PendingImpl {
     type_path: Vec<String>,
     trait_path: Vec<String>,
@@ -3362,43 +3334,166 @@ fn read_l2_pending_impls(properties: &Value) -> Vec<L2PendingImpl> {
         .unwrap_or_default()
 }
 
-async fn record_l2_pending_impl(
+#[derive(Clone)]
+struct PendingL2<T> {
+    value: T,
+    file: String,
+}
+
+fn append_l2_pending<T: Clone + Eq + Hash>(list: &mut Vec<T>, additions: &[T]) -> usize {
+    let mut seen: HashSet<T> = list.iter().cloned().collect();
+    let mut appended = 0;
+    for addition in additions {
+        if seen.insert(addition.clone()) {
+            list.push(addition.clone());
+            appended += 1;
+        }
+    }
+    appended
+}
+
+fn rebase_l2_pending<T: Clone + Eq + Hash>(
+    current: &mut Vec<T>,
+    original: &HashSet<T>,
+    remaining: &[T],
+) {
+    current.retain(|value| !original.contains(value));
+    append_l2_pending(current, remaining);
+}
+
+async fn record_l2_pending_batch<T>(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
-    module_id: Uuid,
-    type_path: Vec<String>,
-    trait_path: Vec<String>,
-    file_label: &str,
+    id: Uuid,
+    key: &str,
+    pending: &[PendingL2<T>],
     report: &mut CodeSourceIngestReport,
-) -> Result<bool, CodeSourceIngestError> {
-    let entry = L2PendingImpl {
-        type_path,
-        trait_path,
-    };
-    let outcome = mutate_entity(rt, token, module_id, file_label, report, |current| {
-        let mut module = current?.clone();
-        let mut list = module
+) -> Result<bool, CodeSourceIngestError>
+where
+    T: Clone + Eq + Hash + serde::Serialize + serde::de::DeserializeOwned,
+{
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    let read_list = |entity: &Entity| -> Vec<T> {
+        entity
             .properties
             .as_ref()
-            .map(read_l2_pending_impls)
-            .unwrap_or_default();
-        if list.contains(&entry) {
+            .and_then(|props| props.get(key))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    };
+    let Some(current) = rt
+        .entities(token)?
+        .get_entity_including_deleted(id)
+        .await
+        .map_err(|error| CodeSourceIngestError::Storage(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    l2_batch_tests::observe_row_read(id);
+    let existing: HashSet<T> = read_list(&current).into_iter().collect();
+    if pending.iter().all(|item| existing.contains(&item.value)) {
+        return Ok(false);
+    }
+    advancing_entity_revision(current.updated_at, current.updated_at)?;
+    if let Err(error) = gate_check(&current) {
+        match error {
+            RuntimeError::SecretDetected(secret) => {
+                for item in pending
+                    .iter()
+                    .filter(|item| !existing.contains(&item.value))
+                {
+                    report.blocked_count += 1;
+                    report.blocked.push(BlockedWrite {
+                        file: item.file.clone(),
+                        detector: secret.detector.to_string(),
+                        masked_excerpt: secret.masked.clone(),
+                    });
+                }
+                return Ok(false);
+            }
+            other => return Err(other.into()),
+        }
+    }
+    let mut allowed = Vec::new();
+    let mut occurrences = Vec::new();
+    let mut seen = existing.clone();
+    for item in pending {
+        if existing.contains(&item.value) {
+            continue;
+        }
+        if seen.contains(&item.value) {
+            occurrences.push(item);
+            continue;
+        }
+        match secret_gate::check_json_at(
+            &serde_json::to_value(&item.value).expect("serializes"),
+            "entity",
+            "properties",
+        ) {
+            Ok(()) => {
+                seen.insert(item.value.clone());
+                allowed.push(item.value.clone());
+                occurrences.push(item);
+            }
+            Err(RuntimeError::SecretDetected(secret)) => {
+                report.blocked_count += 1;
+                report.blocked.push(BlockedWrite {
+                    file: item.file.clone(),
+                    detector: secret.detector.to_string(),
+                    masked_excerpt: secret.masked,
+                });
+            }
+            Err(other) => return Err(other.into()),
+        }
+    }
+    if allowed.is_empty() {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    l2_batch_tests::pause_before_batch().await;
+    let mut attempted_files = Vec::new();
+    let outcome = mutate_entity(rt, token, id, &pending[0].file, report, |current| {
+        attempted_files.clear();
+        let mut entity = current?.clone();
+        let mut list = read_list(&entity);
+        let present: HashSet<T> = list.iter().cloned().collect();
+        attempted_files.extend(
+            occurrences
+                .iter()
+                .filter(|item| !present.contains(&item.value))
+                .map(|item| item.file.clone()),
+        );
+        if append_l2_pending(&mut list, &allowed) == 0 {
             return None;
         }
-        list.push(entry.clone());
-        let mut props = module
+        let mut props = entity
             .properties
             .clone()
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
-        props.insert(
-            "l2_pending_impls".into(),
-            serde_json::to_value(&list).expect("serializes"),
-        );
-        module.properties = Some(Value::Object(props));
-        Some(module)
+        props.insert(key.into(), serde_json::to_value(list).expect("serializes"));
+        entity.properties = Some(Value::Object(props));
+        Some(entity)
     })
     .await?;
+    if outcome == RowMutationOutcome::Blocked {
+        let refusal = report
+            .blocked
+            .pop()
+            .expect("blocked mutation records refusal");
+        report.blocked_count -= 1;
+        for file in attempted_files {
+            report.blocked_count += 1;
+            report.blocked.push(BlockedWrite {
+                file,
+                detector: refusal.detector.clone(),
+                masked_excerpt: refusal.masked_excerpt.clone(),
+            });
+        }
+    }
     Ok(outcome.wrote())
 }
 
@@ -3809,8 +3904,9 @@ async fn persist_l2_file(
         )
         .await?;
 
+        let mut pending_references = Vec::new();
         for call in &decl.calls {
-            resolve_l2_reference(
+            if let Some(reference) = resolve_l2_reference(
                 rt,
                 token,
                 source_project,
@@ -3820,15 +3916,20 @@ async fn persist_l2_file(
                 &current_file_ids,
                 &call.segments,
                 "call",
-                file_label,
                 sweep_time,
                 state,
                 report,
             )
-            .await?;
+            .await?
+            {
+                pending_references.push(PendingL2 {
+                    value: reference,
+                    file: file_label.to_owned(),
+                });
+            }
         }
         for type_ref in &decl.type_refs {
-            resolve_l2_reference(
+            if let Some(reference) = resolve_l2_reference(
                 rt,
                 token,
                 source_project,
@@ -3838,35 +3939,63 @@ async fn persist_l2_file(
                 &current_file_ids,
                 &type_ref.segments,
                 "type_reference",
-                file_label,
                 sweep_time,
                 state,
                 report,
             )
-            .await?;
+            .await?
+            {
+                pending_references.push(PendingL2 {
+                    value: reference,
+                    file: file_label.to_owned(),
+                });
+            }
         }
-    }
-
-    // Phase C: positive trait implementations.
-    for imp in &parsed.impls {
-        let containing_module_path = resolve_module_path(module_path, &imp.module_segments);
-        resolve_l2_implements(
+        record_l2_pending_batch(
             rt,
             token,
-            source_project,
-            language,
-            module_id,
-            &containing_module_path,
-            &current_file_ids,
-            &imp.type_path,
-            &imp.trait_path,
-            file_label,
-            sweep_time,
-            state,
+            *id,
+            "l2_unresolved_references",
+            &pending_references,
             report,
         )
         .await?;
     }
+
+    // Phase C: positive trait implementations.
+    let mut pending_impls = Vec::new();
+    for imp in &parsed.impls {
+        let containing_module_path = resolve_module_path(module_path, &imp.module_segments);
+        if let Some(entry) = resolve_l2_implements(
+            rt,
+            token,
+            source_project,
+            language,
+            &containing_module_path,
+            &current_file_ids,
+            &imp.type_path,
+            &imp.trait_path,
+            sweep_time,
+            state,
+            report,
+        )
+        .await?
+        {
+            pending_impls.push(PendingL2 {
+                value: entry,
+                file: file_label.to_owned(),
+            });
+        }
+    }
+    record_l2_pending_batch(
+        rt,
+        token,
+        module_id,
+        "l2_pending_impls",
+        &pending_impls,
+        report,
+    )
+    .await?;
 
     declaration_ids.sort();
     declaration_ids.dedup();
@@ -4371,7 +4500,7 @@ async fn l2_reresolve_pass(
         if pending.is_empty() {
             continue;
         }
-        let original_pending = pending.clone();
+        let original_pending: HashSet<_> = pending.iter().cloned().collect();
         let mut still_pending = Vec::new();
         let mut pending_changed = false;
         for reference in pending {
@@ -4423,6 +4552,8 @@ async fn l2_reresolve_pass(
         }
         if pending_changed {
             let label = id.to_string();
+            #[cfg(test)]
+            l2_batch_tests::pause_before_rebase().await;
             mutate_entity(rt, token, id, &label, report, |current| {
                 let mut entity = current?.clone();
                 let mut rebased = entity
@@ -4430,12 +4561,7 @@ async fn l2_reresolve_pass(
                     .as_ref()
                     .map(read_l2_unresolved)
                     .unwrap_or_default();
-                rebased.retain(|reference| !original_pending.contains(reference));
-                for reference in &still_pending {
-                    if !rebased.contains(reference) {
-                        rebased.push(reference.clone());
-                    }
-                }
+                rebase_l2_pending(&mut rebased, &original_pending, &still_pending);
                 let mut props = entity
                     .properties
                     .clone()
@@ -4516,7 +4642,7 @@ async fn l2_reresolve_pass(
         if pending.is_empty() {
             continue;
         }
-        let original_pending = pending.clone();
+        let original_pending: HashSet<_> = pending.iter().cloned().collect();
         let mut still_pending = Vec::new();
         let mut resolved_any = false;
         for entry in pending {
@@ -4562,6 +4688,8 @@ async fn l2_reresolve_pass(
         }
         if resolved_any {
             let label = module_id.to_string();
+            #[cfg(test)]
+            l2_batch_tests::pause_before_rebase().await;
             mutate_entity(rt, token, module_id, &label, report, |current| {
                 let mut module = current?.clone();
                 let mut rebased = module
@@ -4569,12 +4697,7 @@ async fn l2_reresolve_pass(
                     .as_ref()
                     .map(read_l2_pending_impls)
                     .unwrap_or_default();
-                rebased.retain(|entry| !original_pending.contains(entry));
-                for entry in &still_pending {
-                    if !rebased.contains(entry) {
-                        rebased.push(entry.clone());
-                    }
-                }
+                rebase_l2_pending(&mut rebased, &original_pending, &still_pending);
                 let mut props = module
                     .properties
                     .clone()
@@ -4608,6 +4731,13 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
 }
 
 #[cfg(test)]
+#[path = "source_ingest/owner_alias_tests.rs"]
+mod owner_alias_tests;
+
+#[cfg(test)]
+mod l2_batch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use khive_db::StorageBackend;
@@ -4638,7 +4768,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum TestJournalMode {
+    pub(super) enum TestJournalMode {
         Wal,
         Delete,
     }
@@ -4656,7 +4786,7 @@ mod tests {
         }
     }
 
-    fn runtime_on_with_mode(
+    pub(super) fn runtime_on_with_mode(
         db_path: &Path,
         mode: TestJournalMode,
     ) -> (KhiveRuntime, NamespaceToken) {

@@ -9,6 +9,7 @@ mod graph;
 mod link;
 mod list;
 mod merge;
+mod message_scope;
 mod note_list;
 mod params;
 mod proposal;

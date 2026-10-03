@@ -203,6 +203,16 @@ fn reject_reserved_note_properties(
     })
 }
 
+fn reject_existing_secret_gate_property(
+    existing: Option<&Note>,
+    operation: &'static str,
+) -> StorageResult<()> {
+    if let Some(existing) = existing {
+        reject_reserved_note_properties(existing.properties.as_ref(), operation)?;
+    }
+    Ok(())
+}
+
 fn reject_changed_identity_properties(
     existing: &Note,
     properties: Option<&Value>,
@@ -300,17 +310,6 @@ impl PolicyEnforcingNoteStore {
             .is_some_and(has_web_receipt_provenance)
         {
             return Err(web_receipt_write_refused(operation));
-        }
-        Ok(())
-    }
-
-    async fn reject_existing_secret_gate_property(
-        &self,
-        id: Uuid,
-        operation: &'static str,
-    ) -> StorageResult<()> {
-        if let Some(existing) = self.inner.get_note_including_deleted(id).await? {
-            reject_reserved_note_properties(existing.properties.as_ref(), operation)?;
         }
         Ok(())
     }
@@ -443,10 +442,11 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<bool> {
         reject_reserved_patch_target(key, "set_note_property")?;
-        self.reject_web_receipt_mutation(id, "set_note_property")
-            .await?;
-        self.reject_existing_secret_gate_property(id, "set_note_property")
-            .await?;
+        let existing = self.inner.get_note_including_deleted(id).await?;
+        if existing.as_ref().is_some_and(has_web_receipt_provenance) {
+            return Err(web_receipt_write_refused("set_note_property"));
+        }
+        reject_existing_secret_gate_property(existing.as_ref(), "set_note_property")?;
         self.inner
             .set_note_property(id, key, value, updated_at)
             .await
@@ -462,10 +462,11 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<bool> {
         reject_reserved_patch_target(json_path, "try_patch_note_property")?;
-        self.reject_web_receipt_mutation(id, "try_patch_note_property")
-            .await?;
-        self.reject_existing_secret_gate_property(id, "try_patch_note_property")
-            .await?;
+        let existing = self.inner.get_note_including_deleted(id).await?;
+        if existing.as_ref().is_some_and(has_web_receipt_provenance) {
+            return Err(web_receipt_write_refused("try_patch_note_property"));
+        }
+        reject_existing_secret_gate_property(existing.as_ref(), "try_patch_note_property")?;
         self.inner
             .try_patch_note_property(id, namespace, filter, json_path, value, updated_at)
             .await
@@ -481,13 +482,25 @@ impl NoteStore for PolicyEnforcingNoteStore {
         updated_at: i64,
     ) -> StorageResult<()> {
         reject_reserved_patch_target(json_path, "patch_note_property_atomic")?;
+        // Each target is read once. A secret-gate refusal is held back while the
+        // rest of the batch is scanned, so a web-receipt target anywhere in it is
+        // still refused first.
+        let mut secret_gate_refusal = None;
         for id in &ids {
-            self.reject_web_receipt_mutation(*id, "patch_note_property_atomic")
-                .await?;
+            let existing = self.inner.get_note_including_deleted(*id).await?;
+            if existing.as_ref().is_some_and(has_web_receipt_provenance) {
+                return Err(web_receipt_write_refused("patch_note_property_atomic"));
+            }
+            if secret_gate_refusal.is_none() {
+                secret_gate_refusal = reject_existing_secret_gate_property(
+                    existing.as_ref(),
+                    "patch_note_property_atomic",
+                )
+                .err();
+            }
         }
-        for id in &ids {
-            self.reject_existing_secret_gate_property(*id, "patch_note_property_atomic")
-                .await?;
+        if let Some(refusal) = secret_gate_refusal {
+            return Err(refusal);
         }
         self.inner
             .patch_note_property_atomic(ids, namespace, filter, json_path, value, updated_at)

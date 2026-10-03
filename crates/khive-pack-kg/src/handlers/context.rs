@@ -29,11 +29,15 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::types::{Direction, NeighborQuery, PageRequest};
+use khive_runtime::{
+    KgNeighborRead, KhiveRuntime, MailboxView, Namespace, NamespaceToken, Resolved, RuntimeError,
+    VerbRegistry,
+};
+use khive_storage::types::{Direction, NeighborHit, NeighborQuery, PageRequest};
 use khive_storage::{EdgeRelation, Entity, EntityFilter};
 
-use super::common::{deser, parse_direction, parse_relation, resolve_uuid_async, ContextParams};
+use super::common::{deser, parse_direction, parse_relation, ContextParams};
+use super::message_scope::{message_neighbor_permitted, resolve_mailbox_graph_id};
 use crate::KgPack;
 
 static CONTEXT_CALL_ID: AtomicU64 = AtomicU64::new(0);
@@ -118,102 +122,153 @@ fn relations_all_symmetric(relations: Option<&[EdgeRelation]>) -> bool {
     }
 }
 
-/// Fetch up to `fanout` neighbors of `node_id`, each tagged with its actual direction.
-/// See `docs/api/context-verb.md`.
+struct ContextNeighborRead<'a> {
+    direction: &'a Direction,
+    relations: Option<&'a [EdgeRelation]>,
+    fanout: u32,
+}
+
+/// Fetch one namespace's neighbor window without replacing the caller token.
 async fn fetch_directed_neighbors(
     runtime: &KhiveRuntime,
+    registry: &VerbRegistry,
     token: &NamespaceToken,
     node_id: Uuid,
-    requested_direction: &Direction,
-    relations: Option<&[EdgeRelation]>,
-    fanout: u32,
-) -> Result<Vec<(Uuid, EdgeRelation, f64, &'static str)>, RuntimeError> {
-    let relations_vec = relations.map(|r| r.to_vec());
-
-    if relations_all_symmetric(relations) {
-        let hits = runtime
-            .neighbors_with_query(
-                token,
-                node_id,
-                NeighborQuery {
-                    direction: Direction::Both,
-                    relations: relations_vec,
-                    limit: Some(fanout),
-                    min_weight: None,
-                },
-            )
+    namespace: &Namespace,
+    options: &ContextNeighborRead<'_>,
+) -> Result<Vec<(NeighborHit, &'static str)>, RuntimeError> {
+    let symmetric = relations_all_symmetric(options.relations);
+    let query = NeighborQuery {
+        direction: if symmetric {
+            Direction::Both
+        } else {
+            options.direction.clone()
+        },
+        relations: options.relations.map(|r| r.to_vec()),
+        limit: Some(options.fanout),
+        min_weight: None,
+    };
+    if !symmetric && *options.direction == Direction::Both {
+        let hits = registry
+            .directed_neighbors_for_kg_read(runtime, token, node_id, query, Some(namespace))
             .await?;
         return Ok(hits
             .into_iter()
-            .map(|h| (h.node_id, h.relation, h.weight, "both"))
+            .map(|(h, dir)| {
+                let tag = if dir == Direction::Out {
+                    "outgoing"
+                } else {
+                    "incoming"
+                };
+                (h, tag)
+            })
             .collect());
     }
+    let hits = registry
+        .neighbors_for_kg_read(
+            runtime,
+            token,
+            node_id,
+            KgNeighborRead {
+                query,
+                after: None,
+                neighbor_kinds: None,
+                enrich: true,
+                namespace: Some(namespace.clone()),
+            },
+        )
+        .await?;
+    let tag = if symmetric {
+        "both"
+    } else if *options.direction == Direction::Out {
+        "outgoing"
+    } else {
+        "incoming"
+    };
+    Ok(hits.into_iter().map(|h| (h, tag)).collect())
+}
 
-    match requested_direction {
-        Direction::Out => {
-            let hits = runtime
-                .neighbors_with_query(
+async fn fetch_mailbox_neighbors(
+    runtime: &KhiveRuntime,
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    view: &MailboxView,
+    node_id: Uuid,
+    options: &ContextNeighborRead<'_>,
+    permitted: &mut HashMap<Uuid, bool>,
+) -> Result<(Vec<(Uuid, EdgeRelation, f64, &'static str)>, bool), RuntimeError> {
+    const SCAN_CAP: u32 = 10_000;
+    let mut merged: Vec<(NeighborHit, &'static str)> = Vec::new();
+    let mut scan_incomplete = false;
+    for namespace in token.visible_namespaces() {
+        let mut window = options.fanout;
+        loop {
+            let raw = missing_neighbor_anchor_as_empty(
+                fetch_directed_neighbors(
+                    runtime,
+                    registry,
                     token,
                     node_id,
-                    NeighborQuery {
-                        direction: Direction::Out,
-                        relations: relations_vec,
-                        limit: Some(fanout),
-                        min_weight: None,
+                    namespace,
+                    &ContextNeighborRead {
+                        direction: options.direction,
+                        relations: options.relations,
+                        fanout: window,
                     },
                 )
-                .await?;
-            Ok(hits
-                .into_iter()
-                .map(|h| (h.node_id, h.relation, h.weight, "outgoing"))
-                .collect())
-        }
-        Direction::In => {
-            let hits = runtime
-                .neighbors_with_query(
-                    token,
-                    node_id,
-                    NeighborQuery {
-                        direction: Direction::In,
-                        relations: relations_vec,
-                        limit: Some(fanout),
-                        min_weight: None,
-                    },
-                )
-                .await?;
-            Ok(hits
-                .into_iter()
-                .map(|h| (h.node_id, h.relation, h.weight, "incoming"))
-                .collect())
-        }
-        Direction::Both => {
-            // ADR-089 UNION ALL optimization; see docs/api/context-verb.md.
-            let hits = runtime
-                .neighbors_with_query_directed(
-                    token,
-                    node_id,
-                    NeighborQuery {
-                        direction: Direction::Both,
-                        relations: relations_vec,
-                        limit: Some(fanout),
-                        min_weight: None,
-                    },
-                )
-                .await?;
-            Ok(hits
-                .into_iter()
-                .map(|(h, dir)| {
-                    // `neighbors_with_query_directed` only ever tags `Out`/`In`, never `Both`.
-                    let tag = if dir == Direction::Out {
-                        "outgoing"
-                    } else {
-                        "incoming"
-                    };
-                    (h.node_id, h.relation, h.weight, tag)
-                })
-                .collect())
+                .await,
+            )?;
+            let raw_count = raw.len();
+            let mut admitted = Vec::with_capacity(raw_count);
+            for hit in raw {
+                let allowed = match permitted.get(&hit.0.node_id) {
+                    Some(allowed) => *allowed,
+                    None => {
+                        let allowed =
+                            message_neighbor_permitted(runtime, registry, token, view, &hit.0)
+                                .await?;
+                        permitted.insert(hit.0.node_id, allowed);
+                        allowed
+                    }
+                };
+                if allowed {
+                    admitted.push(hit);
+                }
+            }
+            if admitted.len() >= options.fanout as usize || raw_count < window as usize {
+                admitted.truncate(options.fanout as usize);
+                merged.extend(admitted);
+                break;
+            }
+            if window >= SCAN_CAP {
+                merged.extend(admitted);
+                scan_incomplete = true;
+                break;
+            }
+            window = window.saturating_mul(2).min(SCAN_CAP);
         }
     }
+    let direction_rank = |tag: &str| match tag {
+        "outgoing" => 0,
+        "incoming" => 1,
+        _ => 2,
+    };
+    merged.sort_by_key(|(hit, tag)| (hit.node_id, hit.edge_id, direction_rank(tag)));
+    merged.dedup_by_key(|(hit, tag)| (hit.node_id, hit.edge_id, direction_rank(tag)));
+    merged.sort_by(|a, b| {
+        b.0.weight
+            .partial_cmp(&a.0.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.node_id.cmp(&b.0.node_id))
+            .then(a.0.edge_id.cmp(&b.0.edge_id))
+    });
+    Ok((
+        merged
+            .into_iter()
+            .map(|(hit, tag)| (hit.node_id, hit.relation, hit.weight, tag))
+            .collect(),
+        scan_incomplete,
+    ))
 }
 
 fn missing_neighbor_anchor_as_empty<T>(
@@ -242,9 +297,13 @@ impl KgPack {
         &self,
         token: &NamespaceToken,
         params: Value,
+        registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let call_id = CONTEXT_CALL_ID.fetch_add(1, Ordering::Relaxed);
         let prof = context_profile_enabled();
+        let mailbox_view = self
+            .runtime
+            .authorize_mailbox_view(token, "context", None, &params)?;
         let p: ContextParams = deser(params)?;
 
         let has_query = p.query.as_deref().is_some_and(|s| !s.trim().is_empty());
@@ -295,7 +354,9 @@ impl KgPack {
         let mut explicit_ids: Vec<Uuid> = Vec::new();
         if let Some(ids) = &p.entity_ids {
             for s in ids {
-                let uuid = resolve_uuid_async(s, &self.runtime, token).await?;
+                let uuid =
+                    resolve_mailbox_graph_id(&self.runtime, registry, token, &mailbox_view, s)
+                        .await?;
                 explicit_ids.push(uuid);
                 if seen.insert(uuid) {
                     anchor_ids.push(uuid);
@@ -383,6 +444,13 @@ impl KgPack {
         let mut visited: HashSet<Uuid> = anchor_ids.iter().copied().collect();
         let mut per_anchor_neighbors: Vec<Vec<NeighborRecord>> =
             Vec::with_capacity(anchor_ids.len());
+        let mut permitted = HashMap::new();
+        let mut scan_incomplete = false;
+        let neighbor_options = ContextNeighborRead {
+            direction: &direction,
+            relations: relations.as_deref(),
+            fanout,
+        };
 
         for &anchor in &anchor_ids {
             let mut recs: Vec<NeighborRecord> = Vec::new();
@@ -390,17 +458,17 @@ impl KgPack {
 
             // hops=0 means anchors only — skip expansion entirely.
             if hops >= 1 {
-                let hop1_raw = missing_neighbor_anchor_as_empty(
-                    fetch_directed_neighbors(
-                        &self.runtime,
-                        token,
-                        anchor,
-                        &direction,
-                        relations.as_deref(),
-                        fanout,
-                    )
-                    .await,
-                )?;
+                let (hop1_raw, incomplete) = fetch_mailbox_neighbors(
+                    &self.runtime,
+                    registry,
+                    token,
+                    &mailbox_view,
+                    anchor,
+                    &neighbor_options,
+                    &mut permitted,
+                )
+                .await?;
+                scan_incomplete |= incomplete;
 
                 for (id, relation, weight, dir) in hop1_raw {
                     if !visited.insert(id) {
@@ -421,17 +489,17 @@ impl KgPack {
             if hops == 2 {
                 let mut hop2_pool: Vec<(Uuid, Uuid, EdgeRelation, f64, &'static str)> = Vec::new();
                 for parent in &hop1_parents {
-                    let hop2_raw = missing_neighbor_anchor_as_empty(
-                        fetch_directed_neighbors(
-                            &self.runtime,
-                            token,
-                            *parent,
-                            &direction,
-                            relations.as_deref(),
-                            fanout,
-                        )
-                        .await,
-                    )?;
+                    let (hop2_raw, incomplete) = fetch_mailbox_neighbors(
+                        &self.runtime,
+                        registry,
+                        token,
+                        &mailbox_view,
+                        *parent,
+                        &neighbor_options,
+                        &mut permitted,
+                    )
+                    .await?;
+                    scan_incomplete |= incomplete;
                     for (id, relation, weight, dir) in hop2_raw {
                         hop2_pool.push((*parent, id, relation, weight, dir));
                     }
@@ -507,9 +575,8 @@ impl KgPack {
         // fetch a note neighbour missed the stage 4 lookup and was skipped
         // before `assemble_within_budget` ever saw it, so the response could
         // report an empty neighbour list beside `dropped.neighbors == 0` and
-        // both halves were true. `get_notes_batch` takes ids only, so the
-        // visible-namespace restriction the entity filter applied is applied
-        // here by hand rather than left off.
+        // both halves were true. Preserve the local batch read, then resolve
+        // only missing handles across pack backends.
         let visible: HashSet<String> = token
             .visible_namespace_strs()
             .iter()
@@ -520,19 +587,32 @@ impl KgPack {
             .copied()
             .filter(|id| !entity_meta.contains_key(id))
             .collect();
-        let note_meta: HashMap<Uuid, khive_storage::note::Note> = if unresolved.is_empty() {
-            HashMap::new()
-        } else {
-            self.runtime
-                .notes(token)?
-                .get_notes_batch(&unresolved)
-                .await
-                .map_err(RuntimeError::Storage)?
-                .into_iter()
-                .filter(|n| visible.contains(&n.namespace))
-                .map(|n| (n.id, n))
-                .collect()
-        };
+        let local_notes = self
+            .runtime
+            .notes(token)?
+            .get_notes_batch(&unresolved)
+            .await
+            .map_err(RuntimeError::Storage)?;
+        let local_ids: HashSet<Uuid> = local_notes.iter().map(|note| note.id).collect();
+        let mut note_meta: HashMap<Uuid, khive_storage::note::Note> = local_notes
+            .into_iter()
+            .filter(|note| {
+                visible.contains(&note.namespace) && mailbox_view.permits_message_note(token, note)
+            })
+            .map(|note| (note.id, note))
+            .collect();
+        for id in unresolved.into_iter().filter(|id| !local_ids.contains(id)) {
+            if let Some(Resolved::Note(note)) = registry
+                .resolve_kg_read_by_id(&self.runtime, token, id, false)
+                .await?
+            {
+                if visible.contains(&note.namespace)
+                    && mailbox_view.permits_message_note(token, &note)
+                {
+                    note_meta.insert(id, note);
+                }
+            }
+        }
         let meta_for = |id: &Uuid| -> Option<NeighborMeta> {
             if let Some(e) = entity_meta.get(id) {
                 return Some(NeighborMeta {
@@ -623,6 +703,9 @@ impl KgPack {
         let fields = response
             .as_object_mut()
             .expect("context response is an object");
+        if scan_incomplete {
+            fields.insert("scan_incomplete".into(), json!(true));
+        }
         for (name, requested, effective) in clamp_reports {
             let Some(requested) = requested else {
                 continue;

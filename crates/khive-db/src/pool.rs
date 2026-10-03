@@ -1082,20 +1082,23 @@ impl<'pool> ReaderGuard<'pool> {
                 StorageError::driver(StorageCapability::Sql, "reader_guard.query_row", error)
             })
         })
-        .map_err(|error| match error {
-            StorageError::Driver {
-                capability,
-                operation,
-                source,
-            } => match source.downcast::<rusqlite::Error>() {
-                Ok(error) => SqliteError::Rusqlite(*error),
-                Err(source) => SqliteError::RequestReadStopped(StorageError::Driver {
+        .map_err(|error| {
+            self.pool.record_reader_query_error(&error);
+            match error {
+                StorageError::Driver {
                     capability,
                     operation,
                     source,
-                }),
-            },
-            other => SqliteError::RequestReadStopped(other),
+                } => match source.downcast::<rusqlite::Error>() {
+                    Ok(error) => SqliteError::Rusqlite(*error),
+                    Err(source) => SqliteError::RequestReadStopped(StorageError::Driver {
+                        capability,
+                        operation,
+                        source,
+                    }),
+                },
+                other => SqliteError::RequestReadStopped(other),
+            }
         })
     }
 
@@ -1364,6 +1367,14 @@ pub struct ReaderAcquisitionSnapshot {
     /// query began. Covers pooled checkout and the closed raw-SQL exception;
     /// cooperative request cancellation is intentionally excluded.
     pub checkout_timeouts: u64,
+    /// Queries on a checked-out pooled reader that SQLite refused with
+    /// `SQLITE_BUSY` after the connection's busy handler gave up (typed-store
+    /// reads, pooled raw-SQL reads, and [`ReaderGuard::query_row`]). Counted
+    /// after checkout succeeded, so it never overlaps `checkout_timeouts`;
+    /// `SQLITE_LOCKED` and cooperative cancellation are excluded. Writer
+    /// refusals are not counted here; the writer task's are in
+    /// [`WriterAcquisitionSnapshot::writer_task_begin_busy`].
+    pub busy_timeouts: u64,
     /// Pooled checkouts live at the instant this snapshot was taken.
     pub active_pooled_checkouts: u64,
     /// High-water mark of concurrent pooled checkouts.
@@ -1401,6 +1412,7 @@ struct ReaderAcquisitionCounters {
     standalone_opens: AtomicU64,
     infrastructure_standalone_opens: AtomicU64,
     checkout_timeouts: AtomicU64,
+    busy_timeouts: AtomicU64,
     active_pooled_checkouts: AtomicU64,
     peak_active_pooled_checkouts: AtomicU64,
     completed_pooled_checkouts: AtomicU64,
@@ -1421,6 +1433,10 @@ impl ReaderAcquisitionCounters {
 
     fn record_checkout_timeout(&self) {
         self.checkout_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_busy_timeout(&self) {
+        self.busy_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_reader_replacement_open_failure(&self) {
@@ -1471,6 +1487,7 @@ impl ReaderAcquisitionCounters {
                 .infrastructure_standalone_opens
                 .load(Ordering::Relaxed),
             checkout_timeouts: self.checkout_timeouts.load(Ordering::Relaxed),
+            busy_timeouts: self.busy_timeouts.load(Ordering::Relaxed),
             active_pooled_checkouts: self.active_pooled_checkouts.load(Ordering::Relaxed),
             peak_active_pooled_checkouts: self.peak_active_pooled_checkouts.load(Ordering::Relaxed),
             completed_pooled_checkouts: self.completed_pooled_checkouts.load(Ordering::Relaxed),
@@ -2308,6 +2325,19 @@ impl ConnectionPool {
     /// raw-SQL read-transaction exception and reads on a standalone writer).
     pub(crate) fn record_reader_admission_timeout(&self) {
         self.reader_acquisition_counters.record_checkout_timeout();
+    }
+
+    /// Count a query error from an already checked-out pooled reader when it is
+    /// SQLite's `SQLITE_BUSY` surfacing after the busy handler gave up. Every
+    /// other error, including `SQLITE_LOCKED`, is ignored. Checkout exhaustion
+    /// is counted by [`Self::reader_until`] before any query runs, so the two
+    /// classes cannot overlap.
+    pub(crate) fn record_reader_query_error(&self, error: &StorageError) {
+        if crate::read_cancellation::storage_error_sqlite_code(error)
+            == Some(rusqlite::ErrorCode::DatabaseBusy)
+        {
+            self.reader_acquisition_counters.record_busy_timeout();
+        }
     }
 
     /// Clone the pool-scoped counter set for the lifetime-owned writer task.

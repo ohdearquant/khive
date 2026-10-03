@@ -928,11 +928,16 @@ impl KnowledgeHandlers {
                 .await
                 .map_err(|e| sql_err("edit atom reader", e))?;
             let id = p.id.trim().to_string();
-            let row = if id.parse::<Uuid>().is_ok() {
+            let row = if let Ok(uuid) = id.parse::<Uuid>() {
+                // Atom ids are stored as lowercase hyphenated text, so bind the
+                // parsed value's canonical form, not the spelling the caller used.
                 reader
                     .query_row(SqlStatement {
                         sql: "SELECT id FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
-                        params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
+                        params: vec![
+                            SqlValue::Text(uuid.as_hyphenated().to_string()),
+                            SqlValue::Text(ns.clone()),
+                        ],
                         label: None,
                     })
                     .await

@@ -297,6 +297,11 @@ holds late-opened pools only while collecting the report.
 - `infrastructure_standalone_reader_opens`, kept outside the request aggregate;
 - `reader_checkout_timeouts`, including pooled and closed-exception admission
   waits but excluding cooperative cancellation;
+- `reader_busy_timeouts`, queries on an already checked-out pooled reader
+  (typed-store reads, pooled raw-SQL reads, and `ReaderGuard::query_row`) that
+  SQLite refused with `SQLITE_BUSY` once `configured_busy_timeout_ms` elapsed.
+  It is disjoint from `reader_checkout_timeouts`, so the two timeout classes
+  can be told apart from the counters alone; writer refusals are not included;
 - point-in-time and peak pooled checkouts, completed pooled checkouts, and the
   longest completed pooled hold in microseconds. Hold time includes reset or
   replacement because the connection is not reusable before that finishes.

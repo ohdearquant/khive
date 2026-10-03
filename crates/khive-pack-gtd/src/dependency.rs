@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
-use khive_storage::note::Note;
+use khive_storage::note::{Note, NoteVisibility};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::EdgeRelation;
 
@@ -92,6 +92,27 @@ pub(crate) async fn ensure_completion_dependencies_ready(
     .into())
 }
 
+enum DependencyNote {
+    Live(Box<Note>),
+    Deleted(NoteVisibility),
+}
+
+impl DependencyNote {
+    fn namespace(&self) -> &str {
+        match self {
+            Self::Live(note) => &note.namespace,
+            Self::Deleted(note) => &note.namespace,
+        }
+    }
+
+    fn is_deleted(&self) -> bool {
+        match self {
+            Self::Live(note) => note.deleted_at.is_some(),
+            Self::Deleted(note) => note.deleted_at.is_some(),
+        }
+    }
+}
+
 pub(crate) async fn diagnose_tasks(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -116,18 +137,25 @@ pub(crate) async fn diagnose_tasks(
 
     let store = runtime.notes(token)?;
     let ids: Vec<Uuid> = dependency_ids.iter().copied().collect();
-    let mut notes_by_id: HashMap<Uuid, Option<Note>> = store
+    let mut notes_by_id: HashMap<Uuid, DependencyNote> = store
         .get_notes_batch(&ids)
         .await?
         .into_iter()
-        .map(|note| (note.id, Some(note)))
+        .map(|note| (note.id, DependencyNote::Live(Box::new(note))))
         .collect();
 
-    for id in dependency_ids {
-        if notes_by_id.contains_key(&id) {
-            continue;
+    let missing: Vec<Uuid> = ids
+        .into_iter()
+        .filter(|id| !notes_by_id.contains_key(id))
+        .collect();
+    for visibility in store.get_note_visibility_batch(&missing).await? {
+        if visibility.deleted_at.is_some() {
+            notes_by_id.insert(visibility.id, DependencyNote::Deleted(visibility));
+        } else if let Some(note) = store.get_note(visibility.id).await? {
+            // A row can become live between the two reads. Visibility does not
+            // carry kind or task status, so classify it from a normal full read.
+            notes_by_id.insert(note.id, DependencyNote::Live(Box::new(note)));
         }
-        notes_by_id.insert(id, store.get_note_including_deleted(id).await?);
     }
 
     Ok(tasks
@@ -138,7 +166,7 @@ pub(crate) async fn diagnose_tasks(
 
 fn diagnose_task(
     task: &Note,
-    notes_by_id: &HashMap<Uuid, Option<Note>>,
+    notes_by_id: &HashMap<Uuid, DependencyNote>,
 ) -> TaskDependencyDiagnostic {
     let mut blocked_by = Vec::new();
     let mut broken = false;
@@ -170,21 +198,26 @@ fn diagnose_task(
             blocked_by.push(json!({"id": raw, "state": "invalid"}));
             continue;
         };
-        let Some(Some(blocker)) = notes_by_id.get(&id) else {
+        let Some(blocker) = notes_by_id.get(&id) else {
             broken = true;
             blocked_by.push(json!({"id": raw, "state": "missing"}));
             continue;
         };
-        if blocker.namespace != task.namespace {
+        if blocker.namespace() != task.namespace {
             broken = true;
             blocked_by.push(json!({"id": raw, "state": "different_namespace"}));
             continue;
         }
-        if blocker.deleted_at.is_some() {
+        if blocker.is_deleted() {
             broken = true;
             blocked_by.push(json!({"id": raw, "state": "soft_deleted"}));
             continue;
         }
+        let DependencyNote::Live(blocker) = blocker else {
+            // Deleted projections were handled above and are never treated as
+            // live tasks without their full kind and properties.
+            continue;
+        };
         if blocker.kind != "task" {
             broken = true;
             blocked_by.push(json!({"id": raw, "state": "wrong_kind"}));
@@ -270,11 +303,16 @@ pub(crate) async fn validate_property_update(
                 task.id
             )));
         }
-        let blocker = store.get_note(dependency_id).await?.ok_or_else(|| {
-            RuntimeError::NotFound(format!(
-                "depends_on target {dependency_id} is missing or deleted"
-            ))
-        })?;
+        let blocker = store
+            .get_notes_batch(std::slice::from_ref(&dependency_id))
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                RuntimeError::NotFound(format!(
+                    "depends_on target {dependency_id} is missing or deleted"
+                ))
+            })?;
         if blocker.kind != "task" {
             return Err(RuntimeError::InvalidInput(format!(
                 "depends_on target {dependency_id} must be a task note; got {:?}",
@@ -316,49 +354,72 @@ async fn property_path_reaches(
     let mut queue = VecDeque::from([start]);
     let mut visited = HashSet::new();
     let mut traversed_edges = 0usize;
-    while let Some(current) = queue.pop_front() {
-        if current == goal {
+    while !queue.is_empty() {
+        let frontier: Vec<Uuid> = queue.drain(..).collect();
+        if frontier.first() == Some(&goal) {
             return Ok(true);
         }
-        if !visited.insert(current) {
-            continue;
-        }
-        if visited.len() > DEPENDENCY_WALK_MAX_NODES {
-            return Err(RuntimeError::InvalidInput(format!(
-                "depends_on cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-task safety bound"
-            )));
-        }
-        let Some(note) = store.get_note(current).await? else {
-            continue;
-        };
-        if note.kind != "task" || note.namespace != namespace {
-            continue;
-        }
-        let Some(dependencies) = note
-            .properties
-            .as_ref()
-            .and_then(|properties| properties.get("depends_on"))
-            .and_then(Value::as_array)
-        else {
-            continue;
-        };
-        traversed_edges = traversed_edges
+        let mut frontier_ids = HashSet::new();
+        let ids: Vec<Uuid> = frontier
+            .iter()
+            .take_while(|id| **id != goal)
+            .filter(|id| !visited.contains(*id) && frontier_ids.insert(**id))
+            .take(DEPENDENCY_WALK_MAX_NODES.saturating_sub(visited.len()))
+            .copied()
+            .collect();
+        let notes_by_id: HashMap<Uuid, Note> = store
+            .get_notes_batch(&ids)
+            .await?
+            .into_iter()
+            .map(|note| (note.id, note))
+            .collect();
+
+        // Process in the original BFS order. In particular, a goal after an
+        // earlier node must not bypass that node's edge or task safety check.
+        for current in frontier {
+            if current == goal {
+                return Ok(true);
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            if visited.len() > DEPENDENCY_WALK_MAX_NODES {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "depends_on cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-task safety bound"
+                )));
+            }
+            let Some(note) = notes_by_id.get(&current) else {
+                continue;
+            };
+            if note.kind != "task" || note.namespace != namespace {
+                continue;
+            }
+            let Some(dependencies) = note
+                .properties
+                .as_ref()
+                .and_then(|properties| properties.get("depends_on"))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            traversed_edges = traversed_edges
             .checked_add(dependencies.len())
             .ok_or_else(|| {
                 RuntimeError::InvalidInput(format!(
                     "depends_on cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
                 ))
             })?;
-        if traversed_edges > DEPENDENCY_WALK_MAX_NODES {
-            return Err(RuntimeError::InvalidInput(format!(
-                "depends_on cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
-            )));
+            if traversed_edges > DEPENDENCY_WALK_MAX_NODES {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "depends_on cycle validation exceeded the {DEPENDENCY_WALK_MAX_NODES}-edge safety bound"
+                )));
+            }
+            queue.extend(dependencies.iter().filter_map(|dependency| {
+                dependency
+                    .as_str()
+                    .and_then(|raw| Uuid::parse_str(raw).ok())
+            }));
         }
-        queue.extend(dependencies.iter().filter_map(|dependency| {
-            dependency
-                .as_str()
-                .and_then(|raw| Uuid::parse_str(raw).ok())
-        }));
     }
     Ok(false)
 }

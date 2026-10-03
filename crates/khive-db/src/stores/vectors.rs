@@ -1013,6 +1013,16 @@ fn orphan_sweep_dml(
             p = orphan_pred,
         );
         let mut select_stmt = conn.prepare(&select_sql)?;
+        // vec0 only selects its point plan for primary-key equality outside KNN,
+        // so the log insert and the delete each run once per victim id.
+        let log_sql = format!(
+            "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
+             SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
+             FROM {table} WHERE subject_id = ?1"
+        );
+        let mut log_stmt = conn.prepare(&log_sql)?;
+        let del_sql = format!("DELETE FROM {table} WHERE subject_id = ?1");
+        let mut delete_stmt = conn.prepare(&del_sql)?;
         let mut total: i64 = 0;
         let mut remaining = max_delete;
         while remaining > 0 {
@@ -1027,23 +1037,11 @@ fn orphan_sweep_dml(
                 break;
             }
 
-            let placeholders: String = (1..=victim_ids.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let in_clause = format!("subject_id IN ({placeholders})");
-            let params: Vec<&dyn rusqlite::ToSql> = victim_ids
-                .iter()
-                .map(|s| s as &dyn rusqlite::ToSql)
-                .collect();
-            let log_sql = format!(
-                "INSERT INTO ann_write_log (namespace, embedding_model, kind, field, subject_id, op) \
-                 SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
-                 FROM {table} WHERE {in_clause}"
-            );
-            conn.prepare_cached(&log_sql)?.execute(params.as_slice())?;
-            let del_sql = format!("DELETE FROM {t} WHERE {in_clause}", t = table);
-            total += conn.prepare_cached(&del_sql)?.execute(params.as_slice())? as i64;
+            for id in &victim_ids {
+                log_stmt.execute([id.as_str()])?;
+                total += delete_stmt.execute([id.as_str()])? as i64;
+            }
+            // The relational provenance sidecar keeps its bounded IN statement.
             delete_vector_provenance(conn, table, &victim_ids)?;
             remaining -= victim_ids.len() as i64;
         }
@@ -1936,8 +1934,6 @@ impl SqliteVecStore {
 #[cfg(all(test, feature = "vectors"))]
 mod point_lookup_tests {
     use std::collections::HashMap;
-    use std::ffi::{c_int, c_uint, c_void, CStr};
-    use std::sync::Mutex;
 
     use super::*;
     use crate::pool::PoolConfig;
@@ -2103,85 +2099,30 @@ mod point_lookup_tests {
     }
 
     // Capture statements executed by the public operations, so planner checks
-    // cannot accidentally exercise a separate copy of their SQL.
+    // cannot accidentally exercise a separate copy of their SQL. This rides the
+    // pool's shared statement observer: SQLite keeps one trace callback per
+    // connection, so a second hook here would silence the observer.
     struct StatementCapture {
-        pool: Arc<ConnectionPool>,
-        statements: Box<Mutex<Vec<String>>>,
-    }
-
-    unsafe extern "C" fn capture_statement(
-        event: c_uint,
-        context: *mut c_void,
-        statement: *mut c_void,
-        _detail: *mut c_void,
-    ) -> c_int {
-        if event != rusqlite::ffi::SQLITE_TRACE_STMT || statement.is_null() {
-            return 0;
-        }
-        let _ = std::panic::catch_unwind(|| {
-            // SAFETY: StatementCapture owns this boxed context until its Drop
-            // unregisters the callback on the same guarded connection. SQLite
-            // supplies a live statement for SQLITE_TRACE_STMT; sqlite3_sql is
-            // read-only and its string is copied before the callback returns.
-            let statements = unsafe { &*context.cast::<Mutex<Vec<String>>>() };
-            let sql = unsafe { rusqlite::ffi::sqlite3_sql(statement.cast()) };
-            if !sql.is_null() {
-                let sql = unsafe { CStr::from_ptr(sql) }
-                    .to_string_lossy()
-                    .into_owned();
-                if let Ok(mut statements) = statements.lock() {
-                    statements.push(sql);
-                }
-            }
-        });
-        0
+        observation: crate::StatementStartObservation,
     }
 
     impl StatementCapture {
         fn new(pool: Arc<ConnectionPool>) -> Self {
-            let mut capture = Self {
-                pool,
-                statements: Box::new(Mutex::new(Vec::new())),
-            };
-            {
-                let writer = capture.pool.try_writer().expect("pool writer");
-                // SAFETY: the in-memory pool uses this single connection for
-                // reads and writes. The writer guard serializes registration;
-                // the boxed callback context stays at a stable address.
-                let result = unsafe {
-                    rusqlite::ffi::sqlite3_trace_v2(
-                        writer.conn().handle(),
-                        rusqlite::ffi::SQLITE_TRACE_STMT,
-                        Some(capture_statement),
-                        (&mut *capture.statements as *mut Mutex<Vec<String>>).cast(),
-                    )
-                };
-                assert_eq!(result, rusqlite::ffi::SQLITE_OK, "install SQL capture");
-            }
-            capture
+            // The bound turns an unexpectedly long run into an error rather
+            // than a silently short list.
+            let observation = pool
+                .observe_test_statement_starts(100_000)
+                .expect("observe statement starts");
+            Self { observation }
         }
 
         fn finish(self) -> Vec<String> {
-            let statements = self.statements.lock().expect("captured statements").clone();
-            drop(self);
-            statements
-        }
-    }
-
-    impl Drop for StatementCapture {
-        fn drop(&mut self) {
-            let writer = self.pool.try_writer().expect("pool writer");
-            // SAFETY: the writer guard excludes concurrent statement execution;
-            // clear the callback before freeing its boxed context.
-            let result = unsafe {
-                rusqlite::ffi::sqlite3_trace_v2(
-                    writer.conn().handle(),
-                    0,
-                    None,
-                    std::ptr::null_mut(),
-                )
-            };
-            assert_eq!(result, rusqlite::ffi::SQLITE_OK, "remove SQL capture");
+            self.observation
+                .started_statements()
+                .expect("captured statements")
+                .into_iter()
+                .map(|statement| statement.sql)
+                .collect()
         }
     }
 
@@ -2329,6 +2270,142 @@ mod point_lookup_tests {
         }
         assert_point_plans(&fixture.pool, &statements, "INSERT INTO ann_write_log ");
         assert_point_plans(&fixture.pool, &statements, "DELETE FROM vec_point_lookup ");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_uses_point_plans_across_batches() {
+        let fixture = Fixture::new();
+        // Every ninth stored vector keeps a live entity. The rest are orphans,
+        // enough for one full 400-victim batch and a partial one.
+        let live: HashSet<String> = fixture
+            .stored
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 9 == 0)
+            .map(|(_, vector)| vector.id.to_string())
+            .collect();
+        {
+            let writer = fixture.pool.try_writer().expect("pool writer");
+            let conn = writer.conn();
+            conn.execute_batch(
+                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER); \
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER); \
+                 CREATE TABLE knowledge_atoms (id TEXT PRIMARY KEY, deleted_at INTEGER)",
+            )
+            .expect("create live-subject tables");
+            let mut insert = conn
+                .prepare("INSERT INTO entities (id, deleted_at) VALUES (?1, NULL)")
+                .expect("prepare live entity insert");
+            for id in &live {
+                insert.execute([id.as_str()]).expect("seed live entity");
+            }
+        }
+        let mut expected_log: Vec<_> = fixture
+            .stored
+            .iter()
+            .filter(|vector| !live.contains(&vector.id.to_string()))
+            .map(|vector| {
+                (
+                    vector.namespace.to_string(),
+                    vector.model.to_string(),
+                    vector.kind.to_string(),
+                    vector.field.to_string(),
+                    vector.id.to_string(),
+                    "delete".to_string(),
+                )
+            })
+            .collect();
+        expected_log.sort();
+        assert!(
+            expected_log.len() > 400,
+            "fixture must need more than one delete batch"
+        );
+        let capture = StatementCapture::new(Arc::clone(&fixture.pool));
+        let result = fixture
+            .store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![],
+                substrate_kinds: vec![],
+                max_delete: 1000,
+                dry_run: false,
+            })
+            .await
+            .expect("orphan sweep");
+        let statements = capture.finish();
+        assert_eq!(result.scanned as usize, fixture.stored.len());
+        assert_eq!(result.would_delete as usize, expected_log.len());
+        assert_eq!(result.deleted as usize, expected_log.len());
+        assert!(!result.max_delete_hit);
+        {
+            let writer = fixture.pool.try_writer().expect("pool writer");
+            let conn = writer.conn();
+            let mut log = conn
+                .prepare(
+                    "SELECT namespace, embedding_model, kind, field, subject_id, op \
+                     FROM ann_write_log",
+                )
+                .expect("read delete log");
+            let mut actual_log: Vec<(String, String, String, String, String, String)> = log
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .expect("query delete log")
+                .collect::<Result<_, _>>()
+                .expect("delete log rows");
+            actual_log.sort();
+            assert_eq!(actual_log, expected_log);
+            for sql in [
+                "SELECT subject_id FROM vec_point_lookup",
+                "SELECT subject_id FROM vector_provenance WHERE model_key = 'point_lookup'",
+            ] {
+                let actual: HashSet<String> = conn
+                    .prepare(sql)
+                    .expect("read surviving identities")
+                    .query_map([], |row| row.get(0))
+                    .expect("query surviving identities")
+                    .collect::<Result<_, _>>()
+                    .expect("surviving identities");
+                assert_eq!(actual, live);
+            }
+            assert!(conn.is_autocommit(), "sweep must finish its transaction");
+        }
+        assert_point_plans(&fixture.pool, &statements, "INSERT INTO ann_write_log ");
+        assert_point_plans(&fixture.pool, &statements, "DELETE FROM vec_point_lookup ");
+    }
+
+    #[tokio::test]
+    async fn observer_still_records_after_a_statement_capture_is_dropped() {
+        let fixture = Fixture::new();
+        drop(StatementCapture::new(Arc::clone(&fixture.pool)));
+        let observation = fixture
+            .pool
+            .observe_test_statement_starts(8)
+            .expect("observe after capture");
+        let sql = "SELECT 17 AS after_capture";
+        {
+            let writer = fixture.pool.try_writer().expect("pool writer");
+            let value: i64 = writer
+                .conn()
+                .query_row(sql, [], |row| row.get(0))
+                .expect("run statement");
+            assert_eq!(value, 17);
+        }
+        assert_eq!(
+            observation.started_statements().expect("observed starts"),
+            vec![crate::StartedStatement {
+                sql: sql.to_owned(),
+                readonly: true,
+            }],
+            "a dropped capture must leave the shared observer recording"
+        );
     }
 }
 

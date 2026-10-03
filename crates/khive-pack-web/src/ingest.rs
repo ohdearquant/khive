@@ -403,6 +403,9 @@ impl WebPack {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod descriptor_tests;
+
     use super::*;
     use khive_pack_kg::KgPack;
     use khive_runtime::engine_config::WebSectionConfig;

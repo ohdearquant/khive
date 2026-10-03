@@ -75,6 +75,11 @@ impl TraversalExecutionBudget {
         self.max_duration
     }
 
+    /// Wall-clock time left in the original execution window, without renewal.
+    pub fn remaining_duration(&self) -> Duration {
+        self.max_duration.saturating_sub(self.started_at.elapsed())
+    }
+
     pub fn is_expired(&self) -> bool {
         self.started_at.elapsed() >= self.max_duration
     }

@@ -503,6 +503,15 @@ false). Resolution, namespace/message-kind checks, inbound-direction enforcement
 authorization, legacy-row compatibility, deduplication, response ordering, and aggregate counts
 are shared with `handle_read` rather than reimplemented.
 
+Complete UUID inputs are read in contiguous windows of at most 128 occurrences. A prefix or
+other spelling is resolved serially at its original position; lookahead stops before it. Each
+occurrence passes the ordinary namespace, message-kind, direction and recipient checks before
+successful UUIDs are deduplicated. A healthy window observes each distinct row once, so duplicates
+within that window share the same stored version. There is no cache across windows. This is a
+bounded live observation, not a request snapshot. If a window read fails, its results are discarded
+and those occurrences are point-read in their original order, preserving the first refusal and
+its text. Only live rows are read by both paths.
+
 The default path calls the same best-effort target loop documented above. `atomic=true` instead
 passes the unique target UUIDs and the same live eligibility `NoteFilter` to
 `NoteStore::patch_note_property_atomic`. The SQLite implementation executes every guarded
@@ -514,6 +523,11 @@ executors verify that finalization restored autocommit mode. An unverified rollb
 commit, or any other poisoned-connection state returns `side_effects_unknown`. Any transaction-body
 panic also retires its writer (reporting `transaction_rolled_back` only when rollback was verified),
 rather than allowing another request to reuse a terminal connection.
+
+After a successful atomic commit, fresh properties are also read in windows of at most 128.
+Any failed window falls back to fresh point reads. A missing or unreadable row still reports the
+committed mark as successful, with `read=true` merged into its validated property snapshot; good
+siblings retain their fresh properties. The write transaction is never retried by this readback.
 
 ## `handlers.rs::handle_reply`
 
@@ -612,6 +626,13 @@ value since there is no specific row to break ties against.
 The optional `fields` projection is identical to `comm.inbox` and is applied
 only after visibility filtering, dual-write deduplication, cursor filtering,
 ordering, and truncation. Omitting it preserves the full thread response.
+
+The physical scan uses 200-row keyset windows in `created_at DESC, id ASC` order, advancing
+from the last physically fetched row before actor filtering or twin folding. It avoids growing
+OFFSET rescans while keeping the logical response limit after the complete physical scan. Like
+inbox, this is a live window walk: deletion of an already-fetched row does not skip an older row;
+a new row inserted before a cursor already passed may not be observed. It does not create a
+snapshot, bound total thread memory/work, or change the public chronological cursor contract.
 
 ## `handlers.rs::handle_ingest`
 

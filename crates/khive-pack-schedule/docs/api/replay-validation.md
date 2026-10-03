@@ -159,9 +159,24 @@ not only discovered at trigger-time replay. `context` prefixes error messages (e
 `ScheduleBulkCreateEntryCheck` mirrors
 `khive-pack-kg::handlers::params::BulkCreateEntry`'s exact field set (including
 `#[serde(deny_unknown_fields)]`) so schedule-time validation rejects the same
-malformed entries the real bulk handler would. `validate_create_bulk_items`
-validates a `create(items=[...])` bulk payload the way `handle_create`'s bulk path
-would: `items` must parse into that shape (required `kind` + `name`,
-deny-unknown-fields), and bulk create only supports entity kinds (never note kinds).
+malformed entries the real bulk handler would. `name` and `content` are optional on
+the struct because whether they are required depends on the substrate `kind` resolves
+to, exactly as in the KG pack. `validate_create_bulk_items` validates a
+`create(items=[...])` bulk payload the way `handle_create`'s bulk path would: `items`
+must parse into that shape (deny-unknown-fields), then each entry is classified with
+`classify_create_kind`:
+
+- An entity item requires a non-empty `name`, applies the same `kind`/`entity_kind` and
+  `entity_type` reconciliation as the singleton path, and refuses the note-only fields
+  `content`, `note_kind` and `salience`.
+- A note item requires non-empty `content`, reconciles `kind` against `note_kind` (a
+  bare `kind="note"` defaults to `observation`), refuses the entity-only fields
+  `entity_kind`, `entity_type` and `description`, and refuses `scheduled_event`, which
+  bulk create never creates.
+
+`khive-pack-schedule` cannot import the KG pack's private struct, so the field set is a
+local copy. `schedule_bulk_create_check_accepts_every_field_of_the_kg_bulk_entry` in
+`create_validation.rs` reads the field list out of the KG struct's source and fails
+when the KG pack gains or renames a field that this check does not accept.
 
 Source: `crates/khive-pack-schedule/src/handlers.rs`.

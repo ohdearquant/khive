@@ -459,6 +459,25 @@ pub fn parse_pack_list(s: &str) -> Vec<String> {
         .collect()
 }
 
+const ANN_REBUILD_THRESHOLD_DEFAULT: f64 = 0.20;
+
+/// Read the ANN tail-rebuild fraction on each invocation (ADR-079 Amendment 2).
+///
+/// The exact environment value must parse as `f64` and lie in `(0, 1]`;
+/// unset, non-Unicode, malformed and out-of-range values use `0.20`.
+/// This reader deliberately does not trim or cache the value.
+pub fn ann_rebuild_threshold_from_env() -> f64 {
+    std::env::var("KHIVE_ANN_REBUILD_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0 && *v <= 1.0)
+        .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
+}
+
+#[cfg(test)]
+#[path = "config/ann_rebuild_threshold_tests.rs"]
+mod ann_rebuild_threshold_tests;
+
 /// Interpret the construction-time `KHIVE_ANN_FRESH_TAIL` value.
 ///
 /// Preserve the escape hatch's existing semantics while moving its read out of
