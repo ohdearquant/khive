@@ -414,6 +414,14 @@ async fn activate_with_creator_provenance(
     Ok(())
 }
 
+#[cfg(test)]
+#[path = "create_refusal_tests.rs"]
+mod create_refusal_tests;
+
+#[cfg(test)]
+#[path = "resource_alias_drift_tests.rs"]
+mod resource_alias_drift_tests;
+
 /// Rejects scheduled actions known to fail a handler's *conditional*
 /// required param even though `describe_verb` marks none of the
 /// alternatives `required:true` (issue #461) — hard-codes the `create`
@@ -503,13 +511,24 @@ fn validate_conditional_requirements(
             )?;
         }
         CreateKindClass::Note { specific } => {
-            reconcile_specific_for_replay(
+            let canonical = reconcile_specific_for_replay(
                 "",
                 specific,
                 note_kind_arg,
                 |s| canonical_note_kind_for_replay(s, registry),
                 "note_kind",
             )?;
+            if canonical.as_deref() == Some("scheduled_event") {
+                // KG's refusal is private; the real dual-dispatch fixture
+                // keeps this reason aligned without expanding its public API.
+                return Err(RuntimeError::InvalidInput(
+                    "kind=scheduled_event is not creatable via `create` — its \
+                     `created_by_actor` is a trust boundary for replay dispatch and must \
+                     be derived from the authenticated caller, not caller-supplied \
+                     properties; use `schedule.remind` or `schedule.schedule` instead"
+                        .into(),
+                ));
+            }
             let content = args
                 .get("content")
                 .and_then(khive_request::ArgValue::as_value)
@@ -648,8 +667,9 @@ fn canonical_note_kind_for_replay(
 /// Hand-copied ADR-048 `resource`-kind alias set mirroring
 /// `khive-pack-kg::vocab::EntityKind`'s `FromStr` arm (that type is
 /// pack-private). `normalized` must already be trimmed + lowercased. Kept in
-/// sync with the CI-checked `entity_kind_resource_aliases_match_real_vocab`
-/// test. See `docs/api/replay-validation.md#resource_alias_for_replay`.
+/// sync with the source-reading `entity_kind_resource_aliases_match_real_vocab`
+/// test in `src/resource_alias_drift_tests.rs`. See
+/// `docs/api/replay-validation.md#resource_alias_for_replay`.
 fn resource_alias_for_replay(normalized: &str) -> bool {
     matches!(
         normalized,

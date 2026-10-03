@@ -188,6 +188,30 @@ pub fn count(unit: UsageUnit, n: u64) {
     }
 }
 
+/// Publish event rows only after a write has a known committed outcome.
+/// An unknown writer-task outcome makes the entire shipping snapshot unavailable,
+/// even if earlier work already produced measured counters. The original result
+/// and error remain unchanged.
+pub fn account_event_write(outcome: Result<u64, &crate::StorageError>) {
+    match outcome {
+        Ok(committed_rows) => count(UsageUnit::EventRows, committed_rows),
+        Err(
+            crate::StorageError::WriterTaskRequestFailed {
+                request_state: crate::WriterTaskRequestState::SideEffectsUnknown,
+                ..
+            }
+            | crate::StorageError::WriterTaskTerminated {
+                request_state: crate::WriterTaskRequestState::SideEffectsUnknown,
+            },
+        ) => {
+            if let Some(context) = current() {
+                context.mark_unmeasured();
+            }
+        }
+        Err(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

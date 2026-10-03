@@ -294,7 +294,7 @@ fn cas_refused(argv: &[&str], stderr: &[u8]) -> bool {
     else {
         return false;
     };
-    observed.len() == 40 && observed.bytes().all(|byte| byte.is_ascii_hexdigit())
+    crate::object_id::is_40_hex(observed.as_bytes())
 }
 
 fn run_git(
@@ -498,7 +498,7 @@ async fn run_async_with_snapshot(
 }
 
 fn validate_oid(value: &str, field: &str) -> Result<()> {
-    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !crate::object_id::is_40_hex(value.as_bytes()) {
         return Err(LocalGitError::new(
             "invalid_params",
             format!("{field} must be a 40-hex SHA"),
@@ -511,7 +511,7 @@ fn oid_output(bytes: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| LocalGitError::new("git_output", "git returned a non-UTF-8 object id"))?
         .trim();
-    if text.len() != 40 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !crate::object_id::is_40_hex(text.as_bytes()) {
         return Err(LocalGitError::new(
             "git_output",
             "git did not return one SHA-1 object id",
@@ -783,6 +783,7 @@ pub(crate) async fn write_manifest_tree(
         .blob_hydrator()
         .ok_or_else(|| RuntimeError::Unconfigured("git blob hydrator is not installed".into()))?;
     let mut directories: BTreeMap<String, Vec<GitEntry>> = BTreeMap::new();
+    let mut object_ids = BTreeMap::<ContentRef, String>::new();
     let mut filters = None;
     directories.insert(String::new(), Vec::new());
     for entry in entries {
@@ -791,16 +792,23 @@ pub(crate) async fn write_manifest_tree(
         let bytes = hydrator
             .hydrate_verified(&content_ref, MAX_BLOB_WHOLE_BYTES)
             .await?;
-        let oid = oid_output(
-            &run_async_hydrated(
-                program,
-                repo,
-                &["hash-object", "-w", "--no-filters", "--stdin"],
-                bytes,
-                &mut filters,
-            )
-            .await?,
-        )?;
+        let oid = if let Some(oid) = object_ids.get(&content_ref) {
+            drop(bytes);
+            oid.clone()
+        } else {
+            let oid = oid_output(
+                &run_async_hydrated(
+                    program,
+                    repo,
+                    &["hash-object", "-w", "--no-filters", "--stdin"],
+                    bytes,
+                    &mut filters,
+                )
+                .await?,
+            )?;
+            object_ids.insert(content_ref, oid.clone());
+            oid
+        };
         let (parent, name) = parent_and_name(&entry.path);
         directories
             .entry(parent.to_string())
@@ -1045,7 +1053,7 @@ fn parse_operation_recorded(bytes: &[u8], new_sha: &str, marker: &str) -> Result
             .position(|byte| *byte == 0)
             .ok_or_else(invalid)?;
         let oid = &remaining[..end];
-        if oid.len() != 40 || !oid.iter().all(u8::is_ascii_hexdigit) {
+        if !crate::object_id::is_40_hex(oid) {
             return Err(invalid());
         }
         remaining = &remaining[end + 1..];
@@ -1679,6 +1687,10 @@ pub(crate) async fn log(
     }
     Ok(entries)
 }
+
+#[cfg(all(test, unix))]
+#[path = "local_git_gp_tests.rs"]
+mod gp_tests;
 
 #[cfg(test)]
 mod tests {

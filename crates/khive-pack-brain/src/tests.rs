@@ -12698,3 +12698,6 @@ mod dispatch_counters {
         assert_eq!(state.snapshot_serializations.load(Ordering::Relaxed), 1);
     }
 }
+
+#[path = "event_usage_tests.rs"]
+mod event_usage_tests;

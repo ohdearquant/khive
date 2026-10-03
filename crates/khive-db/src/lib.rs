@@ -7,6 +7,8 @@
 pub mod backend;
 /// Periodic WAL checkpoint task.
 pub mod checkpoint;
+/// Durable database owner identity paired with the opened physical file.
+pub mod database_owner_identity;
 /// Read-only-by-intent database-integrity and WAL/checkpoint diagnostics.
 pub mod diagnostics;
 /// Error types for the SQLite layer.
@@ -55,6 +57,7 @@ pub use checkpoint::{
     CheckpointTick,
 };
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
+pub use database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
 pub use error::{
     SqliteError, SQLITE_WAL_CAPACITY_REFUSED_STAGE, SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE,
 };

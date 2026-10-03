@@ -66,6 +66,7 @@ const BUILD_SEED: u64 = 0x5641_4d41_4e41;
 // build_alpha_one_two_passes_are_not_idempotent_at_scale).
 #[cfg(test)]
 thread_local! {
+    static VISITED_SET_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MAX_PASSES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
@@ -115,6 +116,8 @@ pub struct VisitedSet {
 impl VisitedSet {
     /// Create a new `VisitedSet` with pre-allocated capacity for `capacity` nodes.
     pub fn new(capacity: usize) -> Self {
+        #[cfg(test)]
+        VISITED_SET_ALLOCATIONS.with(|count| count.set(count.get().wrapping_add(1)));
         Self {
             marks: vec![0; capacity],
             generation: 1,
@@ -166,6 +169,77 @@ impl VisitedSet {
         Self {
             marks: vec![0; capacity],
             generation,
+        }
+    }
+}
+
+/// Pass-local scratch indexed by the current Rayon pool's real workers.
+///
+/// Broadcast partitions each batch into contiguous ranges. A worker locks only
+/// its own slot once for that range; proposals themselves run without locks or
+/// nested parallel work. Scratch stays alive across all batches in the pass.
+struct BuildScratch {
+    #[cfg(feature = "parallel")]
+    slots: Vec<std::sync::Mutex<Option<VisitedSet>>>,
+    #[cfg(feature = "parallel")]
+    capacity: usize,
+    #[cfg(not(feature = "parallel"))]
+    visited: VisitedSet,
+}
+
+impl BuildScratch {
+    fn new(capacity: usize) -> Self {
+        Self {
+            #[cfg(feature = "parallel")]
+            slots: (0..rayon::current_num_threads())
+                .map(|_| std::sync::Mutex::new(None))
+                .collect(),
+            #[cfg(feature = "parallel")]
+            capacity,
+            #[cfg(not(feature = "parallel"))]
+            visited: VisitedSet::new(capacity),
+        }
+    }
+
+    fn collect<F>(&mut self, batch: &[u32], prior: &[Vec<u32>], propose: F) -> Vec<(u32, Vec<u32>)>
+    where
+        F: Fn(u32, &[u32], &mut VisitedSet) -> (u32, Vec<u32>) + Sync,
+    {
+        #[cfg(feature = "parallel")]
+        {
+            let mut parts = rayon::broadcast(|worker| {
+                let index = worker.index();
+                let workers = worker.num_threads();
+                let width = batch.len() / workers;
+                let remainder = batch.len() % workers;
+                let start = width * index + index.min(remainder);
+                let end = start + width + usize::from(index < remainder);
+                if start == end {
+                    return (index, Vec::new());
+                }
+                let mut slot = self.slots[index]
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let visited = slot.get_or_insert_with(|| VisitedSet::new(self.capacity));
+                let proposals = (start..end)
+                    .map(|position| propose(batch[position], &prior[position], visited))
+                    .collect::<Vec<_>>();
+                (index, proposals)
+            });
+            // Preserve batch order independently of broadcast completion order.
+            parts.sort_unstable_by_key(|(index, _)| *index);
+            parts
+                .into_iter()
+                .flat_map(|(_, proposals)| proposals)
+                .collect()
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            batch
+                .iter()
+                .zip(prior)
+                .map(|(&node, neighbors)| propose(node, neighbors, &mut self.visited))
+                .collect()
         }
     }
 }
@@ -242,18 +316,18 @@ impl VamanaGraph {
 
         let alphas = refinement_alpha_schedule(config.alpha);
         for &pass_alpha in &alphas {
+            let mut scratch = BuildScratch::new(num_vectors);
             for batch in order.chunks(batch_size) {
                 // L1: capture only the current neighbors of the batch nodes (O(batch*R))
                 // instead of cloning the full adjacency (O(N)). The greedy search reads
                 // `adjacency` directly — this is safe because adjacency is not mutated
-                // until after all proposals are collected (the par_iter below is read-only).
+                // until after all proposals are collected (proposal work is read-only).
                 let batch_prior: Vec<Vec<u32>> = batch
                     .iter()
                     .map(|&node| adjacency[node as usize].clone())
                     .collect();
 
-                let propose = |(&node, prior_neighbors): (&u32, &Vec<u32>)| {
-                    let mut visited = VisitedSet::new(num_vectors);
+                let propose = |node: u32, prior_neighbors: &[u32], visited: &mut VisitedSet| {
                     let query = row(vectors, config.dimensions, node);
                     let search = greedy_search_inner(
                         vectors,
@@ -263,7 +337,7 @@ impl VamanaGraph {
                         medoid,
                         config.max_degree,
                         config.search_list_size,
-                        &mut visited,
+                        visited,
                         None, // no tombstones during build
                     );
 
@@ -287,15 +361,7 @@ impl VamanaGraph {
 
                     (node, neighbors)
                 };
-                #[cfg(feature = "parallel")]
-                let proposals: Vec<(u32, Vec<u32>)> = batch
-                    .par_iter()
-                    .zip(batch_prior.par_iter())
-                    .map(propose)
-                    .collect();
-                #[cfg(not(feature = "parallel"))]
-                let proposals: Vec<(u32, Vec<u32>)> =
-                    batch.iter().zip(batch_prior.iter()).map(propose).collect();
+                let proposals = scratch.collect(batch, &batch_prior, propose);
 
                 for (node, neighbors) in &proposals {
                     adjacency[*node as usize] = neighbors.clone();
@@ -386,14 +452,14 @@ impl VamanaGraph {
 
         let alphas = refinement_alpha_schedule(config.alpha);
         for &pass_alpha in &alphas {
+            let mut scratch = BuildScratch::new(num_vectors);
             for batch in order.chunks(batch_size) {
                 let batch_prior: Vec<Vec<u32>> = batch
                     .iter()
                     .map(|&node| adjacency[node as usize].clone())
                     .collect();
 
-                let propose = |(&node, prior_neighbors): (&u32, &Vec<u32>)| {
-                    let mut visited = VisitedSet::new(num_vectors);
+                let propose = |node: u32, prior_neighbors: &[u32], visited: &mut VisitedSet| {
                     let query = row(vectors, config.dimensions, node);
                     let query_enc = encoded.code(node as usize);
                     let search = greedy_search_inner_sq8(
@@ -407,7 +473,7 @@ impl VamanaGraph {
                         medoid,
                         config.max_degree,
                         config.search_list_size,
-                        &mut visited,
+                        visited,
                         None,
                     );
 
@@ -433,15 +499,7 @@ impl VamanaGraph {
 
                     (node, neighbors)
                 };
-                #[cfg(feature = "parallel")]
-                let proposals: Vec<(u32, Vec<u32>)> = batch
-                    .par_iter()
-                    .zip(batch_prior.par_iter())
-                    .map(propose)
-                    .collect();
-                #[cfg(not(feature = "parallel"))]
-                let proposals: Vec<(u32, Vec<u32>)> =
-                    batch.iter().zip(batch_prior.iter()).map(propose).collect();
+                let proposals = scratch.collect(batch, &batch_prior, propose);
 
                 for (node, neighbors) in &proposals {
                     adjacency[*node as usize] = neighbors.clone();
@@ -1222,6 +1280,14 @@ fn build_reverse_adj(adjacency: &[Vec<u32>]) -> Vec<Vec<u32>> {
 // exposed in the public API. Moving them to `tests/` would require pub(crate) re-exports
 // that would bloat the public surface. The graph.rs build logic is complex enough that
 // keeping unit tests close to the code they cover outweighs the file-size cost.
+#[cfg(test)]
+#[path = "graph_build_parity_tests.rs"]
+mod build_parity_tests;
+
+#[cfg(test)]
+#[path = "graph_build_scratch_tests.rs"]
+mod build_scratch_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
