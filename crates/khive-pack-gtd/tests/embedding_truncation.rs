@@ -6,8 +6,15 @@ mod common;
 
 use common::{assign, pack, rt};
 use serde_json::json;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
-struct TruncationEmbeddingService;
+struct TruncationEmbeddingService {
+    calls: Arc<AtomicUsize>,
+    dimensions: usize,
+}
 
 #[async_trait::async_trait]
 impl lattice_embed::EmbeddingService for TruncationEmbeddingService {
@@ -16,7 +23,8 @@ impl lattice_embed::EmbeddingService for TruncationEmbeddingService {
         texts: &[String],
         _model: lattice_embed::EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
-        Ok(vec![vec![1.0]; texts.len()])
+        self.calls.fetch_add(texts.len(), Ordering::SeqCst);
+        Ok(vec![vec![1.0; self.dimensions]; texts.len()])
     }
 
     fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
@@ -28,24 +36,46 @@ impl lattice_embed::EmbeddingService for TruncationEmbeddingService {
     }
 }
 
-struct TruncationEmbedderProvider;
+struct TruncationEmbedderProvider {
+    name: &'static str,
+    calls: Arc<AtomicUsize>,
+    dimensions: usize,
+}
 
 #[async_trait::async_trait]
 impl khive_runtime::EmbedderProvider for TruncationEmbedderProvider {
     fn name(&self) -> &str {
-        "gtd-truncation-test"
+        self.name
     }
 
     fn dimensions(&self) -> usize {
-        1
+        self.dimensions
     }
 
     async fn build(
         &self,
     ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
     {
-        Ok(std::sync::Arc::new(TruncationEmbeddingService))
+        Ok(Arc::new(TruncationEmbeddingService {
+            calls: self.calls.clone(),
+            dimensions: self.dimensions,
+        }))
     }
+}
+
+fn register_embedder(rt: &khive_runtime::KhiveRuntime, name: &'static str) -> Arc<AtomicUsize> {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let dimensions = if name == "multilingual-e5-small" {
+        lattice_embed::EmbeddingModel::MultilingualE5Small.dimensions()
+    } else {
+        1
+    };
+    rt.register_embedder(TruncationEmbedderProvider {
+        name,
+        calls: calls.clone(),
+        dimensions,
+    });
+    calls
 }
 
 #[tokio::test]
@@ -54,7 +84,7 @@ async fn assign_over_embedding_budget_records_dependencies_and_discloses_truncat
     use khive_storage::EdgeRelation;
 
     let rt = rt();
-    rt.register_embedder(TruncationEmbedderProvider);
+    register_embedder(&rt, "gtd-truncation-test");
     let pack = pack(rt.clone());
 
     let blocker = assign(&pack, json!({"title": "write spec"})).await;
@@ -102,9 +132,9 @@ async fn assign_over_embedding_budget_records_dependencies_and_discloses_truncat
 }
 
 #[tokio::test]
-async fn keyed_assign_discloses_truncation_on_fresh_write_and_not_on_replay() {
+async fn keyed_assign_discloses_truncation_on_fresh_write_and_replay_without_embedding() {
     let rt = rt();
-    rt.register_embedder(TruncationEmbedderProvider);
+    let calls = register_embedder(&rt, "gtd-truncation-test");
     let pack = pack(rt.clone());
 
     let args = json!({
@@ -124,6 +154,11 @@ async fn keyed_assign_discloses_truncation_on_fresh_write_and_not_on_replay() {
         "a fresh keyed assign must disclose the truncated embedding input: {created}"
     );
 
+    let calls_before_replay = calls.load(Ordering::SeqCst);
+    assert!(
+        calls_before_replay > 0,
+        "the fresh write must embed content"
+    );
     let replayed = assign(&pack, args).await;
     assert_eq!(
         replayed["replayed"],
@@ -131,8 +166,134 @@ async fn keyed_assign_discloses_truncation_on_fresh_write_and_not_on_replay() {
         "second call replays: {replayed}"
     );
     assert_eq!(replayed["full_id"], created["full_id"]);
+    assert_eq!(
+        replayed["warnings"], created["warnings"],
+        "an identical retry must retain the embedding truncation disclosure: {replayed}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        calls_before_replay,
+        "replay must disclose truncation without embedding again"
+    );
+}
+
+#[tokio::test]
+async fn keyed_assign_replay_warning_respects_model_budget_and_no_embeddings() {
+    for (model, content_bytes, truncated) in [
+        (
+            Some("gtd-truncation-test"),
+            lattice_embed::MAX_TEXT_BYTES,
+            false,
+        ),
+        (
+            Some("multilingual-e5-small"),
+            khive_runtime::retrieval::document_embedding_budget("multilingual-e5-small"),
+            false,
+        ),
+        (
+            Some("multilingual-e5-small"),
+            khive_runtime::retrieval::document_embedding_budget("multilingual-e5-small") + 1,
+            true,
+        ),
+        (None, lattice_embed::MAX_TEXT_BYTES + 1, false),
+    ] {
+        let rt = rt();
+        let calls = model.map(|name| register_embedder(&rt, name));
+        let pack = pack(rt.clone());
+        let args = json!({
+            "title": "budget boundary task",
+            "description": "x".repeat(content_bytes),
+            "idempotency_key": "budget-boundary",
+        });
+        let created = assign(&pack, args.clone()).await;
+        let calls_before_replay = calls.as_ref().map(|count| count.load(Ordering::SeqCst));
+        let replayed = assign(&pack, args).await;
+
+        assert_eq!(replayed["full_id"], created["full_id"]);
+        assert_eq!(replayed["replayed"], json!(true));
+        for response in [&created, &replayed] {
+            assert_eq!(
+                response.get("warnings").is_some(),
+                truncated,
+                "model={model:?}, content_bytes={content_bytes}: {response}"
+            );
+        }
+        assert_eq!(
+            calls.as_ref().map(|count| count.load(Ordering::SeqCst)),
+            calls_before_replay,
+            "model={model:?}: replay must not embed again"
+        );
+        let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
+        let stored = rt
+            .notes(&token)
+            .unwrap()
+            .get_live_notes_by_key("local", "budget-boundary", Some("task"))
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1, "replay must not create another task");
+        assert_eq!(stored[0].content.len(), content_bytes);
+    }
+}
+
+#[tokio::test]
+async fn keyed_assign_replay_discloses_model_prefix_truncation() {
+    let model = lattice_embed::EmbeddingModel::MultilingualE5Small;
+    let prefix_bytes = model.document_instruction().unwrap().len();
+    assert_eq!(prefix_bytes, 9);
+    let content_bytes = lattice_embed::MAX_TEXT_BYTES - prefix_bytes + 1;
+    assert!(content_bytes < lattice_embed::MAX_TEXT_BYTES);
+
+    let rt = rt();
+    let calls = register_embedder(&rt, "multilingual-e5-small");
+    let pack = pack(rt.clone());
+    let args = json!({
+        "title": "E5 passage prefix budget",
+        "description": "x".repeat(content_bytes),
+        "idempotency_key": "e5-prefix-truncation",
+    });
+    let created = assign(&pack, args.clone()).await;
+    assert_eq!(
+        created["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "the passage prefix must consume the fresh embedding budget: {created}"
+    );
+    let calls_before_replay = calls.load(Ordering::SeqCst);
+    assert!(calls_before_replay > 0);
+    let replayed = assign(&pack, args).await;
+    assert_eq!(replayed["full_id"], created["full_id"]);
+    assert_eq!(replayed["replayed"], json!(true));
+    assert_eq!(
+        replayed["warnings"], created["warnings"],
+        "replay must deduct the passage prefix from the embedding budget: {replayed}"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), calls_before_replay);
+}
+
+#[tokio::test]
+async fn keyed_assign_replay_warning_ignores_models_excluded_by_task_policy() {
+    let rt = rt();
+    let calls = register_embedder(&rt, "gtd-truncation-test");
+    rt.install_note_embedding_policies(&[khive_runtime::NoteEmbeddingPolicySpec {
+        kind: "task",
+        policy: khive_runtime::NoteEmbeddingPolicy::DefaultModel,
+    }]);
+    assert!(!rt.registered_embedding_model_names().is_empty());
+    assert!(rt.embedding_models_for_note_kind("task").is_empty());
+    let pack = pack(rt.clone());
+    let args = json!({
+        "title": "task with no selected embedding model",
+        "description": "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1),
+        "idempotency_key": "task-embedding-policy",
+    });
+    let created = assign(&pack, args.clone()).await;
+    let replayed = assign(&pack, args).await;
+
+    assert_eq!(replayed["full_id"], created["full_id"]);
+    assert_eq!(replayed["replayed"], json!(true));
+    assert!(created.get("warnings").is_none());
     assert!(
         replayed.get("warnings").is_none(),
-        "a replay embeds nothing, so it must carry no truncation warning: {replayed}"
+        "an unselected model must not produce a truncation warning: {replayed}"
     );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
