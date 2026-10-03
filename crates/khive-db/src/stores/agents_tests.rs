@@ -115,6 +115,39 @@ async fn test_update_state_and_terminal_reason() {
     let fetched = store.get("agent-2").await.unwrap().unwrap();
     assert_eq!(fetched.state, AgentState::Terminal);
     assert_eq!(fetched.terminal_reason, Some(TerminalReason::Completed));
+
+    // Every spelling `as_str` writes must read back as the same variant.
+    let non_terminal = [
+        AgentState::Spawned,
+        AgentState::Running,
+        AgentState::Suspended,
+    ];
+    for state in non_terminal {
+        store
+            .update_state("agent-2", state, None, 4_000)
+            .await
+            .unwrap();
+        let fetched = store.get("agent-2").await.unwrap().unwrap();
+        assert_eq!(fetched.state, state);
+        assert_eq!(fetched.terminal_reason, None);
+    }
+
+    let reasons = [
+        TerminalReason::Completed,
+        TerminalReason::Failed,
+        TerminalReason::Killed,
+        TerminalReason::Abandoned,
+        TerminalReason::HostRestart,
+    ];
+    for reason in reasons {
+        store
+            .update_state("agent-2", AgentState::Terminal, Some(reason), 5_000)
+            .await
+            .unwrap();
+        let fetched = store.get("agent-2").await.unwrap().unwrap();
+        assert_eq!(fetched.state, AgentState::Terminal);
+        assert_eq!(fetched.terminal_reason, Some(reason));
+    }
 }
 
 #[tokio::test]
