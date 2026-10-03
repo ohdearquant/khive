@@ -687,6 +687,10 @@ async fn search_embedding(
 }
 
 #[cfg(test)]
+#[path = "embedding_warning_tests.rs"]
+mod embedding_warning_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         sync::{

@@ -7185,7 +7185,8 @@ async fn remember_over_embedding_budget_succeeds_and_discloses_truncation() {
 }
 
 /// A keyed memory over the embedder input budget discloses the truncation on
-/// the fresh write; replaying the same key embeds nothing and warns of nothing.
+/// the fresh write and its replay. Replay retains the stored identity and
+/// fences, reports its recomputed truncation, and adds no rows.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn keyed_remember_discloses_truncation_on_fresh_write_and_not_on_replay() {
@@ -7227,9 +7228,10 @@ async fn keyed_remember_discloses_truncation_on_fresh_write_and_not_on_replay() 
         "second call replays: {replayed}"
     );
     assert_eq!(replayed["id"], created["id"]);
-    assert!(
-        replayed.get("warnings").is_none(),
-        "a replay embeds nothing, so it must carry no truncation warning: {replayed}"
+    assert_eq!(
+        replayed["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "a replay must disclose its computed truncated embedding input: {replayed}"
     );
 }
 
@@ -7324,9 +7326,9 @@ async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay
             assert_eq!(replayed["id"], created["id"]);
             assert_eq!(replayed["replayed"], json!(true));
             assert_eq!(replayed["visibility_token"], receipt);
-            assert!(
-                replayed.get("warnings").is_none(),
-                "replay embeds nothing new"
+            assert_eq!(
+                replayed["warnings"], created["warnings"],
+                "replay must retain its computed truncation warning with the original fence"
             );
             let mut reader = rt.sql().reader().await.unwrap();
             let replay_rows = reader

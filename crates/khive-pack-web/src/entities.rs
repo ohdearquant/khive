@@ -2,8 +2,8 @@
 //! seam (ADR-191 D3: "every write lands in the caller's namespace through
 //! the runtime's create seam").
 //!
-//! `KhiveRuntime::create_entity` (and every other `operations.rs` create
-//! helper) always assigns a fresh `Uuid::new_v4()` — there is no public,
+//! `KhiveRuntime::create_entity_with_embedding_report` assigns a fresh
+//! `Uuid::new_v4()` — there is no public,
 //! non-crate-private path that both accepts a caller-supplied id AND runs
 //! the full FTS+embedding indexing pipeline in one call (verified by reading
 //! `operations.rs::create_entity_with_embedding_report_inner`, whose
@@ -16,9 +16,9 @@
 //! The seam this module uses instead is two public runtime calls, both part
 //! of "the runtime" in the same sense `operations.rs`'s own internals are:
 //! `KhiveRuntime::entities()` (the `EntityStore` capability trait, ADR-005)
-//! for the id-carrying insert, then `KhiveRuntime::update_entity()` (the
-//! same method the `update` verb dispatches to) to route the real name and
-//! properties through the ordinary reindex path. `update_entity`'s reindex
+//! for the id-carrying insert, then
+//! `KhiveRuntime::update_entity_with_embedding_report()` to route the real name
+//! and properties through the ordinary reindex path. Its reindex
 //! only fires on a `name`/`description`/`entity_type` value change
 //! (`curation.rs::prepare_update_entity`), so the bare row is inserted with
 //! an empty name on purpose — the immediately following patch always

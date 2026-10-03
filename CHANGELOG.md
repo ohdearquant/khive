@@ -39,7 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded vectors with their byte counts.
 - `memory.remember` retains its visibility token while disclosing bounded embedding input on a
   fresh keyed or unkeyed write. An identical keyed replay keeps the original fences and reports
-  no new truncation. The separate receipt-only and report-only Rust entry points remain available.
+  the truncation computed for that content. Receipt-only Rust entry points remain available, and
+  report-returning entry points are added.
 
 - Fresh, uncorrelated inbound email now defaults to the `channel:email` mailbox
   when `KHIVE_EMAIL_DEFAULT_ACTOR` is unset or blank. Deployments currently

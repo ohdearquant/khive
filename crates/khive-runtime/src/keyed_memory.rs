@@ -132,8 +132,8 @@ pub async fn create_keyed_memory(
 }
 
 /// Same as [`create_keyed_memory`], also returning the embedding-input
-/// truncation report for a freshly written memory. A replay stores nothing
-/// new, so it reports no truncation.
+/// truncation report computed for this call. A replay stores nothing new but
+/// retains the report from preparing this call's identical content.
 pub async fn create_keyed_memory_with_report(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -162,7 +162,8 @@ pub async fn create_keyed_memory_with_receipt(
 }
 
 /// Return both the original visibility receipt and the embedding-input report.
-/// Replays retain the stored fences and report no newly truncated input.
+/// Replays retain the stored fences and the report computed while preparing
+/// this call's embedding input; the report does not describe the original write.
 pub async fn create_keyed_memory_with_receipt_and_report(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -234,13 +235,7 @@ pub async fn create_keyed_memory_with_receipt_and_report(
                         let fences = memory_visibility_receipt(runtime, token, holder.id)
                             .await?
                             .ok_or_else(|| missing_visibility_receipt(holder.id))?;
-                        return Ok((
-                            holder,
-                            None,
-                            true,
-                            fences,
-                            crate::retrieval::EmbeddingTruncationReport::default(),
-                        ));
+                        return Ok((holder, None, true, fences, prepared.embedding_truncation));
                     }
                     return Err(idempotency_conflict(spec.key, &holder));
                 }
