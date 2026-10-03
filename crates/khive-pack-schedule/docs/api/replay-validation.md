@@ -119,9 +119,11 @@ That type is `pub(crate)` to `khive-pack-kg`, and `khive-pack-schedule` does not
 depend on `khive-pack-kg` in production (dev-dependency only, for tests), so this
 hand-copies just the alias set — six short strings — rather than the type.
 `normalized` must already be trimmed + lowercased. Kept in sync by
-`entity_kind_resource_aliases_match_real_vocab` in `create_validation.rs`, which
-asserts this list against the live `khive-pack-kg` vocab (via the dev-dependency) so
-drift is caught in CI rather than silently reproducing a similar false rejection.
+`entity_kind_resource_aliases_match_real_vocab` in `src/resource_alias_drift_tests.rs`.
+The test reads the resource alias arm from `khive-pack-kg/src/vocab.rs`, compares it
+with the schedule predicate's literal list, and checks each extracted alias with
+the predicate. This follows the source-reading approach of
+`kg_bulk_entry_field_names` in `tests/create_validation.rs`.
 
 ## `validate_entity_type_for_replay`
 
