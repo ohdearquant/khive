@@ -53,6 +53,56 @@ mix of `memory.recall` / `knowledge.search` / `knowledge.compose` (reads) and
 process; one worker per tenant additionally runs a `comm.send` + `get`
 readback pair to check write attribution.
 
+### Open-loop arrival mode
+
+Add `--arrival-rate RATE` to offer arrivals independently of completions:
+
+```bash
+uv run scripts/perf/bench_load_harness.py --mode bench --workers 20 --tenants 4 \
+  --ops-per-worker 20 --arrival-rate 50 --worker-timeout 120 --report /tmp/load-open-loop.json
+```
+
+This command declares a schedule; it does not imply an observed throughput.
+The harness offers `workers * ops-per-worker` operations using the existing
+weighted menu. RATE is the total across classes, not a per-worker rate. Every
+arrival has a fixed monotonic deadline relative to arrival zero. Late
+scheduler wake-ups are recorded as late actual offers without shifting the
+remaining schedule. The menu's weights sum to 0.90 and are normalized; class
+reports distinguish configured weighted rates from the actual sampled mix.
+
+Each admitted operation reserves one idle, persistent worker connection.
+When all connections are busy, the arrival is refused immediately instead of
+waiting in a client queue. `refused` means this client capacity refusal;
+daemon/backpressure errors from admitted calls are `failed`, with their
+original errors also contributing to the existing dimension counters.
+The schedule window ends one arrival interval after the final offer. The harness then
+drains calls for at most `--worker-timeout` seconds and snapshots remaining
+calls as `outstanding` before terminating front-ends. The snapshot always
+partitions submitted arrivals into completed, failed, refused and outstanding.
+Outstanding calls make the plumbing smoke result FAIL; capacity refusals
+alone do not impose a throughput threshold.
+
+Open-loop setup excludes bootstrap remember/recall, daemon engagement, worker
+handshakes and per-tenant attribution probes from the arrival window. The
+recorded warm-up boundary is their completion condition and its monotonic
+timestamp, with zero discarded arrivals. Warm daemon/front-end readiness does
+not establish a controlled SQLite or OS cache, nor prove every namespace ANN
+is converged. The report labels those limitations explicitly.
+
+The optional `arrival` object contains raw relative monotonic timestamps
+(`scheduled_s`, `offered_s`, `started_s`, `finished_s`), per-class counts and
+rates, and the overflow policy. Offered rate divides submitted arrivals by
+`operations / RATE`; achieved rate divides successful completions by the
+observation window, including the bounded drain. Service latency and
+scheduler lateness can therefore be distinguished. Omitting this option
+keeps the complete legacy JSON bytes for the same closed-loop fixture.
+
+The write menu retains ordinary `memory.remember` and entity `create` calls:
+they use registered daemon embedders without a text-only override. Neither
+vector dimensionality nor tail caps is exposed by this driver, so the report
+marks both `UNMEASURED`. Pre-register and record those settings under the
+README write-workload protocol before using these rates as decision evidence.
+
 The harness always runs with `KHIVE_DAEMON_STRICT=1` and
 `KHIVE_WRITE_QUEUE=1` — the run posture required for the load/perf acceptance
 run. It uses a fresh scratch DB under a temp directory; the live
