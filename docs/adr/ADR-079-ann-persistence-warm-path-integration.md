@@ -749,16 +749,61 @@ between ticks and exits on daemon shutdown or state drop.
 
 ### `ann_rebuild_threshold` default — why 20%
 
-Tail replay is per-row: one primary-key embedding read plus one ADR-052 incremental insert
-(greedy-search dominated, single-threaded, ~2-3 ms/vector at the current ~553K-vector scale).
-Full rebuild amortizes the same greedy inserts with batch locality and parallelism at roughly
-0.5-0.7 ms/vector (the measured 4-6 minute rebuild). The cost crossover therefore sits near
-20-25% of `vector_count`; past it, replay approaches rebuild latency while yielding a
-worse-conditioned graph (accumulated tombstones, no consolidation). 20% is the conservative side
-of that crossover. Worst-case replay just under threshold at current scale: ~110K rows ≈ 3-4
-minutes — bounded by the same ceiling as today's rebuild, and §2 serve-stale applies throughout.
-The expected case is orders of magnitude smaller: a typical restart tail is one session's writes
-(hundreds to low thousands of rows), i.e. seconds.
+The default remains `0.20`, and the comparisons count raw log rows. This is an
+adopted bound on raw-tail work, not a measured replay/rebuild crossover for every
+workload.
+
+Let `N` be the live vector count, `R` the scoped raw tail rows, `D` the distinct
+tail subjects and `U` the final in-scope upserts (`U <= D <= R`). Replay applies
+one final state update per subject. An upsert may tombstone the old ordinal before
+inserting its replacement; a delete tombstones only a mapped subject. A useful
+cost decomposition is:
+
+```text
+T_replay ~= T_log_and_coalesce(R,D) + T_hydrate(R,U) + T_id_map(N,D)
+            + U*c_upsert + (D-U)*c_delete + T_replay_publication(N,D)
+T_rebuild ~= T_corpus_scan(N) + N*c_build + T_rebuild_publication(N)
+```
+
+The SQL and publication terms are consumer-specific. Knowledge groups the log
+before reading each final upsert's embedding. Memory currently joins embeddings
+to selected raw rows before coalescing them in Rust. Repeated writes therefore
+reduce the number of graph mutations without eliminating all raw-row work.
+
+Under the additional assumptions that final operations are mostly distinct
+upserts and that graph insertion dominates the other terms, the historical
+estimates of `2–3 ms` per incremental insert and `0.5–0.7 ms` per rebuilt vector,
+using insertion time as a proxy for `c_upsert`, give
+`U/N ~= c_build/c_upsert`: approximately `0.17–0.35`, with midpoint estimates of
+`0.24`. These estimates explain the historical choice of `0.20`;
+they do not establish a universal `20–25%` crossover or a latency ceiling. If
+`q = U/R`, the same simplified model puts the raw-row crossover at
+`R/N ~= c_build/(q*c_upsert)` for `q > 0`. With many rewrites, `q` is small and
+the unchanged raw-row policy can choose a rebuild before the graph-insertion
+crossover. Workload-specific crossover claims require measurements of raw rows,
+distinct subjects, operation mix, SQL/hydration work, graph work and publication
+cost. §2 serve-stale applies while replay or rebuild runs.
+
+The setting controls three coupled behaviors:
+
+1. Restart classification for knowledge and memory: raw tails at or below
+   `ceil(ann_rebuild_threshold * N)` use final-state replay; larger tails request
+   a rebuild.
+2. Memory maintenance: the same raw-tail limit chooses incremental maintenance
+   or rebuild, and checkpoint scheduling uses a quarter of that allowance,
+   bounded by the configured operation limit and a minimum of one operation:
+   `max(1, min(max_dirty_ops, floor(ann_rebuild_threshold * N / 4)))`, using the
+   installed bridge's live count for `N`. Dirty operations count raw log rows.
+   Cumulative delta-chain compaction has its own limit.
+3. [ADR-118 §3](ADR-118-fresh-tail-recall-visibility.md#3-cost-shape-and-the-no-index-case)'s
+   no-index exact leg for both consumers: the newest
+   `ceil(ann_rebuild_threshold * N)` retained raw rows are selected before
+   final-state coalescing. Changing the setting therefore changes which retained
+   writes remain visible while no ANN index serves. The serving-index exact leg
+   remains uncapped by this setting.
+
+Changing this bound or substituting a distinct-subject count requires considering
+all three roles. The accepted default and raw-row comparisons remain unchanged.
 
 ### Lever inventory (full residency budget, with projections)
 
