@@ -521,11 +521,13 @@ The plaintext is a UTF-8 JSON object: `v` (1), `subject` (string or null), `body
 `sent_at` (RFC 3339, UTC, in the A.2 timestamp profile), `thread_id` (a UUID or null), `in_reply_to` (a logical message
 identifier or null) and, optionally, `kind` (`announce`, `report` or `ask`: the sender's declared
 purpose under runtime ADR-195 D4). A sender writes `kind` only with one of those three values and
-otherwise omits it; absent means unspecified. A recipient ignores members it does not know, except that a plaintext with a duplicated member,
-at the top level or inside any nested object including the value of a member it ignores,
-or with any of the reserved identity members `from`, `sender`, `to`, `recipient`, `tenant`,
-`namespace`, `actor`, `project`, `device` or `delegation`, is invalid and is quarantined (A.8): identity comes from the
-authenticated envelope, never from the plaintext. A `kind` with any other value, `null`,
+otherwise omits it; absent means unspecified. A recipient ignores members it does not know.
+A plaintext with a duplicated member at the top level or inside any nested object, including the
+value of a member it ignores, is invalid and is quarantined (A.8).
+A plaintext with any of the reserved identity members `from`, `sender`, `to`, `recipient`, `tenant`,
+`namespace`, `actor`, `project`, `device` or `delegation` at its top level is likewise invalid and
+quarantined: identity comes from the authenticated envelope, never from the plaintext.
+A `kind` with any other value, `null`,
 `unspecified` and `reply` included, is likewise invalid and quarantined: a reply is never declared.
 A message is a reply when its `in_reply_to` names a verified parent: a message this recipient agent
 (the delivery's `recipient_agent_id`) sent to this sender agent (`sender_agent_id`), committed in the

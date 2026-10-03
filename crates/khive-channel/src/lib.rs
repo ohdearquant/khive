@@ -5,6 +5,9 @@
 //! the `Channel` trait; the MCP server polls registered channels and ingests inbound
 //! messages via the `comm.ingest` subhandler verb.
 
+mod signing;
+pub use signing::{ReceiptSignatureError, ReceiptSigningPublicKey};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

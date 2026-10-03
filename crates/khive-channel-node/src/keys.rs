@@ -2,6 +2,7 @@
 use crate::encoding::{context, length_prefix, Base64Bytes, CanonicalUuid, HexBytes, Realm};
 use crate::envelope::{aad, Ciphertext, EnvelopeHeader, SealedEnvelope, MAX_PLAINTEXT_BYTES};
 use crate::ProtocolError;
+#[cfg(test)]
 use curve25519_dalek::edwards::CompressedEdwardsY;
 use ed25519_dalek::{Signer, SigningKey};
 use hpke::{
@@ -10,6 +11,7 @@ use hpke::{
     kem::{Kem, X25519HkdfSha256},
     Deserializable, OpModeR, OpModeS, Serializable,
 };
+use khive_channel::ReceiptSigningPublicKey;
 use rand_core::{OsRng, RngCore};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -44,29 +46,25 @@ impl<'de> Deserialize<'de> for KemPublicKey {
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SigningPublicKey(HexBytes<32>);
+pub struct SigningPublicKey(ReceiptSigningPublicKey);
 impl SigningPublicKey {
     pub fn new(bytes: [u8; 32]) -> Result<Self, ProtocolError> {
-        let point = CompressedEdwardsY(bytes)
-            .decompress()
-            .ok_or(ProtocolError::InvalidKey)?;
-        if point.is_small_order() || point.compress().to_bytes() != bytes {
-            return Err(ProtocolError::InvalidKey);
-        }
-        Ok(Self(HexBytes::new(bytes)))
+        ReceiptSigningPublicKey::new(bytes)
+            .map(Self)
+            .map_err(|_| ProtocolError::InvalidKey)
     }
     pub fn as_bytes(&self) -> &[u8; 32] {
         self.0.as_bytes()
     }
     pub fn verify(&self, input: &[u8], signature: &[u8; 64]) -> Result<(), ProtocolError> {
-        ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, self.as_bytes())
+        self.0
             .verify(input, signature)
             .map_err(|_| ProtocolError::InvalidSignature)
     }
 }
 impl Serialize for SigningPublicKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
+        HexBytes::new(*self.as_bytes()).serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for SigningPublicKey {

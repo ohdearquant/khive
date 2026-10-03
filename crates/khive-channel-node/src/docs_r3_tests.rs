@@ -281,3 +281,53 @@ fn a11_malformed_delivery_keeps_valid_items_and_cursor() {
         .unwrap();
     receipt.receipt.verify(&keys.signing).unwrap();
 }
+
+#[test]
+fn a11_conformance_metadata_distinguishes_scope_and_source_coverage() {
+    let fixture = fixture();
+    let sources = [
+        (
+            "crates/khive-channel-node/src/vectors.rs",
+            include_str!("vectors.rs"),
+        ),
+        (
+            "crates/khive-channel-node/src/docs_r3_tests.rs",
+            include_str!("docs_r3_tests.rs"),
+        ),
+        (
+            "crates/khive-channel-node/src/keys_r3_tests.rs",
+            include_str!("keys_r3_tests.rs"),
+        ),
+        (
+            "crates/khive-channel-node/src/plaintext_r3_tests.rs",
+            include_str!("plaintext_r3_tests.rs"),
+        ),
+        (
+            "crates/khive-channel-node/src/wire_r3_tests.rs",
+            include_str!("wire_r3_tests.rs"),
+        ),
+    ];
+    for row in fixture["conformance_cases"].as_array().unwrap() {
+        assert!(matches!(
+            row["scope"].as_str().unwrap(),
+            "client" | "service" | "client_and_service"
+        ));
+        assert!(!row["implementation_scope"].as_array().unwrap().is_empty());
+        assert!(!row["coverage_note"].as_str().unwrap().is_empty());
+        let tests = row["client_tests"].as_array().unwrap();
+        match row["client_coverage"].as_str().unwrap() {
+            "none" => assert!(tests.is_empty()),
+            "partial" | "full" => assert!(!tests.is_empty()),
+            other => panic!("unknown source coverage: {other}"),
+        }
+        for test in tests {
+            let source = sources
+                .iter()
+                .find(|(path, _)| Some(*path) == test["source"].as_str())
+                .expect("coverage must reference a node-crate test source")
+                .1;
+            let (_, name) = test["test"].as_str().unwrap().rsplit_once("::").unwrap();
+            assert!(source.contains(&format!("fn {name}(")), "{name}");
+        }
+    }
+}

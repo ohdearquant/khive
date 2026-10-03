@@ -873,7 +873,13 @@ fn w0_fixture_matches_authoritative_adr_a11_blocks() {
     assert_eq!(f["negative_vectors"], json!(negatives));
     assert_eq!(negatives.len(), 11);
     let cases = table("**Conformance cases", "case");
-    assert_eq!(f["conformance_cases"], json!(cases));
+    let fixture_cases: Vec<Value> = f["conformance_cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| json!({"case":row["case"],"required_outcome":row["required_outcome"]}))
+        .collect();
+    assert_eq!(json!(fixture_cases), json!(cases));
     assert_eq!(cases.len(), 52);
     for key in [
         "sender_kem_label",
