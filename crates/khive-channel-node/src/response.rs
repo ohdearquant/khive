@@ -2,12 +2,11 @@ use crate::encoding::{CanonicalUuid, JsonInteger};
 use crate::plaintext::PlaintextClassification;
 use crate::receipt::{WireReceipt, WireReceiptBinding};
 use crate::wire::{
-    BoundedList, ContactResponse, Delivery, MessageState, ReceiptItem, UtcTimestamp,
+    ContactResponse, Delivery, MessageState, ReceiptItem, RefusalCode, ServerTimestamp,
+    WireDecodeError,
 };
 use crate::ProtocolError;
 use khive_channel::ChannelError;
-use serde::Deserialize;
-use serde_json::value::RawValue;
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -73,11 +72,15 @@ pub enum DeliveryOpenResult {
 }
 #[derive(Debug)]
 pub struct NodeDelivery {
+    pub(crate) index: usize,
     pub(crate) delivery: Delivery,
     pub(crate) original: Vec<u8>,
     pub(crate) opening: DeliveryOpenResult,
 }
 impl NodeDelivery {
+    pub fn index(&self) -> usize {
+        self.index
+    }
     pub fn delivery(&self) -> &Delivery {
         &self.delivery
     }
@@ -93,8 +96,10 @@ impl NodeDelivery {
             return Err(ProtocolError::Decryption);
         }
         // Parse the preserved object itself; serialization is never a receipt-binding source.
-        let d: Delivery =
-            serde_json::from_slice(&self.original).map_err(|_| ProtocolError::InvalidEncoding)?;
+        let d = Delivery::parse(&self.original).map_err(|error| match error {
+            WireDecodeError::Protocol(error) => error,
+            WireDecodeError::Json(_) => ProtocolError::InvalidEncoding,
+        })?;
         Ok(WireReceiptBinding {
             protocol_version: d.protocol_version,
             logical_message_id: d.logical_message_id,
@@ -135,15 +140,32 @@ pub enum ReceiptVerification {
 }
 #[derive(Debug)]
 pub struct NodeReceiptResult {
+    pub index: usize,
     pub item: ReceiptItem,
     pub verification: ReceiptVerification,
 }
+
+/// One refused wire item, retaining its page position and original JSON bytes.
+#[derive(Debug)]
+pub struct NodePollRejection {
+    pub index: usize,
+    pub code: RefusalCode,
+    pub(crate) original: Vec<u8>,
+}
+impl NodePollRejection {
+    pub fn original_json(&self) -> &[u8] {
+        &self.original
+    }
+}
+
 #[derive(Debug)]
 pub struct NodePollResult {
     pub deliveries: Vec<NodeDelivery>,
     pub receipts: Vec<NodeReceiptResult>,
+    pub rejected_deliveries: Vec<NodePollRejection>,
+    pub rejected_receipts: Vec<NodePollRejection>,
     pub next_cursor: JsonInteger,
-    pub server_time: UtcTimestamp,
+    pub server_time: ServerTimestamp,
 }
 #[derive(Debug)]
 pub struct NodeStatusResult {
@@ -155,13 +177,4 @@ pub struct NodeStatusResult {
 pub struct NodeContactResult {
     pub observed: ContactResponse,
     pub matches_owner_pin: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RawPollResponse {
-    pub deliveries: BoundedList<Box<RawValue>, 16>,
-    pub receipts: BoundedList<ReceiptItem, 64>,
-    pub receipts_cursor: JsonInteger,
-    pub server_time: UtcTimestamp,
 }

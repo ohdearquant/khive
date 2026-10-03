@@ -1240,14 +1240,18 @@ async fn poll_refuses_noncanonical_attempt_before_opening() {
             pins(true),
             keys.clone(),
         );
-        assert!(matches!(
-            c.poll(JsonInteger::new(0).unwrap(), PollWait::new(0).unwrap())
-                .await
-                .unwrap_err()
-                .channel_error(),
-            Some(ChannelError::Transport(_))
-        ));
+        let page = c
+            .poll(JsonInteger::new(0).unwrap(), PollWait::new(0).unwrap())
+            .await
+            .expect("a malformed delivery must not discard a valid page");
+        assert!(page.deliveries.is_empty());
+        assert!(page.receipts.is_empty());
+        assert_eq!(page.next_cursor.get(), 0);
         assert_eq!(keys.opens.load(Ordering::SeqCst), 0);
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].target, "/node/v1/poll?wait=0&receipts_after=0");
     }
 }
 #[tokio::test]
@@ -1430,8 +1434,9 @@ async fn poll_calls_do_not_overlap_and_timeout_exceeds_wait() {
 }
 #[tokio::test]
 async fn response_and_delivery_limits_are_bounded() {
-    let body = " ".repeat(2_097_153);
-    let server = ScriptedServer::start(vec![Reply::json(200, &body)])
+    let body = format!("{}{}", " ".repeat(2_097_153), admission());
+    assert!(serde_json::from_str::<AdmissionResponse>(&body).is_ok());
+    let server = ScriptedServer::start(vec![Reply::json(202, &body)])
         .await
         .unwrap();
     assert!(ordinary_client(&server, true)
@@ -1443,10 +1448,26 @@ async fn response_and_delivery_limits_are_bounded() {
     let server = ScriptedServer::start(vec![Reply::json(200, &poll_body(Some(&raw), vec![]))])
         .await
         .unwrap();
-    assert!(ordinary_client(&server, false)
+    let keys = SpyFacility::new(false);
+    let c = client(
+        &server,
+        false,
+        Arc::new(FixedSource(Ok(None))),
+        pins(true),
+        keys.clone(),
+    );
+    let page = c
         .poll(JsonInteger::new(0).unwrap(), PollWait::new(0).unwrap())
         .await
-        .is_err());
+        .expect("an oversized delivery must not discard a valid page");
+    assert!(page.deliveries.is_empty());
+    assert!(page.receipts.is_empty());
+    assert_eq!(page.next_cursor.get(), 0);
+    assert_eq!(keys.opens.load(Ordering::SeqCst), 0);
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, "GET");
+    assert_eq!(requests[0].target, "/node/v1/poll?wait=0&receipts_after=0");
 }
 #[tokio::test]
 async fn status_receipt_uses_same_outbox_and_pin_checks() {
@@ -1481,3 +1502,360 @@ async fn network_failure_is_transport() {
         Some(ChannelError::Transport(_))
     ));
 }
+
+fn poll_body_slices(
+    deliveries: &[&str],
+    receipts: &[&str],
+    cursor: u64,
+    server_time: &str,
+) -> String {
+    format!(
+        "{{\"deliveries\":[{}],\"receipts\":[{}],\"receipts_cursor\":{},\"server_time\":{}}}",
+        deliveries.join(","),
+        receipts.join(","),
+        cursor,
+        serde_json::to_string(server_time).unwrap()
+    )
+}
+
+fn receipt_item_json(receipt: &WireReceipt, seq: u64) -> String {
+    json!({"seq":seq,"receipt":receipt,"recorded_at":"2026-09-24T00:00:00Z"}).to_string()
+}
+
+fn spaced_delivery_json() -> String {
+    let raw = serde_json::to_string_pretty(&serde_json::to_value(delivery()).unwrap())
+        .unwrap()
+        .replace("01920000", "\\u00301920000");
+    assert_eq!(serde_json::from_str::<Delivery>(&raw).unwrap(), delivery());
+    raw
+}
+
+#[tokio::test]
+async fn poll_accepts_numeric_offset_server_time_and_normalizes_utc_output() {
+    for (input, expected) in [
+        ("2026-09-24T00:00:00Z", "2026-09-24T00:00:00Z"),
+        ("2026-09-24T05:30:00+05:30", "2026-09-24T00:00:00Z"),
+        ("2026-09-23T17:00:00-07:00", "2026-09-24T00:00:00Z"),
+        ("2026-09-24T00:00:00.123+00:00", "2026-09-24T00:00:00.123Z"),
+    ] {
+        let body = poll_body_slices(&[], &[], 23, input);
+        let server = ScriptedServer::start(vec![Reply::json(200, &body)])
+            .await
+            .unwrap();
+        let page = ordinary_client(&server, true)
+            .poll(JsonInteger::new(7).unwrap(), PollWait::new(0).unwrap())
+            .await
+            .expect("numeric-offset server time must preserve the successful poll");
+        assert_eq!(page.next_cursor.get(), 23);
+        assert!(page.deliveries.is_empty());
+        assert!(page.receipts.is_empty());
+        assert_eq!(
+            serde_json::to_value(&page.server_time).unwrap(),
+            json!(expected)
+        );
+        assert_eq!(
+            page.server_time.as_utc(),
+            UtcTimestamp::parse(expected).unwrap().as_utc()
+        );
+        let requests = server.requests().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].target, "/node/v1/poll?wait=0&receipts_after=7");
+    }
+}
+
+#[tokio::test]
+async fn poll_malformed_first_receipt_keeps_later_verified_receipt_and_cursor() {
+    let expected = receipt();
+    let first = receipt_item_json(&expected, 1);
+    let later = receipt_item_json(&expected, 2);
+    let malformed = r#"{ "seq": 1, "receipt": false, "recorded_at": "2026-09-24T00:00:00Z" }"#;
+    let server = ScriptedServer::start(vec![
+        Reply::json(
+            200,
+            &poll_body_slices(&[], &[&first], 1, "2026-09-24T00:00:00Z"),
+        ),
+        Reply::json(
+            200,
+            &poll_body_slices(&[], &[malformed, &later], 73, "2026-09-24T00:00:00Z"),
+        ),
+    ])
+    .await
+    .unwrap();
+    let source = Arc::new(OrderedSource {
+        outcomes: std::sync::Mutex::new(vec![Ok(Some(persisted())); 2].into()),
+        requested: std::sync::Mutex::new(Vec::new()),
+    });
+    let keys = SpyFacility::new(true);
+    let c = client(&server, true, source.clone(), pins(false), keys.clone());
+    let guard = c
+        .poll(JsonInteger::new(0).unwrap(), PollWait::new(0).unwrap())
+        .await
+        .expect("the unmodified receipt page must verify first");
+    assert_eq!(guard.receipts.len(), 1);
+    assert!(matches!(&guard.receipts[0].verification,
+        ReceiptVerification::Verified(verified) if verified.receipt() == &expected));
+    let page = c
+        .poll(guard.next_cursor, PollWait::new(0).unwrap())
+        .await
+        .expect("a malformed receipt must not hide a later valid receipt or cursor");
+    assert_eq!(page.next_cursor.get(), 73);
+    assert!(page.deliveries.is_empty());
+    assert_eq!(page.receipts.len(), 1);
+    assert_eq!(page.receipts[0].item.seq.get(), 2);
+    assert!(matches!(&page.receipts[0].verification,
+        ReceiptVerification::Verified(verified) if verified.receipt() == &expected));
+    assert_eq!(*source.requested.lock().unwrap(), vec![logical(); 2]);
+    assert!(source.outcomes.lock().unwrap().is_empty());
+    assert_eq!(keys.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(keys.seals.load(Ordering::SeqCst), 0);
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "polling never acknowledges malformed items"
+    );
+    assert!(requests.iter().all(|request| request.method == "GET"));
+    assert_eq!(requests[1].target, "/node/v1/poll?wait=0&receipts_after=1");
+}
+
+#[tokio::test]
+async fn poll_malformed_first_delivery_keeps_later_raw_bytes_and_cursor() {
+    let raw = spaced_delivery_json();
+    let mut bad = serde_json::to_value(delivery()).unwrap();
+    bad["unexpected"] = json!(true);
+    let malformed = serde_json::to_string_pretty(&bad).unwrap();
+    let server = ScriptedServer::start(vec![
+        Reply::json(
+            200,
+            &poll_body_slices(&[&raw], &[], 5, "2026-09-24T00:00:00Z"),
+        ),
+        Reply::json(
+            200,
+            &poll_body_slices(&[&malformed, &raw], &[], 41, "2026-09-24T00:00:00Z"),
+        ),
+    ])
+    .await
+    .unwrap();
+    let keys = SpyFacility::new(false);
+    let c = client(
+        &server,
+        false,
+        Arc::new(FixedSource(Ok(None))),
+        pins(true),
+        keys.clone(),
+    );
+    let guard = c
+        .poll(JsonInteger::new(0).unwrap(), PollWait::new(0).unwrap())
+        .await
+        .expect("the unmodified delivery page must open first");
+    assert_eq!(guard.deliveries.len(), 1);
+    assert!(matches!(
+        guard.deliveries[0].opening(),
+        DeliveryOpenResult::Opened(_)
+    ));
+    assert_eq!(guard.deliveries[0].original_json(), raw.as_bytes());
+    assert_eq!(
+        guard.deliveries[0].receipt_binding().unwrap(),
+        receipt().binding
+    );
+    assert_eq!(keys.opens.load(Ordering::SeqCst), 1);
+    let page = c
+        .poll(guard.next_cursor, PollWait::new(0).unwrap())
+        .await
+        .expect("a malformed delivery must not hide a later valid delivery or cursor");
+    assert_eq!(page.next_cursor.get(), 41);
+    assert!(page.receipts.is_empty());
+    assert_eq!(page.deliveries.len(), 1);
+    let valid = &page.deliveries[0];
+    assert_eq!(valid.delivery(), &delivery());
+    assert!(matches!(valid.opening(), DeliveryOpenResult::Opened(_)));
+    assert_eq!(valid.original_json(), raw.as_bytes());
+    assert_ne!(
+        valid.original_json(),
+        serde_json::to_vec(valid.delivery()).unwrap()
+    );
+    assert_eq!(valid.receipt_binding().unwrap(), receipt().binding);
+    assert_eq!(
+        keys.opens.load(Ordering::SeqCst),
+        2,
+        "only the two valid deliveries may open"
+    );
+    assert_eq!(keys.seals.load(Ordering::SeqCst), 0);
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "polling never acknowledges malformed items"
+    );
+    assert!(requests.iter().all(|request| request.method == "GET"));
+    assert_eq!(requests[1].target, "/node/v1/poll?wait=0&receipts_after=5");
+}
+
+#[tokio::test]
+async fn poll_page_fields_and_cardinality_stay_strict_before_any_item_action() {
+    let raw = serde_json::to_string(&delivery()).unwrap();
+    let receipt_raw = receipt_item_json(&receipt(), 1);
+    let valid = poll_body_slices(&[&raw], &[&receipt_raw], 25, "2026-09-24T00:00:00Z");
+    let base: Value = serde_json::from_str(&valid).unwrap();
+    let mut cases = Vec::new();
+    let mut unknown = base.clone();
+    unknown["future_page_field"] = json!(true);
+    cases.push(("unknown page field", unknown.to_string()));
+    for field in ["deliveries", "receipts", "receipts_cursor", "server_time"] {
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove(field);
+        cases.push((field, missing.to_string()));
+    }
+    for (field, value) in [
+        ("deliveries", json!({})),
+        ("receipts", json!(null)),
+        ("receipts_cursor", json!("25")),
+        ("receipts_cursor", json!(-1)),
+        ("server_time", json!("2026-09-24 00:00:00Z")),
+    ] {
+        let mut invalid = base.clone();
+        invalid[field] = value;
+        cases.push((field, invalid.to_string()));
+    }
+    cases.push(("non-object page", "[]".to_owned()));
+    cases.push((
+        "duplicate page member",
+        format!("{{\"deliveries\":[],\"deliveries\":[{raw}],\"receipts\":[{receipt_raw}],\"receipts_cursor\":25,\"server_time\":\"2026-09-24T00:00:00Z\"}}"),
+    ));
+    let mut too_many_deliveries = base.clone();
+    let mut delivery_items = vec![json!(null); 17];
+    delivery_items[0] = serde_json::to_value(delivery()).unwrap();
+    too_many_deliveries["deliveries"] = Value::Array(delivery_items);
+    cases.push(("17 total delivery slots", too_many_deliveries.to_string()));
+    let mut too_many_receipts = base.clone();
+    let mut receipt_items = vec![json!(null); 65];
+    receipt_items[0] = serde_json::from_str(&receipt_raw).unwrap();
+    too_many_receipts["receipts"] = Value::Array(receipt_items);
+    cases.push(("65 total receipt slots", too_many_receipts.to_string()));
+    let mut replies = vec![Reply::json(200, &valid)];
+    replies.extend(cases.iter().map(|(_, body)| Reply::json(200, body)));
+    let server = ScriptedServer::start(replies).await.unwrap();
+    let source = Arc::new(OrderedSource {
+        outcomes: std::sync::Mutex::new(vec![Ok(Some(persisted())); cases.len() + 1].into()),
+        requested: std::sync::Mutex::new(Vec::new()),
+    });
+    let keys = SpyFacility::new(false);
+    let c = client(&server, false, source.clone(), pins(true), keys.clone());
+    let guard = c
+        .poll(JsonInteger::new(0).unwrap(), PollWait::new(0).unwrap())
+        .await
+        .expect("a valid page must exercise both item routes before refusals");
+    assert_eq!(guard.next_cursor.get(), 25);
+    assert_eq!(guard.deliveries.len(), 1);
+    assert_eq!(guard.receipts.len(), 1);
+    assert!(matches!(
+        guard.deliveries[0].opening(),
+        DeliveryOpenResult::Opened(_)
+    ));
+    assert_eq!(keys.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(*source.requested.lock().unwrap(), vec![logical()]);
+    for (reason, _) in &cases {
+        let error = c
+            .poll(JsonInteger::new(25).unwrap(), PollWait::new(0).unwrap())
+            .await
+            .expect_err("an invalid page must fail before processing any item");
+        assert!(
+            matches!(error.channel_error(), Some(ChannelError::Transport(_))),
+            "{reason}"
+        );
+        assert_eq!(keys.opens.load(Ordering::SeqCst), 1, "{reason}");
+        assert_eq!(
+            *source.requested.lock().unwrap(),
+            vec![logical()],
+            "{reason}"
+        );
+    }
+    assert_eq!(keys.seals.load(Ordering::SeqCst), 0);
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), cases.len() + 1);
+    assert!(requests.iter().all(|request| request.method == "GET"));
+}
+
+#[tokio::test]
+async fn poll_version_and_ciphertext_refusals_keep_later_delivery_and_cursor() {
+    let raw = spaced_delivery_json();
+    let mut unsupported = serde_json::to_value(delivery()).unwrap();
+    unsupported["protocol_version"] = json!(2);
+    let unsupported_raw = serde_json::to_string_pretty(&unsupported).unwrap();
+    let mut oversized = serde_json::to_value(delivery()).unwrap();
+    oversized["ciphertext"] = json!(encode_base64url(&vec![0; MAX_CIPHERTEXT_BYTES + 1]));
+    let oversized_raw = serde_json::to_string_pretty(&oversized).unwrap();
+    assert!(Delivery::parse(unsupported_raw.as_bytes()).is_err());
+    assert!(Delivery::parse(oversized_raw.as_bytes()).is_err());
+    assert!(oversized_raw.len() < crate::request::MAX_REQUEST_BODY_BYTES);
+    let server = ScriptedServer::start(vec![
+        Reply::json(
+            200,
+            &poll_body_slices(&[&raw], &[], 5, "2026-09-24T00:00:00Z"),
+        ),
+        Reply::json(
+            200,
+            &poll_body_slices(&[&unsupported_raw, &raw], &[], 41, "2026-09-24T00:00:00Z"),
+        ),
+        Reply::json(
+            200,
+            &poll_body_slices(&[&oversized_raw, &raw], &[], 42, "2026-09-24T00:00:00Z"),
+        ),
+    ])
+    .await
+    .unwrap();
+    let keys = SpyFacility::new(false);
+    let c = client(
+        &server,
+        false,
+        Arc::new(FixedSource(Ok(None))),
+        pins(true),
+        keys.clone(),
+    );
+    let guard = c
+        .poll(JsonInteger::new(0).unwrap(), PollWait::new(0).unwrap())
+        .await
+        .expect("the unmodified delivery page must open first");
+    assert_eq!(guard.deliveries.len(), 1);
+    assert!(matches!(
+        guard.deliveries[0].opening(),
+        DeliveryOpenResult::Opened(_)
+    ));
+    assert_eq!(keys.opens.load(Ordering::SeqCst), 1);
+    let mut cursor = guard.next_cursor;
+    for (expected_cursor, expected_opens) in [(41, 2), (42, 3)] {
+        let page = c
+            .poll(cursor, PollWait::new(0).unwrap())
+            .await
+            .expect("version and ciphertext refusals must preserve the later valid delivery");
+        assert_eq!(page.next_cursor.get(), expected_cursor);
+        assert!(page.receipts.is_empty());
+        assert_eq!(page.deliveries.len(), 1);
+        assert_eq!(page.deliveries[0].delivery(), &delivery());
+        assert!(matches!(
+            page.deliveries[0].opening(),
+            DeliveryOpenResult::Opened(_)
+        ));
+        assert_eq!(page.deliveries[0].original_json(), raw.as_bytes());
+        assert_eq!(
+            page.deliveries[0].receipt_binding().unwrap(),
+            receipt().binding
+        );
+        assert_eq!(keys.opens.load(Ordering::SeqCst), expected_opens);
+        cursor = page.next_cursor;
+    }
+    assert_eq!(keys.seals.load(Ordering::SeqCst), 0);
+    let requests = server.requests().await;
+    assert_eq!(
+        requests.len(),
+        3,
+        "neither refused item may cause an acknowledgement"
+    );
+    assert!(requests.iter().all(|request| request.method == "GET"));
+    assert_eq!(requests[1].target, "/node/v1/poll?wait=0&receipts_after=5");
+    assert_eq!(requests[2].target, "/node/v1/poll?wait=0&receipts_after=41");
+}
+
+#[path = "client_r2_rejection_tests.rs"]
+mod r2_rejection_tests;

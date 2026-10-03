@@ -9,12 +9,13 @@ use crate::response::*;
 use crate::source::{NodeClientBinding, OutboundSource, PersistedSubmission};
 use crate::submit::serialize_submission;
 use crate::wire::{
-    AcknowledgeResponse, AdmissionResponse, ContactResponse, Delivery, MessageState, RefusalCode,
-    RefusalResponse, StatusResponse,
+    AcknowledgeResponse, AdmissionResponse, ContactResponse, Delivery, MessageState, PollResponse,
+    RefusalCode, RefusalResponse, StatusResponse,
 };
 use khive_channel::{ChannelError, HoldReason, PendingDetail, ReceiptDisposition, SendOutcome};
 use reqwest::{Client, Method, Url};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
+use serde_json::value::RawValue;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -44,6 +45,14 @@ struct HttpResponse {
     status: u16,
     body: Vec<u8>,
     diagnostic: RemoteDiagnostic,
+}
+
+// This extracts bytes only. PollResponse owns all page fields and wire limits;
+// never serialize its typed items to reconstruct their original JSON.
+#[derive(Deserialize)]
+struct RawPollItems {
+    deliveries: Vec<Box<RawValue>>,
+    receipts: Vec<Box<RawValue>>,
 }
 
 impl NodeClient {
@@ -416,29 +425,82 @@ impl NodeClient {
         if r.status != 200 {
             return Err(refusal_error(&r));
         }
-        let page: RawPollResponse = decode(&r.body)?;
+        let page: PollResponse = decode(&r.body)?;
+        let raw: RawPollItems = decode(&r.body)?;
+        if page.deliveries.as_slice().len() != raw.deliveries.len()
+            || page.receipts.as_slice().len() != raw.receipts.len()
+        {
+            return Err(NodeError::transport(
+                "poll item byte positions are inconsistent",
+            ));
+        }
         let mut deliveries = Vec::new();
-        for raw in page.deliveries.into_vec() {
+        let mut rejected_deliveries = Vec::new();
+        for (item, raw) in page.deliveries.into_vec().into_iter().zip(raw.deliveries) {
             let original = raw.get().as_bytes().to_vec();
             if original.len() > MAX_REQUEST_BODY_BYTES {
-                return Err(NodeError::transport("delivery object exceeds local limit"));
+                rejected_deliveries.push(NodePollRejection {
+                    index: item.index,
+                    code: RefusalCode::PayloadTooLarge,
+                    original,
+                });
+                continue;
             }
-            let delivery: Delivery = decode(&original)?;
+            // The raw entry point preserves typed version/size refusals; the
+            // shared item's validity remains authoritative for all wire fields.
+            let delivery = match (item.result, Delivery::parse(&original)) {
+                (Ok(_), Ok(delivery)) => delivery,
+                (_, Err(error)) => {
+                    rejected_deliveries.push(NodePollRejection {
+                        index: item.index,
+                        code: error.refusal_code(),
+                        original,
+                    });
+                    continue;
+                }
+                (Err(failure), Ok(_)) => {
+                    rejected_deliveries.push(NodePollRejection {
+                        index: item.index,
+                        code: failure.code,
+                        original,
+                    });
+                    continue;
+                }
+            };
             let opening = self.open_delivery(&delivery).await;
             deliveries.push(NodeDelivery {
+                index: item.index,
                 delivery,
                 original,
                 opening,
             });
         }
         let mut receipts = Vec::new();
-        for item in page.receipts.into_vec() {
-            let verification = self.verify_sender_receipt(&item.receipt, None).await;
-            receipts.push(NodeReceiptResult { item, verification });
+        let mut rejected_receipts = Vec::new();
+        for (item, raw) in page.receipts.into_vec().into_iter().zip(raw.receipts) {
+            let receipt = match item.result {
+                Ok(receipt) => receipt,
+                Err(failure) => {
+                    rejected_receipts.push(NodePollRejection {
+                        index: item.index,
+                        code: failure.code,
+                        original: raw.get().as_bytes().to_vec(),
+                    });
+                    continue;
+                }
+            };
+            let verification = self.verify_sender_receipt(&receipt.receipt, None).await;
+            receipts.push(NodeReceiptResult {
+                index: item.index,
+                item: receipt,
+                verification,
+            });
         }
         Ok(NodePollResult {
             deliveries,
             receipts,
+            rejected_deliveries,
+            rejected_receipts,
             next_cursor: page.receipts_cursor,
             server_time: page.server_time,
         })

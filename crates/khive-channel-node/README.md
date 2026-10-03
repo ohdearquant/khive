@@ -14,7 +14,12 @@ all persisted binding fields and the recipient's pinned signature agree. A node 
 refusal returns `ChannelError::Auth`; its consumer must pause and retain pending transport rows.
 
 Polling returns opened classifications or closed unopened reasons alongside the original delivery
-object bytes. It writes no message or replay state and posts no receipt. The recipient receipt
+object bytes. Malformed deliveries and receipts are reported by their page index without hiding
+later valid items or the receipt cursor. Page fields and array limits remain strict. Server times
+accept numeric offsets and normalize to UTC `Z`. Polling writes no message or replay state and
+posts no receipt. `deliveries` and `receipts` contain valid wire items; `rejected_deliveries` and
+`rejected_receipts` retain the refused items with their original bytes and refusal codes. Every
+index refers to the original response array, including skipped entries. The recipient receipt
 binding is parsed from that same preserved object. The binary receipt signature input and the
 original delivery JSON are distinct: the signature covers the binding and disposition, while the
 original JSON is retained for a later quarantine commit. `ack` is a separate post-commit call.
