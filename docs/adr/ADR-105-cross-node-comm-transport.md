@@ -1231,7 +1231,7 @@ and every existing channel adapter stays byte-identical.
 
 ## Amendment 2026-10-03 -- Sender receipts from the poll page
 
-**Status.** Proposed.
+**Status.** Accepted; ratified by the maintainer, 2026-10-03.
 
 **Why.** Item 5 of the 2026-09-14 amendment gives the `Channel` trait three receipt methods.
 `send_with_receipt` answers when a submit is answered, and `poll_deliveries` returns inbound
