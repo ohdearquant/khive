@@ -392,6 +392,29 @@ impl SenderTransportStore {
             .with_reader("sender_transport_get", move |conn| load(conn, key))
             .await
     }
+    /// Read the caller's outbound transport record. A recipient receipt wins over
+    /// a newer envelope; without a receipt, use the latest local envelope sequence.
+    pub async fn get_by_outbound_note_id(
+        &self,
+        namespace: &str,
+        outbound_note_id: Uuid,
+    ) -> StorageResult<Option<SenderRecord>> {
+        let namespace = namespace.to_owned();
+        self.notes
+            .with_reader("sender_transport_status", move |conn| {
+                conn.query_row(
+                    &format!(
+                        "SELECT {COLUMNS} FROM comm_sender_transport \
+                         WHERE namespace = ?1 AND outbound_note_id = ?2 \
+                         ORDER BY (receipt IS NOT NULL) DESC, envelope_seq DESC LIMIT 1"
+                    ),
+                    params![namespace, outbound_note_id.to_string()],
+                    read_row,
+                )
+                .optional()
+            })
+            .await
+    }
     /// Exact retries reuse the record. Only confirmed key-change operations
     /// may create another envelope.
     pub async fn create(

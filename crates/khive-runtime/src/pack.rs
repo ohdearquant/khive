@@ -2424,6 +2424,7 @@ impl VerbRegistry {
         ("brain", "brain.bindings"),
         // comm
         ("comm", "comm.delivered"),
+        ("comm", "comm.transport_status"),
         ("comm", "comm.inbox"),
         ("comm", "comm.unread"),
         ("comm", "comm.thread"),

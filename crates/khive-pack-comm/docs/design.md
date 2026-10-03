@@ -4,7 +4,7 @@
 
 ### Communication Pack (ADR-040)
 
-This crate is the primary implementation of ADR-040. It provides ten public `comm.*` verbs over the
+This crate is the primary implementation of ADR-040. It provides eleven public `comm.*` verbs over the
 standard `message` note kind stored in the notes table.
 
 Key design decisions from ADR-040:
@@ -52,7 +52,7 @@ taxonomy from ADR-025. The mapping is enforced by the `verb_categories_match_spe
 - `NOTE_KINDS = ["message"]`
 - `ENTITY_KINDS = []`
 - `REQUIRES = ["kg"]`
-- `HANDLERS = COMM_HANDLERS` (10 public verb entries plus 4 internal subhandlers)
+- `HANDLERS = COMM_HANDLERS` (11 public verb entries plus 5 internal subhandlers)
 
 The pack self-registers via `inventory::submit!` so it is available when loaded by name.
 
