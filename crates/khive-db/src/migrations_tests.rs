@@ -41,6 +41,8 @@ fn migrate_through(conn: &mut Connection, through_version: u32) {
         // the migration runner.
         if migration.version == 44 {
             migrate_outbound_due_key(&tx).expect("apply historical migration body");
+        } else if migration.version == 48 {
+            migrate_acknowledgement_journal(&tx).expect("apply historical migration body");
         } else {
             tx.execute_batch(migration.up)
                 .expect("apply historical migration body");
@@ -5385,4 +5387,222 @@ fn recipient_transport_migration_fresh_and_previous_tail() {
             "replaying V45 must preserve recipient state"
         );
     }
+}
+
+fn acknowledgement_schema(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+    conn.prepare(
+        "SELECT type,name,sql FROM sqlite_master \
+         WHERE tbl_name='comm_ack_work' AND type IN ('table','index') ORDER BY type,name",
+    )
+    .unwrap()
+    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+fn acknowledgement_columns(
+    conn: &Connection,
+    retry_columns: bool,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let columns = if retry_columns {
+        "delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,state,\
+         created_at,updated_at,attempt_count,not_before,retirement_reason"
+    } else {
+        "delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,state,\
+         created_at,updated_at"
+    };
+    conn.prepare(&format!(
+        "SELECT {columns} FROM comm_ack_work ORDER BY delivery_attempt_id"
+    ))
+    .unwrap()
+    .query_map([], |row| {
+        (0..row.as_ref().column_count())
+            .map(|column| row.get(column))
+            .collect()
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+#[test]
+fn acknowledgement_journal_upgrade_preserves_every_legacy_column_and_matches_fresh_schema() {
+    let mut upgraded = open_memory();
+    migrate_through(&mut upgraded, 47);
+    for (attempt, state, disposition, created_at, updated_at) in [
+        ("pending-attempt", "pending", "stored", 17, 23),
+        ("finished-attempt", "acknowledged", "quarantined", 31, 47),
+    ] {
+        upgraded
+            .execute(
+                "INSERT INTO comm_ack_work \
+                 (delivery_attempt_id,sender_agent_id,logical_message_id,binding,\
+                  disposition,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    attempt,
+                    format!("sender-{attempt}"),
+                    format!("message-{attempt}"),
+                    format!("{{ \"attempt\":\"{attempt}\", \"version\": 1 }}"),
+                    disposition,
+                    state,
+                    created_at,
+                    updated_at
+                ],
+            )
+            .unwrap();
+    }
+    let legacy_rows = acknowledgement_columns(&upgraded, false);
+    assert_eq!(legacy_rows.len(), 2);
+    run_migrations(&mut upgraded).unwrap();
+    assert_eq!(
+        acknowledgement_columns(&upgraded, false),
+        legacy_rows,
+        "upgrading must preserve every legacy acknowledgement column byte for byte"
+    );
+    let mut fresh = open_memory();
+    run_migrations(&mut fresh).unwrap();
+    assert_eq!(
+        acknowledgement_schema(&upgraded),
+        acknowledgement_schema(&fresh),
+        "fresh and upgraded acknowledgement table and index SQL must match"
+    );
+    assert!(acknowledgement_schema(&fresh)
+        .iter()
+        .any(|(_, name, _)| name == "idx_comm_ack_due"));
+    let bookkeeping = upgraded
+        .prepare("SELECT attempt_count,not_before,retirement_reason FROM comm_ack_work")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(bookkeeping, vec![(0, None, None), (0, None, None)]);
+}
+
+#[test]
+fn acknowledgement_journal_tail_replay_preserves_retry_and_terminal_rows() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+    for (attempt, state, counter, not_before, reason) in [
+        ("pending", "pending", 3, Some(101), None),
+        ("finished", "acknowledged", 7, None, None),
+        (
+            "retired",
+            "retired",
+            11,
+            Some(103),
+            Some("permanent_transport"),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO comm_ack_work \
+             (delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,\
+              state,created_at,updated_at,attempt_count,not_before,retirement_reason) \
+             VALUES (?1,'sender','message','{\"version\":1}','stored',?2,17,23,?3,?4,?5)",
+            rusqlite::params![attempt, state, counter, not_before, reason],
+        )
+        .unwrap();
+    }
+    let before_rows = acknowledgement_columns(&conn, true);
+    let before_schema = acknowledgement_schema(&conn);
+    conn.execute("DELETE FROM _schema_migrations WHERE version>=45", [])
+        .unwrap();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(
+        acknowledgement_columns(&conn, true),
+        before_rows,
+        "replaying the recipient migration tail must preserve retries and terminal states"
+    );
+    assert_eq!(
+        acknowledgement_schema(&conn),
+        before_schema,
+        "tail replay must restore only the canonical acknowledgement indexes"
+    );
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(acknowledgement_columns(&conn, true), before_rows);
+}
+
+fn assert_acknowledgement_journal_partial_columns_refused(with_not_before: bool) {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 47);
+    conn.execute_batch(
+        "ALTER TABLE comm_ack_work ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+    )
+    .unwrap();
+    if with_not_before {
+        conn.execute_batch("ALTER TABLE comm_ack_work ADD COLUMN not_before INTEGER")
+            .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO comm_ack_work \
+         (delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,\
+          state,created_at,updated_at,attempt_count) \
+         VALUES ('partial-attempt','original-sender','original-message',\
+                 '{ \"version\": 1, \"transport\": \"original\" }','quarantined',\
+                 'pending',17,23,29)",
+        [],
+    )
+    .unwrap();
+    if with_not_before {
+        conn.execute("UPDATE comm_ack_work SET not_before=103", [])
+            .unwrap();
+    }
+    let before_rows = acknowledgement_columns(&conn, false);
+    let before_schema = acknowledgement_schema(&conn);
+    assert_eq!(before_rows.len(), 1);
+
+    let error = run_migrations(&mut conn)
+        .expect_err("V48 must refuse an acknowledgement table with only some retry columns");
+    assert!(
+        matches!(&error, SqliteError::Migration { version: 48, .. }),
+        "the real migration runner must report V48 refusal: {error:?}"
+    );
+    assert_eq!(
+        acknowledgement_columns(&conn, false),
+        before_rows,
+        "refusal must preserve every stored legacy acknowledgement column"
+    );
+    let attempt_count: i64 = conn
+        .query_row("SELECT attempt_count FROM comm_ack_work", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        attempt_count, 29,
+        "refusal must preserve retries already recorded in the partial schema"
+    );
+    if with_not_before {
+        let not_before: i64 = conn
+            .query_row("SELECT not_before FROM comm_ack_work", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(not_before, 103, "refusal must preserve the retry deadline");
+    }
+    assert_eq!(
+        acknowledgement_schema(&conn),
+        before_schema,
+        "refusal must leave the partial table and indexes untouched"
+    );
+    let latest_applied: u32 = conn
+        .query_row("SELECT max(version) FROM _schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(latest_applied, 47, "refusal must not advance the ledger");
+}
+
+#[test]
+fn acknowledgement_journal_partial_one_column_refuses_without_changing_rows() {
+    assert_acknowledgement_journal_partial_columns_refused(false);
+}
+
+#[test]
+fn acknowledgement_journal_partial_two_columns_refuses_without_changing_rows() {
+    assert_acknowledgement_journal_partial_columns_refused(true);
 }
