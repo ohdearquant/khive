@@ -7238,7 +7238,7 @@ async fn remember_over_embedding_budget_succeeds_and_discloses_truncation() {
 /// fences, reports its recomputed truncation, and adds no rows.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
-async fn keyed_remember_discloses_truncation_on_fresh_write_and_not_on_replay() {
+async fn keyed_remember_discloses_truncation_on_fresh_write_and_on_identical_replay() {
     let rt = KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         embedding_model: None,
