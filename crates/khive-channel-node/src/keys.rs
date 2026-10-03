@@ -158,18 +158,22 @@ fn signing_operation(seed: &[u8; 32], input: &[u8]) -> ([u8; 64], [u8; 32]) {
 /// Volatile keys with zeroized private storage and no Debug or export API.
 pub struct InMemoryKeyFacility {
     kem: PrivateKemKey,
-    signing_seed: Zeroizing<[u8; 32]>,
+    signing_seed: Box<Zeroizing<[u8; 32]>>,
     signing_public_key: SigningPublicKey,
 }
 impl InMemoryKeyFacility {
     pub fn generate() -> Result<Self, ProtocolError> {
+        Self::generate_with_rng(&mut OsRng)
+    }
+    fn generate_with_rng<R: RngCore + rand_core::CryptoRng>(
+        rng: &mut R,
+    ) -> Result<Self, ProtocolError> {
         let mut ikm = Zeroizing::new([0u8; 32]);
-        let mut seed = Zeroizing::new([0u8; 32]);
-        OsRng
-            .try_fill_bytes(ikm.as_mut())
+        // Allocate before filling so facility moves relocate only the pointer.
+        let mut seed = Box::new(Zeroizing::new([0u8; 32]));
+        rng.try_fill_bytes(ikm.as_mut())
             .map_err(|_| ProtocolError::Randomness)?;
-        OsRng
-            .try_fill_bytes(seed.as_mut())
+        rng.try_fill_bytes(&mut seed[..])
             .map_err(|_| ProtocolError::Randomness)?;
         let (kem, _) = NodeKem::derive_keypair(ikm.as_ref());
         Ok(Self {
@@ -180,10 +184,12 @@ impl InMemoryKeyFacility {
     }
     #[cfg(test)]
     pub(crate) fn from_test_seeds(ikm: &[u8; 32], seed: &[u8; 32]) -> Self {
+        let mut signing_seed = Box::new(Zeroizing::new([0u8; 32]));
+        signing_seed.copy_from_slice(seed);
         Self {
             kem: NodeKem::derive_keypair(ikm).0,
             signing_public_key: SigningPublicKey::new(signing_operation(seed, &[]).1).unwrap(),
-            signing_seed: Zeroizing::new(*seed),
+            signing_seed,
         }
     }
     #[cfg(test)]
