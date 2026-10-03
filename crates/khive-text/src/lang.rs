@@ -20,12 +20,27 @@ pub fn is_cjk_char(c: char) -> bool {
 
 /// Return whether strictly more than 15% of `text` characters are CJK.
 pub fn contains_cjk(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
+    let (cjk_count, char_count) = cjk_counts(text);
+    if char_count == 0 {
         return false;
     }
-    let cjk_count = chars.iter().filter(|&&c| is_cjk_char(c)).count();
-    (cjk_count as f64 / chars.len() as f64) > 0.15
+    (cjk_count as f64 / char_count as f64) > 0.15
+}
+
+/// The 15% classifier using `f32` arithmetic for existing memory routing behavior.
+/// Near the boundary it can differ from [`contains_cjk`], which uses `f64`.
+pub fn contains_cjk_f32(text: &str) -> bool {
+    let (cjk_count, char_count) = cjk_counts(text);
+    if char_count == 0 {
+        return false;
+    }
+    (cjk_count as f32 / char_count as f32) > 0.15
+}
+
+fn cjk_counts(text: &str) -> (usize, usize) {
+    text.chars().fold((0, 0), |(cjk, total), ch| {
+        (cjk + usize::from(is_cjk_char(ch)), total + 1)
+    })
 }
 
 /// Character-count profile containing CJK and ASCII-letter fractions.
@@ -218,6 +233,20 @@ mod tests {
         let text = "你好世abcdefghijklmnopq"; // 3 CJK + 17 latin = 20 chars
         assert_eq!(text.chars().count(), 20);
         assert!(!contains_cjk(text));
+    }
+
+    #[test]
+    fn f32_classifier_preserves_strict_boundary_and_script_ranges() {
+        for (text, expected) in [
+            ("", false),
+            ("ordinary latin query", false),
+            ("漢字かな한글", true),
+            ("界界界abcdefghijklmnopq", false),
+            ("界界界abcdefghijklmnopqr", false),
+            ("界界界abcdefghijklmnop", true),
+        ] {
+            assert_eq!(contains_cjk_f32(text), expected, "text={text:?}");
+        }
     }
 
     #[test]
