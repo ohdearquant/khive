@@ -1710,19 +1710,6 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
     }
 }
 
-/// Escape SQLite `LIKE` wildcards (`%`, `_`, `\`) so a caller-supplied path
-/// matches literally under `LIKE ... ESCAPE '\'`.
-fn escape_like(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Find an existing `document` entity whose `properties.source_uri` or
 /// `name` matches `path` (ADR-086 keying convention); `None` when no match
 /// (v0 never creates documents on the ingester's behalf). See
@@ -1739,7 +1726,7 @@ async fn find_document_for_path(
         .unwrap_or(path);
     let sql = runtime.sql();
     let namespace = token.namespace().as_str().to_string();
-    let like_pattern = format!("%{}", escape_like(path));
+    let like_pattern = format!("%{}", khive_types::escape_like_literal(path));
 
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
@@ -2142,7 +2129,7 @@ fn walk_commits(
         }
         let text = |field: &[u8]| String::from_utf8_lossy(field).into_owned();
         let sha = text(fields[0]);
-        if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !crate::object_id::is_40_hex(sha.as_bytes()) {
             bail!("git log returned a malformed commit id");
         }
         metadata.push((
@@ -3179,7 +3166,7 @@ async fn ingest_commits(
                                     .as_ref()
                                     .and_then(|properties| properties.get("sha"))
                                     .and_then(Value::as_str)
-                                    .filter(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+                                    .filter(|sha| crate::object_id::is_40_hex(sha.as_bytes()))
                                     .unwrap_or("<missing or malformed>");
                                 RuntimeError::Internal(format!(
                                     "git commit key {key:?} is held by note {} kind {} properties.sha {holder_sha:?}; expected SHA {}",

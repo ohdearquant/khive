@@ -999,25 +999,10 @@ fn finish(report: &ReindexReport, best_effort: bool) -> Result<()> {
     result
 }
 
-/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
-/// character itself (`\`) so a caller-supplied namespace is matched literally
-/// under `LIKE ... ESCAPE '\'` rather than as a pattern (#819: an
-/// underscore-bearing namespace like `a_b` must not also match `aXb`).
-fn escape_like(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyhow::Result<()> {
     use khive_storage::types::{SqlStatement, SqlValue};
 
-    let pattern = format!("{}::vamana::%", escape_like(namespace));
+    let pattern = format!("{}::vamana::%", khive_types::escape_like_literal(namespace));
     let sql = rt.sql();
     let mut writer = sql
         .writer()
