@@ -1584,6 +1584,11 @@ remains subject to the existing finalizer gates.
 **Status**: Proposed. Refs [#1840](https://github.com/ohdearquant/khive/issues/1840).
 No masking policy or new admission surface is activated by this proposal.
 
+The maintainer's standing rule forbids storing credential plaintext in any content write:
+reference credentials by environment variable name or dashboard location, and mask a displayed
+credential as its first six characters followed by an ellipsis and the remaining length in
+brackets (`first6…[N chars]`).
+
 ### Ownership and the decision still required
 
 ADR-115 owns the canonical detector, permanent masking surfaces, final stored candidate,
@@ -1808,13 +1813,15 @@ These obligations describe what would need acceptance; they do not allocate an i
    conservative-tail disposition. Decide overlap attribution; never label every removed tail byte
    as a confirmed credential. Retain bounded work and valid UTF-8 boundaries. If the required
    truthful report cannot be produced, keep quarantine rather than invent provenance.
-2. **A replacement without original fragments.** The diagnostic first-six-character preview is
-   not a stored mask: it retains original characters. The current whole-span `***MASKED***` marker
-   is a candidate format, not executed proof that every resulting message passes the gate. Marker,
-   surrounding context and new report strings must pass the ordinary final scan. A report carrying
-   long source hashes, opaque IDs, class labels or trigger words can itself retrigger a contextual
-   detector. Masking must have a bounded post-pass/failure disposition; no exemption or repeated
-   unbounded remasking may rescue a failing candidate.
+2. **A replacement without original fragments.** Should ratification retain the current whole-span
+   `***MASKED***` marker as a candidate departure from the standing `first6…[N chars]` display
+   convention because even six characters of a third party's credential may be sensitive, unlike
+   a reference to one's own credential? This candidate format is not executed proof that every
+   resulting message passes the gate. Marker, surrounding context and new report strings must
+   pass the ordinary final scan. A report carrying long source hashes, opaque IDs, class labels or
+   trigger words can itself retrigger a contextual detector. Masking must have a bounded
+   post-pass/failure disposition; no exemption or repeated unbounded remasking may rescue a
+   failing candidate.
 3. **All final string surfaces.** Define which display fields may be transformed: body, subject,
    names and designated metadata values. The gate scans JSON keys as well as recursive string
    leaves, and ingest includes address/actor/thread/wire identity strings. Do not blindly rename
