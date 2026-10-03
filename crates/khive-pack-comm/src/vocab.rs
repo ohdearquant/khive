@@ -62,6 +62,11 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
         category: khive_types::VerbCategory::Commissive,
         params: &[
             ParamDef {
+                name: "attachments", param_type: "array", required: false,
+                description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "idempotency_key",
                 param_type: "string",
                 required: false,
@@ -328,6 +333,11 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
+            ParamDef {
+                name: "attachments", param_type: "array", required: false,
+                description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "idempotency_key",
                 param_type: "string",

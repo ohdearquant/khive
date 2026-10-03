@@ -362,12 +362,17 @@ pub(crate) async fn handle_send(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
+    let attachments =
+        crate::file_attachments::prepare(runtime, "comm.send", &to_actor, &p.attachments).await?;
     let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
-        json!({
-            "version": 1, "op": "send", "to": to_actor, "content": p.content,
-            "subject": p.subject, "thread_id": thread_id,
-            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": null,
-        })
+        crate::file_attachments::identify_request(
+            json!({
+                "version": 1, "op": "send", "to": to_actor, "content": p.content,
+                "subject": p.subject, "thread_id": thread_id,
+                "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": null,
+            }),
+            &p.attachments,
+        )
     })?;
     let MessageWrite {
         outbound: outbound_note,
@@ -388,6 +393,7 @@ pub(crate) async fn handle_send(
         None,
         None,
         p.tags.as_deref(),
+        &attachments,
         identity.as_ref(),
     )
     .await?;
@@ -755,6 +761,7 @@ pub(crate) async fn handle_inbox(
     let namespace = token.namespace().as_str();
     wait_for_inbox_response(inbox_signal, deadline, || {
         query_inbox_response(
+            runtime,
             store,
             namespace,
             &view,
@@ -823,6 +830,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn query_inbox_response(
+    runtime: &KhiveRuntime,
     store: &dyn khive_storage::NoteStore,
     namespace: &str,
     view: &MailboxView,
@@ -916,6 +924,7 @@ async fn query_inbox_response(
     if has_more {
         messages.truncate(limit);
     }
+    crate::file_attachments::enrich_many(runtime, messages.iter_mut().collect()).await?;
     let count = messages.len();
     // This is a mailbox-wide signal; page and status filters only shape `messages`.
     let unread = if params.mailbox.as_deref().unwrap_or("inbox") == "inbox" {
@@ -1084,7 +1093,11 @@ pub(crate) async fn handle_read(
         )),
         (Some(raw), None) => {
             let (id, note) = validate_read_target(runtime, token, &raw).await?;
-            let message = include_body.then(|| read_message_fields(&note));
+            let message = if include_body {
+                Some(read_message_fields(runtime, &note).await?)
+            } else {
+                None
+            };
             let result = mark_read_target(runtime, token, id, note).await?;
             Ok(read_result_with_body(result, message))
         }
@@ -1206,10 +1219,27 @@ async fn mark_read_targets_best_effort(
     targets: Vec<(Uuid, Note)>,
     include_body: bool,
 ) -> Result<Value, RuntimeError> {
-    let mut results = Vec::with_capacity(targets.len());
-    for (id, note) in targets {
+    // Read every target's fields before marking any target, so a failed field
+    // lookup cannot leave earlier messages marked as read.
+    let attachment_fields: Vec<Option<Value>> = if include_body {
+        let ids: Vec<_> = targets.iter().map(|(id, _)| *id).collect();
+        crate::file_attachments::metadata_many(runtime, &ids)
+            .await?
+            .into_iter()
+            .map(Some)
+            .collect()
+    } else {
+        vec![None; targets.len()]
+    };
+    let mut prepared_targets = Vec::with_capacity(targets.len());
+    for ((id, note), fields) in targets.into_iter().zip(attachment_fields) {
+        let message = fields.map(|fields| read_message_fields_prepared(&note, fields));
+        prepared_targets.push((id, note, message));
+    }
+
+    let mut results = Vec::with_capacity(prepared_targets.len());
+    for (id, note, message) in prepared_targets {
         let original_properties = note.properties.clone();
-        let message = include_body.then(|| read_message_fields(&note));
         match mark_read_target(runtime, token, id, note).await {
             Ok(result) => results.push(read_result_with_body(result, message)),
             Err(error) => {
@@ -1236,16 +1266,27 @@ async fn mark_read_targets_best_effort(
     Ok(bulk_read_response(requested_count, results))
 }
 
-fn read_message_fields(note: &Note) -> Value {
+async fn read_message_fields(runtime: &KhiveRuntime, note: &Note) -> Result<Value, RuntimeError> {
+    let attachment_fields = crate::file_attachments::metadata(runtime, note.id).await?;
+    Ok(read_message_fields_prepared(note, attachment_fields))
+}
+
+fn read_message_fields_prepared(note: &Note, attachment_fields: Value) -> Value {
     let message = note_to_message_json(note);
-    json!({
+    let mut fields = json!({
         "subject": message["subject"],
         "content": message["content"],
         "from": message["from"],
         "to": message["to"],
         "direction": message["direction"],
         "created_at": message["created_at"],
-    })
+    });
+    if let (Some(fields), Value::Object(attachment_fields)) =
+        (fields.as_object_mut(), attachment_fields)
+    {
+        fields.extend(attachment_fields);
+    }
+    fields
 }
 
 fn read_result_with_body(mut result: Value, message: Option<Value>) -> Value {
@@ -1848,12 +1889,17 @@ pub(crate) async fn handle_reply(
     // Pass caller_ns as both `from` and `to` so `from == recipient_ns_str` in
     // dual_write_message, naturally bypassing the cross-namespace allowlist gate
     // (ADR-057 §"Interaction with ADR-040"). Actor labels are stored via from_actor/to_actor.
+    let attachments =
+        crate::file_attachments::prepare(runtime, "comm.reply", &reply_to, &p.attachments).await?;
     let identity = MessageIdentity::new(p.idempotency_key.as_deref(), || {
-        json!({
-            "version": 1, "op": "reply", "to": reply_to, "content": p.content,
-            "subject": reply_subject_opt, "thread_id": thread_id,
-            "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": id,
-        })
+        crate::file_attachments::identify_request(
+            json!({
+                "version": 1, "op": "reply", "to": reply_to, "content": p.content,
+                "subject": reply_subject_opt, "thread_id": thread_id,
+                "tags": p.tags.as_deref().unwrap_or_default(), "reply_parent_id": id,
+            }),
+            &p.attachments,
+        )
     })?;
     let MessageWrite {
         outbound: reply_note,
@@ -1874,6 +1920,7 @@ pub(crate) async fn handle_reply(
         in_reply_to_message_id.as_deref(),
         references_chain.as_deref(),
         p.tags.as_deref(),
+        &attachments,
         identity.as_ref(),
     )
     .await?;
@@ -2254,6 +2301,11 @@ pub(crate) async fn handle_thread(
         }
     });
     rows.truncate(limit);
+    crate::file_attachments::enrich_many(
+        runtime,
+        rows.iter_mut().map(|row| &mut row.json).collect(),
+    )
+    .await?;
     let count = rows.len();
     let messages: Vec<Value> = rows
         .into_iter()
@@ -4851,6 +4903,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -4942,6 +4995,7 @@ mod tests {
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
                 exec: Default::default(),
+                ..khive_runtime::RuntimeConfig::no_embeddings()
             })
             .expect("in-memory runtime"),
         );
@@ -6297,6 +6351,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -6426,6 +6481,7 @@ mod tests {
                 allowed_outbound_namespaces: vec![],
                 actor_id: None,
                 exec: Default::default(),
+                ..khive_runtime::RuntimeConfig::no_embeddings()
             })
             .expect("in-memory runtime");
             let token = runtime

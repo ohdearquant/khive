@@ -76,6 +76,14 @@ pub struct Attachment {
     pub created_at: i64,
 }
 
+/// Readable attachment rows and diagnostics for unreadable metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttachmentReadReport {
+    pub attachments: Vec<Attachment>,
+    pub unreadable_count: u64,
+    pub unreadable_reason: Option<String>,
+}
+
 impl Attachment {
     /// Bind caller-supplied metadata to one record and timestamp.
     pub fn from_new(
@@ -160,6 +168,29 @@ pub trait AttachmentStore: Send + Sync + 'static {
     ) -> StorageResult<Option<Attachment>>;
     /// List all attachment roles for a record in stable role order.
     async fn list_attachments(&self, record_uuid: Uuid) -> StorageResult<Vec<Attachment>>;
+    /// Report and skip unreadable rows while preserving whole-lookup errors.
+    /// Backends without row diagnostics retain their strict listing behavior.
+    async fn list_attachments_report(
+        &self,
+        record_uuid: Uuid,
+    ) -> StorageResult<AttachmentReadReport> {
+        Ok(AttachmentReadReport {
+            attachments: self.list_attachments(record_uuid).await?,
+            ..AttachmentReadReport::default()
+        })
+    }
+    /// Return reports in input order, including repeated records.
+    /// Backends may batch the reads; the default preserves scalar behavior.
+    async fn list_attachments_reports(
+        &self,
+        record_uuids: &[Uuid],
+    ) -> StorageResult<Vec<AttachmentReadReport>> {
+        let mut reports = Vec::with_capacity(record_uuids.len());
+        for record_uuid in record_uuids {
+            reports.push(self.list_attachments_report(*record_uuid).await?);
+        }
+        Ok(reports)
+    }
     /// Remove one attachment role without touching the referenced blob.
     async fn delete_attachment(&self, record_uuid: Uuid, role: &str) -> StorageResult<bool>;
 }

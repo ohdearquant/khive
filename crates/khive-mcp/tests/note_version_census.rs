@@ -447,7 +447,7 @@ fn census() -> BTreeMap<(String, String), String> {
         // Keyed message pairs stamp the caller key onto the outbound note in a
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
-        (MESSAGE, "create_keyed_message_pair"),
+        (MESSAGE, "create_keyed_message_pair_with_attachments"),
         // A matching quarantine replay repairs legacy retention metadata in
         // one UPDATE. The note version trigger, not this writer, advances it.
         (COMM, "repair_duplicate_quarantine"),
@@ -580,7 +580,12 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         (OPERATIONS, "restore_note", "memory", "{}"),
         // The keyed pair stamps the caller key onto an already-inserted
         // outbound note, so the fixture is a keyless message row.
-        (MESSAGE, "create_keyed_message_pair", "message", "{}"),
+        (
+            MESSAGE,
+            "create_keyed_message_pair_with_attachments",
+            "message",
+            "{}",
+        ),
         (
             COMM,
             "repair_duplicate_quarantine",

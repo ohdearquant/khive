@@ -12,6 +12,8 @@ pub(crate) struct SendParams {
     pub to: String,
     pub content: String,
     #[serde(default)]
+    pub attachments: Vec<String>,
+    #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub subject: Option<String>,
@@ -120,6 +122,8 @@ pub(crate) struct UnreadParams {}
 pub(crate) struct ReplyParams {
     pub id: String,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
     /// Structured provenance tags, persisted verbatim to `properties["tags"]` on

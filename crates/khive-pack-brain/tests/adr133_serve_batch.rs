@@ -39,6 +39,7 @@ fn file_backed_runtime(db_path: std::path::PathBuf) -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("file-backed runtime")
 }

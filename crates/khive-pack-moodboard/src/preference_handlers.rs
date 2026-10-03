@@ -1757,6 +1757,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some(actor_id.to_string()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         }
     }
 
