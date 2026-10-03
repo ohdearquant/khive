@@ -3062,8 +3062,9 @@ impl BrainPack {
             }
         }
 
-        self.runtime
-            .create_entity(
+        let (_, embedding_report) = self
+            .runtime
+            .create_entity_with_embedding_report(
                 token,
                 "artifact",
                 Some("adapter"),
@@ -3074,12 +3075,17 @@ impl BrainPack {
             )
             .await?;
 
-        Ok(json!({
+        let mut response = json!({
             "registered": true,
             "adapter_id": p.adapter_id,
             "content_hash": p.content_hash,
             "base_model_revision": p.base_model_revision,
-        }))
+        });
+        if embedding_report.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+        }
+        Ok(response)
     }
 }
 

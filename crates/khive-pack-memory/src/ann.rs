@@ -7422,12 +7422,13 @@ mod tests {
         );
 
         const UPDATED_TEXT: &str = "tail dedup UPDATED content, unrelated to the original";
-        rt.update_note(
+        rt.update_note_with_embedding_report(
             &token,
             target.id,
             khive_runtime::NotePatch::new(None, Some(UPDATED_TEXT.to_string()), None, None, None),
         )
         .await
+        .map(|(row, _report)| row)
         .expect("update target note");
 
         // Query the segment's stale embedding of the ORIGINAL content: the

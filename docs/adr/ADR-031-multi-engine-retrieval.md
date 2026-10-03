@@ -1093,3 +1093,126 @@ says it is applied (#3246).
 ### Refs
 
 - #3246
+
+---
+
+## Amendment 4 (2026-09-30): disclose bounded document-embedding input at the Rust runtime boundary
+
+Status: Proposed (awaiting project-owner ratification)
+
+### Context
+
+The runtime preserves full entity descriptions and note content while bounding the text passed to an
+embedder. A caller that receives only a vector or a stored record cannot tell whether the embedding
+represents all of that text. This matters for direct Rust consumers as well as MCP handlers. The
+`DocumentEmbeddingOutcome` and `EmbeddingTruncationReport` types already carry the runtime's observed
+source byte count, embedded byte count, truncated count, and discarded byte count; older public
+methods discarded those values.
+
+This amendment governs the public Rust API for runtime-managed document embedding and writes. It
+does not describe or certify truncation that may occur inside an independently registered provider.
+
+### Decision
+
+1. Direct document-embedding methods that can bound input expose an outcome carrying `truncated`,
+   `source_bytes`, and `embedded_bytes`. Batch methods expose ordered outcomes; write methods expose
+   `EmbeddingTruncationReport`. A report counts each bounded embedding input and its omitted bytes;
+   the stored entity or note content remains complete.
+2. Five public Rust methods that previously returned only vectors or records cease to be public
+   entry points. Direct consumers migrate from `embed_document_with_model` to
+   `embed_document_with_model_outcome`, from `create_entity` to
+   `create_entity_with_embedding_report`, from `update_entity` to
+   `update_entity_with_embedding_report`, from `update_note` to
+   `update_note_with_embedding_report`, and from the exported `create_notes_atomic` to
+   `create_notes_atomic_with_report`. The atomic replacement preserves the same all-or-none note
+   write and adds the aggregate report; it does not alter the atomic note-write semantics.
+3. Widely used legacy-return methods remain callable. `embed_document`,
+   `embed_document_batch_with_model`, and its default-model delegate `embed_document_batch` return
+   an explicit error when runtime input bounding occurs. Consumers that need the bounded vectors
+   call `embed_document_outcome`, `embed_document_batch_with_model_outcomes`, or
+   `embed_document_batch_outcomes` respectively.
+4. `create_entity_with_attachments`, `create_note`, `create_note_with_embedding_content`,
+   `create_note_with_decay`, `create_note_with_decay_for_embedding_model`, and
+   `update_entity_if_unchanged` preserve their ordinary success values when no input is bounded.
+   On a bounded embedding, the write may already be
+   committed, so they return a structured, non-retryable `embedding_input_truncated` error with
+   `committed=true`, the committed `record_id`, and the serialized truncation report. The error also
+   retains any post-commit degradation diagnostics. Callers must inspect or reconcile that ID and
+   must not retry the mutation as if it rolled back. Report-aware alternatives are
+   `create_entity_with_attachments_and_report`,
+   `create_note_with_embedding_content_and_report` (pass `None` for the default note path),
+   `create_note_with_decay_and_report`,
+   `create_note_with_decay_for_embedding_model_and_report`, and
+   `update_entity_if_unchanged_with_embedding_report`. Those alternatives return the committed
+   record and report together when no independent post-commit failure occurs.
+5. A source census may name the known compatibility methods and their alternatives, but must not
+   claim to discover every future public method. Behavioral tests exercise oversized inputs at the
+   vector-only and record-only boundaries. A new public wrapper that can bound input must either
+   return its outcome or report, or disclose truncation with an explicit error.
+6. `web.refresh` uses the report-aware guarded-update method for entity promotions and aggregates
+   those embedding reports for the refresh settlement. When at least one such input is bounded,
+   the reply exposes `embedding_truncation_report` and the stored receipt's `request` object carries
+   the same key and value. Both keys are absent when no input is bounded. The report contains the
+   existing `truncated` input count and `discarded_bytes` count; it does not add an aggregate
+   `embedded_bytes` field. This disclosure is distinct from the network-body `truncated` flag and
+   does not change capture ownership, deduplication or replay decisions. Tests assert the exact
+   report on both surfaces, its absence on ordinary input, and the exact bytes passed to the
+   provider; removing the receipt key must make the receipt-disclosure test fail.
+7. The entity-type backfill scan aggregates the reports from successful guarded updates in its
+   serialized `embedding_truncation_report`. A bounded embedding does not turn a committed
+   promotion into a scan failure; independent update failures retain the existing failure behavior.
+   The stock command disables embedding providers and reports zero counters. A registered-provider
+   scan fixture separately proves bounded-input disclosure and continued promotion of later rows.
+
+### Boundary of this amendment
+
+The compatibility rule above covers the named direct vector, create, and guarded-update methods.
+Claim and reindex operations, entity and note restore, stream batch results, best-effort/trusted
+ingest, and backfills other than the entity-type scan above have different success and receipt
+contracts. They require a separate design
+for aggregate or per-member disclosure; this amendment makes no assertion that their current
+return values disclose all truncation. The private atomic post-commit mapper is likewise outside
+the public API census.
+
+Further surfaces still drop the embedding report and are not yet disclosing. Each reaches a
+bounded embedding only when its embedded text exceeds the document-embedding budget: 32768 UTF-8
+bytes, less the model's document-instruction prefix for a model that defines one.
+
+- The web pack's shared entity helpers `get_or_create` and `patch`, reached from `web.fetch` and
+  `web.extract` and redirect settlement in `web.refresh`, call the report-aware update and
+  discard its report. For a document entity, `get_or_create` embeds the entity name, which is the canonical URL, so a canonical URL
+  over the budget is embedded truncated without any signal from that helper in the verb reply.
+  `patch` re-embeds the stored name and description when it changes `entity_type`. Section 6
+  covers `web.refresh`'s guarded promotion and metadata updates; it does not cover the reports
+  discarded by these shared helpers when refresh creates redirect endpoints.
+- `create_web_receipt_note`, called by the web receipt writer, returns the stored receipt without
+  its report. The receipt summary embeds a requested URL or a search query, so a summary over the
+  budget is embedded truncated without any signal.
+- The public `keyed_memory::create_keyed_memory` returns `Ok` with the stored memory when its
+  content exceeds the budget, and drops the report that `create_keyed_memory_with_report`
+  returns. Nothing in a production path calls it: `memory.remember` uses
+  `create_keyed_memory_with_receipt_and_report` to retain both the original visibility fences and
+  truncation accounting. An external Rust consumer that calls it keeps the silent behavior.
+- The receipt-only memory APIs `create_keyed_memory_with_receipt` and
+  `create_note_with_decay_for_embedding_model_with_visibility` keep their existing return shapes
+  and omit the truncation report. `memory.remember` uses the combined receipt-and-report forms
+  instead; callers that need both disclosures can use those forms directly.
+
+Bringing these under the rule in decision 5 needs its own change, because each changes a return
+shape or a verb reply.
+
+### Consequences
+
+- External Rust consumers of the five narrowed methods must migrate to the named report-aware
+  alternatives. MCP verbs and parameters are unchanged; `web.refresh` adds the conditional reply
+  and receipt-request report described above.
+- Legacy write callers that previously received `Ok(record)` for bounded input now receive an
+  error identifying the committed record. Normal-length input keeps its previous return shape.
+- Runtime byte accounting does not attest to provider-internal preprocessing or token limits.
+
+### Related decisions
+
+- [ADR-011](ADR-011-embedding-and-inference.md) established the original vector-only runtime
+  examples; this amendment supersedes those examples for document embedding.
+- [ADR-099](ADR-099-bulk-apply-atomic-units.md) governs cross-operation atomic writes; the
+  report-aware note export does not alter its transaction semantics.

@@ -670,48 +670,99 @@ pub struct EventsDaemonGuard {
     _file: std::fs::File,
 }
 
-/// Try to become the events daemon for `socket_path`. `None` = the lock
-/// could not be safely acquired — either another events daemon holds it, or
-/// a hardening step refused (symlinked lock entry, failed chmod). Both mean
-/// the caller must not serve; callers that need the socket directory
-/// validated must run `ensure_socket_dir_is_trusted` on the parent BEFORE
-/// calling this, so no lock-path operation happens in an untrusted
-/// directory.
+/// Try to become the events daemon for `socket_path`, returning `None` for
+/// contention or any refusal. Callers must validate the parent with
+/// `ensure_socket_dir_is_trusted` before lock-path operations in that directory.
 #[cfg(unix)]
 pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemonGuard> {
+    match acquire_events_daemon_guard_outcome(socket_path) {
+        EventsDaemonGuardAcquisition::Held(guard) => Some(guard),
+        _ => None,
+    }
+}
+
+/// Why a non-blocking daemon-lock acquisition did or did not succeed.
+/// Refusals retain the I/O error instead of treating every failure as contention.
+#[cfg(unix)]
+enum EventsDaemonGuardAcquisition {
+    Held(EventsDaemonGuard),
+    Contended,
+    OpenFailed(std::io::Error),
+    HardeningRefused(std::io::Error),
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for EventsDaemonGuardAcquisition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Held(_) => f.write_str("Held"),
+            Self::Contended => f.write_str("Contended"),
+            Self::OpenFailed(error) => f.debug_tuple("OpenFailed").field(error).finish(),
+            Self::HardeningRefused(error) => {
+                f.debug_tuple("HardeningRefused").field(error).finish()
+            }
+        }
+    }
+}
+
+/// Try to become the events daemon for `socket_path`. Every refusal means
+/// the caller must not serve; only `Contended` identifies a held lock.
+/// Callers that need the socket directory validated must run
+/// `ensure_socket_dir_is_trusted` on the parent BEFORE calling this, so no
+/// lock-path operation happens in an untrusted directory.
+#[cfg(unix)]
+fn acquire_events_daemon_guard_outcome(socket_path: &Path) -> EventsDaemonGuardAcquisition {
+    use EventsDaemonGuardAcquisition::{Contended, HardeningRefused, Held, OpenFailed};
+
     let lock_path = socket_path.with_extension("lock");
     if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return OpenFailed(error);
+        }
     }
     use std::os::unix::fs::OpenOptionsExt;
     // `O_NOFOLLOW` pins the open to the final component: a symlink planted
     // at the lock name is refused instead of redirecting the open (and the
     // chmod below) to an attacker-selected target.
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&lock_path)
-        .ok()?;
+    {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return HardeningRefused(error);
+        }
+        Err(error) => return OpenFailed(error),
+    };
     // `mode` applies only at creation; tighten a pre-existing lock file too.
     // Descriptor-based (`fchmod` on the handle just opened), never a second
     // path lookup — and fail closed: with the inode pinned, a failed chmod
     // is abnormal, and serving behind a lock file another user can open is
     // exactly what the hardening exists to refuse.
-    file.set_permissions(
+    if let Err(error) = file.set_permissions(
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-    )
-    .ok()?;
+    ) {
+        return HardeningRefused(error);
+    }
     use std::os::fd::AsRawFd;
     // SAFETY: `fd` is a live descriptor owned by `file` for the duration of
     // the call; `flock` reads nothing else.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
-        Some(EventsDaemonGuard { _file: file })
+        Held(EventsDaemonGuard { _file: file })
     } else {
-        None
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || error.raw_os_error() == Some(libc::EAGAIN)
+        {
+            Contended
+        } else {
+            HardeningRefused(error)
+        }
     }
 }
 
@@ -1160,12 +1211,16 @@ pub async fn run_events_daemon_with_wal_ceiling(
         std::fs::create_dir_all(parent)?;
         crate::daemon::ensure_socket_dir_is_trusted(parent)?;
     }
-    let Some(_guard) = try_acquire_events_daemon_guard(socket_path) else {
-        tracing::info!(
-            socket = %socket_path.display(),
-            "events daemon lock unavailable (held by another daemon, or hardening refused); exiting"
-        );
-        return Ok(());
+    let _guard = match acquire_events_daemon_guard_outcome(socket_path) {
+        EventsDaemonGuardAcquisition::Held(guard) => guard,
+        refusal => {
+            tracing::info!(
+                socket = %socket_path.display(),
+                reason = ?refusal,
+                "events daemon lock unavailable; exiting"
+            );
+            return Ok(());
+        }
     };
     ensure_events_db_owner_only(db_path)?;
     // Tighten a pre-existing database and any `-wal`/`-shm` an earlier
@@ -2765,15 +2820,21 @@ mod tests {
         let socket = dir.path().join("events.sock");
         std::os::unix::fs::symlink(&victim, socket.with_extension("lock")).unwrap();
         assert!(
-            try_acquire_events_daemon_guard(&socket).is_none(),
-            "a symlinked lock entry must refuse the guard"
+            matches!(
+                acquire_events_daemon_guard_outcome(&socket),
+                EventsDaemonGuardAcquisition::HardeningRefused(_)
+            ),
+            "a symlinked lock entry must report a hardening refusal"
         );
         let mode = victim.metadata().unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o644, "the symlink's target must keep its mode");
         assert_eq!(std::fs::read(&victim).unwrap(), b"v");
         let clean = dir.path().join("clean.sock");
         assert!(
-            try_acquire_events_daemon_guard(&clean).is_some(),
+            matches!(
+                acquire_events_daemon_guard_outcome(&clean),
+                EventsDaemonGuardAcquisition::Held(_)
+            ),
             "a plain lock path in the same directory must still acquire"
         );
     }
@@ -4242,15 +4303,67 @@ mod tests {
     fn events_daemon_guard_is_exclusive_then_reusable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("events.sock");
-        let first = try_acquire_events_daemon_guard(&socket).expect("first acquire");
+        let first = match acquire_events_daemon_guard_outcome(&socket) {
+            EventsDaemonGuardAcquisition::Held(guard) => guard,
+            other => panic!("first acquire must succeed: {other:?}"),
+        };
+        let second = acquire_events_daemon_guard_outcome(&socket);
         assert!(
-            try_acquire_events_daemon_guard(&socket).is_none(),
-            "second acquire must fail while the first guard is held"
+            matches!(second, EventsDaemonGuardAcquisition::Contended),
+            "second acquire must report contention while the first guard is held: {second:?}"
         );
         drop(first);
+        // Another test may fork while the first description is open. A child
+        // can retain that flock until exec or exit; retry only that diagnosed
+        // contention, never an open/hardening error, and never without a bound.
+        const MAX_ATTEMPTS: usize = 100;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match acquire_events_daemon_guard_outcome(&socket) {
+                EventsDaemonGuardAcquisition::Held(_) => return,
+                EventsDaemonGuardAcquisition::Contended if attempt < MAX_ATTEMPTS => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => panic!(
+                    "acquire must succeed after release within {MAX_ATTEMPTS} attempts; \
+                     attempt {attempt}: {other:?}"
+                ),
+            }
+        }
+        unreachable!("the final acquisition attempt returns or reports its refusal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn events_daemon_guard_open_failure_is_not_contention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clean = dir.path().join("clean.sock");
+        assert!(matches!(
+            acquire_events_daemon_guard_outcome(&clean),
+            EventsDaemonGuardAcquisition::Held(_)
+        ));
+
         assert!(
-            try_acquire_events_daemon_guard(&socket).is_some(),
-            "acquire must succeed again after the guard is released"
+            try_acquire_events_daemon_guard(&clean).is_some(),
+            "the public Option entrance must preserve a successful acquisition"
+        );
+
+        // Opening a directory for writing must fail even when no process
+        // holds a daemon lock. Exercise the real open, not an injected result.
+        let socket = dir.path().join("blocked.sock");
+        let lock_path = socket.with_extension("lock");
+        std::fs::create_dir(&lock_path).expect("create directory at lock entry");
+        let outcome = acquire_events_daemon_guard_outcome(&socket);
+        assert!(
+            matches!(outcome, EventsDaemonGuardAcquisition::OpenFailed(_)),
+            "an actual lock-file open failure must not report contention: {outcome:?}"
+        );
+        assert!(
+            try_acquire_events_daemon_guard(&socket).is_none(),
+            "the public Option entrance must refuse an actual open failure"
+        );
+        assert!(
+            lock_path.is_dir(),
+            "the refused entry must remain a directory"
         );
     }
 

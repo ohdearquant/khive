@@ -28,13 +28,18 @@ pub(crate) async fn handle_store(
         properties.insert("tags".into(), json!(tags));
     }
 
+    // Session content is caller-supplied and often longer than the embedder's
+    // input budget. The report variant keeps the committed record a success and
+    // discloses the truncation, as comm, kg and knowledge writes do, instead of
+    // failing a write that has already been stored.
     let core = runtime.core();
-    let note = core
-        .create_note(
+    let (note, embedding_truncation) = core
+        .create_note_with_embedding_content_and_report(
             token,
             SESSION_KIND,
             p.title.as_deref(),
             &p.content,
+            None,
             None,
             Some(Value::Object(properties)),
             vec![],
@@ -45,7 +50,11 @@ pub(crate) async fn handle_store(
         ok: true,
         session: to_session_record(&note),
     };
-    Ok(serde_json::to_value(result).expect("StoreResult serializes"))
+    let mut response = serde_json::to_value(result).expect("StoreResult serializes");
+    if embedding_truncation.any_truncated() {
+        response["warnings"] = json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+    }
+    Ok(response)
 }
 
 #[cfg(test)]
@@ -54,6 +63,92 @@ mod tests {
     use serde_json::json;
 
     use super::handle_store;
+
+    struct TruncationEmbeddingService;
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for TruncationEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "session-truncation-test"
+        }
+    }
+
+    struct TruncationEmbedderProvider;
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for TruncationEmbedderProvider {
+        fn name(&self) -> &str {
+            "session-truncation-test"
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+        {
+            Ok(std::sync::Arc::new(TruncationEmbeddingService))
+        }
+    }
+
+    #[tokio::test]
+    async fn store_over_embedding_budget_keeps_the_session_and_discloses_truncation() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(TruncationEmbedderProvider);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let content = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+
+        let response = handle_store(&rt, &token, json!({ "content": content }))
+            .await
+            .expect("an over-budget session must not fail after it is committed");
+
+        assert_eq!(
+            response["warnings"],
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+            "store must disclose the truncated embedding input: {response}"
+        );
+        let id = uuid::Uuid::parse_str(response["session"]["id"].as_str().expect("session id"))
+            .expect("session id is a uuid");
+        let stored = rt
+            .core()
+            .notes(&token)
+            .expect("notes store")
+            .get_note(id)
+            .await
+            .expect("read the stored session")
+            .expect("the session is stored");
+        assert_eq!(stored.content.len(), lattice_embed::MAX_TEXT_BYTES + 1);
+    }
+
+    #[tokio::test]
+    async fn store_within_embedding_budget_has_no_warning() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(TruncationEmbedderProvider);
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+        let response = handle_store(&rt, &token, json!({ "content": "short session" }))
+            .await
+            .expect("store a session");
+
+        assert!(
+            response.get("warnings").is_none(),
+            "no warning expected: {response}"
+        );
+    }
 
     #[tokio::test]
     async fn empty_content_rejected() {

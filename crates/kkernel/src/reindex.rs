@@ -2141,8 +2141,9 @@ read_only = true
 
         // Seed a base row so `distinct_base_namespaces` returns only `local`
         // and the sweep guard does not skip the drop loop.
-        rt.create_entity(&token, "concept", None, "seed", None, None, vec![])
+        rt.create_entity_with_embedding_report(&token, "concept", None, "seed", None, None, vec![])
             .await
+            .map(|(row, _report)| row)
             .expect("seed entity");
 
         let sql = rt.sql();
@@ -3367,7 +3368,10 @@ read_only = true
 
         let mut patch = NotePatch::default();
         patch.content = Some("second body with different source text".into());
-        rt.update_note(&token, note.id, patch).await.unwrap();
+        rt.update_note_with_embedding_report(&token, note.id, patch)
+            .await
+            .map(|(row, _report)| row)
+            .unwrap();
         let blob_after = rt
             .sql()
             .reader()

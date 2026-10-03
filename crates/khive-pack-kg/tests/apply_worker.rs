@@ -124,12 +124,14 @@ async fn apply_worker_applies_add_edge_changeset() {
     ensure_schema(&rt).await;
 
     let e1 = rt
-        .create_entity(&tok, "concept", None, "EntityA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "EntityA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create e1");
     let e2 = rt
-        .create_entity(&tok, "concept", None, "EntityB", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "EntityB", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create e2");
 
     let proposal_id = Uuid::new_v4();
@@ -209,16 +211,35 @@ async fn apply_worker_applies_merge_entities_changeset() {
     ensure_schema(&rt).await;
 
     let into = rt
-        .create_entity(&tok, "concept", None, "Into", Some("desc A"), None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Into",
+            Some("desc A"),
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create into");
     let from = rt
-        .create_entity(&tok, "concept", None, "From", Some("desc B"), None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "From",
+            Some("desc B"),
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create from");
     let other = rt
-        .create_entity(&tok, "concept", None, "Other", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Other", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create other");
     rt.link(
         &tok,

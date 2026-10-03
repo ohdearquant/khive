@@ -35,6 +35,7 @@ khive-pack-comm = { version = "0.9.0", path = "../khive-pack-comm" }
 khive-pack-brain = { version = "0.9.0", path = "../khive-pack-brain" }
 khive-pack-git = { version = "0.9.0", path = "../khive-pack-git" }
 criterion = { workspace = true }
+lattice-embed = { workspace = true }
 
 [[bench]]
 name = "schedule_bench"

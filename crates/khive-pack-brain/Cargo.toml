@@ -41,6 +41,7 @@ tracing = { workspace = true }
 lattice-router = ["dep:lattice-fann"]
 
 [dev-dependencies]
+lattice-embed = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
 # Dev-only: exercises the real memory.recall -> BrainPack dispatch-hook path
