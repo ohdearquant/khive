@@ -1228,3 +1228,112 @@ Everything under "What stands" and "Compatibility obligation" above. In particul
 and every existing channel adapter stays byte-identical.
 
 <!-- deno-fmt-ignore-end -->
+
+## Amendment 2026-10-03 -- Sender receipts from the poll page
+
+**Status.** Proposed.
+
+**Why.** Item 5 of the 2026-09-14 amendment gives the `Channel` trait three receipt methods.
+`send_with_receipt` answers when a submit is answered, and `poll_deliveries` returns inbound
+envelopes with their receipt tickets. Neither carries the receipts that A.6.3 returns to a sender on
+its own poll. A.6.3 allows one outstanding poll per device, so the poll that receives a device's
+deliveries is also the poll that brings its agent's receipts. Without a route for them, a sender
+learns of a delivery only by resubmitting (A.6.2 step 2) or by a status read for each pending message
+(A.6.5), and the receipts on every poll page go unread. This amendment adds the route.
+
+### What changes
+
+1. **The poll page carries the sender's receipts and their cursor.** `DeliveryPage` gains a list of
+   receipt results, one for each receipt item on the page, in page order, and the page's
+   `receipts_cursor`. Both are separate from the page's envelope checkpoint (`next_checkpoint`),
+   which keeps its present meaning. The default `poll_deliveries` and `DeliveryPage::legacy` carry no
+   receipt results and no receipt cursor, and pass the legacy page, its checkpoint included, through
+   unchanged.
+2. **A receipt is verified in one place: the node adapter.** Every receipt, whether it arrives in a
+   submit answer, a poll page or a status read, is verified by the adapter under the sender rule of
+   A.8: its binding against the outbox record for that message, and its signature with the recipient
+   signing key the owner pinned for that message's recipient device at `recipient_key_epoch`. The
+   adapter reads the outbox record and the pinned key through the source and pin interfaces the
+   deployment supplies, never through a database of its own, and never takes a key from the service.
+   This is the same boundary at which the adapter already authenticates inbound envelopes with the
+   owner's pinned keys before it issues an `InboundReceiptTicket`, and the place A.9 and the
+   `SendOutcome` documentation in `khive-channel` already assign the check for a receipt in a submit
+   answer. The verified result crosses the `Channel` boundary as a value only the adapter constructs.
+   Like `InboundReceiptTicket`, its type authenticates nothing by itself: the guarantee is that the
+   adapter constructs it only from a verification it performed. The runtime records a receipt only
+   from that value. Its present constructor that checks a signature itself is replaced by a
+   conversion from the adapter's value, so there is no second signature check. Inside the writer
+   transaction that records it, the runtime still requires the receipt's binding and disposition to
+   match the outbox row, which keeps a row changed after the adapter's read from being receipted on
+   stale data.
+3. **Two kinds of failure, handled differently.** A **rejection** is a failure the receipt itself
+   causes: an item that does not parse, a binding that does not match the outbox record, a receipt
+   for a message with no outbox record, a recipient key the owner has not confirmed or whose
+   fingerprint does not match, or a signature that does not verify. A rejection never counts as
+   delivered and changes no message's state: a `pending` message stays `pending` and a `failed` one
+   stays `failed`, because only a verified receipt ends either (A.8). When it names an outbox row,
+   the runtime records on that row the reason A.9 gives for an unverified receipt, and otherwise it
+   is reported. A rejection is handled, so the cursor passes it (A.6.3). A failure to **read local
+   state** while verifying (the outbox record or the pin source cannot be read) is not a rejection.
+   The receipt is unhandled, the page's receipt cursor is not committed, and the next poll returns
+   the receipt again.
+4. **The cursor commits once the page's receipts are handled, and never decreases.** For the `khive`
+   channel kind the runtime stores `receipts_after` durably per slug, in that slug's channel
+   checkpoint: `source` names the slug's realm, agent and device, `generation` is fixed because a
+   sender's `seq` values are never reset (A.6.3), and `high_water` holds the value. The poll
+   coordinator commits a page's `receipts_cursor` once every receipt result on the page has been
+   recorded or reported, whatever happened to the page's deliveries. Deliveries need no cursor: one
+   that is not handled gets no receipt and the service hands it out again (A.6.3). A page with an
+   unhandled receipt commits no cursor. A page whose `receipts_cursor` is below the `receipts_after`
+   it was requested with is refused whole, and the stored value stands.
+5. **Recording is idempotent per message.** Receipts recorded before a crash, but above the committed
+   cursor, come back on the first poll after restart. Accepting a verified receipt for a message that
+   already holds one with the same disposition changes nothing, under any `delivery_attempt_id`: a
+   resubmitted message can be receipted again under a new attempt (A.8, replay identity). A verified
+   receipt whose disposition differs from the recorded one changes nothing and is reported; the first
+   recorded disposition stands, as it does on the service (A.6.4). Recording the same rejection
+   reason again changes nothing, and a verified receipt that arrives after a rejection is recorded as
+   any verified receipt is. This changes the runtime's present acceptance, which refuses every second
+   receipt that is not byte-identical to the first. Under that rule a second receipt with the same
+   disposition under a new attempt is refused as a conflict, and a coordinator that treated the
+   refusal as unhandled would never advance the cursor past it. After this amendment, only a
+   different disposition is a conflict, and a reported conflict is handled.
+
+### Acceptance
+
+Each arm names the change that must turn it red.
+
+1. **One verification site.** With the recipient's pin confirmed and the binding matching the outbox
+   record, a poll page carries a receipt whose signature does not verify. The result is a rejection,
+   the message stays `pending`, and its row carries the unverified-receipt reason. Removing the
+   adapter's signature check turns the arm red: the message becomes `recipient_stored`, because
+   nothing else checks the signature.
+2. **A rejection is recorded and passed; a read failure is not.** A page holds a rejected receipt for
+   one message, then a verified receipt for a second. The first row carries the reason and keeps its
+   state, the second becomes `recipient_stored`, and the cursor commits past both. Not recording the
+   reason turns the arm red, and so do treating the rejection as unhandled (the cursor stays) and
+   recording it as delivered. In a second case the pin source fails while the page is verified: no
+   cursor commits, and once the pin source answers again the next poll records the receipt. Treating
+   the read failure as a rejection turns this case red, because the cursor moves past a receipt that
+   is then never recorded.
+3. **Replay after a crash.** The process stops after a receipt is recorded and before the cursor
+   commits. After restart, the next poll returns the receipt again, and the message ends up recorded
+   once, holding the first receipt. Committing the cursor before recording turns the arm red (the
+   receipt is lost), and so does removing the already-recorded check (the second accept replaces the
+   stored receipt). A second verified receipt for the same message under a new `delivery_attempt_id`,
+   with the same disposition, changes nothing and the cursor moves past it. Refusing it as a conflict
+   that leaves the page unhandled turns the arm red.
+4. **The cursor rule.** A page holding one delivery whose ingest fails and one verified receipt
+   commits the cursor past the receipt. A page whose `receipts_cursor` is below the requested
+   `receipts_after` is refused and the stored value is unchanged. Committing before the receipts are
+   handled turns the arm red, and so do tying the commit to the page's deliveries (the cursor stays)
+   and accepting the lower cursor (the stored value decreases).
+5. **Legacy adapters are unchanged.** An existing adapter's page carries no receipt results and no
+   receipt cursor, and its stored envelope checkpoint and ingested notes are identical to what they
+   were before this amendment, a checkpoint-aware adapter included. Making the default
+   `poll_deliveries` return a receipt result or a receipt cursor turns the arm red.
+
+### What stands
+
+Item 5's three methods and their defaults; A.8 and A.9, except as items 2 to 5 above refine them; and
+the status read (A.6.5), which a client may still use but which the receipt path does not need.
