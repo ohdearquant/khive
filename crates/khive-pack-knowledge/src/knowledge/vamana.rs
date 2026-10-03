@@ -2806,23 +2806,8 @@ pub(crate) async fn load_and_build_from_vector_store(
 /// Called after any vector-corpus mutation to guarantee `ensure_ann_for_model` cannot
 /// load a snapshot that no longer matches the live corpus.  Best-effort: if
 /// the `retrieval_snapshots` table doesn't exist yet, the call is a no-op.
-/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
-/// character itself (`\`) so a caller-supplied namespace is matched literally
-/// under `LIKE ... ESCAPE '\'` rather than as a pattern (#819: an
-/// underscore-bearing namespace like `a_b` must not also match `aXb`).
-fn escape_like(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
-    let pattern = format!("{}::vamana::%", escape_like(namespace));
+    let pattern = format!("{}::vamana::%", khive_types::escape_like_literal(namespace));
     let sql = rt.sql();
     let mut w = match sql.writer().await {
         Ok(w) => w,

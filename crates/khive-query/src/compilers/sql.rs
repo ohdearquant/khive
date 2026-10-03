@@ -784,17 +784,6 @@ fn bind_condition_value(
     Ok(params.len())
 }
 
-fn escape_like_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
-}
-
 fn compile_condition_predicate(
     col_expr: &str,
     cond: &Condition,
@@ -807,7 +796,7 @@ fn compile_condition_predicate(
                     "CONTAINS and STARTS WITH require a string literal".into(),
                 ));
             };
-            let escaped = escape_like_literal(value);
+            let escaped = khive_types::escape_like_literal(value);
             let pattern = if cond.op == CompareOp::Contains {
                 format!("%{escaped}%")
             } else {
