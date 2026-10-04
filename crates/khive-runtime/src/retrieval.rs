@@ -131,7 +131,7 @@ impl SearchSource {
 const RRF_K: usize = 10;
 
 /// Candidates pulled per path before fusion. Higher = better recall, more work.
-const CANDIDATE_MULTIPLIER: u32 = 4;
+pub(crate) const CANDIDATE_MULTIPLIER: u32 = 4;
 
 /// Advisory emitted by write verbs when only the embedding input was bounded.
 pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =

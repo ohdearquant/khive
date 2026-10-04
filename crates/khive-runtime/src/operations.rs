@@ -11751,9 +11751,9 @@ mod tests {
     /// exhaustion or connection timeout on the text-search backend — is not a
     /// bad query and must propagate as `Err`, not be silently swallowed into
     /// an empty (falsely "successful") result set. `search_notes`,
-    /// `hybrid_search`, `hybrid_search_with_strategy`, and
-    /// `collect_recall_text_hits` all share the same `is_fts5_syntax_error()`
-    /// gate on `StorageError`, so this case generalizes to all four call sites.
+    /// `hybrid_search`, and `collect_recall_text_hits` all share the same
+    /// `is_fts5_syntax_error()` gate on `StorageError`, so this case
+    /// generalizes to all three call sites.
     #[tokio::test]
     async fn search_notes_propagates_non_parser_fts_error() {
         let rt = rt();

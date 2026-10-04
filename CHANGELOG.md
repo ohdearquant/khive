@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `update_note_with_embedding_report`. The `create_notes_atomic` re-export is dropped from the
   crate root; migrate to `create_notes_atomic_with_report`, which keeps the same all-or-none note
   write and adds the aggregate report.
+- `KhiveRuntime::hybrid_search_with_strategy` is removed. Nothing in the workspace called it
+  outside its own tests, and `KhiveRuntime::hybrid_search` remains the one entity search entry
+  point. This is a source-breaking change for an out-of-tree Rust consumer. `hybrid_search` takes
+  no fusion strategy, and its text leg covers every namespace visible to the caller, where the
+  removed method searched the caller's primary namespace only.
 
 ### Changed
 
