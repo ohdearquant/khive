@@ -84,9 +84,251 @@ fn snapshot_namespaces(conn: &Connection) -> Vec<String> {
         .expect("rows")
 }
 
+const EXEC_RUNS_DDL: &str = "CREATE TABLE exec_runs (\
+    id TEXT PRIMARY KEY, namespace TEXT NOT NULL, actor TEXT NOT NULL, \
+    tool TEXT NOT NULL, session_id TEXT, seq INTEGER, receipt TEXT NOT NULL, \
+    created_at INTEGER NOT NULL)";
+
+const EXEC_RUNS_SESSION_SEQ_DDL: &str = "CREATE UNIQUE INDEX idx_exec_runs_session_seq \
+    ON exec_runs(namespace, session_id, seq) WHERE session_id IS NOT NULL";
+
+const EXEC_EVENTS_DDL: &str = "CREATE TABLE exec_events (\
+    id INTEGER PRIMARY KEY AUTOINCREMENT, namespace TEXT NOT NULL, \
+    run_id TEXT NOT NULL, kind TEXT NOT NULL, at INTEGER NOT NULL, detail TEXT)";
+
+const GIT_RECEIPTS_DDL: &str = "CREATE TABLE git_receipts (\
+    id TEXT PRIMARY KEY NOT NULL, namespace TEXT NOT NULL, actor TEXT NOT NULL, \
+    session_id TEXT, verb TEXT NOT NULL, repo TEXT NOT NULL, \
+    inputs TEXT NOT NULL CHECK (json_valid(inputs)), \
+    gate TEXT NOT NULL CHECK (json_valid(gate)), policy TEXT, fork_policy TEXT, \
+    credential TEXT, started_at INTEGER NOT NULL, finished_at INTEGER, \
+    disposition TEXT NOT NULL, result TEXT NOT NULL CHECK (json_valid(result)), \
+    reason TEXT)";
+
+const TOOL_POLICY_DDL: &str = "CREATE TABLE tool_policy (\
+    id TEXT PRIMARY KEY, namespace TEXT NOT NULL, actor TEXT NOT NULL, \
+    tool TEXT NOT NULL, decision TEXT NOT NULL, note TEXT, created_at INTEGER NOT NULL, \
+    created_by TEXT, updated_at INTEGER, updated_by TEXT, history TEXT, \
+    deleted_at INTEGER, deleted_by TEXT)";
+
+const TOOL_GRANTS_DDL: &str = "CREATE TABLE tool_grants (\
+    id TEXT PRIMARY KEY, namespace TEXT NOT NULL, actor TEXT NOT NULL, \
+    tool TEXT NOT NULL, scope TEXT, reason TEXT, status TEXT NOT NULL, \
+    requested_at INTEGER NOT NULL, decided_at INTEGER, decided_by TEXT, \
+    expires_at INTEGER, decision_note TEXT, registry_id TEXT, \
+    definition_digest TEXT, invalidated_by_registry_id TEXT, invalidated_at INTEGER)";
+
+const PACK_TABLES_DDL: [&str; 6] = [
+    EXEC_RUNS_DDL,
+    EXEC_RUNS_SESSION_SEQ_DDL,
+    EXEC_EVENTS_DDL,
+    GIT_RECEIPTS_DDL,
+    TOOL_POLICY_DDL,
+    TOOL_GRANTS_DDL,
+];
+
+/// The instant the tests below ask the move to judge grant expiry at.
+const NOW: i64 = 1_000;
+
+fn exec_run(conn: &Connection, id: &str, namespace: &str, seq: i64) {
+    conn.execute(
+        "INSERT INTO exec_runs \
+         (id, namespace, actor, tool, session_id, seq, receipt, created_at) \
+         VALUES (?1, ?2, 'actor', 'tool', 'session-1', ?3, '{}', 1)",
+        rusqlite::params![id, namespace, seq],
+    )
+    .expect("seed exec run");
+}
+
+fn exec_event(conn: &Connection, run_id: &str, namespace: &str) {
+    conn.execute(
+        "INSERT INTO exec_events (namespace, run_id, kind, at) VALUES (?1, ?2, 'started', 1)",
+        rusqlite::params![namespace, run_id],
+    )
+    .expect("seed exec event");
+}
+
+fn git_receipt(conn: &Connection, id: &str, namespace: &str) {
+    conn.execute(
+        "INSERT INTO git_receipts \
+         (id, namespace, actor, verb, repo, inputs, gate, started_at, disposition, result) \
+         VALUES (?1, ?2, 'actor', 'git.push', 'repo', '{}', '{}', 1, 'unknown', '{}')",
+        rusqlite::params![id, namespace],
+    )
+    .expect("seed git receipt");
+}
+
+fn policy(conn: &Connection, id: &str, namespace: &str, deleted_at: Option<i64>) {
+    conn.execute(
+        "INSERT INTO tool_policy \
+         (id, namespace, actor, tool, decision, note, created_at, deleted_at) \
+         VALUES (?1, ?2, 'actor', ?1, 'allow', 'note-text-for-the-log-check', 1, ?3)",
+        rusqlite::params![id, namespace, deleted_at],
+    )
+    .expect("seed policy");
+}
+
+fn grant(conn: &Connection, id: &str, namespace: &str, expires_at: Option<i64>) {
+    conn.execute(
+        "INSERT INTO tool_grants \
+         (id, namespace, actor, tool, status, requested_at, expires_at) \
+         VALUES (?1, ?2, 'actor', ?1, 'granted', 1, ?3)",
+        rusqlite::params![id, namespace, expires_at],
+    )
+    .expect("seed grant");
+}
+
+fn ns(conn: &Connection, table: &str, id: &str) -> String {
+    conn.query_row(
+        &format!("SELECT namespace FROM {table} WHERE id = ?1"),
+        [id],
+        |row| row.get::<_, String>(0),
+    )
+    .expect("row")
+}
+
+/// Every column of one row, so a test can prove a move rewrote none of them.
+fn image(conn: &Connection, table: &str, id: &str) -> Vec<rusqlite::types::Value> {
+    let sql = format!("SELECT * FROM {table} WHERE id = ?1");
+    let mut stmt = conn.prepare(&sql).expect("prepare");
+    let columns = stmt.column_count();
+    stmt.query_row([id], |row| {
+        (0..columns)
+            .map(|index| row.get::<_, rusqlite::types::Value>(index))
+            .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+    })
+    .expect("row image")
+}
+
+fn events_matching_their_run(conn: &Connection, namespace: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM exec_events AS event \
+         JOIN exec_runs AS run ON run.id = event.run_id AND run.namespace = event.namespace \
+         WHERE event.namespace = ?1",
+        [namespace],
+        |row| row.get(0),
+    )
+    .expect("count events")
+}
+
+/// One source holding rows in all five tables, beside a neighbour namespace
+/// whose rows must never move. The policies include a soft-deleted one and the
+/// grants include two that are expired at `NOW`, one of them at exactly `NOW`.
+fn seeded_source() -> Connection {
+    let conn = store(&PACK_TABLES_DDL);
+    seed_note(&conn, "n1", "source", "observation");
+    seed_note(&conn, "n2", "source", "decision");
+    exec_run(&conn, "run-1", "source", 1);
+    exec_run(&conn, "run-2", "source", 2);
+    exec_run(&conn, "run-other", "elsewhere", 1);
+    exec_event(&conn, "run-1", "source");
+    exec_event(&conn, "run-1", "source");
+    exec_event(&conn, "run-2", "source");
+    exec_event(&conn, "run-other", "elsewhere");
+    git_receipt(&conn, "receipt-1", "source");
+    git_receipt(&conn, "receipt-other", "elsewhere");
+    policy(&conn, "policy-live", "source", None);
+    policy(&conn, "policy-live-2", "source", None);
+    policy(&conn, "policy-gone", "source", Some(5));
+    policy(&conn, "policy-elsewhere", "elsewhere", None);
+    grant(&conn, "grant-open", "source", None);
+    grant(&conn, "grant-future", "source", Some(NOW + 1));
+    grant(&conn, "grant-past", "source", Some(NOW - 1));
+    grant(&conn, "grant-edge", "source", Some(NOW));
+    grant(&conn, "grant-elsewhere", "elsewhere", None);
+    conn
+}
+
+fn total_request() -> MoveRequest {
+    MoveRequest::new(
+        "source",
+        vec![
+            route("note:observation", "target"),
+            route("note:decision", "target"),
+        ],
+    )
+    .at(NOW)
+}
+
+fn observation_request() -> MoveRequest {
+    MoveRequest::new("source", vec![route("note:observation", "target")])
+}
+
+fn partitioning_request() -> MoveRequest {
+    MoveRequest::new(
+        "source",
+        vec![
+            route("note:observation", "one"),
+            route("note:decision", "another"),
+        ],
+    )
+    .at(NOW)
+}
+
+type CapturedEvents = std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>;
+
+struct Captured(CapturedEvents);
+
+struct Fields<'a>(&'a mut String);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        let _ = write!(self.0, "{}={:?} ", field.name(), value);
+    }
+}
+
+impl tracing::Subscriber for Captured {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut Fields(&mut line));
+        let level = *event.metadata().level();
+        self.0.lock().unwrap().push((level, line));
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Run `run` and return its result with every WARN event it logged, one string
+/// of `field=value` pairs per event.
+fn warnings_of<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+    let events = CapturedEvents::default();
+    let result = tracing::subscriber::with_default(Captured(events.clone()), run);
+    let seen = std::mem::take(&mut *events.lock().unwrap());
+    let warnings = seen
+        .into_iter()
+        .filter(|(level, _)| *level == tracing::Level::WARN)
+        .map(|(_, line)| line)
+        .collect();
+    (result, warnings)
+}
+
 #[test]
 fn pack_created_tables_are_classified_by_the_move() {
-    let conn = store(&[GTD_AUDIT_DDL, EVAL_RUNS_DDL, SNAPSHOTS_DDL]);
+    let conn = store(&[
+        GTD_AUDIT_DDL,
+        EVAL_RUNS_DDL,
+        SNAPSHOTS_DDL,
+        EXEC_RUNS_DDL,
+        EXEC_EVENTS_DDL,
+        GIT_RECEIPTS_DDL,
+        TOOL_POLICY_DDL,
+        TOOL_GRANTS_DDL,
+    ]);
     let census = namespace_census::census(&conn).expect("census");
     for (name, expected) in [
         (
@@ -105,6 +347,11 @@ fn pack_created_tables_are_classified_by_the_move() {
                 trigger_maintained: false,
             },
         ),
+        ("exec_runs", TableDisposition::NamespaceScopedAggregate),
+        ("exec_events", TableDisposition::NamespaceScopedAggregate),
+        ("git_receipts", TableDisposition::NamespaceScopedAggregate),
+        ("tool_policy", TableDisposition::LeaveBehind),
+        ("tool_grants", TableDisposition::LeaveBehind),
     ] {
         let table = census
             .tables
@@ -323,4 +570,192 @@ fn a_store_without_the_snapshot_table_moves_cleanly() {
 
     assert_eq!(counts.subjects.get("note:observation"), Some(&1));
     assert_eq!(eval_namespace(&conn, "run-1"), "target");
+}
+
+#[test]
+fn a_total_move_carries_receipts_and_leaves_authorization_rows_where_they_are() {
+    let conn = seeded_source();
+    let policy_before = image(&conn, "tool_policy", "policy-live");
+    let grant_before = image(&conn, "tool_grants", "grant-open");
+
+    let request = total_request();
+    let counts = move_namespace(&conn, &request).expect("a total single-target move");
+
+    assert_eq!(counts.rows.get("exec_runs"), Some(&2));
+    assert_eq!(counts.rows.get("exec_events"), Some(&3));
+    assert_eq!(counts.rows.get("git_receipts"), Some(&1));
+    assert_eq!(ns(&conn, "exec_runs", "run-1"), "target");
+    assert_eq!(ns(&conn, "exec_runs", "run-2"), "target");
+    assert_eq!(ns(&conn, "exec_runs", "run-other"), "elsewhere");
+    assert_eq!(ns(&conn, "git_receipts", "receipt-1"), "target");
+    assert_eq!(ns(&conn, "git_receipts", "receipt-other"), "elsewhere");
+    assert_eq!(events_matching_their_run(&conn, "target"), 3);
+    assert_eq!(events_matching_their_run(&conn, "source"), 0);
+
+    assert!(!counts.rows.contains_key("tool_policy"));
+    assert!(!counts.rows.contains_key("tool_grants"));
+    assert_eq!(counts.left_behind.get("tool_policy"), Some(&3));
+    assert_eq!(counts.left_behind.get("tool_grants"), Some(&4));
+    assert_eq!(counts.live_policies_left_behind, 2);
+    assert_eq!(counts.unexpired_grants_left_behind, 2);
+    assert_eq!(ns(&conn, "tool_policy", "policy-live"), "source");
+    assert_eq!(ns(&conn, "tool_grants", "grant-open"), "source");
+    assert_eq!(image(&conn, "tool_policy", "policy-live"), policy_before);
+    assert_eq!(image(&conn, "tool_grants", "grant-open"), grant_before);
+}
+
+#[test]
+fn a_partitioning_move_leaves_all_five_tables_and_reports_each_count() {
+    let conn = seeded_source();
+    let policy_before = image(&conn, "tool_policy", "policy-live");
+    let grant_before = image(&conn, "tool_grants", "grant-open");
+
+    let request = partitioning_request();
+    let counts = move_namespace(&conn, &request).expect("a partitioning move");
+
+    for (table, left) in [
+        ("exec_runs", 2),
+        ("exec_events", 3),
+        ("git_receipts", 1),
+        ("tool_policy", 3),
+        ("tool_grants", 4),
+    ] {
+        assert_eq!(counts.left_behind.get(table), Some(&left), "{table}");
+        assert!(!counts.rows.contains_key(table), "{table}");
+    }
+    assert_eq!(ns(&conn, "exec_runs", "run-1"), "source");
+    assert_eq!(ns(&conn, "git_receipts", "receipt-1"), "source");
+    assert_eq!(events_matching_their_run(&conn, "source"), 3);
+    assert_eq!(counts.live_policies_left_behind, 2);
+    assert_eq!(counts.unexpired_grants_left_behind, 2);
+    assert_eq!(image(&conn, "tool_policy", "policy-live"), policy_before);
+    assert_eq!(image(&conn, "tool_grants", "grant-open"), grant_before);
+}
+
+#[test]
+fn a_store_without_the_receipt_and_authorization_tables_moves_as_before() {
+    let conn = store(&[]);
+    seed_note(&conn, "n1", "source", "observation");
+
+    let request = observation_request().at(NOW);
+    let counts = move_namespace(&conn, &request).expect("absent pack tables are a no-op");
+
+    assert_eq!(counts.subjects.get("note:observation"), Some(&1));
+    assert!(counts.left_behind.is_empty(), "{:?}", counts.left_behind);
+    assert_eq!(counts.live_policies_left_behind, 0);
+    assert_eq!(counts.unexpired_grants_left_behind, 0);
+}
+
+#[test]
+fn leaving_live_authorization_rows_logs_one_warning_with_the_counts() {
+    let conn = seeded_source();
+
+    let request = total_request();
+    let (outcome, warnings) = warnings_of(|| move_namespace(&conn, &request));
+    outcome.expect("a total single-target move");
+
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    for expected in [
+        "namespace=\"source\"",
+        "live_policies=2",
+        "unexpired_grants=2",
+    ] {
+        assert!(
+            warnings[0].contains(expected),
+            "{expected} in {}",
+            warnings[0]
+        );
+    }
+    assert!(
+        !warnings[0].contains("note-text-for-the-log-check"),
+        "the line names no row contents: {}",
+        warnings[0]
+    );
+}
+
+#[test]
+fn authorization_rows_that_are_all_dead_stay_without_a_warning() {
+    let conn = store(&[TOOL_POLICY_DDL, TOOL_GRANTS_DDL]);
+    seed_note(&conn, "n1", "source", "observation");
+    policy(&conn, "policy-gone", "source", Some(5));
+    grant(&conn, "grant-past", "source", Some(NOW - 1));
+
+    let request = observation_request().at(NOW);
+    let (outcome, warnings) = warnings_of(|| move_namespace(&conn, &request));
+    let counts = outcome.expect("the move succeeds");
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(counts.left_behind.get("tool_policy"), Some(&1));
+    assert_eq!(counts.left_behind.get("tool_grants"), Some(&1));
+    assert_eq!(counts.live_policies_left_behind, 0);
+    assert_eq!(counts.unexpired_grants_left_behind, 0);
+}
+
+#[test]
+fn grant_expiry_is_judged_at_the_instant_the_request_carries() {
+    for (now, want) in [(99, 1), (100, 0), (101, 0)] {
+        let conn = store(&[TOOL_GRANTS_DDL]);
+        grant(&conn, "grant-1", "source", Some(100));
+
+        let request = observation_request().at(now);
+        let counts = move_namespace(&conn, &request).expect("nothing is routed in this source");
+
+        assert_eq!(counts.unexpired_grants_left_behind, want, "now = {now}");
+    }
+}
+
+#[test]
+fn without_an_instant_grant_expiry_is_judged_at_the_wall_clock() {
+    let conn = store(&[TOOL_GRANTS_DDL]);
+    grant(&conn, "grant-old", "source", Some(1));
+    grant(&conn, "grant-open", "source", None);
+
+    let request = observation_request();
+    let counts = move_namespace(&conn, &request).expect("nothing is routed in this source");
+
+    assert_eq!(counts.left_behind.get("tool_grants"), Some(&2));
+    assert_eq!(counts.unexpired_grants_left_behind, 1);
+}
+
+/// `idx_exec_runs_session_seq` is a partial unique index, and the collision
+/// pre-flight enumerates no partial index, so a clash on it is not named. The
+/// move refuses as the failing statement itself, which the caller's rollback
+/// then undoes. Same shape as the note-key arm in `namespace_move_fixture_tests`.
+#[test]
+fn an_exec_run_whose_session_seq_is_taken_in_the_target_fails_the_statement() {
+    let conn = store(&PACK_TABLES_DDL);
+    seed_note(&conn, "n1", "source", "observation");
+    exec_run(&conn, "run-source", "source", 1);
+    exec_run(&conn, "run-target", "target", 1);
+    exec_event(&conn, "run-source", "source");
+    let notes_before = image(&conn, "notes", "n1");
+    let source_before = image(&conn, "exec_runs", "run-source");
+    let target_before = image(&conn, "exec_runs", "run-target");
+
+    let request = observation_request().at(NOW);
+    conn.execute_batch("SAVEPOINT move").expect("savepoint");
+    let outcome = move_namespace(&conn, &request);
+    conn.execute_batch("ROLLBACK TO move").expect("rollback");
+    conn.execute_batch("RELEASE move").expect("release");
+
+    match outcome {
+        Err(MoveError::Sqlite(error)) => {
+            let message = error.to_string();
+            assert!(
+                message.contains("exec_runs.namespace, exec_runs.session_id, exec_runs.seq"),
+                "the constraint raised it: {message}"
+            );
+        }
+        Err(MoveError::Collisions { collisions }) => panic!(
+            "the pre-flight now names partial-index clashes: upgrade this arm. {collisions:?}"
+        ),
+        other => panic!("expected the failing statement, got {other:?}"),
+    }
+
+    assert_eq!(ns(&conn, "notes", "n1"), "source");
+    assert_eq!(image(&conn, "notes", "n1"), notes_before);
+    assert_eq!(image(&conn, "exec_runs", "run-source"), source_before);
+    assert_eq!(image(&conn, "exec_runs", "run-target"), target_before);
+    assert_eq!(events_matching_their_run(&conn, "source"), 1);
+    assert_eq!(events_matching_their_run(&conn, "target"), 0);
 }

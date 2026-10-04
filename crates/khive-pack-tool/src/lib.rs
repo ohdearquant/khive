@@ -16,6 +16,9 @@ mod pin;
 pub mod policy;
 pub mod vocab;
 
+#[cfg(test)]
+mod namespace_move_counts_tests;
+
 pub use handlers::resolve_registered;
 pub use pack::ToolPack;
 pub use pin::{registry_policy_inputs, RegistryPin};

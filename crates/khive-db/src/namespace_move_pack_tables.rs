@@ -11,9 +11,24 @@ use super::*;
 /// note and `namespace` is nullable.
 const TASK_AUDIT: &str = "gtd_lifecycle_audit";
 
-/// Per-namespace summary rows that name no subject, like the brain aggregates:
-/// they move only when the request is total and single-target.
-const NAMESPACE_SCOPED_PACK_TABLES: &[&str] = &["knowledge_eval_runs"];
+/// Per-namespace rows that name no subject, like the brain aggregates: they move
+/// only when the request is total and single-target. The evaluation runs are
+/// summaries and the other three are receipts of work done in the namespace.
+/// `exec_events` rows belong to an `exec_runs` row of the same namespace and the
+/// step below treats every table here alike, so those two always move or stay
+/// together.
+const NAMESPACE_SCOPED_PACK_TABLES: &[&str] = &[
+    "knowledge_eval_runs",
+    "exec_runs",
+    "exec_events",
+    "git_receipts",
+];
+
+/// Authorization state written by the tool pack. A row carried into a target
+/// would grant, or deny, there what the target never decided, so no move carries
+/// these and no move deletes them.
+const POLICY: &str = "tool_policy";
+const GRANTS: &str = "tool_grants";
 
 /// Cached ANN index snapshots. The key in the `namespace` column is either a
 /// bare namespace or a composite that starts with one.
@@ -58,8 +73,8 @@ pub(super) fn move_task_audit(
 }
 
 /// What is left to do for these tables once the subjects have moved: report the
-/// audit rows that stayed, carry or report the summary rows, and drop the
-/// source's index snapshots.
+/// audit rows that stayed, carry or report the per-namespace rows, leave the
+/// authorization rows and report them, and drop the source's index snapshots.
 pub(super) fn settle_pack_tables(
     conn: &Connection,
     census: &NamespaceCensus,
@@ -92,8 +107,70 @@ pub(super) fn settle_pack_tables(
         }
     }
 
+    leave_authorization_behind(conn, census, request, counts)?;
+
     if present(census, SNAPSHOTS) {
         drop_source_snapshots(conn, source)?;
+    }
+    Ok(())
+}
+
+/// Report the authorization rows a move leaves in the source, and write nothing.
+///
+/// `left_behind` counts every row that stayed. The two counts on the result are
+/// the ones an operator acts on: a policy row is in force until it is
+/// soft-deleted, and a grant row until it expires. Both tests restate what the
+/// tool pack reads (`deleted_at IS NULL`, and `expires_at IS NULL OR expires_at >
+/// now`) because this crate cannot depend on the pack; `khive-pack-tool` pins
+/// them against the pack's own writers and readers.
+///
+/// The instant comes from the request, so a test chooses it. Without one it is
+/// the wall clock at the call.
+fn leave_authorization_behind(
+    conn: &Connection,
+    census: &NamespaceCensus,
+    request: &MoveRequest,
+    counts: &mut MoveCounts,
+) -> rusqlite::Result<()> {
+    let source = request.source.as_str();
+    let now_micros = request
+        .now_micros
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_micros());
+
+    if present(census, POLICY) {
+        let left = count_in_namespace(conn, POLICY, source)?;
+        if left > 0 {
+            counts.left_behind.insert(POLICY.to_string(), left);
+            let live = conn.query_row(
+                "SELECT COUNT(*) FROM tool_policy WHERE namespace = ?1 AND deleted_at IS NULL",
+                [source],
+                |row| row.get::<_, i64>(0),
+            )? as u64;
+            counts.live_policies_left_behind = live;
+        }
+    }
+
+    if present(census, GRANTS) {
+        let left = count_in_namespace(conn, GRANTS, source)?;
+        if left > 0 {
+            counts.left_behind.insert(GRANTS.to_string(), left);
+            let unexpired = conn.query_row(
+                "SELECT COUNT(*) FROM tool_grants \
+                 WHERE namespace = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
+                rusqlite::params![source, now_micros],
+                |row| row.get::<_, i64>(0),
+            )? as u64;
+            counts.unexpired_grants_left_behind = unexpired;
+        }
+    }
+
+    if counts.live_policies_left_behind > 0 || counts.unexpired_grants_left_behind > 0 {
+        tracing::warn!(
+            namespace = source,
+            live_policies = counts.live_policies_left_behind,
+            unexpired_grants = counts.unexpired_grants_left_behind,
+            "a namespace move left authorization rows in the source namespace"
+        );
     }
     Ok(())
 }

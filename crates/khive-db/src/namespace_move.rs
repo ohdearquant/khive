@@ -116,6 +116,11 @@ pub struct MoveRoute {
 pub struct MoveRequest {
     pub source: String,
     pub routes: Vec<MoveRoute>,
+    /// The instant, in microseconds since the epoch, at which grant expiry is
+    /// judged when authorization rows stay behind. `None` reads the wall clock
+    /// once, at the call. Set it with [`MoveRequest::at`] so a test, or a caller
+    /// replaying a move, controls it.
+    pub now_micros: Option<i64>,
 }
 
 impl MoveRequest {
@@ -126,7 +131,14 @@ impl MoveRequest {
         Self {
             source: source.into(),
             routes,
+            now_micros: None,
         }
+    }
+
+    /// Judge grant expiry at `now_micros` instead of at the wall clock.
+    pub fn at(mut self, now_micros: i64) -> Self {
+        self.now_micros = Some(now_micros);
+        self
     }
 
     fn route_for(&self, class: &SubjectClass) -> Option<&MoveRoute> {
@@ -163,6 +175,13 @@ pub struct MoveCounts {
     pub left_behind: BTreeMap<String, u64>,
     /// Entries appended to `ann_write_log` for the source and target namespaces.
     pub ann_log_appended: u64,
+    /// Tool policy rows left in the source that are not soft-deleted. Authorization
+    /// state is never carried, so these are the rows an operator still has to
+    /// decide about; `left_behind` counts every row that stayed.
+    pub live_policies_left_behind: u64,
+    /// Tool grant rows left in the source that have not expired at the instant
+    /// the move judged them (see [`MoveRequest::now_micros`]).
+    pub unexpired_grants_left_behind: u64,
 }
 
 /// A note that cannot move, and its position in the stream that pins it.
@@ -453,7 +472,7 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
             subject_column: "note_id",
         },
 
-        // The next three are created by a pack, not by a migration, so a store
+        // The next eight are created by a pack, not by a migration, so a store
         // may not have them. Their rules live in `namespace_move_pack_tables.rs`.
         //
         // Readers of a task's audit rows key on `note_id` alone, so a transition
@@ -465,6 +484,16 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
         // One summary row per evaluation run, read per namespace, naming no
         // subject: the same problem the brain aggregates have.
         "knowledge_eval_runs" => NamespaceScopedAggregate,
+        // Receipts of work done in the namespace, keyed to no routed subject, so
+        // they follow the evaluation runs: a total single-target move carries
+        // them and a partitioning move leaves them. An `exec_events` row belongs
+        // to an `exec_runs` row of the same namespace and both take the same
+        // branch, so the two tables always move or stay together.
+        "exec_runs" | "exec_events" | "git_receipts" => NamespaceScopedAggregate,
+        // Authorization state. A row carried into a target would grant, or deny,
+        // there what the target never decided, so no move carries either table.
+        // The rows stay in the source and the move reports them.
+        "tool_policy" | "tool_grants" => LeaveBehind,
         // A cache of an index over the namespace it names, keyed by a bare
         // namespace or by `{namespace}::vamana::{model}`. The move deletes the
         // source's rows and writes nothing for the target.
