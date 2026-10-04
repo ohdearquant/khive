@@ -528,3 +528,132 @@ These database fixtures establish row placement and durable fence values. They d
 not replace Amendment 2's session-recall and keyed-replay acceptance or the warmed
 consumer acceptance in ADR-189 Amendment 1. Seeding a covering watermark does not
 establish an actual consumer's session proof.
+
+## Amendment 4 (2026-10-04): unknown write epochs at the sealed-receipt cutover
+
+**Status**: Proposed. Refs #3619. Acceptance is required before the dependent
+sealed-receipt implementation merges.
+
+### Deployed state and scope
+
+The joint rollout required by Amendment 2 did not occur: [#3549](https://github.com/ohdearquant/khive/pull/3549)
+merged as `83886c71b82486fbb0299fd752312bd0886960ef` on 2026-10-02 UTC while
+issuing clear version-1 receipts. At that commit,
+`crates/khive-db/sql/046-memory-visibility-receipts.sql` creates receipt headers
+and model fences, but no independent write-epoch marker. The exact keyed replay
+path in `crates/khive-runtime/src/keyed_memory.rs` cannot distinguish a pre-V46
+note from a V46-or-later note whose receipt was lost. The existing
+`keyed_memory_replay_refuses_when_original_receipt_is_missing` fixture in
+`keyed_memory_tests.rs` demonstrates the latter possible state by removing a
+receipt after a successful keyed write; it does not establish that production
+data has suffered that loss.
+
+This amendment covers keyed memory notes present when the sealed-receipt
+cutover runs, including soft-deleted notes that could later be restored. A note
+is identified by its immutable ID and memory kind, with its current namespace
+carried as attribution; a mutable key string alone is not provenance. The
+ambiguous cohort consists of notes for which neither independent durable
+write-epoch evidence nor a complete original receipt is available at cutover.
+It can contain both old notes and notes written after V46. No claim is made
+about its size in any deployed database.
+
+On acceptance, this amendment replaces Amendment 2's unrealized joint-landing
+requirement with a coordinated upgrade to v2-only issuance and validation. It
+extends the missing-receipt rule with an explicit unknown cohort and defines
+how the independent marker is established during that upgrade. Amendment 2's
+cryptography, key custody, v1 rejection, zero-model distinction, replay without
+new vector or log writes, and one-snapshot proof remain required. Amendment 3
+and its Proposed status are unchanged; this amendment decides no move-routing
+policy.
+
+### Establishing durable provenance
+
+The cutover persists one of `legacy`, `modern`, or `unknown` for every existing
+keyed memory note in the same consistent migration transaction. The marker is
+stored independently of the receipt and its model fences, so removing either
+cannot erase or reclassify the epoch. Use an append-only schema migration;
+do not modify already-shipped V46 or allocate a migration number in this ADR.
+
+- `legacy` requires durable evidence that the exact note already existed
+  before V46. An upgrade beginning below V46 may capture the exact keyed-memory
+  IDs from its coherent pre-V46 snapshot, before V46 is applied, and retain
+  that inventory transactionally as the evidence. Merely observing an old
+  schema version without that identity-bound inventory is insufficient.
+- `modern` requires an existing independent marker for the original write,
+  or a complete original receipt verified at cutover. The latter verification
+  must bind the header and fences to the same note and namespace in one
+  snapshot, check the expected model count and valid unique per-model fences,
+  and preserve the explicit zero-model case. Persist the resulting marker in
+  that transaction before serving the upgraded database. This records the
+  witnessed receipt; it does not reconstruct a missing receipt or fence.
+- Every remaining note is `unknown`, including absent or incomplete receipts
+  with no independent epoch evidence. Contradictory evidence must not be
+  silently overwritten or used to issue a token; it takes the same unknown
+  refusal below. Receipt absence, `created_at`, the current database version,
+  ANN log contents, and a later `MAX(seq)` cannot classify these notes.
+
+New keyed notes written after cutover record `modern` atomically with the note,
+receipt header, and vector fences. A rollback leaves none of them committed.
+New code must not serve a database until its cutover has completed, and old
+writers must not keep writing after that point. An interrupted migration either
+rolls back or resumes from its durable provenance without substituting the
+database's now-current version for the captured historical population.
+
+The marker follows its note across namespace moves in the same transaction,
+survives soft delete and restore, and is removed with hard deletion. Reusing a
+key for another note ID cannot inherit the deleted note's epoch. Missing or
+unreadable provenance at replay never defaults to `modern` or `legacy`.
+
+### Replay disposition
+
+Exact replay reads the epoch and receipt coherently and applies these rules:
+
+| Durable provenance and receipt                             | Result                                                                                     |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `modern`, complete receipt                                 | Reseal the stored fences as v2, including a genuine zero-model receipt, under Amendment 2. |
+| `modern`, absent or incomplete receipt                     | `freshness_unmet`, reason `receipt_temporarily_unavailable`, `retryable: true`.            |
+| `legacy`, absent receipt                                   | `freshness_unmet`, reason `legacy_receipt_absent`, `retryable: false`.                     |
+| `unknown`, missing provenance, or contradictory provenance | `freshness_unmet`, reason `receipt_epoch_unknown`, `retryable: false`.                     |
+
+An unreadable provenance store is an availability failure, not proof of an
+unknown epoch: return a retryable unavailable error without a token and without
+changing the persisted classification. A legacy marker paired with a receipt
+is contradictory evidence and takes `receipt_epoch_unknown`.
+
+The terminal unknown refusal means repeating the same call or waiting cannot
+establish the original fence. It does not authorize deletion, re-embedding,
+recreating a note under its existing key, or copying a later log sequence into
+its receipt. Replay never changes the marker, emits a new vector or log row,
+or issues a token in a refusal case. An operator repair protocol is outside
+this amendment and requires its own evidence and contract; restoring a receipt
+alone cannot silently promote an unknown marker. Eventual recall remains
+available under its existing contract. Errors disclose neither fence values
+nor a database-wide cohort count.
+
+### Acceptance before implementation merge
+
+- Upgrade actual pre-V46 data and actual already-V46 data through the migration
+  runner. Capture the former population before V46 is applied. In the latter,
+  include a keyed write whose receipt is deliberately removed before cutover:
+  it must become `unknown`, never inferred legacy or modern. Include an
+  incomplete receipt, a complete positive-model receipt, and an explicit
+  zero-model receipt. Preserve all note, vector, and ANN log rows and values.
+- A known modern marker with a subsequently removed header or model fence
+  remains modern and produces the retryable missing-receipt result. The
+  otherwise identical unknown cohort produces the terminal unknown result.
+  Removing only the independent-marker discrimination must fail this test.
+- A captured legacy note stays legacy after upgrade and restart. Restarting
+  an interrupted upgrade must neither broaden the captured population nor
+  overwrite an unknown marker. A control that classifies missing receipts
+  from current schema version or note age must fail the unknown-cohort case.
+- Known modern complete receipts reseal without changing original fences,
+  model counts, vectors, log counts, or markers. Zero-model receipts remain
+  distinct from incomplete ones. An unknown marker with a later restored
+  receipt still refuses; removing only that refusal must fail the fixture.
+- Namespace move, soft delete/restore, hard delete, and key reuse preserve the
+  identity-bound provenance rules. An unreadable provenance store must refuse
+  without persisting `unknown`; test it separately from a missing marker.
+- Run the inherited v2-only confidentiality, tampering, key rotation, expiry,
+  keyed replay, and session proof acceptance from Amendment 2. A clear v1 token
+  must still be denied. These outputs and the unknown-cohort controls are
+  required evidence for sign-off; a docs-only proposal does not execute them.
