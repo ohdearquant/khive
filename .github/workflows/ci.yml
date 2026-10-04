@@ -1209,6 +1209,11 @@ jobs:
         run: cargo check -p kkernel -p khive-mcp --no-default-features --all-targets --locked
       - name: Run the library tests without the optional packs
         run: cargo test -p kkernel -p khive-mcp --no-default-features --lib --locked
+      # These integration tests assert which packs are linked and selectable. Their
+      # feature-off branches are what catch a core crate linking an optional pack,
+      # and the ci job runs them only with every feature on.
+      - name: Run the pack composition tests without the optional packs
+        run: cargo test -p kkernel --no-default-features --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers
 
       - name: Check each optional pack independently
         if: ${{ !cancelled() }}
