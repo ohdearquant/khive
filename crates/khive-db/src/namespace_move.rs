@@ -49,6 +49,13 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::namespace_census::{self, NamespaceCensus, NamespaceConstraint};
 
+#[path = "namespace_move_knowledge.rs"]
+mod knowledge_move;
+#[path = "namespace_move_routes.rs"]
+mod subject_routes;
+use knowledge_move::{move_knowledge_atoms, ordinary_atom_count};
+use subject_routes::routed_subjects;
+
 /// A routable subject class: a record that exists in its own right.
 ///
 /// Qualified by kind for the two classes that carry one. Nothing in the schema
@@ -535,7 +542,7 @@ fn read_source(
         note_kinds: kinds_in_namespace(conn, "notes", source)?,
         entity_kinds: kinds_in_namespace(conn, "entities", source)?,
         edges: count_in_namespace(conn, "graph_edges", source)?,
-        atoms: count_in_namespace(conn, "knowledge_atoms", source)?,
+        atoms: ordinary_atom_count(conn, source)?,
         domains: count_in_namespace(conn, "knowledge_domains", source)?,
         unknown: Vec::new(),
     };
@@ -631,47 +638,6 @@ pub fn validate(
 
     validate_partitioned_vector_moves(conn, census, request)?;
     Ok(())
-}
-
-/// Resolve physical source rows rather than vector `kind`: atom embeddings use
-/// `kind='entity'`, and section embeddings follow their source atom's route.
-fn routed_subjects(request: &MoveRequest) -> (String, Vec<rusqlite::types::Value>) {
-    let mut parameters = vec![request.source.clone().into()];
-    let mut selectors = Vec::new();
-    for route in &request.routes {
-        parameters.push(route.target.clone().into());
-        let target = parameters.len();
-        let (table, kind) = match &route.class {
-            SubjectClass::Note(kind) => ("notes", Some(kind)),
-            SubjectClass::Entity(kind) => ("entities", Some(kind)),
-            SubjectClass::Edge => ("graph_edges", None),
-            SubjectClass::Atom => ("knowledge_atoms", None),
-            SubjectClass::Domain => ("knowledge_domains", None),
-        };
-        let predicate = if let Some(kind) = kind {
-            parameters.push(kind.clone().into());
-            format!(" AND kind = ?{}", parameters.len())
-        } else {
-            String::new()
-        };
-        selectors.push(format!(
-            "SELECT id AS subject_id, ?{target} AS target FROM {table} \
-             WHERE namespace = ?1{predicate}"
-        ));
-        if route.class == SubjectClass::Atom {
-            selectors.push(format!(
-                "SELECT section.id, ?{target} FROM knowledge_sections AS section \
-                 JOIN knowledge_atoms AS atom ON atom.id = section.atom_id \
-                 WHERE section.namespace = ?1 AND atom.namespace = ?1"
-            ));
-        }
-    }
-    let selector = if selectors.is_empty() {
-        "SELECT NULL AS subject_id, NULL AS target WHERE ?1 IS NULL AND 0".to_string()
-    } else {
-        selectors.join(" UNION ALL ")
-    };
-    (selector, parameters)
 }
 
 fn validate_partitioned_vector_moves(
@@ -1237,21 +1203,11 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
                 move_whole_table(conn, "graph_edges", source, target, &mut counts.rows)?
             }
             SubjectClass::Atom => {
-                let moved =
-                    move_whole_table(conn, "knowledge_atoms", source, target, &mut counts.rows)?;
-                // Sections follow their atom by `atom_id`, and `fts_knowledge`
-                // and `fts_sections` follow both by trigger. Writing either
-                // virtual table here would be a no-op that reports success.
-                let sections = conn.execute(
-                    "UPDATE knowledge_sections SET namespace = ?2 \
-                     WHERE namespace = ?1 \
-                       AND atom_id IN (SELECT id FROM knowledge_atoms WHERE namespace = ?2)",
-                    rusqlite::params![source, target],
-                )? as u64;
-                *counts.rows.entry("knowledge_sections".into()).or_default() += sections;
-                moved
+                move_knowledge_atoms(conn, source, target, false, &mut counts.rows)?
             }
             SubjectClass::Domain => {
+                // A domain and its same-ID mirror atom form one logical subject.
+                move_knowledge_atoms(conn, source, target, true, &mut counts.rows)?;
                 move_whole_table(conn, "knowledge_domains", source, target, &mut counts.rows)?
             }
         };
