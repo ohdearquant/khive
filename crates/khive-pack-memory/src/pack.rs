@@ -1040,9 +1040,12 @@ mod ann_route_tests {
 /// watcher, that a repeated `warm()` is idempotent, or that the watcher
 /// exits once its `AnnState` is dropped. Time is paused so the watcher's
 /// 5-second tick can be crossed deterministically instead of by a real
-/// sleep. `#[serial(background_tasks)]` matches every other test in this
-/// crate that reads the process-wide `background_task_count()` counter,
-/// since memory's warm-rebuild chain also tracks through it.
+/// sleep. The assertions read the watcher's own state (the one-shot started
+/// flag and the task handle retained for this `AnnState`) rather than the
+/// process-wide `background_task_count()` counter, which any test that
+/// dispatches a memory verb can move. `#[serial(background_tasks)]` stays on
+/// the test because the watcher is a tracked task: while it runs it moves
+/// that counter for the tests in this crate that read it under the same key.
 #[cfg(test)]
 mod rotation_watcher_lifecycle_tests {
     use super::*;
@@ -1064,23 +1067,23 @@ mod rotation_watcher_lifecycle_tests {
         let pack = MemoryPack::new(rt);
         let ann = pack.ann_for_test();
 
-        let before = khive_runtime::background_task_count();
         pack.warm().await;
         assert!(
             crate::ann::rotation_watch_started_for_test(&ann),
             "a writable warm must start the rotation watcher"
         );
-        assert_eq!(
-            khive_runtime::background_task_count(),
-            before + 1,
-            "warm must track exactly one rotation watcher task"
+        let watcher = crate::ann::take_rotation_watch_handle_for_test(&ann)
+            .expect("a writable warm must retain its rotation watcher task");
+        assert!(
+            !watcher.is_finished(),
+            "the rotation watcher must be running after warm"
         );
 
-        // A repeated warm must not start a second tracked watcher.
+        // A repeated warm must not start a second watcher: the one-shot guard
+        // is already claimed, so no new task handle is retained.
         pack.warm().await;
-        assert_eq!(
-            khive_runtime::background_task_count(),
-            before + 1,
+        assert!(
+            crate::ann::take_rotation_watch_handle_for_test(&ann).is_none(),
             "a repeated warm must be idempotent and not start a second watcher"
         );
 
@@ -1095,16 +1098,11 @@ mod rotation_watcher_lifecycle_tests {
         );
 
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
-        for _ in 0..100 {
-            if khive_runtime::background_task_count() == before {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            khive_runtime::background_task_count(),
-            before,
-            "the watcher must exit once its ANN state is dropped"
+        let limit = std::time::Duration::from_secs(30);
+        let exited = tokio::time::timeout(limit, watcher).await;
+        assert!(
+            matches!(exited, Ok(Ok(()))),
+            "the watcher must exit once its ANN state is dropped: {exited:?}"
         );
     }
 }

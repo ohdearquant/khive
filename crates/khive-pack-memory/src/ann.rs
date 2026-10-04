@@ -55,6 +55,11 @@ use incremental::*;
 mod checkpoint_timer;
 #[path = "ann/delta.rs"]
 mod delta;
+#[cfg(test)]
+#[path = "ann/rotation_watch_test_support.rs"]
+mod rotation_watch_test_support;
+#[cfg(test)]
+pub(crate) use rotation_watch_test_support::take_rotation_watch_handle_for_test;
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -221,6 +226,10 @@ pub(crate) struct AnnState {
     last_epoch_check: std::sync::Mutex<HashMap<AnnKey, std::time::Instant>>,
     /// Idempotence guard for the pack-lifetime file-generation watcher.
     rotation_watch_started: AtomicBool,
+    /// The watcher task started for this state, retained so a lifecycle test
+    /// can observe this state's own watcher instead of a process-wide counter.
+    #[cfg(test)]
+    rotation_watch_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Counts how many times `search_loaded` returned a warm hit. Test-only;
     /// call `reset_warm_route_count()` between operations to isolate counts.
     #[cfg(test)]
@@ -330,6 +339,8 @@ pub(crate) fn new_shared_for_role(builds_corpus_indexes: bool) -> SharedAnn {
         generations: Mutex::new(HashMap::new()),
         last_epoch_check: std::sync::Mutex::new(HashMap::new()),
         rotation_watch_started: AtomicBool::new(false),
+        #[cfg(test)]
+        rotation_watch_handle: std::sync::Mutex::new(None),
         #[cfg(test)]
         warm_route_count: AtomicUsize::new(0),
         #[cfg(test)]
@@ -1372,11 +1383,12 @@ pub(crate) fn rotation_watch_started_for_test(ann: &SharedAnn) -> bool {
 /// between ticks, so dropping the pack ends it even in a non-daemon stdio
 /// process; daemon shutdown is an immediate second exit path.
 pub(crate) fn start_rotation_watcher(rt: &KhiveRuntime, ann: &SharedAnn) {
-    drop(start_rotation_watcher_with_shutdown(
-        rt,
-        ann,
-        khive_runtime::daemon_shutdown_token(),
-    ));
+    let shutdown = khive_runtime::daemon_shutdown_token();
+    let watcher = start_rotation_watcher_with_shutdown(rt, ann, shutdown);
+    #[cfg(test)]
+    rotation_watch_test_support::retain_rotation_watch_handle(ann, watcher);
+    #[cfg(not(test))]
+    drop(watcher);
 }
 
 fn start_rotation_watcher_with_shutdown(
