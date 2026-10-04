@@ -25,11 +25,21 @@
 use super::*;
 
 const UPLOAD_DIRECTORY: &str = ".uploads";
+#[path = "blob_upload_lease.rs"]
+pub(super) mod lease;
+#[cfg(test)]
+#[path = "blob_upload_lease_tests.rs"]
+mod lease_tests;
+#[cfg(unix)]
+type UploadDirectory = fs::File;
+#[cfg(not(unix))]
+type UploadDirectory = PathBuf;
 
 struct UploadContext {
     root: PathBuf,
     root_handle: Arc<fs::File>,
     floor_bytes: u64,
+    observations: Arc<StdMutex<lease::Observations>>,
     #[cfg(unix)]
     publication: BlobPublication,
 }
@@ -46,6 +56,7 @@ async fn run<T: Send + 'static>(
         root: store.root.clone(),
         root_handle: Arc::clone(&store.root_handle),
         floor_bytes: store.floor_bytes,
+        observations: Arc::clone(&store.upload_observations),
         #[cfg(unix)]
         publication: BlobPublication {
             #[cfg(test)]
@@ -155,13 +166,30 @@ impl UploadContext {
 }
 
 pub(super) async fn begin(store: &FsBlobStore, declared_size: u64) -> StorageResult<UploadId> {
+    begin_inner(store, declared_size, None).await
+}
+
+pub(super) async fn begin_leased(
+    store: &FsBlobStore,
+    size: u64,
+    config: UploadLeaseConfig,
+) -> StorageResult<UploadId> {
+    begin_inner(store, size, Some(config)).await
+}
+
+async fn begin_inner(
+    store: &FsBlobStore,
+    declared_size: u64,
+    config: Option<UploadLeaseConfig>,
+) -> StorageResult<UploadId> {
     if declared_size > MAX_BLOB_WHOLE_BYTES {
         return Err(invalid(
             "begin_upload",
             "declared upload exceeds the 64 MiB ceiling",
         ));
     }
-    run(store, "begin_upload", |context| {
+    run(store, "begin_upload", move |context| {
+        let lease = config.map(lease::Lease::begin).transpose()?;
         let directory = context
             .directory(true)
             .map_err(|error| map_io_err(error, "begin_upload"))?;
@@ -179,9 +207,31 @@ pub(super) async fn begin(store: &FsBlobStore, declared_size: u64) -> StorageRes
                 .open(directory.join(id.as_str()));
             match created {
                 Ok(file) => {
-                    file.sync_all()
-                        .map_err(|error| map_io_err(error, "begin_upload_sync"))?;
-                    return Ok(id);
+                    let result = (|| {
+                        lease::step(&context, "begin_upload_sync", || file.sync_all())?;
+                        if let Some(lease) = &lease {
+                            lease::publish(&context, &directory, &id, lease)?;
+                            #[cfg(unix)]
+                            context
+                                .publication
+                                .sync_directory("upload_sync_root", &context.root_handle)
+                                .map_err(|error| map_io_err(error, "upload_sync_root"))?;
+                        }
+                        Ok(id.clone())
+                    })();
+                    drop(file);
+                    if result.is_err() {
+                        match lease::unlink(&directory, id.as_str()) {
+                            Ok(()) => {
+                                let _ = lease::cleanup(&context, &id);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                let _ = lease::cleanup(&context, &id);
+                            }
+                            Err(_) => {} // Keep a lease if staging could not be removed.
+                        }
+                    }
+                    return result;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(map_io_err(error, "begin_upload")),
@@ -224,6 +274,10 @@ pub(super) async fn append(
         #[cfg(not(unix))]
         let opened = open_staging(&directory.join(id.as_str()), true);
         let mut file = opened.map_err(|error| upload_error(error, &id, "append_part"))?;
+        // A preserves legacy production while held; B removes this absent-lease arm.
+        let renewal = lease::read(&directory, &id)?
+            .map(|value| value.next())
+            .transpose()?;
         let before = file
             .metadata()
             .map_err(|error| map_io_err(error, "append_part_stat"))?
@@ -237,8 +291,7 @@ pub(super) async fn append(
             .map_err(|error| map_io_err(error, "append_part_write"))?;
         file.set_modified(SystemTime::now())
             .map_err(|error| map_io_err(error, "append_part_touch"))?;
-        file.sync_all()
-            .map_err(|error| map_io_err(error, "append_part_sync"))?;
+        lease::step(&context, "append_part_sync", || file.sync_all())?;
         if file
             .metadata()
             .map_err(|error| map_io_err(error, "append_part_stat"))?
@@ -250,7 +303,24 @@ pub(super) async fn append(
                 "staged length changed during append",
             ));
         }
+        if let Some(renewal) = &renewal {
+            lease::publish(&context, &directory, &id, renewal)?;
+        }
         Ok(after)
+    })
+    .await
+}
+
+pub(super) async fn renew(store: &FsBlobStore, id: UploadId) -> StorageResult<()> {
+    run(store, "renew_upload", move |context| {
+        let directory = context
+            .directory(false)
+            .map_err(|error| upload_error(error, &id, "renew_upload"))?;
+        lease::open(&directory, id.as_str())
+            .map_err(|error| upload_error(error, &id, "renew_upload"))?;
+        let value = lease::read(&directory, &id)?
+            .ok_or_else(|| invalid("renew_upload", "missing upload lease"))?;
+        lease::publish(&context, &directory, &id, &value.next()?)
     })
     .await
 }
@@ -261,7 +331,8 @@ pub(super) async fn commit(
     content_ref: ContentRef,
 ) -> StorageResult<()> {
     run(store, "commit_upload", move |context| {
-        commit_staged(&context, &id, &content_ref)
+        commit_staged(&context, &id, &content_ref)?;
+        lease::cleanup(&context, &id)
     })
     .await
 }
@@ -374,8 +445,10 @@ pub(super) async fn abort(store: &FsBlobStore, id: UploadId) -> StorageResult<()
             fs::remove_file(directory.join(id.as_str()))
         })();
         match result {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => lease::cleanup(&context, &id),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                lease::cleanup(&context, &id)
+            }
             Err(error) => Err(map_io_err(error, "abort_upload")),
         }
     })
@@ -418,6 +491,10 @@ pub(super) async fn sweep(store: &FsBlobStore, idle_for: Duration) -> StorageRes
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(map_io_err(error, "sweep_uploads_stat")),
             };
+            // Held A never subjects a present lease to the legacy caller bound.
+            if lease::read(&directory, &id)?.is_some() {
+                continue;
+            }
             let modified = file
                 .metadata()
                 .and_then(|metadata| metadata.modified())
@@ -661,6 +738,7 @@ mod tests {
                 "put_sync_parent",
                 "put_sync_root",
                 "upload_sync_staging",
+                "lease_sync_cleanup",
             ]);
             assert_eq!(*hook.completed.lock().unwrap(), expected);
             let target = shard_path(store.root(), &reference);
@@ -668,6 +746,7 @@ mod tests {
                 target.parent().unwrap().to_path_buf(),
                 target.parent().unwrap().parent().unwrap().to_path_buf(),
                 store.root().to_path_buf(),
+                store.root().join(UPLOAD_DIRECTORY),
                 store.root().join(UPLOAD_DIRECTORY),
             ];
             let expected_inodes: Vec<_> = expected_paths
