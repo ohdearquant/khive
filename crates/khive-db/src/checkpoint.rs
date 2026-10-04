@@ -49,6 +49,10 @@ use std::time::{Duration, Instant};
 
 use crate::pool::ConnectionPool;
 
+mod off_worker;
+#[cfg(test)]
+mod off_worker_tests;
+
 // ── metrics read-surface (load/perf harness) ─────────────────────────────
 // Read-only process-wide gauges (never reset outside #[cfg(test)]). See
 // crates/khive-db/docs/api/checkpoint.md#metrics-read-surface-loadperf-harness
@@ -2216,7 +2220,9 @@ async fn run_fts_maintenance_off_worker(
 /// `pool.writer()` checkout can never queue behind a checkpoint tick. That
 /// guarantee is admission-only: an armed TRUNCATE still takes SQLite's writer
 /// lock and can block new write transactions, on any connection, for up to
-/// `truncate_busy_timeout` (see `CheckpointConnection`'s contract). A tick is
+/// `truncate_busy_timeout` (see `CheckpointConnection`'s contract). The
+/// checkpoint call itself runs on `spawn_blocking`, so that wait never holds
+/// one of the runtime's worker threads. A tick is
 /// `Skipped` when that connection is unavailable or SQLite returns a busy
 /// PASSIVE row without a usable pressure observation. A
 /// WARNING fires once per below→above threshold crossing, not every tick.
@@ -2366,16 +2372,25 @@ pub async fn run_checkpoint_task(
             CheckpointTick::Skipped
         } else {
             // `ensure_open` above just confirmed a connection is open. Take
-            // ownership of it so the FTS maintenance step below can move it
-            // onto a blocking thread; every path either restores it to
-            // `checkpoint_conn` or lets it drop, which is the moved-ownership
-            // equivalent of the former `drop_connection()` call.
+            // ownership of it so the checkpoint cycle and the FTS maintenance
+            // step below can each move it onto a blocking thread; every path
+            // either restores it to `checkpoint_conn` or lets it drop, which is
+            // the moved-ownership equivalent of the former `drop_connection()`
+            // call.
             let conn = checkpoint_conn
                 .conn
                 .take()
                 .expect("ensure_open just confirmed a connection is open");
-            match checkpoint_once_core(&pool, &conn, &config, &mut truncate_state) {
-                Ok(outcome) => {
+            match off_worker::run_checkpoint_core_off_worker(
+                Arc::clone(&pool),
+                conn,
+                config.clone(),
+                truncate_state,
+            )
+            .await
+            {
+                Ok((conn, state, Ok(outcome))) => {
+                    truncate_state = state;
                     #[cfg(unix)]
                     {
                         pending_sidecar_attribution = outcome.sidecar_attribution;
@@ -2469,11 +2484,26 @@ pub async fn run_checkpoint_task(
                         }
                     }
                 }
-                Err(e) => {
+                Ok((_conn, state, Err(e))) => {
+                    truncate_state = state;
                     tracing::warn!(
                         error = %e,
                         "dedicated checkpoint connection failed a pragma; \
                          dropping it for a fresh reopen next tick"
+                    );
+                    note_checkpoint_skipped();
+                    CheckpointTick::Skipped
+                }
+                Err(join_err) => {
+                    // The checkpoint cycle panicked on the blocking thread. The
+                    // connection and escalation state moved into it are gone;
+                    // `ensure_open` reopens the connection next tick and the
+                    // escalation state restarts from its initial value.
+                    truncate_state = TruncateState::default();
+                    tracing::warn!(
+                        error = %join_err,
+                        "WAL checkpoint cycle panicked on its blocking thread; \
+                         dropping the connection for a fresh reopen next tick"
                     );
                     note_checkpoint_skipped();
                     CheckpointTick::Skipped
@@ -3126,10 +3156,10 @@ fn maybe_truncate(
                 {
                     // The census above had to be captured before TRUNCATE so
                     // a transient holder remains attributable. The bounded
-                    // sidecar walk itself must not run here: this synchronous
-                    // core is called directly from `run_checkpoint_task` on a
-                    // Tokio worker. Hand the immutable request back to that
-                    // async owner for an awaited `spawn_blocking` pass.
+                    // sidecar walk itself must not run here: it keeps its own
+                    // awaited pass in the async owner, which orders it against
+                    // the tick's housekeeping. Hand the immutable request back
+                    // to that owner for its `spawn_blocking` pass.
                     sidecar_attribution = holder_attribution.take();
                 }
                 log_backfill_gap(pool, conn);
@@ -5294,7 +5324,7 @@ mod tests {
         );
     }
 
-    fn file_pool(path: &std::path::Path) -> Arc<ConnectionPool> {
+    pub(super) fn file_pool(path: &std::path::Path) -> Arc<ConnectionPool> {
         let cfg = PoolConfig {
             path: Some(path.to_path_buf()),
             ..PoolConfig::for_test()
@@ -5318,7 +5348,7 @@ mod tests {
     /// Test helper: open the same dedicated standalone connection
     /// `run_checkpoint_task` opens in production, for tests that drive
     /// `checkpoint_once` directly.
-    fn checkpoint_conn(pool: &ConnectionPool) -> rusqlite::Connection {
+    pub(super) fn checkpoint_conn(pool: &ConnectionPool) -> rusqlite::Connection {
         pool.open_standalone_writer()
             .expect("open dedicated checkpoint connection")
     }
@@ -6088,7 +6118,7 @@ mod tests {
             "/// Whether a `CheckpointOutcomeRecorded` transition should be enqueued",
         );
         let checkpoint = task
-            .find("checkpoint_once_core(")
+            .find("run_checkpoint_core_off_worker(")
             .expect("checkpoint core call");
         let completion = task
             .find("complete_walpin_attribution(")
@@ -9054,7 +9084,7 @@ mod tests {
     /// Bounded condition poll for filesystem effects of the async sweep
     /// task — fixed sleeps flake under parallel test load because sidecar
     /// writes fsync.
-    async fn wait_for(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    pub(super) async fn wait_for(deadline: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let start = std::time::Instant::now();
         while start.elapsed() < deadline {
             if cond() {
