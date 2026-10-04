@@ -1802,6 +1802,38 @@ class CoreOnlyFeatureWorkflowTests(unittest.TestCase):
         self.assertIn("pack-web: failed (", summary)
         self.assertIn("pack-moodboard: passed (", summary)
 
+    def test_core_steps_build_and_test_with_defaults_disabled(self):
+        job = indented_block(workflow_text("ci.yml"), "core-only", 2)
+        expected = {
+            "Compile every target without the optional packs": [
+                "cargo", "check", "-p", "kkernel", "-p", "khive-mcp",
+                "--no-default-features", "--all-targets", "--locked",
+            ],
+            "Run the library tests without the optional packs": [
+                "cargo", "test", "-p", "kkernel", "-p", "khive-mcp",
+                "--no-default-features", "--lib", "--locked",
+            ],
+            "Run the pack composition tests without the optional packs": [
+                "cargo", "test", "-p", "kkernel", "--no-default-features", "--locked",
+                "--test", "optional_pack_features", "--test", "gate_operation_census",
+                "--test", "descriptions_are_written_for_callers",
+            ],
+        }
+        for name, argv in expected.items():
+            step = step_block(job, name)
+            command = step.split("        run: ", 1)[1].splitlines()[0]
+            self.assertEqual(shlex.split(command), argv, name)
+        for test in ("optional_pack_features", "gate_operation_census",
+                     "descriptions_are_written_for_callers"):
+            self.assertTrue((REPO_ROOT / "crates/kkernel/tests" / f"{test}.rs").is_file(), test)
+
+    def test_core_only_job_stays_outside_the_required_gate(self):
+        workflow = workflow_text("ci.yml")
+        gate_needs = indented_block(indented_block(workflow, "ci-gate", 2), "needs", 4)
+        needs = {line.strip().removeprefix("- ") for line in gate_needs.splitlines() if line.strip()}
+        self.assertIn("msrv-check", needs, "the needs list was read")
+        self.assertNotIn("core-only", needs)
+
 
 class HistoricalReplayWorkflowTests(unittest.TestCase):
     CHECKOUT_NAMES = {
