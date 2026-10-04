@@ -30,6 +30,12 @@ use khive_types::RefusalReason;
 
 use crate::exec::OpsFileEntry;
 
+mod reindex_report;
+use reindex_report::{add_post_commit_embedding_warning, model_degradations};
+
+#[cfg(test)]
+mod partial_indexing_tests;
+
 #[derive(Clone, Debug)]
 struct AtomicFailureDetail {
     op_index: usize,
@@ -365,32 +371,6 @@ fn refusal_reason_for_prepare_error(error: &anyhow::Error) -> Option<RefusalReas
     }
 }
 
-fn add_post_commit_embedding_warning(
-    result: &mut Value,
-    effect: Option<&PostCommitEffect>,
-    outcomes: &[khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome],
-) {
-    // More than one atomic update may schedule the same target effect. Treat
-    // those outcomes as one aggregate advisory: a late model registration can
-    // make a later duplicate reindex truncate even when the first did not, and
-    // first-match lookup would silently lose that real outcome.
-    let truncated = effect.is_some_and(|effect| {
-        outcomes
-            .iter()
-            .filter(|outcome| &outcome.effect == effect)
-            .any(|outcome| outcome.truncation.any_truncated())
-    });
-    if !truncated {
-        return;
-    }
-    if let Some(object) = result.as_object_mut() {
-        object.insert(
-            "warnings".to_string(),
-            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
-        );
-    }
-}
-
 /// Run `ops` as ONE ADR-099 atomic unit against a freshly built in-process
 /// runtime. Returns the additive result envelope
 /// (`{"results", "summary", "atomic"}`) on success or a rolled-back run; the
@@ -405,6 +385,16 @@ pub(crate) async fn execute_atomic_ops_file(
     cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     max_ops: usize,
+) -> Result<Value> {
+    execute_atomic_ops_file_with_runtime_setup(ops, cfg, khive_cfg, max_ops, |_| {}).await
+}
+
+async fn execute_atomic_ops_file_with_runtime_setup(
+    ops: Vec<OpsFileEntry>,
+    cfg: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    max_ops: usize,
+    setup: impl FnOnce(&KhiveRuntime),
 ) -> Result<Value> {
     // The dry-run path calls the same read-only admission before reporting
     // success. Keep it ahead of runtime construction and all target writes.
@@ -459,6 +449,7 @@ pub(crate) async fn execute_atomic_ops_file(
     // local, so it still cannot reach a separately-running daemon's warm
     // cache — see the cross-process analysis in #750.
     verb_registry.call_register_note_mutation_hooks(&runtime);
+    setup(&runtime);
 
     // ── async prepare pass (reads only, no writes) ───────────────────────────
     let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(ops.len());
@@ -548,6 +539,7 @@ pub(crate) async fn execute_atomic_ops_file(
                         Vec::new()
                     }
                 };
+            degradations.extend(model_degradations(&embedding_outcomes));
             // ADR-099 B3: render each committed op's
             // canonical-shaped `result` payload (ADR-099 D4 requires
             // `results[i].result`; the pre-fix envelope carried only
@@ -1483,6 +1475,7 @@ mod validate_atomic_args_tests {
         };
         let outcomes = vec![khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
             effect: effect.clone(),
+            failures: Vec::new(),
             truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
                 truncated: 1,
                 discarded_bytes: 17,
@@ -1515,10 +1508,12 @@ mod validate_atomic_args_tests {
         let outcomes = vec![
             khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
                 effect: effect.clone(),
+                failures: Vec::new(),
                 truncation: khive_runtime::retrieval::EmbeddingTruncationReport::default(),
             },
             khive_runtime::atomic_prepare::PostCommitEmbeddingOutcome {
                 effect: effect.clone(),
+                failures: Vec::new(),
                 truncation: khive_runtime::retrieval::EmbeddingTruncationReport {
                     truncated: 1,
                     discarded_bytes: 23,

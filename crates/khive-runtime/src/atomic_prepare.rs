@@ -2152,18 +2152,8 @@ async fn prepare_merge(
 // post-commit effects
 // ---------------------------------------------------------------------------
 
-/// Embedding metadata produced by one successfully applied reindex effect.
-///
-/// The effect identity is retained so response builders can attach an advisory
-/// to the exact atomic op that scheduled the reindex. Effects whose target is
-/// no longer present are omitted from the returned outcome list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PostCommitEmbeddingOutcome {
-    /// The committed reindex effect that produced this outcome.
-    pub effect: PostCommitEffect,
-    /// Actual input bounding observed while executing the effect.
-    pub truncation: crate::retrieval::EmbeddingTruncationReport,
-}
+mod embedding_outcome;
+pub use embedding_outcome::{PostCommitEmbeddingOutcome, ReindexModelFailure, ReindexModelStage};
 
 /// Run every deferred [`PostCommitEffect`] after a committed atomic unit.
 pub async fn apply_post_commit_effects(
@@ -2176,12 +2166,13 @@ pub async fn apply_post_commit_effects(
         .map(|_| ())
 }
 
-/// Truncation-reporting form of [`apply_post_commit_effects`]. Re-fetches each
+/// Embedding-reporting form of [`apply_post_commit_effects`]. Re-fetches each
 /// target's now-committed row outside any transaction and reuses the existing
 /// `reindex_entity`/`reindex_note` (FTS + embedding, same as the non-atomic
 /// path) for exact parity. Returns the typed embedding outcome for each reindex
-/// effect so callers can preserve write-response advisories instead of
-/// discarding them after commit.
+/// effect so callers can preserve truncation advisories and partial model
+/// failures instead of discarding them after commit. Model failures remain
+/// best-effort; lexical indexing and excluded-model cleanup errors propagate.
 pub async fn apply_post_commit_effects_with_report(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -2226,6 +2217,7 @@ async fn apply_one_post_commit_effect(
             Ok(Some(PostCommitEmbeddingOutcome {
                 effect: PostCommitEffect::ReindexEntity { entity_id },
                 truncation,
+                failures: Vec::new(),
             }))
         }
         PostCommitEffect::ReindexNote { note_id, version } => {
