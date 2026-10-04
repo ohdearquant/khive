@@ -536,6 +536,9 @@ with the same ID contributes one, the vector therefore refuses with zero
 destinations. This applies separately to each backend receiving the route map;
 it does not undo a transaction already committed on another backend. The
 single-target vector branch retains its existing whole-source-namespace behavior.
+In a single-target move, routing a knowledge class carries every source
+`knowledge_sections` row to that target, even when its parent atom already occupies
+the target or a third namespace.
 
 Every successful partitioned move carries all source vector rows to those unique
 targets, preserves their bytes, and appends source-delete then destination-upsert
