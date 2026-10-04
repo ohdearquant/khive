@@ -345,16 +345,28 @@ pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate:
     }
 }
 
-/// Install `candidate`, replacing an equal-generation incumbent.
+/// Install `candidate` over whatever the slot holds.
 ///
-/// Same namespace-generation fence as `install_if_fresher` (a candidate that
-/// predates the namespace's current generation is rejected), but ties REPLACE
-/// instead of keeping the incumbent. Only two ordered-within-one-warm-task
-/// paths use it: swapping a just-persisted segment's mmap reopen in for the
-/// Owned build product (identical content), and replacing a served stale
-/// segment with its completed rebuild (rule 8 → rebuild completion). The
-/// A/B-race protection that motivates tie-keeps-incumbent in
-/// `install_if_fresher` does not apply inside a single single-flight task.
+/// The only check is the namespace-generation fence `install_if_fresher` also
+/// applies: a candidate that predates the namespace's current generation is
+/// rejected and `false` is returned. The incumbent's generation is never read,
+/// so an accepted candidate replaces an older, an equal and a newer incumbent
+/// alike, and clears the key's unavailable marker.
+///
+/// Callers are ordered by the per-key lock from `checkpoint_lock`, which each
+/// of them holds across the call:
+///
+/// - `checkpoint_raise_compact_readopt`, called from the warm path and from
+///   the index verb handler, installs the bridge it was handed or the reopened
+///   segment it published;
+/// - `adopt_checkpoint_winner`, reached only from that function, installs the
+///   segment another checkpoint already published;
+/// - `refresh_rotated_segment`, run by the rotation watcher, installs a newly
+///   published segment in place of the incumbent it supersedes.
+///
+/// `install_if_fresher` keeps the incumbent on a tie because its callers can
+/// race one another. The callers here are serialized by that lock, so the
+/// later install wins.
 pub(crate) async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) -> bool {
     let mut idxs = ann.indexes.write().await;
     let ns_generation = current_generation(ann, &key.namespace);
