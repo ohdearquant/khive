@@ -163,6 +163,9 @@ them. So the key names a subject class, qualified by kind for the two classes th
 note:<kind>   entity:<kind>   edge   atom   domain
 ```
 
+The proposed [Amendment 4](#amendment-4-2026-10-04-edge-relation-routes) extends this grammar with
+`edge:<relation>` and defines its precedence over the bare `edge` fallback.
+
 The qualification is not decoration. Nothing in the schema stops a note kind and an entity kind
 sharing a spelling, and an unqualified key would route both on a store where they do. It also makes
 the refusal exact: the message names `note:observation` rather than `observation`.
@@ -691,3 +694,68 @@ excluded list. Its failure message names the tables without a rule.
 - The liveness predicates for policy and grant rows are pinned by a test in the tool pack that
   builds rows through the pack's own writers, so the move's counts cannot drift from what the
   pack reads.
+
+## Amendment 4 (2026-10-04): edge relation routes
+
+**Status: Proposed.** Refs #4038.
+
+This route grammar serves relation-specific namespace moves in #4038, whose acceptance requires
+exact relation routes with an order-independent bare-edge fallback, refusal of unrouted relations
+before writes, per-route counts and vectors following the resolved edge destination.
+
+### Canonical relation keys and fallback precedence
+
+The extended route-key grammar is:
+
+```
+note:<kind>   entity:<kind>   edge:<relation>   edge   atom   domain
+```
+
+`edge:<relation>` accepts exactly the canonical stored names in
+`khive_types::EdgeRelation::VALID_NAMES`. Empty, unknown or noncanonical qualifiers refuse as
+`UnknownSubjectClass` with the original key. Direct construction of a Rust route must enforce the
+same validation before writes. Two entries for the same relation refuse as `DuplicateRoute`, even
+if their targets are equal. A specific relation key and the bare `edge` fallback are distinct keys.
+
+For each source graph edge, its specific relation route takes precedence over `edge`. The fallback
+carries only relations without a specific route, independently of route-list order. If neither
+route exists for a relation present in source, preflight refuses the entire backend move before any
+write and names `edge:<relation>` and its row count. The inventory includes soft-deleted rows.
+Validation restricts requested specific keys; the fallback retains the prior compatibility with
+stored relation strings, including historical noncanonical values. Endpoints never determine the
+destination.
+
+`MoveCounts.subjects` reports the number moved by each supplied route key, including explicit
+zeroes. The fallback's count excludes specifically routed relations, and the `graph_edges` row
+total counts each moved row once. Bare-edge-only requests retain their prior rows and counts.
+
+### Vectors use the same resolved edge destination
+
+Amendment 2's partitioned vector resolution uses this same resolved edge route. A specific route
+plus a fallback does not contribute two destinations for one edge. Different physical subjects
+sharing an ID still obey the existing distinct-target ambiguity rule. Source scoping, vector bytes,
+paired ANN instructions, collision refusal, transaction ownership, aggregate handling and
+repeated-call behavior retain their existing rules. This amendment extends the route grammar; it
+does not replace or change the status of the document or Amendments 1 through 3.
+
+### Acceptance
+
+- Five canonical relations, including a deleted edge, move to their exact specific or fallback
+  destinations with fallback first and last. Assert per-ID destinations, unchanged nonnamespace
+  columns, explicit zero counts, no double counting and an empty repeated move.
+- Exhaustive specific routes succeed without a bare fallback; omitting a present relation refuses
+  before any write with its exact key and count. Empty, unknown and noncanonical keys, direct invalid
+  Rust routes, duplicate relation routes and a target equal to source must refuse.
+- A bare-edge-only request preserves its prior behavior, including historical noncanonical stored
+  relations and deleted rows. Destination and foreign residents remain unchanged.
+- Actual source edge vectors follow the resolved route in either route-list order, preserve bytes
+  and append a source-delete then destination-upsert pair per moved vector. Vector kind and field do
+  not choose the destination. Resident vectors remain unchanged and unlogged.
+- Removing relation filtering from the actual edge update must fail the unchanged routing test;
+  removing per-relation preflight must fail the unchanged missing-relation test; removing fallback
+  exclusion from the vector selector must fail the unchanged vector success test. Each control
+  requires a semantic failure after valid setup and the same test passing after exact restoration.
+
+These storage routing fixtures do not establish warmed ANN consumer behavior. Amendment 1's
+consumer acceptance and Amendment 2's orphan and competing-subject refusals remain separate
+requirements. This proposal records acceptance obligations, not a claim that they have run.
