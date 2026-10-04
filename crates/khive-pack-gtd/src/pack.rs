@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, PackSchemaPlan, RuntimeError, SchemaPlan,
+    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, PackSchemaPlan, RuntimeError,
     VerbRegistry,
 };
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
@@ -50,13 +50,7 @@ impl GtdPack {
 struct GtdPackFactory;
 
 impl khive_runtime::PackFactory for GtdPackFactory {
-    fn name(&self) -> &'static str {
-        "gtd"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(GtdPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(GtdPack::new(runtime))
@@ -67,40 +61,7 @@ inventory::submit! { khive_runtime::PackRegistration(&GtdPackFactory) }
 
 #[async_trait]
 impl PackRuntime for GtdPack {
-    fn name(&self) -> &str {
-        <GtdPack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <GtdPack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <GtdPack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &GTD_HANDLERS
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        <GtdPack as Pack>::EDGE_RULES
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <GtdPack as Pack>::REQUIRES
-    }
-
-    fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
-        <GtdPack as Pack>::NOTE_KIND_SPECS
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "gtd",
-            statements: &GTD_SCHEMA_PLAN_STMTS,
-        }
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
         match kind {
@@ -128,5 +89,18 @@ impl PackRuntime for GtdPack {
                 "gtd pack does not handle verb {verb:?}"
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_runtime::PackFactory;
+
+    #[test]
+    fn factory_metadata_matches_the_pack_it_constructs() {
+        let factory = GtdPackFactory;
+        assert_eq!(factory.name(), <GtdPack as Pack>::NAME);
+        assert_eq!(factory.requires(), <GtdPack as Pack>::REQUIRES);
     }
 }
