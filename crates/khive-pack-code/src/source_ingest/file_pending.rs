@@ -20,14 +20,24 @@ pub(super) struct FilePending {
     pub(super) content_hash: String,
     pub(super) declaration_ids: Vec<Uuid>,
     pub(super) references: Vec<FileReference>,
+    #[serde(default)]
+    pub(super) scanner_version: u64,
     // Missing inventory predates producer-owned edge coverage and requires parsing.
     pub(super) natural_edge_ids: Option<Vec<Uuid>>,
     #[serde(default)]
     pub(super) implementations: Vec<FileImplementation>,
 }
+/// The object key of a file's entry: a digest of its label, so the host path
+/// the label spells is never stored in module properties.
+pub(super) fn file_key(file: &str) -> String {
+    content_hash(file)
+}
 pub(super) fn read_file(properties: &Value, file: &str) -> Option<FilePending> {
-    let entry: FilePending =
-        serde_json::from_value(properties.get("l2_file_pending")?.get(file)?.clone()).ok()?;
+    let stored = properties.get("l2_file_pending")?.get(file_key(file))?;
+    let entry: FilePending = serde_json::from_value(stored.clone()).ok()?;
+    if entry.scanner_version != RUST_L2_SCANNER_IDENTITY_VERSION {
+        return None;
+    }
     entry
         .references
         .iter()
@@ -51,11 +61,40 @@ pub(super) async fn stamp_l2_declarations(
     report: &mut CodeSourceIngestReport,
 ) -> Result<bool, CodeSourceIngestError> {
     let mut seen = HashSet::new();
-    let references: Vec<_> = references
-        .iter()
-        .filter(|reference| seen.insert((*reference).clone()))
-        .cloned()
-        .collect();
+    let mut kept = Vec::new();
+    for reference in references {
+        if !seen.insert(reference.clone()) {
+            continue;
+        }
+        // The per-item screen record_l2_pending_batch applies. A refused
+        // reference was already reported there; it is only left out here, so
+        // one refused reference cannot make the module row refuse the stamp.
+        match secret_gate::check_json_at(
+            &serde_json::to_value(&reference.reference).expect("serializes"),
+            "entity",
+            "properties",
+        ) {
+            Ok(()) => kept.push(reference.clone()),
+            Err(RuntimeError::SecretDetected(_)) => {}
+            Err(other) => return Err(other.into()),
+        }
+    }
+    let references = kept;
+    let mut kept = Vec::new();
+    for implementation in implementations {
+        // The existing pending-impl writer already reports refused items.
+        // Keep their producer inventory out of the same stamped row as well.
+        match secret_gate::check_json_at(
+            &serde_json::to_value(&implementation.implementation).expect("serializes"),
+            "entity",
+            "properties",
+        ) {
+            Ok(()) => kept.push(implementation.clone()),
+            Err(RuntimeError::SecretDetected(_)) => {}
+            Err(other) => return Err(other.into()),
+        }
+    }
+    let implementations = kept;
     let mut row_missing = false;
     let mut invalid_properties = false;
     let outcome = mutate_entity(rt, token, module_id, file_label, report, |current| {
@@ -77,11 +116,12 @@ pub(super) async fn stamp_l2_declarations(
             *entries = json!({});
         }
         entries.as_object_mut().expect("object").insert(
-            file_label.to_owned(),
+            file_key(file_label),
             json!(FilePending {
                 content_hash: content_hash.to_owned(),
                 declaration_ids: declaration_ids.to_vec(),
                 references: references.to_vec(),
+                scanner_version: RUST_L2_SCANNER_IDENTITY_VERSION,
                 natural_edge_ids: Some(
                     natural_edge_ids
                         .iter()
@@ -232,7 +272,7 @@ pub(super) async fn reresolve(
             props
                 .get_mut("l2_file_pending")?
                 .as_object_mut()?
-                .insert(file.clone(), json!(fresh));
+                .insert(file_key(&file), json!(fresh));
             module.properties = Some(Value::Object(props));
             Some(module)
         })
@@ -338,7 +378,7 @@ pub(super) async fn record_resolved_implementations(
             properties
                 .get_mut("l2_file_pending")?
                 .as_object_mut()?
-                .insert(file.clone(), json!(fresh));
+                .insert(file_key(&file), json!(fresh));
             module.properties = Some(Value::Object(properties));
             Some(module)
         })

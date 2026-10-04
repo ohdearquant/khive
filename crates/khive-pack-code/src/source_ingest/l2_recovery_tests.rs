@@ -410,14 +410,15 @@ async fn l2_recovery_attempt_precedes_changed_file_and_reresolve_failures() {
                 "fn ba() { bh(); }\nfn bh() {}\nfn new_target() {}\n",
             );
             let trigger = if reresolve {
+                let label = root
+                    .join("a.rs")
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string();
                 let path = format!(
                     "$.l2_file_pending.{}.references",
-                    json!(root
-                        .join("a.rs")
-                        .canonicalize()
-                        .unwrap()
-                        .display()
-                        .to_string())
+                    json!(file_pending::file_key(&label))
                 )
                 .replace('\'', "''");
                 format!(
@@ -894,6 +895,9 @@ async fn l2_recovery_restored_read_skip_reobserves_actual_references() {
 
 #[path = "l2_removed_pending_tests.rs"]
 mod pending_removed_tests;
+
+#[path = "l2_file_pending_gate_tests.rs"]
+mod file_pending_gate_tests;
 
 #[path = "l2_owner_refresh_tests.rs"]
 mod shared_owner_tests;

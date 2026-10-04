@@ -136,3 +136,35 @@ async fn l2_missing_accepted_edge_inventory_parses_once_without_clock_fallback()
         assert_eq!(report.l2.unwrap().symbol_edges_stamped, 1);
     }
 }
+
+#[tokio::test]
+async fn l2_refused_impl_inventory_preserves_the_files_accepted_coverage() {
+    for wal in [true, false] {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("fixture");
+        manifest(&root, "fixture");
+        let refused = ["AKIA", "1234567890ABCDEF"].concat();
+        let text = format!("impl {refused} for crate::b::Item {{}}\nfn helper(){{}}\n");
+        source(&root, "a.rs", &text);
+        source(&root, "b.rs", "pub struct Item;\n");
+        let (rt, token) = runtime(&dir.path().join("map.db"), wal);
+        let (report, _) = l2(&rt, &token, &root, 10).await;
+        assert_eq!(report.blocked_count, 1);
+        let module = stored(&rt, &token, module_uuid("fixture", "rust", "a")).await;
+        let entry = file_pending::read_file(
+            module.properties.as_ref().unwrap(),
+            &root
+                .join("a.rs")
+                .canonicalize()
+                .unwrap()
+                .display()
+                .to_string(),
+        )
+        .expect("refused impl must not refuse accepted coverage");
+        assert_eq!(entry.declaration_ids, [symbol("a", "helper")]);
+        assert!(entry.implementations.is_empty());
+        assert_eq!(entry.natural_edge_ids, Some(vec![]));
+        let (_, work) = l2(&rt, &token, &root, 20).await;
+        assert!(work.parsed.is_empty());
+    }
+}

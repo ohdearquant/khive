@@ -1280,6 +1280,7 @@ async fn l2_replay_rebases_concurrent_reference_and_impl_additions_in_both_modes
                 module_path: "crate".into(),
                 reference,
             };
+            let source_key = file_pending::file_key("source.rs");
             let key = if impl_path {
                 "l2_pending_impls"
             } else {
@@ -1288,7 +1289,7 @@ async fn l2_replay_rebases_concurrent_reference_and_impl_additions_in_both_modes
             let initial = if impl_path {
                 json!([resolved_impl, remaining_impl])
             } else {
-                json!({"source.rs":file_pending::FilePending { content_hash: "hash".into(), declaration_ids: vec![symbol], references: vec![file_ref(reference("resolved", "call")), file_ref(reference("missing", "call"))], natural_edge_ids: Some(vec![]), implementations: vec![] }})
+                json!({(source_key.clone()):file_pending::FilePending { content_hash: "hash".into(), declaration_ids: vec![symbol], references: vec![file_ref(reference("resolved", "call")), file_ref(reference("missing", "call"))], scanner_version: RUST_L2_SCANNER_IDENTITY_VERSION, natural_edge_ids: Some(vec![]), implementations: vec![] }})
             };
             seed(&rt, &token, owner, "concept", "module", "owner", json!({"source_project":"fixture","language":"rust","module_path":"crate",(key):initial,"unrelated":[2,1]})).await;
             seed(
@@ -1351,7 +1352,7 @@ async fn l2_replay_rebases_concurrent_reference_and_impl_additions_in_both_modes
                             .expect("array")
                             .push(json!(concurrent_impl));
                     } else {
-                        props[key]["source.rs"]["references"]
+                        props[key][&source_key]["references"]
                             .as_array_mut()
                             .expect("array")
                             .push(json!(file_ref(reference("concurrent", "call"))));
@@ -1381,7 +1382,7 @@ async fn l2_replay_rebases_concurrent_reference_and_impl_additions_in_both_modes
                 props[key].clone()
             } else {
                 json!(serde_json::from_value::<Vec<FileReference>>(
-                    props[key]["source.rs"]["references"].clone()
+                    props[key][&source_key]["references"].clone()
                 )
                 .expect("references")
                 .into_iter()
@@ -1474,6 +1475,7 @@ async fn l2_unsafe_repeated_candidates_owner_refusal_and_soft_delete_history() {
 
 #[tokio::test]
 async fn l2_late_cleanup_preserves_a_newer_accepted_producer_replacement() {
+    let source_key = file_pending::file_key("source.rs");
     for wal in [true, false] {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("replacement.db");
@@ -1559,7 +1561,7 @@ async fn l2_late_cleanup_preserves_a_newer_accepted_producer_replacement() {
                 let expected = stored(&other, &other_token, module)
                     .await
                     .properties
-                    .unwrap()["l2_file_pending"]["source.rs"]
+                    .unwrap()["l2_file_pending"][&source_key]
                     .clone();
                 assert_eq!(expected["references"].as_array().unwrap().len(), 3);
                 assert_ne!(expected["content_hash"], before_hash);
@@ -1570,7 +1572,7 @@ async fn l2_late_cleanup_preserves_a_newer_accepted_producer_replacement() {
         result.unwrap();
         let row = stored(&rt, &token, module).await;
         assert_eq!(
-            row.properties.as_ref().unwrap()["l2_file_pending"]["source.rs"],
+            row.properties.as_ref().unwrap()["l2_file_pending"][&source_key],
             expected,
             "old cleanup cannot erase a newly accepted declaration/reference"
         );

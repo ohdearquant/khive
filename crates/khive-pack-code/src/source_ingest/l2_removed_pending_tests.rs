@@ -67,7 +67,7 @@ async fn l2_removed_pending_call_does_not_materialize_after_real_parses() {
     }
 }
 
-fn fixture(wal: bool) -> (TempDir, PathBuf, KhiveRuntime, NamespaceToken) {
+pub(super) fn fixture(wal: bool) -> (TempDir, PathBuf, KhiveRuntime, NamespaceToken) {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join("fixture");
     manifest(&root, "fixture");
@@ -75,21 +75,17 @@ fn fixture(wal: bool) -> (TempDir, PathBuf, KhiveRuntime, NamespaceToken) {
     (dir, root, rt, token)
 }
 
-async fn pending_file(
+pub(super) async fn pending_file(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     root: &Path,
     name: &str,
     module: &str,
 ) -> Value {
+    let path = root.join(name).canonicalize().unwrap();
+    let key = file_pending::file_key(&path.display().to_string());
     let row = stored(rt, token, module_uuid("fixture", "rust", module)).await;
-    row.properties.unwrap()["l2_file_pending"][root
-        .join(name)
-        .canonicalize()
-        .unwrap()
-        .display()
-        .to_string()]
-    .clone()
+    row.properties.unwrap()["l2_file_pending"][key].clone()
 }
 async fn absent(rt: &KhiveRuntime, token: &NamespaceToken, from: Uuid, to: Uuid) -> bool {
     rt.graph(token)
@@ -111,6 +107,11 @@ async fn l2_unchanged_producer_resolves_its_retained_reference() {
         );
         let (report, _) = l2(&rt, &token, &root, 10).await;
         assert_eq!(report.l2.unwrap().symbol_dependencies_unresolved, 1);
+        let row = stored(&rt, &token, module_uuid("fixture", "rust", "a")).await;
+        let all = row.properties.unwrap()["l2_file_pending"].clone();
+        let keys: Vec<_> = all.as_object().unwrap().keys().collect();
+        assert!(!keys.is_empty());
+        assert!(keys.iter().all(|key| !key.contains(['/', '\\'])));
         assert_eq!(
             pending_file(&rt, &token, &root, "a.rs", "a").await["references"]
                 .as_array()
@@ -149,23 +150,23 @@ async fn l2_alias_removal_preserves_the_other_physical_producer() {
             imports::module_path_for_file(&root.join("foo.rs"), &root, "rust"),
             imports::module_path_for_file(&root.join("foo/mod.rs"), &root, "rust")
         );
-        source(&root.join("foo"), "mod.rs", "fn helper(){}\n");
+        // The walk sorts foo/mod.rs before foo.rs, so foo.rs is the producer
+        // stamped last. It drops its call; foo/mod.rs is unchanged and reused.
+        source(&root, "foo.rs", "fn helper(){}\n");
         let (_, work) = l2(&rt, &token, &root, 20).await;
         assert_eq!(
-            pending_file(&rt, &token, &root, "foo.rs", "foo").await["references"]
+            pending_file(&rt, &token, &root, "foo/mod.rs", "foo").await["references"]
                 .as_array()
                 .unwrap()
                 .len(),
             1
         );
         assert_eq!(
-            pending_file(&rt, &token, &root, "foo/mod.rs", "foo").await["references"],
+            pending_file(&rt, &token, &root, "foo.rs", "foo").await["references"],
             json!([])
         );
-        assert_eq!(
-            work.parsed,
-            [root.join("foo/mod.rs").canonicalize().unwrap()]
-        );
+        let foo = root.join("foo.rs").canonicalize().unwrap();
+        assert_eq!(work.parsed, [foo]);
         source(&root.join("foo"), "target.rs", "fn ghost(){}\n");
         l2(&rt, &token, &root, 30).await;
         assert!(
@@ -268,7 +269,10 @@ async fn l2_refused_producer_keeps_history_without_current_authority() {
         );
         let (report, work) = l2(&rt, &token, &root, 30).await;
         assert!(report.blocked_count > 0);
-        assert!(work.parsed.iter().all(|file| file.ends_with("target.rs")));
+        assert!(
+            work.parsed.is_empty(),
+            "the refused module row stops both producers before parsing"
+        );
         assert_eq!(
             stored(&rt, &token, module_id).await.properties.unwrap()["l2_file_pending"],
             all
@@ -279,7 +283,7 @@ async fn l2_refused_producer_keeps_history_without_current_authority() {
 #[tokio::test]
 async fn l2_legacy_pending_store_parses_once_before_accepting_empty() {
     for wal in [true, false] {
-        for malformed in [false, true] {
+        for arm in ["missing", "undeserializable", "foreign_declaration"] {
             let (_dir, root, rt, token) = fixture(wal);
             source(&root, "a.rs", "fn helper(){crate::b::ghost();}\n");
             l2(&rt, &token, &root, 10).await;
@@ -293,11 +297,26 @@ async fn l2_legacy_pending_store_parses_once_before_accepting_empty() {
             );
             let id = module_uuid("fixture", "rust", "a");
             let mut module = stored(&rt, &token, id).await;
+            let label = root.join("a.rs").canonicalize().unwrap();
+            let label = label.display().to_string();
+            let key = file_pending::file_key(&label);
+            let properties = module.properties.clone().unwrap();
+            let mut entry = file_pending::read_file(&properties, &label).unwrap();
+            entry.references.push(FileReference {
+                declaration_id: Uuid::from_u128(99),
+                module_path: "a".into(),
+                reference: L2UnresolvedRef {
+                    segments: vec!["ghost".into()],
+                    evidence: "call".into(),
+                },
+            });
             let props = module.properties.as_mut().unwrap().as_object_mut().unwrap();
-            if malformed {
-                props.insert("l2_file_pending".into(), json!({"invalid": []}));
-            } else {
+            if arm == "missing" {
                 props.remove("l2_file_pending");
+            } else if arm == "undeserializable" {
+                props.insert("l2_file_pending".into(), json!({(key): "not an entry"}));
+            } else {
+                props.insert("l2_file_pending".into(), json!({(key): entry}));
             }
             rt.entities(&token)
                 .unwrap()
@@ -328,11 +347,12 @@ async fn l2_alias_shared_hash_cannot_authorize_another_producer() {
         source(&root.join("foo"), "mod.rs", "fn helper(){}\n");
         l2(&rt, &token, &root, 10).await;
         let before = pending_file(&rt, &token, &root, "foo.rs", "foo").await;
-        let module = stored(&rt, &token, module_uuid("fixture", "rust", "foo")).await;
-        assert_ne!(
-            before["content_hash"],
-            module.properties.unwrap()["l2_content_hash"]
-        );
+        let sibling = pending_file(&rt, &token, &root, "foo/mod.rs", "foo").await;
+        assert_ne!(before["content_hash"], sibling["content_hash"]);
+        // The walk sorts foo/mod.rs before foo.rs. The module row still carries
+        // foo.rs's old hash, so mod.rs is reparsed first and restamps the row
+        // with its own hash, which is also the hash foo.rs now has, while
+        // foo.rs's own entry still holds the old one.
         source(&root, "foo.rs", "fn helper(){}\n");
         let (_, work) = l2(&rt, &token, &root, 20).await;
         assert!(
@@ -342,6 +362,7 @@ async fn l2_alias_shared_hash_cannot_authorize_another_producer() {
         );
         let after = pending_file(&rt, &token, &root, "foo.rs", "foo").await;
         assert_ne!(before["content_hash"], after["content_hash"]);
+        assert_eq!(after["content_hash"], sibling["content_hash"]);
         assert_eq!(after["references"], json!([]));
     }
 }
