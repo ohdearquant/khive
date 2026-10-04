@@ -2223,7 +2223,7 @@ impl KhiveRuntime {
     /// evidence the trusted ingest handler just derived. `try_create_note`
     /// instead runs its own narrower reserved-transport-property check
     /// inline (`operations.rs`'s `try_create_note_impl`), which allows the
-    /// three `message`-kind transport properties only when called through
+    /// `message`-kind transport properties only when called through
     /// [`Self::try_create_note_as_trusted_ingest`] with a
     /// [`crate::pack::ChannelIngestCapability`].
     ///
