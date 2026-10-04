@@ -3,6 +3,11 @@
 //! Neither item knows anything about an index. One is the lock every writer of a checkpoint
 //! directory takes, the other is the polling loop that notices a peer process rotating a
 //! segment. A pack supplies its own error-text prefix, task label and refresh step.
+//!
+//! The [`registry`] submodule holds the durable consumer registration lifecycle that gates
+//! compaction of the ANN write log.
+
+pub mod registry;
 
 use std::fs::File;
 use std::future::Future;

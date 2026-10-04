@@ -1323,6 +1323,7 @@ dependencies = [
  "chrono",
  "khive-fusion",
  "khive-score",
+ "khive-storage",
  "khive-types",
  "lattice-embed",
  "parking_lot",
@@ -1331,6 +1332,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
 ]
 
