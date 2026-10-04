@@ -15,14 +15,13 @@ description = "Hybrid retrieval composer (HNSW + BM25 + fusion + graph + cross-e
 bench = false
 
 [dependencies]
-khive-hnsw    = { version = "0.9.0", path = "../khive-hnsw" }
-khive-bm25    = { version = "0.9.0", path = "../khive-bm25" }
+khive-hnsw    = { version = "0.9.0", path = "../khive-hnsw", optional = true }
+khive-bm25    = { version = "0.9.0", path = "../khive-bm25", optional = true }
 khive-fusion  = { version = "0.9.0", path = "../khive-fusion" }
 khive-score   = { version = "0.9.0", path = "../khive-score" }
 khive-types   = { version = "0.9.0", path = "../khive-types" }
 khive-fold    = { version = "0.9.0", path = "../khive-fold", optional = true }
 khive-storage = { version = "0.9.0", path = "../khive-storage", optional = true }
-khive-db      = { version = "0.9.0", path = "../khive-db" }
 khive-gate    = { version = "0.9.0", path = "../khive-gate", optional = true }
 lattice-embed = { workspace = true }
 
@@ -45,16 +44,20 @@ rand = { workspace = true, optional = true }
 # and avoid pulling in rusqlite/lattice-embed/khive-storage unless explicitly requested.
 # This deviation is tracked as a known gap pending an ADR-030 amendment.
 default = []
+# Re-exports the khive-hnsw index types (HnswIndex, HnswConfig, ...) at the crate root
+hnsw = ["dep:khive-hnsw"]
+# Re-exports the khive-bm25 index types (Bm25Index, Bm25Config, ...) at the crate root
+bm25 = ["dep:khive-bm25"]
 # Policy-based access control for search results (uses khive-gate API)
 policy = ["khive-gate"]
 # HNSW checkpoint integration with khive-fold (ADR-030 F167)
 # Enables HnswCheckpoint/HnswCheckpointStore re-exports and khive-hnsw checkpoint support.
-checkpoint = ["khive-fold", "khive-hnsw/checkpoint"]
+checkpoint = ["hnsw", "khive-fold", "khive-hnsw/checkpoint"]
 # SQLite-based persistence for HNSW and BM25 indexes
-persist = ["rusqlite", "tracing", "rand"]
+persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand"]
 # Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.
-# Enables the vectors feature on khive-db so sqlite-vec is loaded for tests.
-storage-adapters = ["khive-storage", "khive-db/vectors"]
+# The adapter tests get sqlite-vec from the khive-db dev-dependency's vectors feature.
+storage-adapters = ["khive-storage"]
 # Native cross-encoder reranking (deferred until khive-inference is ported)
 native-rerank = []
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
@@ -64,6 +67,8 @@ embed = []
 criterion = { workspace = true }
 khive-score = { version = "0.9.0", path = "../khive-score" }
 khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
+# Only the storage-adapters tests use khive-db; `vectors` loads sqlite-vec for them.
+khive-db = { version = "0.9.0", path = "../khive-db", features = ["vectors"] }
 
 [[bench]]
 name = "fusion_bench"
