@@ -66,6 +66,7 @@ pub mod retrieval;
 pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
+mod sql_include;
 mod streams;
 pub mod telemetry_config;
 pub use streams::{
