@@ -2540,6 +2540,7 @@ dependencies = [
  "encoding_rs",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-pack-blob",
  "khive-pack-exec",
  "khive-pack-kg",

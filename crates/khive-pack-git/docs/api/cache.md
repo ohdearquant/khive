@@ -239,13 +239,13 @@ there yet.
 
 ## `unix_fd` / `is_owned_entry_via_fd`
 
-`unix_fd` is a small private module of `openat`/`fstatat`/`fstat`/`renameat`
-wrappers bound to an already-opened directory descriptor, mirroring the
-`O_NOFOLLOW`/`fstat` idiom already used by `khive-db`'s WAL-pin sidecar
-(`crates/khive-db/src/walpin.rs`) and `khive-vamana`'s external-id sidecar
-(`crates/khive-vamana/src/external_ids.rs`): every operation after the
-initial `open`/`openat` is relative to a handle the kernel resolved once,
-immune to the original pathname being swapped out from under it afterward.
+The cache takes its descriptor-relative `openat`, `fstatat` and `fstat` calls
+(`open_dir_at`, `stat_at`, `stat_fd`) from the shared `fd_relative` module of
+the `khive-fs` crate (`crates/khive-fs/src/fd_relative.rs`): every operation
+after the initial `open`/`openat` is relative to a handle the kernel resolved
+once, immune to the original pathname being swapped out from under it
+afterward. `unix_fd` is the small private module of what that module does not
+cover: the path-based `open_dir_nofollow` and `renameat`.
 `is_owned_entry_via_fd` is `is_owned_entry`'s fd-relative mirror, used by
 `delete_verified_owned_entry` right before it acts.
 
