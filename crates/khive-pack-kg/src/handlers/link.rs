@@ -46,11 +46,7 @@ impl KgPack {
                     // must see caller order so a rejected symmetric relation reports the
                     // legal set for the requested ordered pair; `build_edge` canonicalizes
                     // the accepted edge before persistence.
-                    let (key_source, key_target) = if relation.is_symmetric() && target < source {
-                        (target, source)
-                    } else {
-                        (source, target)
-                    };
+                    let (key_source, key_target) = relation.canonical_endpoints(source, target);
                     let key = format!("{key_source}::{key_target}::{}", relation.as_str());
                     if !seen.insert(key) {
                         skipped += 1;
@@ -164,11 +160,7 @@ impl KgPack {
                     };
                     // Keep caller order for validation/diagnostics; only the dedup key
                     // needs UUID-canonical endpoints. `link` canonicalizes on success.
-                    let (key_source, key_target) = if relation.is_symmetric() && target < source {
-                        (target, source)
-                    } else {
-                        (source, target)
-                    };
+                    let (key_source, key_target) = relation.canonical_endpoints(source, target);
                     let key = format!("{key_source}::{key_target}::{}", relation.as_str());
                     if !seen.insert(key) {
                         skipped += 1;
@@ -330,3 +322,7 @@ impl KgPack {
         Ok(format_edge_output(raw, verbose))
     }
 }
+
+#[cfg(test)]
+#[path = "link_dedup_tests.rs"]
+mod link_dedup_tests;
