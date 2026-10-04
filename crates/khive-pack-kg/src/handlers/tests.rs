@@ -2057,15 +2057,6 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
             Ok(())
         }
 
-        async fn after_create(
-            &self,
-            _: &KhiveRuntime,
-            _: uuid::Uuid,
-            _: &Value,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-
         async fn normalize_note_update(
             &self,
             _: &KhiveRuntime,

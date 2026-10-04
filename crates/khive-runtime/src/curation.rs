@@ -15630,15 +15630,6 @@ mod tests {
             Ok(())
         }
 
-        async fn after_create(
-            &self,
-            _runtime: &KhiveRuntime,
-            _id: Uuid,
-            _args: &Value,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-
         async fn validate_entity_update(
             &self,
             _runtime: &KhiveRuntime,
@@ -15661,7 +15652,7 @@ mod tests {
         }
     }
 
-    /// Test-only `KindHook` implementing only the two required methods, so
+    /// Test-only `KindHook` implementing only the one required method, so
     /// its entity-update path is the trait's inherited default. Proves the
     /// default is a default (issue #2943 acceptance item 5): a kind can
     /// register a hook for `create` without that hook opting into
@@ -15681,15 +15672,6 @@ mod tests {
             &self,
             _runtime: &KhiveRuntime,
             _args: &mut Value,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-
-        async fn after_create(
-            &self,
-            _runtime: &KhiveRuntime,
-            _id: Uuid,
-            _args: &Value,
         ) -> Result<(), RuntimeError> {
             Ok(())
         }
