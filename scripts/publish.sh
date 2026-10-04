@@ -57,6 +57,7 @@ CRATES=(
     khive-text          # khive-bm25 depends on it (normal dep); the old dev-dep cycle is gone
     khive-bm25
     khive-fusion
+    khive-fs             # no khive-* dependencies; dep of khive-db, so publish first
     khive-db
     khive-hnsw
     khive-query

@@ -2191,6 +2191,7 @@ dependencies = [
  "fs4",
  "futures",
  "khive-db",
+ "khive-fs",
  "khive-score",
  "khive-storage",
  "khive-types",
@@ -2225,6 +2226,13 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+]
+
+[[package]]
+name = "khive-fs"
+version = "0.9.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
