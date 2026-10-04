@@ -253,6 +253,18 @@ that implements D3 (pull request #3000) admits disk sources under `read_roots` a
 here, and cites A1.1 as its acceptance. Until that change lands, D3 disk ingest is unenforced and is
 not to be relied on.
 
+Disk admission retains the opened regular-file descriptors until the complete source tree has been
+validated, before any body is read or any ingest row is written. This keeps the admitted bytes tied to
+the same files even if a leaf or directory is replaced after admission. The `limit` bounds retained
+regular-file descriptors, in addition to directory-walk and other process descriptors; it is not a
+promise that every limit fits the process's available descriptor budget. The chosen policy retains
+this all-or-nothing admission rather than closing files and reopening paths for a later body read.
+When admission encounters `EMFILE` or `ENFILE`, it refuses with `ingest_descriptor_exhausted`, including
+the affected path and operating-system cause, and releases the files retained so far. The caller can
+retry with a smaller `limit`. A regression admits a tree of 128 regular files in a joined child with a
+soft descriptor limit of at most 64, observes this refusal, and verifies that a one-file retry succeeds
+under the unchanged budget; the leaf and directory replacement controls still retain the original bytes.
+
 ### A1.2 D4: bodies are rooted by attachment on the main backend; `persist` false stores no bytes
 
 D4 said every receipt carries a blob reference; this amendment rewrites that sentence of D4 to read
