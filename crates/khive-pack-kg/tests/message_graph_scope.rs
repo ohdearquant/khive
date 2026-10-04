@@ -41,7 +41,12 @@ fn runtime(backend: &str) -> KhiveRuntime {
     .expect("in-memory runtime")
 }
 
-async fn read(registry: &VerbRegistry, actor: &str, verb: &str, args: Value) -> Value {
+async fn try_read(
+    registry: &VerbRegistry,
+    actor: &str,
+    verb: &str,
+    args: Value,
+) -> Result<Value, RuntimeError> {
     registry
         .dispatch_with_identity(
             verb,
@@ -53,10 +58,15 @@ async fn read(registry: &VerbRegistry, actor: &str, verb: &str, args: Value) -> 
             }),
         )
         .await
+}
+
+async fn read(registry: &VerbRegistry, actor: &str, verb: &str, args: Value) -> Value {
+    try_read(registry, actor, verb, args)
+        .await
         .expect("scoped graph read")
 }
 
-async fn fixture(topology: Topology) -> Fixture {
+fn scoped_registry(topology: Topology) -> (KhiveRuntime, KhiveRuntime, VerbRegistry) {
     let main = runtime("main");
     let comm = match topology {
         Topology::Shared => main.clone(),
@@ -76,6 +86,11 @@ async fn fixture(topology: Topology) -> Fixture {
     main.install_edge_rules(registry.all_edge_rules());
     comm.install_edge_rules(registry.all_edge_rules());
     registry.call_register_entity_type_validators(&main);
+    (main, comm, registry)
+}
+
+async fn fixture(topology: Topology) -> Fixture {
+    let (main, comm, registry) = scoped_registry(topology);
 
     let sent = read(
         &registry,
@@ -487,7 +502,7 @@ async fn graph_message_prefix_errors_keep_candidates_within_mailbox_scope() {
             assert!(matches!(error, RuntimeError::InvalidInput(_)), "{error}");
             let text = error.to_string();
             assert!(
-                text.contains("full UUID") && text.contains("comm.inbox"),
+                text.contains("no record matches prefix") && text.contains(reference),
                 "{text}"
             );
             for id in message_ids.into_iter().chain(edge_ids) {
@@ -935,4 +950,797 @@ async fn message_context_scope_on_shared_and_split_backends() {
             assert_absent(&second, &[other, other_target], &[]);
         }
     }
+}
+
+async fn link(fixture: &Fixture, source: Uuid, target: Uuid, relation: EdgeRelation) -> Uuid {
+    let id = Uuid::new_v4();
+    store_edge(&fixture.main, "local", id, source, target, relation, 1.0).await;
+    id
+}
+
+async fn store_message(fixture: &Fixture, id: &str) -> Uuid {
+    let id = Uuid::parse_str(id).expect("message UUID");
+    let token = fixture
+        .comm
+        .authorize(Namespace::local())
+        .expect("note token");
+    let mut message = Note::new("local", "message", "Graph prefix example").with_properties(
+        json!({"direction": "inbound", "from_actor": "sender", "to_actor": "recipient"}),
+    );
+    message.id = id;
+    fixture
+        .comm
+        .notes(&token)
+        .expect("note store")
+        .upsert_note(message)
+        .await
+        .expect("store message");
+    id
+}
+
+async fn store_concept(fixture: &Fixture, id: &str) -> Uuid {
+    let id = Uuid::parse_str(id).expect("entity UUID");
+    let token = fixture
+        .main
+        .authorize(Namespace::local())
+        .expect("entity token");
+    let mut entity = Entity::new("local", "concept", "Graph prefix entity");
+    entity.id = id;
+    fixture
+        .main
+        .entities(&token)
+        .expect("entity store")
+        .upsert_entity(entity)
+        .await
+        .expect("store entity");
+    id
+}
+
+async fn store_seeded_concept(main: &KhiveRuntime, id: Uuid) {
+    let token = main.authorize(Namespace::local()).expect("entity token");
+    let mut entity = Entity::new("local", "concept", format!("Concept {}", id.simple()));
+    entity.id = id;
+    let entities = main.entities(&token).expect("entity store");
+    entities.upsert_entity(entity).await.expect("store entity");
+}
+
+fn edge_ids(response: &Value) -> Vec<Uuid> {
+    response["items"]
+        .as_array()
+        .or_else(|| response["edges"].as_array())
+        .expect("edge array")
+        .iter()
+        .map(|edge| Uuid::parse_str(edge["id"].as_str().expect("edge id")).expect("edge UUID"))
+        .collect()
+}
+
+fn sorted(mut ids: Vec<Uuid>) -> Vec<Uuid> {
+    ids.sort_unstable();
+    ids
+}
+
+fn prefix_args(verb: &str, reference: &str) -> Value {
+    match verb {
+        "neighbors" => json!({"node_id": reference}),
+        "context" => json!({"entity_ids": [reference]}),
+        _ => json!({"kind": "edge", "source_id": reference}),
+    }
+}
+
+/// An observer that cannot read the message under `cafe2001` is answered for
+/// that prefix exactly as for a prefix no record carries.
+async fn assert_prefix_reads_as_no_match(fixture: &Fixture, verbs: &[&str]) {
+    for verb in verbs {
+        let withheld = try_read(
+            &fixture.registry,
+            "observer",
+            verb,
+            prefix_args(verb, "cafe2001"),
+        )
+        .await
+        .expect_err("a prefix naming only an unreadable message is refused");
+        let missing = try_read(
+            &fixture.registry,
+            "observer",
+            verb,
+            prefix_args(verb, "cafe9999"),
+        )
+        .await
+        .expect_err("a prefix naming nothing is refused");
+        assert!(
+            matches!(missing, RuntimeError::InvalidInput(_)),
+            "{verb}: {missing}"
+        );
+        assert_eq!(
+            std::mem::discriminant(&withheld),
+            std::mem::discriminant(&missing),
+            "{verb}: {withheld} / {missing}"
+        );
+        assert!(withheld.to_string().contains("cafe2001"), "{verb}");
+        assert_eq!(
+            withheld.to_string().replace("cafe2001", "<prefix>"),
+            missing.to_string().replace("cafe9999", "<prefix>"),
+            "{verb}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_withholds_edges_touching_unreadable_messages() {
+    for topology in [Topology::Shared, Topology::Split] {
+        let f = fixture(topology).await;
+        let control = link(&f, f.anchor, f.outbound_target, EdgeRelation::Extends).await;
+        let observer = read(&f.registry, "observer", "list", json!({"kind": "edge"})).await;
+        assert_eq!(edge_ids(&observer), [control], "{observer}");
+        assert_absent(&observer, &f.edges, &[]);
+        let owner = read(&f.registry, "sender", "list", json!({"kind": "edge"})).await;
+        assert_eq!(
+            sorted(edge_ids(&owner)),
+            sorted(vec![f.edges[1], f.edges[2], control]),
+            "{owner}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_full_id_of_unreadable_message_matches_an_id_with_no_edges() {
+    for topology in [Topology::Shared, Topology::Split] {
+        let f = fixture(topology).await;
+        let withheld = read(
+            &f.registry,
+            "observer",
+            "list",
+            json!({"kind": "edge", "source_id": f.outbound.id}),
+        )
+        .await;
+        let none = read(
+            &f.registry,
+            "observer",
+            "list",
+            json!({"kind": "edge", "source_id": f.inbound_target}),
+        )
+        .await;
+        assert!(edge_ids(&none).is_empty(), "{none}");
+        assert_eq!(withheld, none);
+        let owner = read(
+            &f.registry,
+            "sender",
+            "list",
+            json!({"kind": "edge", "source_id": f.outbound.id}),
+        )
+        .await;
+        assert_eq!(
+            sorted(edge_ids(&owner)),
+            sorted(vec![f.edges[1], f.edges[2]]),
+            "{owner}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_prefix_of_unreadable_message_answers_like_no_match() {
+    let f = fixture(Topology::Shared).await;
+    let message = store_message(&f, "cafe2001-0000-4000-8000-000000000001").await;
+    let edge = link(&f, message, f.anchor, EdgeRelation::Annotates).await;
+    assert_prefix_reads_as_no_match(&f, &["list"]).await;
+    let owner = read(
+        &f.registry,
+        "recipient",
+        "list",
+        json!({"kind": "edge", "source_id": "cafe2001"}),
+    )
+    .await;
+    assert_eq!(edge_ids(&owner), [edge], "{owner}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_pages_fill_from_readable_edges_in_offset_and_cursor_modes() {
+    for topology in [Topology::Shared, Topology::Split] {
+        let f = fixture(topology).await;
+        let token = f.main.authorize(Namespace::local()).expect("entity token");
+        let source = Entity::new("local", "concept", "Edge page source");
+        f.main
+            .entities(&token)
+            .expect("entity store")
+            .upsert_entity(source.clone())
+            .await
+            .expect("store source");
+        let mut readable = Vec::new();
+        let mut withheld = f.edges.clone();
+        withheld.extend([f.outbound.id, f.inbound.id]);
+        for index in 0..5 {
+            let target = Entity::new("local", "concept", format!("Edge page target {index}"));
+            f.main
+                .entities(&token)
+                .expect("entity store")
+                .upsert_entity(target.clone())
+                .await
+                .expect("store target");
+            readable.push(link(&f, source.id, target.id, EdgeRelation::Extends).await);
+            for message in [f.outbound.id, f.inbound.id] {
+                withheld.push(link(&f, message, target.id, EdgeRelation::Annotates).await);
+            }
+        }
+
+        let mut seen = Vec::new();
+        for (offset, len, more) in [(0, 2, true), (2, 2, true), (4, 1, false)] {
+            let page = read(
+                &f.registry,
+                "observer",
+                "list",
+                json!({"kind": "edge", "limit": 2, "offset": offset}),
+            )
+            .await;
+            assert_absent(&page, &withheld, &[]);
+            assert_eq!(edge_ids(&page).len(), len, "{page}");
+            assert_eq!(page["has_more"], json!(more), "{page}");
+            seen.extend(edge_ids(&page));
+        }
+        assert_eq!(sorted(seen), sorted(readable.clone()));
+
+        let mut seen = Vec::new();
+        let mut lengths = Vec::new();
+        let mut after = String::new();
+        for _ in 0..4 {
+            let page = read(
+                &f.registry,
+                "observer",
+                "list",
+                json!({"kind": "edge", "limit": 2, "after": after}),
+            )
+            .await;
+            assert_absent(&page, &withheld, &[]);
+            lengths.push(edge_ids(&page).len());
+            seen.extend(edge_ids(&page));
+            let Some(next) = page["next_after"].as_str() else {
+                assert_eq!(page["has_more"], json!(false), "{page}");
+                break;
+            };
+            assert!(
+                readable.contains(&Uuid::parse_str(next).expect("cursor UUID")),
+                "{page}"
+            );
+            assert_eq!(page["has_more"], json!(true), "{page}");
+            after = next.to_string();
+        }
+        assert_eq!(lengths, [2, 2, 1]);
+        assert_eq!(sorted(seen), sorted(readable));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_cursor_naming_an_unreadable_edge_reads_as_no_edge() {
+    let f = fixture(Topology::Shared).await;
+    let unknown = Uuid::new_v4();
+    let missing = try_read(
+        &f.registry,
+        "observer",
+        "list",
+        json!({"kind": "edge", "limit": 1, "after": unknown.to_string()}),
+    )
+    .await
+    .expect_err("a cursor naming no edge is refused");
+    let withheld = try_read(
+        &f.registry,
+        "observer",
+        "list",
+        json!({"kind": "edge", "limit": 1, "after": f.edges[1].to_string()}),
+    )
+    .await
+    .expect_err("a cursor naming an unreadable edge is refused");
+    assert!(matches!(withheld, RuntimeError::NotFound(_)), "{withheld}");
+    assert_eq!(
+        withheld
+            .to_string()
+            .replace(&f.edges[1].to_string(), "<id>"),
+        missing.to_string().replace(&unknown.to_string(), "<id>")
+    );
+    let owner = read(
+        &f.registry,
+        "sender",
+        "list",
+        json!({"kind": "edge", "limit": 1, "after": f.edges[1].to_string()}),
+    )
+    .await;
+    assert_eq!(edge_ids(&owner), [f.edges[2]], "{owner}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_limit_zero_is_refused_with_a_cursor_and_returns_no_rows_by_offset() {
+    for topology in [Topology::Shared, Topology::Split] {
+        let f = fixture(topology).await;
+        let first = link(&f, f.anchor, f.outbound_target, EdgeRelation::Extends).await;
+        link(&f, f.anchor, f.inbound_target, EdgeRelation::Extends).await;
+
+        // A cursor read needs room for a row, whoever asks and wherever it starts.
+        for actor in ["observer", "sender"] {
+            for after in [String::new(), first.to_string()] {
+                let error = try_read(
+                    &f.registry,
+                    actor,
+                    "list",
+                    json!({"kind": "edge", "after": after, "limit": 0}),
+                )
+                .await
+                .expect_err("a cursor read at limit 0 is refused");
+                assert!(
+                    matches!(&error, RuntimeError::InvalidInput(message)
+                        if message == "cursor pagination requires limit greater than zero"),
+                    "{actor}: {error}"
+                );
+            }
+        }
+
+        // The offset form returns no rows and says whether a row exists.
+        let page = read(
+            &f.registry,
+            "observer",
+            "list",
+            json!({"kind": "edge", "limit": 0}),
+        )
+        .await;
+        assert!(edge_ids(&page).is_empty(), "{page}");
+        assert_eq!(page["has_more"], json!(true), "{page}");
+        assert_eq!(page["requested_limit"], json!(0), "{page}");
+        assert_eq!(page["effective_limit"], json!(0), "{page}");
+        assert_eq!(page["limit_clamped"], json!(false), "{page}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn neighbors_and_context_answer_an_unreadable_message_prefix_like_no_match() {
+    let f = fixture(Topology::Shared).await;
+    let message = store_message(&f, "cafe2001-0000-4000-8000-000000000001").await;
+    link(&f, message, f.anchor, EdgeRelation::Annotates).await;
+    assert_prefix_reads_as_no_match(&f, &["neighbors", "context"]).await;
+
+    // A full id keeps the answer it has always had.
+    let neighbors = read(
+        &f.registry,
+        "observer",
+        "neighbors",
+        json!({"node_id": message}),
+    )
+    .await;
+    assert!(neighbor_rows(&neighbors).is_empty(), "{neighbors}");
+    let error = try_read(
+        &f.registry,
+        "observer",
+        "context",
+        json!({"entity_ids": [message]}),
+    )
+    .await
+    .expect_err("a message is not an entity");
+    assert!(matches!(error, RuntimeError::NotFound(_)), "{error}");
+
+    let owner = read(
+        &f.registry,
+        "recipient",
+        "neighbors",
+        json!({"node_id": "cafe2001"}),
+    )
+    .await;
+    assert_eq!(neighbor_rows(&owner).len(), 1, "{owner}");
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn ambiguous_prefix_leaves_out_unreadable_messages() {
+    let f = fixture(Topology::Shared).await;
+    let message = store_message(&f, "cafe4001-0000-4000-8000-000000000001").await;
+    let record = store_concept(&f, "cafe4001-1000-4000-8000-000000000002").await;
+    let edge = link(&f, record, f.anchor, EdgeRelation::Extends).await;
+
+    let neighbors = read(
+        &f.registry,
+        "observer",
+        "neighbors",
+        json!({"node_id": "cafe4001"}),
+    )
+    .await;
+    assert_eq!(neighbor_rows(&neighbors).len(), 1, "{neighbors}");
+    assert_eq!(neighbor_rows(&neighbors)[0]["id"], json!(f.anchor));
+    assert_absent(&neighbors, &[message], &[]);
+    let context = read(
+        &f.registry,
+        "observer",
+        "context",
+        json!({"entity_ids": ["cafe4001"], "hops": 0}),
+    )
+    .await;
+    assert_eq!(context["anchors"][0]["entity"]["id"], json!(record));
+    assert_absent(&context, &[message], &[]);
+    let listed = read(
+        &f.registry,
+        "observer",
+        "list",
+        json!({"kind": "edge", "source_id": "cafe4001"}),
+    )
+    .await;
+    assert_eq!(edge_ids(&listed), [edge], "{listed}");
+
+    // Someone who can read both records still sees the prefix as ambiguous.
+    let error = try_read(
+        &f.registry,
+        "recipient",
+        "neighbors",
+        json!({"node_id": "cafe4001"}),
+    )
+    .await
+    .expect_err("two readable records share the prefix");
+    assert!(
+        matches!(&error, RuntimeError::AmbiguousPrefix { matches, .. }
+            if matches.contains(&message) && matches.contains(&record)),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn ambiguous_prefix_beyond_the_resolver_sample_counts_only_readable_records() {
+    let f = fixture(Topology::Shared).await;
+    // The prefix resolver reads entities, then notes, and stops once two ids
+    // match. Its sample is therefore the concept and the two messages, whatever
+    // order each table returns its rows in. The edge that also carries the prefix
+    // is beyond the sample, so the sample alone shows one readable record.
+    let record = store_concept(&f, "cafe3001-1000-4000-8000-000000000002").await;
+    let first = store_message(&f, "cafe3001-0000-4000-8000-000000000001").await;
+    let second = store_message(&f, "cafe3001-3000-4000-8000-000000000003").await;
+    let edge = Uuid::parse_str("cafe3001-2000-4000-8000-000000000004").expect("edge UUID");
+    store_edge(
+        &f.main,
+        "local",
+        edge,
+        f.anchor,
+        f.outbound_target,
+        EdgeRelation::Extends,
+        1.0,
+    )
+    .await;
+    let readable = sorted(vec![record, edge]);
+    for (verb, args) in [
+        ("neighbors", json!({"node_id": "cafe3001"})),
+        ("list", json!({"kind": "edge", "source_id": "cafe3001"})),
+    ] {
+        let error = try_read(&f.registry, "observer", verb, args.clone())
+            .await
+            .expect_err("two readable records share the prefix");
+        assert!(
+            matches!(&error, RuntimeError::AmbiguousPrefix { matches, .. }
+                if sorted(matches.clone()) == readable),
+            "{verb}: {error}"
+        );
+        for message in [first, second] {
+            assert!(
+                !error.to_string().contains(&message.to_string()),
+                "{verb}: {error}"
+            );
+        }
+        // Someone who can read both messages gets the resolver's own sample.
+        let owner = try_read(&f.registry, "recipient", verb, args)
+            .await
+            .expect_err("the concept and both messages share the prefix");
+        assert!(
+            matches!(&owner, RuntimeError::AmbiguousPrefix { matches, .. }
+                if matches.contains(&first) && matches.contains(&second)),
+            "{verb}: {owner}"
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Run {
+    Readable(usize),
+    Withheld(usize),
+}
+
+/// Ids are seeded by position, so two stores written from the same runs hold
+/// the readable records under the same ids and their pages compare as values.
+/// Edge ids rise with creation order, which keeps every sort tie in that order.
+fn seeded(kind: u128, position: usize) -> Uuid {
+    Uuid::from_u128((kind << 64) | position as u128)
+}
+
+/// Writes `runs` in order. A readable edge joins two concepts. A withheld edge
+/// runs from one of `messages` to a concept, and is skipped when there are no
+/// messages: that is the store that never held it. Returns the ids of the
+/// readable edges and of the withheld ones, which a store without them still
+/// names.
+async fn write_runs(
+    main: &KhiveRuntime,
+    messages: &[Uuid],
+    runs: &[Run],
+) -> (Vec<Uuid>, Vec<Uuid>) {
+    let mut readable = Vec::new();
+    let mut withheld = Vec::new();
+    let mut position = 0;
+    for run in runs {
+        let (count, hidden) = match *run {
+            Run::Readable(count) => (count, false),
+            Run::Withheld(count) => (count, true),
+        };
+        for _ in 0..count {
+            position += 1;
+            let edge = seeded(0xed, position);
+            let target = seeded(0xc0, position);
+            if hidden {
+                withheld.push(edge);
+                let Some(&message) = messages.get(position % 2) else {
+                    continue;
+                };
+                store_seeded_concept(main, target).await;
+                store_edge(
+                    main,
+                    "local",
+                    edge,
+                    message,
+                    target,
+                    EdgeRelation::Annotates,
+                    1.0,
+                )
+                .await;
+            } else {
+                let source = seeded(0x5c, position);
+                store_seeded_concept(main, source).await;
+                store_seeded_concept(main, target).await;
+                store_edge(
+                    main,
+                    "local",
+                    edge,
+                    source,
+                    target,
+                    EdgeRelation::Extends,
+                    1.0,
+                )
+                .await;
+                readable.push(edge);
+            }
+        }
+    }
+    (readable, withheld)
+}
+
+/// A page as a value, without the stamps the store assigns when it writes.
+fn page_without_stamps(page: &Value) -> Value {
+    let mut page = page.clone();
+    for key in ["items", "edges"] {
+        if let Some(edges) = page.get_mut(key).and_then(Value::as_array_mut) {
+            for edge in edges {
+                for stamp in ["created_at", "updated_at"] {
+                    edge.as_object_mut().expect("edge object").remove(stamp);
+                }
+            }
+        }
+    }
+    page
+}
+
+fn page_keys(page: &Value) -> Vec<&String> {
+    page.as_object().expect("page object").keys().collect()
+}
+
+/// Reads every page of the observer's edge list, advancing the offset by
+/// `limit` or following `next_after`.
+async fn walk_pages(registry: &VerbRegistry, limit: u32, cursor: bool) -> Vec<Value> {
+    let mut pages = Vec::new();
+    let mut after = String::new();
+    let mut offset = 0;
+    loop {
+        let args = if cursor {
+            json!({"kind": "edge", "limit": limit, "after": after})
+        } else {
+            json!({"kind": "edge", "limit": limit, "offset": offset})
+        };
+        let page = read(registry, "observer", "list", args).await;
+        pages.push(page_without_stamps(&page));
+        assert!(pages.len() <= 64, "the walk does not end: {page}");
+        if cursor {
+            let Some(next) = page["next_after"].as_str() else {
+                return pages;
+            };
+            after = next.to_string();
+        } else {
+            if page["has_more"] != json!(true) {
+                return pages;
+            }
+            offset += limit;
+        }
+    }
+}
+
+/// The observer cannot read the messages that the withheld edges touch. Every
+/// answer it gets from the edge list is the answer of a store built from the
+/// same readable records in which those messages and edges were never written.
+async fn assert_walks_match_the_store_without_them(topology: Topology, runs: &[Run]) {
+    let f = fixture(topology).await;
+    let (readable, withheld) = write_runs(&f.main, &[f.outbound.id, f.inbound.id], runs).await;
+    let (twin_main, _, twin_registry) = scoped_registry(topology);
+    let (twin_readable, twin_withheld) = write_runs(&twin_main, &[], runs).await;
+    assert_eq!(readable, twin_readable);
+    assert_eq!(withheld, twin_withheld);
+
+    for cursor in [false, true] {
+        for limit in [1, 2, 3] {
+            let mode = if cursor { "cursor" } else { "offset" };
+            let seen = walk_pages(&f.registry, limit, cursor).await;
+            let expected = walk_pages(&twin_registry, limit, cursor).await;
+            assert_eq!(
+                seen.len(),
+                expected.len(),
+                "{mode} limit {limit}: pages in the walk"
+            );
+            for (index, (page, twin)) in seen.iter().zip(&expected).enumerate() {
+                let context = format!("{mode} limit {limit} page {index}");
+                assert_eq!(page_keys(page), page_keys(twin), "{context}: keys");
+                assert_eq!(page, twin, "{context}");
+            }
+        }
+    }
+
+    // At limit 0 the offset form returns no rows and a cursor read is refused.
+    let args = json!({"kind": "edge", "limit": 0});
+    let seen = read(&f.registry, "observer", "list", args.clone()).await;
+    let twin = read(&twin_registry, "observer", "list", args.clone()).await;
+    assert_eq!(
+        page_without_stamps(&seen),
+        page_without_stamps(&twin),
+        "{args}"
+    );
+    let args = json!({"kind": "edge", "limit": 0, "after": ""});
+    let seen = try_read(&f.registry, "observer", "list", args.clone())
+        .await
+        .expect_err("a cursor read at limit 0 is refused");
+    let twin = try_read(&twin_registry, "observer", "list", args)
+        .await
+        .expect_err("a cursor read at limit 0 is refused");
+    assert_eq!(seen.to_string(), twin.to_string());
+    assert_eq!(std::mem::discriminant(&seen), std::mem::discriminant(&twin));
+
+    let args = json!({"kind": "edge", "limit": 1, "after": withheld[0].to_string()});
+    let seen = try_read(&f.registry, "observer", "list", args.clone())
+        .await
+        .expect_err("a cursor naming an unreadable edge is refused");
+    let twin = try_read(&twin_registry, "observer", "list", args)
+        .await
+        .expect_err("a cursor naming no edge is refused");
+    assert_eq!(seen.to_string(), twin.to_string());
+    assert_eq!(std::mem::discriminant(&seen), std::mem::discriminant(&twin));
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_walk_equals_twin_with_withheld_run_between_readable_edges() {
+    for topology in [Topology::Shared, Topology::Split] {
+        let runs = [Run::Readable(1), Run::Withheld(250), Run::Readable(2)];
+        assert_walks_match_the_store_without_them(topology, &runs).await;
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_walk_equals_twin_with_withheld_run_before_last_readable_edge() {
+    for topology in [Topology::Shared, Topology::Split] {
+        let runs = [Run::Withheld(250), Run::Readable(1)];
+        assert_walks_match_the_store_without_them(topology, &runs).await;
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_walk_equals_twin_with_withheld_run_after_last_readable_edge() {
+    for topology in [Topology::Shared, Topology::Split] {
+        let runs = [Run::Readable(1), Run::Withheld(250)];
+        assert_walks_match_the_store_without_them(topology, &runs).await;
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_walk_equals_twin_with_only_withheld_edges() {
+    for topology in [Topology::Shared, Topology::Split] {
+        assert_walks_match_the_store_without_them(topology, &[Run::Withheld(250)]).await;
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_walk_equals_twin_with_interleaved_withheld_edges() {
+    let mut runs = vec![Run::Readable(1)];
+    for size in [1, 2, 4, 8, 16, 32, 64, 128] {
+        runs.extend([Run::Withheld(size), Run::Readable(1)]);
+    }
+    for topology in [Topology::Shared, Topology::Split] {
+        assert_walks_match_the_store_without_them(topology, &runs).await;
+    }
+}
+
+/// Reads the observer's `args` and counts the edge-list statements SQLite
+/// started, in the cursor form or the offset form.
+async fn edge_list_reads(fixture: &Fixture, args: Value, cursor: bool) -> (usize, Value) {
+    let observation = fixture
+        .main
+        .backend()
+        .pool()
+        .observe_test_statement_starts(100_000)
+        .expect("statement observation");
+    let page = read(&fixture.registry, "observer", "list", args).await;
+    let started = observation
+        .started_statements()
+        .expect("complete statement observation");
+    drop(observation);
+    let reads = started
+        .iter()
+        .filter(|statement| {
+            if cursor {
+                statement
+                    .sql
+                    .contains("FROM graph_edges_seq CROSS JOIN graph_edges")
+            } else {
+                statement.sql.starts_with("SELECT namespace, id, source_id")
+                    && statement.sql.contains(" OFFSET ?")
+            }
+        })
+        .count();
+    (reads, page)
+}
+
+/// The most reads of the store one scan may start:
+/// `floor(log2(1 + T / w)) + floor(T / C) + 1` for `T` edges passed over, a
+/// window `w` that first holds a withheld edge and `C = EDGE_LIST_MAX_LIMIT`.
+fn window_formula(passed_over: u32, first_window: u32) -> usize {
+    let doublings = (1 + passed_over / first_window).ilog2();
+    let at_the_cap = passed_over / KhiveRuntime::EDGE_LIST_MAX_LIMIT;
+    (doublings + at_the_cap + 1) as usize
+}
+
+async fn assert_a_long_withheld_run_stays_within_the_window_formula(cursor: bool) {
+    let f = fixture(Topology::Shared).await;
+    let messages = [f.outbound.id, f.inbound.id];
+    let runs = [Run::Withheld(2000), Run::Readable(1)];
+    let (readable, _) = write_runs(&f.main, &messages, &runs).await;
+    // The fixture's own four edges come first, and the one readable edge last.
+    let passed_over = f.edges.len() as u32 + 2000 + 1;
+
+    // A filter nothing matches takes one pass, which counts the statements a pass starts.
+    let mut args = json!({"kind": "edge", "limit": 1, "relations": ["supports"]});
+    if cursor {
+        args["after"] = json!("");
+    }
+    let (per_pass, _) = edge_list_reads(&f, args, cursor).await;
+    assert!(per_pass >= 1, "no edge-list statement was recognised");
+
+    let mut args = json!({"kind": "edge", "limit": 1});
+    if cursor {
+        args["after"] = json!("");
+    }
+    let (reads, page) = edge_list_reads(&f, args, cursor).await;
+    assert_eq!(edge_ids(&page), [readable[0]], "{page}");
+    let allowed = per_pass * window_formula(passed_over, 2);
+    assert!(
+        reads > per_pass,
+        "the run is crossed in several passes: {reads} statements"
+    );
+    assert!(
+        reads <= allowed,
+        "{reads} edge-list statements for 2000 withheld edges; the formula allows {allowed}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_cursor_store_reads_stay_within_the_window_formula() {
+    assert_a_long_withheld_run_stays_within_the_window_formula(true).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn list_edge_offset_store_reads_stay_within_the_window_formula() {
+    assert_a_long_withheld_run_stays_within_the_window_formula(false).await;
 }

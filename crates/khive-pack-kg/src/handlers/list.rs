@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, MailboxView, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::Note;
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{Edge, PageRequest, SqlStatement, SqlValue};
 use khive_storage::EntityFilter;
 
 use khive_runtime::EdgeListFilter;
@@ -13,9 +13,10 @@ use super::common::{
     canonical_entity_kind, canonical_note_kind, deser, entity_type_filter_matches,
     event_filter_from_params, normalize_entity_timestamps, normalize_entity_timestamps_array,
     normalize_event_timestamps_array, parse_note_content, parse_relation, reconcile_entity_type,
-    reconcile_specific, remap_note_status, resolve_kind_spec, resolve_uuid_async, tags_match_any,
-    to_json, validate_graph_read_kind, KindSpec, ListParams,
+    reconcile_specific, remap_note_status, resolve_kind_spec, tags_match_any, to_json,
+    validate_graph_read_kind, KindSpec, ListParams,
 };
+use super::message_scope::{resolve_mailbox_graph_id, EdgeScope};
 use crate::sql::sql;
 use crate::KgPack;
 
@@ -271,6 +272,130 @@ async fn resolve_message_thread_filter(
     )))
 }
 
+/// One offset page of the edges the caller's view admits. `offset` counts
+/// admitted edges. An edge with a withheld endpoint is dropped before the page
+/// is cut, so the page, `has_more` and the keys of the response are those of a
+/// store that never held the edge. The scan reads until the page is full or the
+/// store has no more edges. Once a window has held a withheld edge, every later
+/// window is at least twice the one before, up to `EDGE_LIST_MAX_LIMIT`, so the
+/// rows read grow in proportion to the withheld run. For `T` edges passed over,
+/// `C = EDGE_LIST_MAX_LIMIT` and `w` the size of the window that first held a
+/// withheld edge, the scan makes at most
+/// `floor(log2(1 + T / w)) + floor(T / C) + 1` store reads. Returns the page and
+/// `has_more`.
+async fn edge_page_at(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    scope: &mut EdgeScope<'_>,
+    filter: &EdgeListFilter,
+    offset: u32,
+    limit: u32,
+) -> Result<(Vec<Edge>, bool), RuntimeError> {
+    let cap = KhiveRuntime::EDGE_LIST_MAX_LIMIT;
+    let wanted = overfetch_limit(limit) as usize;
+    let mut kept: Vec<Edge> = Vec::new();
+    let mut skipped = 0u32;
+    let mut raw_offset = 0u32;
+    let mut withheld_seen = false;
+    let mut window = offset.saturating_add(overfetch_limit(limit)).min(cap);
+    loop {
+        let page = runtime
+            .list_edges(token, filter.clone(), window, raw_offset)
+            .await?;
+        let fetched = page.len() as u32;
+        for edge in page {
+            if !scope.permits(&edge).await? {
+                withheld_seen = true;
+            } else if skipped < offset {
+                skipped += 1;
+            } else {
+                kept.push(edge);
+                if kept.len() >= wanted {
+                    break;
+                }
+            }
+        }
+        if kept.len() >= wanted || fetched < window {
+            break;
+        }
+        raw_offset = raw_offset.saturating_add(fetched);
+        let missing = (wanted - kept.len()) as u32;
+        let next = offset
+            .saturating_sub(skipped)
+            .saturating_add(missing)
+            .saturating_mul(2);
+        let doubled = if withheld_seen {
+            window.saturating_mul(2)
+        } else {
+            0
+        };
+        window = next.max(doubled).clamp(1, cap);
+    }
+    Ok(split_overfetched(kept, limit))
+}
+
+/// One cursor page of the edges the caller's view admits, scanned the way
+/// [`edge_page_at`] scans, so its reads follow the same formula. `next_after` is
+/// the last edge the page returns and is set only when more admitted edges
+/// follow. A cursor naming an edge the caller may not read is answered like
+/// one that names no edge. `limit` is at least one: `list` refuses a cursor at
+/// limit zero before it reads anything.
+async fn edge_page_after(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    scope: &mut EdgeScope<'_>,
+    filter: &EdgeListFilter,
+    after: Option<uuid::Uuid>,
+    limit: u32,
+) -> Result<(Vec<Edge>, Option<uuid::Uuid>), RuntimeError> {
+    if let Some(cursor) = after {
+        if let Some(edge) = runtime.get_edge_including_deleted(token, cursor).await? {
+            if !scope.permits(&edge).await? {
+                return Err(RuntimeError::NotFound(format!("edge cursor {cursor}")));
+            }
+        }
+    }
+    let cap = KhiveRuntime::EDGE_LIST_MAX_LIMIT;
+    let wanted = overfetch_limit(limit) as usize;
+    let mut kept: Vec<Edge> = Vec::new();
+    let mut raw_after = after;
+    let mut withheld_seen = false;
+    let mut window = overfetch_limit(limit).min(cap);
+    loop {
+        let (page, next_raw) = runtime
+            .list_edges_after(token, filter.clone(), raw_after, window)
+            .await?;
+        for edge in page {
+            if !scope.permits(&edge).await? {
+                withheld_seen = true;
+                continue;
+            }
+            kept.push(edge);
+            if kept.len() >= wanted {
+                break;
+            }
+        }
+        if kept.len() >= wanted || next_raw.is_none() {
+            break;
+        }
+        raw_after = next_raw;
+        let next = ((wanted - kept.len()) as u32).saturating_mul(2);
+        let doubled = if withheld_seen {
+            window.saturating_mul(2)
+        } else {
+            0
+        };
+        window = next.max(doubled).clamp(1, cap);
+    }
+    let (kept, has_more) = split_overfetched(kept, limit);
+    let next_after = if has_more {
+        kept.last().map(|edge| uuid::Uuid::from(edge.id))
+    } else {
+        None
+    };
+    Ok((kept, next_after))
+}
+
 pub(super) fn note_matches_list_filters(
     note: &Note,
     params: &ListParams,
@@ -482,12 +607,21 @@ impl KgPack {
                 ))
             }
             KindSpec::Edge => {
+                let runtime = &self.runtime;
+                let mailbox_view =
+                    runtime.authorize_mailbox_view(token, "list", None, &original_params)?;
                 let source_id = match p.source_id.as_deref() {
-                    Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
+                    Some(s) => Some(
+                        resolve_mailbox_graph_id(&self.runtime, registry, token, &mailbox_view, s)
+                            .await?,
+                    ),
                     None => None,
                 };
                 let target_id = match p.target_id.as_deref() {
-                    Some(s) => Some(resolve_uuid_async(s, &self.runtime, token).await?),
+                    Some(s) => Some(
+                        resolve_mailbox_graph_id(&self.runtime, registry, token, &mailbox_view, s)
+                            .await?,
+                    ),
                     None => None,
                 };
                 let relations: Vec<_> = p
@@ -506,14 +640,14 @@ impl KgPack {
                 let requested = p.limit.unwrap_or(100);
                 let cap = KhiveRuntime::EDGE_LIST_MAX_LIMIT;
                 let limit = effective_list_limit(requested, cap);
+                let mut scope = EdgeScope::new(&self.runtime, registry, token, &mailbox_view);
                 if let Some(ref after_str) = p.after {
                     // An empty string opts into cursor-mode pagination while
                     // starting from the beginning of the set (no prior page).
                     let after = parse_after_cursor(after_str)?;
-                    let (edges, next_after) = self
-                        .runtime
-                        .list_edges_after(token, filter, after, limit)
-                        .await?;
+                    let (edges, next_after) =
+                        edge_page_after(&self.runtime, token, &mut scope, &filter, after, limit)
+                            .await?;
                     let mut out = serde_json::json!({
                         "edges": to_json(&edges)?,
                         "next_after": next_after,
@@ -522,11 +656,9 @@ impl KgPack {
                     Ok(out)
                 } else {
                     let offset = p.offset.unwrap_or(0);
-                    let edges = self
-                        .runtime
-                        .list_edges(token, filter, overfetch_limit(limit), offset)
-                        .await?;
-                    let (edges, has_more) = split_overfetched(edges, limit);
+                    let (edges, has_more) =
+                        edge_page_at(&self.runtime, token, &mut scope, &filter, offset, limit)
+                            .await?;
                     Ok(render_list_response(
                         to_json(&edges)?,
                         requested,
