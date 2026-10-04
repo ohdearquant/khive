@@ -630,6 +630,51 @@ alone cannot silently promote an unknown marker. Eventual recall remains
 available under its existing contract. Errors disclose neither fence values
 nor a database-wide cohort count.
 
+### Settled points for the implementation
+
+These four points close questions the text above leaves open. The first two
+clarify sentences of Amendment 2 without changing its security properties.
+
+- **Bytes after the nonce.** The version 2 envelope carries no ciphertext
+  length, so every byte after the nonce belongs to the ciphertext and its tag.
+  Amendment 2's rule to reject extra bytes before key lookup therefore applies
+  to what the envelope delimits: canonical unpadded base64url, the version
+  byte, the key-ID length and alphabet, the 24-byte nonce, a ciphertext no
+  shorter than its 16-byte tag, and the 64 KiB bound. Bytes appended to the
+  ciphertext cannot be told apart from ciphertext before authentication; they
+  fail authentication. Trailing bytes inside the authenticated plaintext fail
+  strict decoding. No length field is added to the envelope.
+- **Effective namespace.** The decrypted namespace must be a member of the
+  recall's effective read set: the one namespace an explicit request names,
+  once authorized, or otherwise every namespace the caller's visibility admits
+  for that recall. The set is computed from authorization before the token is
+  opened, so a token cannot widen it. A default recall that reads the caller's
+  local and actor namespaces accepts a receipt from either; an explicit request
+  for one namespace refuses a receipt from another. This is the behaviour the
+  clear version 1 path already has.
+- **Which writers establish `modern`.** Only the runtime unit that creates a
+  keyed memory note together with its receipt header and fences writes the
+  `modern` marker. That covers the specialized memory writer, generic keyed
+  note creation with kind `memory`, and new keyed members of a stream batch.
+  Lower-level storage constructors that accept a caller-supplied note, the
+  exported note statement builders, and transport commits have no model or
+  fence context; they write no marker. A keyed memory note they create has
+  missing provenance and takes the terminal unknown refusal on exact replay,
+  while eventual recall is unchanged. No caller can assert `modern` through a
+  note field, and a current binary performing an insert is not evidence of an
+  original write.
+- **Where the pre-V46 inventory is captured.** Capture runs inside the
+  transaction that applies V46, after the runner's under-lock version checks
+  and before the unchanged V46 SQL executes. The inventory and the V46 ledger
+  row commit together, and the write lock that transaction holds excludes
+  other writers while the population is read. A database that already records
+  V46 skips capture: its keyed notes without a complete receipt become
+  `unknown`. The V46 SQL bytes and ledger identity stay unchanged; the
+  transaction gains one effect, defined by a new SQL file that the cutover
+  change owns. A separate pre-upgrade capture transaction was rejected: it is
+  sound only if every old writer stays stopped across all later version steps,
+  and it adds a preparation journal with its own lifecycle.
+
 ### Acceptance before implementation merge
 
 - Upgrade actual pre-V46 data and actual already-V46 data through the migration
@@ -653,6 +698,20 @@ nor a database-wide cohort count.
 - Namespace move, soft delete/restore, hard delete, and key reuse preserve the
   identity-bound provenance rules. An unreadable provenance store must refuse
   without persisting `unknown`; test it separately from a missing marker.
+- A crash after the V46 transaction commits and before the cutover leaves the
+  captured inventory intact, and resuming classifies exactly that population;
+  holding the captured identities only in process memory must fail this test.
+  A failure injected after capture and before the V46 ledger row commits leaves
+  neither the inventory nor V46 committed; committing the capture in its own
+  earlier transaction must fail that test.
+- A keyed memory note created through a lower-level storage constructor has
+  no marker and refuses as `receipt_epoch_unknown` on exact replay. The same
+  note created through the runtime keyed writer is `modern` and reseals.
+- A default recall accepts a token whose namespace is in its visible set and
+  refuses one outside it; an explicit one-namespace request refuses a token
+  from another visible namespace. A byte appended to a valid envelope fails
+  authentication, and a valid envelope whose plaintext carries a trailing byte
+  fails strict decoding.
 - Run the inherited v2-only confidentiality, tampering, key rotation, expiry,
   keyed replay, and session proof acceptance from Amendment 2. A clear v1 token
   must still be denied. These outputs and the unknown-cohort controls are
