@@ -42,7 +42,6 @@ khive-types = 0
 khive-wire-protocol = 0
 khive-changeset = 1
 khive-channel-email = 1
-khive-channel-node = 1
 khive-channel-telegram = 1
 khive-gate = 1
 khive-query = 1
