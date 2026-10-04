@@ -232,14 +232,14 @@ current default behavior.
 | Parameter         | Type             | Default                | Semantics                                                                                                                                                                                                                                                                   |
 | ----------------- | ---------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `top_k`           | `usize` \| null  | `limit` or `10`        | Maximum number of results to return. Overrides `limit` when set. Capped at `100`.                                                                                                                                                                                           |
-| `fusion_strategy` | `string` \| null | omitted = RRF `k = 10` | Fusion algorithm for candidate merging. Must be one of `"rrf"`, `"weighted"`, `"union"`, `"vector_only"`, `"keyword_only"`; any other value errors. Omitting the parameter selects the calibrated pack default, RRF `k = 10`; the explicit string `"rrf"` selects `k = 60`. |
+| `fusion_strategy` | `string` \| null | omitted = RRF `k = 10` | Fusion algorithm for candidate merging. Must be one of `"rrf"`, `"weighted"`, `"union"`, `"vector_only"`, `"keyword_only"`; any other value errors. Omitting the parameter selects the calibrated pack default, RRF `k = 10`; an explicit `"rrf"` keeps the configured `k`. |
 | `score_floor`     | `f32` \| null    | `0.0` (no floor)       | Minimum composite score threshold applied after `compute_score`. Results below this floor are excluded. `0.0` or `null` = no filtering.                                                                                                                                     |
 
 **`fusion_strategy` details:**
 
-- `"rrf"` — Reciprocal Rank Fusion with k=60. Robust across query types. (Omitting
-  `fusion_strategy` entirely selects the calibrated pack default, RRF with k=10 — a
-  distinct configuration from the explicit `"rrf"` string.)
+- `"rrf"` — Reciprocal Rank Fusion with the configured `k` (10 by default; 60 when the
+  configured fusion is not RRF). Robust across query types. Omitting `fusion_strategy`
+  entirely selects the calibrated pack default, RRF with k=10.
 - `"weighted"` — Weighted linear combination (explicit, non-default). Vector weight 0.7,
   text weight 0.3 from pack-level config (`RecallConfig.fuse_strategy` when set to
   Weighted). The request cannot override weights.

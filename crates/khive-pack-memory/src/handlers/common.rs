@@ -309,6 +309,37 @@ pub(super) fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, Runti
     }
 }
 
+/// Apply the `fusion_strategy` a recall request names to the effective configuration.
+///
+/// A request naming `weighted` keeps the configured weights and one naming `rrf` keeps the
+/// configured constant `k`, so naming a strategy never replaces a value the configuration
+/// already carries. When the configured strategy is of another kind there is nothing to keep
+/// and the named strategy's built-in default applies. A request naming no strategy leaves the
+/// configuration untouched.
+pub(super) fn apply_requested_fusion_strategy(
+    cfg: &mut RecallConfig,
+    requested: Option<&str>,
+) -> Result<(), RuntimeError> {
+    let Some(name) = requested else {
+        return Ok(());
+    };
+    let mut strategy = parse_fusion_strategy_str(name)?;
+    match (&mut strategy, &cfg.fuse_strategy) {
+        (
+            FusionStrategy::Weighted { weights: new_w },
+            FusionStrategy::Weighted { weights: old_w },
+        ) => {
+            *new_w = old_w.clone();
+        }
+        (FusionStrategy::Rrf { k: new_k }, FusionStrategy::Rrf { k: old_k }) => {
+            *new_k = *old_k;
+        }
+        _ => {}
+    }
+    cfg.fuse_strategy = strategy;
+    Ok(())
+}
+
 /// Resolve an explicit or actor-plus-namespace recall profile; omit global fallback.
 pub(super) async fn resolve_serving_profile(
     brain_profile: &Option<String>,
