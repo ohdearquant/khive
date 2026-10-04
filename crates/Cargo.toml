@@ -8,6 +8,7 @@ members = [
     "khive-fold",
     "khive-storage",
     "khive-text",
+    "khive-fs",
     "khive-db",
     "khive-query",
     "khive-gate",

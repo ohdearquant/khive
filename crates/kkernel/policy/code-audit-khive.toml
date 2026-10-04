@@ -32,6 +32,7 @@ denied_pairs = []
 
 [crate_ranks]
 khive-channel = 0
+khive-fs = 0
 khive-quant = 0
 khive-text = 0
 khive-types = 0
