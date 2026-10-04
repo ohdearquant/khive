@@ -1,12 +1,14 @@
 //! Helpers shared by the packs that keep a file-backed ANN checkpoint.
 //!
-//! Neither item knows anything about an index. One is the lock every writer of a checkpoint
-//! directory takes, the other is the polling loop that notices a peer process rotating a
-//! segment. A pack supplies its own error-text prefix, task label and refresh step.
+//! Checkpoint helpers provide the directory lock and peer-rotation polling loop.
+//! Packs retain their error-text prefixes, task labels and refresh steps.
+//! The [`corpus`] module builds the SQL for corpus counts and write-log probes
+//! from each consumer's namespace, field and live-row predicates.
 //!
 //! The [`registry`] submodule holds the durable consumer registration lifecycle that gates
 //! compaction of the ANN write log.
 
+pub mod corpus;
 pub mod registry;
 
 use std::fs::File;
