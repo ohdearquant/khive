@@ -96,10 +96,7 @@ fn note_to_event_json(note: &Note) -> Value {
     })
 }
 
-fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+use khive_runtime::deser_params as deser;
 
 /// Validates `at` is an RFC 3339 timestamp lying in the future; returns the
 /// parsed instant. See `docs/api/replay-validation.md#validate_at` for accepted

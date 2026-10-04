@@ -53,6 +53,7 @@ mod note_write_tests;
 pub mod objectives;
 pub mod operations;
 pub mod pack;
+mod params;
 pub mod phase_events;
 pub mod portability;
 pub mod preference_verification;
@@ -177,6 +178,7 @@ pub use pack::{
     VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
     Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
+pub use params::deser_params;
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};

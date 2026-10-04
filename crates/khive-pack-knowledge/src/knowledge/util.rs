@@ -96,10 +96,7 @@ pub(super) fn sql_err(ctx: &str, e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Internal(format!("{ctx}: {e}"))
 }
 
-pub(super) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+pub(super) use khive_runtime::deser_params as deser;
 
 // ─── token estimation ────────────────────────────────────────────────────────
 
