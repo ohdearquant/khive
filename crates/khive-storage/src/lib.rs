@@ -7,6 +7,7 @@ pub mod attachment;
 pub mod blob;
 pub mod capability;
 pub mod entity;
+mod env;
 pub mod error;
 pub mod event;
 pub mod graph;
@@ -34,6 +35,7 @@ pub use blob::{
 };
 pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};
+pub use env::read_env_number;
 pub use error::{StorageError, WriterTaskRequestState};
 
 pub use event::{
