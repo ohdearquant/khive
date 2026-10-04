@@ -238,6 +238,7 @@ const RECIPIENT_TRANSPORT_VERSION: u32 = 45;
 const V45_UP: &str = include_str!("../sql/045-recipient-transport.sql");
 const V46_UP: &str = include_str!("../sql/046-memory-visibility-receipts.sql");
 const V47_UP: &str = include_str!("../sql/047-attachment-role-quarantine.sql");
+const V49_UP: &str = include_str!("../sql/049-git-note-property-indexes.sql");
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -558,6 +559,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 48,
         name: "acknowledgement_journal",
         up: V48_UP,
+    },
+    VersionedMigration {
+        version: 49,
+        name: "git_note_property_indexes",
+        up: V49_UP,
     },
 ];
 
@@ -1801,3 +1807,7 @@ mod entity_version_measurement;
 #[cfg(test)]
 #[path = "migrations_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "git_note_index_migration_tests.rs"]
+mod git_note_indexes;

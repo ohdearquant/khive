@@ -38,29 +38,31 @@ Shape is intentionally generic across git record kinds within a project —
 `kind` distinguishes `commits` / `issues` / `prs` cursors so a follow-up pack
 (e.g. a code-review pack) can reuse this exact table for its own cursor rows
 without a schema change, keyed by its own `project_id`/`kind` pair.
-The seven schema statements install the receipts table and its two indexes,
-the cursor table and its update index, and two nonunique live-note expression
-indexes: namespace/kind/commit SHA and namespace/kind/issue/pull_request number
-plus project identity.
-The number lookup explicitly restricts its literal kind set to the two kinds
-its production callers pass, so the partial index is usable with bound kind
-parameters. JSON value types, exact namespace/project matching and deleted-row
-exclusion remain query predicates; text numbers do not match integer binds.
+The five schema statements install only the receipts table and its two indexes,
+the cursor table and its update index. Numbered core migration 049 creates four
+nonunique indexes on `notes`, regardless of which packs are loaded: live commit
+SHA and issue/pull-request number/project lookups, and two annotation history
+partitions. Existing indexes with these names are retained by `IF NOT EXISTS`.
 
-Legacy duplicate issue/PR numbers retain an unspecified winner under unordered
-`LIMIT 1`. A changed query plan can select a different holder, including a row
-with an invalid stored ID; there is no unique constraint, trailing UUID sort key,
-new refusal or history repair. Commit lookup still detects two live SHA holders
-before decoding their IDs. Annotation repair and the writer's annotation COUNT
-include tombstones and are unchanged; these live indexes do not accelerate those
-all-row paths. Deleted malformed JSON is outside the index predicates and is not
-repaired or indexed by this pack plan.
+JSON types, exact namespace/project matching and deleted-row exclusion remain
+query predicates. Unordered duplicate number lookups retain an unspecified
+winner; live duplicate SHAs still refuse before decoding IDs. Annotation COUNT
+includes tombstones and counts a `UNION ALL` of canonical text SHAs and properties
+for which `json_valid(properties) IS NOT 1`, retaining the original typed BINARY
+predicate in the latter branch. This preserves JSON5/JSONB matches, SQL NULL,
+duplicates and malformed-JSON errors without repairing history. A guarded CASE
+protects construction of the canonical index.
 
-Idempotent (`CREATE TABLE/INDEX IF NOT EXISTS`), applied once at pack registration
-time in the existing schema-plan transaction; not part of the core versioned
-migration chain. Stores without the Git pack keep the existing semantic queries
-but do not receive these indexes. Read-only stores use any already-installed
-indexes without attempting schema writes.
+INSERT and failed-insert source classification use these partitions when the
+same statement's `sqlite_schema` probe finds both history index names on `notes`;
+otherwise they retain the original COUNT. The fallback remains reachable through
+low-level `StorageBackend::sqlite_read_only_with_max_readers` plus
+`KhiveRuntime::from_backend` on an older snapshot; that assembly does not validate
+or migrate core schema. Serving boot requires the current core version. Read-only
+snapshots are queried without schema writes. Readiness adds a catalog scan for a
+fixed schema; matching duplicates and the namespace's noncanonical history remain
+scan work. Matching names with wrong definitions preserve semantics but prove
+neither the desired query plan nor its work bound.
 
 ## `GIT_EDGE_RULES`
 
