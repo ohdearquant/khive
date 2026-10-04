@@ -161,7 +161,7 @@ async fn split_query_events_orders_by_created_at_then_id_desc() {
     let rows = events();
     seed(
         legacy.as_ref(),
-        [0_usize, 4, 5]
+        [2_usize, 0, 5]
             .into_iter()
             .map(|i| rows[i].clone())
             .collect(),
@@ -169,7 +169,7 @@ async fn split_query_events_orders_by_created_at_then_id_desc() {
     .await;
     seed(
         lane.as_ref(),
-        [1_usize, 2, 3]
+        [4_usize, 1, 3]
             .into_iter()
             .map(|i| rows[i].clone())
             .collect(),
