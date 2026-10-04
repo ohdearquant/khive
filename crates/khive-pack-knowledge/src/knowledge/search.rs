@@ -3068,6 +3068,8 @@ struct KgEntityHit {
 /// (`khive-pack-kg`'s `handle_search` calls the identical method) — so this
 /// does not stand up a parallel retrieval stack; only the final relevance
 /// score is recomputed, to land on the atom-comparable scale.
+/// `hybrid_search_each_kind` hands each blend kind the list `hybrid_search`
+/// returns for it while issuing the vector query once for all kinds.
 ///
 /// `min_score` is the self-calibrating inclusion floor (ADR-051 Amendment
 /// 1): only hits scoring at or above it survive, applied after rerank and
@@ -3082,8 +3084,8 @@ async fn search_kg_entities(
     cap: usize,
     min_score: f32,
 ) -> Result<Vec<KgEntityHit>, RuntimeError> {
-    // KG discovery has two kind-specific hybrid searches. Both are gated on
-    // `role_specific` specifically, never `generic`: a vector produced by
+    // KG discovery has two kind-specific hybrid searches that share one vector query.
+    // Both are gated on `role_specific` specifically, never `generic`: a vector produced by
     // the rerank's combined batch (`embed_batch`) lands in a different
     // embedding space than `embed_query` for asymmetric-prompt models, so it
     // must never stand in for a role-specific vector here — doing so would
@@ -3098,23 +3100,18 @@ async fn search_kg_entities(
     let candidate_k = ((cap * 4) as u32).max(20);
     let mut candidate_ids: Vec<Uuid> = Vec::new();
     let mut seen: HashSet<Uuid> = HashSet::new();
-    for kind in KG_BLEND_ENTITY_KINDS {
-        let hits = runtime
-            .hybrid_search(
-                token,
-                query,
-                Some(query_vector.to_vec()),
-                candidate_k,
-                Some(kind),
-                None,
-                &[],
-                None,
-            )
-            .await?;
-        for hit in hits {
-            if seen.insert(hit.entity_id) {
-                candidate_ids.push(hit.entity_id);
-            }
+    let hits_by_kind = runtime
+        .hybrid_search_each_kind(
+            token,
+            query,
+            Some(query_vector.to_vec()),
+            candidate_k,
+            &KG_BLEND_ENTITY_KINDS,
+        )
+        .await?;
+    for hit in hits_by_kind.into_iter().flatten() {
+        if seen.insert(hit.entity_id) {
+            candidate_ids.push(hit.entity_id);
         }
     }
     if candidate_ids.is_empty() {

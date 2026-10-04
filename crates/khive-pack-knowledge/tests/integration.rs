@@ -6160,8 +6160,8 @@ mod kg_blend {
         );
     }
 
-    /// #2232: auto-compose crosses suggest ANN/rerank, atom rerank, and two
-    /// KG kind searches. Every stage must reuse the first successful query
+    /// #2232: auto-compose crosses suggest ANN/rerank, atom rerank, and the
+    /// KG blend search. Every stage must reuse the first successful query
     /// vector instead of independently embedding the same request text.
     #[tokio::test]
     async fn auto_compose_embeds_request_query_exactly_once() {
@@ -6693,6 +6693,164 @@ mod kg_blend {
             ids.len(),
             entities.len(),
             "blended entities must be deduplicated by id, got: {entities:?}"
+        );
+    }
+
+    /// Runs an explicit-domain compose with a dispatch-accounting context armed and
+    /// returns the response with the counters that dispatch recorded. Explicit domains
+    /// skip the suggest phase, so the KG blend is the only vector search in the call.
+    async fn compose_counting_usage(f: &Fixture, domain_id: &str) -> (Value, Value) {
+        let usage = khive_runtime::usage::UsageContext::new();
+        let resp = khive_runtime::usage::scope(
+            usage.clone(),
+            f.dispatch(
+                "knowledge.compose",
+                json!({ "domain_ids": [domain_id], "query": QUERY }),
+            ),
+        )
+        .await
+        .expect("explicit domain_ids compose ok");
+        (resp, usage.snapshot())
+    }
+
+    /// The blend finds `concept` and `document` entities with one vector query shared
+    /// by both kinds, so the vector store is queried once for the call rather than once
+    /// per kind, and both kinds still come back.
+    #[tokio::test]
+    async fn kg_blend_searches_both_kinds_in_one_vector_pass() {
+        let f = pack(rt_with_marker_embedder());
+        let domain_id = seed_domain_and_atom(&f).await;
+        let concept_id = seed_kg_concept(&f).await;
+        let document_id = seed_kg_document(&f).await;
+
+        let (resp, usage) = compose_counting_usage(&f, &domain_id).await;
+
+        assert_eq!(
+            usage["vector_passes"], 1,
+            "one blend search over both kinds must run one vector pass, got: {usage}"
+        );
+        let entities = resp["data"]["entities"]
+            .as_array()
+            .expect("entities array must be present when both kinds blend");
+        let ids: HashSet<&str> = entities.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(
+            ids,
+            HashSet::from([concept_id.as_str(), document_id.as_str()]),
+            "both seeded kinds must be blended, got: {entities:?}"
+        );
+    }
+
+    /// With only one blend kind present, the shared vector query returns that kind's
+    /// entity and the call still runs one vector pass.
+    #[tokio::test]
+    async fn kg_blend_with_one_kind_present_returns_it_in_one_vector_pass() {
+        for kind in ["concept", "document"] {
+            let f = pack(rt_with_marker_embedder());
+            let domain_id = seed_domain_and_atom(&f).await;
+            let seeded = if kind == "concept" {
+                seed_kg_concept(&f).await
+            } else {
+                seed_kg_document(&f).await
+            };
+
+            let (resp, usage) = compose_counting_usage(&f, &domain_id).await;
+
+            assert_eq!(
+                usage["vector_passes"], 1,
+                "a {kind}-only blend must run one vector pass, got: {usage}"
+            );
+            let entities = resp["data"]["entities"]
+                .as_array()
+                .expect("entities array must be present when one kind blends");
+            let ids: Vec<&str> = entities.iter().filter_map(|e| e["id"].as_str()).collect();
+            assert_eq!(
+                ids,
+                [seeded.as_str()],
+                "a {kind}-only blend must return exactly the seeded entity, got: {entities:?}"
+            );
+        }
+    }
+
+    /// The shared vector query leaves each kind with the list a per-kind search returns,
+    /// also when one kind has more matches than its budget.
+    ///
+    /// Scenario: with a limit of 2, six concepts match both the text query and the vector,
+    /// so the concept list is cut to its budget. Two documents match only by vector. The
+    /// oracle is the per-kind `hybrid_search` call the blend made before it shared the
+    /// vector query.
+    #[tokio::test]
+    async fn kg_blend_each_kind_matches_the_per_kind_search_when_a_kind_is_over_budget() {
+        const LIMIT: u32 = 2;
+        let rt = rt_with_marker_embedder();
+        let f = pack(rt.clone());
+        for i in 0..6 {
+            f.dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": format!("Concept{i}"),
+                    "description": format!("{MARKER} paged cache variant {i}"),
+                }),
+            )
+            .await
+            .expect("create kg concept");
+        }
+        for i in 0..2 {
+            f.dispatch(
+                "create",
+                json!({
+                    "kind": "document",
+                    "name": format!("Document{i}"),
+                    "description": format!("{MARKER} decode attention paper {i}"),
+                }),
+            )
+            .await
+            .expect("create kg document");
+        }
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let mut marker_vector = vec![0.0f32; DIM];
+        marker_vector[0] = 1.0;
+        let kinds = ["concept", "document"];
+
+        let mut expected: Vec<Vec<String>> = Vec::new();
+        for kind in kinds {
+            let hits = rt
+                .hybrid_search(
+                    &token,
+                    "paged",
+                    Some(marker_vector.clone()),
+                    LIMIT,
+                    Some(kind),
+                    None,
+                    &[],
+                    None,
+                )
+                .await
+                .expect("per-kind search");
+            expected.push(hits.iter().map(|hit| hit.entity_id.to_string()).collect());
+        }
+        assert_eq!(
+            expected[0].len(),
+            LIMIT as usize,
+            "premise: the concept list is cut to its budget"
+        );
+        assert_eq!(
+            expected[1].len(),
+            2,
+            "premise: the document list is not empty"
+        );
+
+        let per_kind = rt
+            .hybrid_search_each_kind(&token, "paged", Some(marker_vector), LIMIT, &kinds)
+            .await
+            .expect("shared-vector search");
+        let mut actual: Vec<Vec<String>> = Vec::new();
+        for hits in &per_kind {
+            actual.push(hits.iter().map(|hit| hit.entity_id.to_string()).collect());
+        }
+        assert_eq!(
+            actual, expected,
+            "each kind must get the ids and order its own per-kind search returns"
         );
     }
 

@@ -839,9 +839,58 @@ impl KhiveRuntime {
                 text_mode,
                 None,
                 false,
+                None,
             )
             .await?;
         Ok(hits)
+    }
+
+    /// Hybrid search over several entity kinds that issues the vector query once.
+    ///
+    /// Returns one list per entry of `entity_kinds`, in that order. Each list is what
+    /// [`Self::hybrid_search`] returns for that kind with the same `limit`: the text stage
+    /// is filtered to the kind and keeps its own `limit * 4` budget, and fusion, the kind
+    /// filter and the cut to `limit` run per kind. Only the vector stage is shared, because
+    /// it takes no entity kind: the single query is the one every per-kind search would have
+    /// issued. When `query_vector` is `None` and an embedding model is configured, the query
+    /// text is embedded once instead of once per kind. No entity-type, tag or property
+    /// filter is set. An empty `entity_kinds` returns no lists and runs no query.
+    pub async fn hybrid_search_each_kind(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+        entity_kinds: &[&str],
+    ) -> RuntimeResult<Vec<Vec<SearchHit>>> {
+        if entity_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
+        let (vector_hits, _vector_error) = self
+            .hybrid_vector_stage(token, query_text, query_vector, candidates, None, false)
+            .await?;
+        let mut per_kind = Vec::with_capacity(entity_kinds.len());
+        for &kind in entity_kinds {
+            let (hits, _vector_error) = self
+                .hybrid_search_inner(
+                    token,
+                    query_text,
+                    None,
+                    limit,
+                    Some(kind),
+                    None,
+                    &[],
+                    None,
+                    TextQueryMode::Plain,
+                    None,
+                    false,
+                    Some(vector_hits.clone()),
+                )
+                .await?;
+            per_kind.push(hits);
+        }
+        Ok(per_kind)
     }
 
     /// `vector_similarity_floor` is a cosine-similarity value in `[-1.0,
@@ -874,6 +923,7 @@ impl KhiveRuntime {
                 TextQueryMode::Plain,
                 Some(vector_similarity_floor),
                 false,
+                None,
             )
             .await?;
         Ok(hits)
@@ -938,11 +988,14 @@ impl KhiveRuntime {
                 text_mode,
                 None,
                 true,
+                None,
             )
             .await?;
         Ok(HybridSearchOutcome { hits, vector_error })
     }
 
+    /// `vector_pool`, when `Some`, supplies the vector stage's hits and the stage does not
+    /// run; `None` runs it. The stage takes no entity kind, so one pool serves every kind.
     #[allow(clippy::too_many_arguments)]
     async fn hybrid_search_inner(
         &self,
@@ -957,6 +1010,7 @@ impl KhiveRuntime {
         text_mode: TextQueryMode,
         vector_similarity_floor: Option<f64>,
         tolerate_vector_error: bool,
+        vector_pool: Option<Vec<VectorSearchHit>>,
     ) -> RuntimeResult<(Vec<SearchHit>, Option<String>)> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
@@ -1000,34 +1054,20 @@ impl KhiveRuntime {
             query_text,
         )?;
 
-        let mut vector_error: Option<String> = None;
-        let mut vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
-            match self
-                .vector_search(
+        let (vector_hits, vector_error) = match vector_pool {
+            Some(pool) => (pool, None),
+            None => {
+                self.hybrid_vector_stage(
                     token,
+                    query_text,
                     query_vector,
-                    Some(query_text),
                     candidates,
-                    Some(SubstrateKind::Entity),
+                    vector_similarity_floor,
+                    tolerate_vector_error,
                 )
-                .await
-            {
-                Ok(hits) => hits,
-                Err(e) if tolerate_vector_error => {
-                    vector_error = Some(e.to_string());
-                    Vec::new()
-                }
-                Err(e) => return Err(e),
+                .await?
             }
-        } else {
-            Vec::new()
         };
-        if let Some(cosine_floor) = vector_similarity_floor {
-            // Vector store scores use canonical cosine similarity (`1 - distance`),
-            // so the caller's raw-cosine floor is already on the comparison scale.
-            let score_floor = DeterministicScore::from_f64(cosine_floor);
-            vector_hits.retain(|hit| hit.score >= score_floor);
-        }
 
         // Each arm fetched `candidates` independently, so their union can contain
         // twice that many distinct IDs. Keep the complete fetched pool through
@@ -1089,6 +1129,49 @@ impl KhiveRuntime {
 
         fused.truncate(limit as usize);
         Ok((fused, vector_error))
+    }
+
+    /// The vector stage of hybrid entity search: one KNN query over the entity vectors of
+    /// the primary namespace. It does not depend on an entity kind, which only the text
+    /// stage and the filter after fusion apply.
+    async fn hybrid_vector_stage(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        candidates: u32,
+        vector_similarity_floor: Option<f64>,
+        tolerate_vector_error: bool,
+    ) -> RuntimeResult<(Vec<VectorSearchHit>, Option<String>)> {
+        let mut vector_error: Option<String> = None;
+        let mut vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
+            match self
+                .vector_search(
+                    token,
+                    query_vector,
+                    Some(query_text),
+                    candidates,
+                    Some(SubstrateKind::Entity),
+                )
+                .await
+            {
+                Ok(hits) => hits,
+                Err(e) if tolerate_vector_error => {
+                    vector_error = Some(e.to_string());
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            Vec::new()
+        };
+        if let Some(cosine_floor) = vector_similarity_floor {
+            // Vector store scores use canonical cosine similarity (`1 - distance`),
+            // so the caller's raw-cosine floor is already on the comparison scale.
+            let score_floor = DeterministicScore::from_f64(cosine_floor);
+            vector_hits.retain(|hit| hit.score >= score_floor);
+        }
+        Ok((vector_hits, vector_error))
     }
 
     /// Exact KNN over the full namespace's vector store.
@@ -2752,6 +2835,83 @@ mod tests {
         assert_eq!(
             hits[0].entity_id, target.id,
             "the returned hit must be the document, not a concept"
+        );
+    }
+
+    /// `hybrid_search_each_kind` gives each kind the list `hybrid_search` returns for it.
+    ///
+    /// Scenario: twenty `concept` entities repeat the query term and outrank three
+    /// `document` entities that mention it once, with `limit=2`. The text arm fetches 8
+    /// candidates per kind, so the concepts alone overflow it and the cut to `limit`
+    /// binds. A text budget shared by the two kinds would leave the documents none; each
+    /// kind has to keep its own, so both lists equal the per-kind search.
+    #[tokio::test]
+    async fn hybrid_search_each_kind_matches_per_kind_search_when_one_kind_dominates() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        for i in 0..20 {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                &format!("quillfeather decoy {i}"),
+                Some("quillfeather quillfeather quillfeather"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..3 {
+            let description = format!(
+                "A long administrative description {i} that mentions quillfeather once. {}",
+                "Unrelated filing, scheduling and review words. ".repeat(20)
+            );
+            rt.create_entity(
+                &tok,
+                "document",
+                None,
+                &format!("Archive filing report {i}"),
+                Some(description.as_str()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+
+        let kinds = ["concept", "document"];
+        let mut expected: Vec<Vec<Uuid>> = Vec::new();
+        for kind in kinds {
+            let hits = rt
+                .hybrid_search(&tok, "quillfeather", None, 2, Some(kind), None, &[], None)
+                .await
+                .unwrap();
+            expected.push(hits.iter().map(|hit| hit.entity_id).collect());
+        }
+        assert_eq!(
+            expected[0].len(),
+            2,
+            "premise: the concept list is cut to limit"
+        );
+        assert_eq!(
+            expected[1].len(),
+            2,
+            "premise: the document list is not starved"
+        );
+
+        let per_kind = rt
+            .hybrid_search_each_kind(&tok, "quillfeather", None, 2, &kinds)
+            .await
+            .unwrap();
+        let mut actual: Vec<Vec<Uuid>> = Vec::new();
+        for hits in &per_kind {
+            actual.push(hits.iter().map(|hit| hit.entity_id).collect());
+        }
+        assert_eq!(
+            actual, expected,
+            "each kind must get the ids and order its own per-kind search returns"
         );
     }
 
