@@ -68,6 +68,7 @@ pub fn open_regular_file_within(
 /// The path the kernel reports for the file behind `file`, read from `/proc/self/fd`.
 ///
 /// The path is resolved, so it names the file that was opened and not a symlink that led to it.
+/// Removed files and directories keep the kernel's `" (deleted)"` suffix.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn opened_file_path(file: &File) -> io::Result<PathBuf> {
     use std::os::fd::AsRawFd as _;
@@ -78,7 +79,8 @@ pub fn opened_file_path(file: &File) -> io::Result<PathBuf> {
 /// The path the kernel reports for the file behind `file`, read with `F_GETPATH`.
 ///
 /// The path is resolved, so it names the file that was opened and not a symlink that led to it.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+/// This query is available on every Apple target.
+#[cfg(target_vendor = "apple")]
 pub fn opened_file_path(file: &File) -> io::Result<PathBuf> {
     use std::ffi::OsStr;
     use std::os::fd::AsRawFd as _;
@@ -147,12 +149,7 @@ pub fn opened_file_path(file: &File) -> io::Result<PathBuf> {
 /// descriptor.
 #[cfg(all(
     unix,
-    not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios"
-    ))
+    not(any(target_os = "linux", target_os = "android", target_vendor = "apple"))
 ))]
 pub fn opened_file_path(_file: &File) -> io::Result<PathBuf> {
     Err(io::Error::new(
