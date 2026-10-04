@@ -5808,8 +5808,10 @@ impl KhiveRuntime {
             return Ok((vec![], vector_error));
         }
 
-        // Fetch each candidate note individually to get salience and apply
-        // soft-delete + (optional) kind filtering. Notes whose `kind` doesn't
+        // Hydrate every candidate note with one batched read to get salience and
+        // apply soft-delete + (optional) kind filtering. The store chunks the read
+        // below its bound-parameter ceiling, so the read costs `ceil(candidates / 900)`
+        // statements instead of one per candidate. Notes whose `kind` doesn't
         // match `note_kind` are dropped post-fetch — they're a small set
         // bounded by the text∪vector union (≤ 2×candidates), so the read is cheap.
         let note_store = self.notes(token)?;
@@ -5819,52 +5821,50 @@ impl KhiveRuntime {
             delegated: false,
         };
         let mut alive_notes: HashMap<Uuid, Note> = HashMap::new();
-        for id in &candidate_ids {
-            if let Some(note) = note_store.get_note(*id).await? {
-                search_pool.record_note_candidate_hydration_row();
-                if note.deleted_at.is_some() {
-                    continue;
-                }
-                if !mailbox_view.permits_message_note(token, &note) {
-                    continue;
-                }
-                if let Some(want_kind) = note_kind {
-                    if note.kind != want_kind {
-                        continue;
-                    }
-                }
-                // Apply tag predicate before adding to alive set: tags on notes live
-                // inside `properties["tags"]` (a JSON array). This pushes the filter
-                // before truncation so matching notes ranked beyond `limit` in the raw
-                // fusion are not silently dropped.
-                if !tags_any.is_empty() {
-                    let note_tags: Vec<String> = note
-                        .properties
-                        .as_ref()
-                        .and_then(|p| p.get("tags"))
-                        .and_then(serde_json::Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(serde_json::Value::as_str)
-                                .map(str::to_owned)
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if !note_tags
-                        .iter()
-                        .any(|t| tags_any.iter().any(|w| t.eq_ignore_ascii_case(w)))
-                    {
-                        continue;
-                    }
-                }
-                // Apply properties predicate before truncation, same reasoning as tags above.
-                if let Some(pf) = properties_filter {
-                    if !note_props_match(note.properties.as_ref(), pf) {
-                        continue;
-                    }
-                }
-                alive_notes.insert(*id, note);
+        for note in note_store.get_notes_batch(&candidate_ids).await? {
+            search_pool.record_note_candidate_hydration_row();
+            if note.deleted_at.is_some() {
+                continue;
             }
+            if !mailbox_view.permits_message_note(token, &note) {
+                continue;
+            }
+            if let Some(want_kind) = note_kind {
+                if note.kind != want_kind {
+                    continue;
+                }
+            }
+            // Apply tag predicate before adding to alive set: tags on notes live
+            // inside `properties["tags"]` (a JSON array). This pushes the filter
+            // before truncation so matching notes ranked beyond `limit` in the raw
+            // fusion are not silently dropped.
+            if !tags_any.is_empty() {
+                let note_tags: Vec<String> = note
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.get("tags"))
+                    .and_then(serde_json::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !note_tags
+                    .iter()
+                    .any(|t| tags_any.iter().any(|w| t.eq_ignore_ascii_case(w)))
+                {
+                    continue;
+                }
+            }
+            // Apply properties predicate before truncation, same reasoning as tags above.
+            if let Some(pf) = properties_filter {
+                if !note_props_match(note.properties.as_ref(), pf) {
+                    continue;
+                }
+            }
+            alive_notes.insert(note.id, note);
         }
 
         // Drop superseded notes unless include_superseded is true: any note targeted
@@ -19447,6 +19447,126 @@ mod tests {
         assert_eq!(
             snap["db_round_trips"], 1,
             "supersedes suppression must use one batched adjacency query; got {snap:?}"
+        );
+    }
+
+    // Candidate hydration reads the fused pool in `ceil(candidates / 900)` batched
+    // statements, never one point read per candidate. 901 live candidates cross the
+    // store's 900-id chunk boundary, so a per-candidate loop issues 901 point reads
+    // here while the batch issues exactly two statements. The soft-deleted note is
+    // never returned or counted, and the hydration-row counter equals the live
+    // candidate count.
+    #[tokio::test]
+    async fn search_notes_hydrates_candidates_in_chunked_batch_reads() {
+        const LIVE: usize = 901;
+        const LIMIT: u32 = 226;
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::for_namespace(Namespace::parse("note-hydration").unwrap());
+
+        let mut live_ids = std::collections::HashSet::new();
+        for ordinal in 0..LIVE {
+            let note = rt
+                .create_note(
+                    &tok,
+                    "observation",
+                    None,
+                    &format!("hydrationbatchprobe candidate {ordinal}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .expect("create_note must succeed");
+            live_ids.insert(note.id);
+        }
+        let deleted = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "hydrationbatchprobe candidate deleted",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_note must succeed");
+        rt.notes(&tok)
+            .unwrap()
+            .delete_note(deleted.id, DeleteMode::Soft)
+            .await
+            .unwrap();
+
+        // `LIMIT * 4` is 904 text candidates, above the at most 902 indexed rows,
+        // so every live note is a candidate.
+        let pool = rt.backend().pool();
+        let before = pool.search_mechanism_snapshot();
+        let observation = pool
+            .observe_test_statement_starts(4096)
+            .expect("statement observation");
+        let hits = rt
+            .search_notes(
+                &tok,
+                "hydrationbatchprobe",
+                None,
+                LIMIT,
+                None,
+                false,
+                &[],
+                None,
+            )
+            .await
+            .expect("search_notes must succeed");
+        let statements = observation
+            .started_statements()
+            .expect("complete statement observation");
+        drop(observation);
+        let after = pool.search_mechanism_snapshot();
+
+        let point_reads = statements
+            .iter()
+            .filter(|s| {
+                s.sql.starts_with("SELECT id, namespace, kind, status,")
+                    && s.sql.contains("FROM notes WHERE id = ?1")
+            })
+            .count();
+        let batch_reads = statements
+            .iter()
+            .filter(|s| {
+                s.sql.starts_with("SELECT id, namespace, kind, status,")
+                    && s.sql.contains("FROM notes WHERE id IN (")
+            })
+            .count();
+        assert_eq!(
+            point_reads, 0,
+            "candidate hydration must not issue a point read per candidate"
+        );
+        assert_eq!(
+            batch_reads,
+            LIVE.div_ceil(900),
+            "candidate hydration must issue ceil(candidates / 900) batched reads"
+        );
+        assert_eq!(
+            after.note_candidate_hydration_rows - before.note_candidate_hydration_rows,
+            LIVE as u64,
+            "the hydration-row counter must equal the live candidate count"
+        );
+
+        assert_eq!(hits.len(), LIMIT as usize);
+        assert!(
+            hits.iter().all(|hit| live_ids.contains(&hit.note_id)),
+            "only live candidates may be returned"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.note_id != deleted.id),
+            "the soft-deleted note must not be returned"
+        );
+        assert!(
+            hits.windows(2).all(|pair| {
+                pair[0].score > pair[1].score
+                    || (pair[0].score == pair[1].score && pair[0].note_id < pair[1].note_id)
+            }),
+            "hits must stay ordered by score descending, then note id ascending"
         );
     }
 
