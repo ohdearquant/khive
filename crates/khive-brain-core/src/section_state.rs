@@ -182,26 +182,40 @@ impl SectionPosteriorState {
         self.total_events += 1;
 
         for (section_type, feedback_signal) in signals {
-            if let Some(posterior) = self.posteriors.get_mut(section_type) {
-                match feedback_signal {
-                    FeedbackSignal::Useful => posterior.update_success_weighted(weight),
-                    FeedbackSignal::NotUseful => posterior.update_failure_weighted(weight),
-                    FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0 * weight),
-                }
-                if let Some(prior) = self.priors.get(section_type) {
-                    if let Err(e) = posterior.apply_ess_cap(&prior.clone(), DEFAULT_ESS_CAP) {
-                        eprintln!(
-                            "[brain-core] apply_ess_cap failed for section {:?}: {e}",
-                            section_type
-                        );
-                    }
-                }
+            if let Err(e) = self.apply_section_feedback_entry(section_type, feedback_signal, weight)
+            {
+                eprintln!(
+                    "[brain-core] apply_ess_cap failed for section {:?}: {e}",
+                    section_type
+                );
             }
         }
 
         if self.exploration_epoch > 0 {
             self.exploration_epoch -= 1;
         }
+    }
+
+    /// Update one existing section and cap its evidence against its prior.
+    /// An existing section requires a finite, positive weight.
+    /// Counters, exploration state, iteration order and error reporting belong to the caller.
+    pub fn apply_section_feedback_entry(
+        &mut self,
+        section_type: &SectionType,
+        feedback_signal: &FeedbackSignal,
+        weight: f64,
+    ) -> Result<(), String> {
+        if let Some(posterior) = self.posteriors.get_mut(section_type) {
+            match feedback_signal {
+                FeedbackSignal::Useful => posterior.update_success_weighted(weight),
+                FeedbackSignal::NotUseful => posterior.update_failure_weighted(weight),
+                FeedbackSignal::Wrong => posterior.update_failure_weighted(2.0 * weight),
+            }
+            if let Some(prior) = self.priors.get(section_type).cloned() {
+                posterior.apply_ess_cap(&prior, DEFAULT_ESS_CAP)?;
+            }
+        }
+        Ok(())
     }
 }
 
