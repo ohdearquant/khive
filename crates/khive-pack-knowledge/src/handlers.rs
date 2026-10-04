@@ -14,10 +14,7 @@ use crate::KnowledgePack;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+use khive_runtime::deser_params as deser;
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()

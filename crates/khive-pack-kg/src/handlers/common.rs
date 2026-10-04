@@ -1088,10 +1088,7 @@ pub(crate) fn to_json<T: serde::Serialize>(v: &T) -> Result<Value, RuntimeError>
     serde_json::to_value(v).map_err(|e| RuntimeError::Internal(format!("serialize: {e}")))
 }
 
-pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+pub(crate) use khive_runtime::deser_params as deser;
 
 /// Convert `created_at`/`updated_at`/`deleted_at`/`expires_at` fields on a JSON entity
 /// object from epoch-micros integers to ISO-8601 strings, in place. Fields that are

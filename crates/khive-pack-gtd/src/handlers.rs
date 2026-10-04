@@ -305,10 +305,7 @@ pub struct TransitionParams {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+use khive_runtime::deser_params as deser;
 
 /// #2679: merge the shared `khive_storage::types::LimitReport`
 /// (`requested_limit`, `effective_limit`, `limit_clamped = requested >
