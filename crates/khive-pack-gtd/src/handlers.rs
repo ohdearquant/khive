@@ -330,6 +330,31 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
+/// Rename an accepted parameter-name alias to its canonical name.
+///
+/// Callers repeatedly send the sibling verb's spelling (`gtd.transition(to=)`,
+/// `gtd.assign(content=)`, `gtd.complete(note=)`). The rename runs before the
+/// strict parameter struct is deserialized, so the struct keeps refusing every
+/// other unknown field exactly as before and its field list stays the schema.
+/// Supplying both spellings is refused even when the values agree, so a call has
+/// one reading; an explicit `null` counts as supplied. A non-object payload is
+/// left for the struct's own refusal.
+fn fold_alias(params: &mut Value, canonical: &str, alias: &str) -> Result<(), RuntimeError> {
+    let Some(map) = params.as_object_mut() else {
+        return Ok(());
+    };
+    if map.contains_key(canonical) && map.contains_key(alias) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "`{alias}` is an alias for `{canonical}`; supply only one of the two, \
+             even when the values agree"
+        )));
+    }
+    if let Some(value) = map.remove(alias) {
+        map.insert(canonical.to_string(), value);
+    }
+    Ok(())
+}
+
 /// Resolve a task-create reference as a full UUID or 8+ hex prefix.
 /// Prefix lookup stays scoped to the caller's primary namespace per ADR-016;
 /// task creation applies its primary-namespace mutation checks after this
@@ -1343,8 +1368,9 @@ impl GtdPack {
     pub(crate) async fn handle_assign(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
     ) -> Result<Value, RuntimeError> {
+        fold_alias(&mut params, "description", "content")?;
         let p: AssignParams = deser(params)?;
 
         // #625/#626: `gtd.assign` and the generic `create(kind="note",
@@ -1581,8 +1607,9 @@ impl GtdPack {
     pub(crate) async fn handle_complete(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
     ) -> Result<Value, RuntimeError> {
+        fold_alias(&mut params, "result", "note")?;
         let p: CompleteParams = deser(params)?;
 
         // Decide step (ADR-099 B3 r6 second pass): validates the target
@@ -1883,8 +1910,9 @@ impl GtdPack {
     pub(crate) async fn handle_transition(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
     ) -> Result<Value, RuntimeError> {
+        fold_alias(&mut params, "status", "to")?;
         let p: TransitionParams = deser(params)?;
 
         // Decide step (ADR-099 B3 r6 second pass): normalizes/validates the
