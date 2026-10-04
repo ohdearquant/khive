@@ -7,6 +7,7 @@ mod config;
 #[cfg(feature = "native-rerank")]
 mod cross_encoder;
 mod identity;
+mod labelled;
 mod searcher;
 
 // Re-export public types
@@ -14,6 +15,9 @@ pub use config::{HybridConfig, Query, DEFAULT_POOL_MULTIPLIER};
 #[cfg(feature = "native-rerank")]
 pub use cross_encoder::{CrossEncoderScorer, NativeCrossEncoderReranker, RerankDocumentResolver};
 pub use identity::IdentityReranker;
+pub use labelled::{
+    combine_best_ranked_evidence, combine_leg_first_appearance, fuse_labelled, HitLabel,
+};
 pub use searcher::{
     fuse_search_results, fuse_search_results_checked, HybridSearcher, KeywordSearch, Reranker,
     VectorSearch,
