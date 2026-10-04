@@ -9,6 +9,21 @@ use uuid::Uuid;
 const ROLE_PREFIX: &str = "message-attachment:";
 const MAX_ATTACHMENTS: usize = 8;
 const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_INVALID_REFERENCE_PREVIEW_BYTES: usize = 64;
+
+fn invalid_reference(verb: &str, raw: &str) -> RuntimeError {
+    let mut end = raw.len().min(MAX_INVALID_REFERENCE_PREVIEW_BYTES);
+    // A byte bound also limits escaped output; never split a UTF-8 character.
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let preview = &raw[..end];
+    let suffix = if end < raw.len() { "..." } else { "" };
+    RuntimeError::InvalidInput(format!(
+        "{verb}: invalid attachment {preview:?}{suffix}: expected 64 lowercase hex characters (0-9, a-f), got {} bytes",
+        raw.len()
+    ))
+}
 
 fn role_index(role: &str) -> Option<u8> {
     match role.strip_prefix(ROLE_PREFIX)?.as_bytes() {
@@ -50,9 +65,8 @@ pub(crate) async fn prepare(
     let mut total = 0_u64;
     let mut attachments = Vec::with_capacity(references.len());
     for (index, raw) in references.iter().enumerate() {
-        let content_ref = ContentRef::from_hex(raw).map_err(|error| {
-            RuntimeError::InvalidInput(format!("{verb}: invalid attachment {raw:?}: {error}"))
-        })?;
+        // The parser's error includes the full input, so do not append it to the preview.
+        let content_ref = ContentRef::from_hex(raw).map_err(|_| invalid_reference(verb, raw))?;
         if !seen.insert(content_ref.clone()) {
             return Err(RuntimeError::InvalidInput(format!(
                 "{verb}: duplicate attachment {content_ref}"
@@ -201,3 +215,7 @@ pub(crate) fn identify_request(mut request: Value, references: &[String]) -> Val
     }
     request
 }
+
+#[cfg(test)]
+#[path = "file_attachment_diagnostic_tests.rs"]
+mod diagnostic_tests;
