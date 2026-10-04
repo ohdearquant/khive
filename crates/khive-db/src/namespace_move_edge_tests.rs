@@ -412,3 +412,76 @@ fn edge_vectors_follow_the_resolved_relation_not_both_matching_routes() {
         tx.commit().unwrap();
     }
 }
+
+#[test]
+fn a_cross_target_false_collision_refuses_directly_and_moves_in_two_steps() {
+    let mut conn = migrated();
+    edge(&conn, 0, "source", "depends_on");
+    edge(&conn, 1, "source", "supports");
+    // A resident of target-b repeats edge 0's endpoints and relation, so the unique
+    // triple matches it although depends_on is routed to target-a.
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (id, namespace, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, metadata) \
+         SELECT ?1, 'target-b', source_id, target_id, relation, weight, created_at, updated_at, \
+         deleted_at, metadata FROM graph_edges WHERE id = ?2",
+        rusqlite::params![id(200), id(0)],
+    )
+    .unwrap();
+    let before = content(&conn);
+    let untouched = (places(&conn), changes(&conn));
+
+    let direct = MoveRequest::new(
+        "source",
+        vec![
+            route("edge:depends_on", "target-a"),
+            route("edge:supports", "target-b"),
+        ],
+    );
+    let Err(MoveError::Collisions { collisions }) = move_namespace(&conn, &direct) else {
+        panic!("a split move whose relation shares a triple with another target must refuse");
+    };
+    assert_eq!(collisions.len(), 1);
+    assert_eq!(
+        (
+            collisions[0].table.as_str(),
+            collisions[0].constraint.as_str(),
+            collisions[0].target.as_str(),
+        ),
+        ("graph_edges", "idx_graph_edges_unique_triple", "target-b")
+    );
+    assert_eq!((places(&conn), changes(&conn)), untouched);
+
+    let staged = MoveRequest::new(
+        "source",
+        vec![
+            route("edge:depends_on", "stage-a"),
+            route("edge:supports", "stage-b"),
+        ],
+    );
+    let tx = conn.transaction().unwrap();
+    assert_eq!(
+        move_namespace(&tx, &staged)
+            .unwrap()
+            .rows
+            .get("graph_edges"),
+        Some(&2)
+    );
+    tx.commit().unwrap();
+    for (stage, target) in [("stage-a", "target-a"), ("stage-b", "target-b")] {
+        let tx = conn.transaction().unwrap();
+        let counts =
+            move_namespace(&tx, &MoveRequest::new(stage, vec![route("edge", target)])).unwrap();
+        assert_eq!(counts.subjects, BTreeMap::from([("edge".into(), 1)]));
+        tx.commit().unwrap();
+    }
+    assert_eq!(
+        places(&conn),
+        BTreeMap::from([
+            (id(0), "target-a".into()),
+            (id(1), "target-b".into()),
+            (id(200), "target-b".into()),
+        ])
+    );
+    assert_eq!(content(&conn), before);
+}
