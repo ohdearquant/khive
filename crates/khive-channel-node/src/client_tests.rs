@@ -582,7 +582,10 @@ async fn submit_accepts_a_new_canonical_service_attempt_but_refuses_noncanonical
         .unwrap()
     {
         SendOutcome::RecipientStored(accepted) => {
-            assert_eq!(accepted.binding.delivery_attempt_id, other_id().into_uuid());
+            assert_eq!(
+                accepted.receipt().binding.delivery_attempt_id,
+                other_id().into_uuid()
+            );
         }
         other => panic!("canonical service attempt must be accepted, got {other:?}"),
     }
@@ -785,15 +788,15 @@ async fn poll_source_failures_do_not_block_later_receipts_or_cursor() {
         .unwrap();
     assert_eq!(page.next_cursor.get(), 3);
     assert_eq!(page.receipts.len(), 3);
-    for (index, reason) in [
-        ReceiptRejection::SourceUnavailable,
-        ReceiptRejection::SourceMissing,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        assert!(matches!(&page.receipts[index].verification,
-            ReceiptVerification::Rejected(actual) if actual == &reason));
+    assert!(matches!(
+        &page.receipts[0].verification,
+        ReceiptVerification::Unhandled(khive_channel::ReceiptReadFailure::SourceUnavailable)
+    ));
+    assert!(matches!(
+        &page.receipts[1].verification,
+        ReceiptVerification::Rejected(ReceiptRejection::SourceMissing)
+    ));
+    for index in 0..2 {
         assert_eq!(page.receipts[index].item.seq.get(), index as u64 + 1);
     }
     match &page.receipts[2].verification {
@@ -1862,3 +1865,6 @@ mod r2_rejection_tests;
 
 #[path = "client_r3_regression_tests.rs"]
 mod r3_regression_tests;
+
+#[path = "adapter_tests.rs"]
+mod adapter_tests;

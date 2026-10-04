@@ -1348,6 +1348,8 @@ impl VamanaIndex {
         // file locks are not reentrant across descriptors: the read lock is released
         // before anything publishes.
         let rebuild_and_persist = |guard: &mut Option<File>, config| {
+            #[cfg(test)]
+            checkpoint_allocation_tests::record_rebuild();
             guard.take();
             let mut index = Self::rebuild_from_corpus(corpus_vectors, config)?;
             index.set_last_applied_seq(rebuild_last_applied_seq);
@@ -1383,117 +1385,70 @@ impl VamanaIndex {
                 }
             };
 
-            // Verify checksums of all three segments.
-            let (vhash, _) = match hash_vectors_file(&path.join("vectors.bin")) {
-                Ok(d) => d,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let config = VamanaConfig {
-                        dimensions: commit.index_meta.dimensions,
-                        max_degree: commit.index_meta.max_degree,
-                        search_list_size: commit.index_meta.search_list_size,
-                        alpha: commit.index_meta.alpha,
-                    };
-                    return rebuild_and_persist(&mut publication_guard, config);
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let graph_data = match fs::read(path.join("graph.bin")) {
-                Ok(d) => d,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let config = VamanaConfig {
-                        dimensions: commit.index_meta.dimensions,
-                        max_degree: commit.index_meta.max_degree,
-                        search_list_size: commit.index_meta.search_list_size,
-                        alpha: commit.index_meta.alpha,
-                    };
-                    return rebuild_and_persist(&mut publication_guard, config);
-                }
-                Err(e) => return Err(e.into()),
-            };
-            let lifecycle_data = match fs::read(path.join("lifecycle.bin")) {
-                Ok(d) => d,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let config = VamanaConfig {
-                        dimensions: commit.index_meta.dimensions,
-                        max_degree: commit.index_meta.max_degree,
-                        search_list_size: commit.index_meta.search_list_size,
-                        alpha: commit.index_meta.alpha,
-                    };
-                    return rebuild_and_persist(&mut publication_guard, config);
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            let ghash = *blake3::hash(&graph_data).as_bytes();
-            let lhash = *blake3::hash(&lifecycle_data).as_bytes();
-
-            if vhash != commit.vectors_hash
-                || ghash != commit.graph_hash
-                || lhash != commit.lifecycle_hash
-            {
-                let config = VamanaConfig {
-                    dimensions: commit.index_meta.dimensions,
-                    max_degree: commit.index_meta.max_degree,
-                    search_list_size: commit.index_meta.search_list_size,
-                    alpha: commit.index_meta.alpha,
+            // Keep all temporary segment mappings inside the read phase. A
+            // corrupt snapshot releases them before rebuild_and_persist takes
+            // the writer lock and replaces the incumbent files.
+            let restored = (|| -> Result<Option<Self>> {
+                let (vhash, _) = match hash_vectors_file(&path.join("vectors.bin")) {
+                    Ok(d) => d,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e.into()),
                 };
-                return rebuild_and_persist(&mut publication_guard, config);
-            }
+                let graph_data = match map_checkpoint_segment(&path.join("graph.bin")) {
+                    Ok(d) => d,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                };
+                let lifecycle_data = match map_checkpoint_segment(&path.join("lifecycle.bin")) {
+                    Ok(d) => d,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => return Err(e.into()),
+                };
 
-            // codes.bin is checksum-gated exactly like the other segments whenever the
-            // commit record carries a codes_hash: a missing or altered codes segment
-            // must never reach load_v2_fast's mmap parse, which trusts its header.
-            if let Some(expected) = commit.codes_hash {
-                let codes_ok = hash_file_mmap(&path.join("codes.bin"))
-                    .map(|hash| hash == expected)
-                    .unwrap_or(false);
-                if !codes_ok {
-                    let config = VamanaConfig {
-                        dimensions: commit.index_meta.dimensions,
-                        max_degree: commit.index_meta.max_degree,
-                        search_list_size: commit.index_meta.search_list_size,
-                        alpha: commit.index_meta.alpha,
-                    };
-                    return rebuild_and_persist(&mut publication_guard, config);
+                let ghash = *blake3::hash(&graph_data).as_bytes();
+                let lhash = *blake3::hash(&lifecycle_data).as_bytes();
+                if vhash != commit.vectors_hash
+                    || ghash != commit.graph_hash
+                    || lhash != commit.lifecycle_hash
+                {
+                    return Ok(None);
                 }
-            }
 
-            // Verify corpus fingerprint: dimensions, count, and content hash.
-            let dim = commit.index_meta.dimensions;
-            if dim == 0 || !corpus_vectors.len().is_multiple_of(dim) {
-                let config = VamanaConfig {
-                    dimensions: commit.index_meta.dimensions,
-                    max_degree: commit.index_meta.max_degree,
-                    search_list_size: commit.index_meta.search_list_size,
-                    alpha: commit.index_meta.alpha,
-                };
-                return rebuild_and_persist(&mut publication_guard, config);
-            }
-            let live_count = corpus_vectors.len() / dim;
-            let live_content_hash = *blake3::hash(cast_slice(corpus_vectors)).as_bytes();
+                // A checksum-invalid codes segment never reaches load_v2_fast.
+                if let Some(expected) = commit.codes_hash {
+                    let codes_ok = hash_file_mmap(&path.join("codes.bin"))
+                        .map(|hash| hash == expected)
+                        .unwrap_or(false);
+                    if !codes_ok {
+                        return Ok(None);
+                    }
+                }
 
-            let fp_matches = commit.fingerprint.vector_count == live_count as u64
-                && commit.fingerprint.dimensions == dim as u64
-                && commit.fingerprint.content_hash == live_content_hash;
+                // Verify corpus fingerprint: dimensions, count, and content hash.
+                let dim = commit.index_meta.dimensions;
+                if dim == 0 || !corpus_vectors.len().is_multiple_of(dim) {
+                    return Ok(None);
+                }
+                let live_count = corpus_vectors.len() / dim;
+                let live_content_hash = *blake3::hash(cast_slice(corpus_vectors)).as_bytes();
+                let fp_matches = commit.fingerprint.vector_count == live_count as u64
+                    && commit.fingerprint.dimensions == dim as u64
+                    && commit.fingerprint.content_hash == live_content_hash;
+                if !fp_matches {
+                    return Ok(None);
+                }
 
-            if !fp_matches {
-                let config = VamanaConfig {
-                    dimensions: commit.index_meta.dimensions,
-                    max_degree: commit.index_meta.max_degree,
-                    search_list_size: commit.index_meta.search_list_size,
-                    alpha: commit.index_meta.alpha,
-                };
-                return rebuild_and_persist(&mut publication_guard, config);
-            }
-
-            // Fast path: load all segments, restore lifecycle state.
-            // A corrupt-but-checksum-valid lifecycle segment (e.g. reverse_adj not the inverse
-            // of graph.bin) passes the blake3 gate but fails the new bidirectional check inside
-            // load_v2_fast.  Route that InvalidFormat error through the same corrupt-snapshot →
-            // rebuild path used by the unknown-magic and checksum-mismatch cases above.
-            match Self::load_v2_fast(path, &lifecycle_data) {
-                Ok(index) => Ok(index),
-                Err(VamanaError::InvalidFormat { .. }) => {
+                // Checksum-valid structural corruption also rebuilds, while
+                // ordinary storage errors retain the strict error path.
+                match Self::load_v2_fast(path, &lifecycle_data) {
+                    Ok(index) => Ok(Some(index)),
+                    Err(VamanaError::InvalidFormat { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })()?;
+            match restored {
+                Some(index) => Ok(index),
+                None => {
                     let config = VamanaConfig {
                         dimensions: commit.index_meta.dimensions,
                         max_degree: commit.index_meta.max_degree,
@@ -1502,7 +1457,6 @@ impl VamanaIndex {
                     };
                     rebuild_and_persist(&mut publication_guard, config)
                 }
-                Err(e) => Err(e),
             }
         } else if &metadata_bytes[..8] == METADATA_MAGIC {
             // V1 format: upgrade to v2. Remove any stale staged segments first.
@@ -1558,8 +1512,8 @@ impl VamanaIndex {
         let commit = parse_v2_commit(&metadata_bytes)?;
 
         let (vectors_hash, _) = hash_vectors_file(&path.join("vectors.bin"))?;
-        let graph_data = fs::read(path.join("graph.bin"))?;
-        let lifecycle_data = fs::read(path.join("lifecycle.bin"))?;
+        let graph_data = map_checkpoint_segment(&path.join("graph.bin"))?;
+        let lifecycle_data = map_checkpoint_segment(&path.join("lifecycle.bin"))?;
 
         if vectors_hash != commit.vectors_hash
             || *blake3::hash(&graph_data).as_bytes() != commit.graph_hash
@@ -3122,9 +3076,9 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
         ("graph.bin", commit.graph_hash),
         ("lifecycle.bin", commit.lifecycle_hash),
     ];
-    let mut lifecycle_data: Option<Vec<u8>> = None;
+    let mut lifecycle_data: Option<MappedCheckpointSegment> = None;
     for (name, expected) in segments {
-        let data = match fs::read(path.join(name)) {
+        let data = match map_checkpoint_segment(&path.join(name)) {
             Ok(data) => data,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -3136,9 +3090,9 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
             lifecycle_data = Some(data);
         }
     }
-    let mut codes_data: Option<Vec<u8>> = None;
+    let mut codes_data: Option<MappedCheckpointSegment> = None;
     if let Some(expected) = commit.codes_hash {
-        let data = match fs::read(path.join("codes.bin")) {
+        let data = match map_checkpoint_segment(&path.join("codes.bin")) {
             Ok(data) => data,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
@@ -3229,23 +3183,48 @@ fn validate_v2_structural(
     // per-list shape checks while still violating this — a false in-neighbor corrupts
     // Wolverine delete-repair.
     let adjacency = graph.adjacency();
-    let mut expected: Vec<Vec<u32>> = vec![Vec::new(); num_vectors];
-    for (u, neighbors) in adjacency.iter().enumerate() {
+    let mut incoming_counts = vec![0_usize; num_vectors];
+    for neighbors in adjacency {
         for &v in neighbors {
-            expected[v as usize].push(u as u32);
+            incoming_counts[v as usize] += 1;
         }
     }
-    for e in expected.iter_mut() {
-        e.sort_unstable();
-    }
-    for (v, (exp, got)) in expected
-        .iter()
-        .zip(lifecycle.reverse_adj.iter())
-        .enumerate()
-    {
-        let mut got_sorted = got.clone();
-        got_sorted.sort_unstable();
-        if *exp != got_sorted {
+
+    // Non-medoid forward lists have the configured out-degree bound. The
+    // medoid may exceed it, so use a single sorted forward-list copy there:
+    // checking a legal star must not scan its large list for every destination.
+    let medoid = graph.medoid() as usize;
+    let mut medoid_neighbors = adjacency[medoid].clone();
+    medoid_neighbors.sort_unstable();
+    for (v, got) in lifecycle.reverse_adj.iter().enumerate() {
+        // parse_lifecycle already rejects duplicate parents. Equal cardinality
+        // and inclusion in the true incoming set therefore prove exact equality.
+        let cardinality_matches = incoming_counts[v] == got.len();
+        let parents_match = cardinality_matches
+            && got.iter().all(|&parent| {
+                if parent as usize == medoid {
+                    medoid_neighbors
+                        .binary_search_by(|neighbor| {
+                            #[cfg(all(test, feature = "mmap"))]
+                            checkpoint_allocation_tests::record_medoid_comparison();
+                            neighbor.cmp(&(v as u32))
+                        })
+                        .is_ok()
+                } else {
+                    adjacency[parent as usize].contains(&(v as u32))
+                }
+            });
+        if !parents_match {
+            // Preserve the existing diagnostic without constructing a second
+            // inverse on successful loads. Sources are already in sorted order.
+            let exp: Vec<u32> = adjacency
+                .iter()
+                .enumerate()
+                .filter(|(_, neighbors)| neighbors.contains(&(v as u32)))
+                .map(|(source, _)| source as u32)
+                .collect();
+            let mut got_sorted = got.clone();
+            got_sorted.sort_unstable();
             return Err(VamanaError::invalid_format(format!(
                 "lifecycle.bin reverse_adj[{v}] is not the inverse of graph.bin \
                  forward adjacency: expected {exp:?}, got {got_sorted:?}"
@@ -3896,7 +3875,7 @@ fn encode_graph_inner(graph: &VamanaGraph, medoid_degree_limit: Option<usize>) -
 
 #[cfg(feature = "mmap")]
 fn read_graph(path: &Path, max_degree: usize, num_vectors: usize) -> Result<VamanaGraph> {
-    let data = fs::read(path)?;
+    let data = map_checkpoint_segment(path)?;
     parse_graph(&data, max_degree, num_vectors)
 }
 
@@ -4181,6 +4160,16 @@ pub fn read_commit_fingerprint(path: &Path) -> Result<Option<PersistedFingerprin
 pub fn corpus_content_hash(vectors: &[f32]) -> [u8; 32] {
     *blake3::hash(cast_slice(vectors)).as_bytes()
 }
+
+#[cfg(all(test, feature = "mmap"))]
+#[path = "checkpoint_allocation_tests.rs"]
+mod checkpoint_allocation_tests;
+
+#[cfg(feature = "mmap")]
+#[path = "checkpoint_segment.rs"]
+mod checkpoint_segment;
+#[cfg(feature = "mmap")]
+use checkpoint_segment::{map_checkpoint_segment, MappedCheckpointSegment};
 
 #[cfg(test)]
 #[path = "index_perf_compat_tests.rs"]

@@ -114,15 +114,18 @@ impl SqlEventStore {
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
             let db = crate::timeout_sink::db_label(&self.pool);
+            let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
-                f(&conn).map_err(|e| {
-                    crate::timeout_sink::maybe_emit_busy(
-                        &db,
-                        crate::timeout_sink::Site::StandaloneEvent,
-                        &e,
-                    );
-                    map_err(e, op)
-                })
+                f(&conn)
+                    .map_err(|e| {
+                        crate::timeout_sink::maybe_emit_busy(
+                            &db,
+                            crate::timeout_sink::Site::StandaloneEvent,
+                            &e,
+                        );
+                        map_err(e, op)
+                    })
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
             })
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
@@ -135,7 +138,9 @@ impl SqlEventStore {
                 // Cancellation of the caller must not release the slot before this job ends.
                 let _unit_slot = unit_slot;
                 let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
+                f(guard.conn())
+                    .map_err(|e| map_err(e, op))
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
             })
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
@@ -1513,3 +1518,7 @@ pub(crate) fn ensure_events_schema(conn: &rusqlite::Connection) -> Result<(), ru
 #[cfg(test)]
 #[path = "event_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "event_busy_tests.rs"]
+mod direct_busy_tests;

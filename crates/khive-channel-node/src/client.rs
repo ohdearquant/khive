@@ -12,7 +12,10 @@ use crate::wire::{
     AcknowledgeResponse, AdmissionResponse, BoundedList, ContactResponse, Delivery, MessageState,
     ReceiptItem, RefusalCode, RefusalResponse, ServerTimestamp, StatusResponse,
 };
-use khive_channel::{ChannelError, HoldReason, PendingDetail, ReceiptDisposition, SendOutcome};
+use khive_channel::{
+    ChannelError, HoldReason, PendingDetail, ReceiptDisposition, ReceiptReadFailure, SendOutcome,
+    VerifiedRecipientReceipt,
+};
 use reqwest::{Client, Method, Url};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::value::RawValue;
@@ -59,6 +62,9 @@ struct RawPollPage {
 }
 
 impl NodeClient {
+    pub fn binding(&self) -> &NodeClientBinding {
+        &self.state.binding
+    }
     pub fn new(
         binding: NodeClientBinding,
         service_url: &str,
@@ -320,14 +326,17 @@ impl NodeClient {
             };
             return Ok(match self.verify_sender_receipt(&receipt, Some(&p)).await {
                 ReceiptVerification::Verified(v) => match v.receipt.disposition {
-                    ReceiptDisposition::Stored => {
-                        SendOutcome::RecipientStored(v.receipt.to_channel())
-                    }
+                    ReceiptDisposition::Stored => SendOutcome::RecipientStored(v.into_verified()),
                     ReceiptDisposition::Quarantined => {
-                        SendOutcome::RecipientQuarantined(v.receipt.to_channel())
+                        SendOutcome::RecipientQuarantined(v.into_verified())
                     }
                 },
                 ReceiptVerification::Rejected(reason) => unverified(reason),
+                ReceiptVerification::Unhandled(reason) => {
+                    return Err(NodeError::transport(&format!(
+                        "receipt local state unavailable: {reason:?}"
+                    )));
+                }
             });
         }
         let refusal = serde_json::from_slice::<RefusalResponse>(&r.body).ok();
@@ -369,7 +378,11 @@ impl NodeClient {
                 {
                     Ok(Some(p)) => p,
                     Ok(None) => return rejected(ReceiptRejection::SourceMissing),
-                    Err(_) => return rejected(ReceiptRejection::SourceUnavailable),
+                    Err(_) => {
+                        return ReceiptVerification::Unhandled(
+                            ReceiptReadFailure::SourceUnavailable,
+                        )
+                    }
                 };
                 &fetched
             }
@@ -400,16 +413,21 @@ impl NodeClient {
                 return rejected(ReceiptRejection::FingerprintMismatch)
             }
             Ok(_) => return rejected(ReceiptRejection::PinUnconfirmed),
-            Err(_) => return rejected(ReceiptRejection::PinUnavailable),
+            Err(_) => return ReceiptVerification::Unhandled(ReceiptReadFailure::PinUnavailable),
         };
         if pin.identity() != &identity || pin.fingerprint() != &p.recipient_fingerprint {
             return rejected(ReceiptRejection::FingerprintMismatch);
         }
-        if receipt.verify(&pin.keys().signing).is_err() {
-            return rejected(ReceiptRejection::InvalidSignature);
-        }
+        let verified = match VerifiedRecipientReceipt::verify(
+            receipt.to_channel(),
+            pin.keys().signing.as_bytes(),
+        ) {
+            Ok(verified) => verified,
+            Err(_) => return rejected(ReceiptRejection::InvalidSignature),
+        };
         ReceiptVerification::Verified(VerifiedSenderReceipt {
             receipt: receipt.clone(),
+            verified,
         })
     }
 
@@ -624,7 +642,7 @@ impl NodeClient {
 
 fn unverified(reason: ReceiptRejection) -> SendOutcome {
     SendOutcome::Pending(PendingDetail::ReceiptUnverified {
-        reason: format!("{reason:?}"),
+        reason: reason.as_str().to_owned(),
     })
 }
 fn rejected(reason: ReceiptRejection) -> ReceiptVerification {

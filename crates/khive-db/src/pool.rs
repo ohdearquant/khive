@@ -1,4 +1,7 @@
 //! Connection pool for SQLite: one exclusive writer, N concurrent readers.
+#[path = "pool/writer_acquisition.rs"]
+mod writer_acquisition;
+
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
@@ -975,6 +978,16 @@ impl Drop for ReaderQueryInProgress<'_> {
     }
 }
 
+/// One pool-wide reader admission permit acquired before any connection is
+/// selected, with the instant its checkout wait began so a single
+/// `checkout_timeout` bounds both the permit wait and the connection pick.
+/// Hand it to [`ConnectionPool::reader_with_admission`], which moves the permit
+/// into the resulting [`ReaderGuard`].
+pub(crate) struct ReaderAdmission {
+    slot: tokio::sync::OwnedSemaphorePermit,
+    started: Instant,
+}
+
 /// A reader connection checked out from the pool.
 /// Returns the connection to the pool on drop.
 pub struct ReaderGuard<'pool> {
@@ -1586,6 +1599,11 @@ pub struct WriterAcquisitionSnapshot {
     pub writer_task_acquisitions: u64,
     /// Finite-wait pool writer checkouts that exhausted their deadline.
     pub timeouts: u64,
+    /// Instrumented direct executions whose final returned error retains SQLite's
+    /// primary DatabaseBusy code, once per operation after its busy handler.
+    /// Excludes LOCKED, checkout/open/admission failures, readers, writer tasks,
+    /// infrastructure probes and uninstrumented raw connection escapes.
+    pub direct_busy_refusals: u64,
     /// Every writer-task `BEGIN IMMEDIATE` attempt refused busy or locked,
     /// including refusals a subsequent bounded retry went on to absorb.
     /// Counted separately from `timeouts` because that counter names the
@@ -1619,86 +1637,12 @@ pub(crate) struct WriterAcquisitionCounters {
     standalone_acquisitions: AtomicU64,
     writer_task_acquisitions: AtomicU64,
     pooled_timeouts: AtomicU64,
+    direct_busy_refusals: AtomicU64,
     writer_task_begin_busy: AtomicU64,
     writer_task_begin_busy_absorbed: AtomicU64,
     writer_task_begin_errors: AtomicU64,
     writer_task_request_failures: AtomicU64,
     writer_task_side_effects_unknown: AtomicU64,
-}
-
-impl WriterAcquisitionCounters {
-    pub(crate) fn record_writer_task_acquisition(&self) {
-        self.writer_task_acquisitions
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one writer-task `BEGIN IMMEDIATE` refused busy or locked.
-    /// Called for every such refusal, whether or not a bounded retry goes
-    /// on to absorb it — this is the caller-facing contention count, and it
-    /// alone must equal the number of busy/locked refusals SQLite actually
-    /// returned, independent of retry policy.
-    pub(crate) fn record_writer_task_begin_busy(&self) {
-        self.writer_task_begin_busy.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one busy or locked `BEGIN IMMEDIATE` refusal hidden from the
-    /// caller by a subsequent bounded retry. This counter moves before the
-    /// next BEGIN attempt, in addition to (never instead of) the
-    /// `writer_task_begin_busy` call for the same refusal; it never implies
-    /// that the request closure ran.
-    pub(crate) fn record_writer_task_begin_busy_absorbed(&self) {
-        self.writer_task_begin_busy_absorbed
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one writer-task `BEGIN IMMEDIATE` that failed for any other
-    /// reason. Without this the non-busy arm reproduces, one level down, the
-    /// same silent-failure gap the busy counter closes.
-    pub(crate) fn record_writer_task_begin_error(&self) {
-        self.writer_task_begin_errors
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one dequeued writer-task request that reached the writer seam
-    /// and terminated in error. Called exactly once per such request,
-    /// regardless of which terminal state it produced.
-    pub(crate) fn record_writer_task_request_failure(&self) {
-        self.writer_task_request_failures
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records the subset of [`Self::record_writer_task_request_failure`]
-    /// whose terminal state was `SideEffectsUnknown`. Callers pair this call
-    /// with a `record_writer_task_request_failure()` call for the same
-    /// request rather than in place of it.
-    pub(crate) fn record_writer_task_side_effects_unknown(&self) {
-        self.writer_task_side_effects_unknown
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> WriterAcquisitionSnapshot {
-        let pooled_acquisitions = self.pooled_acquisitions.load(Ordering::Relaxed);
-        let standalone_acquisitions = self.standalone_acquisitions.load(Ordering::Relaxed);
-        let writer_task_acquisitions = self.writer_task_acquisitions.load(Ordering::Relaxed);
-        WriterAcquisitionSnapshot {
-            acquisitions: pooled_acquisitions
-                .saturating_add(standalone_acquisitions)
-                .saturating_add(writer_task_acquisitions),
-            pooled_acquisitions,
-            standalone_acquisitions,
-            writer_task_acquisitions,
-            timeouts: self.pooled_timeouts.load(Ordering::Relaxed),
-            writer_task_begin_busy: self.writer_task_begin_busy.load(Ordering::Relaxed),
-            writer_task_begin_busy_absorbed: self
-                .writer_task_begin_busy_absorbed
-                .load(Ordering::Relaxed),
-            writer_task_begin_errors: self.writer_task_begin_errors.load(Ordering::Relaxed),
-            writer_task_request_failures: self.writer_task_request_failures.load(Ordering::Relaxed),
-            writer_task_side_effects_unknown: self
-                .writer_task_side_effects_unknown
-                .load(Ordering::Relaxed),
-        }
-    }
 }
 
 impl<'pool> WriterGuard<'pool> {
@@ -2025,6 +1969,81 @@ impl ConnectionPool {
             }
             admission_attempt = admission_attempt.saturating_add(1);
         };
+
+        self.reader_with_admission(
+            ReaderAdmission {
+                slot: admission_slot,
+                started,
+            },
+            should_stop,
+        )
+    }
+
+    /// Wait for one pool-wide reader admission permit on the async side, so a
+    /// read that has to queue costs a task and not a blocking-pool thread.
+    ///
+    /// The wait is bounded by `checkout_timeout` and by the current request's
+    /// cancellation and deadline, and it yields the same `Ok(Some)` / `Ok(None)`
+    /// / `Err` outcomes the permit loop in [`Self::reader_until`] does, resolved
+    /// through the same refusal mapping as [`Self::resolve_reader_checkout`].
+    /// Dropping the future abandons the wait without taking a permit.
+    pub(crate) async fn acquire_reader_admission(
+        &self,
+        capability: StorageCapability,
+        operation: &'static str,
+    ) -> Result<ReaderAdmission, StorageError> {
+        let context = khive_storage::capture_request_read_context();
+        let started = Instant::now();
+        let stopped = context.stop_reason().is_some();
+        let outcome: Result<Option<ReaderAdmission>, SqliteError> = if stopped {
+            Ok(None)
+        } else {
+            tokio::select! {
+                biased;
+                _ = context.wait_for_stop() => Ok(None),
+                waited = tokio::time::timeout(
+                    self.config.checkout_timeout,
+                    Arc::clone(&self.sql_bridge_reader_slots).acquire_owned(),
+                ) => match waited {
+                    Ok(Ok(slot)) => Ok(Some(ReaderAdmission { slot, started })),
+                    Ok(Err(_closed)) => Err(SqliteError::InvalidData(
+                        "reader admission semaphore is closed".to_string(),
+                    )),
+                    Err(_elapsed) => {
+                        self.reader_acquisition_counters.record_checkout_timeout();
+                        Err(pool_exhausted_error(
+                            self.config.checkout_timeout,
+                            self.max_readers,
+                        ))
+                    }
+                },
+            }
+        };
+        match outcome {
+            Ok(Some(admission)) => Ok(admission),
+            Ok(None) => Err(self.reader_checkout_refusal(capability, operation, None)),
+            Err(error) => Err(self.reader_checkout_refusal(capability, operation, Some(error))),
+        }
+    }
+
+    /// Select the reader connection for an admission permit already held.
+    ///
+    /// This is [`Self::reader_until`] after its permit loop: the same
+    /// `should_stop` polling, the same `Ok(Some)` / `Ok(None)` / `Err`
+    /// outcomes, and the remainder of the one `checkout_timeout` that began
+    /// when the permit wait did.
+    pub(crate) fn reader_with_admission<C>(
+        &self,
+        admission: ReaderAdmission,
+        should_stop: C,
+    ) -> Result<Option<ReaderGuard<'_>>, SqliteError>
+    where
+        C: Fn() -> bool,
+    {
+        let ReaderAdmission {
+            slot: admission_slot,
+            started,
+        } = admission;
 
         if self.max_readers == 0 {
             self.ensure_pooled_writer_active()?;
@@ -2458,21 +2477,35 @@ impl ConnectionPool {
                 guard.label_operation(operation);
                 Ok(guard)
             }
-            Ok(None) => Err(StorageError::Timeout {
+            Ok(None) => Err(self.reader_checkout_refusal(capability, operation, None)),
+            Err(error) => Err(self.reader_checkout_refusal(capability, operation, Some(error))),
+        }
+    }
+
+    /// The refusal for a reader checkout that produced nothing, shared by
+    /// [`Self::resolve_reader_checkout`] and [`Self::acquire_reader_admission`]
+    /// so the arms documented on the former have one home. `None` is the
+    /// stopped-request arm; `Some` carries the failed checkout's error.
+    fn reader_checkout_refusal(
+        &self,
+        capability: StorageCapability,
+        operation: &'static str,
+        error: Option<SqliteError>,
+    ) -> StorageError {
+        let Some(error) = error else {
+            return StorageError::Timeout {
                 operation: operation.into(),
-            }),
-            Err(error) => {
-                let is_pool_exhausted = matches!(
-                    &error,
-                    SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
-                        if code.code == rusqlite::ErrorCode::DatabaseBusy
-                );
-                if is_pool_exhausted {
-                    Err(self.reader_admission_timeout(operation))
-                } else {
-                    Err(StorageError::driver(capability, operation, error))
-                }
-            }
+            };
+        };
+        let is_pool_exhausted = matches!(
+            &error,
+            SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        );
+        if is_pool_exhausted {
+            self.reader_admission_timeout(operation)
+        } else {
+            StorageError::driver(capability, operation, error)
         }
     }
 
@@ -6455,6 +6488,7 @@ mod tests {
                 standalone_acquisitions: 1,
                 writer_task_acquisitions: 0,
                 timeouts: 0,
+                direct_busy_refusals: 0,
                 writer_task_begin_busy: 0,
                 writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
@@ -6983,6 +7017,7 @@ mod tests {
                 standalone_acquisitions: 0,
                 writer_task_acquisitions: 0,
                 timeouts: 1,
+                direct_busy_refusals: 0,
                 // A pool-mutex checkout timeout must NOT bleed into the
                 // writer-task BEGIN counters: separate stages, separate
                 // counters. This is the mislabeling guard in assertion form.
@@ -7004,6 +7039,7 @@ mod tests {
                 standalone_acquisitions: 0,
                 writer_task_acquisitions: 0,
                 timeouts: 1,
+                direct_busy_refusals: 0,
                 writer_task_begin_busy: 0,
                 writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,

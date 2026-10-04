@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Breaking Rust API change: `khive-channel-node::ReceiptRejection` now aliases
+  `khive_channel::ReceiptRejectionReason`; local `PinUnavailable` and `SourceUnavailable`
+  failures use `ReceiptVerification::Unhandled(ReceiptReadFailure)` instead of rejection.
+  Poll/status callers must retain the receipt cursor for those read failures. Submission
+  pin or outbound-record read failures return transient transport errors; retain the
+  pending message and retry when local state is available.
+- Breaking Rust API change: `khive-channel::SendOutcome::RecipientStored` and
+  `RecipientQuarantined` now carry `VerifiedRecipientReceipt` instead of
+  `DeliveryReceipt`. Verify with the pinned recipient key through
+  `VerifiedRecipientReceipt::verify` and inspect the payload through `receipt()`.
+  `VerifiedRecipientReceipt` and `ReceiptVerificationError` move from
+  `khive_runtime::comm_transport` to `khive_channel`; update those imports.
 - Legacy write methods that previously returned `Ok(record)` when the embedder bounded their input
   now return an error that carries `committed=true`, the committed `record_id` and the serialized
   truncation report, with `retryable=false`. The stored record is complete, so reconcile by

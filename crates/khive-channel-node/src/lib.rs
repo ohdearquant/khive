@@ -1,6 +1,7 @@
 //! Node wire protocol v1 encodings, cryptography, and HTTPS calls.
 //! Contact confirmation, key persistence, and message commits belong to callers.
 
+pub mod adapter;
 pub mod client;
 pub mod pins;
 pub mod response;

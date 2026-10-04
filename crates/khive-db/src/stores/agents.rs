@@ -231,14 +231,21 @@ impl SqlAgentStore {
             .record_direct_route(crate::timeout_sink::Site::DirectRouteAgentGeneralWrite);
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Sql, op, e))?
+            let pool = Arc::clone(&self.pool);
+            tokio::task::spawn_blocking(move || {
+                f(&conn)
+                    .map_err(|e| map_err(e, op))
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
+            })
+            .await
+            .map_err(|e| StorageError::driver(StorageCapability::Sql, op, e))?
         } else {
             let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
                 let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
+                f(guard.conn())
+                    .map_err(|e| map_err(e, op))
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
             })
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Sql, op, e))?
@@ -413,3 +420,7 @@ pub(crate) fn ensure_agents_schema(conn: &rusqlite::Connection) -> Result<(), ru
 #[cfg(test)]
 #[path = "agents_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "agents_busy_tests.rs"]
+mod direct_busy_tests;

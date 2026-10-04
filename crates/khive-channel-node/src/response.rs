@@ -6,7 +6,8 @@ use crate::wire::{
     WireDecodeError,
 };
 use crate::ProtocolError;
-use khive_channel::ChannelError;
+pub use khive_channel::ReceiptRejectionReason as ReceiptRejection;
+use khive_channel::{ChannelError, ReceiptReadFailure, VerifiedRecipientReceipt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -113,30 +114,27 @@ impl NodeDelivery {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReceiptRejection {
-    SourceMissing,
-    SourceUnavailable,
-    SourceMismatch,
-    BindingMismatch,
-    PinUnavailable,
-    PinUnconfirmed,
-    FingerprintMismatch,
-    InvalidSignature,
-}
 #[derive(Debug)]
 pub struct VerifiedSenderReceipt {
     pub(crate) receipt: WireReceipt,
+    pub(crate) verified: VerifiedRecipientReceipt,
 }
 impl VerifiedSenderReceipt {
     pub fn receipt(&self) -> &WireReceipt {
         &self.receipt
     }
+    pub fn into_verified(self) -> VerifiedRecipientReceipt {
+        self.verified
+    }
 }
+// Keep the parsed receipt and verified proof inline to preserve the by-value API
+// and avoid an extra allocation for every verified receipt.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ReceiptVerification {
     Verified(VerifiedSenderReceipt),
     Rejected(ReceiptRejection),
+    Unhandled(ReceiptReadFailure),
 }
 #[derive(Debug)]
 pub struct NodeReceiptResult {

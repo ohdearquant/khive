@@ -56,6 +56,8 @@ impl PersistedSubmission {
 pub struct SourceError(pub String);
 
 /// Implementations resolve the current persisted envelope for their bound namespace and slug.
+/// Keep the row's recipient epoch and fingerprint available through its receipt
+/// retention; a later key rotation does not replace those recorded identifiers.
 #[async_trait]
 pub trait OutboundSource: Send + Sync {
     async fn current(&self, logical_id: Uuid) -> Result<Option<PersistedSubmission>, SourceError>;

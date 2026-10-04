@@ -7,6 +7,13 @@
 
 mod signing;
 pub use signing::{ReceiptSignatureError, ReceiptSigningPublicKey};
+mod verified_receipt;
+pub use verified_receipt::{ReceiptVerificationError, VerifiedRecipientReceipt};
+mod sender_receipt;
+pub use sender_receipt::{
+    ReceiptReadFailure, ReceiptRejectionReason, SenderReceiptClaim, SenderReceiptResult,
+    LOGICAL_MESSAGE_ID_METADATA_KEY,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -338,14 +345,22 @@ pub fn receipt_signing_input(receipt: &DeliveryReceipt) -> Result<Vec<u8>, Recei
 }
 
 /// Result of a receipt-aware outbound submission.
+/// A raw receipt cannot assert recipient commitment:
+///
+/// ```compile_fail
+/// use khive_channel::{DeliveryReceipt, SendOutcome};
+/// fn outcome(receipt: DeliveryReceipt) {
+///     let _ = SendOutcome::RecipientStored(receipt);
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendOutcome {
     /// The legacy adapter accepted the send; not a recipient commit receipt.
     LegacyAccepted,
     /// The sender retains the message until a verified recipient receipt arrives.
     Pending(PendingDetail),
-    RecipientStored(DeliveryReceipt),
-    RecipientQuarantined(DeliveryReceipt),
+    RecipientStored(VerifiedRecipientReceipt),
+    RecipientQuarantined(VerifiedRecipientReceipt),
 }
 
 /// Admission or hold information retained while waiting for a verified recipient receipt.
@@ -378,13 +393,15 @@ impl SendOutcome {
     /// proof of delivery. This check performs none of those protocol operations.
     pub fn validate_receipt(&self) -> Result<(), ChannelError> {
         match self {
-            Self::RecipientStored(receipt) if receipt.disposition != ReceiptDisposition::Stored => {
+            Self::RecipientStored(receipt)
+                if receipt.receipt().disposition != ReceiptDisposition::Stored =>
+            {
                 Err(ChannelError::InvalidEnvelope(
                     "recipient_stored outcome requires a stored receipt".into(),
                 ))
             }
             Self::RecipientQuarantined(receipt)
-                if receipt.disposition != ReceiptDisposition::Quarantined =>
+                if receipt.receipt().disposition != ReceiptDisposition::Quarantined =>
             {
                 Err(ChannelError::InvalidEnvelope(
                     "recipient_quarantined outcome requires a quarantined receipt".into(),
@@ -442,6 +459,8 @@ impl InboundReceiptTicket {
 pub struct DeliveryPage {
     page: ChannelPollPage,
     tickets: Vec<Option<InboundReceiptTicket>>,
+    receipt_results: Vec<SenderReceiptResult>,
+    receipts_cursor: Option<u64>,
 }
 
 impl DeliveryPage {
@@ -456,13 +475,37 @@ impl DeliveryPage {
                 tickets.len(),
             )));
         }
-        Ok(Self { page, tickets })
+        Ok(Self {
+            page,
+            tickets,
+            receipt_results: Vec::new(),
+            receipts_cursor: None,
+        })
+    }
+
+    /// Attach sender receipt results and their independent cursor to a checked page.
+    /// `None` means this transport has no receipt cursor; `Some(0)` is a node cursor.
+    pub fn new_with_receipts(
+        page: ChannelPollPage,
+        tickets: Vec<Option<InboundReceiptTicket>>,
+        receipt_results: Vec<SenderReceiptResult>,
+        receipts_cursor: Option<u64>,
+    ) -> Result<Self, ChannelError> {
+        let mut result = Self::new(page, tickets)?;
+        result.receipt_results = receipt_results;
+        result.receipts_cursor = receipts_cursor;
+        Ok(result)
     }
 
     /// Preserve a legacy page, including its checkpoint, with no receipt tickets.
     pub fn legacy(page: ChannelPollPage) -> Self {
         let tickets = (0..page.envelopes.len()).map(|_| None).collect();
-        Self { page, tickets }
+        Self {
+            page,
+            tickets,
+            receipt_results: Vec::new(),
+            receipts_cursor: None,
+        }
     }
 
     pub fn page(&self) -> &ChannelPollPage {
@@ -473,11 +516,38 @@ impl DeliveryPage {
         &self.tickets
     }
 
+    pub fn receipt_results(&self) -> &[SenderReceiptResult] {
+        &self.receipt_results
+    }
+
+    pub fn receipts_cursor(&self) -> Option<u64> {
+        self.receipts_cursor
+    }
+
     /// Consume the page to transfer its envelopes and their aligned ticket slots.
     /// The consumer owns preserving that pairing and validating binding/replay
     /// before ingest; the page can no longer enforce alignment after consumption.
+    /// Sender receipt results are discarded; receipt-aware consumers use
+    /// [`Self::into_receipt_parts`] instead.
     pub fn into_parts(self) -> (ChannelPollPage, Vec<Option<InboundReceiptTicket>>) {
         (self.page, self.tickets)
+    }
+
+    /// Consume both independent streams while retaining the envelope-ticket pairing.
+    pub fn into_receipt_parts(
+        self,
+    ) -> (
+        ChannelPollPage,
+        Vec<Option<InboundReceiptTicket>>,
+        Vec<SenderReceiptResult>,
+        Option<u64>,
+    ) {
+        (
+            self.page,
+            self.tickets,
+            self.receipt_results,
+            self.receipts_cursor,
+        )
     }
 }
 
@@ -786,6 +856,20 @@ mod tests {
         }
     }
 
+    fn verified_receipt(disposition: ReceiptDisposition) -> VerifiedRecipientReceipt {
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        let mut receipt = receipt(disposition);
+        receipt.binding.sender_agent_id = Uuid::nil().to_string();
+        receipt.binding.recipient_agent_id = Uuid::nil().to_string();
+        let key = Ed25519KeyPair::from_seed_unchecked(&[17; 32]).unwrap();
+        receipt.signature = key
+            .sign(&receipt_signing_input(&receipt).unwrap())
+            .as_ref()
+            .to_vec();
+        let pinned: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        VerifiedRecipientReceipt::verify(receipt, &pinned).unwrap()
+    }
+
     #[tokio::test]
     async fn receipt_defaults_preserve_legacy_send_and_poll() {
         let envelope = ChannelEnvelope::new("legacy:sender", "legacy:recipient", "body")
@@ -815,6 +899,8 @@ mod tests {
             );
         }
         let deliveries = channel.poll_deliveries(Utc::now(), None).await.unwrap();
+        assert!(deliveries.receipt_results().is_empty());
+        assert_eq!(deliveries.receipts_cursor(), None);
         assert_eq!(deliveries.tickets().len(), 1);
         assert!(deliveries.tickets().iter().all(Option::is_none));
         let (page, tickets) = deliveries.into_parts();
@@ -922,6 +1008,8 @@ mod tests {
             })
         );
         assert!(page.tickets()[0].is_none());
+        assert!(page.receipt_results().is_empty());
+        assert_eq!(page.receipts_cursor(), None);
     }
 
     #[test]
@@ -955,7 +1043,6 @@ mod tests {
     #[test]
     fn receipt_disposition_is_closed_and_outcomes_must_agree() {
         let stored = receipt(ReceiptDisposition::Stored);
-        let quarantined = receipt(ReceiptDisposition::Quarantined);
         assert!(SendOutcome::LegacyAccepted.validate_receipt().is_ok());
         assert!(SendOutcome::Pending(PendingDetail::Admitted {
             admitted_at: Utc::now(),
@@ -977,16 +1064,20 @@ mod tests {
         })
         .validate_receipt()
         .is_ok());
-        assert!(SendOutcome::RecipientStored(stored.clone())
+        let verified_stored = verified_receipt(ReceiptDisposition::Stored);
+        let verified_quarantined = verified_receipt(ReceiptDisposition::Quarantined);
+        assert!(SendOutcome::RecipientStored(verified_stored.clone())
             .validate_receipt()
             .is_ok());
-        assert!(SendOutcome::RecipientQuarantined(quarantined.clone())
-            .validate_receipt()
-            .is_ok());
-        assert!(SendOutcome::RecipientStored(quarantined)
+        assert!(
+            SendOutcome::RecipientQuarantined(verified_quarantined.clone())
+                .validate_receipt()
+                .is_ok()
+        );
+        assert!(SendOutcome::RecipientStored(verified_quarantined)
             .validate_receipt()
             .is_err());
-        assert!(SendOutcome::RecipientQuarantined(stored.clone())
+        assert!(SendOutcome::RecipientQuarantined(verified_stored)
             .validate_receipt()
             .is_err());
         let mut value = serde_json::to_value(&stored).unwrap();

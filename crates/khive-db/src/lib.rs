@@ -51,6 +51,9 @@ pub mod walpin;
 /// Single-writer task and bounded write queue (ADR-067 Component A).
 pub mod writer_task;
 
+#[cfg(test)]
+mod writer_busy_fixture;
+
 pub use backend::StorageBackend;
 pub use checkpoint::{
     checkpoint_once, run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner,
@@ -96,3 +99,6 @@ mod stream_schema_tests;
 
 #[cfg(test)]
 mod reader_lease_tests;
+
+#[cfg(test)]
+mod raw_sql_reader_admission_tests;

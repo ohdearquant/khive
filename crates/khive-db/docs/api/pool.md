@@ -152,14 +152,18 @@ registry tests for defense-in-depth against cross-test interference.
 
 ## Pooled reader routing and raw-SQL exception budget
 
-Every typed store read uses `ConnectionPool::reader_until` for both file-backed
-and in-memory databases. A file-backed `SqlAccess::reader()` is only a logical
+Every typed store read waits for its permit on the async side with
+`ConnectionPool::acquire_reader_admission`, so a read that has to queue holds a
+task and not a blocking-pool thread, then selects its connection with
+`ConnectionPool::reader_with_admission`, for both file-backed and in-memory
+databases. A file-backed `SqlAccess::reader()` is only a logical
 handle: constructing or retaining it opens no SQLite connection. Its ordinary
 `query_row`, `query_all`, and `query_page` calls check out one pooled reader for
 the operation and return it only after statement finalization, callback cleanup,
 and connection reset/replacement. Ordinary reads through a queue-backed
 `SqlWriter` use the same route. There is no standalone fallback after pool
-saturation.
+saturation. A raw-SQL read waits for its permit the same way, so raw-SQL and
+typed reads are admitted in arrival order.
 
 The pool-wide reader admission budget is the effective `max_readers` (minimum
 one in degraded in-memory mode). Pooled guards and the explicit raw-SQL
