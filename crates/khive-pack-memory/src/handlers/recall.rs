@@ -15,7 +15,7 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::{Direction, EdgeFilter, NeighborQuery, PageRequest};
+use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
 use khive_types::{Details, KhiveError};
 
@@ -972,26 +972,24 @@ impl MemoryPack {
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
             if !candidate_ids.is_empty() {
                 let graph = self.runtime.graph(token)?;
-                for candidate_id in candidate_ids {
-                    let edges = graph
-                        .query_edges(
-                            EdgeFilter {
-                                target_ids: vec![candidate_id],
-                                relations: vec![EdgeRelation::Supersedes],
-                                ..EdgeFilter::default()
-                            },
-                            vec![],
-                            PageRequest {
-                                offset: 0,
-                                limit: 1,
-                            },
-                        )
-                        .await?;
-                    khive_storage::ensure_request_read_active("memory.recall")?;
-                    if !edges.items.is_empty() {
-                        superseded_by_edge.insert(candidate_id);
-                    }
-                }
+                // One batched read for every candidate; the first element of each
+                // returned pair is the requested candidate that has an incoming
+                // `supersedes` edge.
+                superseded_by_edge = graph
+                    .batch_neighbors(
+                        &candidate_ids,
+                        NeighborQuery {
+                            direction: Direction::In,
+                            relations: Some(vec![EdgeRelation::Supersedes]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|(candidate_id, _)| candidate_id)
+                    .collect();
+                khive_storage::ensure_request_read_active("memory.recall")?;
             }
 
             let superseded_ids: HashSet<Uuid> = superseded_by_prop
