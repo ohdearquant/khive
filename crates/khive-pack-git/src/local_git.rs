@@ -14,6 +14,9 @@ use serde::Serialize;
 use crate::git_env;
 use crate::write_argv::{validate_message, validate_ref_name};
 
+#[path = "local_git_checkout_batch.rs"]
+mod checkout_batch;
+
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 /// Settings only local invocations carry, passed after `git_env::SHARED_SETTINGS`.
 const HARDENING: &[&str] = &[
@@ -702,22 +705,32 @@ pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) ->
     // Validate every mode and path before producing any manifest entries.
     let listed = parse_listing(&listing)?;
     let store = tree::blob_store(rt)?;
+    checkout_batch::admit_manifest(&listed)?;
     let mut entries = Vec::with_capacity(listed.len());
+    let mut reader = if listed.is_empty() {
+        None
+    } else {
+        Some(checkout_batch::BlobReader::start(program, repo, &listed, &mut filters).await?)
+    };
     for entry in listed {
-        let bytes = run_async_with_snapshot(
-            program,
-            repo,
-            &["cat-file", "blob", &entry.oid],
-            None,
-            &mut filters,
-        )
-        .await?;
-        let content_ref = store.put(bytes).await?;
+        let frame = reader
+            .as_mut()
+            .expect("nonempty tree has a blob reader")
+            .next()
+            .await?;
+        let content_ref = store.put(frame.bytes).await?;
+        frame
+            .consumed
+            .send(())
+            .map_err(|_| LocalGitError::after_start("cat-file", false))?;
         entries.push(TreeEntry {
             path: entry.path,
             content_ref: content_ref.as_str().to_string(),
             mode: entry.mode,
         });
+    }
+    if let Some(reader) = reader {
+        reader.finish().await?;
     }
     let value = tree::entries_json(&entries);
     let manifest = serde_json::json!({"schema": "khive-tree/v1", "entries": &value});
