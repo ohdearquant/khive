@@ -179,9 +179,10 @@ pub struct MoveCounts {
     /// state is never carried, so these are the rows an operator still has to
     /// decide about; `left_behind` counts every row that stayed.
     pub live_policies_left_behind: u64,
-    /// Tool grant rows left in the source that have not expired at the instant
-    /// the move judged them (see [`MoveRequest::now_micros`]).
-    pub unexpired_grants_left_behind: u64,
+    /// Tool grant rows left in the source that are in force at the instant the
+    /// move judged them (see [`MoveRequest::now_micros`]): granted, not
+    /// invalidated by a registration, and not expired.
+    pub grants_in_force_left_behind: u64,
 }
 
 /// A note that cannot move, and its position in the stream that pins it.

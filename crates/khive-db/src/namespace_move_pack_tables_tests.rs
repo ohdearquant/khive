@@ -178,6 +178,17 @@ fn grant(conn: &Connection, id: &str, namespace: &str, expires_at: Option<i64>) 
     .expect("seed grant");
 }
 
+/// A grant in any state, with no expiry and no invalidation.
+fn grant_with_status(conn: &Connection, id: &str, namespace: &str, status: &str) {
+    conn.execute(
+        "INSERT INTO tool_grants \
+         (id, namespace, actor, tool, status, requested_at) \
+         VALUES (?1, ?2, 'actor', ?1, ?3, 1)",
+        rusqlite::params![id, namespace, status],
+    )
+    .expect("seed grant");
+}
+
 fn ns(conn: &Connection, table: &str, id: &str) -> String {
     conn.query_row(
         &format!("SELECT namespace FROM {table} WHERE id = ?1"),
@@ -597,7 +608,7 @@ fn a_total_move_carries_receipts_and_leaves_authorization_rows_where_they_are() 
     assert_eq!(counts.left_behind.get("tool_policy"), Some(&3));
     assert_eq!(counts.left_behind.get("tool_grants"), Some(&4));
     assert_eq!(counts.live_policies_left_behind, 2);
-    assert_eq!(counts.unexpired_grants_left_behind, 2);
+    assert_eq!(counts.grants_in_force_left_behind, 2);
     assert_eq!(ns(&conn, "tool_policy", "policy-live"), "source");
     assert_eq!(ns(&conn, "tool_grants", "grant-open"), "source");
     assert_eq!(image(&conn, "tool_policy", "policy-live"), policy_before);
@@ -607,6 +618,10 @@ fn a_total_move_carries_receipts_and_leaves_authorization_rows_where_they_are() 
 #[test]
 fn a_partitioning_move_leaves_all_five_tables_and_reports_each_count() {
     let conn = seeded_source();
+    // Two unexpired grants that were never in force: they stay and are counted
+    // in `left_behind`, and the count of grants in force does not move.
+    grant_with_status(&conn, "grant-undecided", "source", "requested");
+    grant_with_status(&conn, "grant-revoked", "source", "revoked");
     let policy_before = image(&conn, "tool_policy", "policy-live");
     let grant_before = image(&conn, "tool_grants", "grant-open");
 
@@ -618,7 +633,7 @@ fn a_partitioning_move_leaves_all_five_tables_and_reports_each_count() {
         ("exec_events", 3),
         ("git_receipts", 1),
         ("tool_policy", 3),
-        ("tool_grants", 4),
+        ("tool_grants", 6),
     ] {
         assert_eq!(counts.left_behind.get(table), Some(&left), "{table}");
         assert!(!counts.rows.contains_key(table), "{table}");
@@ -627,7 +642,7 @@ fn a_partitioning_move_leaves_all_five_tables_and_reports_each_count() {
     assert_eq!(ns(&conn, "git_receipts", "receipt-1"), "source");
     assert_eq!(events_matching_their_run(&conn, "source"), 3);
     assert_eq!(counts.live_policies_left_behind, 2);
-    assert_eq!(counts.unexpired_grants_left_behind, 2);
+    assert_eq!(counts.grants_in_force_left_behind, 2);
     assert_eq!(image(&conn, "tool_policy", "policy-live"), policy_before);
     assert_eq!(image(&conn, "tool_grants", "grant-open"), grant_before);
 }
@@ -643,7 +658,7 @@ fn a_store_without_the_receipt_and_authorization_tables_moves_as_before() {
     assert_eq!(counts.subjects.get("note:observation"), Some(&1));
     assert!(counts.left_behind.is_empty(), "{:?}", counts.left_behind);
     assert_eq!(counts.live_policies_left_behind, 0);
-    assert_eq!(counts.unexpired_grants_left_behind, 0);
+    assert_eq!(counts.grants_in_force_left_behind, 0);
 }
 
 #[test]
@@ -658,7 +673,7 @@ fn leaving_live_authorization_rows_logs_one_warning_with_the_counts() {
     for expected in [
         "namespace=\"source\"",
         "live_policies=2",
-        "unexpired_grants=2",
+        "grants_in_force=2",
     ] {
         assert!(
             warnings[0].contains(expected),
@@ -688,7 +703,34 @@ fn authorization_rows_that_are_all_dead_stay_without_a_warning() {
     assert_eq!(counts.left_behind.get("tool_policy"), Some(&1));
     assert_eq!(counts.left_behind.get("tool_grants"), Some(&1));
     assert_eq!(counts.live_policies_left_behind, 0);
-    assert_eq!(counts.unexpired_grants_left_behind, 0);
+    assert_eq!(counts.grants_in_force_left_behind, 0);
+}
+
+#[test]
+fn grants_that_are_not_in_force_stay_without_a_warning() {
+    let conn = store(&[TOOL_POLICY_DDL, TOOL_GRANTS_DDL]);
+    seed_note(&conn, "n1", "source", "observation");
+    policy(&conn, "policy-gone", "source", Some(5));
+    grant_with_status(&conn, "grant-undecided", "source", "requested");
+    grant_with_status(&conn, "grant-denied", "source", "denied");
+    grant_with_status(&conn, "grant-revoked", "source", "revoked");
+    grant(&conn, "grant-invalidated", "source", None);
+    conn.execute(
+        "UPDATE tool_grants SET invalidated_by_registry_id = 'registry-1', \
+         invalidated_at = 7 WHERE id = 'grant-invalidated'",
+        [],
+    )
+    .expect("invalidate grant");
+
+    let request = observation_request().at(NOW);
+    let (outcome, warnings) = warnings_of(|| move_namespace(&conn, &request));
+    let counts = outcome.expect("the move succeeds");
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(counts.left_behind.get("tool_policy"), Some(&1));
+    assert_eq!(counts.left_behind.get("tool_grants"), Some(&4));
+    assert_eq!(counts.live_policies_left_behind, 0);
+    assert_eq!(counts.grants_in_force_left_behind, 0);
 }
 
 #[test]
@@ -700,7 +742,7 @@ fn grant_expiry_is_judged_at_the_instant_the_request_carries() {
         let request = observation_request().at(now);
         let counts = move_namespace(&conn, &request).expect("nothing is routed in this source");
 
-        assert_eq!(counts.unexpired_grants_left_behind, want, "now = {now}");
+        assert_eq!(counts.grants_in_force_left_behind, want, "now = {now}");
     }
 }
 
@@ -714,7 +756,7 @@ fn without_an_instant_grant_expiry_is_judged_at_the_wall_clock() {
     let counts = move_namespace(&conn, &request).expect("nothing is routed in this source");
 
     assert_eq!(counts.left_behind.get("tool_grants"), Some(&2));
-    assert_eq!(counts.unexpired_grants_left_behind, 1);
+    assert_eq!(counts.grants_in_force_left_behind, 1);
 }
 
 /// `idx_exec_runs_session_seq` is a partial unique index, and the collision

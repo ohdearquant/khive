@@ -119,10 +119,14 @@ pub(super) fn settle_pack_tables(
 ///
 /// `left_behind` counts every row that stayed. The two counts on the result are
 /// the ones an operator acts on: a policy row is in force until it is
-/// soft-deleted, and a grant row until it expires. Both tests restate what the
-/// tool pack reads (`deleted_at IS NULL`, and `expires_at IS NULL OR expires_at >
-/// now`) because this crate cannot depend on the pack; `khive-pack-tool` pins
-/// them against the pack's own writers and readers.
+/// soft-deleted, and a grant row while it is granted, not invalidated by a
+/// registration and not expired. Both tests restate what the tool pack reads
+/// (`deleted_at IS NULL` for a policy; for a grant `status = 'granted'`,
+/// `expires_at IS NULL OR expires_at > now` and both invalidation columns
+/// NULL) because this crate cannot depend on the pack; `khive-pack-tool` pins
+/// them against the pack's own writers and readers. The pack also matches a
+/// grant's registry pin against the tool's current registration, which this
+/// crate cannot read, so a pinned grant that no longer matches still counts.
 ///
 /// The instant comes from the request, so a test chooses it. Without one it is
 /// the wall clock at the call.
@@ -154,21 +158,23 @@ fn leave_authorization_behind(
         let left = count_in_namespace(conn, GRANTS, source)?;
         if left > 0 {
             counts.left_behind.insert(GRANTS.to_string(), left);
-            let unexpired = conn.query_row(
+            let in_force = conn.query_row(
                 "SELECT COUNT(*) FROM tool_grants \
-                 WHERE namespace = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
+                 WHERE namespace = ?1 AND status = 'granted' \
+                 AND (expires_at IS NULL OR expires_at > ?2) \
+                 AND invalidated_by_registry_id IS NULL AND invalidated_at IS NULL",
                 rusqlite::params![source, now_micros],
                 |row| row.get::<_, i64>(0),
             )? as u64;
-            counts.unexpired_grants_left_behind = unexpired;
+            counts.grants_in_force_left_behind = in_force;
         }
     }
 
-    if counts.live_policies_left_behind > 0 || counts.unexpired_grants_left_behind > 0 {
+    if counts.live_policies_left_behind > 0 || counts.grants_in_force_left_behind > 0 {
         tracing::warn!(
             namespace = source,
             live_policies = counts.live_policies_left_behind,
-            unexpired_grants = counts.unexpired_grants_left_behind,
+            grants_in_force = counts.grants_in_force_left_behind,
             "a namespace move left authorization rows in the source namespace"
         );
     }
