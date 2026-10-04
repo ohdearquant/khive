@@ -2234,6 +2234,7 @@ name = "khive-fs"
 version = "0.9.0"
 dependencies = [
  "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
