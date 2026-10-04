@@ -19,7 +19,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = REPO_ROOT / ".gitleaks.toml"
 CACHE_PATH = "crates/khive-pack-git/src/cache.rs"
 CACHE_VALUES = ("abcdef0123456789", "fedcba9876543210")
-GATE_PATH = "crates/khive-runtime/src/secret_gate.rs"
+GATE_HISTORY_PATH = "crates/khive-runtime/src/secret_gate.rs"
+GATE_PATH = "crates/khive-runtime/src/secret_gate_tests.rs"
+GATE_PATHS = (GATE_HISTORY_PATH, GATE_PATH)
 GATE_VALUES = ("a3f5c2e9d1b8047e63a1f4c2d5b6e8f1a9c3d2e4", "Xk9mZ2vQpLrT8nJwYuA/HfBsDcGiONvMabcdefgh")
 GITLEAKS = shutil.which("gitleaks")
 
@@ -179,7 +181,8 @@ class GitleaksConfigTests(unittest.TestCase):
 
 
     def test_gate_constants_are_exempt_at_the_gate_path(self):
-        self.write_values(GATE_PATH, GATE_VALUES)
+        for path in GATE_PATHS:
+            self.write_values(path, GATE_VALUES)
         self.assertEqual(self.scan(expected_exit=0), [])
 
     def baseline_findings(self):
@@ -200,22 +203,24 @@ class GitleaksConfigTests(unittest.TestCase):
     def test_gate_constants_are_not_exempt_at_other_paths(self):
         paths = (
             "crates/khive-runtime/src/other.rs",
-            "prefix/" + GATE_PATH,
-            GATE_PATH + ".bak",
+            "crates/khive-runtime/src/secret_gate/corpus_replay_tests.rs",
+            *("prefix/" + path for path in GATE_PATHS),
+            *(path + ".bak" for path in GATE_PATHS),
         )
         for path in paths:
             self.write_values(path, GATE_VALUES)
-        self.write_values(GATE_PATH, GATE_VALUES)  # the exempt site coexists
+        for path in GATE_PATHS:
+            self.write_values(path, GATE_VALUES)  # both exact sites coexist
         baseline = self.baseline_findings()
         self.assertEqual(
-            {row["File"] for row in baseline}, set(paths) | {GATE_PATH},
+            {row["File"] for row in baseline}, set(paths) | set(GATE_PATHS),
             "control: without the exemption every path must report, or this arm proves nothing",
         )
         findings = self.scan(expected_exit=1)
         self.assertEqual({row["File"] for row in findings}, set(paths))
         self.assertEqual(
             {row["Fingerprint"] for row in findings},
-            {row["Fingerprint"] for row in baseline if row["File"] != GATE_PATH},
+            {row["Fingerprint"] for row in baseline if row["File"] not in GATE_PATHS},
             "the exemption must remove the exempt path's findings and nothing else",
         )
 
@@ -227,11 +232,12 @@ class GitleaksConfigTests(unittest.TestCase):
             "ff" + GATE_VALUES[1],
             "".join(reversed(GATE_VALUES[0])),
         )
-        self.write_values(GATE_PATH, neighbours)
+        for path in GATE_PATHS:
+            self.write_values(path, neighbours)
         baseline = self.baseline_findings()
         self.assertTrue(baseline, "control: the neighbours must be reportable to begin with")
         findings = self.scan(expected_exit=1)
-        self.assertEqual({row["File"] for row in findings}, {GATE_PATH})
+        self.assertEqual({row["File"] for row in findings}, set(GATE_PATHS))
         self.assertEqual(
             {row["Fingerprint"] for row in findings},
             {row["Fingerprint"] for row in baseline},
@@ -246,16 +252,16 @@ class GitleaksConfigTests(unittest.TestCase):
         hooks.mkdir()
         self.git("config", "core.hooksPath", str(hooks))
         self.git("config", "commit.gpgsign", "false")
-        self.write_values(GATE_PATH, GATE_VALUES)
-        self.git("add", "--", GATE_PATH)
+        self.write_values(GATE_HISTORY_PATH, GATE_VALUES)
+        self.git("add", "--", GATE_HISTORY_PATH)
         self.git("commit", "--quiet", "-m", "original fixtures")
         first = self.git("rev-parse", "HEAD")
-        self.write_values(GATE_PATH, ())
-        self.git("add", "--", GATE_PATH)
+        self.write_values(GATE_HISTORY_PATH, ())
+        self.git("add", "--", GATE_HISTORY_PATH)
         self.git("commit", "--quiet", "-m", "remove fixtures before reintroduction")
         self.write_values(GATE_PATH, GATE_VALUES, padding=31)
         self.git("add", "--", GATE_PATH)
-        self.git("commit", "--quiet", "-m", "reintroduce the same values at new lines")
+        self.git("commit", "--quiet", "-m", "extract the same values to the test module")
         moved = self.git("rev-parse", "HEAD")
         self.assertNotEqual(first, moved)
 
@@ -264,9 +270,33 @@ class GitleaksConfigTests(unittest.TestCase):
         self.config.write_text("[extend]\nuseDefault = true\n")
         findings = self.scan(expected_exit=1, history="--all")
         self.assertEqual({row["Commit"] for row in findings}, {first, moved})
+        self.assertEqual({row["File"] for row in findings}, set(GATE_PATHS))
 
         self.config.write_text(CONFIG.read_text())
         self.assertEqual(self.scan(expected_exit=0, history="--all"), [])
+        self.assertEqual(self.scan(expected_exit=0), [])
+
+        # Each exact path is necessary: removing it exposes only that history.
+        for path, commit in [(GATE_HISTORY_PATH, first), (GATE_PATH, moved)]:
+            entry = "  '''^" + path.replace(".", r"\.") + "$''',\n"
+            config = CONFIG.read_text()
+            self.assertEqual(config.count(entry), 1)
+            self.config.write_text(config.replace(entry, "", 1))
+            findings = self.scan(expected_exit=1, history="--all")
+            self.assertEqual({row["File"] for row in findings}, {path})
+            self.assertEqual({row["Commit"] for row in findings}, {commit})
+
+    def test_gate_values_at_both_paths_still_match_a_different_rule(self):
+        self.config.write_text(CONFIG.read_text() + "\n" + "\n".join([
+            "[[rules]]", 'id = "fixture-other-gate-rule"',
+            "regex = '''(" + "|".join(GATE_VALUES) + ")'''",
+        ]) + "\n")
+        for path in GATE_PATHS:
+            self.write_values(path, GATE_VALUES)
+        findings = self.scan(expected_exit=1)
+        self.assertEqual(len(findings), len(GATE_VALUES) * len(GATE_PATHS))
+        self.assertEqual({row["File"] for row in findings}, set(GATE_PATHS))
+        self.assertEqual({row["RuleID"] for row in findings}, {"fixture-other-gate-rule"})
 
     def test_every_exempt_gate_constant_still_appears_in_the_file_it_exempts(self):
         # An exemption outlives the fixture it was written for. This fails when a
