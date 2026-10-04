@@ -978,7 +978,7 @@ async fn invalid_projection_payload_aborts_event_insert() {
 async fn query_events_orders_by_created_at_then_id_desc() {
     let store = setup_memory_store();
 
-    let ts = chrono::Utc::now().timestamp_micros();
+    let ts = 1_700_000_000_000_000_i64;
     let id_low = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
     let id_high = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
 
@@ -1020,6 +1020,79 @@ async fn query_events_orders_by_created_at_then_id_desc() {
         "higher UUID must come first (id DESC tiebreaker)"
     );
     assert_eq!(page.items[1].id, id_low);
+
+    let newer_low = Uuid::from_u128(2);
+    let newer_high = Uuid::from_u128(3);
+    let older_low = Uuid::from_u128(4);
+    let older_high = Uuid::from_u128(5);
+    let rows = [
+        (older_high, ts - 10),
+        (newer_low, ts + 10),
+        (older_low, ts - 10),
+        (newer_high, ts + 10),
+    ];
+    let events = rows
+        .into_iter()
+        .map(|(id, created_at)| {
+            let mut event = make_event("default");
+            event.id = id;
+            event.created_at = created_at;
+            event
+        })
+        .collect();
+    let written = store.append_events(events).await.unwrap();
+    assert_eq!(written.attempted, 4);
+    assert_eq!(written.affected, 4);
+    assert_eq!(written.failed, 0);
+    let expected = [
+        newer_high, newer_low, id_high, id_low, older_high, older_low,
+    ];
+    let whole = store
+        .query_events(
+            EventFilter::default(),
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        whole.items.iter().map(|event| event.id).collect::<Vec<_>>(),
+        expected
+    );
+
+    for limit in [1_u32, 2, 3, 4] {
+        let mut seen = Vec::new();
+        for offset in (0..expected.len()).step_by(limit as usize) {
+            let page = store
+                .query_events(
+                    EventFilter::default(),
+                    PageRequest {
+                        offset: offset as u64,
+                        limit,
+                    },
+                )
+                .await
+                .unwrap();
+            let ids: Vec<_> = page.items.iter().map(|event| event.id).collect();
+            let end = (offset + limit as usize).min(expected.len());
+            assert_eq!(ids, expected[offset..end], "offset={offset} limit={limit}");
+            seen.extend(ids);
+        }
+        assert_eq!(seen, expected, "complete pagination at limit={limit}");
+        let terminal = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: expected.len() as u64,
+                    limit,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(terminal.items.is_empty(), "terminal page at limit={limit}");
+    }
 }
 
 #[tokio::test]
