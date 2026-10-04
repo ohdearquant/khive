@@ -11,6 +11,13 @@ struct ObservedStore {
     inner: khive_db::stores::blob::FsBlobStore,
     puts: AtomicUsize,
     refuse_put: AtomicBool,
+    blocked_put: Mutex<Option<Arc<PutGate>>>,
+}
+
+#[derive(Debug)]
+struct PutGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Semaphore,
 }
 
 #[async_trait::async_trait]
@@ -23,6 +30,11 @@ impl BlobStore for ObservedStore {
                 "put",
                 std::io::Error::other("fixture refuses a premature blob write"),
             ));
+        }
+        let gate = self.blocked_put.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.acquire().await.unwrap().forget();
         }
         self.inner.put(bytes).await
     }
@@ -126,6 +138,7 @@ impl Fixture {
                 .unwrap(),
             puts: AtomicUsize::new(0),
             refuse_put: AtomicBool::new(false),
+            blocked_put: Mutex::new(None),
         });
         runtime.install_blob_store(store.clone()).unwrap();
         Self {
@@ -681,4 +694,170 @@ async fn malformed_batch_output_kills_a_child_that_keeps_its_pipes_open() {
     );
     assert_eq!(result.unwrap().unwrap_err().code(), "git_output");
     assert!(!alive, "the malformed-output child must already be reaped");
+}
+
+#[tokio::test]
+async fn checkout_stores_the_previous_blob_before_acknowledging_its_frame() {
+    let fixture = Fixture::new(&[("a", b"x", 0o644), ("b", b"x", 0o755)]);
+    fixture.mode("requests");
+    let gate = Arc::new(PutGate {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    *fixture.store.blocked_put.lock().unwrap() = Some(Arc::clone(&gate));
+    let runtime = Arc::clone(&fixture.runtime);
+    let repo = fixture.repo.clone();
+    let mut task = tokio::spawn(async move { checkout(&runtime, &repo, "HEAD").await });
+    let entered = tokio::time::timeout(Duration::from_secs(5), gate.entered.notified()).await;
+    if entered.is_err() {
+        task.abort();
+        let _ = task.await;
+        panic!("checkout never reached the blocking BlobStore put");
+    }
+    let puts_while_blocked = fixture.store.puts.load(Ordering::SeqCst);
+    let reference = ContentRef::from_digest_bytes(blake3::hash(b"x").as_bytes());
+    let stored_while_blocked = fixture.store.exists(&reference).await.unwrap();
+    let mut requests_while_blocked = 0;
+    for _ in 0..100 {
+        requests_while_blocked = std::fs::read_to_string(fixture.repo.join("requests"))
+            .unwrap()
+            .lines()
+            .count();
+        if requests_while_blocked > 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    gate.release.add_permits(1);
+    let completed = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+    if completed.is_err() {
+        task.abort();
+        let _ = task.await;
+        panic!("checkout did not complete after releasing BlobStore put");
+    }
+    let checkout = completed.unwrap().unwrap().unwrap();
+    let entries = tree::load(&fixture.runtime, &checkout.tree).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        let reference = ContentRef::from_hex(entry.content_ref).unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .get_bounded_verified(&reference, 1)
+                .await
+                .unwrap(),
+            b"x"
+        );
+    }
+    let requests_after_release = std::fs::read_to_string(fixture.repo.join("requests"))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(
+        requests_after_release, 2,
+        "both real checkout entries must complete"
+    );
+    assert_eq!(puts_while_blocked, 1);
+    assert!(
+        !stored_while_blocked,
+        "the first put must still be incomplete"
+    );
+    assert_eq!(
+        requests_while_blocked, 1,
+        "checkout must not acknowledge a frame before its BlobStore put completes"
+    );
+}
+
+#[test]
+fn batch_header_bound_refuses_a_valid_shape_with_a_parseable_digit_size() {
+    let oid = "1".repeat(40);
+    let size = format!("{}1", "0".repeat(100));
+    assert!(size.bytes().all(|byte| byte.is_ascii_digit()));
+    assert_eq!(size.parse::<u64>().unwrap(), 1);
+    let header = format!("{oid} blob {size}\n");
+    assert!(header.len() as u64 > HEADER_LIMIT);
+    assert_eq!(header.trim_end().split(' ').count(), 3);
+    let result = read_header(&mut std::io::Cursor::new(header), &oid);
+    assert!(
+        matches!(result, Err(ref error) if error.code() == "git_output"
+            && error.to_string() == "git_output: invalid batch header length"),
+        "a valid-shaped, parseable header must still obey the byte bound"
+    );
+}
+
+#[tokio::test]
+async fn oversized_truncated_loose_blob_prioritizes_the_declared_size_limit() {
+    let mut state = 0x1234_5678_9abc_def0_u64;
+    let bytes = (0..MAX_BLOB_WHOLE_BYTES as usize + 1)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect::<Vec<_>>();
+    let fixture = Fixture::new(&[("a", &bytes, 0o644)]);
+    let oid = fixture.oid("HEAD:a");
+    let object = fixture
+        .repo
+        .join(".git/objects")
+        .join(&oid[..2])
+        .join(&oid[2..]);
+    let original_size = std::fs::metadata(&object).unwrap().len();
+    assert!(original_size > MAX_BLOB_WHOLE_BYTES);
+    std::fs::set_permissions(&object, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&object)
+        .unwrap()
+        .set_len(original_size / 2)
+        .unwrap();
+    let native = super::super::run_async(
+        fixture.runtime.config().git_write.git_program(),
+        &fixture.repo,
+        &["cat-file", "blob", &oid],
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(native.code(), "git_failed");
+    assert!(native.to_string().ends_with("exit status 128"));
+    let mut batch = base_command(Path::new("git"))
+        .arg("-C")
+        .arg(&fixture.repo)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    batch
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{oid}\n").as_bytes())
+        .unwrap();
+    let batch = batch.wait_with_output().unwrap();
+    let header = format!("{oid} blob {}\n", bytes.len());
+    assert_eq!(batch.status.code(), Some(128));
+    assert!(
+        batch.stdout.starts_with(header.as_bytes())
+            && batch.stdout.len() > header.len()
+            && batch.stdout.len() < header.len() + bytes.len(),
+        "fixture must expose an oversized native header before a truncated body"
+    );
+    let before = fixture.store.puts.load(Ordering::SeqCst);
+    let error = checkout(&fixture.runtime, &fixture.repo, "HEAD")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        "output_limit",
+        "the declared oversized frame must take priority over its later native truncation"
+    );
+    assert_eq!(
+        error.to_string(),
+        "output_limit: git output exceeds the whole-blob limit"
+    );
+    assert_eq!(fixture.store.puts.load(Ordering::SeqCst), before);
 }
