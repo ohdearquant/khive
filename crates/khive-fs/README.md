@@ -34,3 +34,15 @@ last. A component that is a symlink is followed only when the caller's `LinkPoli
 - `after_read` runs once the target has been read and does nothing unless a policy overrides it.
 - `budget` bounds the links the walk follows; a link met after it is spent ends the walk with a
   `BudgetExhausted` error.
+
+## `opened_file`
+
+Helpers that judge the file that was actually opened instead of the pathname that was checked
+before the open:
+
+- `opened_file_path`: the path the kernel reports for an open file. Linux and Android read
+  `/proc/self/fd`, macOS and iOS use `F_GETPATH`, Windows uses the final path name of the handle,
+  and any other target reports `ErrorKind::Unsupported`.
+- `open_regular_file_within`: opens a path read-only and returns the file only if it is a regular
+  file whose resolved path is inside a canonical root. A refusal is a `ContainedOpenError`
+  variant, and the variants that come from a failing call carry its raw `std::io::Error`.
