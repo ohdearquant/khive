@@ -432,7 +432,7 @@ impl KhiveRuntime {
     /// already-prepared backend.
     pub fn new(mut config: RuntimeConfig) -> RuntimeResult<Self> {
         let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
-        Self::new_with_file_backend(config, |path| {
+        Self::new_with_file_backend(config, true, |path| {
             StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, None, wal_ceiling)
         })
     }
@@ -441,20 +441,21 @@ impl KhiveRuntime {
     #[cfg(any(test, feature = "test-internals"))]
     pub fn new_for_test(mut config: RuntimeConfig) -> RuntimeResult<Self> {
         let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
-        Self::new_with_file_backend(config, |path| {
+        Self::new_with_file_backend(config, true, |path| {
             StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, Some(2), wal_ceiling)
         })
     }
 
-    fn new_with_file_backend(
+    pub(crate) fn new_with_file_backend(
         config: RuntimeConfig,
+        create_parent: bool,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
         #[cfg(all(test, target_os = "macos"))]
         ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {
             Some(path) => {
-                if let Some(parent) = path.parent() {
+                if let Some(parent) = path.parent().filter(|_| create_parent) {
                     std::fs::create_dir_all(parent).ok();
                 }
                 open_file(path)?

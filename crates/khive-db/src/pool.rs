@@ -1,4 +1,5 @@
 //! Connection pool for SQLite: one exclusive writer, N concurrent readers.
+mod code_map;
 #[path = "pool/writer_acquisition.rs"]
 mod writer_acquisition;
 
@@ -516,6 +517,8 @@ impl WalCeilingPolicy {
 pub struct PoolConfig {
     /// Database path. None = in-memory (pool degrades to single connection).
     pub path: Option<PathBuf>,
+    /// Registered native code-map VFS name; set only by the code-map constructor.
+    pub code_map_vfs: Option<String>,
     /// Number of reader connections (default: min(num_cpus, 8)).
     pub max_readers: usize,
     /// WAL mode (must be true for pooling to work; default: true).
@@ -623,6 +626,7 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             path: None,
+            code_map_vfs: None,
             max_readers: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
@@ -1714,6 +1718,7 @@ impl ConnectionPool {
             config.wal_mode,
             config.read_only,
         )?;
+        code_map::validate_pool(&config)?;
 
         // Resolve "no preference" (`None`) now that `path` is known: on for
         // file-backed pools, off for in-memory ones. An explicit `Some(_)`
@@ -1735,6 +1740,7 @@ impl ConnectionPool {
         // an immutable URI derived from it), so a symlink cannot split main-file
         // resolution from sidecar resolution.
         let (origin, identity_path) = match config.path.as_ref() {
+            Some(path) if config.code_map_vfs.is_some() => code_map::guarded_identity(path),
             Some(path) => {
                 let (identity, canonical) = mint_db_identity(path)?;
                 (TxOrigin::Database(identity), Some(canonical))
@@ -2905,7 +2911,7 @@ impl ConnectionPool {
         #[cfg(test)]
         run_identity_open_hook(path, IdentityOpenStage::BeforeStandaloneOpen, None);
 
-        let conn = Connection::open_with_flags(
+        let conn = self.config.open_file_connection(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -2924,8 +2930,10 @@ impl ConnectionPool {
         // each of them needs the same functions the pooled writer registers.
         register_rfc3339_key(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
-        self.checkpoint_ownership
-            .configure_wal_autocheckpoint(&conn)?;
+        if self.config.code_map_vfs.is_none() {
+            self.checkpoint_ownership
+                .configure_wal_autocheckpoint(&conn)?;
+        }
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
@@ -3079,7 +3087,7 @@ impl ConnectionPool {
             self.verify_opened_file_identity(identity_path)?;
         }
 
-        let conn = Connection::open_with_flags(
+        let conn = self.config.open_file_connection(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -3385,7 +3393,7 @@ fn resolve_symlink_chain(path: &Path) -> Result<PathBuf, SqliteError> {
 }
 
 fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
-    if config.path.is_some() && config.read_only {
+    if config.path.is_some() && (config.read_only || config.code_map_vfs.is_some()) {
         config.max_readers.max(1)
     } else if config.path.is_some() && config.wal_mode && wal_enabled {
         config.max_readers
@@ -3419,7 +3427,7 @@ fn open_writer_connection(
                     )
                 })?
             };
-            Connection::open_with_flags(target, flags).map_err(Into::into)
+            config.open_file_connection(target, flags)
         }
         None => Connection::open_in_memory().map_err(Into::into),
     }
@@ -3480,7 +3488,7 @@ fn read_only_open_target(
     config: &PoolConfig,
     physical_path: Option<&Path>,
 ) -> Result<Option<PathBuf>, SqliteError> {
-    if !config.read_only {
+    if !config.read_only || config.code_map_vfs.is_some() {
         return Ok(None);
     }
     let Some(path) = physical_path else {
@@ -3617,7 +3625,7 @@ fn push_sqlite_uri_path(uri: &mut String, bytes: &[u8]) {
 }
 
 fn open_reader_connection(path: &Path, config: &PoolConfig) -> Result<Connection, SqliteError> {
-    let conn = Connection::open_with_flags(path, reader_open_flags())?;
+    let conn = config.open_file_connection(path, reader_open_flags())?;
     configure_reader_connection(&conn, config)?;
     Ok(conn)
 }
@@ -3747,6 +3755,7 @@ fn configure_writer_connection(
     if wants_wal {
         conn.pragma_update(None, "journal_mode", "WAL")?;
     }
+    code_map::require_delete_journal(conn, config)?;
 
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -3758,11 +3767,13 @@ fn configure_writer_connection(
     // claim the pool, so it starts on the bounded fallback;
     // `claim_checkpoint_ownership` re-applies the pragma on this connection
     // under the writer mutex when a dedicated owner attaches.
-    conn.pragma_update(
-        None,
-        "wal_autocheckpoint",
-        FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
-    )?;
+    if config.code_map_vfs.is_none() {
+        conn.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            FALLBACK_WAL_AUTOCHECKPOINT_PAGES,
+        )?;
+    }
 
     let wal_enabled = wants_wal && current_journal_mode(conn)?.eq_ignore_ascii_case("wal");
 

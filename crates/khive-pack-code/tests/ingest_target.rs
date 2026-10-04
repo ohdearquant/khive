@@ -2,6 +2,7 @@
 //! deliberately creatable workspace default. These do not model path races.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
 
 use khive_pack_code::CodePack;
@@ -18,7 +19,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::tempdir().expect("isolated ingest fixture");
+        // The guarded VFS refuses symlink components of explicit targets.
+        // macOS's ordinary /var TMPDIR spelling aliases /private/var, so
+        // positive targets must be constructed under the physical temp root.
+        let physical_temp = std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temporary directory");
+        let root = tempfile::tempdir_in(physical_temp).expect("isolated ingest fixture");
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         let runtime = KhiveRuntime::memory().unwrap();
@@ -59,6 +66,38 @@ impl Fixture {
             "refusal created filesystem artifacts"
         );
     }
+}
+
+/// Positive VFS tests must not sample the runner's real HOME production DB.
+/// Run each one in a child with a private HOME, without mutating process-wide
+/// environment while the integration tests execute concurrently.
+fn run_with_private_home_in_child() -> bool {
+    const CHILD_TEST: &str = "KHIVE_INGEST_TARGET_CHILD";
+    let thread = std::thread::current();
+    let name = thread.name().expect("libtest names its test threads");
+    if std::env::var(CHILD_TEST).ok().as_deref() == Some(name) {
+        return false;
+    }
+    let physical_temp = std::env::temp_dir()
+        .canonicalize()
+        .expect("physical temporary directory");
+    let home = tempfile::tempdir_in(physical_temp).expect("private child HOME");
+    let output = Command::new(std::env::current_exe().expect("integration test executable"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(CHILD_TEST, name)
+        .env("HOME", home.path())
+        .env("KHIVE_DB", "")
+        .output()
+        .expect("spawn isolated ingest test");
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed;"),
+        "isolated ingest test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
 }
 
 fn registry(runtime: KhiveRuntime) -> VerbRegistry {
@@ -214,6 +253,9 @@ async fn explicit_dangling_symlink_refuses_without_creating_its_target() {
 
 #[tokio::test]
 async fn explicit_precreated_empty_file_initializes_and_reopens() {
+    if run_with_private_home_in_child() {
+        return;
+    }
     let fixture = Fixture::new();
     let target = fixture.root.path().join("intentional-map.db");
     std::fs::File::create(&target).unwrap();
@@ -232,10 +274,75 @@ async fn explicit_precreated_empty_file_initializes_and_reopens() {
     assert_eq!(second["projects_created"], 0);
 }
 
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn explicit_var_parent_alias_refuses_without_rewriting_target_path() {
+    if run_with_private_home_in_child() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let physical_temp = std::env::temp_dir()
+        .canonicalize()
+        .expect("physical temporary directory");
+    let physical_parent =
+        tempfile::tempdir_in(physical_temp).expect("physical macOS /var alias control directory");
+    let target = physical_parent.path().join("parent-alias-map.db");
+    std::fs::File::create(&target).unwrap();
+    let suffix = target
+        .strip_prefix("/private/var")
+        .expect("macOS temporary root is under /private/var");
+    let alias = Path::new("/var").join(suffix);
+    let error = fixture
+        .ingest(Some(&alias))
+        .await
+        .expect_err("explicit parent symlink must not be canonicalized away");
+    assert!(
+        error.to_string().contains("code-map VFS cannot prove"),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("symlinked code-map parent component /var"),
+        "{error:?}"
+    );
+    assert_eq!(std::fs::metadata(target).unwrap().len(), 0);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn omitted_var_parent_alias_creates_physical_default() {
+    if run_with_private_home_in_child() {
+        return;
+    }
+    let physical_temp = std::env::temp_dir()
+        .canonicalize()
+        .expect("physical temporary directory");
+    let root =
+        tempfile::tempdir_in(physical_temp).expect("physical macOS /var alias control directory");
+    let physical_source = root.path().join("source");
+    std::fs::create_dir(&physical_source).unwrap();
+    let suffix = physical_source
+        .strip_prefix("/private/var")
+        .expect("source is below the physical /var directory");
+    let alias_source = Path::new("/var").join(suffix);
+    let physical_target = physical_source.join(".khive").join("code-map.db");
+    let registry = registry(KhiveRuntime::memory().unwrap());
+    let response = registry
+        .dispatch("code.ingest", json!({"path": alias_source, "tiers": []}))
+        .await
+        .expect("omitted db resolves its configured parent alias once");
+    assert_eq!(response["db_path"], json!(physical_target));
+    assert!(physical_target.is_file());
+}
+
 // MUST-FAIL: applying the existing-file restriction to omitted db prevents
 // the documented first-ingest creation of the dedicated workspace map.
 #[tokio::test]
 async fn omitted_target_creates_workspace_default() {
+    if run_with_private_home_in_child() {
+        return;
+    }
     let fixture = Fixture::new();
     let target = fixture.source.join(".khive").join("code-map.db");
     assert!(!target.exists());
@@ -251,6 +358,9 @@ async fn omitted_target_creates_workspace_default() {
 #[cfg(unix)]
 #[tokio::test]
 async fn explicit_symlink_to_existing_dedicated_file_refuses_without_mutation() {
+    if run_with_private_home_in_child() {
+        return;
+    }
     let fixture = Fixture::new();
     let target = fixture.root.path().join("dedicated.db");
     let link = fixture.root.path().join("dedicated-link.db");
@@ -341,6 +451,9 @@ async fn default_map_target_colliding_with_declared_backend_is_refused_before_mu
 #[cfg(unix)]
 #[tokio::test]
 async fn hardlink_to_runtime_main_is_refused_but_fresh_inode_copy_is_accepted() {
+    if run_with_private_home_in_child() {
+        return;
+    }
     use std::os::unix::fs::MetadataExt;
 
     let fixture = Fixture::new();

@@ -17,6 +17,7 @@ use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy};
 use crate::sql_bridge::SqlBridge;
 use crate::stores::{agents, attachment, blob, entity, event, graph, note, sparse, text, vectors};
 
+mod code_map;
 mod pack_schema;
 
 fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, SqliteError> {
@@ -591,7 +592,7 @@ impl StorageBackend {
                 ))
             })?;
             let mut writer = self.pool.try_writer()?;
-            crate::migrations::run_migrations_with_database_gc_owner(writer.conn_mut(), &owner)
+            self.run_core_migrations(writer.conn_mut(), &owner)
         }
     }
 
