@@ -1427,20 +1427,13 @@ fn terminate_clone(
 ) -> Result<(), CacheError> {
     #[cfg(unix)]
     let kill_result = {
-        let pid = child.id();
-        // SAFETY: `pid` names the live child we spawned into its own process
-        // group; negating it targets that group, and `kill` borrows no Rust
-        // memory or descriptors.
-        let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            let group_error = std::io::Error::last_os_error();
-            if group_error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                child.kill()
-            }
+        // The child was spawned into its own process group, so its pid is the
+        // group id.
+        let pgid = child.id() as i32;
+        match khive_runtime::process_group::signal_process_group(pgid, libc::SIGKILL) {
+            Ok(()) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(_) => child.kill(),
         }
     };
     #[cfg(windows)]

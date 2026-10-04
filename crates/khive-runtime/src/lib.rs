@@ -59,6 +59,7 @@ pub mod phase_events;
 pub mod portability;
 pub mod preference_verification;
 pub mod presentation;
+pub mod process_group;
 pub mod process_retry;
 pub mod reference_resolution;
 pub mod reference_ring;
