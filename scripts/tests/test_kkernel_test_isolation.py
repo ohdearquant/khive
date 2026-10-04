@@ -40,7 +40,7 @@ def function(filename, name):
 class KkernelTestIsolationTests(unittest.TestCase):
     def test_child_environment_removes_external_model_cache_override(self):
         source = (SOURCE / "test_process.rs").read_text()
-        command = source[source.index("let output = command"):source.index('.expect("spawn isolated test")')]
+        command = source[source.index("run_exact_test_in_child("):source.index("fixture = Some(")]
         self.assertIn('.env_remove("LATTICE_MODEL_CACHE")', command,
                       "exact child must not inherit an external model cache override")
 
