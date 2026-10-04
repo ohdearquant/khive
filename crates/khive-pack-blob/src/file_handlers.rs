@@ -9,9 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt as _;
 
-use crate::handlers::{
-    blob_hydrator, blob_store, parse_content_ref, parse_params, MAX_OBJECT_BYTES,
-};
+use crate::handlers::{parse_content_ref, parse_params, MAX_OBJECT_BYTES};
 use crate::uploads::UploadManager;
 
 #[derive(Deserialize)]
@@ -120,7 +118,8 @@ pub(crate) async fn handle_export(
     file_policy::confined_file_roots().map_err(|error| file_error("blob.export", error))?;
     let destination = file_policy::resolve_destination(Path::new(&path), true)
         .map_err(|error| file_error("blob.export", error))?;
-    let size = blob_store(runtime)?
+    let size = runtime
+        .require_blob_store()?
         .size(&reference)
         .await?
         .ok_or_else(|| {
@@ -134,7 +133,8 @@ pub(crate) async fn handle_export(
             format!("object exceeds the {MAX_OBJECT_BYTES}-byte maximum"),
         ));
     }
-    let verified = blob_hydrator(runtime)?
+    let verified = runtime
+        .require_blob_hydrator()?
         .hydrate_verified(&reference, size)
         .await?;
     tokio::task::spawn_blocking(move || {

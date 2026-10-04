@@ -1907,6 +1907,31 @@ impl KhiveRuntime {
         self.blob_hydrator.get().map(|hydrator| hydrator.store())
     }
 
+    /// Return the installed `BlobStore`, or `RuntimeError::Unconfigured` with
+    /// the operator-facing message when none is installed.
+    ///
+    /// Packs share this conversion so an operator sees one error wherever the
+    /// missing `[storage.blob]` configuration is first hit.
+    pub fn require_blob_store(&self) -> RuntimeResult<Arc<dyn khive_storage::BlobStore>> {
+        self.blob_store().ok_or_else(Self::no_blob_store)
+    }
+
+    /// Return the installed shared blob hydrator, or `RuntimeError::Unconfigured`
+    /// with the same message as [`Self::require_blob_store`] when none is
+    /// installed. The store is read from the hydrator, so both accessors are
+    /// unset under the same condition.
+    pub fn require_blob_hydrator(&self) -> RuntimeResult<Arc<crate::blob::BlobHydrator>> {
+        self.blob_hydrator().ok_or_else(Self::no_blob_store)
+    }
+
+    fn no_blob_store() -> RuntimeError {
+        RuntimeError::Unconfigured(
+            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or \
+             KHIVE_BLOB_ROOT)"
+                .to_string(),
+        )
+    }
+
     /// Install the pack-aggregated valid entity and note kinds.
     ///
     /// Called by the transport layer after the `VerbRegistry` is built so that
@@ -2765,6 +2790,43 @@ mod tests {
             .expect_err("live admission must match the construction-baked config identity");
         assert!(matches!(error, RuntimeError::InvalidInput(_)));
         assert!(runtime.blob_hydrator().is_none());
+    }
+
+    #[test]
+    fn require_blob_accessors_refuse_with_the_operator_message_when_no_store_is_installed() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let expected = concat!(
+            "no BlobStore installed on this server ",
+            "(configure [storage.blob] in khive.toml, or KHIVE_BLOB_ROOT)"
+        );
+
+        let Err(RuntimeError::Unconfigured(message)) = runtime.require_blob_store() else {
+            panic!("require_blob_store must refuse when no store is installed");
+        };
+        assert_eq!(message, expected);
+
+        let Err(RuntimeError::Unconfigured(message)) = runtime.require_blob_hydrator() else {
+            panic!("require_blob_hydrator must refuse when no store is installed");
+        };
+        assert_eq!(message, expected);
+    }
+
+    #[test]
+    fn require_blob_accessors_return_the_installed_store_and_hydrator() {
+        let runtime = KhiveRuntime::memory().expect("runtime");
+        let root = tempfile::tempdir().expect("blob root");
+        let store = Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(root.path().to_path_buf(), 0)
+                .expect("fs blob store"),
+        );
+        runtime.install_blob_store(store).expect("install");
+
+        let required_store = runtime.require_blob_store().expect("store");
+        let installed_store = runtime.blob_store().expect("installed store");
+        assert!(Arc::ptr_eq(&required_store, &installed_store));
+        let required_hydrator = runtime.require_blob_hydrator().expect("hydrator");
+        let installed_hydrator = runtime.blob_hydrator().expect("installed hydrator");
+        assert!(Arc::ptr_eq(&required_hydrator, &installed_hydrator));
     }
 
     #[test]
