@@ -157,6 +157,26 @@ mismatch, or an inconsistent lifecycle segment) rather than rebuilding — `load
 is the entry point that decides whether to fall back to a rebuild; `VamanaIndex::load`
 surfaces the error directly to callers that don't hold a corpus to rebuild from.
 
+File-backed v2 reads hash `vectors.bin` through a fixed 64 KiB buffer. Graph and
+lifecycle checksum reads and parsing use temporary read-only mappings; the
+save-time sequence guard also maps the codes segment. Empty temporary segments
+reach the same checksum and format checks as empty byte buffers. Temporary views
+close before a recovery rebuild publishes replacements. Segment files must not
+be modified or truncated outside the publication-lock protocol, as already
+required for the retained vector and code mappings.
+
+A checksum-valid empty `codes.bin` maps as an empty slice and reaches the codes
+parser, which returns `InvalidFormat`. Strict `load` refuses it;
+`load_or_build` rebuilds it from the corpus, and the sequence guard treats the
+malformed incumbent as repairable. Ordinary file or mapping I/O errors retain
+their existing error path.
+
+The parsed graph and lifecycle retain their owned adjacency lists. Structural
+validation checks the inverse through per-node incoming counts and membership in
+the forward lists, with one sorted medoid forward-list copy for its potentially
+larger degree. Successful validation does not build another full reverse
+adjacency or clone each reverse list, and it preserves their stored order.
+
 ## lifecycle.bin format
 
 Written by `write_lifecycle` (`index.rs`) as part of the v2 segmented save. All
