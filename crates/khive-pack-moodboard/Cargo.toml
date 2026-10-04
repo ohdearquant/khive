@@ -15,6 +15,7 @@ description = "Experimental Khive-native visual retrieval and pairwise preferenc
 khive-retrieval = { version = "0.9.0", path = "../khive-retrieval" }
 khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
 khive-score = { version = "0.9.0", path = "../khive-score" }
+khive-fs = { version = "0.9.0", path = "../khive-fs" }
 khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
 khive-storage = { version = "0.9.0", path = "../khive-storage" }
@@ -32,15 +33,6 @@ sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-] }
 
 [dev-dependencies]
 khive-db = { version = "0.9.0", path = "../khive-db" }

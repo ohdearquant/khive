@@ -842,3 +842,47 @@ pub trait BackendMigrator: Send + Sync {
 
 This exact `SqliteMigrator` / `Arc<dyn BackendMigrator>` wiring is not part of the current
 implementation; the async host-builder contract above is authoritative.
+
+## Proposed amendment: live entity list indexes (2026-10-04)
+
+**Status**: Proposed
+
+V50, `entity_list_plans`, follows V49, `git_note_property_indexes`, and adds
+two partial indexes over live entities:
+`idx_entities_live_namespace_order` on
+`(namespace, created_at DESC, id DESC)` and
+`idx_entities_live_namespace_type_order` on
+`(namespace, entity_type, created_at DESC, id DESC)`, both with
+`WHERE deleted_at IS NULL`. The idempotent entity-store DDL declares the same
+indexes for directly opened stores. V1 and the V21 attachment/GC gates remain
+unchanged; the canonical migration ledger records V50 only after its transaction
+commits.
+
+Ordinary offset/count queries without IDs, kinds, name constraints, tags,
+per-kind type groups or legacy JSON fallback select the type index for canonical
+type filters. Queries without type filters select the order index only when
+there is at most one visible namespace. Explicit IDs retain their primary-key
+plan; candidate-name and insertion-sequence cursor queries retain their existing
+access paths. An eligible read whose forced index is absent retries once without
+that forced index, leaving plan choice to SQLite, and emits one diagnostic
+naming the missing index. Reads never create indexes; only V50 and the
+idempotent open-time entity-store DDL create them. Writable, read-only and
+standalone stores share this read behavior. Unrelated errors preserve their
+original operation and SQLite cause.
+
+The indexes incur a one-time construction scan, storage proportional to live
+indexed rows and keys, and maintenance on entity writes and live/deleted
+transitions. COUNT still visits matching entries. Offset pages still visit
+skipped entries; multiple types or namespaces can require sorting matches.
+Selective kind/name/tag and legacy JSON filters retain planner-dependent costs.
+These indexes do not provide snapshot isolation or a constant-work guarantee for
+every filter. No ANALYZE/optimize lifecycle, reader/writer policy, transaction
+semantics or new maintained counter is introduced.
+
+The following proposed row extends the post-consolidation live allocation ledger.
+V50 is allocated to this proposal after V49. Its number and name must remain
+consistent with the current migration chain before adoption:
+
+| Version | Owning ADR / issue | Migration name    | Status   |
+| ------: | ------------------ | ----------------- | -------- |
+|     V50 | ADR-015 / #3689    | entity_list_plans | proposed |

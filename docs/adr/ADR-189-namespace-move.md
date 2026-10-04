@@ -182,6 +182,12 @@ Only subject classes are routed. Everything else is carried:
 None of these appears in the route map. A caller cannot route them independently, because they have
 no independent existence.
 
+In a single-target move, every source `knowledge_sections` row moves to that target, matching the
+whole-namespace vector move. This applies even when no atom or domain class is routed, or when a
+historical section's parent is missing or already attributed elsewhere. Section counts appear in
+`MoveCounts.rows`. In a partitioning move, sections follow the routed atom or domain mirror that
+owns them.
+
 The four fts5 tables do not take one mechanism, and the split is measured rather than assumed.
 `fts_notes` and `fts_entities` are ordinary fts5 tables: an `UPDATE` of their `namespace` column is
 accepted, preserves the rowid the two maps are keyed on, and leaves the index intact. `fts_knowledge`

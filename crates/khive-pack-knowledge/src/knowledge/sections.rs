@@ -344,6 +344,7 @@ struct PreparedImportFile {
     sections: Vec<PreparedSection>,
     sections_discovered: usize,
     sections_skipped: usize,
+    sections_unknown_type: usize,
 }
 
 #[derive(Debug, Default)]
@@ -652,7 +653,7 @@ fn prepare_import_file(
 
     let citation_count = parsed_sections
         .iter()
-        .filter(|(section_type, _, _)| *section_type == SectionType::References)
+        .filter(|(section_type, _, _)| *section_type == Some(SectionType::References))
         .map(|(_, _, body)| body.lines().filter(|line| !line.trim().is_empty()).count())
         .sum::<usize>();
     let source_uri = atlas_id
@@ -674,11 +675,21 @@ fn prepare_import_file(
     }
 
     let sections_discovered = parsed_sections.len();
-    let (sections, sections_skipped) = if chunk_strategy == "section" {
+    let (sections, sections_skipped, sections_unknown_type) = if chunk_strategy == "section" {
         let mut prepared = Vec::new();
         let mut skipped = 0usize;
+        let mut unknown_type = 0usize;
         for (index, (section_type, heading, content)) in parsed_sections.into_iter().enumerate() {
             let record = format!("section[{index}]");
+            let Some(section_type) = section_type else {
+                tracing::warn!(
+                    source_path = %identity.source_path,
+                    heading = %heading,
+                    "knowledge.import refused a section whose {{type}} marker names no section type"
+                );
+                unknown_type = unknown_type.saturating_add(1);
+                continue;
+            };
             if content.len() < super::util::MIN_SECTION_CONTENT_LEN {
                 skipped = skipped.saturating_add(1);
                 continue;
@@ -692,9 +703,9 @@ fn prepare_import_file(
                 content,
             });
         }
-        (prepared, skipped)
+        (prepared, skipped, unknown_type)
     } else {
-        (Vec::new(), 0)
+        (Vec::new(), 0, 0)
     };
 
     khive_runtime::secret_gate::check_at(&slug, "file", "slug")?;
@@ -720,6 +731,7 @@ fn prepare_import_file(
         sections,
         sections_discovered,
         sections_skipped,
+        sections_unknown_type,
     })
 }
 
@@ -859,12 +871,48 @@ fn extract_atlas_id(content: &str) -> Option<String> {
     })
 }
 
-fn parse_atlas_md(content: &str) -> (String, String, Vec<(SectionType, String, String)>) {
+/// A `## ` section parsed from markdown: its type, display heading and body. The type is
+/// `None` when the heading declares a `{type}` marker that names no [`SectionType`].
+type ParsedSection = (Option<SectionType>, String, String);
+
+/// Split a trailing `{type}` marker off a section heading. The marker is a lowercase
+/// snake_case token in braces at the very end of the heading; any other brace text stays
+/// part of the heading. Returns the heading without the marker and the marker token.
+fn split_type_marker(heading: &str) -> Option<(&str, &str)> {
+    let without_close = heading.strip_suffix('}')?;
+    let open = without_close.rfind('{')?;
+    let marker = &without_close[open + 1..];
+    let is_token = marker
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_lowercase())
+        && marker.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
+    if !is_token {
+        return None;
+    }
+    Some((without_close[..open].trim_end(), marker))
+}
+
+/// Resolve a section heading to its type and display heading. A trailing `{type}` marker
+/// must name a canonical [`SectionType`] value (no aliases) and is removed from the
+/// heading; without a marker the whole heading goes through the alias lookup, and a
+/// heading it does not recognise is typed `other`.
+fn section_heading_type(heading: &str) -> (Option<SectionType>, String) {
+    match split_type_marker(heading) {
+        Some((display, marker)) => (marker.parse().ok(), display.to_string()),
+        None => (
+            Some(SectionType::from_str_loose(heading).unwrap_or(SectionType::Other)),
+            heading.to_string(),
+        ),
+    }
+}
+
+fn parse_atlas_md(content: &str) -> (String, String, Vec<ParsedSection>) {
     let mut name = String::new();
     let mut pre_body = String::new();
-    let mut sections: Vec<(SectionType, String, String)> = Vec::new();
+    let mut sections: Vec<ParsedSection> = Vec::new();
 
-    let mut current_heading: Option<(SectionType, String)> = None;
+    let mut current_heading: Option<(Option<SectionType>, String)> = None;
     let mut current_body = String::new();
     let mut in_pre = true;
 
@@ -885,9 +933,7 @@ fn parse_atlas_md(content: &str) -> (String, String, Vec<(SectionType, String, S
                 current_body.clear();
                 in_pre = false;
             }
-            let heading_text = rest.trim().to_string();
-            let stype = SectionType::from_str_loose(&heading_text).unwrap_or(SectionType::Other);
-            current_heading = Some((stype, heading_text));
+            current_heading = Some(section_heading_type(rest.trim()));
             continue;
         }
         current_body.push_str(line);
@@ -1268,6 +1314,10 @@ impl KnowledgeHandlers {
             .iter()
             .map(|prepared| prepared.sections_skipped)
             .sum::<usize>();
+        let sections_unknown_type = prepared_files
+            .iter()
+            .map(|prepared| prepared.sections_unknown_type)
+            .sum::<usize>();
         let mut imported_atoms = 0usize;
         let mut imported_sections = 0usize;
 
@@ -1320,6 +1370,7 @@ impl KnowledgeHandlers {
             "traversal_errors": 0,
             "sections_discovered": sections_discovered,
             "sections_skipped": sections_skipped,
+            "sections_unknown_type": sections_unknown_type,
         }))
     }
 
@@ -1558,6 +1609,10 @@ impl KnowledgeHandlers {
         }))
     }
 }
+
+#[cfg(test)]
+#[path = "sections_marker_tests.rs"]
+mod marker_tests;
 
 #[cfg(test)]
 mod import_traversal_tests {
