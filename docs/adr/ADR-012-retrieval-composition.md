@@ -176,15 +176,6 @@ pub async fn hybrid_search(
     limit: u32,
     entity_kind: Option<&str>,
 ) -> RuntimeResult<Vec<SearchHit>>;
-
-pub async fn hybrid_search_with_strategy(
-    &self,
-    token: &NamespaceToken,   // replaces namespace: Option<&str>
-    query_text: &str,
-    query_vector: Option<Vec<f32>>,
-    strategy: FusionStrategy,
-    limit: u32,
-) -> RuntimeResult<Vec<SearchHit>>;
 ```
 
 ### Retrieval layering
@@ -370,7 +361,6 @@ retrieval paths.
 | `FusionStrategy` enum: `Rrf`, `Weighted`, `Union`, `VectorOnly`, `KeywordOnly`, `Custom` | `khive-runtime::fusion`                                           |
 | Custom strategy registration                                                             | `khive-runtime::FusionRegistry`                                   |
 | Hybrid search composition (vector + text)                                                | `khive-runtime::retrieval::hybrid_search`                         |
-| Strategy-parameterized hybrid search                                                     | `khive-runtime::fusion::hybrid_search_with_strategy`              |
 | Graph BFS (depth-bounded, direction + relation filters)                                  | `khive-runtime::graph_traversal::bfs_traverse`                    |
 | Bidirectional shortest-path                                                              | `khive-runtime::graph_traversal::shortest_path`                   |
 | Exact KNN                                                                                | `khive-runtime::retrieval::knn`                                   |
@@ -381,8 +371,7 @@ retrieval paths.
 The older entity-oriented `KhiveRuntime::hybrid_search` path is an explicit
 method-local exception to the generic RRF default: it uses fixed `k=10`, a 4×
 candidate pool, and a `0.5` exact-title boost so exact entity names dominate its
-small RRF score range. `hybrid_search_with_strategy` uses the caller's strategy
-(whose default RRF value is `k=60`) and a 4× pool. Reusable
+small RRF score range. Reusable
 `khive-retrieval::HybridConfig` defaults to a 5× pool, while its higher-level
 balanced `SearchConfig`/query-IR preset uses 3×. These pool sizes are
 API-specific latency/quality policies rather than `FusionStrategy` semantics;
@@ -531,7 +520,7 @@ tree, benchmark suite, and dependency surface (`lattice-embed`). ADR-012 is now 
   such as `hybrid_search`, `vector_search`, `knn`, `rerank`, `search_mixed`, and
   embedding helpers.
 - `crates/khive-runtime/src/fusion.rs`: runtime strategy entry points such as
-  `FusionStrategy`, `fuse_with_strategy`, and `hybrid_search_with_strategy`.
+  `FusionStrategy` and `fuse_with_strategy`.
 - `crates/khive-retrieval/src/lib.rs` and `crates/khive-retrieval/src/hybrid/searcher.rs`:
   low-level retrieval/ranking primitives, fusion helpers, engines, and adapters
   owned by ADR-030 and used where wired.

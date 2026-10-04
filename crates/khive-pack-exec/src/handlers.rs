@@ -1853,12 +1853,7 @@ fn finish_cleanup(receipt: &mut Receipt, run_dir: &Path, profile_path: &Path, ke
 
 #[cfg(unix)]
 fn kill_group(pid: i32) {
-    if pid <= 0 {
-        return;
-    }
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-    }
+    let _ = khive_runtime::process_group::signal_process_group(pid, libc::SIGKILL);
 }
 
 #[cfg(unix)]

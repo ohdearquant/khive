@@ -1,14 +1,8 @@
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, RUNTIME_STAMPED_ACTOR_KINDS};
+use khive_runtime::{split_stamped_label, KhiveRuntime, NamespaceToken, RuntimeError};
 use serde_json::Value;
 
 pub(super) fn caller_actor(token: &NamespaceToken) -> String {
     format!("{}:{}", token.actor().kind, token.actor().id)
-}
-
-fn split_stamped_actor(label: &str) -> Option<(&str, &str)> {
-    label
-        .split_once(':')
-        .filter(|(kind, _)| RUNTIME_STAMPED_ACTOR_KINDS.contains(kind))
 }
 
 pub(super) fn is_caller(token: &NamespaceToken, actor: &str) -> bool {
@@ -47,7 +41,7 @@ impl ActorScope {
         }
         if let Some(actor) = actor {
             super::label("actor", actor)?;
-            let (identity, is_self) = match split_stamped_actor(actor) {
+            let (identity, is_self) = match split_stamped_label(actor) {
                 Some((kind, id)) => (
                     if kind == "actor" { id } else { actor },
                     token.actor().kind == kind && token.actor().id == id,
@@ -61,10 +55,10 @@ impl ActorScope {
             }
         }
         let actors = match actor {
-            Some(actor) if split_stamped_actor(actor).is_some() => vec![actor.to_string()],
+            Some(actor) if split_stamped_label(actor).is_some() => vec![actor.to_string()],
             Some(actor) => vec![actor.to_string(), format!("actor:{actor}")],
             None if token.actor().kind == "actor"
-                && split_stamped_actor(&token.actor().id).is_none() =>
+                && split_stamped_label(&token.actor().id).is_none() =>
             {
                 vec![token.actor().id.clone(), caller_actor(token)]
             }
