@@ -737,25 +737,6 @@ fn note_snippet(note: &Note) -> Option<String> {
     text_preview(&note.content, 200)
 }
 
-/// Message properties established only by the trusted channel-ingest path.
-///
-/// Mirrors `khive-pack-comm`'s `TRANSPORT_OWNED_MESSAGE_PROPERTIES`. Duplicated
-/// here rather than imported because `khive-runtime` sits below `khive-pack-comm`
-/// in the dependency chain (`runtime → packs`); this list is the one place in
-/// the runtime layer that needs to know the shape of comm's trust boundary,
-/// guarding [`KhiveRuntime::try_create_note`]'s fast path.
-const TRANSPORT_OWNED_MESSAGE_PROPERTIES: &[&str] =
-    &["quarantined", "channel_kind", "channel_slug"];
-
-fn transport_owned_message_property_named_in(
-    properties: &serde_json::Map<String, serde_json::Value>,
-) -> Option<&'static str> {
-    TRANSPORT_OWNED_MESSAGE_PROPERTIES
-        .iter()
-        .copied()
-        .find(|key| properties.contains_key(*key))
-}
-
 /// Result of resolving a UUID to its substrate kind.
 #[derive(Clone, Debug)]
 pub enum Resolved {
@@ -4733,10 +4714,12 @@ impl KhiveRuntime {
     /// salience/decay, annotates edges, and embedding-model selection, which
     /// are not needed for channel-ingest paths.
     ///
-    /// Rejects `quarantined` / `channel_kind` / `channel_slug` on a `message`
-    /// note: those three properties are transport-owned evidence that
-    /// `comm.health` trusts at face value, and this fast path (unlike the
-    /// generic `create` verb funnel) is not covered by the
+    /// Rejects the transport-owned properties on a `message` note: the
+    /// `message` entry of the kind-owned property list that the note-store
+    /// accessor guard enforces, so both guards refuse the same keys. These
+    /// properties are transport-owned evidence (`comm.health` trusts the
+    /// quarantine and channel ones at face value), and this fast path (unlike
+    /// the generic `create` verb funnel) is not covered by the
     /// pack-installed note-write validator. Only the trusted channel-ingest
     /// path may establish them — see
     /// [`Self::try_create_note_as_trusted_ingest`].
@@ -4753,8 +4736,7 @@ impl KhiveRuntime {
     }
 
     /// Like [`Self::try_create_note`] but permits the caller to establish the
-    /// transport-owned `message` properties (`quarantined`, `channel_kind`,
-    /// `channel_slug`).
+    /// transport-owned `message` properties that `try_create_note` refuses.
     ///
     /// This is a deliberately named, separate entry point rather than a flag
     /// on `try_create_note` so the trust decision is visible at every call
@@ -4765,7 +4747,7 @@ impl KhiveRuntime {
     /// documentation: the required [`crate::ChannelIngestCapability`] is
     /// constructible only inside this crate and granted at pack registration
     /// exclusively to channel-transport packs. Every other write path uses
-    /// `try_create_note`, which rejects those three properties
+    /// `try_create_note`, which rejects those properties
     /// unconditionally.
     #[allow(clippy::too_many_arguments)]
     pub async fn try_create_note_as_trusted_ingest(
@@ -4861,7 +4843,12 @@ impl KhiveRuntime {
             if let Some(key) = properties
                 .as_ref()
                 .and_then(serde_json::Value::as_object)
-                .and_then(transport_owned_message_property_named_in)
+                .and_then(|supplied| {
+                    crate::curation::kind_owned_properties("message")
+                        .iter()
+                        .copied()
+                        .find(|key| supplied.contains_key(*key))
+                })
             {
                 return Err(RuntimeError::InvalidInput(format!(
                     "`{key}` is transport-owned on a `message` note and cannot be supplied \
@@ -21982,6 +21969,137 @@ mod tests {
             matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// One value for each key of the `message` entry of the kind-owned property
+    /// list, shaped like what the owning transport writes.
+    fn transport_owned_message_properties() -> [(&'static str, serde_json::Value); 7] {
+        use serde_json::json;
+
+        [
+            ("quarantined", json!(true)),
+            ("channel_kind", json!("email")),
+            ("channel_slug", json!("forged-channel")),
+            ("delivery_hold", json!("external_id_unverifiable")),
+            ("delivery_hold_reason", json!("forged hold")),
+            ("delivery_hold_at", json!("2026-01-01T00:00:00Z")),
+            ("external_id_diagnostic_note_id", json!("diag-note")),
+        ]
+    }
+
+    #[tokio::test]
+    async fn try_create_note_refuses_every_transport_owned_message_property() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        for (key, value) in transport_owned_message_properties() {
+            let err = rt
+                .try_create_note(
+                    &tok,
+                    "message",
+                    None,
+                    "forged transport-owned property via direct runtime write",
+                    Some(serde_json::json!({ key: value })),
+                )
+                .await
+                .expect_err(&format!("try_create_note must refuse `{key}`"));
+            assert!(
+                matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains(key)),
+                "refusal must name `{key}`: {err:?}"
+            );
+        }
+
+        let left_behind = rt
+            .list_notes(&tok, Some("message"), 100, 0)
+            .await
+            .expect("list must succeed");
+        assert!(
+            left_behind.is_empty(),
+            "refused writes must leave no row behind: {left_behind:?}"
+        );
+
+        // Control: the same read sees a message row, and the refusal is key-scoped.
+        let created = rt
+            .try_create_note(
+                &tok,
+                "message",
+                None,
+                "ordinary message",
+                Some(serde_json::json!({"direction": "inbound"})),
+            )
+            .await
+            .expect("a message without transport-owned properties is accepted")
+            .expect("the insert is not deduplicated");
+        let rows = rt
+            .list_notes(&tok, Some("message"), 100, 0)
+            .await
+            .expect("list must succeed");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, created.id);
+    }
+
+    #[tokio::test]
+    async fn trusted_ingest_accepts_every_transport_owned_message_property() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let capability = crate::pack::ChannelIngestCapability { _sealed: () };
+
+        let mut written = Vec::new();
+        for (key, value) in transport_owned_message_properties() {
+            let note = rt
+                .try_create_note_as_trusted_ingest(
+                    &capability,
+                    &tok,
+                    "message",
+                    None,
+                    "trusted ingest establishes a transport-owned property",
+                    Some(serde_json::json!({ key: value })),
+                    None,
+                )
+                .await
+                .unwrap_or_else(|err| panic!("trusted ingest refused `{key}`: {err}"))
+                .expect("the insert is not deduplicated");
+            written.push((key, value, note.id));
+        }
+
+        let mut everything = serde_json::Map::new();
+        for (key, value) in transport_owned_message_properties() {
+            everything.insert(key.to_string(), value);
+        }
+        let all_at_once = rt
+            .try_create_note_as_trusted_ingest(
+                &capability,
+                &tok,
+                "message",
+                None,
+                "trusted ingest establishes every transport-owned property",
+                Some(serde_json::Value::Object(everything)),
+                None,
+            )
+            .await
+            .expect("trusted ingest must accept all transport-owned properties at once")
+            .expect("the insert is not deduplicated");
+
+        let rows = rt
+            .list_notes(&tok, Some("message"), 100, 0)
+            .await
+            .expect("list must succeed");
+        assert_eq!(rows.len(), written.len() + 1);
+        for (key, value, id) in written {
+            let row = rows
+                .iter()
+                .find(|note| note.id == id)
+                .expect("the trusted ingest row is persisted");
+            let props = row.properties.as_ref().expect("properties");
+            assert_eq!(props[key], value, "must persist `{key}`");
+        }
+        let stored = rows
+            .iter()
+            .find(|note| note.id == all_at_once.id)
+            .and_then(|note| note.properties.as_ref())
+            .and_then(serde_json::Value::as_object)
+            .expect("the all-at-once row keeps its properties");
+        assert_eq!(stored.len(), 7);
     }
 
     #[tokio::test]
