@@ -19,6 +19,10 @@ use khive_storage::ContentRef;
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
+pub use khive_retrieval::{
+    HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource,
+};
+
 /// Bounds provider input and per-page outcome memory while amortizing model setup.
 pub(crate) const EMBEDDING_BATCH_PAGE_SIZE: usize = 256;
 
@@ -36,90 +40,6 @@ std::thread_local! {
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_backfill_reader_fail() {
     BACKFILL_READER_FAIL.with(|c| c.set(true));
-}
-
-/// The strategy that produced a hit's ordering score, including local modifiers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RankScoreKind {
-    Rrf,
-    Vector,
-    Keyword,
-    Weighted,
-    Union,
-}
-
-impl RankScoreKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Rrf => "rrf",
-            Self::Vector => "vector",
-            Self::Keyword => "keyword",
-            Self::Weighted => "weighted",
-            Self::Union => "union",
-        }
-    }
-}
-
-/// Retained component scores before fusion and strategy-local modifiers.
-/// An absent retrieval leg has no score, which is distinct from a measured zero.
-/// Scores belong to the backend and model that produced the retained hit;
-/// vector similarities from different embedding models are not comparable.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SearchSignals {
-    pub vector_similarity: Option<DeterministicScore>,
-    pub keyword_score: Option<DeterministicScore>,
-}
-
-/// A unified search result combining vector and text signals.
-#[derive(Clone, Debug)]
-pub struct SearchHit {
-    pub entity_id: Uuid,
-    pub score: DeterministicScore,
-    pub rank_score_kind: RankScoreKind,
-    pub signals: SearchSignals,
-    pub source: SearchSource,
-    pub title: Option<String>,
-    pub snippet: Option<String>,
-}
-
-/// Result of [`KhiveRuntime::hybrid_search_outcome`]: the fused hits — text
-/// hits alone when the vector arm failed — plus the vector arm's error, if
-/// any.
-#[derive(Clone, Debug)]
-pub struct HybridSearchOutcome {
-    pub hits: Vec<SearchHit>,
-    pub vector_error: Option<String>,
-}
-
-/// Which retrieval path(s) contributed to a hit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchSource {
-    Vector,
-    Text,
-    Both,
-}
-
-impl SearchSource {
-    /// Combine retrieval-leg membership from two appearances of the same hit.
-    #[must_use]
-    pub const fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Text, Self::Text) => Self::Text,
-            (Self::Vector, Self::Vector) => Self::Vector,
-            _ => Self::Both,
-        }
-    }
-
-    /// Lowercase wire representation used by search serializers.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Vector => "vector",
-            Self::Text => "text",
-            Self::Both => "both",
-        }
-    }
 }
 
 /// RRF constant. Controls how strongly top ranks dominate.
