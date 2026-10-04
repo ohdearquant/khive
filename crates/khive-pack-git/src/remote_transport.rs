@@ -6,8 +6,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use base64::Engine;
+use khive_runtime::bounded_read::read_to_end_bounded_async;
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::Command;
 use zeroize::Zeroizing;
 
@@ -112,13 +113,10 @@ fn git_command(program: &Path, repo: &Path, token: Option<&str>) -> Command {
     command
 }
 
-async fn bounded(mut pipe: impl AsyncRead + Unpin, limit: u64) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    (&mut pipe).take(limit + 1).read_to_end(&mut bytes).await?;
-    if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other("remote output exceeded limit"));
-    }
-    Ok(bytes)
+async fn bounded(pipe: impl AsyncRead + Unpin, limit: u64) -> std::io::Result<Vec<u8>> {
+    read_to_end_bounded_async(pipe, limit)
+        .await?
+        .ok_or_else(|| std::io::Error::other("remote output exceeded limit"))
 }
 
 async fn run(

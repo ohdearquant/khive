@@ -1,10 +1,11 @@
 //! ADR-191 A1.1: admit and read disk entries through the same opened descriptors.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use khive_runtime::{engine_config::WebSectionConfig, RuntimeError};
+use khive_runtime::{
+    bounded_read::read_to_end_bounded, engine_config::WebSectionConfig, RuntimeError,
+};
 
 use crate::egress::Refusal;
 
@@ -16,20 +17,15 @@ pub(crate) struct OpenedFile {
 
 impl OpenedFile {
     pub fn read(mut self, max_bytes: u64) -> Result<Vec<u8>, RuntimeError> {
-        let mut bytes = Vec::new();
-        self.file
-            .by_ref()
-            .take(max_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|error| refusal("ingest_read_failed", &self.relative, error))?;
-        if bytes.len() as u64 > max_bytes {
-            return Err(refusal(
-                "ingest_file_too_large",
-                &self.relative,
-                format!("file exceeds the {max_bytes}-byte disk ingest ceiling"),
-            ));
-        }
-        Ok(bytes)
+        read_to_end_bounded(&mut self.file, max_bytes)
+            .map_err(|error| refusal("ingest_read_failed", &self.relative, error))?
+            .ok_or_else(|| {
+                refusal(
+                    "ingest_file_too_large",
+                    &self.relative,
+                    format!("file exceeds the {max_bytes}-byte disk ingest ceiling"),
+                )
+            })
     }
 }
 
