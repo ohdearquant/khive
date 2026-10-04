@@ -30,6 +30,13 @@ transition table as `gtd.transition`. Successful state changes report
 `audit_persisted`; `false` means the task write committed but the best-effort
 lifecycle-audit append failed.
 
+Three parameters accept an input alias: `gtd.transition` takes `to` for
+`status`, `gtd.assign` takes `content` for `description`, and `gtd.complete`
+takes `note` for `result`. The canonical name stays the one in the schema and
+`help` lists the alias beside it. Supplying both spellings is refused with a
+message naming both, even when the values agree, and any other unknown field is
+refused as before.
+
 ## Timestamp census
 
 `gtd.census()` reports counts for live task rows in the caller-visible namespaces
