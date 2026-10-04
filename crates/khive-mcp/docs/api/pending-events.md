@@ -118,7 +118,7 @@ that find no due rows or return an error. Successful MCP dispatches of `schedule
 include a host-added health field:
 
 ```json
-{ "events": [], "count": 0, "ticker": { "last_tick_at": "2026-08-01T12:34:56.123456Z" } }
+{ "events": [], "count": 0, "next": null, "ticker": { "last_tick_at": "2026-08-01T12:34:56.123456Z" } }
 ```
 
 `last_tick_at` is null before this server instance observes a tick. It is intentionally
