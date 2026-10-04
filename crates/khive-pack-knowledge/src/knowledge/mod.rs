@@ -27,4 +27,6 @@ mod ann_degrade_tests;
 #[cfg(test)]
 mod namespace_move_consumer_tests;
 #[cfg(test)]
+mod namespace_move_snapshot_key_tests;
+#[cfg(test)]
 mod suggest_ranking_tests;

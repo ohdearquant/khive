@@ -203,12 +203,13 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// derived observations, etc. Errors are logged but not propagated
     /// (the write already happened; failing the call would mislead the
     /// caller). Implementations `tracing::warn!` and return `Ok(())`.
+    /// The default is a no-op.
     async fn after_create(
         &self,
-        runtime: &KhiveRuntime,
-        id: Uuid,
-        args: &Value,
-    ) -> Result<(), RuntimeError>;
+        _runtime: &KhiveRuntime,
+        _id: Uuid,
+        _args: &Value,
+    ) -> Result<(), RuntimeError> { Ok(()) }
 
     /// Normalize caller-facing note-update fields before validation runs.
     /// This is the extension point a kind-owning pack overrides. Default: no-op.

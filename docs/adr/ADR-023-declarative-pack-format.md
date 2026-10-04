@@ -302,7 +302,7 @@ vocabulary. When called with a `kind` argument, kg consults the owning pack's
 pub trait KindHook: Send + Sync + std::fmt::Debug {
     // create — already in ADR-017
     async fn prepare_create(&self, rt: &KhiveRuntime, args: &mut Value) -> Result<(), RuntimeError>;
-    async fn after_create  (&self, rt: &KhiveRuntime, id: Uuid, args: &Value) -> Result<(), RuntimeError>;
+    async fn after_create  (&self, _rt: &KhiveRuntime, _id: Uuid, _args: &Value) -> Result<(), RuntimeError> { Ok(()) }
 
     // list
     async fn prepare_list  (&self, rt: &KhiveRuntime, args: &mut Value)             -> Result<(), RuntimeError> { Ok(()) }
@@ -317,7 +317,7 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
 }
 ```
 
-All non-create hooks have empty default impls. Packs override only the ones they need.
+Only `prepare_create` is required. The other hooks have no-op defaults; packs override the ones they need.
 
 Concrete examples:
 
