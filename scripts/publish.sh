@@ -64,8 +64,8 @@ CRATES=(
     khive-gate-rego
     khive-channel          # no khive-* deps; transport abstraction; dep of khive-runtime
     khive-request        # needs khive-types only; versioned dev-dep of khive-runtime, so publish first
+    khive-retrieval      # needs khive-fusion/score/types (all above); dep of khive-runtime, so publish first
     khive-runtime
-    khive-retrieval
     khive-vcs-adapters
     khive-changeset      # needs khive-types (above)
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
