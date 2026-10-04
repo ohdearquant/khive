@@ -37,8 +37,9 @@
 //! `try_create_note` and `try_create_note_as_trusted_ingest`) bypasses this
 //! decorator entirely by reaching the backend directly
 //! (`KhiveRuntime::raw_notes`) rather than through `notes()`; it enforces the
-//! identical property check itself, conditionally allowing the three keys
-//! only when called with a `ChannelIngestCapability`. That keeps the trusted
+//! identical property check itself (over the same kind-owned list this
+//! decorator reads), conditionally allowing those keys only when called
+//! with a `ChannelIngestCapability`. That keeps the trusted
 //! ingest path exempt by construction rather than by call site.
 
 use std::collections::HashMap;
