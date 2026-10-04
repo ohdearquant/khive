@@ -2,7 +2,6 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 
 #[cfg(feature = "mmap")]
 use std::{
@@ -46,6 +45,9 @@ const PORTABLE_IDS_VERSION: u32 = 1;
 
 /// Default ops-since-consolidation threshold (ADR-052 §2, OQ5 resolution).
 const DEFAULT_CONSOLIDATION_TAU: usize = 40_000;
+
+mod search_visited;
+use search_visited::SearchVisitedPool;
 
 #[cfg(feature = "mmap")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -586,63 +588,6 @@ pub struct VamanaIndex {
     /// storage layer that owns the log sets it before `save_atomic` and reads
     /// it back after load to classify restart state.
     last_applied_seq: Option<u64>,
-}
-
-#[derive(Debug, Default)]
-struct SearchVisitedPool {
-    available: Mutex<Vec<VisitedSet>>,
-    #[cfg(test)]
-    allocations: std::sync::atomic::AtomicUsize,
-}
-
-impl SearchVisitedPool {
-    fn checkout(&self, capacity: usize) -> SearchVisitedLease<'_> {
-        let cached = self
-            .available
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop();
-        let mut visited = cached.unwrap_or_else(|| {
-            #[cfg(test)]
-            self.allocations
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            VisitedSet::new(capacity)
-        });
-        visited.ensure_capacity(capacity.saturating_sub(1));
-        SearchVisitedLease {
-            pool: self,
-            visited: Some(visited),
-        }
-    }
-}
-
-struct SearchVisitedLease<'a> {
-    pool: &'a SearchVisitedPool,
-    visited: Option<VisitedSet>,
-}
-
-impl std::ops::Deref for SearchVisitedLease<'_> {
-    type Target = VisitedSet;
-
-    fn deref(&self) -> &Self::Target {
-        self.visited.as_ref().expect("live search lease")
-    }
-}
-
-impl std::ops::DerefMut for SearchVisitedLease<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.visited.as_mut().expect("live search lease")
-    }
-}
-
-impl Drop for SearchVisitedLease<'_> {
-    fn drop(&mut self) {
-        self.pool
-            .available
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(self.visited.take().expect("live search lease"));
-    }
 }
 
 struct IndexMetadata {
@@ -2121,7 +2066,7 @@ impl VamanaIndex {
                 VectorStorage::Mmap { .. } => {
                     return Err(VamanaError::invalid_format(
                         "insert: unexpected Mmap after ensure_owned".into(),
-                    ))
+                    ));
                 }
             }
             // Update SQ8 code for the recycled slot.
@@ -2148,7 +2093,7 @@ impl VamanaIndex {
                 VectorStorage::Mmap { .. } => {
                     return Err(VamanaError::invalid_format(
                         "insert: unexpected Mmap after ensure_owned".into(),
-                    ))
+                    ));
                 }
             }
             // Append SQ8 code for the new slot.
@@ -2361,6 +2306,7 @@ impl VamanaIndex {
         self.free_slots.clear();
         self.ops_since_consolidation = 0;
         self.gs_codes = CodeStore::Owned(new_gs_codes);
+        self.search_visited.clear();
 
         Ok(new_to_old)
     }
@@ -4244,6 +4190,10 @@ mod perf_compat_tests;
 #[path = "index_perf_tests.rs"]
 mod perf_tests;
 
+#[cfg(test)]
+#[path = "index_search_visited_tests.rs"]
+mod search_visited_tests;
+
 // Kept inline (not in tests/) because these tests exercise private helpers and the
 // internal `VectorStorage` enum, which moving out would require re-exporting.
 #[cfg(test)]
@@ -5341,7 +5291,9 @@ mod tests {
         let sq8_recall = sq8_total / NUM_QUERIES as f64;
         let delta = f32_recall - sq8_recall;
 
-        println!("sq8_recall_parity | f32_recall@10={f32_recall:.4}  sq8_recall@10={sq8_recall:.4}  delta={delta:.4}");
+        println!(
+            "sq8_recall_parity | f32_recall@10={f32_recall:.4}  sq8_recall@10={sq8_recall:.4}  delta={delta:.4}"
+        );
 
         assert!(
             sq8_recall >= f32_recall - 0.02,
