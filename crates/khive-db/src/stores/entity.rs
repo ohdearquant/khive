@@ -380,6 +380,36 @@ impl SqlEntityStore {
         )
         .await
     }
+
+    async fn with_list_reader<F, R>(
+        &self,
+        op: &'static str,
+        index: Option<&'static str>,
+        mut read: F,
+    ) -> Result<R, StorageError>
+    where
+        F: FnMut(&rusqlite::Connection, bool) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        self.with_reader(op, move |conn| match read(conn, true) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let Some(index) = index.filter(|index| missing_list_index(&error, index)) else {
+                    return Err(error);
+                };
+                tracing::dispatcher::with_default(&dispatch, || {
+                    tracing::warn!(
+                        index,
+                        operation = op,
+                        "entity list index missing; retrying without forced index"
+                    );
+                });
+                read(conn, false)
+            }
+        })
+        .await
+    }
 }
 
 // =============================================================================
@@ -679,7 +709,7 @@ fn entity_read_source(filter: &EntityFilter) -> &'static str {
 }
 
 fn build_entity_count_query(filter: &EntityFilter, where_sql: &str) -> String {
-    let source = entity_read_source(filter);
+    let source = entity_list_source(filter);
     format!("SELECT COUNT(*) FROM {source}{where_sql}")
 }
 
@@ -691,11 +721,65 @@ fn build_entity_page_query(
     limit_idx: usize,
     offset_idx: usize,
 ) -> String {
-    let source = entity_read_source(filter);
+    let source = entity_list_source(filter);
     format!(
         "SELECT {columns} FROM {source}{where_sql} \
          ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
     )
+}
+
+/// Match only ordinary list shapes whose leading predicates fit these indexes.
+/// Keep selective names/kinds/tags and legacy JSON paths free to choose their
+/// own access paths. Explicit IDs always keep the bounded primary-key plan.
+fn entity_list_source(filter: &EntityFilter) -> &'static str {
+    if !filter.ids.is_empty()
+        || !filter.kinds.is_empty()
+        || !filter.entity_types_by_kind.is_empty()
+        || filter.legacy_entity_type_fallback
+        || filter.name_prefix.is_some()
+        || filter.name_exact.is_some()
+        || !filter.names_ci.is_empty()
+        || !filter.tags_any.is_empty()
+    {
+        return entity_read_source(filter);
+    }
+    if !filter.entity_types.is_empty() {
+        "entities INDEXED BY idx_entities_live_namespace_type_order"
+    } else if filter.namespaces.len() <= 1 {
+        "entities INDEXED BY idx_entities_live_namespace_order"
+    } else {
+        "entities"
+    }
+}
+
+fn entity_list_index(filter: &EntityFilter) -> Option<&'static str> {
+    if !filter.ids.is_empty() {
+        return None;
+    }
+    entity_list_source(filter).strip_prefix("entities INDEXED BY ")
+}
+
+fn missing_list_index(error: &rusqlite::Error, index: &str) -> bool {
+    if error
+        .sqlite_error()
+        .is_none_or(|detail| detail.extended_code != rusqlite::ffi::SQLITE_ERROR)
+    {
+        return false;
+    }
+    let message = match error {
+        rusqlite::Error::SqliteFailure(_, Some(message)) => message.as_str(),
+        rusqlite::Error::SqlInputError { msg, .. } => msg.as_str(),
+        _ => return false,
+    };
+    message.strip_prefix("no such index: ") == Some(index)
+}
+
+fn entity_list_query(filter: &EntityFilter, sql: String, force_index: bool) -> String {
+    if force_index || entity_list_index(filter).is_none() {
+        sql
+    } else {
+        sql.replacen(entity_list_source(filter), "entities", 1)
+    }
 }
 
 fn build_candidate_entity_query(
@@ -977,10 +1061,15 @@ impl EntityStore for SqlEntityStore {
             ),
         })?;
 
-        self.with_reader("query_entities", move |conn| {
+        let index = entity_list_index(&filter);
+        let read = move |conn: &rusqlite::Connection, force_index| {
             let total = if filter.names_ci.is_empty() && !skip_total {
                 let (count_sql, count_params) = build_entity_where(&namespace, &filter);
-                let sql = build_entity_count_query(&filter, &count_sql);
+                let sql = entity_list_query(
+                    &filter,
+                    build_entity_count_query(&filter, &count_sql),
+                    force_index,
+                );
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     count_params.iter().map(|p| p.as_ref()).collect();
@@ -1067,6 +1156,7 @@ impl EntityStore for SqlEntityStore {
                 )
             };
 
+            let data_sql = entity_list_query(effective_filter, data_sql, force_index);
             let mut stmt = conn.prepare(&data_sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                 data_params.iter().map(|p| p.as_ref()).collect();
@@ -1078,8 +1168,8 @@ impl EntityStore for SqlEntityStore {
             }
 
             Ok(Page { items, total })
-        })
-        .await
+        };
+        self.with_list_reader("query_entities", index, read).await
     }
 
     async fn query_entities_after(
@@ -1189,10 +1279,15 @@ impl EntityStore for SqlEntityStore {
     ) -> Result<u64, StorageError> {
         let namespace = namespace.to_string();
 
-        self.with_reader("count_entities", move |conn| {
+        let index = entity_list_index(&filter);
+        self.with_list_reader("count_entities", index, move |conn, force_index| {
             if filter.namespaces.is_empty() {
                 let (where_sql, params) = build_entity_where(&namespace, &filter);
-                let sql = build_entity_count_query(&filter, &where_sql);
+                let sql = entity_list_query(
+                    &filter,
+                    build_entity_count_query(&filter, &where_sql),
+                    force_index,
+                );
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
@@ -1215,7 +1310,11 @@ impl EntityStore for SqlEntityStore {
                     ..filter.clone()
                 };
                 let (where_sql, params) = build_entity_where(&namespace, &chunk_filter);
-                let sql = build_entity_count_query(&chunk_filter, &where_sql);
+                let sql = entity_list_query(
+                    &chunk_filter,
+                    build_entity_count_query(&chunk_filter, &where_sql),
+                    force_index && index.is_some(),
+                );
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
@@ -1249,3 +1348,7 @@ mod entity_type_counts_tests;
 #[cfg(test)]
 #[path = "entity_busy_tests.rs"]
 mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "entity_list_plan_tests.rs"]
+mod entity_list_plan_tests;

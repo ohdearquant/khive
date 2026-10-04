@@ -266,6 +266,7 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 
 Amendments to accepted records:
 
+- [ADR-015 amendment: live entity list indexes](ADR-015-schema-migrations.md#proposed-amendment-live-entity-list-indexes-2026-10-04) (2026-10-04): proposed V50 live entity namespace/order and namespace/type/order indexes, bounded eligible first-page plans, and one unforced retry for a missing index (#3689).
 - [ADR-005 amendment: shared streaming event cursor walk](ADR-005-storage-capability-traits.md#amendment-shared-streaming-event-cursor-walk-2026-10-01) (2026-10-01): proposed runtime cursor walk over the existing EventStore capability, shared by brain and moodboard (#3709, #3729).
 - [ADR-031 Amendment 4](ADR-031-multi-engine-retrieval.md#amendment-4-2026-09-30-disclose-bounded-document-embedding-input-at-the-rust-runtime-boundary) (2026-09-30): document-embedding truncation disclosure and Rust runtime API migration.
 - [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
@@ -303,4 +304,5 @@ Amendments inside records whose own status is Proposed:
 - [ADR-133 Amendment 3](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-3-2026-09-08-the-obligation-error-carries-the-domain-disposition-and-a-post-dispatch-obligation-error-is-never-retry-permission) (2026-09-08).
 - [ADR-137 Amendment 1](ADR-137-tailnet-wire-transport.md#amendment-1-wire-contract-closure-before-the-first-consumer): wire-contract closure before the first consumer.
 - [ADR-189 Amendment 2](ADR-189-namespace-move.md#amendment-2-2026-10-04-logical-domain-routes-and-partitioned-vector-destinations) (2026-10-04): canonical Domain mirror ownership and unique source-vector destinations per backend (#3696).
+- [ADR-189 Amendment 4](ADR-189-namespace-move.md#amendment-4-2026-10-04-edge-relation-routes) (2026-10-04): proposed canonical edge relation routes, order-independent fallback and resolved vector destinations (#4038).
 - [ADR-172 Amendment 2](ADR-172-versioned-notes-compare-and-set.md#amendment-2-2026-09-08-a-head-note-kind-for-keyed-documents-the-document-kind-as-a-tag-embed-and-the-in-transaction-arm) (2026-09-08), [Amendment 3](ADR-172-versioned-notes-compare-and-set.md#amendment-3-2026-09-09-ordered-fence-lists) (2026-09-09), [Amendment 4](ADR-172-versioned-notes-compare-and-set.md#amendment-4-2026-09-11-absence-as-a-fence-predicate) (2026-09-11) and [Amendment 5](ADR-172-versioned-notes-compare-and-set.md#amendment-5-2026-09-14-an-accepted-fenced-write-always-mints-a-version-the-no-op-answer-is-for-unfenced-updates-only) (2026-09-14).

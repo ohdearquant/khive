@@ -44,6 +44,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         // SAFETY: the caller supplies the GlobalAlloc layout contract.
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
+            peak_tests::record_allocation(layout.size());
             record_allocation(layout.size());
         }
         pointer
@@ -53,6 +54,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         // SAFETY: the caller supplies the GlobalAlloc layout contract.
         let pointer = unsafe { System.alloc_zeroed(layout) };
         if !pointer.is_null() {
+            peak_tests::record_allocation(layout.size());
             record_allocation(layout.size());
         }
         pointer
@@ -62,6 +64,7 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
         // SAFETY: pointer, layout, and size retain the caller's realloc contract.
         let resized = unsafe { System.realloc(pointer, layout, size) };
         if !resized.is_null() {
+            peak_tests::record_reallocation(layout.size(), size);
             record_allocation(size);
         }
         resized
@@ -70,11 +73,15 @@ unsafe impl GlobalAlloc for MeasuredAllocator {
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         // SAFETY: pointer and layout retain the caller's deallocation contract.
         unsafe { System.dealloc(pointer, layout) };
+        peak_tests::record_deallocation(layout.size());
     }
 }
 
 #[global_allocator]
 static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
+
+#[path = "checkpoint_peak_tests.rs"]
+mod peak_tests;
 
 struct AllocationScope;
 impl Drop for AllocationScope {

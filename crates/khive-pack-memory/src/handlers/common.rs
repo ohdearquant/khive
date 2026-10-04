@@ -2,7 +2,10 @@
 //! See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::AtomicU64;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -230,22 +233,45 @@ pub(super) async fn embed_query_model(
     if let Some(v) = cache.get(&model_name, &query) {
         return Ok((model_name, v));
     }
-    let handle = tokio::runtime::Handle::current();
-    let model_name_blk = model_name.clone();
-    let query_blk = query.clone();
-    let v = khive_storage::await_request_read_phase(
-        "memory.recall.embedding",
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(runtime.embed_query_with_model(&model_name_blk, &query_blk))
-        }),
-    )
-    .await?
-    .map_err(|e| RuntimeError::Internal(format!("recall embed task panicked: {e}")))??;
+    // A provider's `embed_query` runs inline here, so a panic would otherwise unwind
+    // through every sibling model's embedding. Contain it to this model; nothing is
+    // cached for a panicked embed because the error returns before `cache.put`.
+    let mut embed = Box::pin(runtime.embed_query_with_model(&model_name, &query));
+    let guarded = std::future::poll_fn(|cx| {
+        let polled = catch_unwind(AssertUnwindSafe(|| embed.as_mut().poll(cx)));
+        match polled {
+            Ok(poll) => poll.map(Ok),
+            Err(payload) => Poll::Ready(Err(payload)),
+        }
+    });
+    let out = khive_storage::await_request_read_phase("memory.recall.embedding", guarded).await?;
+    // Release the borrows of `model_name` and `query` before `model_name` moves out below.
+    drop(embed);
+    let v = out.map_err(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        RuntimeError::Internal(format!("recall embed task panicked: {message}"))
+    })??;
     cache.put(&model_name, &query, v.clone());
     Ok((model_name, v))
 }
 
 type NamedEmbedResult = (String, Result<(String, Vec<f32>), RuntimeError>);
+
+#[cfg(test)]
+#[path = "common_embedding_tests.rs"]
+mod embedding_tests;
+
+#[cfg(test)]
+#[path = "common_cold_embedding_tests.rs"]
+mod cold_embedding_tests;
+
+#[cfg(test)]
+#[path = "common_embed_branch_tests.rs"]
+mod embed_branch_tests;
 
 /// Partition per-engine embed results into successes, warning on each failure so one
 /// unhealthy embedding engine degrades recall instead of aborting it. Errors only if
@@ -1277,19 +1303,25 @@ impl MemoryPack {
                     }
                 }
                 _ => {
+                    // Request-owned children re-enter the dispatch's usage context, as the
+                    // 1- and 2-model paths observe it directly.
+                    let usage_ctx = khive_storage::usage::current();
                     let mut handles = Vec::with_capacity(model_names.len());
                     for model_name in model_names {
                         let rt = self.runtime.clone();
                         let cache = self.query_cache.clone();
                         let q = query.to_string();
                         let name_for_result = model_name.clone();
+                        let ctx = usage_ctx.clone();
                         handles.push(tokio::spawn(
                             khive_runtime::runtime::inherit_request_embedder_scope(
                                 khive_storage::inherit_request_read_context(async move {
-                                    (
-                                        name_for_result,
-                                        embed_query_model(rt, cache, model_name, q).await,
-                                    )
+                                    let embed = embed_query_model(rt, cache, model_name, q);
+                                    let result = match ctx {
+                                        Some(ctx) => khive_storage::usage::scope(ctx, embed).await,
+                                        None => embed.await,
+                                    };
+                                    (name_for_result, result)
                                 }),
                             ),
                         ));

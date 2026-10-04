@@ -21,6 +21,7 @@ pub(super) fn observe_fts_write() {
 }
 
 enum Point {
+    AfterEntityRead(Uuid),
     Edge(Uuid),
     BeforeCompletion,
     BeforeRead(PathBuf),
@@ -45,6 +46,14 @@ impl Pause {
             self.entered.wait().await;
             self.release.wait().await;
         }
+    }
+}
+pub(super) async fn after_entity_read(id: Uuid) {
+    let Ok(pause) = PAUSE.try_with(Arc::clone) else {
+        return;
+    };
+    if matches!(pause.point, Point::AfterEntityRead(expected) if expected == id) {
+        pause.wait().await;
     }
 }
 pub(super) fn after_entity_commit(entity: &Entity) {
@@ -259,10 +268,22 @@ async fn l2_recovery_mixed_final_refresh_reobserves_only_scanned_references() {
             let (rt, token) = runtime(&db, wal);
             l2(&rt, &token, &root, 10).await;
             let ids = [natural("a", "aa", "ah"), natural("b", "ba", "bh")];
-            // Seed historical removed, manual, foreign-owner and unvisited-source
-            // rows using the same real storage path. None is scanner-observed.
+            let removed_source = symbol("a", "removed");
+            for module in ["a", "b"] {
+                let row = stored(&rt, &token, module_uuid("fixture", "rust", module)).await;
+                let retained =
+                    read_declaration_ids(&row.properties.expect("properties")["declaration_ids"])
+                        .expect("current retained declarations");
+                assert!(
+                    !retained.contains(&removed_source),
+                    "final-refresh history must have an unscanned source"
+                );
+            }
+            // Seed removed-source, manual, foreign-owner and unvisited-source
+            // history. Derived history lies outside retained source coverage,
+            // so the completed predecessor genuinely reaches final refresh.
             let histories = [
-                (symbol("a", "aa"), symbol("b", "bh"), true),
+                (removed_source, symbol("b", "bh"), true),
                 (symbol("a", "ah"), symbol("a", "aa"), false),
                 (
                     symbol_uuid("foreign", "rust", "a", "foreign", "function"),
@@ -720,8 +741,11 @@ fn l2_recovery_marker_validation_is_strict_and_times_are_opaque() {
     let valid = json!({"version":1,"attempted":marker,"completed":marker});
     let props = json!({"sweep_clock":{"rust":"opaque legacy text"},"l2_sweep_runs":{"rust":valid}});
     assert_eq!(
-        completed_l2_sweep_stamp(&props, "rust"),
-        Some("opaque legacy text")
+        completed_l2_observation(&props, "rust"),
+        Some(L2Observation {
+            run_id: Uuid::parse_str(&id).unwrap(),
+            sweep_time: "opaque legacy text".into(),
+        })
     );
     for pointer in [
         "/l2_sweep_runs/rust/attempted",
@@ -729,12 +753,12 @@ fn l2_recovery_marker_validation_is_strict_and_times_are_opaque() {
     ] {
         let mut bad = props.clone();
         bad.pointer_mut(pointer).expect("marker")["extra"] = json!(1);
-        assert_eq!(completed_l2_sweep_stamp(&bad, "rust"), None);
+        assert_eq!(completed_l2_observation(&bad, "rust"), None);
     }
     for value in [json!([]), json!("malformed"), Value::Null] {
         let mut bad = props.clone();
         bad["l2_sweep_runs"] = value;
-        assert_eq!(completed_l2_sweep_stamp(&bad, "rust"), None);
+        assert_eq!(completed_l2_observation(&bad, "rust"), None);
     }
 }
 
@@ -825,7 +849,7 @@ async fn l2_recovery_empty_file_and_parse_skip_do_not_promote_history() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn l2_recovery_real_read_skip_retains_known_historical_strand() {
+async fn l2_recovery_restored_read_skip_reobserves_actual_references() {
     for wal in [true, false] {
         let dir = TempDir::new().expect("directory");
         let root = dir.path().join("source");
@@ -860,11 +884,11 @@ async fn l2_recovery_real_read_skip_retains_known_historical_strand() {
         fs::remove_file(&path).expect("remove symlink");
         fs::write(&path, original).expect("restore unchanged disk");
         let (_, work) = l2(&rt, &token, &root, 30).await;
-        assert!(work.parsed.is_empty());
+        assert_eq!(work.parsed, [path]);
         assert_eq!(
             stamp(&edge(&rt, &token, natural("a", "aa", "ah")).await),
-            time(10).to_rfc3339(),
-            "completed skipped-file strand remains outside the recovery guarantee"
+            time(30).to_rfc3339(),
+            "restored source is really re-observed before its natural edge is current"
         );
     }
 }
@@ -874,3 +898,12 @@ mod pending_removed_tests;
 
 #[path = "l2_file_pending_gate_tests.rs"]
 mod file_pending_gate_tests;
+
+#[path = "l2_owner_refresh_tests.rs"]
+mod shared_owner_tests;
+
+#[path = "l2_run_identity_tests.rs"]
+mod run_identity_tests;
+
+#[path = "l2_accepted_edge_tests.rs"]
+mod accepted_edge_tests;

@@ -2445,6 +2445,7 @@ dependencies = [
  "chrono",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",
@@ -2461,7 +2462,6 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2693,6 +2693,7 @@ dependencies = [
  "image",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-fusion",
  "khive-pack-kg",
  "khive-retrieval",
@@ -2703,7 +2704,6 @@ dependencies = [
  "lattice-embed",
  "lattice-fann",
  "lattice-inference",
- "libc",
  "serde",
  "serde_json",
  "sha2",
@@ -2711,7 +2711,6 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

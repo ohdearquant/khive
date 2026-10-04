@@ -180,10 +180,13 @@ It runs, in order:
    `khive-runtime` atomic-plan vocabulary this CLI orchestrator owns.
 3. The synchronous commit pass (`khive_runtime::atomic_runner::run_atomic_unit`, B2).
 4. The async post-commit reindex pass
-   (`khive_runtime::atomic_prepare::apply_post_commit_effects_with_report`).
+   (`khive_runtime::atomic_prepare::apply_post_commit_effects_with_failures`).
    Its typed embedding outcomes are matched back to the originating update plan, so an atomic
    update whose embedding input was bounded carries the same per-result `warnings` advisory as
-   the canonical non-atomic handler.
+   the canonical non-atomic handler. Each outcome also carries the note's eligible-model
+   `failures`, which become `post_commit_reindex` degradations. The pass returns the outcomes
+   alongside the error text of any effect that failed closed, so model failures and truncation
+   warnings are disclosed even when another effect in the same unit fails.
 
 The commit pass is the retry-safety boundary. Once it returns `Committed`, a reindex, canonical
 result-rendering, or save-file publication failure cannot make the database mutation retryable:

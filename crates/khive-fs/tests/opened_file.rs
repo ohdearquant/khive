@@ -46,6 +46,22 @@ fn opened_file_path_reports_the_resolved_path_through_a_symlinked_directory() {
     assert_eq!(opened_file_path(&file).unwrap(), resolved);
 }
 
+#[cfg(target_vendor = "apple")]
+#[test]
+fn opened_file_path_reports_a_renamed_open_directory_on_apple() {
+    let scratch = Scratch::new("renamed-open-directory");
+    let root = scratch.path().canonicalize().unwrap();
+    let original = root.join("original");
+    let renamed = root.join("renamed");
+    std::fs::create_dir(&original).unwrap();
+    let directory = File::open(&original).unwrap();
+
+    std::fs::rename(&original, &renamed).unwrap();
+    std::fs::create_dir(&original).unwrap();
+
+    assert_eq!(opened_file_path(&directory).unwrap(), renamed);
+}
+
 #[test]
 fn open_regular_file_within_refuses_a_source_swapped_to_an_outside_symlink() {
     let scratch = Scratch::new("swapped-source");

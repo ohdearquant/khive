@@ -1749,6 +1749,92 @@ class NpmReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("would publish @khive-ai/cli", completed.stdout)
 
 
+class CoreOnlyFeatureWorkflowTests(unittest.TestCase):
+    def run_feature_checks(self, failing_feature):
+        job = indented_block(workflow_text("ci.yml"), "core-only", 2)
+        step = step_block(job, "Check each optional pack independently")
+        self.assertIn("if: ${{ !cancelled() }}", step)
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory(prefix="core-features-") as directory:
+            root = pathlib.Path(directory)
+            calls = root / "calls"
+            summary = root / "summary"
+            cargo = root / "cargo"
+            cargo.write_text(
+                "#!/bin/sh\n"
+                'printf "%s\\n" "$*" >> "$FEATURE_CALLS"\n'
+                'case "$*" in *"--features $FAILING_FEATURE "*) exit 19;; esac\n'
+            )
+            cargo.chmod(0o700)
+            env = {key: value for key, value in os.environ.items()
+                   if key not in {"BASH_ENV", "ENV"} and not key.startswith("BASH_FUNC_")}
+            env.update(PATH=str(root) + os.pathsep + env.get("PATH", ""),
+                       FEATURE_CALLS=str(calls), FAILING_FEATURE=failing_feature,
+                       GITHUB_STEP_SUMMARY=str(summary))
+            result = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", script],
+                cwd=root, env=env, text=True, capture_output=True, timeout=10,
+                check=False,
+            )
+            invocations = [shlex.split(line) for line in calls.read_text().splitlines()]
+            manifest = (REPO_ROOT / "crates/kkernel/Cargo.toml").read_text()
+            feature_table = re.search(r"(?ms)^\[features\]\n(.*?)(?=^\[|\Z)", manifest)
+            self.assertIsNotNone(feature_table, "manifest features table exists")
+            features = set(re.findall(r"(?m)^(pack-[a-z0-9-]+)\s*=", feature_table.group(1)))
+            self.assertTrue(features, "optional pack features are declared")
+            self.assertEqual(len(invocations), len(features), "one check per optional pack")
+            self.assertEqual(
+                {tuple(args) for args in invocations},
+                {("check", "-p", "kkernel", "--no-default-features", "--features", name, "--locked")
+                 for name in features},
+                "each feature compiles independently with defaults disabled",
+            )
+            return result, summary.read_text()
+
+    def test_all_optional_features_pass_without_enabling_defaults(self):
+        result, summary = self.run_feature_checks("not-a-feature")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(": failed", summary)
+
+    def test_middle_failure_does_not_skip_later_features_or_turn_green(self):
+        result, summary = self.run_feature_checks("pack-web")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("pack-web: failed (", summary)
+        self.assertIn("pack-moodboard: passed (", summary)
+
+    def test_core_steps_build_and_test_with_defaults_disabled(self):
+        job = indented_block(workflow_text("ci.yml"), "core-only", 2)
+        expected = {
+            "Compile every target without the optional packs": [
+                "cargo", "check", "-p", "kkernel", "-p", "khive-mcp",
+                "--no-default-features", "--all-targets", "--locked",
+            ],
+            "Run the library tests without the optional packs": [
+                "cargo", "test", "-p", "kkernel", "-p", "khive-mcp",
+                "--no-default-features", "--lib", "--locked",
+            ],
+            "Run the pack composition tests without the optional packs": [
+                "cargo", "test", "-p", "kkernel", "--no-default-features", "--locked",
+                "--test", "optional_pack_features", "--test", "gate_operation_census",
+                "--test", "descriptions_are_written_for_callers",
+            ],
+        }
+        for name, argv in expected.items():
+            step = step_block(job, name)
+            command = step.split("        run: ", 1)[1].splitlines()[0]
+            self.assertEqual(shlex.split(command), argv, name)
+        for test in ("optional_pack_features", "gate_operation_census",
+                     "descriptions_are_written_for_callers"):
+            self.assertTrue((REPO_ROOT / "crates/kkernel/tests" / f"{test}.rs").is_file(), test)
+
+    def test_core_only_job_stays_outside_the_required_gate(self):
+        workflow = workflow_text("ci.yml")
+        gate_needs = indented_block(indented_block(workflow, "ci-gate", 2), "needs", 4)
+        needs = {line.strip().removeprefix("- ") for line in gate_needs.splitlines() if line.strip()}
+        self.assertIn("msrv-check", needs, "the needs list was read")
+        self.assertNotIn("core-only", needs)
+
+
 class HistoricalReplayWorkflowTests(unittest.TestCase):
     CHECKOUT_NAMES = {
         "ci": "CI (${{ matrix.os }}, shard ${{ matrix.shard }}/2)",
@@ -1766,6 +1852,7 @@ class HistoricalReplayWorkflowTests(unittest.TestCase):
         "minio-blob-compat": "MinIO BlobStore compatibility (ADR-111 Amendment 2)",
         "check-windows": "Windows compile check",
         "msrv-check": "MSRV compile check",
+        "core-only": "Core-only feature set build and tests",
         "coverage-measurement": "Coverage measurement",
         "coverage-ratchet": "Coverage ratchet",
     }

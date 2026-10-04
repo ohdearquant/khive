@@ -670,7 +670,7 @@ fn resolve_prefix_statement(
     SqlStatement {
         sql: format!(
             "SELECT id FROM {table} \
-             WHERE id >= ?1 AND id < ?2{namespace_clause}{deleted_filter} LIMIT 2",
+             WHERE id >= ?1 AND id < ?2{namespace_clause}{deleted_filter} ORDER BY id LIMIT 2",
             namespace_clause = namespace_clause.as_deref().unwrap_or("")
         ),
         params,
@@ -6061,25 +6061,17 @@ impl KhiveRuntime {
         // so the sidecar scan merges into the same `matches`/`seen` set.
         if matches.len() <= 1 {
             if let Some(sidecar_sql) = self.events_sidecar_sql_read_only()? {
-                let mut params = vec![SqlValue::Text(lower.clone()), SqlValue::Text(upper.clone())];
-                if let Some(ns) = namespaces {
-                    params.extend(ns.iter().map(|n| SqlValue::Text(n.clone())));
-                }
-                let namespace_clause = namespaces.map(|namespaces| {
-                    let placeholders: Vec<String> = (0..namespaces.len())
-                        .map(|index| format!("?{}", index + 3))
-                        .collect();
-                    format!(" AND namespace IN ({})", placeholders.join(", "))
-                });
-                let sql = SqlStatement {
-                    sql: format!(
-                        "SELECT id FROM events \
-                         WHERE id >= ?1 AND id < ?2{namespace_clause} LIMIT 2",
-                        namespace_clause = namespace_clause.as_deref().unwrap_or("")
-                    ),
-                    params,
-                    label: Some("resolve_prefix.events_sidecar".into()),
-                };
+                // The main-store statement, so the sidecar's candidates come back in
+                // the same id order rather than whichever index the planner picks.
+                let mut sql = resolve_prefix_statement(
+                    "events",
+                    false,
+                    include_deleted,
+                    namespaces,
+                    &lower,
+                    &upper,
+                );
+                sql.label = Some("resolve_prefix.events_sidecar".into());
                 let mut sidecar_reader =
                     sidecar_sql.reader().await.map_err(RuntimeError::Storage)?;
                 match sidecar_reader.query_all(sql).await {

@@ -1152,6 +1152,86 @@ jobs:
       - name: Check workspace on the declared minimum Rust version
         run: cargo +1.95.0 check --workspace --locked
 
+  # Keep this job outside ci-gate until a week of successful main merges.
+  # Sequential feature checks reuse one Linux runner without hiding later failures.
+  core-only:
+    name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Core-only feature set build and tests
+    needs: resolve-revision
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: "0"
+      # See the model cache steps below: with this set the cache is load-bearing.
+      LATTICE_OFFLINE: "1"
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve-revision.outputs.checkout_sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      # The same embedding model cache the ci job restores, under the same key. With
+      # LATTICE_OFFLINE set above, a library test that needs the model fails naming
+      # the missing directory instead of fetching from huggingface.co.
+      - name: Resolve the embedding model cache key
+        id: model-cache-key
+        working-directory: ${{ github.workspace }}
+        run: |
+          version=$(awk '/^name = "lattice-inference"$/{found=1; next} found && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' crates/Cargo.lock)
+          # An empty version would silently produce a key that never matches and
+          # a cache that never restores, which reads exactly like a cold runner.
+          if [ -z "$version" ]; then
+            echo "could not read the locked lattice-inference version from crates/Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "resolved lattice-inference $version"
+      - name: Restore the embedding model cache
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.lattice/models
+          key: lattice-models-${{ runner.os }}-all-minilm-l6-v2-${{ steps.model-cache-key.outputs.version }}
+      - name: Warm the embedding model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        working-directory: ${{ github.workspace }}
+        run: scripts/warm-model-cache.sh all-minilm-l6-v2
+      - name: Compile every target without the optional packs
+        run: cargo check -p kkernel -p khive-mcp --no-default-features --all-targets --locked
+      - name: Run the library tests without the optional packs
+        run: cargo test -p kkernel -p khive-mcp --no-default-features --lib --locked
+      # These integration tests assert which packs are linked and selectable. Their
+      # feature-off branches are what catch a core crate linking an optional pack,
+      # and the ci job runs them only with every feature on.
+      - name: Run the pack composition tests without the optional packs
+        run: cargo test -p kkernel --no-default-features --locked --test optional_pack_features --test gate_operation_census --test descriptions_are_written_for_callers
+
+      - name: Check each optional pack independently
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          status=0
+          for feature in pack-agent pack-telemetry pack-web pack-formal pack-moodboard; do
+            started=$SECONDS
+            if cargo check -p kkernel --no-default-features --features "$feature" --locked; then
+              result=passed
+            else
+              result=failed
+              status=1
+            fi
+            printf '%s: %s (%s seconds)\n' "$feature" "$result" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$status"
+
   check-windows:
     name: ${{ github.event_name == 'workflow_dispatch' && inputs.main_sha != '' && 'Replay ' || '' }}Windows compile check
     needs: resolve-revision

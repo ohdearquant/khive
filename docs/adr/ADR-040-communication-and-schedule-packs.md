@@ -1180,6 +1180,20 @@ copies carry the same rows that entry shows the same attachments whichever copy 
 `comm.read` adds the same array to the message fields that the 2026-09-24 amendment returns for a
 successful mark. With `body=false` it adds nothing and keeps its acknowledgement-only shape.
 
+An unreadable ownership row does not hide the message or its readable file references. These
+views add `attachments_error: {count, reason: "unreadable_attachment"}` to the affected message
+when its attachment-store report contains unreadable rows. `count` is the number of unreadable
+rows in `attachments` plus retained rows in `attachment_quarantine` owned by that message UUID.
+This diagnostic is owner-wide: it is counted before the eight positional display roles are
+selected, so unreadable rows with other roles, including `quarantine-original`, can contribute.
+Readable rows with other roles are neither displayed nor counted as errors. The count describes
+metadata rows, not missing blob bytes, and no role, raw invalid reference or file bytes are echoed.
+A clean message omits the marker. `attachments_error` is an accepted `inbox` and `thread`
+projection field; an absent marker projects as null when explicitly selected. A body-bearing
+`comm.read` returns the same diagnostic, while `body=false` returns neither attachment field.
+A failure of the attachment lookup itself fails the verb rather than producing this marker;
+bulk body-bearing reads complete those lookups before marking any target read.
+
 No comm response contains file bytes. Selection, ordering, pagination, counts, deduplication,
 cursors and read state are unchanged. `comm.delivered`, `comm.mark_read`, `comm.unread`,
 `comm.health`, `comm.probe`, `comm.ingest` and the generic record verbs are unchanged.
@@ -1395,7 +1409,7 @@ Acceptance requires these arms, each selecting at least one test and passing:
    `comm.read` with `body=false` is unchanged. A `quarantine-original` row and a
    `message-attachment:8` row are never shown.
 7. A hard delete removes a copy's rows in the same transaction and leaves the other copy's rows. A
-   soft delete leaves them.
+   soft delete leaves them. An injected attachment-delete failure rolls the hard delete back.
 8. `blob.import` then `blob.export` round-trips byte-equal, and the imported reference equals the
    BLAKE3 digest of the file. These are refused: a `..` path, a path outside the import
    directory, a symlink inside the directory that points outside it, a symlink inside the directory
