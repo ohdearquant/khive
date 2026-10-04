@@ -19,14 +19,6 @@ impl KindHook for RewriteHook {
     async fn prepare_create(&self, _: &KhiveRuntime, _: &mut Value) -> Result<(), RuntimeError> {
         Ok(())
     }
-    async fn after_create(
-        &self,
-        _: &KhiveRuntime,
-        _: uuid::Uuid,
-        _: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
-    }
     async fn normalize_note_update(
         &self,
         _: &KhiveRuntime,
