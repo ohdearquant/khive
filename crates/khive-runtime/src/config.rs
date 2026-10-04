@@ -466,6 +466,9 @@ const ANN_REBUILD_THRESHOLD_DEFAULT: f64 = 0.20;
 
 /// Read the ANN tail-rebuild fraction on each invocation (ADR-079 Amendment 2).
 ///
+/// ADR-079's `ann_rebuild_threshold` default rationale describes the raw-row
+/// policy, its workload assumptions and its coupled maintenance/visibility roles.
+///
 /// The exact environment value must parse as `f64` and lie in `(0, 1]`;
 /// unset, non-Unicode, malformed and out-of-range values use `0.20`.
 /// This reader deliberately does not trim or cache the value.

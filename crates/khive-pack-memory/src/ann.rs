@@ -4290,8 +4290,8 @@ async fn classify_and_adopt_segment(
         return SegmentOutcome::Empty;
     }
 
-    // Rule 7: compare replay cost with the live corpus, independently of
-    // cumulative delta-chain headroom. A replay that reaches the chain limit
+    // Rule 7: apply ADR-079's raw-tail work limit (see its default rationale),
+    // independently of delta-chain headroom. A replay that reaches the chain limit
     // publishes a full checkpoint after applying the tail.
     let threshold = replay_limit(live, ann_rebuild_threshold());
     if tail <= threshold {
