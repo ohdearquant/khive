@@ -710,6 +710,158 @@ pub(crate) mod tests {
         }
     }
 
+    /// Dispatches one request on `server` and returns its first result entry.
+    async fn first_result_entry(server: &KhiveMcpServer, ops: &str) -> Value {
+        let raw = server
+            .dispatch_request_local(RequestParams {
+                plan: None,
+                ops: ops.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("per-op failures are results, not dispatch errors");
+        let response: Value = serde_json::from_str(&raw).expect("JSON response");
+        response["results"][0].clone()
+    }
+
+    /// Every accepted spelling of a singleton link must take the coordinator
+    /// path, not only the canonical one.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn multi_backend_link_routes_every_accepted_spelling_through_the_coordinator() {
+        let source_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        for ops in [
+            format!(
+                r#"link(source_id="{source_id}", target_id="{target_id}", relation="implements")"#
+            ),
+            format!(r#"link(source="{source_id}", target="{target_id}", kind="implements")"#),
+            format!(
+                r#"link(source="{source_id}", target_id="{target_id}", kind="implements", dependency_kind="artifact")"#
+            ),
+        ] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            first_result_entry(&server, &ops).await;
+            assert!(
+                coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
+                "{ops} must be routed through the coordinator"
+            );
+        }
+    }
+
+    /// A call giving both spellings of one field is refused by the link handler
+    /// even when the values agree. The coordinator intercept must not accept it
+    /// by ignoring one spelling: it falls through, and the refusal is the one
+    /// the registry path returns for the same call.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn multi_backend_link_refuses_both_spellings_of_one_field_like_the_handler() {
+        let source_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        for (ops, alias) in [
+            (
+                format!(
+                    r#"link(source_id="{source_id}", target_id="{target_id}", relation="implements", kind="implements")"#
+                ),
+                "kind",
+            ),
+            (
+                format!(
+                    r#"link(source_id="{source_id}", source="{source_id}", target_id="{target_id}", relation="implements")"#
+                ),
+                "source",
+            ),
+            (
+                format!(
+                    r#"link(source_id="{source_id}", target_id="{target_id}", target="{target_id}", relation="implements")"#
+                ),
+                "target",
+            ),
+        ] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let entry = first_result_entry(&server, &ops).await;
+
+            let (registry, _runtime) = make_registry();
+            let registry_only =
+                KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg");
+            let handler_entry = first_result_entry(&registry_only, &ops).await;
+
+            assert_eq!(entry["ok"], json!(false), "{ops} must be refused: {entry}");
+            assert!(
+                entry["error"]
+                    .to_string()
+                    .contains(&format!("`{alias}` is an alias for")),
+                "{ops} must be refused as an alias conflict: {entry}"
+            );
+            assert_eq!(
+                entry["error"], handler_entry["error"],
+                "{ops} must be refused exactly as the handler refuses it"
+            );
+            assert!(
+                !coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
+                "{ops} must not reach the coordinator"
+            );
+        }
+    }
+
+    /// The same edge in the canonical and the aliased spelling is one write, so a
+    /// parallel batch refuses both ops before either reaches the coordinator.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn multi_backend_mixed_spelling_links_to_one_edge_conflict_before_dispatch() {
+        let source_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        for ops in [
+            format!(
+                r#"[link(source_id="{source_id}", target_id="{target_id}", relation="implements", weight=0.1), link(source_id="{source_id}", target_id="{target_id}", relation="implements", weight=0.9)]"#
+            ),
+            format!(
+                r#"[link(source_id="{source_id}", target_id="{target_id}", relation="implements", weight=0.1), link(source="{source_id}", target="{target_id}", kind="implements", weight=0.9)]"#
+            ),
+        ] {
+            let (registry, _runtime) = make_registry();
+            let coord = MockCoordinator::multi_backend();
+            let server = KhiveMcpServer::from_registry_with_meta(registry, "local", "test-cfg")
+                .with_coordinator(Arc::clone(&coord) as Arc<dyn CoordinatorService>);
+            let raw = server
+                .dispatch_request_local(RequestParams {
+                    plan: None,
+                    ops: ops.clone(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                    request_id: None,
+                })
+                .await
+                .expect("conflicts are per-op errors");
+            let response: Value = serde_json::from_str(&raw).expect("JSON response");
+            for entry in response["results"].as_array().expect("result rows") {
+                assert_eq!(entry["ok"], json!(false), "{ops}: {entry}");
+                assert!(
+                    entry["error"].to_string().contains("writes overlap"),
+                    "{ops} must conflict: {entry}"
+                );
+            }
+            assert!(
+                !coord.link_called.load(std::sync::atomic::Ordering::SeqCst),
+                "{ops}: neither op may reach the coordinator"
+            );
+        }
+    }
+
     /// T6b: a multi-backend server MUST route `search` through the coordinator.
     #[tokio::test]
     #[serial_test::serial(config_ledger)]

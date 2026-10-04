@@ -120,14 +120,23 @@ pub fn write_keys_for_op_pub(op: &ParsedOp) -> Vec<String> {
         }
         "link" => {
             // Edge keys must not collide with their endpoint entities.
+            // `source`, `target` and `kind` are accepted spellings of `source_id`,
+            // `target_id` and `relation`. Each field reads the canonical name first
+            // and the alias only when the canonical name is absent, so both
+            // spellings of one edge claim the same key. A call giving both
+            // spellings of a field is refused by the handler, so which one this
+            // reads for it does not matter.
+            let link_arg = |canonical: &str, alias: &str| {
+                op.args.get(canonical).or_else(|| op.args.get(alias))
+            };
             if let (
                 Some(ArgValue::Value(Value::String(s))),
                 Some(ArgValue::Value(Value::String(t))),
                 Some(ArgValue::Value(Value::String(r))),
             ) = (
-                op.args.get("source_id"),
-                op.args.get("target_id"),
-                op.args.get("relation"),
+                link_arg("source_id", "source"),
+                link_arg("target_id", "target"),
+                link_arg("relation", "kind"),
             ) {
                 push_link_key(&mut keys, s, t, r);
             }
@@ -352,6 +361,61 @@ mod tests {
                 if id == "edge-natural:a:b:extends"),
             "expected WriteKeyConflict on edge-natural key, got {err:?}"
         );
+    }
+
+    #[test]
+    fn mixed_spelling_links_to_one_edge_conflict_like_the_canonical_spelling() {
+        // Both spellings of the same edge must produce the same key: the
+        // canonical pair is the control, and each mixed ordering is the case a
+        // key builder that only knows the canonical names lets through.
+        for ops in [
+            r#"[link(source_id="a", target_id="b", relation="extends", weight=0.1), link(source_id="a", target_id="b", relation="extends", weight=0.9)]"#,
+            r#"[link(source_id="a", target_id="b", relation="extends", weight=0.1), link(source="a", target="b", kind="extends", weight=0.9)]"#,
+            r#"[link(source="a", target="b", kind="extends", weight=0.1), link(source_id="a", target_id="b", relation="extends", weight=0.9)]"#,
+        ] {
+            let r = parse_request(ops).unwrap();
+            let err = check_write_key_conflicts(&r).unwrap_err();
+            assert!(
+                matches!(&err, DslError::WriteKeyConflict { id, first_op, second_op }
+                    if id == "edge-natural:a:b:extends"
+                        && first_op == "link"
+                        && second_op == "link"),
+                "{ops} must conflict on the edge key, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aliased_only_links_to_one_edge_conflict() {
+        let r = parse_request(
+            r#"[link(source="a", target="b", kind="extends"), link(source="a", target="b", kind="extends")]"#,
+        )
+        .unwrap();
+        let err = check_write_key_conflicts(&r).unwrap_err();
+        assert!(
+            matches!(&err, DslError::WriteKeyConflict { id, .. }
+                if id == "edge-natural:a:b:extends"),
+            "expected WriteKeyConflict on edge-natural key, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn each_link_field_reads_its_own_alias_into_the_canonical_key() {
+        // A directional relation, so an alias read into the wrong endpoint slot
+        // would yield `b:a` rather than `a:b`.
+        for ops in [
+            r#"link(source="a", target="b", kind="extends")"#,
+            r#"link(source="a", target_id="b", relation="extends")"#,
+            r#"link(source_id="a", target="b", relation="extends")"#,
+            r#"link(source_id="a", target_id="b", kind="extends")"#,
+        ] {
+            let r = parse_request(ops).unwrap();
+            assert_eq!(
+                write_keys_for_op_pub(&r.ops[0]),
+                vec!["edge-natural:a:b:extends".to_string()],
+                "{ops}"
+            );
+        }
     }
 
     #[test]

@@ -242,7 +242,7 @@ sessions that set `default_namespace` but not `actor_id`. Uses the shared
 actor-identity policy (#567) so this warning fires under exactly the same
 "unattributed" definition the gate and token minter use.
 
-## `handlers.rs::handle_delivered`
+## `handlers/parameter_aliases.rs::handle_delivered`
 
 Requires the full outbound UUID. It performs one indexed count of live inbound
 `message` notes in the caller's namespace whose `properties.from_actor` is the
@@ -494,12 +494,14 @@ chain. The single-message reply path already provides the common safe ordering:
 `comm.reply` commits the delivery pair first and only then attempts its
 best-effort fold-in read mark.
 
-## `handlers.rs::handle_mark_read`
+## `handlers/parameter_aliases.rs::handle_mark_read`
 
 `comm.mark_read` is the canonical named bulk mutation; it remains acknowledgement-only.
 Message bodies can be retrieved through `comm.read`, `comm.inbox`, or `comm.thread`.
 It requires `ids` (1-500) and accepts optional `atomic` (default
-false). Resolution, namespace/message-kind checks, inbound-direction enforcement, addressee
+false). A single message id may be passed as `id`, an alias of `ids` that the handler
+wraps into a one-element `ids` list; a call supplying both `id` and `ids` is refused even
+when the values agree. Resolution, namespace/message-kind checks, inbound-direction enforcement, addressee
 authorization, legacy-row compatibility, deduplication, response ordering, and aggregate counts
 are shared with `handle_read` rather than reimplemented.
 
