@@ -163,6 +163,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn thousands_of_mixed_references_preserve_extraction_and_deduped_links() {
+        let mut text = String::new();
+        let mut expected_mentions = Vec::new();
+        let keywords = [
+            "cLoSe", "CLOSES", "Closed", "fIx", "FIXES", "Fixed", "rEsOlVe", "RESOLVES", "Resolved",
+        ];
+        let separators = [" ", ":", ":\u{2003}"];
+
+        for group in (0..1024u64).rev() {
+            let first = group * 4 + 1;
+            let second = first + 1;
+            let mention_only = first + 2;
+            let double_hash = first + 3;
+            let malformed = first + 1_000_000;
+            let keyword = keywords[group as usize % keywords.len()];
+            let separator = separators[group as usize % separators.len()];
+            text.push_str(&format!(
+                "修复说明 — {keyword}{separator}#{first}; see #{second}; again #{first}; \
+                 FiXeS #{second}; see #{mention_only}; prefixFIXES #{mention_only}; \
+                 ##{double_hash}; —x#{mention_only}; malformed #{malformed}abc \
+                 #hashtag #18446744073709551616 #\n"
+            ));
+            expected_mentions.extend([
+                RefMention {
+                    number: first,
+                    kind: RefKind::Closes,
+                },
+                RefMention {
+                    number: second,
+                    kind: RefKind::Mentions,
+                },
+                RefMention {
+                    number: first,
+                    kind: RefKind::Mentions,
+                },
+                RefMention {
+                    number: second,
+                    kind: RefKind::Closes,
+                },
+                RefMention {
+                    number: mention_only,
+                    kind: RefKind::Mentions,
+                },
+                RefMention {
+                    number: mention_only,
+                    kind: RefKind::Mentions,
+                },
+                RefMention {
+                    number: double_hash,
+                    kind: RefKind::Mentions,
+                },
+                RefMention {
+                    number: mention_only,
+                    kind: RefKind::Mentions,
+                },
+            ]);
+        }
+
+        let mut expected_links = Vec::new();
+        for group in 0..1024u64 {
+            for (offset, kind) in [
+                RefKind::Closes,
+                RefKind::Closes,
+                RefKind::Mentions,
+                RefKind::Mentions,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                expected_links.push(RefMention {
+                    number: group * 4 + offset as u64 + 1,
+                    kind,
+                });
+            }
+        }
+
+        let mentions = extract_references(&text);
+        assert_eq!(mentions.len(), 8192);
+        assert_eq!(mentions, expected_mentions);
+        let links = dedupe_prefer_closes(mentions);
+        assert_eq!(links.len(), 4096);
+        assert_eq!(links, expected_links);
+    }
+
+    #[test]
     fn closing_keyword_work_ignores_unrelated_prefix_length() {
         for length in [64, 4096, 65536] {
             let text = format!("{} See #13; Fixes :\u{2003}#17", "界".repeat(length));
