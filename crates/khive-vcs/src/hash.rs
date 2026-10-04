@@ -66,10 +66,7 @@ impl<'a> CanonicalArchive<'a> {
 
         let mut edges = Vec::with_capacity(archive.edges.len());
         for edge in &archive.edges {
-            let (mut source, mut target) = (edge.source, edge.target);
-            if edge.relation.is_symmetric() && target < source {
-                std::mem::swap(&mut source, &mut target);
-            }
+            let (source, target) = edge.relation.canonical_endpoints(edge.source, edge.target);
             let weight = serde_json::Number::from_f64(edge.weight).ok_or_else(|| {
                 VcsError::Internal(format!(
                     "edge weight is not finite (NaN or Infinity): {}",
