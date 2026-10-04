@@ -28,6 +28,25 @@ fn vector(conn: &Connection, table: &str, id: &str, namespace: &str, kind: &str,
     .unwrap();
 }
 
+// Shape of knowledge.upsert_domains: same ID/namespace, reviewed/finalized
+// mirror, synthesized members property and domain tag; knowledge.index embeds
+// that mirror under knowledge.atom. This is real writer shape, not a lone domain.
+fn domain_pair(conn: &Connection, id: &str, namespace: &str) {
+    let description = "A complete domain description supplies enough words for the real knowledge writer to validate and index its mirror atom as one logical domain record.";
+    conn.execute(
+        "INSERT INTO knowledge_domains (id, namespace, slug, name, description, tags, members, created_at, updated_at) \
+         VALUES (?1, ?2, 'domain', 'domain', ?3, '[\"type:domain\"]', '[]', 1, 1)",
+        rusqlite::params![id, namespace, description],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, status, finalized, created_at, updated_at) \
+         VALUES (?1, ?2, 'domain', 'domain', ?3, '[\"type:domain\"]', '{\"members\":[]}', 'reviewed', 1, 1, 1)",
+        rusqlite::params![id, namespace, description],
+    )
+    .unwrap();
+}
+
 fn prepared() -> (Connection, MoveRequest) {
     crate::extension::ensure_extensions_loaded();
     let conn = migrated();
@@ -37,12 +56,7 @@ fn prepared() -> (Connection, MoveRequest) {
     spec.gtd = "target-b".into();
     spec.knowledge = "target-b".into();
     fixture::build(&conn, &spec).unwrap();
-    conn.execute(
-        "INSERT INTO knowledge_domains (id, namespace, slug, name, created_at, updated_at) \
-         VALUES (?1, 'source', 'domain', 'domain', 1, 1)",
-        [DOMAIN],
-    )
-    .unwrap();
+    domain_pair(&conn, DOMAIN, "source");
     seed_note(&conn, RESIDENT, "target-a", "observation");
     create_vectors(&conn, "vec_partition_model");
     for (id, kind, field) in [
@@ -53,7 +67,7 @@ fn prepared() -> (Connection, MoveRequest) {
         (EDGE, "entity", "edge.identity"),
         (ATOM, "entity", "knowledge.atom"),
         (SECTION, "entity", "knowledge.section"),
-        (DOMAIN, "entity", "knowledge.domain"),
+        (DOMAIN, "entity", "knowledge.atom"),
     ] {
         vector(&conn, "vec_partition_model", id, "source", kind, field);
     }
@@ -144,6 +158,19 @@ fn partitioned_vectors_follow_every_source_class_and_its_sections() {
         )
         .unwrap();
     assert_eq!(section_place, "target-b");
+    for table in ["knowledge_domains", "knowledge_atoms"] {
+        let place: String = transaction
+            .query_row(
+                &format!("SELECT namespace FROM {table} WHERE id = ?1"),
+                [DOMAIN],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            place, "target-a",
+            "domain and same-ID mirror follow domain route"
+        );
+    }
     let provenance: Vec<(String, String)> = transaction
         .prepare("SELECT subject_id, namespace FROM vector_provenance ORDER BY subject_id")
         .unwrap()
@@ -440,4 +467,232 @@ fn an_empty_partitioned_route_map_over_an_empty_source_is_a_noop() {
     assert!(counts.subjects.is_empty());
     assert_eq!(counts.rows.get("vec_partition_model"), Some(&0));
     assert_eq!(counts.ann_log_appended, 0);
+}
+
+fn section(conn: &Connection, id: &str, atom: &str, namespace: &str) {
+    conn.execute(
+        "INSERT INTO knowledge_sections (id, atom_id, namespace, section_type, content, content_hash, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'body', 'section body', ?1, 1, 1)",
+        rusqlite::params![id, atom, namespace],
+    ).unwrap();
+}
+
+#[test]
+fn domain_mirror_and_sections_need_only_domain_route_in_either_order() {
+    for reversed in [false, true] {
+        crate::extension::ensure_extensions_loaded();
+        let mut conn = migrated();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        domain_pair(&conn, DOMAIN, "source");
+        section(&conn, SECTION, DOMAIN, "source");
+        create_vectors(&conn, "vec_partition_model");
+        vector(
+            &conn,
+            "vec_partition_model",
+            DOMAIN,
+            "source",
+            "entity",
+            "knowledge.atom",
+        );
+        vector(
+            &conn,
+            "vec_partition_model",
+            SECTION,
+            "source",
+            "entity",
+            "knowledge.section",
+        );
+        let before = places_and_bytes(&conn);
+        // No ordinary atoms exist. An atom route is unnecessary; the two
+        // destinations still force the actual partitioned-vector path.
+        let mut routes = vec![
+            route("domain", "domain-target"),
+            route("note:unused", "other-target"),
+        ];
+        if reversed {
+            routes.reverse();
+        }
+        let request = MoveRequest::new("source", routes);
+        let transaction = conn.transaction().unwrap();
+        let counts = move_namespace(&transaction, &request).unwrap();
+        assert_eq!(counts.subjects.get("domain"), Some(&1));
+        assert!(!counts.subjects.contains_key("atom"));
+        for table in ["knowledge_domains", "knowledge_atoms", "knowledge_sections"] {
+            let places: Vec<String> = transaction
+                .prepare(&format!("SELECT namespace FROM {table}"))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                places,
+                ["domain-target"],
+                "all physical domain siblings move together: {table}"
+            );
+            assert_eq!(counts.rows.get(table), Some(&1));
+        }
+        assert_eq!(counts.rows.get("vec_partition_model"), Some(&2));
+        assert_eq!(counts.ann_log_appended, 4);
+        let after = places_and_bytes(&transaction);
+        for ((id, _, bytes), (moved_id, namespace, moved_bytes)) in before.iter().zip(&after) {
+            assert_eq!(id, moved_id);
+            assert_eq!(bytes, moved_bytes);
+            assert_eq!(namespace, "domain-target");
+        }
+        let again = move_namespace(&transaction, &request).unwrap();
+        assert!(again.subjects.values().all(|count| *count == 0));
+        assert_eq!(again.ann_log_appended, 0);
+        assert_eq!(places_and_bytes(&transaction), after);
+        transaction.commit().unwrap();
+    }
+}
+
+#[test]
+fn source_section_with_foreign_parent_refuses_before_any_write() {
+    let (conn, request) = prepared();
+    let atom = "aaaaaaaa-aaaa-4aaa-8aaa-000000000010";
+    let child = "aaaaaaaa-aaaa-4aaa-8aaa-000000000011";
+    conn.execute("INSERT INTO knowledge_atoms (id, namespace, slug, name, created_at, updated_at) VALUES (?1, 'foreign', 'foreign-parent', 'foreign parent', 1, 1)", [atom]).unwrap();
+    // Deliberate historical inconsistent section scope. This is not claimed
+    // as a shape produced by today's knowledge writer.
+    section(&conn, child, atom, "source");
+    vector(
+        &conn,
+        "vec_partition_model",
+        child,
+        "source",
+        "entity",
+        "knowledge.section",
+    );
+    let before = places_and_bytes(&conn);
+    let changes: i64 = conn
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    let error = move_namespace(&conn, &request).unwrap_err();
+    assert!(
+        matches!(&error, MoveError::UnroutableVector { subject_id, destinations: 0, .. } if subject_id == child)
+    );
+    assert_eq!(places_and_bytes(&conn), before);
+    let after: i64 = conn
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        changes, after,
+        "foreign parent cannot authorize a source section's route"
+    );
+}
+
+#[test]
+fn foreign_vector_for_source_subject_stays_outside_the_staged_set() {
+    let (mut conn, request) = prepared();
+    let subject = "aaaaaaaa-aaaa-4aaa-8aaa-000000000012";
+    seed_note(&conn, subject, "source", "observation");
+    // Same real source identity, deliberately foreign vector namespace:
+    // removing the staging namespace guard now actually changes behavior.
+    vector(
+        &conn,
+        "vec_partition_model",
+        subject,
+        "foreign",
+        "note",
+        "note.content",
+    );
+    let original = places_and_bytes(&conn)
+        .into_iter()
+        .find(|(id, _, _)| id == subject)
+        .unwrap();
+    let transaction = conn.transaction().unwrap();
+    let result = move_namespace(&transaction, &request);
+    assert!(
+        result.is_ok(),
+        "foreign vector must not enter staging: {result:?}"
+    );
+    let counts = result.unwrap();
+    assert_eq!(counts.rows.get("vec_partition_model"), Some(&8));
+    assert_eq!(counts.ann_log_appended, 16);
+    let after = places_and_bytes(&transaction)
+        .into_iter()
+        .find(|(id, _, _)| id == subject)
+        .unwrap();
+    assert_eq!(after, original);
+    let place: String = transaction
+        .query_row(
+            "SELECT namespace FROM notes WHERE id = ?1",
+            [subject],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(place, "target-a");
+    let logs: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM ann_write_log WHERE subject_id = ?1",
+            [subject],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(logs, 0);
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn partition_routes_above_compound_select_limit_still_move_real_vectors() {
+    let (mut conn, mut request) = prepared();
+    for index in 0..501 {
+        request
+            .routes
+            .push(route(&format!("note:unused-{index}"), "target-a"));
+    }
+    let transaction = conn.transaction().unwrap();
+    let result = move_namespace(&transaction, &request);
+    assert!(
+        result.is_ok(),
+        "VALUES route rows must not consume compound SELECT terms: {result:?}"
+    );
+    let counts = result.unwrap();
+    assert_eq!(counts.subjects.get("domain"), Some(&1));
+    assert_eq!(counts.rows.get("vec_partition_model"), Some(&8));
+    assert_eq!(counts.ann_log_appended, 16);
+    assert_eq!(places_and_bytes(&transaction).len(), 9);
+    transaction.commit().unwrap();
+}
+
+#[test]
+fn domain_mirror_slug_collision_refuses_without_an_atom_route() {
+    crate::extension::ensure_extensions_loaded();
+    let conn = migrated();
+    domain_pair(&conn, DOMAIN, "source");
+    conn.execute("INSERT INTO knowledge_atoms (id, namespace, slug, name, created_at, updated_at) VALUES (?1, 'domain-target', 'domain', 'occupied domain mirror slug', 1, 1)", [RESIDENT]).unwrap();
+    create_vectors(&conn, "vec_partition_model");
+    vector(
+        &conn,
+        "vec_partition_model",
+        DOMAIN,
+        "source",
+        "entity",
+        "knowledge.atom",
+    );
+    let request = MoveRequest::new(
+        "source",
+        vec![
+            route("domain", "domain-target"),
+            route("note:unused", "other-target"),
+        ],
+    );
+    let before = places_and_bytes(&conn);
+    let changes: i64 = conn
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    let error = move_namespace(&conn, &request).unwrap_err();
+    assert!(
+        matches!(&error, MoveError::Collisions { collisions } if collisions.iter().any(|collision| collision.table == "knowledge_atoms" && collision.target == "domain-target"))
+    );
+    assert_eq!(places_and_bytes(&conn), before);
+    let after: i64 = conn
+        .query_row("SELECT total_changes()", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        changes, after,
+        "mirror collision must be named before any sibling moves"
+    );
 }
