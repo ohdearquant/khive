@@ -228,22 +228,20 @@ pub(super) async fn embed_query_model(
     if let Some(v) = cache.get(&model_name, &query) {
         return Ok((model_name, v));
     }
-    let handle = tokio::runtime::Handle::current();
-    let model_name_blk = model_name.clone();
-    let query_blk = query.clone();
     let v = khive_storage::await_request_read_phase(
         "memory.recall.embedding",
-        tokio::task::spawn_blocking(move || {
-            handle.block_on(runtime.embed_query_with_model(&model_name_blk, &query_blk))
-        }),
+        runtime.embed_query_with_model(&model_name, &query),
     )
-    .await?
-    .map_err(|e| RuntimeError::Internal(format!("recall embed task panicked: {e}")))??;
+    .await??;
     cache.put(&model_name, &query, v.clone());
     Ok((model_name, v))
 }
 
 type NamedEmbedResult = (String, Result<(String, Vec<f32>), RuntimeError>);
+
+#[cfg(test)]
+#[path = "common_embedding_tests.rs"]
+mod embedding_tests;
 
 /// Partition per-engine embed results into successes, warning on each failure so one
 /// unhealthy embedding engine degrades recall instead of aborting it. Errors only if
