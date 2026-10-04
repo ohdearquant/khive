@@ -126,6 +126,23 @@ impl EdgeRelation {
         matches!(self, Self::CompetesWith | Self::ComposedWith)
     }
 
+    /// Order the endpoints of an edge so a symmetric relation has one stored form.
+    ///
+    /// For symmetric relations (`competes_with`, `composed_with`) the smaller
+    /// endpoint comes first, so A→B and B→A collapse into a single canonical row.
+    /// Every other relation, and a symmetric pair that is already ordered or has
+    /// equal endpoints, is returned as given.
+    ///
+    /// Generic over `T: Ord` because this crate does not depend on a UUID type;
+    /// for UUIDs the order is the byte order of the id.
+    pub fn canonical_endpoints<T: Ord>(&self, source: T, target: T) -> (T, T) {
+        if self.is_symmetric() && target < source {
+            (target, source)
+        } else {
+            (source, target)
+        }
+    }
+
     /// The category this relation belongs to.
     pub const fn category(&self) -> EdgeCategory {
         match self {
@@ -440,6 +457,46 @@ mod tests {
         assert!(!EdgeRelation::Extends.is_symmetric());
         assert!(!EdgeRelation::LinksTo.is_symmetric());
         assert!(!EdgeRelation::LocatedIn.is_symmetric());
+    }
+
+    /// The symmetric relations, named here rather than derived from `is_symmetric`
+    /// so the tests below do not take their expectation from the code under test.
+    const SYMMETRIC: [EdgeRelation; 2] = [EdgeRelation::CompetesWith, EdgeRelation::ComposedWith];
+
+    /// Endpoint pairs with source less than, greater than and equal to target.
+    const PAIRS: [(u8, u8); 3] = [(1, 2), (2, 1), (7, 7)];
+
+    #[test]
+    fn canonical_endpoints_sorts_symmetric_relations() {
+        for relation in SYMMETRIC {
+            assert!(relation.is_symmetric(), "{relation}");
+            for (source, target) in PAIRS {
+                assert_eq!(
+                    relation.canonical_endpoints(source, target),
+                    (source.min(target), source.max(target)),
+                    "{relation}: {source} to {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_endpoints_leaves_other_relations_as_given() {
+        let others: alloc::vec::Vec<EdgeRelation> = EdgeRelation::ALL
+            .into_iter()
+            .filter(|relation| !SYMMETRIC.contains(relation))
+            .collect();
+        assert_eq!(others.len(), EdgeRelation::ALL.len() - SYMMETRIC.len());
+        for relation in others {
+            assert!(!relation.is_symmetric(), "{relation}");
+            for (source, target) in PAIRS {
+                assert_eq!(
+                    relation.canonical_endpoints(source, target),
+                    (source, target),
+                    "{relation}: {source} to {target}"
+                );
+            }
+        }
     }
 
     #[test]
