@@ -1297,7 +1297,7 @@ impl MemoryPack {
         let runtime = self.runtime.clone();
         let token = token.clone();
 
-        khive_runtime::track_named_background_task("memory_recall_serve_ledger", async move {
+        khive_runtime::track_recall_ledger_task(async move {
             // The serve ledger lives in the brain pack; without it loaded
             // there is nothing to record, so skip the guaranteed-failed
             // dispatch (and its per-recall warn) entirely.

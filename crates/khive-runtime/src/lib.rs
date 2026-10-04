@@ -110,9 +110,9 @@ pub use curation::{
 pub use daemon::{acquire_recovery_lock, pid_path, run_daemon, socket_path, DaemonDispatch};
 pub use daemon::{
     active_phase_names, background_task_count, background_task_names, daemon_shutdown_token,
-    register_active_phase, spawn_named_tracked_task, track_background_task,
-    track_named_background_task, DaemonRequestFrame, DaemonResponseFrame, PhaseGuard,
-    PROTOCOL_VERSION, UNNAMED_BACKGROUND_TASK,
+    recall_ledger_snapshot, register_active_phase, spawn_named_tracked_task, track_background_task,
+    track_named_background_task, track_recall_ledger_task, DaemonRequestFrame, DaemonResponseFrame,
+    PhaseGuard, PROTOCOL_VERSION, UNNAMED_BACKGROUND_TASK,
 };
 pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};

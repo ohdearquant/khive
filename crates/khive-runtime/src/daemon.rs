@@ -33,6 +33,13 @@ use crate::pack::RequestIdentity;
 #[cfg(unix)]
 use khive_db::{run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner, ConnectionPool};
 
+mod load_limits;
+#[cfg(unix)]
+use load_limits::{admit_or_refuse_busy, ConnectionAdmission};
+pub use load_limits::{
+    recall_ledger_snapshot, track_recall_ledger_task, ConnectionCapSnapshot, RecallLedgerSnapshot,
+};
+
 /// Maximum frame size accepted in either direction.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
@@ -115,6 +122,8 @@ pub struct DaemonLifecycleSnapshot {
 struct DaemonLifecycle {
     options: DaemonOptions,
     state: std::sync::Mutex<DaemonLifecycleState>,
+    /// Admission for new connections on the daemon socket.
+    connections: ConnectionAdmission,
 }
 
 #[cfg(unix)]
@@ -146,6 +155,7 @@ impl DaemonLifecycle {
                 },
                 last_request_completion: None,
             }),
+            connections: ConnectionAdmission::from_env(),
         }
     }
 
@@ -1343,6 +1353,15 @@ pub struct MetricsSnapshot {
     /// Wall-clock timestamp of the writer-stage sample.
     #[serde(default)]
     pub write_last_observed_at_unix_ms: Option<u64>,
+    /// Connection cap of the daemon socket this snapshot was served from.
+    /// `None` from a daemon that predates the cap and when no listener owns
+    /// the connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connections: Option<ConnectionCapSnapshot>,
+    /// Bounds and counts of the best-effort recall serve-ledger tasks.
+    /// `None` from a daemon that predates the bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall_ledger: Option<RecallLedgerSnapshot>,
 }
 
 // ── framing ───────────────────────────────────────────────────────────────────
@@ -1993,6 +2012,8 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
         write_last_observed_at_unix_ms: writer_stages
             .as_ref()
             .map(|sample| sample.observed_at_unix_ms),
+        connections: None,
+        recall_ledger: Some(recall_ledger_snapshot()),
     }
 }
 
@@ -2266,6 +2287,7 @@ async fn handle_conn_with_lifecycle<D: DaemonDispatch>(
                     snapshot.idle_blockers = idle_retirement_blockers(&dispatcher);
                     snapshot
                 });
+                metrics.connections = lifecycle.as_ref().map(|state| state.connections.snapshot());
                 metrics
             }),
             request_id: frame.request_id,
@@ -3238,7 +3260,7 @@ where
             let mut last_accept_error_log: Option<std::time::Instant> = None;
             loop {
                 match listener.accept().await {
-                    Ok((stream, _)) => {
+                    Ok((mut stream, _)) => {
                         let initial_frame_deadline =
                             tokio::time::Instant::now() + INITIAL_FRAME_READ_TIMEOUT;
                         accept_error_backoff = None;
@@ -3278,12 +3300,28 @@ where
                                 continue;
                             }
                         }
+                        // One permit per connection, taken before the task is
+                        // spawned. Past the cap the peer is answered with a busy
+                        // error and the stream is dropped; connections already
+                        // admitted keep their permits and are not affected.
+                        let Some(permit) = admit_or_refuse_busy(
+                            &lifecycle.connections,
+                            &mut stream,
+                            dispatcher.config_id(),
+                        )
+                        .await
+                        else {
+                            continue;
+                        };
                         // Keep the acceptance-time deadline across the
                         // credential check and connection-task scheduling.
                         let d = dispatcher.clone();
                         let shutdown = request_shutdown_rx.clone();
                         let lifecycle = Arc::clone(&lifecycle);
                         let handle = spawn_connection_task(Arc::clone(&active), async move {
+                            // Released when the handler ends, whether it returns,
+                            // panics or is aborted at shutdown.
+                            let _permit = permit;
                             handle_conn_with_lifecycle(
                                 stream,
                                 d,
@@ -3897,6 +3935,7 @@ mod tests {
     mod shutdown_signals {
         include!("daemon/shutdown_signal_tests.rs");
     }
+    mod connection_limit_tests;
     use super::*;
     use serial_test::serial;
 
@@ -5121,7 +5160,7 @@ mod tests {
         use super::*;
         use khive_storage::SqlAccess;
 
-        fn dispatcher(pool: Option<Arc<ConnectionPool>>) -> MockDispatch {
+        pub(super) fn dispatcher(pool: Option<Arc<ConnectionPool>>) -> MockDispatch {
             MockDispatch {
                 namespace: "local".to_owned(),
                 config_id: "idle-test".to_owned(),
@@ -5131,7 +5170,7 @@ mod tests {
             }
         }
 
-        fn lifecycle(mode: DaemonLifetime) -> Arc<DaemonLifecycle> {
+        pub(super) fn lifecycle(mode: DaemonLifetime) -> Arc<DaemonLifecycle> {
             Arc::new(DaemonLifecycle::new(
                 DaemonOptions {
                     lifetime: mode,

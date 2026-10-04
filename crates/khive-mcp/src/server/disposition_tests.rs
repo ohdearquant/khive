@@ -1195,11 +1195,18 @@ impl ErrorConstructorCensus {
     }
 }
 
-const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[(
-    "khive-mcp/src/daemon.rs",
-    "executable",
-    "khive-mcp/src/daemon/executable.rs",
-)];
+const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
+    (
+        "khive-mcp/src/daemon.rs",
+        "executable",
+        "khive-mcp/src/daemon/executable.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "load_limits",
+        "khive-runtime/src/daemon/load_limits.rs",
+    ),
+];
 
 impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
