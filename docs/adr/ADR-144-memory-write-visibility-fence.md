@@ -715,22 +715,37 @@ The routes that write no marker are the storage constructors `upsert_note`,
 `insert_note_if_absent`, `try_insert_note`, `try_insert_note_with_attachments`,
 `upsert_notes` and `batch_upsert_notes` in `crates/khive-db/src/stores/note.rs`
 (also reached through the policy wrapper that `runtime.notes(token)` returns,
-in `crates/khive-runtime/src/note_store_guard.rs`), the exported statement
-builders in the same file, and `RecipientTransportStore::commit` in
+in `crates/khive-runtime/src/note_store_guard.rs`), the insert statement
+builders `note_upsert_statement`, `note_insert_if_absent_statement` and
+`note_insert_keyed_statement` in the same file, and
+`RecipientTransportStore::commit` in
 `crates/khive-db/src/stores/note/recipient/mod.rs`. Every production caller of
 these at `e59b98b99bbafc09f6590b442ec165eff7b0d925`, outside test modules, is
 listed below with its disposition.
 
-| Caller (path, function)                                                                                                                                         | What it writes                                               | Disposition                                                          |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------- |
-| `crates/khive-runtime/src/operations.rs`, `create_note_inner` (generic note creation)                                                                           | A new note built with `Note::new`; the function takes no key | Cannot create keyed memory                                           |
-| `crates/khive-runtime/src/operations.rs`, `try_create_note_impl` (trusted channel ingest)                                                                       | A new note built with `Note::new`, no key                    | Cannot create keyed memory                                           |
-| `crates/khive-pack-comm/src/handlers.rs`, `handle_heartbeat`                                                                                                    | Kind `channel_health`, no key                                | Cannot create keyed memory                                           |
-| `crates/kkernel/src/code_ingest.rs`, `persist_ingest_note` (code findings ingest)                                                                               | Kind `finding`, no key                                       | Cannot create keyed memory                                           |
-| `crates/khive-runtime/src/atomic_prepare.rs`, `prepare_add_note` (proposal apply)                                                                               | A new note built with `Note::new`, no key                    | Cannot create keyed memory                                           |
-| `crates/khive-runtime/src/keyed_message.rs`, `create_keyed_message_pair_with_attachments`                                                                       | Kind restricted to `message`                                 | Cannot create keyed memory                                           |
-| `crates/khive-runtime/src/atomic_message.rs`, `prepare_atomic_note_requests`, and `crates/khive-runtime/src/note_create.rs`, `prepare_note_create`              | The statement builders, inside the runtime unit              | This is the runtime unit; a keyed memory note it creates is `modern` |
-| `crates/khive-runtime/src/comm_recipient.rs`, `ingest_verified_recipient` (recipient transport commit; called only from tests and a doc example at this commit) | Kind `message`, no key                                       | Cannot create keyed memory                                           |
+| Caller (path, function)                                                                                                                                         | What it writes                                                        | Disposition                                                                                                                            |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/khive-runtime/src/operations.rs`, `create_note_inner` (generic note creation)                                                                           | A new note built with `Note::new`; the function takes no key          | Cannot create keyed memory                                                                                                             |
+| `crates/khive-runtime/src/operations.rs`, `try_create_note_impl` (trusted channel ingest)                                                                       | A new note built with `Note::new`, no key                             | Cannot create keyed memory                                                                                                             |
+| `crates/khive-pack-comm/src/handlers.rs`, `handle_heartbeat`                                                                                                    | Kind `channel_health`, no key                                         | Cannot create keyed memory                                                                                                             |
+| `crates/kkernel/src/code_ingest.rs`, `persist_ingest_note` (code findings ingest)                                                                               | Kind `finding`, no key                                                | Cannot create keyed memory                                                                                                             |
+| `crates/khive-runtime/src/atomic_prepare.rs`, `prepare_add_note` (proposal apply)                                                                               | A new note built with `Note::new`, no key                             | Cannot create keyed memory                                                                                                             |
+| `crates/khive-runtime/src/keyed_message.rs`, `create_keyed_message_pair_with_attachments`                                                                       | Kind restricted to `message`                                          | Cannot create keyed memory                                                                                                             |
+| `crates/khive-runtime/src/atomic_message.rs`, `prepare_atomic_note_requests`, and `crates/khive-runtime/src/note_create.rs`, `prepare_note_create`              | New notes of any kind, keyed or not, prepared inside the runtime unit | The runtime unit. No marker exists anywhere at this commit; after the cutover change a keyed memory note created here records `modern` |
+| `crates/khive-runtime/src/comm_recipient.rs`, `ingest_verified_recipient` (recipient transport commit; called only from tests and a doc example at this commit) | Kind `message`, no key                                                | Cannot create keyed memory                                                                                                             |
+
+The other exported note builders change or remove an existing row and create
+no identity: `note_replace_if_unchanged_statement` and
+`note_metadata_replace_if_unchanged_statement` (called from
+`prepare_versioned_note_update` in `crates/khive-runtime/src/note_write.rs`),
+and `note_soft_delete_statement` and `note_hard_delete_statement` (called from
+`prepare_delete` in `crates/khive-runtime/src/atomic_prepare.rs` and
+`delete_note_with_post_commit_report` in
+`crates/khive-runtime/src/operations.rs`). Hard deletion removes the marker
+with its note. The replace statement and the upsert statement's conflict branch
+both set `kind`, so a route could turn an existing keyed row into kind
+`memory`. Such a row is not an original memory write: it carries no marker and
+takes the unknown refusal on exact replay.
 
 The routes that move or revive an existing note create no identity and keep
 its marker: `move_kinded_subject` in `crates/khive-db/src/namespace_move.rs`
@@ -744,23 +759,30 @@ only. The tree has no database restore-from-backup operation; a copy of the
 database file carries the marker table with its notes, so every note keeps its
 class.
 
-So at this commit no production caller creates a keyed memory note through a
-route that writes no marker. The disposition for the routes themselves is
+So at this commit no production caller creates a new keyed memory note through
+a route that writes no marker. The disposition for the routes themselves is
 unknown forever, by intent: they have no model or fence context, and a library
 caller that hands them a `Note` with kind `memory` and a key gets a note that
 refuses as `receipt_epoch_unknown` on exact replay. A production route that
 needs to create keyed memory, including a hosted ingest service that embeds
 this runtime outside this repository, goes through the runtime unit.
 
-Two runtime-unit routes create keyed notes today without the receipt flag:
-`create_note_with_options` and `create_note_with_options_resolving_annotations`
-in `crates/khive-runtime/src/note_write.rs` (called from the shared `create`
-handler, the gtd handlers and curation) and new keyed members of `stream.batch`
-in `crates/khive-runtime/src/streams.rs`. When the memory pack is registered,
-its creation hook in `crates/khive-pack-memory/src/hook.rs` refuses kind
-`memory` on both, so in a served daemon only `memory.remember` creates keyed
-memory. A runtime without that hook can reach them, and they are among the
-writers that must write `modern`, as the settled point above says.
+Inside the runtime unit, three routes create keyed notes today without the
+receipt flag: `create_note_with_options` and
+`create_note_with_options_resolving_annotations` in
+`crates/khive-runtime/src/note_write.rs`, and new keyed members of
+`stream.batch` in `crates/khive-runtime/src/streams.rs`. When the memory pack
+is registered, its creation hook in `crates/khive-pack-memory/src/hook.rs`
+refuses kind `memory` on the shared `create` handler, which runs the hook
+before it calls `create_note_with_options_resolving_annotations`, and on
+`stream.batch`. The two other production callers of `create_note_with_options`
+create fixed kinds: `handle_assign` in `crates/khive-pack-gtd/src/handlers.rs`
+creates `task`, and `record_outbound_external_id_diagnostic` in
+`crates/khive-runtime/src/curation.rs` creates `observation`. So in a served
+daemon only `memory.remember` creates keyed memory. A library caller of
+`create_note_with_options` is not behind the hook, which is why these routes
+are among the writers that must write `modern`, as the settled point above
+says.
 
 ### Acceptance before implementation merge
 
@@ -793,7 +815,9 @@ writers that must write `modern`, as the settled point above says.
   earlier transaction must fail that test.
 - A keyed memory note created through a lower-level storage constructor has
   no marker and refuses as `receipt_epoch_unknown` on exact replay. The same
-  note created through the runtime keyed writer is `modern` and reseals.
+  note created through the runtime keyed writer is `modern` and reseals. A
+  keyed note of another kind that is replaced in place with kind `memory` also
+  refuses as `receipt_epoch_unknown`.
 - Exact replay through the request envelope of an `unknown` keyed memory, and
   separately of a `legacy` one without a receipt, returns its refusal with the
   holder's ID as `memory_id` and `domain_disposition: "not_committed"`. A
