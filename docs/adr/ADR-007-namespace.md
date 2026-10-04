@@ -102,6 +102,30 @@ internal note constructors keep their prior behavior. There is no new actor-base
 authorization rule, by-ID namespace check, data migration or change to Rule 8.
 The qualification requires acceptance before its dependent implementation merges.
 
+### Qualification: mailbox-scoped generic message reads
+
+**Status**: shipped behavior (#3763), documentation clarification (#3764).
+
+The namespace-agnostic by-ID rule has a typed qualification for reads of `message` notes and
+direct edge references to them. Generic `get`, `search`, `neighbors` and `context` reads apply the
+calling actor's mailbox view, including when a broad note read encounters a message. Inbound
+copies belong to `to_actor`; outbound copies belong to `from_actor`. A named caller does not
+inherit legacy unattributed local messages. Generic reads have no cross-actor mailbox selector:
+delegated views remain the explicitly authorized comm read surface. This qualification is a
+message view rule, not a namespace partition or a change to other records' by-ID rules.
+
+A message copy outside the view answers as not found to `get`; an edge directly referencing
+such a message is withheld as well, and message annotations are filtered before exposure. Graph
+expansion and search withhold unreadable message records. Knowing a full UUID does not bypass
+the message view. A message-related short-prefix refusal directs the caller to a full UUID and
+`comm.inbox` when uniqueness cannot safely be established. The resolver's bounded ambiguity
+sample, after filtering, is not evidence of the complete candidate population and must not be
+presented as such or used to infer that one remaining message is unique.
+
+The library preconditions, backend-aware origin resolution, separate-read snapshot limits and
+bounded graph continuation behavior are recorded in the
+[generic message-read contract](../../crates/khive-pack-kg/docs/api/message-read-scope.md).
+
 ### Qualification: `neighbors` and `traverse` on an anchor outside the read scope
 
 **Status**: accepted, dated 2026-09-25.
@@ -229,13 +253,17 @@ The schema declares it per parameter. Today twelve parameters across ten verbs c
 `emit(target_id)`. Any parameter added later under the same contract joins the population by
 carrying it, which is why the rule is written against the contract rather than against the names.
 
-Two qualifications, because the declaration governs _resolution_ and not everything that follows
+Qualifications apply because the declaration governs _resolution_ and not everything that follows
 it. `restore` resolves by id unscoped and then compares the resolved record's namespace against
 the caller's, refusing a mismatch, so unscoped resolution is not unscoped effect for that verb —
 read the handler, not only the declaration. And the contract has narrower siblings on other verbs:
 several parameters declare prefix-scoped-to-primary resolution instead, `neighbors(node_id)` among
 them, where the _prefix_ form resolves within the caller's primary namespace while a full UUID is
 still unchecked. Those are smaller openings rather than exceptions to the rule.
+
+For generic reads, the [message qualification](#qualification-mailbox-scoped-generic-message-reads)
+additionally withholds message copies and direct references outside the caller's mailbox, even
+when the id is a full UUID. This does not add a namespace predicate to by-ID resolution.
 
 **How an id resolves, since Rule 3b's visible set makes the difference load-bearing.** A full UUID is
 used as given. A short prefix on a parameter carrying this contract resolves through an unfiltered
@@ -527,6 +555,10 @@ partitioning. These make the Gate redundant — the exact regression this seam e
 
 get, update, delete by UUID resolve a globally-unique UUID with no namespace check at any
 layer: not in the store SQL, not in the runtime post-fetch check, not in the pack handler.
+
+For reads, `message` notes and direct edge references carry the
+[mailbox-view qualification](#qualification-mailbox-scoped-generic-message-reads). Other record
+kinds retain their declared by-ID behavior; the qualification concerns the message read view.
 
 Status: SHIPPED in commit 2607e263. Covered by regression tests added in that PR.
 
