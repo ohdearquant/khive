@@ -2581,6 +2581,10 @@ where
         + Send
         + 'static,
 {
+    // Await the permit before the blocking task starts: a queued read holds no thread.
+    let admission = pool
+        .acquire_reader_admission(StorageCapability::Sql, operation)
+        .await?;
     crate::read_cancellation::run_interruptible_read(
         StorageCapability::Sql,
         operation,
@@ -2591,7 +2595,7 @@ where
             let mut guard = pool.resolve_reader_checkout(
                 StorageCapability::Sql,
                 operation,
-                pool.reader_until(|| scope.should_stop()),
+                pool.reader_with_admission(admission, || scope.should_stop()),
             )?;
             // Every caller of `run_pool_reader_query` runs a `SqlStatement`
             // (raw SQL) rather than a typed store's fixed query, so the

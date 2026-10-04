@@ -96,3 +96,6 @@ mod stream_schema_tests;
 
 #[cfg(test)]
 mod reader_lease_tests;
+
+#[cfg(test)]
+mod raw_sql_reader_admission_tests;
