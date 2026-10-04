@@ -1,19 +1,15 @@
 //! Fusion strategies for combining ranked result lists.
 
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap};
 
 use uuid::Uuid;
 
 use khive_score::DeterministicScore;
-use khive_storage::types::{
-    PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
-};
-use khive_storage::EntityFilter;
-use khive_types::SubstrateKind;
+use khive_storage::types::{TextSearchHit, VectorSearchHit};
 
-use crate::error::{RuntimeError, RuntimeResult};
+use crate::error::RuntimeResult;
 use crate::retrieval::{RankScoreKind, SearchHit, SearchSignals, SearchSource};
-use crate::runtime::{KhiveRuntime, NamespaceToken};
+use crate::runtime::KhiveRuntime;
 
 pub use khive_fusion::FusionStrategy;
 
@@ -48,8 +44,6 @@ pub trait FusionExecutor: Send + Sync + 'static {
         limit: usize,
     ) -> RuntimeResult<Vec<RankedHit>>;
 }
-
-const CANDIDATE_MULTIPLIER: u32 = 4;
 
 /// RRF convenience wrapper used by operations.rs (k=60 note search path).
 pub(crate) async fn rrf_fuse_k(
@@ -268,123 +262,24 @@ fn merge_sources(left: SearchSource, right: SearchSource) -> SearchSource {
     }
 }
 
-impl KhiveRuntime {
-    async fn retain_alive_search_hits(
-        &self,
-        token: &NamespaceToken,
-        mut fused: Vec<SearchHit>,
-        limit: usize,
-    ) -> RuntimeResult<Vec<SearchHit>> {
-        // Filter out soft-deleted entities. A single query fetches all alive IDs from the
-        // fused candidate pool; any ID absent from the result has been soft-deleted.
-        if !fused.is_empty() {
-            let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
-            let alive_page = self
-                .entities(token)?
-                .query_entities(
-                    token.namespace().as_str(),
-                    EntityFilter {
-                        ids: candidate_ids,
-                        ..EntityFilter::default()
-                    },
-                    PageRequest {
-                        offset: 0,
-                        limit: u32::try_from(fused.len()).unwrap_or(u32::MAX),
-                    },
-                )
-                .await?;
-            let alive: HashSet<Uuid> = alive_page.items.into_iter().map(|e| e.id).collect();
-            fused.retain(|h| alive.contains(&h.entity_id));
-        }
-
-        fused.truncate(limit);
-        Ok(fused)
-    }
-
-    /// Hybrid search with a caller-supplied fusion strategy.
-    ///
-    /// `FusionStrategy::Custom { name, .. }` is resolved against this
-    /// runtime's registered executors (see
-    /// [`register_fusion_strategy`](KhiveRuntime::register_fusion_strategy));
-    /// an unregistered name fails closed with
-    /// `RuntimeError::UnknownFusionStrategy`.
-    pub async fn hybrid_search_with_strategy(
-        &self,
-        token: &NamespaceToken,
-        query_text: &str,
-        query_vector: Option<Vec<f32>>,
-        strategy: FusionStrategy,
-        limit: u32,
-    ) -> RuntimeResult<Vec<SearchHit>> {
-        let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
-
-        let text_hits = if matches!(&strategy, FusionStrategy::VectorOnly) {
-            Vec::new()
-        } else {
-            let ns = token.namespace().as_str().to_owned();
-            // sanitize_fts5_query strips known-unsafe metacharacters, but residual
-            // punctuation can still trip the FTS5 parser at runtime; that error must
-            // fail loud rather than silently degrade to vector-only fusion. Errors
-            // from other legs (vector search) still propagate normally.
-            let text_search_result = self
-                .text(token)?
-                .search(TextSearchRequest {
-                    query: query_text.to_string(),
-                    mode: TextQueryMode::Plain,
-                    filter: Some(TextFilter {
-                        namespaces: vec![ns],
-                        ..TextFilter::default()
-                    }),
-                    top_k: candidates,
-                    snippet_chars: 200,
-                })
-                .await;
-            crate::error::fts_text_leg_or_err(
-                text_search_result.map_err(RuntimeError::from),
-                "hybrid_search_with_strategy",
-                query_text,
-            )?
-        };
-
-        let vector_hits = if !matches!(&strategy, FusionStrategy::KeywordOnly)
-            && (query_vector.is_some() || self.config().embedding_model.is_some())
-        {
-            self.vector_search(
-                token,
-                query_vector,
-                Some(query_text),
-                candidates,
-                Some(SubstrateKind::Entity),
-            )
-            .await?
-        } else {
-            Vec::new()
-        };
-
-        // Each arm fetched `candidates` independently, so their union can contain
-        // twice that many distinct IDs. Keep the complete fetched pool through
-        // ranking and the alive check; truncating it first lets stale hits hide
-        // live candidates from the other arm.
-        let fusion_limit = text_hits.len().saturating_add(vector_hits.len());
-        let fused = self
-            .fuse_with_strategy(text_hits, vector_hits, &strategy, fusion_limit)
-            .await?;
-        self.retain_alive_search_hits(token, fused, limit as usize)
-            .await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
-    use khive_storage::types::{TextDocument, TextSearchHit, VectorSearchHit, VectorSearchRequest};
+    use khive_storage::types::{
+        TextDocument, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
+        VectorSearchRequest,
+    };
     use khive_storage::Entity;
-    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use khive_types::SubstrateKind;
+    use lattice_embed::EmbeddingModel;
+    use std::collections::HashSet;
     use std::sync::Arc;
 
-    use crate::{EmbedderProvider, RuntimeConfig};
+    use crate::error::RuntimeError;
+    use crate::retrieval::CANDIDATE_MULTIPLIER;
+    use crate::runtime::NamespaceToken;
+    use crate::RuntimeConfig;
 
     fn text_hit(id: Uuid, score: f64, title: &str) -> TextSearchHit {
         TextSearchHit {
@@ -416,171 +311,6 @@ mod tests {
                 ..RuntimeConfig::no_embeddings()
             },
         )
-    }
-
-    struct CountingEmbeddingService {
-        calls: Arc<AtomicUsize>,
-        dimensions: usize,
-    }
-
-    #[async_trait::async_trait]
-    impl EmbeddingService for CountingEmbeddingService {
-        async fn embed(
-            &self,
-            texts: &[String],
-            _model: EmbeddingModel,
-        ) -> Result<Vec<Vec<f32>>, EmbedError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(texts.iter().map(|_| vec![1.0; self.dimensions]).collect())
-        }
-
-        fn supports_model(&self, _model: EmbeddingModel) -> bool {
-            true
-        }
-
-        fn name(&self) -> &'static str {
-            "fusion-counting-embedding"
-        }
-    }
-
-    struct CountingEmbedderProvider {
-        name: String,
-        calls: Arc<AtomicUsize>,
-        dimensions: usize,
-    }
-
-    #[async_trait::async_trait]
-    impl EmbedderProvider for CountingEmbedderProvider {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn dimensions(&self) -> usize {
-            self.dimensions
-        }
-
-        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-            Ok(Arc::new(CountingEmbeddingService {
-                calls: Arc::clone(&self.calls),
-                dimensions: self.dimensions,
-            }))
-        }
-    }
-
-    fn counting_embedding_runtime() -> (KhiveRuntime, Arc<AtomicUsize>) {
-        let model = EmbeddingModel::AllMiniLmL6V2;
-        let rt = KhiveRuntime::new(RuntimeConfig {
-            db_path: None,
-            embedding_model: Some(model),
-            packs: vec!["kg".to_string()],
-            ..RuntimeConfig::no_embeddings()
-        })
-        .expect("in-memory runtime");
-        let calls = Arc::new(AtomicUsize::new(0));
-        rt.register_embedder(CountingEmbedderProvider {
-            name: model.to_string(),
-            calls: Arc::clone(&calls),
-            dimensions: model.dimensions(),
-        });
-        (rt, calls)
-    }
-
-    #[tokio::test]
-    async fn keyword_only_search_skips_embedding_and_vector_arm() {
-        let (rt, embed_calls) = counting_embedding_runtime();
-        let tok = NamespaceToken::local();
-        let entity = Entity::new("local", "concept", "keyword candidate");
-        rt.entities(&tok)
-            .unwrap()
-            .upsert_entities(vec![entity.clone()])
-            .await
-            .unwrap();
-        rt.text(&tok)
-            .unwrap()
-            .upsert_document(TextDocument {
-                subject_id: entity.id,
-                kind: SubstrateKind::Entity,
-                record_kind: None,
-                namespace: "local".to_string(),
-                title: None,
-                body: "fusionkeyword".to_string(),
-                tags: vec![],
-                metadata: None,
-                updated_at: Utc::now(),
-            })
-            .await
-            .unwrap();
-
-        let hits = rt
-            .hybrid_search_with_strategy(
-                &tok,
-                "fusionkeyword",
-                None,
-                FusionStrategy::KeywordOnly,
-                10,
-            )
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].entity_id, entity.id);
-        assert_eq!(hits[0].source, SearchSource::Text);
-        assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
-
-        let mixed = rt
-            .hybrid_search_with_strategy(&tok, "fusionkeyword", None, FusionStrategy::rrf(), 10)
-            .await
-            .unwrap();
-        assert_eq!(mixed[0].entity_id, entity.id);
-        assert_eq!(embed_calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn vector_only_search_skips_unavailable_text_arm() {
-        let (rt, embed_calls) = counting_embedding_runtime();
-        let tok = NamespaceToken::local();
-        let entity = Entity::new("local", "concept", "vector candidate");
-        rt.entities(&tok)
-            .unwrap()
-            .upsert_entities(vec![entity.clone()])
-            .await
-            .unwrap();
-        let query_vector = vec![1.0; EmbeddingModel::AllMiniLmL6V2.dimensions()];
-        rt.vectors(&tok)
-            .unwrap()
-            .insert(
-                entity.id,
-                SubstrateKind::Entity,
-                "local",
-                "entity.body",
-                vec![query_vector.clone()],
-            )
-            .await
-            .unwrap();
-        rt.text(&tok).unwrap();
-        let mut writer = rt.sql().writer().await.unwrap();
-        writer
-            .execute_script(
-                "DROP TABLE fts_entities; CREATE TABLE fts_entities (id INTEGER PRIMARY KEY);"
-                    .to_string(),
-            )
-            .await
-            .unwrap();
-        drop(writer);
-
-        let hits = rt
-            .hybrid_search_with_strategy(
-                &tok,
-                "fusionkeyword",
-                Some(query_vector),
-                FusionStrategy::VectorOnly,
-                10,
-            )
-            .await
-            .unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].entity_id, entity.id);
-        assert_eq!(hits[0].source, SearchSource::Vector);
-        assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1378,61 +1108,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hybrid_union_alive_filter_refills_below_complete_four_x_prefix() {
-        let (rt, tok, query_text, query_vector, text_hits, vector_hits, live) =
-            stale_full_prefix_fixture().await;
-        let truncated = rt
-            .fuse_with_strategy(
-                text_hits,
-                vector_hits,
-                &FusionStrategy::Union,
-                CANDIDATE_MULTIPLIER as usize,
-            )
-            .await
-            .unwrap();
-        assert!(truncated.iter().all(|hit| !live.contains(&hit.entity_id)));
-
-        let hits = rt
-            .hybrid_search_with_strategy(
-                &tok,
-                query_text,
-                Some(query_vector),
-                FusionStrategy::Union,
-                1,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(hits.len(), 1);
-        assert!(live.contains(&hits[0].entity_id));
-    }
-
-    #[tokio::test]
-    async fn hybrid_rrf_alive_filter_refills_below_complete_four_x_prefix() {
-        let (rt, tok, query_text, query_vector, text_hits, vector_hits, live) =
-            stale_full_prefix_fixture().await;
-        let strategy = FusionStrategy::Rrf { k: 60 };
-        let truncated = rt
-            .fuse_with_strategy(
-                text_hits,
-                vector_hits,
-                &strategy,
-                CANDIDATE_MULTIPLIER as usize,
-            )
-            .await
-            .unwrap();
-        assert!(truncated.iter().all(|hit| !live.contains(&hit.entity_id)));
-
-        let hits = rt
-            .hybrid_search_with_strategy(&tok, query_text, Some(query_vector), strategy, 1)
-            .await
-            .unwrap();
-
-        assert_eq!(hits.len(), 1);
-        assert!(live.contains(&hits[0].entity_id));
-    }
-
-    #[tokio::test]
     async fn hybrid_default_rrf_alive_filter_refills_below_complete_four_x_prefix() {
         let (rt, tok, query_text, query_vector, _text_hits, _vector_hits, live) =
             stale_full_prefix_fixture().await;
@@ -1473,73 +1148,5 @@ mod tests {
             let back: FusionStrategy = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(strategy, back, "roundtrip failed for {json}");
         }
-    }
-
-    // 10. hybrid_search_with_strategy must not hard-fail on a query containing FTS5
-    // metacharacters like `$`, since sanitize_fts5_query strips them before the query
-    // reaches SQLite. This covers the sanitizer path; test 11 covers the fail-loud
-    // path for characters the sanitizer does not strip.
-    #[tokio::test]
-    async fn hybrid_search_with_strategy_dollar_sign_query_does_not_error() {
-        let rt = KhiveRuntime::memory().unwrap();
-        let tok = NamespaceToken::local();
-        rt.create_entity(
-            &tok,
-            "concept",
-            None,
-            "DSL docs",
-            Some("use $prev.id to chain calls"),
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
-
-        let result = rt
-            .hybrid_search_with_strategy(&tok, "$prev.id", None, FusionStrategy::default(), 10)
-            .await;
-
-        assert!(
-            result.is_ok(),
-            "#388 hybrid_search_with_strategy must not hard-fail on a '$'-bearing query, got: {:?}",
-            result.err()
-        );
-    }
-
-    // 11. #916: `@` used to reach SQLite FTS5's bareword parser raw and error,
-    // surfacing as RuntimeError::InvalidInput per #569's fail-loud policy.
-    // sanitize_fts5_token_group's bareword-safety gate now routes it through the
-    // quoted-phrase alternative instead, so the query succeeds and the fail-loud
-    // arm is no longer reached for ordinary punctuation.
-    #[tokio::test]
-    async fn hybrid_search_with_strategy_residual_fts5_char_now_sanitized() {
-        let rt = KhiveRuntime::memory().unwrap();
-        let tok = NamespaceToken::local();
-        rt.create_entity(
-            &tok,
-            "concept",
-            None,
-            "DSL docs",
-            Some("use foo@bar to chain calls"),
-            None,
-            vec![],
-        )
-        .await
-        .unwrap();
-
-        let result = rt
-            .hybrid_search_with_strategy(&tok, "foo@bar", None, FusionStrategy::default(), 10)
-            .await;
-
-        let hits = result.unwrap_or_else(|e| {
-            panic!(
-                "#916 hybrid_search_with_strategy must not fail on an '@'-bearing query, got: {e:?}"
-            )
-        });
-        assert!(
-            !hits.is_empty(),
-            "#916 '@'-bearing query must still find the seeded 'foo@bar' content via the \
-             quoted-phrase alternative"
-        );
     }
 }
