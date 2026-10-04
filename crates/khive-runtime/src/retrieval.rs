@@ -10,7 +10,8 @@ use crate::curation::note_fts_document;
 use crate::embedder_registry::with_embedding_admission;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
-use khive_score::{rrf_score, DeterministicScore};
+use khive_retrieval::hybrid::{combine_leg_first_appearance, fuse_labelled, HitLabel};
+use khive_score::DeterministicScore;
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorRecord,
     VectorSearchHit, VectorSearchRequest,
@@ -942,28 +943,45 @@ impl KhiveRuntime {
         // sanitize_fts5_query strips known-unsafe FTS5 metacharacters up front, but if
         // the lexical leg still errors at runtime on residual punctuation the sanitizer
         // doesn't strip, this fails loud instead of degrading to vector-only fusion.
-        let text_search_result = self
-            .text(token)?
-            .search(TextSearchRequest {
-                query: query_text.to_string(),
-                mode: text_mode,
-                filter: Some(TextFilter {
-                    namespaces: visible_ns.clone(),
-                    // Push the entity-kind filter into the FTS query. Without it the
-                    // text arm returns the top `candidates` rows across EVERY entity
-                    // kind in the namespace and the kind is applied only afterwards,
-                    // so when one kind dominates the lexical ranking a search for a
-                    // rarer kind gets back fewer rows than exist, or none. The
-                    // `EntityFilter.kinds` check below stays as the backstop.
-                    record_kinds: entity_kind
-                        .map(|kind| vec![kind.to_string()])
-                        .unwrap_or_default(),
-                    ..TextFilter::default()
-                }),
-                top_k: candidates,
-                snippet_chars: 200,
-            })
-            .await;
+        let text_store = self.text(token)?;
+        let text_fut = text_store.search(TextSearchRequest {
+            query: query_text.to_string(),
+            mode: text_mode,
+            filter: Some(TextFilter {
+                namespaces: visible_ns.clone(),
+                // Push the entity-kind filter into the FTS query. Without it the
+                // text arm returns the top `candidates` rows across EVERY entity
+                // kind in the namespace and the kind is applied only afterwards,
+                // so when one kind dominates the lexical ranking a search for a
+                // rarer kind gets back fewer rows than exist, or none. The
+                // `EntityFilter.kinds` check below stays as the backstop.
+                record_kinds: entity_kind
+                    .map(|kind| vec![kind.to_string()])
+                    .unwrap_or_default(),
+                ..TextFilter::default()
+            }),
+            top_k: candidates,
+            snippet_chars: 200,
+        });
+        let text_fut = crate::stage_seam::text_stage(text_fut);
+        // The stages read nothing from each other, so they run together; a text error wins.
+        let vector_fut = async {
+            match vector_pool {
+                Some(pool) => Ok((pool, None)),
+                None => {
+                    self.hybrid_vector_stage(
+                        token,
+                        query_text,
+                        query_vector,
+                        candidates,
+                        vector_similarity_floor,
+                        tolerate_vector_error,
+                    )
+                    .await
+                }
+            }
+        };
+        let (text_search_result, vector_result) = tokio::join!(text_fut, vector_fut);
         // FtsPasses is counted inside the store's `search()` (khive-db
         // stores/text.rs), only once a real FTS5 statement is prepared —
         // an empty/fully-sanitized query short-circuits there before any
@@ -973,21 +991,7 @@ impl KhiveRuntime {
             "hybrid_search",
             query_text,
         )?;
-
-        let (vector_hits, vector_error) = match vector_pool {
-            Some(pool) => (pool, None),
-            None => {
-                self.hybrid_vector_stage(
-                    token,
-                    query_text,
-                    query_vector,
-                    candidates,
-                    vector_similarity_floor,
-                    tolerate_vector_error,
-                )
-                .await?
-            }
-        };
+        let (vector_hits, vector_error) = vector_result?;
 
         // Each arm fetched `candidates` independently, so their union can contain
         // twice that many distinct IDs. Keep the complete fetched pool through
@@ -1635,9 +1639,10 @@ const EXACT_MATCH_BOOST: f64 = 0.5;
 
 /// Fuse text + vector hits with Reciprocal Rank Fusion (k=10).
 ///
-/// Entity search stays local because it uses k=10 plus exact-match boosting.
+/// Scoring and the merge of each id's labels come from the shared labelled fusion in
+/// `khive-retrieval`. Entity search keeps its own k=10 and exact-match boosting here.
 /// Hits in both lists get RRF scores summed. If `query_text` exactly matches
-/// (case-insensitive) an entity's title from the text hits, a bonus of
+/// (case-insensitive) the title a fused hit carries from the text hits, a bonus of
 /// `EXACT_MATCH_BOOST` is added to ensure exact-name matches dominate.
 /// Sort by fused score, take top-`limit`.
 fn rrf_fuse(
@@ -1646,77 +1651,67 @@ fn rrf_fuse(
     limit: usize,
     query_text: &str,
 ) -> Vec<SearchHit> {
-    #[derive(Default)]
-    struct Bucket {
-        score: DeterministicScore,
-        signals: SearchSignals,
-        source: Option<SearchSource>,
-        title: Option<String>,
-        snippet: Option<String>,
+    let mut text_arm = Vec::new();
+    for (rank, hit) in text_hits.into_iter().enumerate() {
+        let label = HitLabel {
+            rank,
+            signals: SearchSignals {
+                vector_similarity: None,
+                keyword_score: Some(hit.score),
+            },
+            source: SearchSource::Text,
+            title: hit.title,
+            snippet: hit.snippet,
+        };
+        text_arm.push((hit.subject_id, label));
+    }
+    let mut vector_arm = Vec::new();
+    for (rank, hit) in vector_hits.into_iter().enumerate() {
+        let label = HitLabel {
+            rank,
+            signals: SearchSignals {
+                vector_similarity: Some(hit.score),
+                keyword_score: None,
+            },
+            source: SearchSource::Vector,
+            title: None,
+            snippet: None,
+        };
+        vector_arm.push((hit.subject_id, label));
     }
 
-    let mut buckets: HashMap<Uuid, Bucket> = HashMap::new();
+    let fused = fuse_labelled(
+        vec![text_arm, vector_arm],
+        RRF_K,
+        combine_leg_first_appearance,
+    );
 
+    // The bonus joins the full fused order, so it decides the sort and the cut below.
     let query_lower = query_text.to_lowercase();
-    let mut text_seen = HashSet::with_capacity(text_hits.len());
-    for (i, hit) in text_hits.into_iter().enumerate() {
-        if !text_seen.insert(hit.subject_id) {
-            continue;
-        }
-        let rank = i + 1; // RRF is 1-indexed
-        let entry = buckets.entry(hit.subject_id).or_default();
-        entry.score = entry.score + rrf_score(rank, RRF_K);
-        entry.signals.keyword_score = Some(hit.score);
-        entry.source = Some(match entry.source {
-            Some(SearchSource::Vector) => SearchSource::Both,
-            _ => SearchSource::Text,
-        });
-        if entry.title.is_none() {
-            // Apply exact-match boost before storing the title so we only check once.
-            if let Some(ref title) = hit.title {
-                if title.to_lowercase() == query_lower {
-                    entry.score = entry.score + DeterministicScore::from_f64(EXACT_MATCH_BOOST);
-                }
-            }
-            entry.title = hit.title;
-        }
-        if entry.snippet.is_none() {
-            entry.snippet = hit.snippet;
-        }
-    }
-
-    let mut vector_seen = HashSet::with_capacity(vector_hits.len());
-    for (i, hit) in vector_hits.into_iter().enumerate() {
-        if !vector_seen.insert(hit.subject_id) {
-            continue;
-        }
-        let rank = i + 1;
-        let entry = buckets.entry(hit.subject_id).or_default();
-        entry.score = entry.score + rrf_score(rank, RRF_K);
-        entry.signals.vector_similarity = Some(hit.score);
-        entry.source = Some(match entry.source {
-            Some(SearchSource::Text) => SearchSource::Both,
-            _ => SearchSource::Vector,
-        });
-    }
-
-    let mut hits: Vec<SearchHit> = buckets
-        .into_iter()
-        .map(|(id, b)| SearchHit {
-            entity_id: id,
-            score: b.score,
+    let boost = DeterministicScore::from_f64(EXACT_MATCH_BOOST);
+    let mut hits = Vec::with_capacity(fused.len());
+    for (entity_id, score, label) in fused {
+        let title_lower = label.title.as_deref().map(str::to_lowercase);
+        let exact = title_lower.as_deref() == Some(query_lower.as_str());
+        let score = if exact { score + boost } else { score };
+        hits.push(SearchHit {
+            entity_id,
+            score,
             rank_score_kind: RankScoreKind::Rrf,
-            signals: b.signals,
-            source: b.source.expect("each bucket gets a source"),
-            title: b.title,
-            snippet: b.snippet,
-        })
-        .collect();
+            signals: label.signals,
+            source: label.source,
+            title: label.title,
+            snippet: label.snippet,
+        });
+    }
 
     hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
     hits.truncate(limit);
     hits
 }
+
+#[cfg(test)]
+mod rrf_fuse_label_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1725,6 +1720,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::runtime::{KhiveRuntime, NamespaceToken, RuntimeConfig};
+    use khive_score::rrf_score;
     use khive_storage::types::{TextSearchHit, VectorSearchHit};
     use khive_types::namespace::Namespace;
     use lattice_embed::{EmbedError, EmbeddingModel};

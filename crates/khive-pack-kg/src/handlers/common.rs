@@ -570,6 +570,13 @@ async fn resolve_name_async(
     }
 }
 
+/// The answer for a prefix that no record the caller may read carries. A
+/// resolver that withholds a candidate answers with this same error, so a
+/// withheld record and a missing one read alike.
+pub(crate) fn prefix_not_found(prefix: &str) -> RuntimeError {
+    RuntimeError::InvalidInput(format!("no record matches prefix: {prefix:?}"))
+}
+
 pub(crate) async fn resolve_uuid_async(
     s: &str,
     runtime: &KhiveRuntime,
@@ -581,11 +588,7 @@ pub(crate) async fn resolve_uuid_async(
     if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
         match runtime.resolve_prefix(token, s).await {
             Ok(Some(uuid)) => return Ok(uuid),
-            Ok(None) => {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "no record matches prefix: {s:?}"
-                )))
-            }
+            Ok(None) => return Err(prefix_not_found(s)),
             Err(e) => return Err(e),
         }
     }

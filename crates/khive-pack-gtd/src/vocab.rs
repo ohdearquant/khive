@@ -172,7 +172,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
                 name: "description",
                 param_type: "string",
                 required: false,
-                description: "Task body. Stored as properties.description and mirrored into the task's content; read back on the task record and by gtd.tasks/gtd.next.",
+                description: "Task body. Stored as properties.description and mirrored into the task's content; read back on the task record and by gtd.tasks/gtd.next. `content` is accepted as an alias for `description`; supplying both is refused.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -296,7 +296,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
                 name: "result",
                 param_type: "string",
                 required: false,
-                description: "Optional result or completion note.",
+                description: "Optional result or completion note. `note` is accepted as an alias for `result`; supplying both is refused.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -426,7 +426,8 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
                 required: true,
                 description: "Target status: inbox | next | waiting | someday | active | done | cancelled. \
                                Aliases also accepted: todo=inbox, in_progress=active, blocked=waiting, \
-                               later=someday, finished=done.",
+                               later=someday, finished=done. The parameter name `to` is accepted as an \
+                               alias for `status`; supplying both is refused.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

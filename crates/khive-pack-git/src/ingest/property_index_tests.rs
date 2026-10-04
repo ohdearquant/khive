@@ -8,6 +8,20 @@ use std::sync::Arc;
 const SHA_INDEX: &str = "idx_git_notes_live_commit_sha";
 const NUMBER_INDEX: &str = "idx_git_notes_live_number_project";
 const EXPECT_GIT_PROPERTY_INDEXES: bool = true;
+const GIT_CORE_INDEXES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../khive-db/sql/049-git-note-property-indexes.sql"
+));
+
+fn configure_property_indexes(runtime: &KhiveRuntime, indexed: bool) {
+    if indexed {
+        install(runtime);
+    } else {
+        runtime.backend().pool().try_writer().unwrap().conn().execute_batch(
+            "DROP INDEX idx_git_notes_live_commit_sha; DROP INDEX idx_git_notes_live_number_project; DROP INDEX idx_git_notes_history_canonical_sha; DROP INDEX idx_git_notes_history_noncanonical"
+        ).unwrap();
+    }
+}
 
 fn file_runtime(path: &Path, read_only: bool) -> KhiveRuntime {
     let backend = if read_only {
@@ -15,6 +29,12 @@ fn file_runtime(path: &Path, read_only: bool) -> KhiveRuntime {
     } else {
         StorageBackend::sqlite_with_max_readers(path, Some(2)).unwrap()
     };
+    if !read_only {
+        // from_backend is assembly only. Core migration 049, including its
+        // indexes and the graph tables used by these real queries, must precede
+        // pack schema loading. Keep the readonly historical-inspection arm raw.
+        backend.prepare_core_schema().unwrap();
+    }
     let runtime = KhiveRuntime::from_backend(Arc::new(backend), RuntimeConfig::no_embeddings());
     if !read_only {
         runtime.backend().notes_for_namespace("local").unwrap();
@@ -134,9 +154,9 @@ fn annotation_count_sql() -> String {
         env!("CARGO_MANIFEST_DIR"),
         "/../khive-db/sql/commit-annotation-insert.sql"
     ));
-    let (_, rest) = insert.split_once("SELECT COUNT(*) FROM notes").unwrap();
-    let (predicate, _) = rest.split_once("\n)").unwrap();
-    format!("SELECT COUNT(*) AS holders FROM notes{predicate}").replace("?9", "?2")
+    let (_, rest) = insert.split_once("AND 1 = (\n").unwrap();
+    let (count, _) = rest.split_once("\n)\nAND EXISTS").unwrap();
+    format!("SELECT ({count}) AS holders").replace("?9", "?2")
 }
 
 async fn annotation_count(runtime: &KhiveRuntime, sha: &str) -> i64 {
@@ -209,8 +229,15 @@ async fn bundled_sqlite_uses_property_indexes_for_exact_production_queries() {
         ];
         for (label, sql, params, index) in &queries {
             let before = plan(&runtime, sql, params.clone()).await;
-            assert!(!uses(&before, index), "index not installed: {before:?}");
-            println!("3716_PLAN before {label} count={count} {}", json!(before));
+            assert_eq!(
+                uses(&before, index),
+                EXPECT_GIT_PROPERTY_INDEXES,
+                "core migration must index without a loaded pack: {before:?}"
+            );
+            println!(
+                "PROPERTY_PLAN before {label} count={count} {}",
+                json!(before)
+            );
         }
         install(&runtime);
         for analyze in [false, true] {
@@ -233,7 +260,7 @@ async fn bundled_sqlite_uses_property_indexes_for_exact_production_queries() {
                 );
                 assert_eq!(query(&runtime, sql, params.clone()).await.len(), 1);
                 println!(
-                    "3716_PLAN after {label} count={count} analyze={analyze} {}",
+                    "PROPERTY_PLAN after {label} count={count} analyze={analyze} {}",
                     json!(after)
                 );
             }
@@ -250,9 +277,7 @@ async fn commit_lookup_preserves_live_scope_value_types_and_duplicate_refusals()
         let foreign = runtime
             .authorize(Namespace::parse("other").unwrap())
             .unwrap();
-        if indexed {
-            install(&runtime);
-        }
+        configure_property_indexes(&runtime, indexed);
         let sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let upper = sha.to_ascii_uppercase();
         let live = Uuid::new_v4();
@@ -388,9 +413,7 @@ async fn number_lookup_preserves_namespace_project_kind_type_and_cast_contracts(
             .unwrap();
         let project = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
         let other_project = Uuid::new_v4();
-        if indexed {
-            install(&runtime);
-        }
+        configure_property_indexes(&runtime, indexed);
         let issue = Uuid::new_v4();
         let pr = Uuid::new_v4();
         let other_ns = Uuid::new_v4();
@@ -574,7 +597,7 @@ async fn number_duplicates_retain_unspecified_holder_including_invalid_ids() {
                 .await
                 .unwrap();
             assert!(actual.is_none() || actual == Some(valid));
-            println!("3716_UNSPECIFIED_NUMBER_WINNER invalid_first={invalid_first} indexed={indexed} selected={selected:?} resolved={actual:?}");
+            println!("UNSPECIFIED_NUMBER_WINNER invalid_first={invalid_first} indexed={indexed} selected={selected:?} resolved={actual:?}");
         }
     }
 }
@@ -709,6 +732,14 @@ async fn malformed_tombstone_history_is_not_indexed_or_repaired_and_count_error_
         .to_string();
     assert!(count_before.contains("malformed JSON"), "{count_before}");
     drop(reader);
+    runtime
+        .backend()
+        .pool()
+        .try_writer()
+        .unwrap()
+        .conn()
+        .execute_batch(GIT_CORE_INDEXES)
+        .unwrap();
     install(&runtime);
     let pack_indexes = query(
         &runtime,
@@ -774,10 +805,12 @@ async fn pack_schema_batch_rolls_back_actual_late_sqlite_refusal() {
         .to_string();
     assert!(error.contains("no such column"), "{error}");
     let created=query(&runtime,"SELECT name FROM sqlite_master WHERE name IN ('idx_git_notes_live_commit_sha','idx_git_notes_live_number_project','git_mirror_cursor','git_receipts')",vec![]).await;
-    assert!(
-        created.is_empty(),
-        "no partial pack install after real SQLite refusal: {created:?}"
+    assert_eq!(
+        created.len(),
+        2,
+        "preexisting core live indexes survive: {created:?}"
     );
+    assert!(created.iter().all(|row| matches!(row.get("name"), Some(SqlValue::Text(name)) if name.starts_with("idx_git_notes_live_"))), "no partial auxiliary pack install after real SQLite refusal: {created:?}");
     install(&runtime);
 }
 
@@ -786,9 +819,7 @@ async fn annotation_count_keeps_zero_one_many_and_deleted_history() {
     for indexed in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let runtime = file_runtime(&dir.path().join("count.db"), false);
-        if indexed {
-            install(&runtime);
-        }
+        configure_property_indexes(&runtime, indexed);
         let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         assert_eq!(annotation_count(&runtime, sha).await, 0);
         insert(
@@ -853,3 +884,6 @@ async fn annotation_count_keeps_zero_one_many_and_deleted_history() {
         assert_eq!(annotation_count(&runtime, "123").await, 1);
     }
 }
+
+#[path = "annotation_count_index_tests.rs"]
+mod annotation_count_index_tests;

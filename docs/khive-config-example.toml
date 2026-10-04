@@ -345,6 +345,26 @@ model = "paraphrase-multilingual-minilm-l12-v2"
 #                                exactly one refuses the boot, naming both variables.
 #   KHIVE_LOCK=~/.khive/khived.recovery.lock     Stale-daemon recovery lock file path.
 #   KHIVE_DRAIN_TIMEOUT_SECS=10  Seconds the daemon waits for in-flight requests before shutdown.
+#   KHIVE_DAEMON_MAX_CONNECTIONS=512
+#                                Cap on concurrently served daemon connections. A connection past
+#                                the cap is answered with a daemon_busy error and closed;
+#                                connections already open are unaffected. Zero or a non-integer
+#                                uses the default and logs a warning. The cap is reduced to fit
+#                                the process's descriptor limit: the soft open-files limit minus
+#                                192 reserved descriptors, never below 1. A reduced cap is logged
+#                                once at start with both numbers and the soft limit; the daemon
+#                                does not raise the limit. The metrics snapshot reports the
+#                                enforced limit (and the configured one when it differs), the
+#                                active count and the refused count.
+#   KHIVE_RECALL_LEDGER_MAX_PENDING=256
+#                                Cap on recall serve-ledger tasks pending at once. A write past
+#                                the cap is skipped and counted; the recall itself never waits on
+#                                it and its results are unchanged. Zero or a non-integer uses the
+#                                default and logs a warning.
+#   KHIVE_RECALL_LEDGER_TIMEOUT_MS=30000
+#                                Milliseconds a recall serve-ledger task may run before it is
+#                                ended and its missed write counted. Zero or a non-integer uses
+#                                the default and logs a warning.
 #   KHIVE_REQUEST_READ_TIMEOUT_SECS=30
 #                                Absolute ceiling for request-owned reads and compose (1..=86400).
 #                                Above 86400 clamps to 86400; zero or a non-integer uses the

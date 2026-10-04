@@ -2027,13 +2027,7 @@ fn conditional_commit_annotation_insert(
         return Ok(CommitAnnotationInsertOutcome::Created(edge));
     }
     let source_live: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1 AND namespace=?2 \
-         AND kind='commit' AND deleted_at IS NULL \
-         AND json_type(properties, '$.sha')='text' \
-         AND json_extract(properties, '$.sha')=?3 COLLATE BINARY \
-         AND (SELECT COUNT(*) FROM notes WHERE namespace=?2 AND kind='commit' \
-              AND json_type(properties, '$.sha')='text' \
-              AND json_extract(properties, '$.sha')=?3 COLLATE BINARY)=1)",
+        include_str!("../../sql/commit-annotation-source-live-select.sql"),
         rusqlite::params![
             edge.source_id.to_string(),
             edge.namespace,

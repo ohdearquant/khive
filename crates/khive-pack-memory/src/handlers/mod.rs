@@ -4,6 +4,8 @@ mod common;
 mod feedback;
 #[cfg(test)]
 mod fresh_tail_tests;
+#[cfg(test)]
+mod fuse_equivalence_tests;
 mod prune;
 mod recall;
 mod remember;

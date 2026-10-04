@@ -5721,12 +5721,14 @@ impl KhiveRuntime {
         #[cfg(not(any(test, feature = "fault-injection")))]
         let fts_search_inject = false;
 
-        let text_search_result = if fts_search_inject {
-            Err(khive_storage::StorageError::Timeout {
-                operation: "fts_search".into(),
-            })
-        } else {
-            self.text_for_notes(token)?
+        let text_store = self.text_for_notes(token)?;
+        let text_fut = async {
+            if fts_search_inject {
+                return Err(khive_storage::StorageError::Timeout {
+                    operation: "fts_search".into(),
+                });
+            }
+            text_store
                 .search(TextSearchRequest {
                     query: query_text.to_string(),
                     mode: text_mode,
@@ -5748,6 +5750,18 @@ impl KhiveRuntime {
                 })
                 .await
         };
+        let text_fut = crate::stage_seam::text_stage(text_fut);
+
+        // Vector search filtered to notes; it runs with the text stage, and a text error wins.
+        let vector_fut = async {
+            if query_vector.is_some() || self.config().embedding_model.is_some() {
+                self.note_search_vector_search(token, query_vector, query_text, candidates)
+                    .await
+            } else {
+                Ok(vec![])
+            }
+        };
+        let (text_search_result, vector_result) = tokio::join!(text_fut, vector_fut);
 
         // FtsPasses is counted inside the store's `search()` (khive-db
         // stores/text.rs), only once a real FTS5 statement is prepared —
@@ -5760,22 +5774,14 @@ impl KhiveRuntime {
             query_text,
         )?;
 
-        // Vector search filtered to notes.
         let mut vector_error: Option<String> = None;
-        let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
-            match self
-                .note_search_vector_search(token, query_vector, query_text, candidates)
-                .await
-            {
-                Ok(hits) => hits,
-                Err(e) if tolerate_vector_error => {
-                    vector_error = Some(e.to_string());
-                    Vec::new()
-                }
-                Err(e) => return Err(e),
+        let vector_hits = match vector_result {
+            Ok(hits) => hits,
+            Err(e) if tolerate_vector_error => {
+                vector_error = Some(e.to_string());
+                Vec::new()
             }
-        } else {
-            vec![]
+            Err(e) => return Err(e),
         };
 
         // Keep the full text∪vector union through RRF — salience weighting and

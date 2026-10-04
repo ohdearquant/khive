@@ -14,6 +14,8 @@ pub use registry::{BackendEntry, BackendRegistrationError, BackendRegistry};
 pub use service::SubstrateCoordinatorService;
 
 #[cfg(test)]
+mod fusion_label_tests;
+#[cfg(test)]
 mod ranking_tests;
 #[cfg(test)]
 mod tests;
