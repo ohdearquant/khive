@@ -93,7 +93,7 @@ pub(super) fn validate_atom_content(content: &str) -> Result<(), RuntimeError> {
 // ─── error helpers ───────────────────────────────────────────────────────────
 
 pub(super) fn sql_err(ctx: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::Internal(format!("{ctx}: {e}"))
+    RuntimeError::internal_with_context(ctx, e)
 }
 
 pub(super) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
@@ -431,4 +431,19 @@ pub(super) async fn compute_embedding_coverage(
     };
 
     Ok(atoms_with_vector as f64 / total_atoms as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knowledge_sql_err_message_is_context_and_error() {
+        match sql_err("insert atom", "boom") {
+            RuntimeError::Internal(message) => {
+                assert_eq!(message, "insert atom: boom");
+            }
+            other => panic!("expected RuntimeError::Internal, got {other:?}"),
+        }
+    }
 }
