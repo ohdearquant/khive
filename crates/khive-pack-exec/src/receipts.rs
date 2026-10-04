@@ -28,10 +28,7 @@ fn int(row: &SqlRow, col: &str) -> Option<i64> {
 }
 
 fn opt_text(v: Option<&str>) -> SqlValue {
-    match v {
-        Some(s) => SqlValue::Text(s.to_string()),
-        None => SqlValue::Null,
-    }
+    SqlValue::from_opt_text(v)
 }
 
 /// Insert the receipt row and return its per-session `seq`. The number is

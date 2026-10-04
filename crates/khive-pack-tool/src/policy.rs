@@ -62,17 +62,11 @@ fn int(row: &SqlRow, col: &str) -> Option<i64> {
 }
 
 fn opt_text(v: Option<&str>) -> SqlValue {
-    match v {
-        Some(s) => SqlValue::Text(s.to_string()),
-        None => SqlValue::Null,
-    }
+    SqlValue::from_opt_text(v)
 }
 
 fn opt_int(v: Option<i64>) -> SqlValue {
-    match v {
-        Some(i) => SqlValue::Integer(i),
-        None => SqlValue::Null,
-    }
+    SqlValue::from_opt_i64(v)
 }
 
 fn iso(v: Option<i64>) -> Value {
