@@ -778,6 +778,10 @@ does not replace or change the status of the document or Amendments 1 through 3.
 - With every other class routed to one target, exhaustive specific relation routes to that same
   target, without a bare `edge` route, move the namespace aggregates. The same source with its
   relations split across two targets leaves them in place and reports them as left behind.
+- A source relation routed to one target whose triple is already resident in another routed target
+  refuses before any write, naming the unique triple and that target. Moving each share to a fresh
+  empty namespace and then on to its destination succeeds, places every edge where it was routed and
+  leaves the resident unchanged. Removing the collision refusal must fail this test.
 - Actual source edge vectors follow the resolved route in either route-list order, preserve bytes
   and append a source-delete then destination-upsert pair per moved vector. Vector kind and field do
   not choose the destination. Resident vectors remain unchanged and unlogged.
