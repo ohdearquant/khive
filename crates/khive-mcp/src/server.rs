@@ -1577,10 +1577,7 @@ fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
 /// where it is wanted: long enough that ordinary gaps in a live session never
 /// trip it.
 fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
-    let secs = std::env::var("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(0);
+    let secs = khive_storage::read_env_number::<u64>("KHIVE_BRIDGE_IDLE_TIMEOUT_SECS").unwrap_or(0);
     if secs == 0 {
         None
     } else {
@@ -1612,9 +1609,7 @@ fn stdio_bridge_idle_timeout_from_env() -> Option<std::time::Duration> {
 /// default. Default: 3600s.
 fn stdio_bridge_request_obligation_ttl_from_env() -> Option<std::time::Duration> {
     const DEFAULT_SECS: u64 = 3600;
-    let secs = std::env::var("KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    let secs = khive_storage::read_env_number::<u64>("KHIVE_BRIDGE_REQUEST_OBLIGATION_SECS")
         .unwrap_or(DEFAULT_SECS);
     if secs == 0 {
         None
@@ -1633,9 +1628,7 @@ fn stdio_bridge_request_obligation_ttl_from_env() -> Option<std::time::Duration>
 /// MCP traffic while keeping a peer that stops reading from growing the
 /// session without limit.
 fn stdio_bridge_max_outstanding_requests_from_env() -> usize {
-    std::env::var("KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
+    khive_storage::read_env_number::<usize>("KHIVE_BRIDGE_MAX_OUTSTANDING_REQUESTS")
         .filter(|&value| value > 0)
         .unwrap_or(crate::transport::DEFAULT_MAX_OUTSTANDING_REQUESTS)
 }
@@ -15138,3 +15131,7 @@ mod operation_attribution_tests;
 #[cfg(test)]
 #[path = "event_row_usage_tests.rs"]
 mod event_row_usage_tests;
+
+#[cfg(test)]
+#[path = "server/numeric_env_tests.rs"]
+mod numeric_env_tests;
