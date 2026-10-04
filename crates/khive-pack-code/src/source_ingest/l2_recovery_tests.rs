@@ -900,3 +900,6 @@ mod shared_owner_tests;
 
 #[path = "l2_run_identity_tests.rs"]
 mod run_identity_tests;
+
+#[path = "l2_accepted_edge_tests.rs"]
+mod accepted_edge_tests;

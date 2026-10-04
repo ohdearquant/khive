@@ -203,6 +203,7 @@ async fn l2_natural_identity_preflight_has_no_declaration_effects() {
             Uuid::new_v4(),
             "a.rs",
             &ids,
+            &[natural("a", "aa", "ah")],
             Some(&predecessor),
             &mut report
         )

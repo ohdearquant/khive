@@ -1,9 +1,8 @@
 use chrono::{DateTime, Utc};
 use khive_runtime::{KhiveRuntime, NamespaceToken};
-use khive_storage::{Direction, LinkId, NeighborQuery};
+use khive_storage::LinkId;
 use khive_types::EdgeRelation;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
 use uuid::Uuid;
 
 use crate::extractor::DeclKind;
@@ -25,6 +24,7 @@ pub(super) async fn refresh_l2_declarations(
     run_id: Uuid,
     file_label: &str,
     declaration_ids: &[Uuid],
+    natural_edge_ids: &[Uuid],
     previous_observation: Option<&L2Observation>,
     report: &mut CodeSourceIngestReport,
 ) -> Result<bool, CodeSourceIngestError> {
@@ -57,7 +57,7 @@ pub(super) async fn refresh_l2_declarations(
         }
         declarations.push(entity);
     }
-    if !retained_natural_edges_match(rt, token, declaration_ids, previous_observation.run_id)
+    if !retained_natural_edges_match(rt, token, natural_edge_ids, previous_observation.run_id)
         .await?
     {
         return Ok(false);
@@ -114,45 +114,41 @@ pub(super) async fn refresh_l2_declarations(
     }
     // These fresh edge reads gate reuse after guarded declaration rebases.
     // They are separate observations, not a transaction across entity/edge rows.
-    retained_natural_edges_match(rt, token, declaration_ids, previous_observation.run_id).await
+    retained_natural_edges_match(rt, token, natural_edge_ids, previous_observation.run_id).await
 }
 
 async fn retained_natural_edges_match(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
-    declaration_ids: &[Uuid],
+    natural_edge_ids: &[Uuid],
     previous_run_id: Uuid,
 ) -> Result<bool, CodeSourceIngestError> {
-    if declaration_ids.is_empty() {
+    if natural_edge_ids.is_empty() {
         return Ok(true);
     }
     let graph = rt.graph(token)?;
-    let hits = graph
-        .batch_neighbors(
-            declaration_ids,
-            NeighborQuery {
-                direction: Direction::Out,
-                relations: Some(vec![EdgeRelation::DependsOn, EdgeRelation::Implements]),
-                limit: None,
-                min_weight: None,
-            },
+    let edges = graph
+        .get_edges(
+            &natural_edge_ids
+                .iter()
+                .copied()
+                .map(LinkId::from)
+                .collect::<Vec<_>>(),
         )
         .await
         .map_err(|error| CodeSourceIngestError::Storage(error.to_string()))?;
-    let ids: BTreeSet<Uuid> = hits.into_iter().map(|(_, hit)| hit.edge_id).collect();
-    let edges = graph
-        .get_edges(&ids.iter().copied().map(LinkId::from).collect::<Vec<_>>())
-        .await
-        .map_err(|error| CodeSourceIngestError::Storage(error.to_string()))?;
-    if edges.len() != ids.len() {
+    if edges.len() != natural_edge_ids.len() {
         return Ok(false);
     }
     Ok(edges.iter().all(|edge| {
         let metadata = edge.metadata.as_ref();
-        metadata
+        matches!(
+            edge.relation,
+            EdgeRelation::DependsOn | EdgeRelation::Implements
+        ) && metadata
             .and_then(|value| value.get("l2_derived"))
             .and_then(Value::as_bool)
-            != Some(true)
-            || observation_matches(metadata, previous_run_id)
+            == Some(true)
+            && observation_matches(metadata, previous_run_id)
     }))
 }

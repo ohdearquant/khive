@@ -154,6 +154,9 @@ pub(super) async fn upsert_l2_depends_on(
     })
     .await?;
     state.stamped_edge_ids.insert(edge_id);
+    if outcome != RowMutationOutcome::Blocked {
+        state.observed_natural_edge_ids.push(edge_id);
+    }
     match outcome {
         RowMutationOutcome::Created => report.edges_created += 1,
         RowMutationOutcome::Updated => report.edges_updated += 1,
@@ -200,6 +203,9 @@ pub(super) async fn upsert_l2_implements(
     })
     .await?;
     state.stamped_edge_ids.insert(edge_id);
+    if outcome != RowMutationOutcome::Blocked {
+        state.observed_natural_edge_ids.push(edge_id);
+    }
     match outcome {
         RowMutationOutcome::Created => report.edges_created += 1,
         RowMutationOutcome::Updated => report.edges_updated += 1,

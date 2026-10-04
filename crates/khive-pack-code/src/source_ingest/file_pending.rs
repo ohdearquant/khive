@@ -9,10 +9,21 @@ pub(super) struct FileReference {
     pub(super) reference: L2UnresolvedRef,
 }
 #[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub(super) struct FileImplementation {
+    pub(super) module_path: String,
+    #[serde(flatten)]
+    pub(super) implementation: L2PendingImpl,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub(super) struct FilePending {
     pub(super) content_hash: String,
     pub(super) declaration_ids: Vec<Uuid>,
     pub(super) references: Vec<FileReference>,
+    // Missing inventory predates producer-owned edge coverage and requires parsing.
+    pub(super) natural_edge_ids: Option<Vec<Uuid>>,
+    #[serde(default)]
+    pub(super) implementations: Vec<FileImplementation>,
 }
 pub(super) fn read_file(properties: &Value, file: &str) -> Option<FilePending> {
     let entry: FilePending =
@@ -33,6 +44,8 @@ pub(super) async fn stamp_l2_declarations(
     module_id: Uuid,
     declaration_ids: &[Uuid],
     references: &[FileReference],
+    natural_edge_ids: &[Uuid],
+    implementations: &[FileImplementation],
     content_hash: &str,
     file_label: &str,
     report: &mut CodeSourceIngestReport,
@@ -68,7 +81,16 @@ pub(super) async fn stamp_l2_declarations(
             json!(FilePending {
                 content_hash: content_hash.to_owned(),
                 declaration_ids: declaration_ids.to_vec(),
-                references: references.to_vec()
+                references: references.to_vec(),
+                natural_edge_ids: Some(
+                    natural_edge_ids
+                        .iter()
+                        .copied()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect()
+                ),
+                implementations: implementations.to_vec(),
             }),
         );
         props.insert("l2_content_hash".into(), json!(content_hash));
@@ -123,6 +145,7 @@ pub(super) async fn reresolve(
         if entry.content_hash != observed_hash {
             continue;
         }
+        let observation_start = state.observed_natural_edge_ids.len();
         let mut remaining = Vec::new();
         for pending in &entry.references {
             let id = pending.declaration_id;
@@ -181,7 +204,8 @@ pub(super) async fn reresolve(
         if let Some(l2) = report.l2.as_mut() {
             l2.symbol_dependencies_unresolved += remaining.len() as u64;
         }
-        if remaining == entry.references {
+        let observed = &state.observed_natural_edge_ids[observation_start..];
+        if remaining == entry.references && observed.is_empty() {
             continue;
         }
         let original: HashSet<_> = entry.references.iter().cloned().collect();
@@ -200,11 +224,122 @@ pub(super) async fn reresolve(
                 .cloned()
                 .collect();
             rebase_l2_pending(&mut fresh.references, &original, &retained);
+            if let Some(ids) = fresh.natural_edge_ids.as_mut() {
+                ids.extend(observed.iter().copied());
+                ids.sort();
+                ids.dedup();
+            }
             props
                 .get_mut("l2_file_pending")?
                 .as_object_mut()?
                 .insert(file.clone(), json!(fresh));
             module.properties = Some(Value::Object(props));
+            Some(module)
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+/// Record only impl relations accepted from this producer's parse and actually
+/// observed by the completed walk's resolution pass. Ambient module history
+/// cannot become this file's edge inventory.
+pub(super) async fn record_resolved_implementations(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    state: &L2SweepState,
+    report: &mut CodeSourceIngestReport,
+) -> Result<(), CodeSourceIngestError> {
+    let no_file_ids = BTreeSet::new();
+    let observed: BTreeSet<_> = state.observed_natural_edge_ids.iter().copied().collect();
+    for ((module_id, file), hash) in &state.current_files {
+        let Some(owner) = state.current_modules.get(module_id) else {
+            continue;
+        };
+        let Some(module) = get_entity_opt(rt, token, *module_id).await? else {
+            continue;
+        };
+        let Some(properties) = module.properties.as_ref() else {
+            continue;
+        };
+        if properties["source_project"].as_str() != Some(owner.source_project.as_str())
+            || properties["language"].as_str() != Some(owner.language.as_str())
+        {
+            continue;
+        }
+        let Some(entry) = read_file(properties, file) else {
+            continue;
+        };
+        if &entry.content_hash != hash {
+            continue;
+        }
+        let mut accepted = BTreeSet::new();
+        for item in &entry.implementations {
+            let implementation = &item.implementation;
+            let type_id = find_first_current(
+                state,
+                &owner.source_project,
+                &owner.language,
+                symbol_candidate_ids_for_kinds(
+                    &owner.source_project,
+                    &owner.language,
+                    &item.module_path,
+                    &implementation.type_path,
+                    &["datatype"],
+                ),
+                &no_file_ids,
+            );
+            let trait_id = find_first_current(
+                state,
+                &owner.source_project,
+                &owner.language,
+                symbol_candidate_ids_for_kinds(
+                    &owner.source_project,
+                    &owner.language,
+                    &item.module_path,
+                    &implementation.trait_path,
+                    &["interface"],
+                ),
+                &no_file_ids,
+            );
+            if let (Some(type_id), Some(trait_id)) = (type_id, trait_id) {
+                let id = edge_uuid(EdgeRelation::Implements, type_id, trait_id);
+                if observed.contains(&id) {
+                    accepted.insert(id);
+                }
+            }
+        }
+        if accepted.is_empty()
+            || entry
+                .natural_edge_ids
+                .as_ref()
+                .is_some_and(|ids| accepted.iter().all(|id| ids.contains(id)))
+        {
+            continue;
+        }
+        mutate_entity(rt, token, *module_id, file, report, |current| {
+            let mut module = current?.clone();
+            let mut properties = module.properties.clone()?.as_object()?.clone();
+            if properties.get("source_project").and_then(Value::as_str)
+                != Some(owner.source_project.as_str())
+                || properties.get("language").and_then(Value::as_str)
+                    != Some(owner.language.as_str())
+            {
+                return None;
+            }
+            let mut fresh = read_file(&Value::Object(properties.clone()), file)?;
+            if fresh != entry {
+                return None;
+            }
+            let ids = fresh.natural_edge_ids.as_mut()?;
+            ids.extend(accepted.iter().copied());
+            ids.sort();
+            ids.dedup();
+            properties
+                .get_mut("l2_file_pending")?
+                .as_object_mut()?
+                .insert(file.clone(), json!(fresh));
+            module.properties = Some(Value::Object(properties));
             Some(module)
         })
         .await?;

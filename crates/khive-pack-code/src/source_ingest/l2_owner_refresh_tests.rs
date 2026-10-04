@@ -199,9 +199,10 @@ async fn l2_shared_owner_cost_boundary_preserves_empty_aliased_and_distinct_run_
             assert_eq!(first.parsed.len(), 1);
             let (_, middle) = l2(&rt, &token, &b, 20).await;
             let (_, last) = l2(&rt, &token, &a, 30).await;
-            assert!(
-                middle.parsed.is_empty(),
-                "shared identity or empty coverage can reuse"
+            assert_eq!(
+                middle.parsed,
+                [b.join("shared.rs").canonicalize().unwrap()],
+                "a new physical producer must establish its own accepted coverage"
             );
             assert!(
                 last.parsed.is_empty(),
@@ -221,6 +222,14 @@ async fn l2_shared_owner_cost_boundary_preserves_empty_aliased_and_distinct_run_
                 }
             }
             assert_completed_stamp(&rt, &token, 30).await;
+            for (root, seconds) in [(&b, 40), (&a, 50)] {
+                let (_, work) = l2(&rt, &token, root, seconds).await;
+                assert!(
+                    work.parsed.is_empty(),
+                    "accepted aliased producers stay warm"
+                );
+                assert_completed_stamp(&rt, &token, seconds).await;
+            }
         }
 
         let dir = TempDir::new().expect("directory");
@@ -488,10 +497,9 @@ async fn l2_shared_owner_reparse_preserves_removed_deleted_and_manual_history() 
         }
         for seconds in [50, 60] {
             let (report, work) = l2(&rt, &token, &a, seconds).await;
-            assert_eq!(
-                work.parsed.len(),
-                1,
-                "retained removed live natural edge forces every repeat to reparse"
+            assert!(
+                work.parsed.is_empty(),
+                "retained removed history must not prevent accepted coverage reuse"
             );
             assert_eq!(
                 stamp(&edge(&rt, &token, observed_id).await),
@@ -559,6 +567,7 @@ async fn l2_declaration_preflight_refuses_an_old_observation_before_writes() {
             Uuid::new_v4(),
             "alpha.rs",
             &[fresh_id, id],
+            &[],
             Some(&predecessor),
             &mut report,
         )
@@ -651,6 +660,7 @@ async fn l2_declaration_freshness_is_rechecked_after_a_guarded_rebase() {
                 Uuid::new_v4(),
                 "alpha.rs",
                 &[id],
+                &[],
                 Some(&predecessor),
                 &mut report,
             )
