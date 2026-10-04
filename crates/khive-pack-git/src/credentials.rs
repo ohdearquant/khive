@@ -140,17 +140,6 @@ struct ResolverChild {
     pgid: libc::pid_t,
 }
 
-#[cfg(unix)]
-fn signal_group(pgid: libc::pid_t, signal: libc::c_int) -> std::io::Result<()> {
-    debug_assert!(pgid > 1);
-    // SAFETY: pgid is the resolver's own process-group id, captured at spawn.
-    if unsafe { libc::kill(-pgid, signal) } == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn darwin_group_contains_only_unreaped_leader(pgid: libc::pid_t) -> bool {
     // XNU's group-signal iterator excludes zombies, so a group containing
@@ -223,7 +212,7 @@ impl ResolverChild {
     /// reused before the signal reaches background descendants.
     fn kill_group(&self) -> Result<(), CredentialError> {
         // The guard still owns the unreaped process-group leader.
-        let signal = signal_group(self.pgid, libc::SIGKILL);
+        let signal = khive_runtime::process_group::signal_process_group(self.pgid, libc::SIGKILL);
         #[cfg(test)]
         if let Err(error) = &signal {
             eprintln!(
@@ -234,7 +223,7 @@ impl ResolverChild {
         confirmed_group_cleanup(
             signal,
             || {
-                let probe = signal_group(self.pgid, 0);
+                let probe = khive_runtime::process_group::signal_process_group(self.pgid, 0);
                 #[cfg(test)]
                 eprintln!(
                     "remote credential diagnostic: group_probe errno={:?}",
@@ -306,7 +295,7 @@ impl Drop for ResolverChild {
         }
         // SAFETY: this unreaped child was spawned as its own process group.
         // Its PID cannot be reused while we hold the unreaped child.
-        let _ = signal_group(self.pgid, libc::SIGKILL);
+        let _ = khive_runtime::process_group::signal_process_group(self.pgid, libc::SIGKILL);
         let _ = child.start_kill();
         // Drop also runs when the calling future is cancelled. Reap independently
         // after termination instead of leaving cleanup tied to that cancelled future.
