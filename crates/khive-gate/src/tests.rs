@@ -3,8 +3,9 @@ use std::sync::Arc;
 use serde_json::json;
 
 use crate::{
-    ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext,
-    GateDecision, GateError, GateRef, GateRequest, GateValidationError, Obligation,
+    split_stamped_label, ActorRef, AllowAllGate, AuditDecision, AuditEvent, CallerEnrollmentGate,
+    Gate, GateContext, GateDecision, GateError, GateRef, GateRequest, GateValidationError,
+    Obligation,
 };
 use khive_types::Namespace;
 
@@ -107,6 +108,27 @@ fn configured_actor_binding_id_is_its_id() {
     let a = ActorRef::new("lambda", "leo");
     assert!(!a.is_anonymous());
     assert_eq!(a.binding_id(), Some("leo"));
+}
+
+#[test]
+fn actor_label_collapses_only_the_plain_actor_kind() {
+    assert_eq!(ActorRef::new("actor", "svc:build").label(), "svc:build");
+    assert_eq!(ActorRef::new("agent", "x").label(), "agent:x");
+    assert_eq!(
+        ActorRef::new("anonymous", "local").label(),
+        "anonymous:local"
+    );
+}
+
+#[test]
+fn split_stamped_label_splits_only_runtime_stamped_kinds() {
+    assert_eq!(
+        split_stamped_label("actor:svc:build"),
+        Some(("actor", "svc:build"))
+    );
+    assert_eq!(split_stamped_label("agent:x"), Some(("agent", "x")));
+    assert_eq!(split_stamped_label("svc:build"), None);
+    assert_eq!(split_stamped_label("plain"), None);
 }
 
 #[test]
