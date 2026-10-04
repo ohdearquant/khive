@@ -670,7 +670,7 @@ fn resolve_prefix_statement(
     SqlStatement {
         sql: format!(
             "SELECT id FROM {table} \
-             WHERE id >= ?1 AND id < ?2{namespace_clause}{deleted_filter} LIMIT 2",
+             WHERE id >= ?1 AND id < ?2{namespace_clause}{deleted_filter} ORDER BY id LIMIT 2",
             namespace_clause = namespace_clause.as_deref().unwrap_or("")
         ),
         params,
