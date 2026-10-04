@@ -51,9 +51,12 @@ use crate::namespace_census::{self, NamespaceCensus, NamespaceConstraint};
 
 #[path = "namespace_move_knowledge.rs"]
 mod knowledge_move;
+#[path = "namespace_move_pack_tables.rs"]
+mod pack_tables;
 #[path = "namespace_move_routes.rs"]
 mod subject_routes;
 use knowledge_move::{move_knowledge_atoms, ordinary_atom_count};
+use pack_tables::{move_task_audit, settle_pack_tables};
 use subject_routes::routed_subjects;
 
 /// A routable subject class: a record that exists in its own right.
@@ -450,6 +453,25 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
         },
         "memory_visibility_fences" => SubjectKeyed {
             subject_column: "note_id",
+        },
+
+        // The next three are created by a pack, not by a migration, so a store
+        // may not have them. Their rules live in `namespace_move_pack_tables.rs`.
+        //
+        // Readers of a task's audit rows key on `note_id` alone, so a transition
+        // record belongs to its task note and follows it. `namespace` is nullable
+        // here, and a NULL row is outside every namespace.
+        "gtd_lifecycle_audit" => SubjectKeyed {
+            subject_column: "note_id",
+        },
+        // One summary row per evaluation run, read per namespace, naming no
+        // subject: the same problem the brain aggregates have.
+        "knowledge_eval_runs" => NamespaceScopedAggregate,
+        // A cache of an index over the namespace it names, keyed by a bare
+        // namespace or by `{namespace}::vamana::{model}`. The move deletes the
+        // source's rows and writes nothing for the target.
+        "retrieval_snapshots" => Derived {
+            trigger_maintained: false,
         },
         _ if LEAVE_BEHIND_TABLES.contains(&table.name.as_str()) => LeaveBehind,
 
@@ -1190,6 +1212,10 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
         )?;
     }
 
+    // Audit rows are selected by the routed note kind, so they go before the
+    // notes do.
+    move_task_audit(conn, &census, request, &mut counts.rows)?;
+
     for route in &request.routes {
         let target = route.target.as_str();
         let moved = match &route.class {
@@ -1298,6 +1324,8 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
             }
         }
     }
+
+    settle_pack_tables(conn, &census, request, &mut counts)?;
 
     Ok(counts)
 }
@@ -2191,3 +2219,7 @@ fn issue2673_namespace_move_advances_entity_version_without_changing_timestamp()
 #[cfg(all(test, feature = "vectors"))]
 #[path = "namespace_move_partition_tests.rs"]
 mod partition_tests;
+
+#[cfg(test)]
+#[path = "namespace_move_pack_tables_tests.rs"]
+mod pack_table_tests;

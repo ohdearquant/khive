@@ -360,9 +360,14 @@ fn index_key_columns(conn: &Connection, index: &str) -> rusqlite::Result<Vec<Opt
 /// under. The two `ann_consumer_*` tables are excluded by the write-log
 /// decision: the log is appended to at a fresh `seq` and no watermark is edited,
 /// so moving a watermark would claim a consumer is caught up on entries it has
-/// never seen.
-pub const TABLES_EXCLUDED_FROM_MOVE: &[&str] =
-    &["events", "ann_consumer_watermark", "ann_consumer_pending"];
+/// never seen. `retrieval_snapshots` is only deleted from, never written for a
+/// target, so its `(namespace, index_type)` key has nothing to collide with.
+pub const TABLES_EXCLUDED_FROM_MOVE: &[&str] = &[
+    "events",
+    "ann_consumer_watermark",
+    "ann_consumer_pending",
+    "retrieval_snapshots",
+];
 
 /// `note_streams` is read by a move and never written by one. Four triggers in
 /// the stream schema abort an `UPDATE` of a member note's namespace, the delete,
