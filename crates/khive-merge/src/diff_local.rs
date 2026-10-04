@@ -64,11 +64,7 @@ impl EdgeKey {
     /// swapped duplicates compare equal.
     /// See `crates/khive-merge/docs/api/edge-merge.md` for identity rules.
     pub fn from_edge(e: &ExportedEdge) -> Self {
-        let (source, target) = if e.relation.is_symmetric() && e.target < e.source {
-            (e.target, e.source)
-        } else {
-            (e.source, e.target)
-        };
+        let (source, target) = e.relation.canonical_endpoints(e.source, e.target);
 
         Self {
             source,
@@ -409,5 +405,24 @@ mod tests {
             diff[&EdgeKey::from_edge(&base_edge)],
             EdgeChange::Unchanged
         ));
+    }
+
+    #[test]
+    fn symmetric_edge_key_ignores_endpoint_order() {
+        let low = Uuid::from_u128(1);
+        let high = Uuid::from_u128(2);
+        for relation in [EdgeRelation::CompetesWith, EdgeRelation::ComposedWith] {
+            let forward = ExportedEdge {
+                relation,
+                ..edge(low, high, 1.0)
+            };
+            let reversed = ExportedEdge {
+                relation,
+                ..edge(high, low, 1.0)
+            };
+            let key = EdgeKey::from_edge(&forward);
+            assert_eq!(key, EdgeKey::from_edge(&reversed), "{relation}");
+            assert_eq!((key.source, key.target), (low, high), "{relation}");
+        }
     }
 }

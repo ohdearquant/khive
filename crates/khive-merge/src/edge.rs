@@ -240,9 +240,7 @@ pub fn merge_edges(
 /// `(min, max)` order, the same normalization [`EdgeKey`] applies to lookup
 /// keys, so merged output always satisfies the storage endpoint invariant.
 fn canonicalize_endpoints(mut e: ExportedEdge) -> ExportedEdge {
-    if e.relation.is_symmetric() && e.target < e.source {
-        std::mem::swap(&mut e.source, &mut e.target);
-    }
+    (e.source, e.target) = e.relation.canonical_endpoints(e.source, e.target);
     e
 }
 
