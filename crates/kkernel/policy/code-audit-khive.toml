@@ -13,7 +13,9 @@
 # `[dependencies]` graph (dev-dependencies excluded — several packs carry
 # deliberate cyclic dev-only test deps, e.g. khive-pack-kg/khive-pack-gtd and
 # khive-pack-brain/khive-pack-memory; production dependencies among them do
-# not cycle). Every ingested `project` in the code map must appear here — the
+# not cycle). `crates/kkernel/tests/code_audit_rank_table.rs` recomputes that
+# depth from the crate manifests and fails on a crate with no row or a
+# differing rank. Every ingested `project` in the code map must appear here — the
 # Rust crates under `crates/` and every other manifest `code.ingest` resolves
 # (the npm distribution packages, the Python contract/workspace projects).
 # Those non-crate projects form a dependency island disconnected from the Rust
@@ -34,10 +36,13 @@ denied_pairs = []
 khive-channel = 0
 khive-fs = 0
 khive-quant = 0
+khive-repo-showcase = 0
 khive-text = 0
 khive-types = 0
+khive-wire-protocol = 0
 khive-changeset = 1
 khive-channel-email = 1
+khive-channel-node = 1
 khive-channel-telegram = 1
 khive-gate = 1
 khive-query = 1
@@ -56,24 +61,30 @@ khive-retrieval = 4
 khive-runtime = 5
 khive-brain-core = 6
 khive-merge = 6
+khive-mounts = 6
+khive-pack-agent = 6
 khive-pack-blob = 6
 khive-pack-code = 6
 khive-pack-comm = 6
 khive-pack-formal = 6
-khive-pack-git = 6
 khive-pack-gtd = 6
 khive-pack-kg = 6
 khive-pack-moodboard = 6
 khive-pack-schedule = 6
 khive-pack-session = 6
+khive-pack-telemetry = 6
 khive-pack-template = 6
+khive-pack-tool = 6
+khive-pack-web = 6
 khive-pack-workspace = 6
 khive-vcs = 7
 khive-pack-brain = 7
+khive-pack-exec = 7
 khive-pack-knowledge = 7
 khive-pack-memory = 7
-khive-mcp = 8
-kkernel = 9
+khive-pack-git = 8
+khive-mcp = 9
+kkernel = 10
 
 # Non-crate projects the workspace also ships and `code.ingest` resolves. The
 # npm distribution graph is a real DAG evaluated in isolation: the six
