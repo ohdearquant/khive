@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use khive_runtime::agent_lifecycle::{apply_transition, Trigger};
 use khive_runtime::RuntimeError;
 use khive_storage::AgentStore;
-use khive_types::{AgentRecord, AgentState, TerminalReason};
+use khive_types::{AgentRecord, TerminalReason};
 
 fn require_str<'a>(params: &'a Value, name: &str, verb: &str) -> Result<&'a str, RuntimeError> {
     params
@@ -27,30 +27,11 @@ fn require_str<'a>(params: &'a Value, name: &str, verb: &str) -> Result<&'a str,
         })
 }
 
-fn state_str(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Spawned => "spawned",
-        AgentState::Running => "running",
-        AgentState::Suspended => "suspended",
-        AgentState::Terminal => "terminal",
-    }
-}
-
-fn terminal_reason_str(reason: TerminalReason) -> &'static str {
-    match reason {
-        TerminalReason::Completed => "completed",
-        TerminalReason::Failed => "failed",
-        TerminalReason::Killed => "killed",
-        TerminalReason::Abandoned => "abandoned",
-        TerminalReason::HostRestart => "host_restart",
-    }
-}
-
 fn record_to_json(record: &AgentRecord) -> Value {
     json!({
         "agent_id": record.agent_id,
-        "state": state_str(record.state),
-        "terminal_reason": record.terminal_reason.map(terminal_reason_str),
+        "state": record.state.as_str(),
+        "terminal_reason": record.terminal_reason.map(TerminalReason::as_str),
         "provider": record.provider,
         "provider_session_id": record.provider_session_id,
         "checkpoint_session_id": record.checkpoint_session_id,
@@ -117,7 +98,7 @@ pub(crate) async fn handle_suspend(
         .map_err(|e| {
             RuntimeError::InvalidInput(format!(
                 "agent.suspend: illegal transition from {} for agent_id {id:?}",
-                state_str(e.from)
+                e.from.as_str()
             ))
         })?;
 
@@ -130,7 +111,7 @@ pub(crate) async fn handle_suspend(
 
     Ok(json!({
         "agent_id": record.agent_id,
-        "state": state_str(outcome.state),
+        "state": outcome.state.as_str(),
         "checkpoint_session_id": record.checkpoint_session_id,
     }))
 }
@@ -150,7 +131,7 @@ pub(crate) async fn handle_resume(
         apply_transition(record.state, record.terminal_reason, Trigger::Resume).map_err(|e| {
             RuntimeError::InvalidInput(format!(
                 "agent.resume: illegal transition from {} for agent_id {id:?}",
-                state_str(e.from)
+                e.from.as_str()
             ))
         })?;
 
@@ -163,7 +144,7 @@ pub(crate) async fn handle_resume(
 
     Ok(json!({
         "agent_id": record.agent_id,
-        "state": state_str(outcome.state),
+        "state": outcome.state.as_str(),
     }))
 }
 
@@ -182,7 +163,7 @@ pub(crate) async fn handle_kill(
         apply_transition(record.state, record.terminal_reason, Trigger::Kill).map_err(|e| {
             RuntimeError::InvalidInput(format!(
                 "agent.kill: illegal transition from {} for agent_id {id:?}",
-                state_str(e.from)
+                e.from.as_str()
             ))
         })?;
 
@@ -195,7 +176,7 @@ pub(crate) async fn handle_kill(
 
     Ok(json!({
         "agent_id": record.agent_id,
-        "state": state_str(outcome.state),
-        "terminal_reason": outcome.terminal_reason.map(terminal_reason_str),
+        "state": outcome.state.as_str(),
+        "terminal_reason": outcome.terminal_reason.map(TerminalReason::as_str),
     }))
 }

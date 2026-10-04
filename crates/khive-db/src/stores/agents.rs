@@ -12,15 +12,6 @@ use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::writer_task::WriterTaskHandle;
 
-fn state_as_sql(state: AgentState) -> &'static str {
-    match state {
-        AgentState::Spawned => "spawned",
-        AgentState::Running => "running",
-        AgentState::Suspended => "suspended",
-        AgentState::Terminal => "terminal",
-    }
-}
-
 fn state_from_sql(s: &str) -> Result<AgentState, rusqlite::Error> {
     match s {
         "spawned" => Ok(AgentState::Spawned),
@@ -32,16 +23,6 @@ fn state_from_sql(s: &str) -> Result<AgentState, rusqlite::Error> {
             rusqlite::types::Type::Text,
             format!("unknown AgentState: {other}").into(),
         )),
-    }
-}
-
-fn terminal_reason_as_sql(reason: TerminalReason) -> &'static str {
-    match reason {
-        TerminalReason::Completed => "completed",
-        TerminalReason::Failed => "failed",
-        TerminalReason::Killed => "killed",
-        TerminalReason::Abandoned => "abandoned",
-        TerminalReason::HostRestart => "host_restart",
     }
 }
 
@@ -179,8 +160,8 @@ fn insert_agent_dml(
         ),
         rusqlite::params![
             record.agent_id,
-            state_as_sql(record.state),
-            record.terminal_reason.map(terminal_reason_as_sql),
+            record.state.as_str(),
+            record.terminal_reason.map(TerminalReason::as_str),
             record.provider,
             record.provider_session_id,
             record.checkpoint_session_id,
@@ -336,8 +317,8 @@ impl AgentStore for SqlAgentStore {
                 "UPDATE agents SET state = ?1, terminal_reason = ?2, state_changed_at = ?3 \
                  WHERE agent_id = ?4",
                 rusqlite::params![
-                    state_as_sql(state),
-                    terminal_reason.map(terminal_reason_as_sql),
+                    state.as_str(),
+                    terminal_reason.map(TerminalReason::as_str),
                     state_changed_at,
                     agent_id,
                 ],
