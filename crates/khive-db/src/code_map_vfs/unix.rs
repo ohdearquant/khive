@@ -49,6 +49,10 @@ fn identity(stat: &libc::stat) -> Identity {
     }
 }
 
+pub(super) fn is_unlinked(file: &File) -> io::Result<bool> {
+    Ok(fstat(file.as_raw_fd())?.st_nlink == 0)
+}
+
 /// Whether `path` still names the file with `opened`, the question SQLite's
 /// Unix VFS answers for SQLITE_FCNTL_HAS_MOVED. The path is not followed, as
 /// the guard never admits a symlinked member.

@@ -10,6 +10,9 @@ use super::{OpenAccess, ProductionBase, ProductionKind};
 use crate::error::SqliteError;
 use crate::StorageBackend;
 
+#[path = "ledger_lifetime_tests.rs"]
+mod ledger_lifetime;
+
 const CHILD_TEST: &str = "KHIVE_CODE_MAP_VFS_TEST_CHILD";
 #[cfg(unix)]
 const PRODUCTION_LOCK_PROBE: &str = "KHIVE_CODE_MAP_VFS_PRODUCTION_LOCK_PROBE";

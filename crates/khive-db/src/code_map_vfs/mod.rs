@@ -14,6 +14,8 @@ mod unix;
 #[cfg(unix)]
 use unix as os;
 mod callbacks;
+mod ledger;
+use ledger::GuardedLedger;
 #[cfg(test)]
 mod tests;
 mod transition;
@@ -130,8 +132,9 @@ impl Drop for GuardedFile {
         if let Some(file) = self.file.take() {
             os::close_unlocked(file, self.identity);
         }
+        let mut ledger = lock_ledger();
+        ledger.guarded.release(self.identity, self.role);
         if self.role == Role::Main {
-            let mut ledger = lock_ledger();
             if let Some(active) = ledger.active_main.get_mut(&self.identity) {
                 let count = match self.mode {
                     Mode::Rollback => &mut active.rollback,
@@ -143,6 +146,7 @@ impl Drop for GuardedFile {
                 }
             }
         }
+        ledger.guarded.retire_unlinked();
     }
 }
 
@@ -154,7 +158,7 @@ struct ActiveMain {
 
 #[derive(Default)]
 struct ProcessLedger {
-    guarded: Vec<(os::Identity, Role)>,
+    guarded: GuardedLedger,
     quarantined: Vec<File>,
     active_main: HashMap<os::Identity, ActiveMain>,
 }
@@ -165,9 +169,11 @@ fn ledger() -> &'static Mutex<ProcessLedger> {
 }
 
 fn lock_ledger() -> std::sync::MutexGuard<'static, ProcessLedger> {
-    ledger()
+    let mut ledger = ledger()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ledger.guarded.retire_unlinked();
+    ledger
 }
 
 fn check_quarantine(ledger: &ProcessLedger) -> Result<(), GuardError> {
@@ -621,7 +627,7 @@ impl CodeMapHandleGuard {
         if first.iter().any(|sample| {
             sample
                 .observed
-                .is_some_and(|item| ledger.guarded.iter().any(|(id, _)| *id == item.identity))
+                .is_some_and(|item| ledger.guarded.contains_identity(item.identity))
         }) {
             return Err(GuardError::ProtectedChanged);
         }
@@ -703,11 +709,7 @@ impl CodeMapHandleGuard {
             ledger.quarantined.push(file);
             return Err(GuardError::ProtectedChanged);
         }
-        if ledger
-            .guarded
-            .iter()
-            .any(|(identity, opened_role)| *identity == observed.identity && *opened_role != role)
-        {
+        if ledger.guarded.has_other_role(observed.identity, role) {
             os::close_unlocked(file, observed.identity);
             return Err(GuardError::Unsafe {
                 path,
@@ -741,8 +743,11 @@ impl CodeMapHandleGuard {
                 }
             }
         }
-        if role == Role::Main {
-            let active = ledger.active_main.entry(observed.identity).or_default();
+        if let Some(active) = ledger
+            .active_main
+            .get(&observed.identity)
+            .filter(|_| role == Role::Main)
+        {
             match self.mode {
                 Mode::Rollback if active.transition > 0 => {
                     os::close_unlocked(file, observed.identity);
@@ -758,11 +763,20 @@ impl CodeMapHandleGuard {
                         reason: "WAL transition requires no open code-map connection",
                     });
                 }
+                _ => {}
+            }
+        }
+        if let Err(error) = ledger.guarded.record(&file, observed.identity, role) {
+            os::close_unlocked(file, observed.identity);
+            return Err(io_at(&path, error));
+        }
+        if role == Role::Main {
+            let active = ledger.active_main.entry(observed.identity).or_default();
+            match self.mode {
                 Mode::Rollback => active.rollback += 1,
                 Mode::QuiescentWalTransition => active.transition += 1,
             }
         }
-        ledger.guarded.push((observed.identity, role));
         if role == Role::TransitionWal {
             self.opened_wal
                 .lock()
