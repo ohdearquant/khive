@@ -22,3 +22,15 @@ What `..` means is the caller's policy.
 
 Otherwise the helpers return the raw `std::io::Error` of the failing call; callers add their own
 context.
+
+## `directory_walk` (Unix only)
+
+`walk_to_directory(path, policy, budget)` opens every directory along a path with `O_DIRECTORY` and
+`O_NOFOLLOW`, one component at a time, and returns every pinned handle with the final directory
+last. A component that is a symlink is followed only when the caller's `LinkPolicy` accepts it:
+
+- `before_follow` sees the link's name, whether it is the last component, its metadata and the
+  pinned parent directory, and may refuse the link with its own error.
+- `after_read` runs once the target has been read and does nothing unless a policy overrides it.
+- `budget` bounds the links the walk follows; a link met after it is spent ends the walk with a
+  `BudgetExhausted` error.
