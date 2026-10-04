@@ -2816,8 +2816,11 @@ async fn end_read_snapshot(reader: &mut dyn khive_storage::SqlReader) {
 /// Exact cosine similarity between a raw query vector and a raw stored
 /// embedding, using the same L2-normalization convention as
 /// [`AnnBridge::search`]: both vectors normalized, dot product, clamped to a
-/// non-negative floor.
+/// non-negative floor. An empty query or a length mismatch scores 0.0.
 pub(crate) fn exact_cosine(query: &[f32], embedding: &[f32]) -> f32 {
+    if query.len() != embedding.len() || query.is_empty() {
+        return 0.0;
+    }
     exact_cosine_unclamped(query, embedding).max(0.0)
 }
 
@@ -3079,7 +3082,8 @@ pub(crate) async fn session_exact_candidates(
 
 /// Merge a fresh-tail's coalesced final ops into an ANN candidate list
 /// (ADR-118 §2): deduplicated by `subject_id` with the tail winning, then
-/// re-sorted by score. A `None` op (delete) drops the subject even if it was
+/// re-sorted by score, with equal scores in ascending id order (ADR-079
+/// Amendment 4, item 6). A `None` op (delete) drops the subject even if it was
 /// in `best_raw` — the tail is authoritative for every subject it names.
 pub(crate) fn merge_fresh_tail(
     best_raw: Vec<(Uuid, f32)>,
@@ -3106,7 +3110,11 @@ pub(crate) fn merge_fresh_tail(
         .filter(|(u, _)| !deletes.contains(u) && !upserts.contains_key(u))
         .collect();
     merged.extend(upserts);
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    merged.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
     merged
 }
 
