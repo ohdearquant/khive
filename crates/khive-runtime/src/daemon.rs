@@ -6451,11 +6451,16 @@ mod tests {
     /// validation, so where it currently points is irrelevant. A non-root
     /// test cannot create a foreign-owned symlink, so this injects a
     /// mismatched euid instead — and the fixture must live under an
-    /// all-root-owned chain (the platform `/tmp`), because under the test's
-    /// own tempdir the self-owned ancestor directories would already fail
-    /// the injected euid before the walk ever reached the link.
+    /// all-root-owned chain (the platform `/tmp`), because a self-owned
+    /// ancestor would already fail the injected euid before the walk ever
+    /// reached the link. Where `/tmp` is not root-owned the test skips.
     #[test]
     fn foreign_owned_symlink_component_is_refused() {
+        let tmp_owner = std::fs::metadata("/tmp").expect("stat /tmp").uid();
+        if tmp_owner != 0 {
+            eprintln!("skipped: /tmp is owned by uid {tmp_owner}, not root");
+            return;
+        }
         let link =
             std::path::PathBuf::from(format!("/tmp/khive-swaptest-link-{}", std::process::id()));
         let _ = std::fs::remove_file(&link);
