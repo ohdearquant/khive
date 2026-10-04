@@ -23,14 +23,14 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
-| `comm`      | 10    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `comm`      | 11    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
-| `session`   | 5     | `KHIVE_PACKS=kg,session`                   | Yes                 |
+| `session`   | 7     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 17    | `KHIVE_PACKS=kg,git`                       | Yes                 |
 | `code`      | 1     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
-| `blob`      | 7     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
+| `blob`      | 9     | `KHIVE_PACKS=kg,blob`                      | Yes                 |
 | `tool`      | 14    | `KHIVE_PACKS=kg,tool`                      | Yes                 |
 | `exec`      | 9     | `KHIVE_PACKS=kg,exec`                      | Yes                 |
 
@@ -69,15 +69,17 @@ or annotation-edge ID is skipped even when its row is soft-deleted, so neither
 real re-ingest nor `--dry-run` treats a tombstone as a new record or resurrects
 it.
 
-`blob` registers no note or entity kinds; its seven verbs (`blob.put` / `blob.get` /
-`blob.stat` / `blob.begin` / `blob.put_part` / `blob.commit` / `blob.abort`) expose
-content-addressed storage and sequential uploads (ADR-111, ADR-173). A
-normal file-backed boot installs a default `FsBlobStore` rooted beside the database file
-even with no `[storage.blob]` section and no `KHIVE_BLOB_ROOT` set; the verbs only stay
+`blob` registers no note or entity kinds; its nine verbs (`blob.put` / `blob.get` /
+`blob.stat` / `blob.begin` / `blob.put_part` / `blob.commit` / `blob.abort` /
+`blob.import` / `blob.export`) expose content-addressed storage, sequential uploads
+and server file transfers (ADR-111, ADR-173). A normal file-backed boot installs a
+default `FsBlobStore` rooted beside the database file even with no `[storage.blob]`
+section and no `KHIVE_BLOB_ROOT` set; the storage and upload verbs only stay
 unconfigured (erroring until a backend is installed) when the server boots against an
 in-memory backend, which has no directory to default a root beside. Staged uploads currently
 use the filesystem backend; the S3 backend retains `blob.put` / `blob.get` / `blob.stat`
-and refuses creation of new staging with `Unsupported`.
+and refuses creation of new staging with `Unsupported`. Server file transfers
+require a separate opt-in.
 
 `tool` (`tool.register`, `tool.ingest`, `tool.suggest`, `tool.describe`, `tool.list`, `tool.check`,
 `tool.request`, `tool.grant`, `tool.deny`, `tool.revoke`, `tool.requests`, `tool.policy`, `tool.policies`)
@@ -502,7 +504,7 @@ singleton `create`; a successful response includes `warnings` when embedding act
 | `content`      | string          | no       | Notes only (body text).                                                           |
 | `salience`     | number          | no       | Notes only, 0.0–1.0.                                                              |
 | `decay_factor` | number          | no       | Notes only, >= 0.                                                                 |
-| `relation`     | string          | no       | Edges only, one of the 17 canonical relations.                                    |
+| `relation`     | string          | no       | Edges only, one of the 19 canonical relations.                                    |
 | `weight`       | number          | no       | Edges only, 0.0–1.0.                                                              |
 | `properties`   | object          | no       | Shallow-merged in.                                                                |
 | `tags`         | array\<string\> | no       | Entities and notes: replaces the tag list; omission preserves it, `[]` clears it. |
@@ -764,14 +766,14 @@ canonicalization. A live match retains its row ID and creation time while
 replacing weight and metadata. A soft-deleted match is refused unless the
 caller explicitly opts into restoration.
 
-| Param       | Type   | Required | Notes                                                                                                                                                                                                                                                                     |
-| ----------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source_id` | uuid   | yes      | Source node.                                                                                                                                                                                                                                                              |
-| `target_id` | uuid   | yes      | Target node.                                                                                                                                                                                                                                                              |
-| `relation`  | string | yes      | One of the 17 canonical relations: `contains`\|`part_of`\|`instance_of`\|`extends`\|`variant_of`\|`introduced_by`\|`supersedes`\|`derived_from`\|`precedes`\|`depends_on`\|`enables`\|`implements`\|`competes_with`\|`composed_with`\|`annotates`\|`supports`\|`refutes`. |
-| `weight`    | number | no       | Default 1.0. 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.                                                                                                                                                                                                         |
-| `metadata`  | object | no       | Edge metadata. On a live natural-key match this replaces the prior metadata object; it is not merged.                                                                                                                                                                     |
-| `resurrect` | bool   | no       | Default `false`. Set `true` to restore a soft-deleted natural-key edge; omission never clears `deleted_at`.                                                                                                                                                               |
+| Param       | Type   | Required | Notes                                                                                                                                                                                                                                                                                               |
+| ----------- | ------ | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source_id` | uuid   | yes      | Source node.                                                                                                                                                                                                                                                                                        |
+| `target_id` | uuid   | yes      | Target node.                                                                                                                                                                                                                                                                                        |
+| `relation`  | string | yes      | One of the 19 canonical relations: `contains`\|`part_of`\|`instance_of`\|`links_to`\|`located_in`\|`extends`\|`variant_of`\|`introduced_by`\|`supersedes`\|`derived_from`\|`precedes`\|`depends_on`\|`enables`\|`implements`\|`competes_with`\|`composed_with`\|`annotates`\|`supports`\|`refutes`. |
+| `weight`    | number | no       | Default 1.0. 1.0=definitional, 0.7-0.9=strong, 0.4-0.6=plausible.                                                                                                                                                                                                                                   |
+| `metadata`  | object | no       | Edge metadata. On a live natural-key match this replaces the prior metadata object; it is not merged.                                                                                                                                                                                               |
+| `resurrect` | bool   | no       | Default `false`. Set `true` to restore a soft-deleted natural-key edge; omission never clears `deleted_at`.                                                                                                                                                                                         |
 
 ```
 request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"extends\")")
@@ -1102,6 +1104,11 @@ still report. If main itself fails, its error remains in the first entry and the
 only `databases` because there is no valid primary report to flatten. The list uses only pools
 opened at startup; it does not open an unserved path or create a missing database file.
 
+The top-level process-lifetime `note_search_ann_route_total` and
+`note_search_fallback_route_total` counters distinguish warm-graph searches from
+the exact sqlite-vec fallback. Unlike pool-scoped contention counters, these
+totals do not reset when a database pool is reopened.
+
 Every successful per-file report includes `process` alongside `build`:
 
 ```json
@@ -1143,6 +1150,9 @@ raw-SQL deferred-transaction exception share it. `reader_acquisitions` is the su
 `infrastructure_standalone_reader_opens` is deliberately separate. Ordinary file-backed reads
 must leave `standalone_reader_opens` flat. `reader_checkout_timeouts` counts admission waits that
 exhausted `KHIVE_CHECKOUT_TIMEOUT_SECS` before work began, not cooperative request cancellation.
+`reader_busy_timeouts` counts queries on an already checked-out pooled reader that SQLite refused
+with `SQLITE_BUSY` after the busy timeout (`KHIVE_BUSY_TIMEOUT_SECS`) elapsed; it is disjoint from
+`reader_checkout_timeouts` and excludes writer refusals.
 `active_pooled_reader_checkouts`, `peak_active_pooled_reader_checkouts`,
 `completed_pooled_reader_checkouts`, and `max_completed_reader_hold_micros` expose concurrency
 and lifecycle evidence; completed hold includes connection reset/replacement before reuse.
@@ -1879,7 +1889,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 10 verbs
+## `comm` pack — 11 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -1926,6 +1936,29 @@ outside this operation's contract.
 
 ```
 request(ops="comm.delivered(id=\"<full-outbound-uuid>\")")
+```
+
+### `comm.transport_status` — Assertive
+
+Read sender-local transport status from the runtime's own records and verified
+recipient receipts. The operation reads only the caller's primary namespace.
+
+| Param | Type | Required | Notes                                                                            |
+| ----- | ---- | -------- | -------------------------------------------------------------------------------- |
+| `id`  | uuid | yes      | Full outbound UUID from `comm.send` or `comm.reply`; short prefixes are refused. |
+
+Returns exactly `{id, status}`. `id` remains a canonical full UUID in Agent mode.
+`status` is `pending`, `recipient_stored`, `recipient_quarantined`, `failed`,
+or `unknown`. A service admission or hold remains `pending`; a verified receipt
+can supersede a local permanent failure. No record in the primary namespace
+returns `unknown`, including when another namespace contains that UUID.
+
+Across re-encrypted envelopes, a receipt row wins; otherwise the highest local
+envelope sequence wins. The read preserves envelope bytes and retry timestamps.
+`comm.delivered` keeps its separate internal dual-write confirmation contract.
+
+```
+request(ops="comm.transport_status(id=\"<full-outbound-uuid>\")")
 ```
 
 ### `comm.inbox` — Assertive
@@ -2599,7 +2632,7 @@ roll back the already-recorded knowledge judgment.
 
 ---
 
-## `session` pack — 5 verbs
+## `session` pack — 7 verbs
 
 Cross-provider agent-session continuity records. Optional; load with
 `KHIVE_PACKS=kg,session`.
@@ -2682,6 +2715,20 @@ authenticated connection identity.
 
 The `namespace` and `account` fields are not parameters. The [identity and scope contract](../../crates/khive-pack-session/docs/api/adr117a-identity.md)
 specifies the scoped key, migration, and search result identity.
+
+### `session.stats` — Assertive
+
+Report database-wide row counts and allocated bytes for session mirror tables,
+plus database-file and WAL sizes. Requires SQLite `dbstat`. See the
+[maintenance contract](../../crates/khive-pack-session/docs/api/session-maintenance.md).
+
+### `session.vacuum` — Commissive
+
+Run explicit SQLite compaction. The result reports `ok: true` once VACUUM
+commits. Before/after byte and page figures are returned when the post-commit
+read succeeds; if the request read deadline expires during VACUUM, the after
+figures are `null` with `post_vacuum_metrics_status:
+"unavailable_after_commit"`. See the [maintenance contract](../../crates/khive-pack-session/docs/api/session-maintenance.md).
 
 ---
 
@@ -2970,12 +3017,13 @@ reporting surface over a code-map database.
 
 ---
 
-## `blob` pack — 7 verbs
+## `blob` pack — 9 verbs
 
-Content-addressed binary object storage and sequential uploads (ADR-111, ADR-173). Optional; load with
-`KHIVE_PACKS=kg,blob`. Registers no note or entity kinds. A normal file-backed boot
-installs a default `FsBlobStore` rooted beside the database file even with no
-`[storage.blob]` section in `khive.toml` and no `KHIVE_BLOB_ROOT` set; the verbs stay
+Content-addressed binary object storage, sequential uploads and server file transfers
+(ADR-111, ADR-173). Optional; load with `KHIVE_PACKS=kg,blob`. Registers no note or
+entity kinds. A normal file-backed boot installs a default `FsBlobStore` rooted
+beside the database file even with no `[storage.blob]` section in `khive.toml` and
+no `KHIVE_BLOB_ROOT` set; the storage and upload verbs stay
 unconfigured (erroring until a backend is installed) only when the server boots against
 an in-memory backend, which has no directory to default a root beside.
 
@@ -2983,6 +3031,15 @@ Staged uploads currently use `FsBlobStore`; S3 supports the existing whole-objec
 operations but returns `Unsupported` when new staging is required. The known-reference
 shortcut in `blob.begin` can return an existing object without staging. `blob.put` and
 all four upload verbs refuse on a read-only runtime.
+
+`blob.import` and `blob.export` are disabled by default. Before starting the
+server, enable them by setting `file_transfers = true` in the `[blob]` section of
+`khive.toml`, or set `KHIVE_FILE_TRANSFERS=1` (exactly `1`). When disabled, both
+refuse with `InvalidInput` and instructions to enable server file transfers.
+Both also refuse on a read-only runtime and require disjoint canonical import
+and export roots. Paths refer to the server's filesystem. See
+[Server file transfers](../../crates/khive-pack-blob/docs/api/file-transfers.md)
+for confinement, upload cleanup and filesystem limits.
 
 ### `blob.put` — Commissive
 
@@ -3016,6 +3073,30 @@ no bytes hydrated.
 | Param         | Type   | Required | Notes                                                                                   |
 | ------------- | ------ | -------- | --------------------------------------------------------------------------------------- |
 | `content_ref` | string | yes      | 64-char lowercase-hex BLAKE3 content reference returned by `blob.put` or `blob.commit`. |
+
+### `blob.import` — Commissive
+
+Stream a regular file beneath the server import root into the blob store, at
+most 64 MiB. Returns `{content_ref, size}` and, when supplied, `media_type`, never
+file bytes. Import uses the staged-upload manager and requires a backend that
+supports staging.
+
+| Param        | Type   | Required | Notes                                                                                                                           |
+| ------------ | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `path`       | string | yes      | Server file relative to `~/.khive/imports` or absolute beneath its canonical root. `KHIVE_IMPORT_FROM_ROOT` overrides the root. |
+| `media_type` | string | no       | Optional media type echoed in the receipt; it is not persisted for the object.                                                  |
+
+### `blob.export` — Commissive
+
+Verify an existing object, at most 64 MiB, and atomically write it beneath the
+server export root using the `save_to` path policy. Returns `{path, size}`, with
+the resolved destination path and verified byte length, never file bytes. An
+existing regular destination is replaced only by the complete file.
+
+| Param         | Type   | Required | Notes                                                                                                                              |
+| ------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `content_ref` | string | yes      | 64-character lowercase-hex BLAKE3 reference to an existing object.                                                                 |
+| `path`        | string | yes      | Server destination relative to `~/.khive/exports` or absolute beneath its canonical root. `KHIVE_SAVE_TO_ROOT` overrides the root. |
 
 ### `blob.begin` — Declaration
 

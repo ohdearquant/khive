@@ -342,6 +342,7 @@ fn producer_temp_identity(name: &str) -> Option<(u32, ProducerTempKind)> {
 #[cfg(unix)]
 mod unix_impl {
     use super::io_other;
+    use khive_fs::fd_relative::{clear_errno, current_errno, errno_location};
     use std::ffi::{CStr, CString};
     use std::fs;
     use std::io::{self, Read, Write};
@@ -422,34 +423,6 @@ mod unix_impl {
         {
             None
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn errno_location() -> *mut libc::c_int {
-        // SAFETY: `__error` returns this thread's errno cell; obtaining the
-        // pointer has no preconditions beyond running on a thread.
-        unsafe { libc::__error() }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn errno_location() -> *mut libc::c_int {
-        // SAFETY: see the macOS arm above; `__errno_location` is the
-        // Linux/glibc equivalent thread-local errno accessor.
-        unsafe { libc::__errno_location() }
-    }
-
-    /// Zero `errno` on the current thread. `readdir` never clears `errno`
-    /// itself on success, so this must run immediately before each call for
-    /// the NULL-return ambiguity below to be resolvable afterward.
-    fn clear_errno() {
-        // SAFETY: `errno_location` returns a valid, live thread-local
-        // `c_int` cell for the duration of this call.
-        unsafe { *errno_location() = 0 };
-    }
-
-    fn current_errno() -> libc::c_int {
-        // SAFETY: see `clear_errno`.
-        unsafe { *errno_location() }
     }
 
     /// Whether a NULL `readdir` return denotes a genuine read error rather

@@ -162,15 +162,6 @@ impl KindHook for FindingHook {
         Ok(())
     }
 
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: uuid::Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
     /// Hold the update path to the predicates the create path uses.
     ///
     /// `code.ingest` is the pack's only verb, so the generic property update is

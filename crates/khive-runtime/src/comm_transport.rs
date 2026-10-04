@@ -6,13 +6,24 @@
 //! checked against the owner's pinned recipient key before durable state changes.
 use crate::error::RuntimeResult;
 use crate::{KhiveRuntime, NamespaceToken};
-use khive_channel::DeliveryReceipt;
+use khive_channel::{receipt_signing_input, DeliveryReceipt, ReceiptSigningPublicKey};
 use khive_db::stores::note::transport::SenderTransportStore;
 pub use khive_db::stores::note::transport::{
     EnvelopeKey, FailureClass, HoldReason, PolicyMode, SenderAssurance, SenderEnvelope,
     SenderRecord, TransportState,
 };
-use uuid::Uuid;
+
+/// Sender-local delivery status, including the absence of a transport record.
+/// Holds retain `Pending`; `Unknown` is never persisted as a transport state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportStatus {
+    Pending,
+    RecipientStored,
+    RecipientQuarantined,
+    Failed,
+    Unknown,
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ReceiptVerificationError {
@@ -22,34 +33,6 @@ pub enum ReceiptVerificationError {
     InvalidSignatureLength,
     #[error("recipient receipt signature is invalid")]
     InvalidSignature,
-}
-
-fn canonical_agent_id(value: &str) -> Result<Uuid, ReceiptVerificationError> {
-    let id = Uuid::parse_str(value).map_err(|_| ReceiptVerificationError::InvalidAgentId)?;
-    if id.to_string() != value {
-        return Err(ReceiptVerificationError::InvalidAgentId);
-    }
-    Ok(id)
-}
-
-fn receipt_signing_input(receipt: &DeliveryReceipt) -> Result<Vec<u8>, ReceiptVerificationError> {
-    let binding = &receipt.binding;
-    let sender_agent_id = canonical_agent_id(&binding.sender_agent_id)?;
-    let recipient_agent_id = canonical_agent_id(&binding.recipient_agent_id)?;
-    let mut input = b"khive-node-v1/receipt\0".to_vec();
-    input.extend_from_slice(&binding.protocol_version.to_be_bytes());
-    input.extend_from_slice(binding.logical_message_id.as_bytes());
-    input.extend_from_slice(sender_agent_id.as_bytes());
-    input.extend_from_slice(recipient_agent_id.as_bytes());
-    input.extend_from_slice(binding.recipient_device_id.as_bytes());
-    input.extend_from_slice(&binding.recipient_key_epoch.to_be_bytes());
-    input.extend_from_slice(&binding.contact_generation.to_be_bytes());
-    input.extend_from_slice(binding.delivery_attempt_id.as_bytes());
-    input.push(match receipt.disposition {
-        khive_channel::ReceiptDisposition::Stored => 1,
-        khive_channel::ReceiptDisposition::Quarantined => 2,
-    });
-    Ok(input)
 }
 
 /// A receipt whose signature was checked with the owner's pinned recipient key.
@@ -66,13 +49,18 @@ impl VerifiedRecipientReceipt {
         if receipt.signature.len() != 64 {
             return Err(ReceiptVerificationError::InvalidSignatureLength);
         }
-        let input = receipt_signing_input(&receipt)?;
-        ring::signature::UnparsedPublicKey::new(
-            &ring::signature::ED25519,
-            pinned_signing_public_key,
-        )
-        .verify(&input, &receipt.signature)
-        .map_err(|_| ReceiptVerificationError::InvalidSignature)?;
+        let input = receipt_signing_input(&receipt)
+            .map_err(|_| ReceiptVerificationError::InvalidAgentId)?;
+        let signing_key = ReceiptSigningPublicKey::new(*pinned_signing_public_key)
+            .map_err(|_| ReceiptVerificationError::InvalidSignature)?;
+        let signature = receipt
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| ReceiptVerificationError::InvalidSignatureLength)?;
+        signing_key
+            .verify(&input, signature)
+            .map_err(|_| ReceiptVerificationError::InvalidSignature)?;
         Ok(Self(receipt))
     }
 }
@@ -80,6 +68,30 @@ impl VerifiedRecipientReceipt {
 impl KhiveRuntime {
     fn sender_transport_store(&self) -> SenderTransportStore {
         SenderTransportStore::new(self.backend().pool_arc())
+    }
+    /// Read transport status in the token's primary namespace on the bound backend.
+    /// This does not infer the internal inbound sibling or mutate retry metadata.
+    pub async fn sender_transport_status(
+        &self,
+        token: &NamespaceToken,
+        outbound_note_id: uuid::Uuid,
+    ) -> RuntimeResult<TransportStatus> {
+        let Some(row) = self
+            .sender_transport_store()
+            .get_by_outbound_note_id(token.namespace().as_str(), outbound_note_id)
+            .await?
+        else {
+            return Ok(TransportStatus::Unknown);
+        };
+        if row.hold_reason.is_some() {
+            return Ok(TransportStatus::Pending);
+        }
+        Ok(match row.state {
+            TransportState::Pending => TransportStatus::Pending,
+            TransportState::RecipientStored => TransportStatus::RecipientStored,
+            TransportState::RecipientQuarantined => TransportStatus::RecipientQuarantined,
+            TransportState::Failed => TransportStatus::Failed,
+        })
     }
     /// Persist immutable bytes before first submission. An exact retry is a no-op;
     /// a different envelope with the same identity is refused. The namespace is
@@ -242,6 +254,44 @@ mod tests {
         (receipt, pinned_key)
     }
 
+    fn assert_identity_key_refused(pinned_key: [u8; 32]) {
+        let recipient_key =
+            vector_key("a914d2b78bbef06e728db06ad577d1c09d04dae4a078ab7b7574187d9dc5d032");
+        for disposition in [ReceiptDisposition::Stored, ReceiptDisposition::Quarantined] {
+            VerifiedRecipientReceipt::verify(vector_receipt(disposition), &recipient_key)
+                .expect("the valid receipt must verify before the forged-key assertion");
+            let mut forged = vector_receipt(disposition);
+            forged.signature = vec![0; 64];
+            forged.signature[0] = 1;
+            assert!(
+                !receipt_signing_input(&forged).unwrap().is_empty(),
+                "the forgery must target an actual valid receipt binding"
+            );
+            assert!(
+                matches!(
+                    VerifiedRecipientReceipt::verify(forged, &pinned_key),
+                    Err(ReceiptVerificationError::InvalidSignature)
+                ),
+                "a degenerate pinned key must not produce a verified {disposition:?} receipt"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_pinned_recipient_key_cannot_verify_forged_receipts() {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        assert_identity_key_refused(identity);
+    }
+
+    #[test]
+    fn identity_sign_bit_variant_cannot_verify_forged_receipts() {
+        let mut identity_with_sign_bit = [0; 32];
+        identity_with_sign_bit[0] = 1;
+        identity_with_sign_bit[31] = 0x80;
+        assert_identity_key_refused(identity_with_sign_bit);
+    }
+
     #[test]
     fn recipient_receipt_vectors_match_signing_input_and_verify() {
         let recipient_key =
@@ -264,6 +314,17 @@ mod tests {
             VerifiedRecipientReceipt::verify(receipt, &recipient_key)
                 .expect("recipient receipt vector must verify");
         }
+    }
+
+    #[test]
+    fn stored_node_receipt_verifies_with_pinned_recipient_key() {
+        let recipient_key =
+            vector_key("a914d2b78bbef06e728db06ad577d1c09d04dae4a078ab7b7574187d9dc5d032");
+        VerifiedRecipientReceipt::verify(
+            vector_receipt(ReceiptDisposition::Stored),
+            &recipient_key,
+        )
+        .expect("stored node receipt must verify with its pinned recipient key");
     }
 
     #[test]
@@ -462,5 +523,207 @@ mod tests {
                 Some(next)
             );
         }
+    }
+
+    async fn accept_status_receipt(
+        runtime: &KhiveRuntime,
+        envelope: &SenderEnvelope,
+        disposition: ReceiptDisposition,
+    ) {
+        let state = match disposition {
+            ReceiptDisposition::Stored => TransportState::RecipientStored,
+            ReceiptDisposition::Quarantined => TransportState::RecipientQuarantined,
+        };
+        let receipt = DeliveryReceipt {
+            binding: DeliveryReceiptBinding {
+                protocol_version: envelope.protocol_version,
+                logical_message_id: envelope.logical_message_id,
+                sender_agent_id: envelope.sender_agent_id.clone(),
+                recipient_agent_id: envelope.recipient_agent_id.clone(),
+                recipient_device_id: envelope.recipient_device_id,
+                recipient_key_epoch: envelope.recipient_key_epoch,
+                contact_generation: envelope.contact_generation,
+                delivery_attempt_id: Uuid::new_v4(),
+            },
+            disposition,
+            signature: vec![],
+        };
+        let (receipt, pinned_key) = signed_receipt(receipt, &[23; 32]);
+        runtime
+            .accept_verified_recipient_receipt(
+                envelope.key(),
+                state,
+                VerifiedRecipientReceipt::verify(receipt, &pinned_key).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_status_pending_admission_and_hold() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = NamespaceToken::local();
+        let e = envelope();
+        runtime
+            .create_sender_transport(&token, e.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .sender_transport_status(&token, e.outbound_note_id)
+                .await
+                .unwrap(),
+            TransportStatus::Pending,
+            "a newly persisted envelope is pending"
+        );
+        runtime
+            .record_sender_transport_admission(e.key(), chrono::Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .sender_transport_status(&token, e.outbound_note_id)
+                .await
+                .unwrap(),
+            TransportStatus::Pending,
+            "service admission is not recipient storage"
+        );
+        runtime
+            .hold_sender_transport(e.key(), Some(HoldReason::InsufficientCredit))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .sender_transport_status(&token, e.outbound_note_id)
+                .await
+                .unwrap(),
+            TransportStatus::Pending,
+            "an insufficient-credit hold is pending, never a further status"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_status_failed_and_verified_receipts() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = NamespaceToken::local();
+        for (disposition, expected) in [
+            (ReceiptDisposition::Stored, TransportStatus::RecipientStored),
+            (
+                ReceiptDisposition::Quarantined,
+                TransportStatus::RecipientQuarantined,
+            ),
+        ] {
+            let e = envelope();
+            runtime
+                .create_sender_transport(&token, e.clone())
+                .await
+                .unwrap();
+            runtime
+                .record_sender_transport_failure(e.key(), FailureClass::Permanent, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .sender_transport_status(&token, e.outbound_note_id)
+                    .await
+                    .unwrap(),
+                TransportStatus::Failed,
+                "a permanent local refusal is failed"
+            );
+            accept_status_receipt(&runtime, &e, disposition).await;
+            assert_eq!(
+                runtime
+                    .sender_transport_status(&token, e.outbound_note_id)
+                    .await
+                    .unwrap(),
+                expected,
+                "a verified receipt supersedes the local failure"
+            );
+        }
+        assert_eq!(
+            runtime
+                .sender_transport_status(&token, Uuid::new_v4())
+                .await
+                .unwrap(),
+            TransportStatus::Unknown,
+            "an absent outbound UUID is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_status_is_primary_namespace_and_backend_scoped() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token_a = NamespaceToken::for_namespace(crate::Namespace::parse("sender-a").unwrap());
+        let token_b = NamespaceToken::mint_with_visibility(
+            crate::Namespace::parse("sender-b").unwrap(),
+            vec![crate::Namespace::parse("sender-a").unwrap()],
+            crate::ActorRef::anonymous(),
+        );
+        let e = envelope();
+        runtime
+            .create_sender_transport(&token_a, e.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .sender_transport(e.key())
+                .await
+                .unwrap()
+                .unwrap()
+                .envelope
+                .namespace,
+            "sender-a"
+        );
+        assert_eq!(
+            runtime
+                .sender_transport_status(&token_a, e.outbound_note_id)
+                .await
+                .unwrap(),
+            TransportStatus::Pending
+        );
+        assert_eq!(
+            runtime
+                .sender_transport_status(&token_b, e.outbound_note_id)
+                .await
+                .unwrap(),
+            TransportStatus::Unknown,
+            "additional visible namespaces cannot reveal transport status"
+        );
+        let unrelated = KhiveRuntime::memory().unwrap();
+        assert_eq!(
+            unrelated
+                .sender_transport_status(&token_a, e.outbound_note_id)
+                .await
+                .unwrap(),
+            TransportStatus::Unknown,
+            "a different bound backend has no record"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_status_read_preserves_every_sender_field() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = NamespaceToken::local();
+        let e = envelope();
+        runtime
+            .create_sender_transport(&token, e.clone())
+            .await
+            .unwrap();
+        let before = runtime.sender_transport(e.key()).await.unwrap().unwrap();
+        assert_eq!(before.admitted_at, None);
+        for _ in 0..3 {
+            assert_eq!(
+                runtime
+                    .sender_transport_status(&token, e.outbound_note_id)
+                    .await
+                    .unwrap(),
+                TransportStatus::Pending
+            );
+        }
+        let after = runtime.sender_transport(e.key()).await.unwrap().unwrap();
+        assert_eq!(
+            after, before,
+            "a status read preserves envelope bytes, holds, attempts and timestamps"
+        );
     }
 }

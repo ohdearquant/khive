@@ -14,7 +14,9 @@ pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod audit_batch;
 pub mod blob;
+pub mod bounded_read;
 pub mod build_info;
+pub mod comm_recipient;
 pub mod comm_transport;
 pub mod config;
 pub mod config_ledger;
@@ -30,6 +32,7 @@ mod error_projection;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
+pub mod file_policy;
 pub mod fusion;
 pub mod graph_traversal;
 pub mod input_schema;
@@ -43,6 +46,7 @@ mod mailbox_view;
 mod note_create;
 mod note_index;
 mod note_read;
+pub mod note_search_ann;
 mod note_store_guard;
 pub mod note_write;
 #[cfg(test)]
@@ -50,10 +54,12 @@ mod note_write_tests;
 pub mod objectives;
 pub mod operations;
 pub mod pack;
+mod params;
 pub mod phase_events;
 pub mod portability;
 pub mod preference_verification;
 pub mod presentation;
+pub mod process_group;
 pub mod process_retry;
 pub mod reference_resolution;
 pub mod reference_ring;
@@ -63,6 +69,7 @@ pub mod retrieval;
 pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
+mod sql_include;
 mod streams;
 pub mod telemetry_config;
 pub use streams::{
@@ -78,7 +85,7 @@ pub use agent_lifecycle::{
     apply_transition, spawn_fingerprint, AgentRecord, AgentState, IllegalTransition,
     TerminalReason, Transition, Trigger,
 };
-pub use atomic_message::{create_notes_atomic, create_notes_atomic_with_report, AtomicNoteSpec};
+pub use atomic_message::{create_notes_atomic_with_report, AtomicNoteSpec};
 pub use atomic_plan::{
     AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan,
     GtdCompletePlan, GtdTransitionPlan, LinkPlan, MergePlan, PlanPredicate, PlanStatement,
@@ -93,7 +100,7 @@ pub use blob::{
     DEFAULT_BLOB_HYDRATION_BYTES,
 };
 pub use build_info::{BuildInfo, BUILD_INFO, BUILD_VERSION};
-pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env};
+pub use config::{ann_fresh_tail_enabled_from_env, process_ref_from_env, WalCeilingSource};
 pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_embedding_text, entity_fts_document, entity_merge_guard_compared_values,
@@ -114,30 +121,33 @@ pub use daemon::{
 pub use email_message_id::{EmailMessageIdDomains, HISTORICAL_DOMAINS_ENV};
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
-    config_from_env, BackendConfig, BackendKind, BlobConfig, BrainSectionConfig, ConfigError,
-    EngineConfig, GateSectionConfig, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
-    PackConfig, StorageSectionConfig,
+    config_from_env, resolve_wal_ceiling, BackendConfig, BackendKind, BlobConfig,
+    BrainSectionConfig, ConfigError, EngineConfig, GateSectionConfig, GitWriteEntryConfig,
+    GitWriteSectionConfig, KhiveConfig, PackConfig, ResolvedWalCeiling, StorageSectionConfig,
 };
 pub use error::{
     fts_text_leg_or_err, AdmissionFailureContext, AuditObligationFailure, AuditObligationReason,
     ChannelIngestFailureClass, DenialAuditOutcome, DenialReceipt, DispatchError, DomainDisposition,
     GuardedWriteFailure, ReceiptRefusal, RefusalEventContext, RefusalEventRecording,
     RefusalRecordingErrorClass, RuntimeError, RuntimeResult, WriterPoolCheckoutTimeoutContext,
-    WriterTaskFailureContext, WRITER_ADMISSION_SCOPE, WRITER_POOL_CHECKOUT_TIMEOUT_STAGE,
-    WRITER_QUEUE_SATURATED_STAGE, WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
+    WriterTaskFailureContext, SQLITE_WAL_CAPACITY_REFUSED_STAGE,
+    SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE, WRITER_ADMISSION_SCOPE,
+    WRITER_POOL_CHECKOUT_TIMEOUT_STAGE, WRITER_QUEUE_SATURATED_STAGE,
+    WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
 pub use error_projection::runtime_error_value;
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
+pub use kg_read::KgNeighborRead;
 pub use khive_db::{
     checkpoint_once, run_checkpoint_task, run_migrations, CheckpointConfig,
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    classify_operation, is_valid_mailbox_actor_label, ActorRef, AllowAllGate, AuditDecision,
-    AuditEvent, CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError, GateRef,
-    GateRequest, MailboxPolicyError, MailboxReadGate, Obligation, OperationAccess,
+    classify_operation, is_valid_mailbox_actor_label, split_stamped_label, ActorRef, AllowAllGate,
+    AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError,
+    GateRef, GateRequest, MailboxPolicyError, MailboxReadGate, Obligation, OperationAccess,
     CLASSIFIED_OPERATIONS, OPERATION_CLASSIFIER_VERSION, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 pub use khive_storage::types::TraversalOptions;
@@ -164,13 +174,14 @@ pub use operations::{
 };
 pub use pack::{
     resolve_explicit_namespace, ChannelIngestCapability, DispatchHook, HandlerDef,
-    IdResolutionMode, IngestAuditStore, InterceptedDispatchResult, KindHook, NoteKindSpec,
-    NoteLifecycleSpec, NoteUpdateEffect, PackByIdResolver, PackFactory, PackInstall, PackLoadError,
-    PackMetadataRegistry, PackRegistration, PackRegistry, PackRuntime, PackSchemaCollisionError,
-    PackSchemaPlan, ParamDef, RequestIdentity, SchemaPlan, VerbCategory, VerbPresentationPolicy,
-    VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
-    AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
+    IdResolutionMode, IngestAuditStore, InterceptedDispatchResult, KindHook, NoteEmbeddingPolicy,
+    NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec, NoteUpdateEffect, PackByIdResolver,
+    PackFactory, PackInstall, PackLoadError, PackMetadataRegistry, PackRegistration, PackRegistry,
+    PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity, SchemaPlan,
+    VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, VerifiedActor,
+    Visibility, AUDIT_PERSISTENCE_SKIPPED_READ_ONLY,
 };
+pub use params::deser_params;
 pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use preference_verification::{LegacyPreferenceVerifier, VerifiedModelNetworkAttachment};

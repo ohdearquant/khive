@@ -55,13 +55,21 @@
 //!
 //! If a shape's own measured stats look pathological (a sample count short
 //! of `SAMPLES`, or a non-finite duration), the test fails loudly with the
-//! collected stats rather than silently passing — there is no skip path.
+//! collected stats rather than silently passing. Coverage instrumentation
+//! skips only the calibrated numeric gate; it still checks sample integrity.
 
 use std::time::{Duration, Instant};
 
 use khive_pack_comm::CommPack;
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
 use serde_json::json;
+
+mod timing {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test_support/timing.rs"
+    ));
+}
 
 const WARMUP: usize = 5;
 const SAMPLES: usize = 40;
@@ -176,21 +184,25 @@ async fn hold_time_regression_comm_send_new_root() {
     );
 
     let (median, p95) = median_and_p95(&mut durations);
-    let median_bound = scale_bound(SEND_MEDIAN_BOUND, SAFETY_FACTOR);
-    let p95_bound = scale_bound(SEND_P95_BOUND, SAFETY_FACTOR);
+    let median_bound = timing::duration_bound(scale_bound(SEND_MEDIAN_BOUND, SAFETY_FACTOR), None);
+    let p95_bound = timing::duration_bound(scale_bound(SEND_P95_BOUND, SAFETY_FACTOR), None);
 
-    assert!(
-        median <= median_bound,
-        "hold-time regression: comm.send median writer-hold proxy {median:?} exceeds \
-         calibrated bound {median_bound:?} ({SEND_MEDIAN_BOUND:?} x {SAFETY_FACTOR}); \
-         p95 was {p95:?}; all samples: {durations:?}"
-    );
-    assert!(
-        p95 <= p95_bound,
-        "hold-time regression: comm.send p95 writer-hold proxy {p95:?} exceeds calibrated \
-         bound {p95_bound:?} ({SEND_P95_BOUND:?} x {SAFETY_FACTOR}); median was {median:?}; \
-         all samples: {durations:?}"
-    );
+    if let Some(median_bound) = median_bound {
+        assert!(
+            median <= median_bound,
+            "hold-time regression: comm.send median writer-hold proxy {median:?} exceeds \
+             calibrated bound {median_bound:?} ({SEND_MEDIAN_BOUND:?} x {SAFETY_FACTOR}); \
+             p95 was {p95:?}; all samples: {durations:?}"
+        );
+    }
+    if let Some(p95_bound) = p95_bound {
+        assert!(
+            p95 <= p95_bound,
+            "hold-time regression: comm.send p95 writer-hold proxy {p95:?} exceeds calibrated \
+             bound {p95_bound:?} ({SEND_P95_BOUND:?} x {SAFETY_FACTOR}); median was {median:?}; \
+             all samples: {durations:?}"
+        );
+    }
 
     eprintln!(
         "hold-time gate: comm.send (new-root) median={median:?} p95={p95:?} \
@@ -242,21 +254,25 @@ async fn hold_time_regression_comm_reply() {
     );
 
     let (median, p95) = median_and_p95(&mut durations);
-    let median_bound = scale_bound(REPLY_MEDIAN_BOUND, SAFETY_FACTOR);
-    let p95_bound = scale_bound(REPLY_P95_BOUND, SAFETY_FACTOR);
+    let median_bound = timing::duration_bound(scale_bound(REPLY_MEDIAN_BOUND, SAFETY_FACTOR), None);
+    let p95_bound = timing::duration_bound(scale_bound(REPLY_P95_BOUND, SAFETY_FACTOR), None);
 
-    assert!(
-        median <= median_bound,
-        "hold-time regression: comm.reply median writer-hold proxy {median:?} exceeds \
-         calibrated bound {median_bound:?} ({REPLY_MEDIAN_BOUND:?} x {SAFETY_FACTOR}); \
-         p95 was {p95:?}; all samples: {durations:?}"
-    );
-    assert!(
-        p95 <= p95_bound,
-        "hold-time regression: comm.reply p95 writer-hold proxy {p95:?} exceeds calibrated \
-         bound {p95_bound:?} ({REPLY_P95_BOUND:?} x {SAFETY_FACTOR}); median was {median:?}; \
-         all samples: {durations:?}"
-    );
+    if let Some(median_bound) = median_bound {
+        assert!(
+            median <= median_bound,
+            "hold-time regression: comm.reply median writer-hold proxy {median:?} exceeds \
+             calibrated bound {median_bound:?} ({REPLY_MEDIAN_BOUND:?} x {SAFETY_FACTOR}); \
+             p95 was {p95:?}; all samples: {durations:?}"
+        );
+    }
+    if let Some(p95_bound) = p95_bound {
+        assert!(
+            p95 <= p95_bound,
+            "hold-time regression: comm.reply p95 writer-hold proxy {p95:?} exceeds calibrated \
+             bound {p95_bound:?} ({REPLY_P95_BOUND:?} x {SAFETY_FACTOR}); median was {median:?}; \
+             all samples: {durations:?}"
+        );
+    }
 
     eprintln!(
         "hold-time gate: comm.reply median={median:?} p95={p95:?} \

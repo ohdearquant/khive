@@ -159,36 +159,6 @@ fn invalid_row(column: &str) -> RuntimeError {
     RuntimeError::Internal(format!("invalid git receipt column: {column}"))
 }
 
-fn required_text(row: &SqlRow, column: &str) -> Result<String, RuntimeError> {
-    match row.get(column) {
-        Some(SqlValue::Text(value)) => Ok(value.clone()),
-        _ => Err(invalid_row(column)),
-    }
-}
-
-fn optional_text(row: &SqlRow, column: &str) -> Result<Option<String>, RuntimeError> {
-    match row.get(column) {
-        Some(SqlValue::Text(value)) => Ok(Some(value.clone())),
-        Some(SqlValue::Null) => Ok(None),
-        _ => Err(invalid_row(column)),
-    }
-}
-
-fn required_int(row: &SqlRow, column: &str) -> Result<i64, RuntimeError> {
-    match row.get(column) {
-        Some(SqlValue::Integer(value)) => Ok(*value),
-        _ => Err(invalid_row(column)),
-    }
-}
-
-fn optional_int(row: &SqlRow, column: &str) -> Result<Option<i64>, RuntimeError> {
-    match row.get(column) {
-        Some(SqlValue::Integer(value)) => Ok(Some(*value)),
-        Some(SqlValue::Null) => Ok(None),
-        _ => Err(invalid_row(column)),
-    }
-}
-
 fn json_column(row: &SqlRow, column: &str, nullable: bool) -> Result<Value, RuntimeError> {
     match row.get(column) {
         Some(SqlValue::Text(value)) => serde_json::from_str(value).map_err(|_| invalid_row(column)),
@@ -200,29 +170,58 @@ fn json_column(row: &SqlRow, column: &str, nullable: bool) -> Result<Value, Runt
 
 fn decode(row: &SqlRow) -> Result<Receipt, RuntimeError> {
     let receipt = Receipt {
-        id: required_text(row, "id")?,
-        namespace: required_text(row, "namespace")?,
-        actor: required_text(row, "actor")?,
-        session_id: optional_text(row, "session_id")?,
-        verb: required_text(row, "verb")?,
-        repo: required_text(row, "repo")?,
+        id: row
+            .text("id")
+            .map(str::to_owned)
+            .map_err(|_| invalid_row("id"))?,
+        namespace: row
+            .text("namespace")
+            .map(str::to_owned)
+            .map_err(|_| invalid_row("namespace"))?,
+        actor: row
+            .text("actor")
+            .map(str::to_owned)
+            .map_err(|_| invalid_row("actor"))?,
+        session_id: row
+            .opt_text("session_id")
+            .map(|value| value.map(str::to_owned))
+            .map_err(|_| invalid_row("session_id"))?,
+        verb: row
+            .text("verb")
+            .map(str::to_owned)
+            .map_err(|_| invalid_row("verb"))?,
+        repo: row
+            .text("repo")
+            .map(str::to_owned)
+            .map_err(|_| invalid_row("repo"))?,
         inputs: json_column(row, "inputs", false)?,
         gate: json_column(row, "gate", false)?,
         policy: json_column(row, "policy", true)?,
         fork_policy: json_column(row, "fork_policy", true)?,
         credential: json_column(row, "credential", true)?,
-        started_at: required_int(row, "started_at")?,
-        finished_at: optional_int(row, "finished_at")?,
-        disposition: Disposition::parse(&required_text(row, "disposition")?)?,
+        started_at: row
+            .i64("started_at")
+            .map_err(|_| invalid_row("started_at"))?,
+        finished_at: row
+            .opt_i64("finished_at")
+            .map_err(|_| invalid_row("finished_at"))?,
+        disposition: Disposition::parse(
+            &row.text("disposition")
+                .map(str::to_owned)
+                .map_err(|_| invalid_row("disposition"))?,
+        )?,
         result: json_column(row, "result", false)?,
-        reason: optional_text(row, "reason")?,
+        reason: row
+            .opt_text("reason")
+            .map(|value| value.map(str::to_owned))
+            .map_err(|_| invalid_row("reason"))?,
     };
     receipt.validate()?;
     Ok(receipt)
 }
 
 fn opt_text(value: Option<&str>) -> SqlValue {
-    value.map_or(SqlValue::Null, |value| SqlValue::Text(value.to_string()))
+    SqlValue::from_opt_text(value)
 }
 
 fn json_sql(value: &Value) -> SqlValue {
@@ -574,3 +573,7 @@ mod tests {
         assert_eq!(durable.disposition, Disposition::Unknown);
     }
 }
+
+#[cfg(test)]
+#[path = "receipts_column_tests.rs"]
+mod column_tests;

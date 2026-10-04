@@ -91,3 +91,7 @@ pub(crate) async fn replace(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "event_usage_tests.rs"]
+mod event_usage_tests;

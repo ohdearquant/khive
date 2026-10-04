@@ -40,7 +40,7 @@ def function(filename, name):
 class KkernelTestIsolationTests(unittest.TestCase):
     def test_child_environment_removes_external_model_cache_override(self):
         source = (SOURCE / "test_process.rs").read_text()
-        command = source[source.index("let output = command"):source.index('.expect("spawn isolated test")')]
+        command = source[source.index("run_exact_test_in_child("):source.index("fixture = Some(")]
         self.assertIn('.env_remove("LATTICE_MODEL_CACHE")', command,
                       "exact child must not inherit an external model cache override")
 
@@ -87,7 +87,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
             self.assertIn(expected, body, f"{name} must preserve its intended embedding mode")
             self.assertTrue(body.strip().startswith(ISOLATION),
                             f"{name} must enter exact child before reindex setup")
-        self.assertEqual(count, 8, "all reindex command witnesses must be counted")
+        self.assertEqual(count, 9, "all reindex command witnesses must be counted")
 
     def test_reindex_offline_setup_replaces_each_configured_provider(self):
         body = function("reindex.rs", "run_reindex_offline")

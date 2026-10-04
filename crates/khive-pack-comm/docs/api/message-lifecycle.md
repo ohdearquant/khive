@@ -6,6 +6,72 @@ Technical reference for the `comm` pack's message write, threading, and read pat
 spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
 `vocab.rs`.
 
+## File attachments on local messages
+
+`comm.send` and `comm.reply` accept optional `attachments: [content_ref, ...]`.
+The list contains at most eight distinct, strict lowercase BLAKE3 references.
+Every object must already exist in the runtime's installed BlobStore, and
+their combined stat sizes must not exceed 64 MiB. A missing object refuses
+with a bad-argument refusal naming its reference. Invalid, duplicate, oversized and
+missing lists write no message notes or attachment rows.
+
+File attachments require a local recipient and the canonical main comm
+backend. Attached sends or replies to `email:`, `telegram:` or `khive1:`
+addresses refuse the entire operation. Attachment-free routing is unchanged.
+A comm runtime on a secondary backend refuses attached writes before any
+note preparation or writer request; it does not split note and attachment
+ownership across databases.
+
+Each outbound and inbound note owns a Note-substrate row for every reference.
+Roles are `message-attachment:0` through `message-attachment:7`, preserving the
+caller order and staying distinct from `quarantine-original`. The complete
+note/index plans and attachment statements run in the same AtomicUnit writer
+transaction. On keyed writes these statements precede the final outbound key
+claim, so a competing claim rolls back the attempted notes and attachments.
+An exact replay returns the original pair only when both copies still have
+the complete expected attachment metadata; an incomplete pair refuses with
+`key_conflict` and is not repaired by the replay.
+
+Blob stat is a metadata pre-check, not a lease. The BlobStore does not share
+the comm SQL transaction, including when a blob pack is routed separately.
+An object removed after the pre-check can become unavailable before the
+message commits or is later exported. This API does not add blob deletion or
+reclaim on message deletion.
+
+`comm.inbox` and `comm.thread` return `attachments: [{content_ref, size,
+media_type}]` on each message, using `[]` when none exist; `attachments` is
+also an accepted projection field. Only the exact indexed roles above are
+read, sorted by index. Other roles and malformed suffixes are ignored.
+`comm.read` returns the same metadata when `body=true` (the default), while
+`body=false` preserves the acknowledgement-only response. No comm response
+contains file bytes. Media type is nullable because references carry no MIME
+catalog metadata; size is the stored per-message stat observation.
+
+An unreadable attachment row leaves its message and readable attachments
+available. Inbox, thread and body-bearing read responses add
+`attachments_error: {count, reason: "unreadable_attachment"}` to that message.
+The marker is also an accepted projection field. The count includes
+unreadable rows preserved by migration 047 in
+`attachment_quarantine`; a clean message omits the marker. The migration
+preserves every column of an invalid-role row and its blob reference while
+tightening the attachment role CHECK to reject empty roles and C0, DEL and
+C1 control characters. Quarantined references remain blob owners in the GC
+liveness predicate,
+including after deletion of their original record; this preserves the bytes
+until the quarantined metadata can be repaired. GC admission still requires
+the exact completed V21 epoch: migrated V47 stores remain refused until
+later epoch ownership has been reviewed.
+
+A failure of the attachment lookup itself still returns an error. Bulk
+`comm.read(body=true)` reads every target's fields before marking the first
+target, so that error does not change any target's read flag. Mark failures
+remain per-item statuses. `body=false` does not read attachment metadata.
+
+Use [blob.import and blob.export](../../../khive-pack-blob/docs/api/file-transfers.md)
+to move files between server directories and the blob store without returning
+bytes through those tools. `blob.get` keeps its existing small-object base64
+behavior.
+
 ## `message.rs::resolve_id`
 
 Accepts a 36-char hyphenated UUID or an 8+ hex-char short prefix. The prefix
@@ -56,7 +122,7 @@ copy they were replying to.
 The runtime pre-generates that outbound UUID before either note is written, so
 the canonical `thread_id` and `comm_schema_version = 1` are already known when
 both notes are constructed. `dual_write_message` commits both fully-formed v1
-notes through `khive_runtime::create_notes_atomic` in one atomic writer
+notes through `khive_runtime::create_notes_atomic_with_report` in one atomic writer
 transaction — a failure on either note rolls back the whole unit, so no
 partial or unversioned row can ever be observed.
 
@@ -437,6 +503,15 @@ false). Resolution, namespace/message-kind checks, inbound-direction enforcement
 authorization, legacy-row compatibility, deduplication, response ordering, and aggregate counts
 are shared with `handle_read` rather than reimplemented.
 
+Complete UUID inputs are read in contiguous windows of at most 128 occurrences. A prefix or
+other spelling is resolved serially at its original position; lookahead stops before it. Each
+occurrence passes the ordinary namespace, message-kind, direction and recipient checks before
+successful UUIDs are deduplicated. A healthy window observes each distinct row once, so duplicates
+within that window share the same stored version. There is no cache across windows. This is a
+bounded live observation, not a request snapshot. If a window read fails, its results are discarded
+and those occurrences are point-read in their original order, preserving the first refusal and
+its text. Only live rows are read by both paths.
+
 The default path calls the same best-effort target loop documented above. `atomic=true` instead
 passes the unique target UUIDs and the same live eligibility `NoteFilter` to
 `NoteStore::patch_note_property_atomic`. The SQLite implementation executes every guarded
@@ -448,6 +523,11 @@ executors verify that finalization restored autocommit mode. An unverified rollb
 commit, or any other poisoned-connection state returns `side_effects_unknown`. Any transaction-body
 panic also retires its writer (reporting `transaction_rolled_back` only when rollback was verified),
 rather than allowing another request to reuse a terminal connection.
+
+After a successful atomic commit, fresh properties are also read in windows of at most 128.
+Any failed window falls back to fresh point reads. A missing or unreadable row still reports the
+committed mark as successful, with `read=true` merged into its validated property snapshot; good
+siblings retain their fresh properties. The write transaction is never retried by this readback.
 
 ## `handlers.rs::handle_reply`
 
@@ -546,6 +626,13 @@ value since there is no specific row to break ties against.
 The optional `fields` projection is identical to `comm.inbox` and is applied
 only after visibility filtering, dual-write deduplication, cursor filtering,
 ordering, and truncation. Omitting it preserves the full thread response.
+
+The physical scan uses 200-row keyset windows in `created_at DESC, id ASC` order, advancing
+from the last physically fetched row before actor filtering or twin folding. It avoids growing
+OFFSET rescans while keeping the logical response limit after the complete physical scan. Like
+inbox, this is a live window walk: deletion of an already-fetched row does not skip an older row;
+a new row inserted before a cursor already passed may not be observed. It does not create a
+snapshot, bound total thread memory/work, or change the public chronological cursor contract.
 
 ## `handlers.rs::handle_ingest`
 
@@ -653,7 +740,14 @@ commits a `quarantine-original` note attachment with that same reference in the
 note's transaction. This attachment is the blob sweep's liveness root; metadata
 alone does not own stored bytes. A duplicate transport id repairs a missing
 attachment only when its stored reference matches the replayed bytes and the
-exact channel kind and slug match. A matching channel-scoped replay also
+exact channel kind and slug match. The one-release legacy IMAP lookup applies
+those same ownership checks before acknowledging a quarantined replay; the
+old-key note keeps its stored `external_id`; the lookup already matched its
+`channel_slug`, and the repair backfills a missing `quarantine_content_ref` and
+restores a missing matching attachment. When that old-key row has no `expires_at`, the
+repair also installs one from replay time plus configured retention, so the row
+that now owns the original bytes is selected by channel cleanup; an existing
+deadline on an old-key row is left as it is. A matching channel-scoped replay also
 installs a missing expiry deadline from replay time plus configured retention
 while preserving a later existing deadline. An older quarantine row without a
 slug occupies the empty channel partition under ADR-056 and cannot be claimed
@@ -670,12 +764,33 @@ each email or Telegram channel poll, an internal, bounded cleanup pass selects
 expired quarantine messages in that channel's ingest namespace and exact
 `channel_kind`/`channel_slug`, then hard-deletes each note and its attachment.
 Subsequent polls continue through the backlog, including when no new messages
-arrive. The blob sweep reclaims an unowned original after its grace period;
-an unexpired quarantine note and its attachment remain available. This follows
+arrive. Hard deletion releases attachment ownership but leaves the original's
+blob bytes on disk; an unexpired quarantine note and its attachment remain
+available. This follows
 [ADR-121](../../../../docs/adr/ADR-121-attachments-first-class.md)'s rule that
 a live note owns its attachment and hard deletion releases that ownership.
 Cleanup failure holds the channel poll and is reported as a failure, so it
 cannot produce a success heartbeat or advance transport progress.
+
+Physical reclamation remains pending ([#3679](https://github.com/ohdearquant/khive/issues/3679)).
+The serving process has no caller for the committed-object collector
+([#3038](https://github.com/ohdearquant/khive/issues/3038)); the daemon's staged-upload
+expiry sweep does not collect committed originals. A future collector must preserve
+ADR-121's publish grace and satisfy its approved schema and producer review,
+complete ownership registration and manifest closure, store binding, and verified
+adoption of populated roots. [#3324](https://github.com/ohdearquant/khive/issues/3324)
+tracks the current schema gate, which also blocks collection on current databases.
+
+The number of quarantine records that hold an original is bounded per channel
+configuration (for email, `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED`, default 256; see the
+[IMAP connector notes](../../../khive-channel-email/docs/api/imap-connector.md)).
+Before publishing an original, whether the adapter quarantined the message or
+`comm.ingest` refused it, the poller reads `comm.health`'s
+`quarantined_count` for the ingest namespace. At the cap, `comm.ingest`
+receives the quarantine record without `quarantine_content_ref` and with
+`quarantine_original_retained: "false"` and
+`quarantine_original_not_retained_reason: "retention-limit"`, so no attachment is
+created and no blob is published. The record keeps the normal retention deadline.
 
 A future promote or release path would need to clear the expiry before the
 deadline; no such path exists today. Older quarantine notes without
@@ -738,19 +853,37 @@ predicate emitted by `build_note_filter_where`. A literal-value partial index
 planner sees different predicates and falls back to a table scan.
 `deleted_at IS NULL` is always present in filtered queries, so the partial
 condition is always satisfied and the index is eligible. `kind` is included
-as an indexed column so the `kind = ?N` predicate is covered. Statements are
-idempotent (`CREATE INDEX IF NOT EXISTS`).
+as an indexed column so the `kind = ?N` predicate is covered. The remaining
+pack statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
 
 `idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
 namespace, note kind, direction, sender actor, and `properties.outbound_ref`.
 
-`idx_comm_message_outbound_recipient` serves the channel delivery loops' outbox
-scan: a seek on direction plus a range on `properties.to_actor` (the channel
-prefix, `email:` or `telegram:`, rendered by `FilterOp::TextStartsWithIndexed`),
-then `created_at DESC, id ASC`. The prefix is in the statement because every
-actor-to-actor outbound row satisfies the pending predicate indefinitely, so a
-scan that pages first and filters the recipient afterwards stops reaching a
-channel's rows once enough other rows sort ahead of them.
+`idx_comm_message_outbound_recipient` serves outbox scans with arbitrary
+partial recipient prefixes: a seek on direction plus a range on
+`properties.to_actor` rendered by `FilterOp::TextStartsWithIndexed`, then
+`created_at DESC, id ASC`. The prefix belongs in the SQL statement because
+actor-to-actor outbound rows remain pending indefinitely; filtering them after
+the page would starve channel rows.
+
+`idx_comm_message_outbound_due` is installed by numbered core migration V44,
+not the pack schema plan. Supported note writers store a strict RFC 3339 UTC
+key and the source deadline text in the same write as `properties`. Its
+builtins-only expression compares that source with the current JSON property;
+if they differ, the row gets the empty BLOB key and enters the due candidates.
+The read path then applies a strict parser residual, so raw property edits
+cannot hide a newly due message or deliver a future one early. Raw SQLite
+connections need no application function to delete notes, check integrity, or
+vacuum. The index serves full colon-terminated channel prefixes.
+Its first-colon recipient bucket is an equality key ahead of the stored retry
+deadline, so a channel with many future retries and no due messages can seek
+past the backlog. Missing or malformed deadlines use the empty BLOB key and
+remain eligible. A full `name:` bucket exactly matches the corresponding
+recipient prefix; arbitrary partial prefixes use the recipient index above.
+The channel due page sorts by `+created_at DESC, id ASC`: `created_at` is an
+INTEGER timestamp, so this preserves the answer order while preventing an
+analyzed planner from walking the creation-order index through future retries
+to fill a small `LIMIT`.
 
 `idx_comm_quarantine_expiry` supports the daemon's bounded, channel-scoped
 expiry page by namespace, kind, channel identity, and expiry timestamp.

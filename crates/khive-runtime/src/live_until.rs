@@ -12,6 +12,7 @@
 use crate::presentation::micros_to_iso;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{SqlWriter, StorageError};
+use khive_types::json_type_name;
 use serde_json::Value;
 
 /// Why a `live_until` path did not admit the write. The caller learns the
@@ -106,17 +107,4 @@ pub(crate) async fn evaluate(
             value_type: found.map_or("absent", json_type_name),
         }),
     })
-}
-
-/// The JSON type of a `live_until` field, which an unreadable refusal reports in
-/// place of the value itself.
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }

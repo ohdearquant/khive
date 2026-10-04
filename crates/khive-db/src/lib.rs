@@ -7,12 +7,17 @@
 pub mod backend;
 /// Periodic WAL checkpoint task.
 pub mod checkpoint;
+/// Durable database owner identity paired with the opened physical file.
+pub mod database_owner_identity;
 /// Read-only-by-intent database-integrity and WAL/checkpoint diagnostics.
 pub mod diagnostics;
 /// Error types for the SQLite layer.
 pub mod error;
 /// SQLite extension registration (sqlite-vec auto-extension).
 pub mod extension;
+/// Physical file identity shared by pool admission and backend alias routing.
+#[cfg(any(unix, windows))]
+pub mod file_identity;
 mod fts_maintenance;
 /// Schema migration system (versioned migrations).
 pub mod migrations;
@@ -23,11 +28,16 @@ pub mod namespace_move;
 /// A store fixture reproducing the namespace split, for the move's own arms.
 #[cfg(any(test, feature = "test-support"))]
 pub mod namespace_move_fixture;
+/// Feature-gated namespace-bounded FTS5 trigram prototype.
+#[cfg(feature = "namespace-trigram-proto")]
+pub mod namespace_trigram_proto;
 /// WAL-mode connection pool: one writer, N concurrent readers.
 pub mod pool;
 mod read_cancellation;
 /// `SqlAccess` trait bridge to `ConnectionPool`.
 pub mod sql_bridge;
+#[cfg(any(test, feature = "test-support"))]
+mod statement_observer;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).
 pub mod stores;
 /// Append-only NDJSON writer-timeout event sink (crate-internal).
@@ -47,7 +57,10 @@ pub use checkpoint::{
     CheckpointTick,
 };
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
-pub use error::SqliteError;
+pub use database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
+pub use error::{
+    SqliteError, SQLITE_WAL_CAPACITY_REFUSED_STAGE, SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE,
+};
 pub use fts_maintenance::{
     fts_maintenance_counters, FtsIndexStructure, FtsLevelStructure, FtsMaintenanceCounters,
     FtsSegmentDiagnostics,
@@ -64,11 +77,16 @@ pub use migrations::{
     run_migrations, EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration,
     MIGRATIONS,
 };
-pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, ReaderRow, WriterGuard};
+pub use pool::{
+    CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,
+    WalCeilingPolicy, WalCeilingSource, WriterGuard,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use read_cancellation::scope_test_read_progress;
 pub use read_cancellation::{sqlite_interrupt_grace_from_env, DEFAULT_SQLITE_INTERRUPT_GRACE_MS};
 pub use sql_bridge::SqlBridge;
+#[cfg(any(test, feature = "test-support"))]
+pub use statement_observer::{StartedStatement, StatementStartObservation};
 pub use writer_task::WriterTaskHandle;
 
 #[cfg(test)]

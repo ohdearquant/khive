@@ -1,6 +1,8 @@
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
+
+use khive_runtime::bounded_read::read_to_end_bounded;
 
 /// Shared L1 manifest, L1.5 source, and L2 Rust source admission ceiling.
 pub(crate) const MAX_INGEST_FILE_BYTES: u64 = 2 * 1024 * 1024;
@@ -77,17 +79,13 @@ pub(crate) fn read_contained_to_string(
             MAX_INGEST_FILE_BYTES
         )));
     }
-    let mut bytes = Vec::new();
-    source
-        .take(MAX_INGEST_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_INGEST_FILE_BYTES {
+    let Some(bytes) = read_to_end_bounded(source, MAX_INGEST_FILE_BYTES)? else {
         return Err(SourceReadError::Refused(format!(
             "file {} exceeds the {}-byte code ingest ceiling",
             source_path.display(),
             MAX_INGEST_FILE_BYTES
         )));
-    }
+    };
     String::from_utf8(bytes)
         .map_err(|error| SourceReadError::Io(io::Error::new(io::ErrorKind::InvalidData, error)))
 }

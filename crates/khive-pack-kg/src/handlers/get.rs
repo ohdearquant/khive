@@ -9,7 +9,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_runtime::{
-    hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
+    hex_prefix_to_uuid_pattern, KhiveRuntime, MailboxView, NamespaceToken, Resolved, RuntimeError,
+    VerbRegistry,
 };
 use khive_storage::event::Event;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
@@ -34,6 +35,9 @@ impl KgPack {
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
         let p: GetParams = deser(params.clone())?;
+        let mailbox = self
+            .runtime
+            .authorize_mailbox_view(token, "get", None, &params)?;
         if let Some(key) = &p.key {
             if p.id.is_some() || p.include_deleted == Some(true) {
                 return Err(RuntimeError::InvalidInput(
@@ -59,7 +63,13 @@ impl KgPack {
             )?;
             let note = self
                 .runtime
-                .get_note_by_key(token, key, kind.as_deref(), false)
+                .get_note_by_key_in_scope(
+                    token,
+                    key,
+                    kind.as_deref(),
+                    false,
+                    Some(&mailbox.note_scope(token)),
+                )
                 .await?;
             return flatten_get_result(
                 "note",
@@ -86,14 +96,12 @@ impl KgPack {
         let resolved_id = if let Ok(id) = Uuid::parse_str(id_ref) {
             Some(id)
         } else if id_ref.len() >= 8 && id_ref.chars().all(|c| c.is_ascii_hexdigit()) {
-            match registry
-                .resolve_kg_read_prefix(&self.runtime, token, id_ref, false)
+            match resolve_get_prefix(&self.runtime, registry, token, &mailbox, id_ref, false)
                 .await?
             {
                 Some(id) => Some(id),
                 None => {
-                    registry
-                        .resolve_kg_read_prefix(&self.runtime, token, id_ref, true)
+                    resolve_get_prefix(&self.runtime, registry, token, &mailbox, id_ref, true)
                         .await?
                 }
             }
@@ -141,13 +149,16 @@ impl KgPack {
                 );
             }
             Some(Resolved::Note(note)) => {
+                if !mailbox.permits_message_note(token, &note) {
+                    return Err(RuntimeError::NotFound(id_ref.to_string()));
+                }
                 return flatten_get_result(
                     "note",
                     parse_note_content(
                         remap_note_status(normalize_entity_timestamps(to_json(&note)?)),
                         p.parse_content,
                     )?,
-                )
+                );
             }
             _ => {}
         }
@@ -178,6 +189,9 @@ impl KgPack {
             .await
             .map_err(RuntimeError::Storage)?
         {
+            if !mailbox.permits_message_note(token, &note) {
+                return Err(RuntimeError::NotFound(id_ref.to_string()));
+            }
             let note_val = normalize_entity_timestamps(to_json(&note)?);
             let remapped = remap_note_status(note_val);
             return flatten_get_result("note", parse_note_content(remapped, p.parse_content)?);
@@ -187,7 +201,10 @@ impl KgPack {
                 .runtime
                 .get_note_including_deleted(token, id)
                 .await?
-                .filter(|deleted| deleted.namespace == token.namespace().as_str())
+                .filter(|deleted| {
+                    deleted.namespace == token.namespace().as_str()
+                        && mailbox.permits_message_note(token, deleted)
+                })
             {
                 let note_val = normalize_entity_timestamps(to_json(&deleted)?);
                 let remapped = remap_note_status(note_val);
@@ -197,8 +214,29 @@ impl KgPack {
 
         // PR-A1: by-ID edge get returns the edge regardless of namespace.
         if let Some(edge) = self.runtime.get_edge(token, id).await? {
+            if !super::message_scope::message_endpoint_permitted(
+                &self.runtime,
+                registry,
+                token,
+                &mailbox,
+                edge.source_id,
+            )
+            .await?
+                || !super::message_scope::message_endpoint_permitted(
+                    &self.runtime,
+                    registry,
+                    token,
+                    &mailbox,
+                    edge.target_id,
+                )
+                .await?
+            {
+                return Err(RuntimeError::NotFound(id_ref.to_string()));
+            }
             let mut edge_val = to_json(&edge)?;
-            let annotations = self.fetch_edge_annotations(token, id).await?;
+            let annotations = self
+                .fetch_edge_annotations(token, registry, &mailbox, id)
+                .await?;
             if let Some(obj) = edge_val.as_object_mut() {
                 obj.insert("annotations".to_string(), Value::Array(annotations));
             }
@@ -211,8 +249,29 @@ impl KgPack {
                 .await?
                 .filter(|deleted| deleted.namespace == token.namespace().as_str())
             {
+                if !super::message_scope::message_endpoint_permitted(
+                    &self.runtime,
+                    registry,
+                    token,
+                    &mailbox,
+                    deleted.source_id,
+                )
+                .await?
+                    || !super::message_scope::message_endpoint_permitted(
+                        &self.runtime,
+                        registry,
+                        token,
+                        &mailbox,
+                        deleted.target_id,
+                    )
+                    .await?
+                {
+                    return Err(RuntimeError::NotFound(id_ref.to_string()));
+                }
                 let mut edge_val = to_json(&deleted)?;
-                let annotations = self.fetch_edge_annotations(token, id).await?;
+                let annotations = self
+                    .fetch_edge_annotations(token, registry, &mailbox, id)
+                    .await?;
                 if let Some(obj) = edge_val.as_object_mut() {
                     obj.insert("annotations".to_string(), Value::Array(annotations));
                 }
@@ -251,6 +310,8 @@ impl KgPack {
     async fn fetch_edge_annotations(
         &self,
         token: &NamespaceToken,
+        registry: &VerbRegistry,
+        mailbox: &MailboxView,
         edge_id: Uuid,
     ) -> Result<Vec<Value>, RuntimeError> {
         let hits = self
@@ -268,13 +329,26 @@ impl KgPack {
             .get_notes_batch(&note_ids)
             .await
             .map_err(RuntimeError::Storage)?;
-        let note_map: HashMap<Uuid, _> = notes.into_iter().map(|n| (n.id, n)).collect();
+        let mut note_map: HashMap<Uuid, _> = notes.into_iter().map(|n| (n.id, n)).collect();
+        for note_id in note_ids {
+            if let std::collections::hash_map::Entry::Vacant(entry) = note_map.entry(note_id) {
+                if let Some(Resolved::Note(note)) = registry
+                    .resolve_kg_read_by_id(&self.runtime, token, note_id, false)
+                    .await?
+                {
+                    entry.insert(note);
+                }
+            }
+        }
 
         let mut out = Vec::with_capacity(hits.len());
         for hit in hits {
             let Some(note) = note_map.get(&hit.node_id) else {
                 continue;
             };
+            if !mailbox.permits_message_note(token, note) {
+                continue;
+            }
             let mut note_val = remap_note_status(normalize_entity_timestamps(to_json(note)?));
             if let Some(obj) = note_val.as_object_mut() {
                 obj.insert(
@@ -331,23 +405,54 @@ impl KgPack {
 
         Ok(Some(Event {
             id: parse_uuid_column(&row, "id")?,
-            namespace: sql_text(&row, "namespace")?,
-            verb: sql_text(&row, "verb")?,
-            substrate: parse_event_substrate(&sql_text(&row, "substrate")?)
-                .map_err(|_| RuntimeError::Internal("stored event substrate is invalid".into()))?,
-            actor: sql_text(&row, "actor")?,
-            kind: parse_event_kind(&sql_text(&row, "kind")?)
-                .map_err(|_| RuntimeError::Internal("stored event kind is invalid".into()))?,
-            outcome: parse_event_outcome(&sql_text(&row, "outcome")?)
-                .map_err(|_| RuntimeError::Internal("stored event outcome is invalid".into()))?,
-            payload: serde_json::from_str(&sql_text(&row, "payload")?).map_err(|e| {
+            namespace: row
+                .text("namespace")
+                .map(str::to_owned)
+                .map_err(|_| event_column_error(&row, "namespace"))?,
+            verb: row
+                .text("verb")
+                .map(str::to_owned)
+                .map_err(|_| event_column_error(&row, "verb"))?,
+            substrate: parse_event_substrate(
+                &row.text("substrate")
+                    .map(str::to_owned)
+                    .map_err(|_| event_column_error(&row, "substrate"))?,
+            )
+            .map_err(|_| RuntimeError::Internal("stored event substrate is invalid".into()))?,
+            actor: row
+                .text("actor")
+                .map(str::to_owned)
+                .map_err(|_| event_column_error(&row, "actor"))?,
+            kind: parse_event_kind(
+                &row.text("kind")
+                    .map(str::to_owned)
+                    .map_err(|_| event_column_error(&row, "kind"))?,
+            )
+            .map_err(|_| RuntimeError::Internal("stored event kind is invalid".into()))?,
+            outcome: parse_event_outcome(
+                &row.text("outcome")
+                    .map(str::to_owned)
+                    .map_err(|_| event_column_error(&row, "outcome"))?,
+            )
+            .map_err(|_| RuntimeError::Internal("stored event outcome is invalid".into()))?,
+            payload: serde_json::from_str(
+                &row.text("payload")
+                    .map(str::to_owned)
+                    .map_err(|_| event_column_error(&row, "payload"))?,
+            )
+            .map_err(|e| {
                 RuntimeError::Internal(format!("stored event payload is invalid JSON: {e}"))
             })?,
-            payload_schema_version: u32::try_from(sql_i64(&row, "payload_schema_version")?)
-                .map_err(|_| {
-                    RuntimeError::Internal("stored event payload_schema_version is invalid".into())
-                })?,
-            profile_state_version: sql_optional_i64(&row, "profile_state_version")?
+            payload_schema_version: u32::try_from(
+                row.i64("payload_schema_version")
+                    .map_err(|_| event_column_error(&row, "payload_schema_version"))?,
+            )
+            .map_err(|_| {
+                RuntimeError::Internal("stored event payload_schema_version is invalid".into())
+            })?,
+            profile_state_version: row
+                .opt_i64_or_absent("profile_state_version")
+                .map_err(|_| event_column_error(&row, "profile_state_version"))?
                 .map(|v| {
                     u64::try_from(v).map_err(|_| {
                         RuntimeError::Internal(
@@ -356,20 +461,32 @@ impl KgPack {
                     })
                 })
                 .transpose()?,
-            duration_us: sql_i64(&row, "duration_us")?,
+            duration_us: row
+                .i64("duration_us")
+                .map_err(|_| event_column_error(&row, "duration_us"))?,
             target_id: sql_optional_uuid(&row, "target_id")?,
             session_id: sql_optional_uuid(&row, "session_id")?,
-            aggregate_kind: sql_optional_text(&row, "aggregate_kind")?,
+            aggregate_kind: row
+                .opt_text_or_absent("aggregate_kind")
+                .map(|value| value.map(str::to_owned))
+                .map_err(|_| event_column_error(&row, "aggregate_kind"))?,
             aggregate_id: sql_optional_uuid(&row, "aggregate_id")?,
-            created_at: sql_i64(&row, "created_at")?,
-            op_index: sql_optional_i64(&row, "op_index")?
+            created_at: row
+                .i64("created_at")
+                .map_err(|_| event_column_error(&row, "created_at"))?,
+            op_index: row
+                .opt_i64_or_absent("op_index")
+                .map_err(|_| event_column_error(&row, "op_index"))?
                 .map(|value| {
                     u32::try_from(value).map_err(|_| {
                         RuntimeError::Internal("stored event op_index is invalid".into())
                     })
                 })
                 .transpose()?,
-            ref_resolution: sql_optional_text(&row, "ref_resolution")?
+            ref_resolution: row
+                .opt_text_or_absent("ref_resolution")
+                .map(|value| value.map(str::to_owned))
+                .map_err(|_| event_column_error(&row, "ref_resolution"))?
                 .map(|value| {
                     value.parse().map_err(|_| {
                         RuntimeError::Internal("stored event ref_resolution is invalid".into())
@@ -386,10 +503,10 @@ impl KgPack {
     ) -> Result<Option<Value>, RuntimeError> {
         let ns = token.namespace().as_str().to_owned();
 
-        let (sql_str, params) = if Uuid::from_str(raw_id).is_ok() {
+        let (sql_str, params) = if let Ok(id) = Uuid::from_str(raw_id) {
             (
                 sql!("proposals_find_by_id").to_string(),
-                vec![SqlValue::Text(raw_id.to_string()), SqlValue::Text(ns)],
+                vec![SqlValue::Text(id.to_string()), SqlValue::Text(ns)],
             )
         } else if raw_id.len() >= 8 && raw_id.chars().all(|c| c.is_ascii_hexdigit()) {
             let pattern = format!("{}%", hex_prefix_to_uuid_pattern(raw_id));
@@ -499,6 +616,84 @@ impl KgPack {
     }
 }
 
+/// Scope prefix candidates before a resolver can return their IDs. The
+/// lower resolver bounds its ambiguity sample, so a sample containing a
+/// message cannot establish uniqueness after mailbox filtering.
+async fn resolve_get_prefix(
+    runtime: &KhiveRuntime,
+    registry: &VerbRegistry,
+    token: &NamespaceToken,
+    mailbox: &MailboxView,
+    prefix: &str,
+    include_deleted: bool,
+) -> Result<Option<Uuid>, RuntimeError> {
+    let mut ambiguous = false;
+    let candidates = match registry
+        .resolve_kg_read_prefix(runtime, token, prefix, include_deleted)
+        .await
+    {
+        Ok(Some(id)) => vec![id],
+        Ok(None) => return Ok(None),
+        Err(RuntimeError::AmbiguousPrefix { matches, .. }) => {
+            ambiguous = true;
+            matches
+        }
+        Err(error) => return Err(error),
+    };
+    let mut visible = Vec::with_capacity(candidates.len());
+    for id in candidates {
+        let record = registry
+            .resolve_kg_read_by_id(runtime, token, id, include_deleted)
+            .await?;
+        if let Some(Resolved::Note(note)) = record {
+            if ambiguous && note.kind == "message" {
+                return Err(RuntimeError::InvalidInput(
+                    "get: message prefixes matching multiple records require a full UUID; use comm.inbox to find messages".into(),
+                ));
+            }
+            if !mailbox.permits_message_note(token, &note) {
+                continue;
+            }
+        } else if record.is_none() {
+            if let Some(edge) = runtime.get_edge_including_deleted(token, id).await? {
+                if !super::message_scope::message_endpoint_permitted(
+                    runtime,
+                    registry,
+                    token,
+                    mailbox,
+                    edge.source_id,
+                )
+                .await?
+                    || !super::message_scope::message_endpoint_permitted(
+                        runtime,
+                        registry,
+                        token,
+                        mailbox,
+                        edge.target_id,
+                    )
+                    .await?
+                {
+                    if ambiguous {
+                        return Err(RuntimeError::InvalidInput(
+                        "get: this prefix requires a full UUID; use comm.inbox to find messages".into(),
+                    ));
+                    }
+                    continue;
+                }
+            }
+        }
+        visible.push(id);
+    }
+    match visible.len() {
+        0 => Ok(None),
+        1 => Ok(visible.pop()),
+        _ => Err(RuntimeError::AmbiguousPrefix {
+            prefix: prefix.to_string(),
+            matches: visible,
+        }),
+    }
+}
+
 /// Classifies a resolver-arm error as absence (the arm found no single id, so the next
 /// arm is still worth trying) versus failure (the lookup itself could not be performed,
 /// so it must reach the caller as-is instead of being swallowed into a false not-found).
@@ -554,56 +749,35 @@ async fn resolve_id_through_arms(
     }
 }
 
-fn sql_text(row: &SqlRow, name: &str) -> Result<String, RuntimeError> {
-    match row.get(name) {
-        Some(SqlValue::Text(v)) => Ok(v.clone()),
-        Some(other) => Err(RuntimeError::Internal(format!(
-            "events.{name} has unexpected SQL value {other:?}"
-        ))),
-        None => Err(RuntimeError::Internal(format!("events row missing {name}"))),
-    }
-}
-
-fn sql_optional_text(row: &SqlRow, name: &str) -> Result<Option<String>, RuntimeError> {
-    match row.get(name) {
-        Some(SqlValue::Null) | None => Ok(None),
-        Some(SqlValue::Text(v)) => Ok(Some(v.clone())),
-        Some(other) => Err(RuntimeError::Internal(format!(
-            "events.{name} has unexpected SQL value {other:?}"
-        ))),
-    }
-}
-
-fn sql_i64(row: &SqlRow, name: &str) -> Result<i64, RuntimeError> {
-    match row.get(name) {
-        Some(SqlValue::Integer(v)) => Ok(*v),
-        Some(other) => Err(RuntimeError::Internal(format!(
-            "events.{name} has unexpected SQL value {other:?}"
-        ))),
-        None => Err(RuntimeError::Internal(format!("events row missing {name}"))),
-    }
-}
-
-fn sql_optional_i64(row: &SqlRow, name: &str) -> Result<Option<i64>, RuntimeError> {
-    match row.get(name) {
-        Some(SqlValue::Null) | None => Ok(None),
-        Some(SqlValue::Integer(v)) => Ok(Some(*v)),
-        Some(other) => Err(RuntimeError::Internal(format!(
-            "events.{name} has unexpected SQL value {other:?}"
-        ))),
-    }
-}
-
 fn parse_uuid_column(row: &SqlRow, name: &str) -> Result<Uuid, RuntimeError> {
-    Uuid::from_str(&sql_text(row, name)?)
-        .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
+    Uuid::from_str(
+        &row.text(name)
+            .map(str::to_owned)
+            .map_err(|_| event_column_error(row, name))?,
+    )
+    .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
 }
 
 fn sql_optional_uuid(row: &SqlRow, name: &str) -> Result<Option<Uuid>, RuntimeError> {
-    sql_optional_text(row, name)?
+    row.opt_text_or_absent(name)
+        .map(|value| value.map(str::to_owned))
+        .map_err(|_| event_column_error(row, name))?
         .map(|v| {
             Uuid::from_str(&v)
                 .map_err(|e| RuntimeError::Internal(format!("events.{name} is not a UUID: {e}")))
         })
         .transpose()
 }
+
+fn event_column_error(row: &SqlRow, name: &str) -> RuntimeError {
+    match row.get(name) {
+        Some(other) => {
+            RuntimeError::Internal(format!("events.{name} has unexpected SQL value {other:?}"))
+        }
+        None => RuntimeError::Internal(format!("events row missing {name}")),
+    }
+}
+
+#[cfg(test)]
+#[path = "get_column_tests.rs"]
+mod column_tests;

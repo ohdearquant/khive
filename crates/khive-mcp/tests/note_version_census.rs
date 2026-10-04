@@ -7,6 +7,7 @@ use syn::parse::Parser;
 use syn::visit::Visit;
 
 const DB: &str = "khive-db/src/stores/note.rs";
+const MIGRATIONS: &str = "khive-db/src/migrations.rs";
 const EVENTS: &str = "khive-mcp/src/pending_events.rs";
 const GTD: &str = "khive-pack-gtd/src/handlers.rs";
 const GTD_REPAIR: &str = "khive-pack-gtd/src/repair.rs";
@@ -228,6 +229,9 @@ fn assignments_rule_out_version(sql: &str) -> bool {
 fn test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         a.path().is_ident("test")
+            || (a.path().segments.len() == 2
+                && a.path().segments[0].ident == "tokio"
+                && a.path().segments[1].ident == "test")
             || (a.path().is_ident("cfg")
                 && a.parse_args::<syn::Path>()
                     .is_ok_and(|p| p.is_ident("test")))
@@ -429,6 +433,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (DB, "note_set_property_statement"),
         (DB, "note_soft_delete_statement"),
         (DB, "execute_filtered_note_property_patch"),
+        (MIGRATIONS, "migrate_outbound_due_key"),
         (EVENTS, "claim_pending_event"),
         (EVENTS, "mark_dispatch_invoking"),
         (EVENTS, "renew_dispatch_lease"),
@@ -437,7 +442,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (EVENTS, "finalize_corrupt_receipt"),
         (EVENTS, "finalize_firing_event"),
         (GTD, "gtd_transition_statement"),
-        (GTD_REPAIR, "UPDATE_SQL"),
+        (GTD_REPAIR, "checked_update_sql"),
         (SCHEDULE, "cancel_pending_event"),
         (CURATION, "merge_note_sql"),
         (CREATE, "prepare_note_create"),
@@ -445,10 +450,10 @@ fn census() -> BTreeMap<(String, String), String> {
         // Keyed message pairs stamp the caller key onto the outbound note in a
         // second statement, so a freshly created pair settles at version 2. The
         // writer never assigns the column itself; the trigger does.
-        (MESSAGE, "create_keyed_message_pair"),
+        (MESSAGE, "create_keyed_message_pair_with_attachments"),
         // A matching quarantine replay repairs legacy retention metadata in
         // one UPDATE. The note version trigger, not this writer, advances it.
-        (COMM, "handle_ingest"),
+        (COMM, "repair_duplicate_quarantine"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
@@ -517,6 +522,9 @@ fn note_version_production_writers_never_assign_version() {
                 .replace("{p2}", "2")
                 .replace("{p3}", "3")
                 .replace("{p4}", "4")
+                .replace("{p5}", "5")
+                .replace("{p6}", "6")
+                .replace("{p7}", "7")
                 .replace("{where_clause}", "WHERE namespace='local'")
         } else if owner == "restore_note" {
             sql.replace("{key_clause}", "")
@@ -545,6 +553,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
     let writers = census();
     let cases = [
         (DB, "note_update_properties_statement", "memory", "{}"),
+        (MIGRATIONS, "migrate_outbound_due_key", "memory", "{}"),
         (
             EVENTS,
             "requeue_legacy_claim",
@@ -557,7 +566,12 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "task",
             r#"{"status":"inbox"}"#,
         ),
-        (GTD_REPAIR, "UPDATE_SQL", "task", r#"{"status":"archived"}"#),
+        (
+            GTD_REPAIR,
+            "checked_update_sql",
+            "task",
+            r#"{"status":"archived"}"#,
+        ),
         (
             SCHEDULE,
             "cancel_pending_event",
@@ -569,10 +583,15 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         (OPERATIONS, "restore_note", "memory", "{}"),
         // The keyed pair stamps the caller key onto an already-inserted
         // outbound note, so the fixture is a keyless message row.
-        (MESSAGE, "create_keyed_message_pair", "message", "{}"),
+        (
+            MESSAGE,
+            "create_keyed_message_pair_with_attachments",
+            "message",
+            "{}",
+        ),
         (
             COMM,
-            "handle_ingest",
+            "repair_duplicate_quarantine",
             "message",
             r#"{"quarantined":true,"quarantine_content_ref":"census-ref","channel_kind":"email"}"#,
         ),
@@ -594,7 +613,17 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         let sql = &writers[&(file.to_owned(), owner.to_owned())];
         assert_eq!(version(&conn), 1);
         let changed = match file {
-            DB => conn.execute(sql, params![r#"{"checked":true}"#, 200_i64, ID]),
+            DB => conn.execute(
+                sql,
+                params![
+                    r#"{"checked":true}"#,
+                    200_i64,
+                    ID,
+                    rusqlite::types::Null,
+                    rusqlite::types::Null
+                ],
+            ),
+            MIGRATIONS => conn.execute(sql, params![vec![0_u8; 12], "2020-01-01T00:00:00Z", ID]),
             EVENTS => conn.execute(sql, params![200_i64, ID, "local", 100_i64, properties]),
             GTD => conn.execute(
                 sql,
@@ -626,7 +655,10 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                     r#"{"originals":{}}"#,
                 ],
             ),
-            SCHEDULE => conn.execute(sql, params!["2026-09-09T00:00:00Z", 200_i64, ID, "local"]),
+            SCHEDULE => conn.execute(
+                sql,
+                params!["2026-09-09T00:00:00Z", 200_i64, ID, "local", properties],
+            ),
             CURATION => conn.execute(sql, params![200_i64, "local", ID]),
             CREATE => conn.execute(sql, params!["census/key", ID, "local", "memory"]),
             OPERATIONS => conn.execute(
@@ -693,6 +725,45 @@ fn note_version_scanner_controls() {
             "scanner must reject {source}"
         );
     }
+}
+
+#[test]
+fn note_version_scanner_skips_tokio_tests_but_keeps_async_writers() {
+    let mut scanner = Scanner::default();
+    scanner.visit_file(
+        &syn::parse_file(
+            r#"
+        #[tokio::test]
+        async fn fixture() { call("UPDATE notes SET content='fixture'"); }
+        #[tokio::test(flavor = "current_thread")]
+        async fn configured_fixture() { call("UPDATE notes SET content='fixture'"); }
+        #[::tokio::test]
+        async fn absolute_fixture() { call("UPDATE notes SET content='fixture'"); }
+        async fn live() { call("UPDATE notes SET content='live'"); }
+        #[other::test]
+        async fn unknown_attribute() { call("UPDATE notes SET content='live'"); }
+        #[tokio::instrument]
+        async fn another_tokio_attribute() { call("UPDATE notes SET content='live'"); }
+        #[cfg(any(test, feature = "fault-injection"))]
+        async fn feature() { call("UPDATE notes SET content='live' WHERE 1=0"); }
+    "#,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        scanner
+            .statements
+            .iter()
+            .map(|(owner, _)| owner.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "live",
+            "unknown_attribute",
+            "another_tokio_attribute",
+            "feature"
+        ],
+        "skip only the known Tokio test harness; retain every production-capable async writer"
+    );
 }
 
 #[test]

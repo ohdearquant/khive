@@ -105,14 +105,17 @@ URIs, `?` query syntax, and relative paths are refused during parameter validati
 or target filesystem probes. Missing and non-file targets are refused with
 `RuntimeError::InvalidInput` naming the path before the target runtime is constructed. A deliberately
 pre-created empty dedicated file may initialize and migrate. Omitting `db` still creates the default
-`<path>/.khive/code-map.db` when needed. This preflight protects against path typos; it does not pin
-an inode or prevent concurrent unlink/replacement between the check and SQLite open. Both explicit
+`<path>/.khive/code-map.db` when needed. This path-level courtesy preflight protects against path
+typos; it does not pin an inode or prevent concurrent unlink/replacement between the check and
+SQLite open. Both explicit
 and default targets are checked against every production database this process knows: the default
 anchor, its runtime database, every declared backend, each adjacent events database, and their
 SQLite companions. A declared backend reached through a symlink protects companions beside both
-the declared name and its physical database. Target symlinks are checked at their destination,
-including a dangling default-map link. Existing files are compared by file identity to catch hard
-links; missing members use normalized paths. An unrelated database unknown to this process is
+the declared name and its physical database. A target's final-component symlink is refused,
+including a dangling default-map link or a link to an otherwise dedicated map. Symlinks in parent
+directories retain the existing normalized path and identity checks. Existing files are compared by
+file identity to catch hard links; missing members use normalized paths. An unrelated database
+unknown to this process is
 outside this preflight fence.
 
 The dedicated map is an ordinary khive database, not a private code-pack format. Every
@@ -122,6 +125,27 @@ success for an unsearchable map. Point a normal `kkernel` process at the map thr
 `[[backends]]` entry in a selected config to use generic KG reads such as `search`, `resolve`,
 `neighbors`, `traverse`, and `context`. `kkernel code-audit` remains the separate policy-driven,
 read-only report surface for the same database.
+
+L2 recovery records versioned `l2_sweep_runs` entries on each participating project, keyed by
+language. A fresh UUID v4 identifies an invocation independently of its caller-supplied time.
+The attempted marker shares the project mutation that advances `sweep_clock`. Without a valid,
+matching completed predecessor and visible clock, encountered files execute the real parsing,
+persistence and resolution path even when their hashes match. A completed predecessor retains
+the unchanged-file fast path and the exact predecessor-stamp guard for natural edges; recovery
+does not promote removed references, manual edges or unvisited files.
+
+Completion follows all file, pending-write, resolution and edge-refresh work. Only a whole
+manifest-governed owner may complete. Reaching an owner through the directory-name fallback
+disqualifies that owner for the entire invocation: it neither reuses a predecessor nor publishes
+completion, and therefore pays the real re-observation cost on each call. No-L2 calls write no
+L2 markers. A successful completion adds one guarded project mutation, one `projects_updated`
+and one successful `fts_indexed` write, with the corresponding entity revision/version advance.
+
+These guarantees cover sequential invocations, not overlapping writers. A completion row can
+commit before its following FTS write fails: the caller receives the existing error while graph
+completion remains durable. Completion describes observed coverage, including existing read,
+parse and gate skips; skipped files' historical-edge strand and multiple project roots sharing
+one owner (#3752) remain outside the recovery guarantee. See ADR-085 Amendments 14 and 15.
 
 Before each guarded entity insert or replacement, source ingest rejects the runtime-owned
 top-level `khive:secret_gate` property using the shared reservation validator. This includes a

@@ -37,8 +37,16 @@ fn migrate_through(conn: &mut Connection, through_version: u32) {
         .filter(|migration| migration.version <= through_version)
     {
         let tx = conn.transaction().expect("begin historical migration");
-        tx.execute_batch(migration.up)
-            .expect("apply historical migration body");
+        // V44's columns and backfill run in Rust before its index body, as in
+        // the migration runner.
+        if migration.version == 44 {
+            migrate_outbound_due_key(&tx).expect("apply historical migration body");
+        } else if migration.version == 48 {
+            migrate_acknowledgement_journal(&tx).expect("apply historical migration body");
+        } else {
+            tx.execute_batch(migration.up)
+                .expect("apply historical migration body");
+        }
         tx.execute(
             "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, 0)",
             rusqlite::params![migration.version, migration.name],
@@ -1890,6 +1898,153 @@ fn v43_vector_provenance_sidecar_starts_empty() {
     );
 }
 
+#[test]
+fn v46_indexes_memory_visibility_receipts_by_note_id() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("apply core migrations");
+
+    let columns = conn
+        .prepare("SELECT name FROM pragma_index_info('memory_visibility_receipts_note_id') ORDER BY seqno")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(columns, vec!["note_id".to_owned()]);
+
+    let detail: String = conn
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT model_count FROM memory_visibility_receipts WHERE note_id = ?1",
+            ["note-id"],
+            |row| row.get(3),
+        )
+        .unwrap();
+    assert!(
+        detail.contains("USING INDEX memory_visibility_receipts_note_id (note_id=?)"),
+        "note-only lookup must use the receipts index: {detail}"
+    );
+}
+
+#[test]
+fn outbound_due_index_is_versioned_and_raw_migration_connection_can_write() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("apply core migrations on a raw connection");
+
+    let index_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_comm_message_outbound_due'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("outbound due index comes from the numbered migration");
+    assert!(
+        !index_sql.contains("khive_rfc3339_strict_key")
+            && index_sql.contains("due_source = json_extract(properties, '$.next_attempt_at')")
+            && index_sql.contains("substr(json_extract(properties, '$.to_actor')"),
+        "the migrated index must be builtins-only and keep its channel bucket: {index_sql}"
+    );
+    assert!(
+        read_schema_version(&conn).unwrap() > 43,
+        "a pre-index binary must refuse this database at schema-version admission"
+    );
+
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, content, properties, created_at, updated_at) \
+         VALUES ('outbound-due', 'local', 'message', 'queued', \
+                 '{\"direction\":\"outbound\",\"to_actor\":\"channel:mail\",\
+                   \"next_attempt_at\":\"2026-01-01T00:00:00Z\"}', 1, 1)",
+        [],
+    )
+    .expect("raw migration connection writes without a registered function");
+}
+
+#[test]
+fn v44_backfills_strict_due_keys_from_preexisting_notes() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 43);
+    for (id, deadline) in [
+        ("future", "2999-01-01T00:00:00Z"),
+        ("malformed", "not-a-timestamp"),
+    ] {
+        conn.execute(
+            "INSERT INTO notes (id, namespace, kind, content, properties, created_at, updated_at) \
+             VALUES (?1, 'local', 'message', '', ?2, 1, 1)",
+            rusqlite::params![
+                id,
+                serde_json::json!({"next_attempt_at": deadline}).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    run_migrations(&mut conn).expect("V44 backfill");
+    let (key, source): (Option<Vec<u8>>, Option<String>) = conn
+        .query_row(
+            "SELECT strict_due_key, due_source FROM notes WHERE id = 'future'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(key, crate::pool::strict_rfc3339_key("2999-01-01T00:00:00Z"));
+    assert_eq!(source.as_deref(), Some("2999-01-01T00:00:00Z"));
+    let (key, source): (Option<Vec<u8>>, Option<String>) = conn
+        .query_row(
+            "SELECT strict_due_key, due_source FROM notes WHERE id = 'malformed'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((key, source), (None, None));
+}
+
+#[test]
+fn reopened_unregistered_raw_notes_connection_can_delete_check_and_vacuum() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("outbound-due-raw-writer.db");
+    let mut setup = Connection::open(&path).expect("open migration connection");
+    run_migrations(&mut setup).expect("migrate database");
+    drop(setup);
+
+    // This opens the same way as the v13 race's post-migration writers.
+    // No application-defined SQL function is registered on this connection.
+    let conn = Connection::open(&path).expect("open raw notes writer");
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, content, properties, created_at, updated_at) \
+         VALUES ('raw-outbound', 'local', 'message', 'queued', \
+                 '{\"direction\":\"outbound\",\"to_actor\":\"email:recipient\",\
+                   \"next_attempt_at\":\"2999-01-01T00:00:00Z\"}', 1, 1)",
+        [],
+    )
+    .expect("raw writer inserts a note after migration");
+    conn.execute(
+        "INSERT INTO notes \
+         (id, namespace, kind, content, properties, created_at, updated_at) \
+         VALUES ('kept-outbound', 'local', 'message', 'queued', \
+                 '{\"direction\":\"outbound\",\"to_actor\":\"email:recipient\",\
+                   \"next_attempt_at\":\"2999-01-01T00:00:00Z\"}', 2, 2)",
+        [],
+    )
+    .expect("keep a live indexed row across integrity_check and VACUUM");
+    conn.execute(
+        "UPDATE notes SET properties = \
+         '{\"direction\":\"outbound\",\"to_actor\":\"email:recipient\",\
+           \"next_attempt_at\":\"2026-01-01T00:00:00Z\"}' \
+         WHERE id = 'raw-outbound'",
+        [],
+    )
+    .expect("raw writer updates builtins-only index");
+    conn.execute("DELETE FROM notes WHERE id = 'raw-outbound'", [])
+        .expect("raw DELETE needs no application-defined function");
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("raw integrity_check needs no application-defined function");
+    assert_eq!(integrity, "ok");
+    conn.execute_batch("VACUUM")
+        .expect("raw VACUUM needs no application-defined function");
+}
+
 #[cfg(feature = "vectors")]
 #[tokio::test]
 async fn v43_upgrade_preserves_v42_vector_as_unknown_provenance() {
@@ -1947,7 +2102,10 @@ async fn v43_upgrade_preserves_v42_vector_as_unknown_provenance() {
             rusqlite::params![subject_id.to_string(), embedding],
         )
         .expect("write historical vector");
-        assert_eq!(run_migrations(&mut conn).expect("upgrade to V43"), 43);
+        assert_eq!(
+            run_migrations(&mut conn).expect("upgrade to the latest version"),
+            latest_schema_version()
+        );
         assert!(table_exists(&conn, "vector_provenance"));
         let sidecars: i64 = conn
             .query_row("SELECT COUNT(*) FROM vector_provenance", [], |row| {
@@ -5177,4 +5335,274 @@ fn sender_transport_migration_fresh_and_previous_tail() {
         assert_eq!(foreign_keys, 0, "transport rows must outlive note history");
         run_migrations(&mut conn).unwrap();
     }
+}
+
+#[test]
+fn recipient_transport_migration_fresh_and_previous_tail() {
+    for previous in [0, RECIPIENT_TRANSPORT_VERSION - 1] {
+        let mut conn = open_memory();
+        if previous != 0 {
+            migrate_through(&mut conn, previous);
+        }
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+        for table in [
+            "comm_recipient_replay",
+            "comm_recipient_quarantine",
+            "comm_ack_work",
+        ] {
+            assert!(table_exists(&conn, table));
+        }
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM _schema_migrations WHERE version = ?1",
+                [RECIPIENT_TRANSPORT_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name, "recipient_transport");
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+        conn.execute(
+            "INSERT INTO comm_recipient_replay \
+             (sender_agent_id, logical_message_id, recipient_agent_id, recipient_actor, \
+              note_id, disposition, created_at) \
+             VALUES ('sender', 'message', 'recipient', 'lambda:recipient', \
+                     'note', 'stored', 1)",
+            [],
+        )
+        .unwrap();
+        // Remove V45 and every later version so the runner replays a contiguous tail.
+        conn.execute(
+            "DELETE FROM _schema_migrations WHERE version >= ?1",
+            [RECIPIENT_TRANSPORT_VERSION],
+        )
+        .unwrap();
+        assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+        let replay_rows: i64 = conn
+            .query_row("SELECT count(*) FROM comm_recipient_replay", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            replay_rows, 1,
+            "replaying V45 must preserve recipient state"
+        );
+    }
+}
+
+fn acknowledgement_schema(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+    conn.prepare(
+        "SELECT type,name,sql FROM sqlite_master \
+         WHERE tbl_name='comm_ack_work' AND type IN ('table','index') ORDER BY type,name",
+    )
+    .unwrap()
+    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+fn acknowledgement_columns(
+    conn: &Connection,
+    retry_columns: bool,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let columns = if retry_columns {
+        "delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,state,\
+         created_at,updated_at,attempt_count,not_before,retirement_reason"
+    } else {
+        "delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,state,\
+         created_at,updated_at"
+    };
+    conn.prepare(&format!(
+        "SELECT {columns} FROM comm_ack_work ORDER BY delivery_attempt_id"
+    ))
+    .unwrap()
+    .query_map([], |row| {
+        (0..row.as_ref().column_count())
+            .map(|column| row.get(column))
+            .collect()
+    })
+    .unwrap()
+    .collect::<rusqlite::Result<_>>()
+    .unwrap()
+}
+
+#[test]
+fn acknowledgement_journal_upgrade_preserves_every_legacy_column_and_matches_fresh_schema() {
+    let mut upgraded = open_memory();
+    migrate_through(&mut upgraded, 47);
+    for (attempt, state, disposition, created_at, updated_at) in [
+        ("pending-attempt", "pending", "stored", 17, 23),
+        ("finished-attempt", "acknowledged", "quarantined", 31, 47),
+    ] {
+        upgraded
+            .execute(
+                "INSERT INTO comm_ack_work \
+                 (delivery_attempt_id,sender_agent_id,logical_message_id,binding,\
+                  disposition,state,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                rusqlite::params![
+                    attempt,
+                    format!("sender-{attempt}"),
+                    format!("message-{attempt}"),
+                    format!("{{ \"attempt\":\"{attempt}\", \"version\": 1 }}"),
+                    disposition,
+                    state,
+                    created_at,
+                    updated_at
+                ],
+            )
+            .unwrap();
+    }
+    let legacy_rows = acknowledgement_columns(&upgraded, false);
+    assert_eq!(legacy_rows.len(), 2);
+    run_migrations(&mut upgraded).unwrap();
+    assert_eq!(
+        acknowledgement_columns(&upgraded, false),
+        legacy_rows,
+        "upgrading must preserve every legacy acknowledgement column byte for byte"
+    );
+    let mut fresh = open_memory();
+    run_migrations(&mut fresh).unwrap();
+    assert_eq!(
+        acknowledgement_schema(&upgraded),
+        acknowledgement_schema(&fresh),
+        "fresh and upgraded acknowledgement table and index SQL must match"
+    );
+    assert!(acknowledgement_schema(&fresh)
+        .iter()
+        .any(|(_, name, _)| name == "idx_comm_ack_due"));
+    let bookkeeping = upgraded
+        .prepare("SELECT attempt_count,not_before,retirement_reason FROM comm_ack_work")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(bookkeeping, vec![(0, None, None), (0, None, None)]);
+}
+
+#[test]
+fn acknowledgement_journal_tail_replay_preserves_retry_and_terminal_rows() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).unwrap();
+    for (attempt, state, counter, not_before, reason) in [
+        ("pending", "pending", 3, Some(101), None),
+        ("finished", "acknowledged", 7, None, None),
+        (
+            "retired",
+            "retired",
+            11,
+            Some(103),
+            Some("permanent_transport"),
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO comm_ack_work \
+             (delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,\
+              state,created_at,updated_at,attempt_count,not_before,retirement_reason) \
+             VALUES (?1,'sender','message','{\"version\":1}','stored',?2,17,23,?3,?4,?5)",
+            rusqlite::params![attempt, state, counter, not_before, reason],
+        )
+        .unwrap();
+    }
+    let before_rows = acknowledgement_columns(&conn, true);
+    let before_schema = acknowledgement_schema(&conn);
+    conn.execute("DELETE FROM _schema_migrations WHERE version>=45", [])
+        .unwrap();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(
+        acknowledgement_columns(&conn, true),
+        before_rows,
+        "replaying the recipient migration tail must preserve retries and terminal states"
+    );
+    assert_eq!(
+        acknowledgement_schema(&conn),
+        before_schema,
+        "tail replay must restore only the canonical acknowledgement indexes"
+    );
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+    assert_eq!(acknowledgement_columns(&conn, true), before_rows);
+}
+
+fn assert_acknowledgement_journal_partial_columns_refused(with_not_before: bool) {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 47);
+    conn.execute_batch(
+        "ALTER TABLE comm_ack_work ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0",
+    )
+    .unwrap();
+    if with_not_before {
+        conn.execute_batch("ALTER TABLE comm_ack_work ADD COLUMN not_before INTEGER")
+            .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO comm_ack_work \
+         (delivery_attempt_id,sender_agent_id,logical_message_id,binding,disposition,\
+          state,created_at,updated_at,attempt_count) \
+         VALUES ('partial-attempt','original-sender','original-message',\
+                 '{ \"version\": 1, \"transport\": \"original\" }','quarantined',\
+                 'pending',17,23,29)",
+        [],
+    )
+    .unwrap();
+    if with_not_before {
+        conn.execute("UPDATE comm_ack_work SET not_before=103", [])
+            .unwrap();
+    }
+    let before_rows = acknowledgement_columns(&conn, false);
+    let before_schema = acknowledgement_schema(&conn);
+    assert_eq!(before_rows.len(), 1);
+
+    let error = run_migrations(&mut conn)
+        .expect_err("V48 must refuse an acknowledgement table with only some retry columns");
+    assert!(
+        matches!(&error, SqliteError::Migration { version: 48, .. }),
+        "the real migration runner must report V48 refusal: {error:?}"
+    );
+    assert_eq!(
+        acknowledgement_columns(&conn, false),
+        before_rows,
+        "refusal must preserve every stored legacy acknowledgement column"
+    );
+    let attempt_count: i64 = conn
+        .query_row("SELECT attempt_count FROM comm_ack_work", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        attempt_count, 29,
+        "refusal must preserve retries already recorded in the partial schema"
+    );
+    if with_not_before {
+        let not_before: i64 = conn
+            .query_row("SELECT not_before FROM comm_ack_work", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(not_before, 103, "refusal must preserve the retry deadline");
+    }
+    assert_eq!(
+        acknowledgement_schema(&conn),
+        before_schema,
+        "refusal must leave the partial table and indexes untouched"
+    );
+    let latest_applied: u32 = conn
+        .query_row("SELECT max(version) FROM _schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(latest_applied, 47, "refusal must not advance the ledger");
+}
+
+#[test]
+fn acknowledgement_journal_partial_one_column_refuses_without_changing_rows() {
+    assert_acknowledgement_journal_partial_columns_refused(false);
+}
+
+#[test]
+fn acknowledgement_journal_partial_two_columns_refuses_without_changing_rows() {
+    assert_acknowledgement_journal_partial_columns_refused(true);
 }

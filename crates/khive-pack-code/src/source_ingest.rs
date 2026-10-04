@@ -28,6 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::hash::Hash;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -645,11 +646,24 @@ fn declared_project_import_target_and_scope(
     }
     let normalized_target = target_project.replace('-', "_");
     let matches: Vec<_> = manifest_scopes
-        .iter()
-        .filter(|((source, declared_language, declared_target), _)| {
-            source == source_project
-                && declared_language == language
-                && declared_target.replace('-', "_") == normalized_target
+        .range(
+            (
+                source_project.to_owned(),
+                language.to_owned(),
+                String::new(),
+            )..,
+        )
+        .inspect(|_| {
+            #[cfg(test)]
+            l2_batch_tests::observe_manifest_visit();
+        })
+        .take_while(|((source, declared_language, _), _)| {
+            source == source_project && declared_language == language
+        })
+        .filter(|((_, _, declared_target), _)| {
+            #[cfg(test)]
+            l2_batch_tests::observe_manifest_normalization();
+            declared_target.replace('-', "_") == normalized_target
         })
         .collect();
 
@@ -795,6 +809,10 @@ async fn index_entity(
         .upsert_document(entity_fts_document(entity))
         .await
         .map_err(|e| CodeSourceIngestError::Storage(format!("entity FTS indexing: {e}")))?;
+    #[cfg(test)]
+    l2_batch_tests::observe_fts_write(entity.id);
+    #[cfg(test)]
+    l2_recovery_tests::observe_fts_write();
     report.fts_indexed += 1;
     Ok(())
 }
@@ -842,6 +860,8 @@ where
             .await
             .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
         #[cfg(test)]
+        l2_batch_tests::observe_row_read(id);
+        #[cfg(test)]
         race_seam::pause_after_row_read().await;
         let Some(mut replacement) = apply(current.as_ref()) else {
             return Ok(RowMutationOutcome::Unchanged);
@@ -853,6 +873,7 @@ where
             )));
         }
         replacement.deleted_at = None;
+        secret_gate::reject_reserved_secret_gate_property(replacement.properties.as_ref())?;
 
         let outcome = if let Some(snapshot) = current.as_ref() {
             replacement.created_at = snapshot.created_at;
@@ -883,6 +904,10 @@ where
         };
 
         if let Some(outcome) = outcome {
+            #[cfg(test)]
+            l2_batch_tests::observe_row_write(id);
+            #[cfg(test)]
+            l2_recovery_tests::after_entity_commit(&replacement);
             index_entity(rt, token, &replacement, report).await?;
             return Ok(outcome);
         }
@@ -938,6 +963,8 @@ where
                 .then_some(RowMutationOutcome::Created)
         };
         if let Some(outcome) = outcome {
+            #[cfg(test)]
+            l2_recovery_tests::after_edge_commit(id).await;
             return Ok(outcome);
         }
     }
@@ -991,9 +1018,8 @@ fn ts(dt: DateTime<Utc>) -> i64 {
     dt.timestamp_micros()
 }
 
-/// Capture the old project/language clock before any tier in this invocation
-/// advances it. A missing or malformed clock cannot authorize refreshing
-/// historical L2 edges.
+/// Capture completed predecessor authority before any selected tier advances
+/// the visible project clock (ADR-085 Amendments 14 and 15).
 async fn capture_previous_l2_sweep_stamp(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1005,23 +1031,17 @@ async fn capture_previous_l2_sweep_stamp(
         source_project: name.to_string(),
         language: language.to_string(),
     };
-    if previous_stamps.contains_key(&owner) {
+    if previous_stamps.stamps.contains_key(&owner) {
         return Ok(());
     }
     let stamp = get_entity_opt(rt, token, project_uuid(name))
         .await?
         .and_then(|project| {
-            project
-                .properties
-                .and_then(|properties| properties.get("sweep_clock").cloned())
-                .and_then(|clock| {
-                    clock
-                        .get(language)
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
+            project.properties.as_ref().and_then(|properties| {
+                completed_l2_sweep_stamp(properties, language).map(str::to_string)
+            })
         });
-    previous_stamps.insert(owner, stamp);
+    previous_stamps.stamps.insert(owner, stamp);
     Ok(())
 }
 
@@ -1070,6 +1090,31 @@ async fn upsert_project(
         props.insert("source_project".into(), json!(name));
         props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
         props.insert("sweep_clock".into(), Value::Object(sweep_clock));
+        if capture_previous_l2_sweep {
+            let mut runs = props
+                .get("l2_sweep_runs")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let completed = runs
+                .get(language)
+                .filter(|entry| valid_l2_sweep_entry(entry))
+                .and_then(|entry| entry.get("completed"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            runs.insert(
+                language.to_string(),
+                json!({
+                    "version": 1,
+                    "attempted": {
+                        "run_id": previous_l2_sweep_stamps.run_id.to_string(),
+                        "sweep_time": sweep_time.to_rfc3339(),
+                    },
+                    "completed": completed,
+                }),
+            );
+            props.insert("l2_sweep_runs".into(), Value::Object(runs));
+        }
         entity.id = id;
         entity.namespace = token.namespace().as_str().to_string();
         entity.kind = "project".to_string();
@@ -1125,7 +1170,7 @@ async fn ensure_project_id(
         file_label,
         language,
         sweep_time,
-        per_language_project_stamps,
+        per_language_project_stamps && language == "rust",
         previous_l2_sweep_stamps,
         report,
     )
@@ -1514,7 +1559,7 @@ async fn reresolve_pass(
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT id, kind, properties FROM entities WHERE namespace=?1 \
+            sql: "SELECT id FROM entities WHERE namespace=?1 \
                   AND deleted_at IS NULL \
                   AND json_extract(properties,'$.unresolved_specifiers') IS NOT NULL"
                 .into(),
@@ -2329,7 +2374,7 @@ pub async fn run_code_ingest(
                 &file_label,
                 m.language,
                 opts.sweep_time,
-                opts.enable_l2,
+                opts.enable_l2 && m.language == "rust",
                 &mut previous_l2_sweep_stamps,
                 &mut report,
             )
@@ -2459,6 +2504,17 @@ pub async fn run_code_ingest(
             opts.sweep_time,
             &previous_l2_sweep_stamps,
             &mut state,
+            &mut report,
+        )
+        .await?;
+        #[cfg(test)]
+        l2_recovery_tests::before_completion().await;
+        complete_l2_sweeps(
+            rt,
+            token,
+            opts.sweep_time,
+            &previous_l2_sweep_stamps,
+            &state,
             &mut report,
         )
         .await?;
@@ -2715,10 +2771,76 @@ struct L2OwnerKey {
     language: String,
 }
 
-type PreviousL2SweepStamps = HashMap<L2OwnerKey, Option<String>>;
+struct PreviousL2SweepStamps {
+    run_id: Uuid,
+    stamps: HashMap<L2OwnerKey, Option<String>>,
+}
+
+impl PreviousL2SweepStamps {
+    fn new() -> Self {
+        Self {
+            run_id: Uuid::new_v4(),
+            stamps: HashMap::new(),
+        }
+    }
+
+    fn get(&self, owner: &L2OwnerKey) -> Option<&Option<String>> {
+        self.stamps.get(owner)
+    }
+}
+
+fn valid_l2_run_marker(marker: &Value) -> bool {
+    let Some(fields) = marker.as_object() else {
+        return false;
+    };
+    if fields.len() != 2 || fields.get("sweep_time").and_then(Value::as_str).is_none() {
+        return false;
+    }
+    fields
+        .get("run_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            Uuid::parse_str(id).is_ok_and(|uuid| {
+                uuid.get_version() == Some(uuid::Version::Random)
+                    && uuid.get_variant() == uuid::Variant::RFC4122
+                    && uuid.to_string() == id
+            })
+        })
+}
+
+fn valid_l2_sweep_entry(entry: &Value) -> bool {
+    entry.as_object().is_some_and(|fields| {
+        fields.len() == 3
+            && fields.get("version").and_then(Value::as_u64) == Some(1)
+            && fields.get("attempted").is_some_and(valid_l2_run_marker)
+            && fields
+                .get("completed")
+                .is_some_and(|marker| marker.is_null() || valid_l2_run_marker(marker))
+    })
+}
+
+fn completed_l2_sweep_stamp<'a>(properties: &'a Value, language: &str) -> Option<&'a str> {
+    let entry = properties
+        .get("l2_sweep_runs")?
+        .as_object()?
+        .get(language)?;
+    if !valid_l2_sweep_entry(entry) || entry.get("completed")? != entry.get("attempted")? {
+        return None;
+    }
+    let stamp = entry.get("completed")?.get("sweep_time")?.as_str()?;
+    (properties.get("sweep_clock")?.get(language)?.as_str()? == stamp).then_some(stamp)
+}
+
+#[derive(Debug)]
+struct L2OwnerCoverage {
+    whole: bool,
+    fallback: bool,
+    file_label: String,
+}
 
 #[derive(Debug, Default)]
 struct L2SweepState {
+    owners: HashMap<L2OwnerKey, L2OwnerCoverage>,
     /// Declarations proven current by this L2 invocation, never ambient
     /// ownership left by a prior sweep or an earlier tier in this call.
     current_declarations: HashMap<Uuid, L2OwnerKey>,
@@ -2730,6 +2852,51 @@ struct L2SweepState {
     /// Natural L2 dependency/implementation edges successfully stamped this
     /// sweep; this set is the authority for `symbol_edges_stamped`.
     stamped_edge_ids: BTreeSet<Uuid>,
+}
+
+async fn complete_l2_sweeps(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    sweep_time: DateTime<Utc>,
+    previous_stamps: &PreviousL2SweepStamps,
+    state: &L2SweepState,
+    report: &mut CodeSourceIngestReport,
+) -> Result<(), CodeSourceIngestError> {
+    let run_id = previous_stamps.run_id.to_string();
+    for (owner, coverage) in &state.owners {
+        if !coverage.whole || coverage.fallback {
+            continue;
+        }
+        let outcome = mutate_entity(
+            rt,
+            token,
+            project_uuid(&owner.source_project),
+            &coverage.file_label,
+            report,
+            |current| {
+                let mut entity = current?.clone();
+                let props = entity.properties.as_mut()?.as_object_mut()?;
+                let runs = props.get_mut("l2_sweep_runs")?.as_object_mut()?;
+                let entry = runs.get_mut(&owner.language)?;
+                if !valid_l2_sweep_entry(entry)
+                    || entry["attempted"]["run_id"].as_str() != Some(run_id.as_str())
+                {
+                    return None;
+                }
+                entry["completed"] = json!({
+                    "run_id": run_id,
+                    "sweep_time": sweep_time.to_rfc3339(),
+                });
+                entity.updated_at = ts(sweep_time);
+                Some(entity)
+            },
+        )
+        .await?;
+        if outcome.wrote() {
+            report.projects_updated += 1;
+        }
+    }
+    Ok(())
 }
 
 impl L2SweepState {
@@ -3022,7 +3189,7 @@ fn push_module_path_variants(paths: &mut Vec<String>, path: String) {
 /// *declaring* symbol entity (mirrors L1.5's `UnresolvedSpec` on
 /// project/module entities). Kept content-hash-free by the same design: only
 /// the fields needed to retry resolution are stored.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 struct L2UnresolvedRef {
     segments: Vec<String>,
     evidence: String,
@@ -3035,49 +3202,10 @@ fn read_l2_unresolved(properties: &Value) -> Vec<L2UnresolvedRef> {
         .unwrap_or_default()
 }
 
-/// Records `reference` on `entity_id`'s pending list (deduped). Returns
-/// `true` only when the reference was newly recorded — callers use this to
-/// count *unique* unresolved references, matching an already-pending
-/// reference re-observed on a later sweep costing nothing extra.
-async fn record_l2_unresolved(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    entity_id: Uuid,
-    reference: L2UnresolvedRef,
-    file_label: &str,
-    report: &mut CodeSourceIngestReport,
-) -> Result<bool, CodeSourceIngestError> {
-    let outcome = mutate_entity(rt, token, entity_id, file_label, report, |current| {
-        let mut entity = current?.clone();
-        let mut list = entity
-            .properties
-            .as_ref()
-            .map(read_l2_unresolved)
-            .unwrap_or_default();
-        if list.contains(&reference) {
-            return None;
-        }
-        list.push(reference.clone());
-        let mut props = entity
-            .properties
-            .clone()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default();
-        props.insert(
-            "l2_unresolved_references".into(),
-            serde_json::to_value(&list).expect("serializes"),
-        );
-        entity.properties = Some(Value::Object(props));
-        Some(entity)
-    })
-    .await?;
-    Ok(outcome.wrote())
-}
-
 /// Attempt immediate same-project resolution of one call/type reference
 /// declared by `declaring_id`; on success upserts (or refreshes) a
-/// `depends_on` edge with the given evidence, on failure records a pending
-/// reference for the reresolve pass. Nonfatal either way.
+/// `depends_on` edge with the given evidence, on failure stages a pending
+/// reference for the phase-local flush and reresolve pass. Nonfatal either way.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_l2_reference(
     rt: &KhiveRuntime,
@@ -3089,13 +3217,12 @@ async fn resolve_l2_reference(
     current_file_ids: &BTreeSet<Uuid>,
     segments: &[String],
     evidence: &str,
-    file_label: &str,
     sweep_time: DateTime<Utc>,
     state: &mut L2SweepState,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
+) -> Result<Option<L2UnresolvedRef>, CodeSourceIngestError> {
     if segments.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let mut target = None;
     let mut suppressed_self_type = false;
@@ -3135,11 +3262,11 @@ async fn resolve_l2_reference(
                 segments: segments.to_vec(),
                 evidence: evidence.to_string(),
             };
-            record_l2_unresolved(rt, token, declaring_id, reference, file_label, report).await?;
+            return Ok(Some(reference));
         }
         None => {}
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Sorted-set-union evidence merge for one L2 `depends_on` edge — repeated
@@ -3262,7 +3389,7 @@ async fn upsert_l2_implements(
 /// Attempt immediate same-project resolution of one positive `impl Trait for
 /// Type`. Unlike a call/type reference, an impl has no declaring storage
 /// entity of its own, so a failed
-/// resolution is recorded as a pending impl on the *file module* instead,
+/// resolution is staged as a pending impl on the *file module* instead,
 /// for the reresolve pass to retry.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_l2_implements(
@@ -3270,18 +3397,16 @@ async fn resolve_l2_implements(
     token: &NamespaceToken,
     source_project: &str,
     language: &str,
-    module_id: Uuid,
     containing_module_path: &str,
     current_file_ids: &BTreeSet<Uuid>,
     type_path: &[String],
     trait_path: &[String],
-    file_label: &str,
     sweep_time: DateTime<Utc>,
     state: &mut L2SweepState,
     report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
+) -> Result<Option<L2PendingImpl>, CodeSourceIngestError> {
     if type_path.is_empty() || trait_path.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let type_id = find_first_current(
         state,
@@ -3317,19 +3442,13 @@ async fn resolve_l2_implements(
             .await?;
         }
         _ => {
-            record_l2_pending_impl(
-                rt,
-                token,
-                module_id,
-                type_path.to_vec(),
-                trait_path.to_vec(),
-                file_label,
-                report,
-            )
-            .await?;
+            return Ok(Some(L2PendingImpl {
+                type_path: type_path.to_vec(),
+                trait_path: trait_path.to_vec(),
+            }));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 fn find_first_current(
@@ -3348,7 +3467,7 @@ fn find_first_current(
 /// module* entity that declared it (mirrors [`L2UnresolvedRef`] on symbol
 /// entities — see [`resolve_l2_implements`]'s doc comment for why the
 /// attachment point differs).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 struct L2PendingImpl {
     type_path: Vec<String>,
     trait_path: Vec<String>,
@@ -3361,43 +3480,166 @@ fn read_l2_pending_impls(properties: &Value) -> Vec<L2PendingImpl> {
         .unwrap_or_default()
 }
 
-async fn record_l2_pending_impl(
+#[derive(Clone)]
+struct PendingL2<T> {
+    value: T,
+    file: String,
+}
+
+fn append_l2_pending<T: Clone + Eq + Hash>(list: &mut Vec<T>, additions: &[T]) -> usize {
+    let mut seen: HashSet<T> = list.iter().cloned().collect();
+    let mut appended = 0;
+    for addition in additions {
+        if seen.insert(addition.clone()) {
+            list.push(addition.clone());
+            appended += 1;
+        }
+    }
+    appended
+}
+
+fn rebase_l2_pending<T: Clone + Eq + Hash>(
+    current: &mut Vec<T>,
+    original: &HashSet<T>,
+    remaining: &[T],
+) {
+    current.retain(|value| !original.contains(value));
+    append_l2_pending(current, remaining);
+}
+
+async fn record_l2_pending_batch<T>(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
-    module_id: Uuid,
-    type_path: Vec<String>,
-    trait_path: Vec<String>,
-    file_label: &str,
+    id: Uuid,
+    key: &str,
+    pending: &[PendingL2<T>],
     report: &mut CodeSourceIngestReport,
-) -> Result<bool, CodeSourceIngestError> {
-    let entry = L2PendingImpl {
-        type_path,
-        trait_path,
-    };
-    let outcome = mutate_entity(rt, token, module_id, file_label, report, |current| {
-        let mut module = current?.clone();
-        let mut list = module
+) -> Result<bool, CodeSourceIngestError>
+where
+    T: Clone + Eq + Hash + serde::Serialize + serde::de::DeserializeOwned,
+{
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    let read_list = |entity: &Entity| -> Vec<T> {
+        entity
             .properties
             .as_ref()
-            .map(read_l2_pending_impls)
-            .unwrap_or_default();
-        if list.contains(&entry) {
+            .and_then(|props| props.get(key))
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
+    };
+    let Some(current) = rt
+        .entities(token)?
+        .get_entity_including_deleted(id)
+        .await
+        .map_err(|error| CodeSourceIngestError::Storage(error.to_string()))?
+    else {
+        return Ok(false);
+    };
+    #[cfg(test)]
+    l2_batch_tests::observe_row_read(id);
+    let existing: HashSet<T> = read_list(&current).into_iter().collect();
+    if pending.iter().all(|item| existing.contains(&item.value)) {
+        return Ok(false);
+    }
+    advancing_entity_revision(current.updated_at, current.updated_at)?;
+    if let Err(error) = gate_check(&current) {
+        match error {
+            RuntimeError::SecretDetected(secret) => {
+                for item in pending
+                    .iter()
+                    .filter(|item| !existing.contains(&item.value))
+                {
+                    report.blocked_count += 1;
+                    report.blocked.push(BlockedWrite {
+                        file: item.file.clone(),
+                        detector: secret.detector.to_string(),
+                        masked_excerpt: secret.masked.clone(),
+                    });
+                }
+                return Ok(false);
+            }
+            other => return Err(other.into()),
+        }
+    }
+    let mut allowed = Vec::new();
+    let mut occurrences = Vec::new();
+    let mut seen = existing.clone();
+    for item in pending {
+        if existing.contains(&item.value) {
+            continue;
+        }
+        if seen.contains(&item.value) {
+            occurrences.push(item);
+            continue;
+        }
+        match secret_gate::check_json_at(
+            &serde_json::to_value(&item.value).expect("serializes"),
+            "entity",
+            "properties",
+        ) {
+            Ok(()) => {
+                seen.insert(item.value.clone());
+                allowed.push(item.value.clone());
+                occurrences.push(item);
+            }
+            Err(RuntimeError::SecretDetected(secret)) => {
+                report.blocked_count += 1;
+                report.blocked.push(BlockedWrite {
+                    file: item.file.clone(),
+                    detector: secret.detector.to_string(),
+                    masked_excerpt: secret.masked,
+                });
+            }
+            Err(other) => return Err(other.into()),
+        }
+    }
+    if allowed.is_empty() {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    l2_batch_tests::pause_before_batch().await;
+    let mut attempted_files = Vec::new();
+    let outcome = mutate_entity(rt, token, id, &pending[0].file, report, |current| {
+        attempted_files.clear();
+        let mut entity = current?.clone();
+        let mut list = read_list(&entity);
+        let present: HashSet<T> = list.iter().cloned().collect();
+        attempted_files.extend(
+            occurrences
+                .iter()
+                .filter(|item| !present.contains(&item.value))
+                .map(|item| item.file.clone()),
+        );
+        if append_l2_pending(&mut list, &allowed) == 0 {
             return None;
         }
-        list.push(entry.clone());
-        let mut props = module
+        let mut props = entity
             .properties
             .clone()
             .and_then(|value| value.as_object().cloned())
             .unwrap_or_default();
-        props.insert(
-            "l2_pending_impls".into(),
-            serde_json::to_value(&list).expect("serializes"),
-        );
-        module.properties = Some(Value::Object(props));
-        Some(module)
+        props.insert(key.into(), serde_json::to_value(list).expect("serializes"));
+        entity.properties = Some(Value::Object(props));
+        Some(entity)
     })
     .await?;
+    if outcome == RowMutationOutcome::Blocked {
+        let refusal = report
+            .blocked
+            .pop()
+            .expect("blocked mutation records refusal");
+        report.blocked_count -= 1;
+        for file in attempted_files {
+            report.blocked_count += 1;
+            report.blocked.push(BlockedWrite {
+                file,
+                detector: refusal.detector.clone(),
+                masked_excerpt: refusal.masked_excerpt.clone(),
+            });
+        }
+    }
     Ok(outcome.wrote())
 }
 
@@ -3808,8 +4050,9 @@ async fn persist_l2_file(
         )
         .await?;
 
+        let mut pending_references = Vec::new();
         for call in &decl.calls {
-            resolve_l2_reference(
+            if let Some(reference) = resolve_l2_reference(
                 rt,
                 token,
                 source_project,
@@ -3819,15 +4062,20 @@ async fn persist_l2_file(
                 &current_file_ids,
                 &call.segments,
                 "call",
-                file_label,
                 sweep_time,
                 state,
                 report,
             )
-            .await?;
+            .await?
+            {
+                pending_references.push(PendingL2 {
+                    value: reference,
+                    file: file_label.to_owned(),
+                });
+            }
         }
         for type_ref in &decl.type_refs {
-            resolve_l2_reference(
+            if let Some(reference) = resolve_l2_reference(
                 rt,
                 token,
                 source_project,
@@ -3837,35 +4085,63 @@ async fn persist_l2_file(
                 &current_file_ids,
                 &type_ref.segments,
                 "type_reference",
-                file_label,
                 sweep_time,
                 state,
                 report,
             )
-            .await?;
+            .await?
+            {
+                pending_references.push(PendingL2 {
+                    value: reference,
+                    file: file_label.to_owned(),
+                });
+            }
         }
-    }
-
-    // Phase C: positive trait implementations.
-    for imp in &parsed.impls {
-        let containing_module_path = resolve_module_path(module_path, &imp.module_segments);
-        resolve_l2_implements(
+        record_l2_pending_batch(
             rt,
             token,
-            source_project,
-            language,
-            module_id,
-            &containing_module_path,
-            &current_file_ids,
-            &imp.type_path,
-            &imp.trait_path,
-            file_label,
-            sweep_time,
-            state,
+            *id,
+            "l2_unresolved_references",
+            &pending_references,
             report,
         )
         .await?;
     }
+
+    // Phase C: positive trait implementations.
+    let mut pending_impls = Vec::new();
+    for imp in &parsed.impls {
+        let containing_module_path = resolve_module_path(module_path, &imp.module_segments);
+        if let Some(entry) = resolve_l2_implements(
+            rt,
+            token,
+            source_project,
+            language,
+            &containing_module_path,
+            &current_file_ids,
+            &imp.type_path,
+            &imp.trait_path,
+            sweep_time,
+            state,
+            report,
+        )
+        .await?
+        {
+            pending_impls.push(PendingL2 {
+                value: entry,
+                file: file_label.to_owned(),
+            });
+        }
+    }
+    record_l2_pending_batch(
+        rt,
+        token,
+        module_id,
+        "l2_pending_impls",
+        &pending_impls,
+        report,
+    )
+    .await?;
 
     declaration_ids.sort();
     declaration_ids.dedup();
@@ -3962,17 +4238,48 @@ async fn run_l2_sweep(
     record_manifest_failures(report, failures);
     let manifest_index = manifest::ManifestIndex::new(&manifests);
 
-    for file in files {
-        let Some(file_dir) = file.parent() else {
-            continue;
-        };
-        let governing = manifest_index.governing(file_dir, &canonical_ingest_root, LANGUAGE);
-        let (proj_root, proj_name) = governing.unwrap_or_else(|| {
-            (
-                canonical_ingest_root.clone(),
-                basename_project_name(ingest_root),
-            )
-        });
+    // Resolve every encountered owner before any unchanged-file decision.
+    // A later fallback file disqualifies the owner for the whole invocation,
+    // including files encountered earlier through a governing manifest.
+    let files: Vec<_> = files
+        .into_iter()
+        .filter_map(|file| {
+            let governing =
+                manifest_index.governing(file.parent()?, &canonical_ingest_root, LANGUAGE);
+            let fallback = governing.is_none();
+            let (proj_root, proj_name) = governing.unwrap_or_else(|| {
+                (
+                    canonical_ingest_root.clone(),
+                    basename_project_name(ingest_root),
+                )
+            });
+            let owner = L2OwnerKey {
+                source_project: proj_name.clone(),
+                language: LANGUAGE.to_string(),
+            };
+            let whole = proj_root.starts_with(&canonical_ingest_root);
+            state
+                .owners
+                .entry(owner.clone())
+                .and_modify(|coverage| {
+                    coverage.whole &= whole;
+                    coverage.fallback |= fallback;
+                })
+                .or_insert_with(|| L2OwnerCoverage {
+                    whole,
+                    fallback,
+                    file_label: file.display().to_string(),
+                });
+            if fallback {
+                // This also discards authority captured by an earlier L1 or
+                // L1.5 upsert. Completion retention is a separate decision.
+                previous_l2_sweep_stamps.stamps.insert(owner, None);
+            }
+            Some((file, proj_root, proj_name))
+        })
+        .collect();
+
+    for (file, proj_root, proj_name) in files {
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, LANGUAGE) else {
             report.files_skipped_without_module_path += 1;
             continue;
@@ -4005,6 +4312,8 @@ async fn run_l2_sweep(
 
         let file_for_read = file.clone();
         let root_for_read = canonical_ingest_root.clone();
+        #[cfg(test)]
+        l2_recovery_tests::before_source_read(&file).await;
         let source =
             match blocking_io(move || read_l2_source(&root_for_read, &file_for_read)).await? {
                 Ok(source) => source,
@@ -4018,7 +4327,16 @@ async fn run_l2_sweep(
 
         let precomputed_module_id = module_uuid(&proj_name, LANGUAGE, &module_path);
         let existing_module = get_entity_opt(rt, token, precomputed_module_id).await?;
-        let needs_reparse = refused
+        let owner = L2OwnerKey {
+            source_project: proj_name.clone(),
+            language: LANGUAGE.to_string(),
+        };
+        let recovering = previous_l2_sweep_stamps
+            .get(&owner)
+            .and_then(Option::as_ref)
+            .is_none();
+        let needs_reparse = recovering
+            || refused
             || l2_needs_reparse(
                 existing_module
                     .as_ref()
@@ -4102,7 +4420,12 @@ async fn run_l2_sweep(
 
         clear_l2_ownership(rt, token, module_id, &file_label, report).await?;
         let parse_result = match source {
-            L2Source::Ready { content, .. } => parse_rust_file_on_worker(content).await,
+            L2Source::Ready { content, .. } => {
+                let result = parse_rust_file_on_worker(content).await;
+                #[cfg(test)]
+                l2_recovery_tests::observe_parse(&file);
+                result
+            }
             L2Source::Refused { reason, .. } => Err(reason),
         };
         if let Some(declaration_ids) = persist_l2_file(
@@ -4370,7 +4693,7 @@ async fn l2_reresolve_pass(
         if pending.is_empty() {
             continue;
         }
-        let original_pending = pending.clone();
+        let original_pending: HashSet<_> = pending.iter().cloned().collect();
         let mut still_pending = Vec::new();
         let mut pending_changed = false;
         for reference in pending {
@@ -4422,6 +4745,8 @@ async fn l2_reresolve_pass(
         }
         if pending_changed {
             let label = id.to_string();
+            #[cfg(test)]
+            l2_batch_tests::pause_before_rebase().await;
             mutate_entity(rt, token, id, &label, report, |current| {
                 let mut entity = current?.clone();
                 let mut rebased = entity
@@ -4429,12 +4754,7 @@ async fn l2_reresolve_pass(
                     .as_ref()
                     .map(read_l2_unresolved)
                     .unwrap_or_default();
-                rebased.retain(|reference| !original_pending.contains(reference));
-                for reference in &still_pending {
-                    if !rebased.contains(reference) {
-                        rebased.push(reference.clone());
-                    }
-                }
+                rebase_l2_pending(&mut rebased, &original_pending, &still_pending);
                 let mut props = entity
                     .properties
                     .clone()
@@ -4515,7 +4835,7 @@ async fn l2_reresolve_pass(
         if pending.is_empty() {
             continue;
         }
-        let original_pending = pending.clone();
+        let original_pending: HashSet<_> = pending.iter().cloned().collect();
         let mut still_pending = Vec::new();
         let mut resolved_any = false;
         for entry in pending {
@@ -4561,6 +4881,8 @@ async fn l2_reresolve_pass(
         }
         if resolved_any {
             let label = module_id.to_string();
+            #[cfg(test)]
+            l2_batch_tests::pause_before_rebase().await;
             mutate_entity(rt, token, module_id, &label, report, |current| {
                 let mut module = current?.clone();
                 let mut rebased = module
@@ -4568,12 +4890,7 @@ async fn l2_reresolve_pass(
                     .as_ref()
                     .map(read_l2_pending_impls)
                     .unwrap_or_default();
-                rebased.retain(|entry| !original_pending.contains(entry));
-                for entry in &still_pending {
-                    if !rebased.contains(entry) {
-                        rebased.push(entry.clone());
-                    }
-                }
+                rebase_l2_pending(&mut rebased, &original_pending, &still_pending);
                 let mut props = module
                     .properties
                     .clone()
@@ -4607,8 +4924,23 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
 }
 
 #[cfg(test)]
+#[path = "source_ingest/owner_alias_tests.rs"]
+mod owner_alias_tests;
+
+#[cfg(test)]
+#[path = "source_ingest/reresolve_projection_tests.rs"]
+mod reresolve_projection_tests;
+
+#[cfg(test)]
+mod l2_batch_tests;
+
+#[cfg(test)]
+mod l2_recovery_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use khive_db::StorageBackend;
     use khive_runtime::{Namespace, RuntimeConfig};
     use tempfile::TempDir;
 
@@ -4631,6 +4963,63 @@ mod tests {
             ..RuntimeConfig::no_embeddings()
         })
         .expect("target runtime opens");
+        let token = runtime.authorize(Namespace::local()).expect("token");
+        (runtime, token)
+    }
+
+    #[derive(Clone, Copy)]
+    pub(super) enum TestJournalMode {
+        Wal,
+        Delete,
+    }
+
+    impl TestJournalMode {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Wal => "wal",
+                Self::Delete => "delete",
+            }
+        }
+
+        fn wal_mode(self) -> bool {
+            matches!(self, Self::Wal)
+        }
+    }
+
+    pub(super) fn runtime_on_with_mode(
+        db_path: &Path,
+        mode: TestJournalMode,
+    ) -> (KhiveRuntime, NamespaceToken) {
+        let backend = Arc::new(
+            StorageBackend::sqlite_for_test_with_journal_mode(
+                db_path,
+                mode.wal_mode(),
+                std::time::Duration::from_secs(5),
+            )
+            .expect("target backend opens"),
+        );
+        backend.prepare_core_schema().expect("fresh schema");
+        let runtime = KhiveRuntime::from_prepared_backend(
+            backend,
+            RuntimeConfig {
+                db_path: Some(db_path.to_path_buf()),
+                packs: vec![],
+                ..RuntimeConfig::no_embeddings()
+            },
+        )
+        .expect("target runtime opens");
+        let writer = runtime.backend().pool().writer().expect("writer");
+        let actual_mode: String = writer
+            .conn()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal mode");
+        let busy_timeout_ms: i64 = writer
+            .conn()
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy timeout");
+        assert_eq!(actual_mode.to_ascii_lowercase(), mode.label());
+        assert_eq!(busy_timeout_ms, 5_000);
+        drop(writer);
         let token = runtime.authorize(Namespace::local()).expect("token");
         (runtime, token)
     }
@@ -4936,11 +5325,12 @@ mod tests {
         assert_eq!(report.l2.expect("L2 report").symbols_created, 0);
     }
 
-    #[tokio::test]
-    async fn concurrent_unresolved_additions_rebase_without_losing_either_specifier() {
+    async fn concurrent_unresolved_additions_rebase_without_losing_either_specifier_in_mode(
+        mode: TestJournalMode,
+    ) {
         let root = TempDir::new().expect("temporary database directory");
-        let db_path = root.path().join("entity-race.db");
-        let (runtime_a, token_a) = runtime_on(&db_path);
+        let db_path = root.path().join(format!("entity-race-{}.db", mode.label()));
+        let (runtime_a, token_a) = runtime_on_with_mode(&db_path, mode);
         let entity_id = project_uuid("race-fixture");
         let mut entity = Entity::new(token_a.namespace().as_str(), "project", "race-fixture");
         entity.id = entity_id;
@@ -4953,7 +5343,7 @@ mod tests {
             .await
             .expect("seed entity");
 
-        let (runtime_b, token_b) = runtime_on(&db_path);
+        let (runtime_b, token_b) = runtime_on_with_mode(&db_path, mode);
         let specifier_a = UnresolvedSpec {
             specifier: "alpha".to_string(),
             target_kind: "project".to_string(),
@@ -5021,6 +5411,14 @@ mod tests {
         assert_eq!(report_b.unresolved_recorded, 1);
         assert_eq!(report_a.fts_indexed, 1);
         assert_eq!(report_b.fts_indexed, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_unresolved_additions_rebase_without_losing_either_specifier() {
+        for mode in [TestJournalMode::Wal, TestJournalMode::Delete] {
+            concurrent_unresolved_additions_rebase_without_losing_either_specifier_in_mode(mode)
+                .await;
+        }
     }
 
     #[tokio::test]
@@ -5099,11 +5497,12 @@ mod tests {
         assert_eq!(report.blocked[0].file, "blocked.toml");
     }
 
-    #[tokio::test]
-    async fn concurrent_dependency_evidence_rebases_without_losing_either_kind() {
+    async fn concurrent_dependency_evidence_rebases_without_losing_either_kind_in_mode(
+        mode: TestJournalMode,
+    ) {
         let root = TempDir::new().expect("temporary database directory");
-        let db_path = root.path().join("edge-race.db");
-        let (runtime_a, token_a) = runtime_on(&db_path);
+        let db_path = root.path().join(format!("edge-race-{}.db", mode.label()));
+        let (runtime_a, token_a) = runtime_on_with_mode(&db_path, mode);
         let source_id = project_uuid("source");
         let target_id = project_uuid("target");
         for (id, name) in [(source_id, "source"), (target_id, "target")] {
@@ -5132,7 +5531,7 @@ mod tests {
         .await
         .expect("seed dependency edge");
 
-        let (runtime_b, token_b) = runtime_on(&db_path);
+        let (runtime_b, token_b) = runtime_on_with_mode(&db_path, mode);
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let pause_a = std::sync::Arc::new(race_seam::OneShotPause::new(std::sync::Arc::clone(
             &barrier,
@@ -5211,6 +5610,322 @@ mod tests {
         assert_eq!(report_b.edges_updated, 1);
         assert!(edge.updated_at > update_time);
     }
+
+    #[tokio::test]
+    async fn concurrent_dependency_evidence_rebases_without_losing_either_kind() {
+        for mode in [TestJournalMode::Wal, TestJournalMode::Delete] {
+            concurrent_dependency_evidence_rebases_without_losing_either_kind_in_mode(mode).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_conditional_inserts_preserve_entity_and_edge_winners() {
+        for mode in [TestJournalMode::Wal, TestJournalMode::Delete] {
+            let root = TempDir::new().expect("temporary database directory");
+            let db_path = root.path().join(format!("insert-race-{}.db", mode.label()));
+            let (runtime_a, token_a) = runtime_on_with_mode(&db_path, mode);
+            let (runtime_b, token_b) = runtime_on_with_mode(&db_path, mode);
+            let entity_id = project_uuid("insert-race");
+            let mut entity_a = Entity::new("local", "project", "first-candidate");
+            entity_a.id = entity_id;
+            entity_a.properties = Some(json!({"candidate": "a"}));
+            let mut entity_b = entity_a.clone();
+            entity_b.name = "second-candidate".to_string();
+            entity_b.properties = Some(json!({"candidate": "b"}));
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let entity_store_a = runtime_a.entities(&token_a).expect("entity store A");
+            let entity_store_b = runtime_b.entities(&token_b).expect("entity store B");
+            let (inserted_a, inserted_b) = tokio::join!(
+                async {
+                    barrier.wait().await;
+                    entity_store_a
+                        .insert_entity_if_absent(entity_a.clone())
+                        .await
+                },
+                async {
+                    barrier.wait().await;
+                    entity_store_b
+                        .insert_entity_if_absent(entity_b.clone())
+                        .await
+                },
+            );
+            let inserted_a = inserted_a.expect("entity insert A");
+            let inserted_b = inserted_b.expect("entity insert B");
+            assert_ne!(
+                inserted_a,
+                inserted_b,
+                "exactly one entity insert wins in {} mode",
+                mode.label()
+            );
+            let stored_entity = entity_store_a
+                .get_entity(entity_id)
+                .await
+                .expect("read entity")
+                .expect("one entity remains");
+            let winner = if inserted_a { &entity_a } else { &entity_b };
+            assert_eq!(stored_entity.name, winner.name, "{} mode", mode.label());
+            assert_eq!(
+                stored_entity.properties,
+                winner.properties,
+                "{} mode",
+                mode.label()
+            );
+
+            let source_id = project_uuid("insert-source");
+            let target_id = project_uuid("insert-target");
+            for (id, name) in [(source_id, "insert-source"), (target_id, "insert-target")] {
+                let mut endpoint = Entity::new("local", "project", name);
+                endpoint.id = id;
+                entity_store_a
+                    .upsert_entity(endpoint)
+                    .await
+                    .expect("seed endpoint");
+            }
+            let now = Utc::now();
+            let edge_a = Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                namespace: "local".to_string(),
+                source_id,
+                target_id,
+                relation: EdgeRelation::DependsOn,
+                weight: 1.0,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                metadata: Some(json!({"candidate": "a"})),
+                target_backend: None,
+            };
+            let edge_b = Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                weight: 0.25,
+                metadata: Some(json!({"candidate": "b"})),
+                ..edge_a.clone()
+            };
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let edge_store_a = runtime_a.graph(&token_a).expect("edge store A");
+            let edge_store_b = runtime_b.graph(&token_b).expect("edge store B");
+            let (inserted_a, inserted_b) = tokio::join!(
+                async {
+                    barrier.wait().await;
+                    edge_store_a.insert_edge_if_absent(edge_a.clone()).await
+                },
+                async {
+                    barrier.wait().await;
+                    edge_store_b.insert_edge_if_absent(edge_b.clone()).await
+                },
+            );
+            let inserted_a = inserted_a.expect("edge insert A");
+            let inserted_b = inserted_b.expect("edge insert B");
+            assert_ne!(
+                inserted_a,
+                inserted_b,
+                "exactly one natural-key edge insert wins in {} mode",
+                mode.label()
+            );
+            let (winning_edge, losing_edge) = if inserted_a {
+                (&edge_a, &edge_b)
+            } else {
+                (&edge_b, &edge_a)
+            };
+            let stored_edge = edge_store_a
+                .get_edge(winning_edge.id)
+                .await
+                .expect("read edge")
+                .expect("one edge remains");
+            assert_eq!(stored_edge.id, winning_edge.id, "{} mode", mode.label());
+            assert_eq!(
+                stored_edge.weight,
+                winning_edge.weight,
+                "{} mode",
+                mode.label()
+            );
+            assert_eq!(
+                stored_edge.metadata,
+                winning_edge.metadata,
+                "{} mode",
+                mode.label()
+            );
+            assert!(
+                edge_store_a
+                    .get_edge(losing_edge.id)
+                    .await
+                    .expect("read loser")
+                    .is_none(),
+                "losing edge must be absent in {} mode",
+                mode.label()
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rollback_journal_busy_begin_retries_after_other_runtime_releases_lock() {
+        let root = TempDir::new().expect("temporary database directory");
+        let db_path = root.path().join("busy-delete.db");
+        let (runtime_a, _) = runtime_on_with_mode(&db_path, TestJournalMode::Delete);
+        let (runtime_b, token_b) = runtime_on_with_mode(&db_path, TestJournalMode::Delete);
+        let pool_b = runtime_b.backend().pool();
+        let writer_task = pool_b
+            .writer_task_handle()
+            .expect("writer task handle")
+            .expect("file-backed writer task");
+        writer_task
+            .send_top_level(|conn| {
+                conn.busy_handler(None)
+                    .map_err(|error| khive_storage::StorageError::Internal(error.to_string()))
+            })
+            .await
+            .expect("disable SQLite wait on first BEGIN");
+
+        let lock_holder = runtime_a.backend().pool().writer().expect("lock holder");
+        lock_holder
+            .conn()
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("reserve rollback-journal writer lock");
+        let id = project_uuid("busy-retry");
+        let mut report = CodeSourceIngestReport::default();
+        let write = mutate_entity(&runtime_b, &token_b, id, "busy.rs", &mut report, |_| {
+            let mut entity = Entity::new("local", "project", "busy-retry");
+            entity.id = id;
+            Some(entity)
+        });
+        let release = async {
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while pool_b.writer_acquisition_snapshot().writer_task_begin_busy == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            lock_holder
+                .conn()
+                .execute_batch("ROLLBACK")
+                .expect("release rollback-journal writer lock");
+            observed.expect("the other runtime must observe a real SQLITE_BUSY refusal");
+        };
+        let (result, ()) = tokio::join!(write, release);
+        assert_eq!(
+            result.expect("busy BEGIN retries after release"),
+            RowMutationOutcome::Created
+        );
+        assert_eq!(report.fts_indexed, 1);
+        let counters = pool_b.writer_acquisition_snapshot();
+        assert!(counters.writer_task_begin_busy >= 1);
+        assert!(counters.writer_task_begin_busy_absorbed >= 1);
+    }
+
+    fn git_in(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .expect("git command starts");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("git output is UTF-8")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "manual A8 WAL/DELETE wall-clock comparison"]
+    async fn measure_concurrent_code_map_ingest_a8_32_commits() {
+        const COMMITS: usize = 32;
+        const REPO_NAME: &str = "code-map-a8-32";
+        let root = TempDir::new().expect("temporary measurement directory");
+        let repo = root.path().join(REPO_NAME);
+        let src = repo.join("src");
+        fs::create_dir_all(&src).expect("source directory");
+        fs::write(
+            repo.join("Cargo.toml"),
+            "[package]\nname = \"code-map-a8-32\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("stable manifest");
+        fs::write(src.join("lib.rs"), "").expect("initial library");
+        git_in(&repo, &["init", "-q"]);
+        for i in 0..COMMITS {
+            fs::write(
+                src.join(format!("module_{i:02}.rs")),
+                format!("pub fn value_{i:02}() -> usize {{ {i} }}\n"),
+            )
+            .expect("small module");
+            let mut lib = fs::read_to_string(src.join("lib.rs")).expect("read library");
+            lib.push_str(&format!("pub mod module_{i:02};\n"));
+            fs::write(src.join("lib.rs"), lib).expect("extend library");
+            git_in(&repo, &["add", "-A"]);
+            let message = format!("add module {i:02}");
+            git_in(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=A8 Fixture",
+                    "-c",
+                    "user.email=a8@example.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    &message,
+                ],
+            );
+        }
+        assert_eq!(
+            git_in(&repo, &["rev-list", "--count", "HEAD"]).trim(),
+            COMMITS.to_string()
+        );
+
+        for mode in [TestJournalMode::Wal, TestJournalMode::Delete] {
+            let db_path = root.path().join(format!("map-{}.db", mode.label()));
+            let (runtime_a, token_a) = runtime_on_with_mode(&db_path, mode);
+            let (runtime_b, token_b) = runtime_on_with_mode(&db_path, mode);
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let sweep_time = Utc::now();
+            let run_a = async {
+                barrier.wait().await;
+                run_code_ingest(
+                    &runtime_a,
+                    &token_a,
+                    CodeSourceIngestOptions {
+                        path: &repo,
+                        languages: ["rust"].into_iter().collect(),
+                        sweep_time,
+                        enable_l1: true,
+                        enable_l1_5: true,
+                        enable_l2: false,
+                    },
+                )
+                .await
+            };
+            let run_b = async {
+                barrier.wait().await;
+                run_code_ingest(
+                    &runtime_b,
+                    &token_b,
+                    CodeSourceIngestOptions {
+                        path: &repo,
+                        languages: ["rust"].into_iter().collect(),
+                        sweep_time,
+                        enable_l1: true,
+                        enable_l1_5: true,
+                        enable_l2: false,
+                    },
+                )
+                .await
+            };
+            let started = std::time::Instant::now();
+            let (report_a, report_b) = tokio::join!(run_a, run_b);
+            let wall = started.elapsed();
+            let report_a = report_a.expect("concurrent ingest A");
+            let report_b = report_b.expect("concurrent ingest B");
+            assert_eq!(report_a.source_revision, report_b.source_revision);
+            println!(
+                "A8_MEASURE mode={} repo={REPO_NAME} commits={COMMITS} wall_ms={}",
+                mode.label(),
+                wall.as_millis()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5241,4 +5956,83 @@ async fn issue2673_code_entity_mutation_rebases_persisted_versions() {
         RowMutationOutcome::Unchanged
     );
     assert_eq!(runtime.get_entity(&token, id).await.unwrap().version, 3);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn code_entity_mutation_refuses_reserved_candidate_and_carried_properties() {
+    let runtime = KhiveRuntime::memory().unwrap();
+    let token = runtime.authorize(khive_types::Namespace::local()).unwrap();
+    let mut report = CodeSourceIngestReport::default();
+    let reserved = json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"});
+
+    let candidate =
+        Entity::new("local", "concept", "reserved candidate").with_properties(reserved.clone());
+    let candidate_id = candidate.id;
+    let error = mutate_entity(
+        &runtime,
+        &token,
+        candidate_id,
+        "reserved.rs",
+        &mut report,
+        |_| Some(candidate.clone()),
+    )
+    .await
+    .expect_err("a reserved candidate must not be inserted");
+    assert!(
+        matches!(error, CodeSourceIngestError::Runtime(RuntimeError::InvalidInput(ref message)) if message.contains("khive:secret_gate")),
+        "unexpected error: {error:?}"
+    );
+    assert!(runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(candidate_id)
+        .await
+        .unwrap()
+        .is_none());
+
+    let current = Entity::new("local", "concept", "original").with_properties(reserved);
+    let current_id = current.id;
+    runtime
+        .entities(&token)
+        .unwrap()
+        .upsert_entity(current)
+        .await
+        .unwrap();
+    let before = runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(current_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = mutate_entity(
+        &runtime,
+        &token,
+        current_id,
+        "reserved.rs",
+        &mut report,
+        |current| {
+            let mut replacement = current.cloned().expect("seeded row");
+            replacement.name = "changed".into();
+            Some(replacement)
+        },
+    )
+    .await
+    .expect_err("a carried reserved key must not be replaced");
+    assert!(
+        matches!(error, CodeSourceIngestError::Runtime(RuntimeError::InvalidInput(ref message)) if message.contains("khive:secret_gate")),
+        "unexpected error: {error:?}"
+    );
+    let after = runtime
+        .entities(&token)
+        .unwrap()
+        .get_entity(current_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(after).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
 }

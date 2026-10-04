@@ -1,10 +1,11 @@
 //! ADR-191 A1.1: admit and read disk entries through the same opened descriptors.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use khive_runtime::{engine_config::WebSectionConfig, RuntimeError};
+use khive_runtime::{
+    bounded_read::read_to_end_bounded, engine_config::WebSectionConfig, RuntimeError,
+};
 
 use crate::egress::Refusal;
 
@@ -16,20 +17,15 @@ pub(crate) struct OpenedFile {
 
 impl OpenedFile {
     pub fn read(mut self, max_bytes: u64) -> Result<Vec<u8>, RuntimeError> {
-        let mut bytes = Vec::new();
-        self.file
-            .by_ref()
-            .take(max_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|error| refusal("ingest_read_failed", &self.relative, error))?;
-        if bytes.len() as u64 > max_bytes {
-            return Err(refusal(
-                "ingest_file_too_large",
-                &self.relative,
-                format!("file exceeds the {max_bytes}-byte disk ingest ceiling"),
-            ));
-        }
-        Ok(bytes)
+        read_to_end_bounded(&mut self.file, max_bytes)
+            .map_err(|error| refusal("ingest_read_failed", &self.relative, error))?
+            .ok_or_else(|| {
+                refusal(
+                    "ingest_file_too_large",
+                    &self.relative,
+                    format!("file exceeds the {max_bytes}-byte disk ingest ceiling"),
+                )
+            })
     }
 }
 
@@ -87,6 +83,40 @@ mod platform {
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Component;
 
+    enum AdmissionError {
+        DescriptorExhausted { path: PathBuf, error: io::Error },
+        Other(RuntimeError),
+    }
+
+    impl From<AdmissionError> for RuntimeError {
+        fn from(error: AdmissionError) -> Self {
+            match error {
+                AdmissionError::DescriptorExhausted { path, error } => {
+                    super::refusal("ingest_descriptor_exhausted", &path, error)
+                }
+                AdmissionError::Other(error) => error,
+            }
+        }
+    }
+
+    fn refusal(code: &'static str, path: &Path, error: impl std::fmt::Display) -> AdmissionError {
+        AdmissionError::Other(super::refusal(code, path, error))
+    }
+
+    fn io_refusal(code: &'static str, path: &Path, error: io::Error) -> AdmissionError {
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EMFILE) | Some(libc::ENFILE)
+        ) {
+            AdmissionError::DescriptorExhausted {
+                path: path.to_path_buf(),
+                error,
+            }
+        } else {
+            refusal(code, path, error)
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct Identity {
         dev: libc::dev_t,
@@ -142,7 +172,7 @@ mod platform {
         Ok(unsafe { stat.assume_init() })
     }
 
-    fn check_type(stat: &libc::stat, path: &Path) -> Result<bool, RuntimeError> {
+    fn check_type(stat: &libc::stat, path: &Path) -> Result<bool, AdmissionError> {
         match stat.st_mode & libc::S_IFMT {
             libc::S_IFDIR => Ok(true),
             libc::S_IFREG => Ok(false),
@@ -165,10 +195,10 @@ mod platform {
         path: &Path,
         checked: &libc::stat,
         before_open: &mut dyn FnMut(&Path),
-    ) -> Result<File, RuntimeError> {
+    ) -> Result<File, AdmissionError> {
         let directory = check_type(checked, path)?;
         let name =
-            c_name(name).map_err(|error| refusal("ingest_path_unresolvable", path, error))?;
+            c_name(name).map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?;
         before_open(path);
         // O_NONBLOCK prevents a raced-in FIFO from blocking before fstat rejects it.
         let flags = libc::O_RDONLY
@@ -179,7 +209,7 @@ mod platform {
         // SAFETY: parent is live and name contains exactly one terminated component.
         let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
         if fd < 0 {
-            return Err(refusal(
+            return Err(io_refusal(
                 "ingest_path_changed",
                 path,
                 io::Error::last_os_error(),
@@ -187,8 +217,8 @@ mod platform {
         }
         // SAFETY: successful openat returned a uniquely owned descriptor.
         let opened = unsafe { File::from_raw_fd(fd) };
-        let actual =
-            stat_fd(&opened).map_err(|error| refusal("ingest_path_unresolvable", path, error))?;
+        let actual = stat_fd(&opened)
+            .map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?;
         if Identity::from(checked) != Identity::from(&actual)
             || checked.st_mode & libc::S_IFMT != actual.st_mode & libc::S_IFMT
         {
@@ -204,12 +234,12 @@ mod platform {
     fn open_directory(
         path: &Path,
         before_open: &mut dyn FnMut(&Path),
-    ) -> Result<Directory, RuntimeError> {
+    ) -> Result<Directory, AdmissionError> {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
             std::env::current_dir()
-                .map_err(|error| refusal("ingest_path_unresolvable", path, error))?
+                .map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?
                 .join(path)
         };
         // The filesystem root has no caller-controlled ancestor to follow.
@@ -217,9 +247,9 @@ mod platform {
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open("/")
-            .map_err(|error| refusal("ingest_path_unresolvable", path, error))?;
+            .map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?;
         let identity = Identity::from(
-            &stat_fd(&root).map_err(|error| refusal("ingest_path_unresolvable", path, error))?,
+            &stat_fd(&root).map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?,
         );
         let mut descriptors = vec![root];
         let mut ancestry = vec![(PathBuf::from("/"), identity)];
@@ -249,7 +279,7 @@ mod platform {
             resolved.push(name);
             let parent = descriptors.last().expect("root descriptor retained");
             let checked = stat_at(parent, name)
-                .map_err(|error| refusal("ingest_path_unresolvable", &resolved, error))?;
+                .map_err(|error| io_refusal("ingest_path_unresolvable", &resolved, error))?;
             if !check_type(&checked, &resolved)? {
                 return Err(refusal(
                     "ingest_path_unresolvable",
@@ -289,9 +319,9 @@ mod platform {
         unsafe { libc::__errno_location() }
     }
 
-    fn names(directory: &File, path: &Path) -> Result<Vec<OsString>, RuntimeError> {
-        let checked =
-            stat_fd(directory).map_err(|error| refusal("ingest_path_unresolvable", path, error))?;
+    fn names(directory: &File, path: &Path) -> Result<Vec<OsString>, AdmissionError> {
+        let checked = stat_fd(directory)
+            .map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?;
         // Reopen '.' for an independent directory position; dup would share its offset.
         let reopened = open_checked(directory, OsStr::new("."), path, &checked, &mut |_| {})?;
         let fd = reopened.into_raw_fd();
@@ -301,7 +331,7 @@ mod platform {
             let error = io::Error::last_os_error();
             // SAFETY: fdopendir failed, so ownership of fd remains here.
             unsafe { libc::close(fd) };
-            return Err(refusal("ingest_read_failed", path, error));
+            return Err(io_refusal("ingest_read_failed", path, error));
         }
         let stream = DirStream(stream);
         let mut result = Vec::new();
@@ -312,7 +342,7 @@ mod platform {
             if entry.is_null() {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() != Some(0) {
-                    return Err(refusal("ingest_read_failed", path, error));
+                    return Err(io_refusal("ingest_read_failed", path, error));
                 }
                 break;
             }
@@ -331,7 +361,7 @@ mod platform {
         absolute: PathBuf,
         limit: usize,
         before_open: &mut dyn FnMut(&Path),
-    ) -> Result<Vec<OpenedFile>, RuntimeError> {
+    ) -> Result<Vec<OpenedFile>, AdmissionError> {
         struct Frame {
             directory: File,
             absolute: PathBuf,
@@ -354,7 +384,7 @@ mod platform {
             let path = frame.absolute.join(&name);
             let relative = frame.relative.join(&name);
             let checked = stat_at(&frame.directory, &name)
-                .map_err(|error| refusal("ingest_path_unresolvable", &path, error))?;
+                .map_err(|error| io_refusal("ingest_path_unresolvable", &path, error))?;
             if check_type(&checked, &path)? {
                 let child = open_checked(&frame.directory, &name, &path, &checked, before_open)?;
                 let entries = names(&child, &path)?.into_iter();
@@ -378,26 +408,50 @@ mod platform {
         limit: usize,
         before_open: &mut dyn FnMut(&Path),
     ) -> Result<Vec<OpenedFile>, RuntimeError> {
+        admit_files(cfg, source, limit, before_open).map_err(RuntimeError::from)
+    }
+
+    fn admit_files(
+        cfg: &WebSectionConfig,
+        source: &Path,
+        limit: usize,
+        before_open: &mut dyn FnMut(&Path),
+    ) -> Result<Vec<OpenedFile>, AdmissionError> {
         let source = open_directory(source, before_open)?;
-        let contained = cfg.read_roots.iter().any(|root| {
-            open_directory(Path::new(root), before_open)
-                .map(|root| {
-                    source.ancestry.iter().any(|(path, identity)| {
+        let mut descriptor_error = None;
+        let mut contained = false;
+        for root in &cfg.read_roots {
+            match open_directory(Path::new(root), before_open) {
+                Ok(root) => {
+                    if source.ancestry.iter().any(|(path, identity)| {
                         path == &root.path
                             && *identity == root.ancestry.last().expect("root identity retained").1
-                    })
-                })
-                .unwrap_or(false)
-        });
+                    }) {
+                        contained = true;
+                        break;
+                    }
+                }
+                Err(error @ AdmissionError::DescriptorExhausted { .. }) => {
+                    if descriptor_error.is_none() {
+                        descriptor_error = Some(error);
+                    }
+                }
+                Err(AdmissionError::Other(_)) => {}
+            }
+        }
         if !contained {
-            return Err(refusal(
-                "ingest_source_outside_read_roots",
-                &source.path,
-                "outside every configured [web] read_roots entry",
-            ));
+            return Err(descriptor_error.unwrap_or_else(|| {
+                refusal(
+                    "ingest_source_outside_read_roots",
+                    &source.path,
+                    "outside every configured [web] read_roots entry",
+                )
+            }));
         }
         walk(source.file, source.path, limit, before_open)
     }
+    #[cfg(test)]
+    mod descriptor_tests;
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

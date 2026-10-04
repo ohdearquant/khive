@@ -1,53 +1,39 @@
 //! Environment-interposing fixtures execute as the sole test in a child.
 
-use std::process::Command;
+use khive_storage::test_support::run_exact_test_in_child;
 
 const CHILD_TEST: &str = "KKERNEL_ISOLATED_TEST";
 
 /// Call before fixture setup or environment changes. Only the exact child
 /// continues; unrelated tests never share its environment or recovery lock.
 pub(crate) fn run_in_child() -> bool {
-    let thread = std::thread::current();
-    let name = thread.name().expect("libtest names its test threads");
-    let arguments = ["--exact", name, "--nocapture", "--test-threads=1"];
-    if std::env::var(CHILD_TEST).ok().as_deref() == Some(name) {
-        assert_eq!(
-            std::env::args().skip(1).collect::<Vec<_>>(),
-            arguments,
-            "isolated child must run exactly its one named test"
-        );
+    let mut fixture = None;
+    let in_parent = run_exact_test_in_child(CHILD_TEST, false, |command| {
+        let root = tempfile::tempdir().expect("isolated test fixture");
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).expect("private child HOME");
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("KHIVE_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env("HOME", &home)
+            // Native model initialization must not escape the checked child HOME.
+            .env_remove("LATTICE_MODEL_CACHE")
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env("KHIVE_LOCK", root.path().join("khived.recovery.lock"));
+        // The fixture must outlive the child that runs inside the call.
+        fixture = Some(root);
+    });
+    if !in_parent {
         return false;
     }
-
-    let root = tempfile::tempdir().expect("isolated test fixture");
-    let home = root.path().join("home");
-    std::fs::create_dir(&home).expect("private child HOME");
-    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
-    for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("KHIVE_") {
-            command.env_remove(key);
-        }
-    }
-    let output = command
-        .args(arguments)
-        .env(CHILD_TEST, name)
-        .env("HOME", &home)
-        // Native model initialization must not escape the checked child HOME.
-        .env_remove("LATTICE_MODEL_CACHE")
-        .env("KHIVE_TEST_HARNESS", "1")
-        .env("KHIVE_LOCK", root.path().join("khived.recovery.lock"))
-        .output()
-        .expect("spawn isolated test");
+    let root = fixture.expect("the parent created the isolated fixture");
+    let thread = std::thread::current();
+    let name = thread.name().expect("libtest names its test threads");
     assert!(
-        output.status.success()
-            && String::from_utf8_lossy(&output.stdout)
-                .contains("test result: ok. 1 passed; 0 failed;"),
-        "isolated test must execute exactly one passing case:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        std::fs::read_dir(&home)
+        std::fs::read_dir(root.path().join("home"))
             .expect("read child HOME")
             .next()
             .is_none(),

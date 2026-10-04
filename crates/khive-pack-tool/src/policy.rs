@@ -3,30 +3,37 @@
 
 use std::any::Any;
 
-use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, secret_gate, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
+use khive_types::{EventKind, SubstrateKind, ToolCheckDecidedPayload};
 
 use crate::pin::{invalidating_registration, registration_snapshot, visible_registration};
 use crate::RegistryPin;
 
-pub fn now_micros() -> i64 {
-    Utc::now().timestamp_micros()
+/// Read a bounded non-negative integer; absent or null returns the supplied default.
+/// The caller supplies a maximum of at least one.
+pub fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(v) => v
+            .as_u64()
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
+            }),
+    }
 }
+
+pub use khive_storage::now_micros;
 
 /// The caller's actor as one label, `kind:id`, except that the plain `actor`
 /// kind collapses to its id so a configured `lambda:khive` reads back as
 /// itself.
 pub fn actor_label(token: &NamespaceToken) -> String {
-    let actor = token.actor();
-    if actor.kind == "actor" {
-        actor.id.clone()
-    } else {
-        format!("{}:{}", actor.kind, actor.id)
-    }
+    token.actor().label()
 }
 
 fn text(row: &SqlRow, col: &str) -> Option<String> {
@@ -47,17 +54,11 @@ fn int(row: &SqlRow, col: &str) -> Option<i64> {
 }
 
 fn opt_text(v: Option<&str>) -> SqlValue {
-    match v {
-        Some(s) => SqlValue::Text(s.to_string()),
-        None => SqlValue::Null,
-    }
+    SqlValue::from_opt_text(v)
 }
 
 fn opt_int(v: Option<i64>) -> SqlValue {
-    match v {
-        Some(i) => SqlValue::Integer(i),
-        None => SqlValue::Null,
-    }
+    SqlValue::from_opt_i64(v)
 }
 
 fn iso(v: Option<i64>) -> Value {
@@ -766,6 +767,77 @@ impl Decision {
             "side_effect": self.side_effect,
         })
     }
+}
+
+/// The two call sites that produce decision receipts.
+#[derive(Clone, Copy)]
+pub enum DecisionCaller {
+    ToolCheck,
+    ExecRun,
+}
+
+impl DecisionCaller {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::ToolCheck => "tool.check",
+            Self::ExecRun => "exec.run",
+        }
+    }
+}
+
+pub struct DecisionInvocation<'a> {
+    pub token: &'a NamespaceToken,
+    pub actor: &'a str,
+    pub tool: &'a str,
+    pub registered: bool,
+    pub caller: DecisionCaller,
+}
+
+/// Compute and persist one decision for either public caller. Other policy
+/// probes use `decide` directly and do not produce decision receipts.
+pub async fn decide_with_receipt(
+    rt: &KhiveRuntime,
+    invocation: DecisionInvocation<'_>,
+    side_effect: Option<&str>,
+    registration: Option<&RegistryPin>,
+) -> Result<Decision, RuntimeError> {
+    // The receipt copies both strings into the namespace event log, so they get
+    // the same credential refusal every other persisted write path applies.
+    let record = invocation.caller.verb();
+    secret_gate::check_at(invocation.actor, record, "actor")?;
+    secret_gate::check_at(invocation.tool, record, "tool")?;
+    let decision = decide(
+        rt,
+        invocation.token.namespace().as_str(),
+        invocation.actor,
+        invocation.tool,
+        side_effect,
+        registration,
+    )
+    .await?;
+    let payload = ToolCheckDecidedPayload {
+        actor: invocation.actor.to_string(),
+        tool: invocation.tool.to_string(),
+        registered: invocation.registered,
+        decision: decision.decision.clone(),
+        source: decision.source.clone(),
+        id: decision
+            .grant_id
+            .clone()
+            .or_else(|| decision.policy_id.clone()),
+        scope: None,
+        caller_verb: invocation.caller.verb().to_string(),
+    };
+    let event = khive_storage::Event::new(
+        invocation.token.namespace().as_str(),
+        "tool.check",
+        EventKind::ToolCheckDecided,
+        SubstrateKind::Event,
+        actor_label(invocation.token),
+    )
+    .with_payload(json!(payload));
+    rt.events(invocation.token)?.append_event(event).await?;
+    Ok(decision)
 }
 
 /// Resolution order: an active grant allows; otherwise the most specific

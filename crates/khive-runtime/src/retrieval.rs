@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
 use crate::curation::note_fts_document;
+use crate::embedder_registry::with_embedding_admission;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 use khive_score::{rrf_score, DeterministicScore};
@@ -17,6 +18,13 @@ use khive_storage::types::{
 use khive_storage::ContentRef;
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
+
+pub use khive_retrieval::{
+    HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource,
+};
+
+/// Bounds provider input and per-page outcome memory while amortizing model setup.
+pub(crate) const EMBEDDING_BATCH_PAGE_SIZE: usize = 256;
 
 // Fault-injection flag for backfill reader errors (test / `fault-injection` builds only).
 #[cfg(any(test, feature = "fault-injection"))]
@@ -34,90 +42,6 @@ pub fn arm_backfill_reader_fail() {
     BACKFILL_READER_FAIL.with(|c| c.set(true));
 }
 
-/// The strategy that produced a hit's ordering score, including local modifiers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RankScoreKind {
-    Rrf,
-    Vector,
-    Keyword,
-    Weighted,
-    Union,
-}
-
-impl RankScoreKind {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Rrf => "rrf",
-            Self::Vector => "vector",
-            Self::Keyword => "keyword",
-            Self::Weighted => "weighted",
-            Self::Union => "union",
-        }
-    }
-}
-
-/// Retained component scores before fusion and strategy-local modifiers.
-/// An absent retrieval leg has no score, which is distinct from a measured zero.
-/// Scores belong to the backend and model that produced the retained hit;
-/// vector similarities from different embedding models are not comparable.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SearchSignals {
-    pub vector_similarity: Option<DeterministicScore>,
-    pub keyword_score: Option<DeterministicScore>,
-}
-
-/// A unified search result combining vector and text signals.
-#[derive(Clone, Debug)]
-pub struct SearchHit {
-    pub entity_id: Uuid,
-    pub score: DeterministicScore,
-    pub rank_score_kind: RankScoreKind,
-    pub signals: SearchSignals,
-    pub source: SearchSource,
-    pub title: Option<String>,
-    pub snippet: Option<String>,
-}
-
-/// Result of [`KhiveRuntime::hybrid_search_outcome`]: the fused hits — text
-/// hits alone when the vector arm failed — plus the vector arm's error, if
-/// any.
-#[derive(Clone, Debug)]
-pub struct HybridSearchOutcome {
-    pub hits: Vec<SearchHit>,
-    pub vector_error: Option<String>,
-}
-
-/// Which retrieval path(s) contributed to a hit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchSource {
-    Vector,
-    Text,
-    Both,
-}
-
-impl SearchSource {
-    /// Combine retrieval-leg membership from two appearances of the same hit.
-    #[must_use]
-    pub const fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Text, Self::Text) => Self::Text,
-            (Self::Vector, Self::Vector) => Self::Vector,
-            _ => Self::Both,
-        }
-    }
-
-    /// Lowercase wire representation used by search serializers.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Vector => "vector",
-            Self::Text => "text",
-            Self::Both => "both",
-        }
-    }
-}
-
 /// RRF constant. Controls how strongly top ranks dominate.
 ///
 /// The paper's k=60 over-compresses scores at KG scale (tens–thousands of
@@ -127,7 +51,7 @@ impl SearchSource {
 const RRF_K: usize = 10;
 
 /// Candidates pulled per path before fusion. Higher = better recall, more work.
-const CANDIDATE_MULTIPLIER: u32 = 4;
+pub(crate) const CANDIDATE_MULTIPLIER: u32 = 4;
 
 /// Advisory emitted by write verbs when only the embedding input was bounded.
 pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =
@@ -229,7 +153,7 @@ impl KhiveRuntime {
     /// own a single model implicitly).
     ///
     /// Applies no instruction prefix (generic role). Use
-    /// [`Self::embed_document_with_model`] / [`Self::embed_query_with_model`] for
+    /// [`Self::embed_document_with_model_outcome`] / [`Self::embed_query_with_model`] for
     /// instruction-tuned models where the asymmetric prefix matters.
     ///
     /// Returns `UnknownModel` if `model_name` is not in the embedder registry.
@@ -241,8 +165,8 @@ impl KhiveRuntime {
         // was handed to the provider is counted even if this task is aborted
         // while parked on the await (drain_embed_join_set cancellation path).
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
-        let out = service.embed_one(text, emb_model).await;
-        Ok(out?)
+        let out = with_embedding_admission(service.embed_one(text, emb_model)).await;
+        out
     }
 
     /// Embed a document/passage for indexing using the named model.
@@ -263,17 +187,6 @@ impl KhiveRuntime {
     /// the embedding model config.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
-    pub async fn embed_document_with_model(
-        &self,
-        model_name: &str,
-        text: &str,
-    ) -> RuntimeResult<Vec<f32>> {
-        Ok(self
-            .embed_document_with_model_outcome_inner(None, model_name, text)
-            .await?
-            .vector)
-    }
-
     pub async fn embed_document_with_model_outcome(
         &self,
         model_name: &str,
@@ -310,7 +223,8 @@ impl KhiveRuntime {
         let embedded_bytes = text.len();
         // Issued-at-dispatch: counted before the await — see embed_with_model.
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, 1);
-        let embeddings = service.embed_passage(&[text.to_string()], emb_model).await;
+        let embeddings =
+            with_embedding_admission(service.embed_passage(&[text.to_string()], emb_model)).await;
         let mut vectors = embeddings?;
         if vectors.len() != 1 {
             return Err(RuntimeError::Internal(format!(
@@ -378,8 +292,10 @@ impl KhiveRuntime {
         let embeddings = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await,
-            _ => service.embed_query(&texts, emb_model).await,
+            | EmbeddingModel::BgeLargeEnV15 => {
+                with_embedding_admission(service.embed(&texts, emb_model)).await
+            }
+            _ => with_embedding_admission(service.embed_query(&texts, emb_model)).await,
         };
         let out = embeddings?
             .into_iter()
@@ -390,16 +306,34 @@ impl KhiveRuntime {
 
     /// Embed a document for indexing using the configured default model.
     ///
-    /// Delegates to [`Self::embed_document_with_model`]. Use for entity/note
+    /// Delegates to [`Self::embed_document_outcome`]. Use for entity/note
     /// create and reindex paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    /// Returns an error if the input is bounded; use the outcome method to
+    /// inspect the vector together with the truncation metadata.
     pub async fn embed_document(&self, text: &str) -> RuntimeResult<Vec<f32>> {
+        let outcome = self.embed_document_outcome(text).await?;
+        if outcome.truncated {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding input truncated from {} to {} bytes; use embed_document_outcome to inspect the bounded vector",
+                outcome.source_bytes, outcome.embedded_bytes
+            )));
+        }
+        Ok(outcome.vector)
+    }
+
+    /// Embed a document with the default model and retain input-bounding metadata.
+    pub async fn embed_document_outcome(
+        &self,
+        text: &str,
+    ) -> RuntimeResult<DocumentEmbeddingOutcome> {
         let model_name = self.default_embedder_name();
         if model_name.is_empty() {
             return Err(RuntimeError::Unconfigured("embedding_model".into()));
         }
-        self.embed_document_with_model(model_name, text).await
+        self.embed_document_with_model_outcome(model_name, text)
+            .await
     }
 
     /// Embed a query for retrieval using the configured default model.
@@ -462,9 +396,9 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        let out = service.embed(texts, emb_model).await;
+        let out = with_embedding_admission(service.embed(texts, emb_model)).await;
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
-        Ok(out?)
+        out
     }
 
     /// Embed a batch of documents for indexing using the named model.
@@ -474,10 +408,12 @@ impl KhiveRuntime {
     /// A mixed batch is bounded into one ordered owned batch so truncation never
     /// fragments one provider batch into sequential singleton inference calls.
     ///
-    /// **Reindex caveat**: see [`Self::embed_document_with_model`] — the same
+    /// **Reindex caveat**: see [`Self::embed_document_with_model_outcome`] — the same
     /// incomparability applies to batch-indexed vectors when switching models.
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
+    /// Returns an error when any input is bounded; use the outcomes method to
+    /// retain the bounded vectors and per-document byte counts.
     pub async fn embed_document_batch_with_model(
         &self,
         model_name: &str,
@@ -486,12 +422,20 @@ impl KhiveRuntime {
         if texts.is_empty() {
             return Ok(vec![]);
         }
-        Ok(self
+        let outcomes = self
             .embed_document_batch_with_model_outcomes(model_name, texts)
-            .await?
-            .into_iter()
-            .map(|outcome| outcome.vector)
-            .collect())
+            .await?;
+        let mut report = EmbeddingTruncationReport::default();
+        for outcome in &outcomes {
+            report.observe(outcome);
+        }
+        if report.any_truncated() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "embedding input truncated for {} documents ({} discarded bytes); use embed_document_batch_with_model_outcomes to inspect the bounded vectors",
+                report.truncated, report.discarded_bytes
+            )));
+        }
+        Ok(outcomes.into_iter().map(|outcome| outcome.vector).collect())
     }
 
     pub async fn embed_document_batch_with_model_outcomes(
@@ -533,13 +477,13 @@ impl KhiveRuntime {
             crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
         }
         let out = if texts.iter().all(|text| text.len() <= budget) {
-            service.embed_passage(texts, emb_model).await
+            with_embedding_admission(service.embed_passage(texts, emb_model)).await
         } else {
             let bounded_texts: Vec<String> = texts
                 .iter()
                 .map(|text| bounded_embedding_input(text, budget).0.to_owned())
                 .collect();
-            service.embed_passage(&bounded_texts, emb_model).await
+            with_embedding_admission(service.embed_passage(&bounded_texts, emb_model)).await
         };
         if token.is_none() {
             crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
@@ -576,6 +520,8 @@ impl KhiveRuntime {
     /// bulk knowledge-atom and section indexing paths.
     ///
     /// Returns `Unconfigured("embedding_model")` if no model is configured.
+    /// Returns an error when any input is bounded; use
+    /// [`Self::embed_document_batch_outcomes`] to retain the bounded vectors.
     pub async fn embed_document_batch(&self, texts: &[String]) -> RuntimeResult<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(vec![]);
@@ -624,11 +570,13 @@ impl KhiveRuntime {
         let out = match emb_model {
             EmbeddingModel::BgeSmallEnV15
             | EmbeddingModel::BgeBaseEnV15
-            | EmbeddingModel::BgeLargeEnV15 => service.embed(texts, emb_model).await,
-            _ => service.embed_query(texts, emb_model).await,
+            | EmbeddingModel::BgeLargeEnV15 => {
+                with_embedding_admission(service.embed(texts, emb_model)).await
+            }
+            _ => with_embedding_admission(service.embed_query(texts, emb_model)).await,
         };
         crate::usage::count(crate::usage::UsageUnit::EmbedCalls, texts.len() as u64);
-        Ok(out?)
+        out
     }
 
     /// Search vectors using either a caller-provided embedding or query text.
@@ -675,7 +623,42 @@ impl KhiveRuntime {
             })
             .await;
         crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
-        Ok(hits?)
+        hits.map_err(RuntimeError::from)
+    }
+
+    /// The note-search vector leg uses the pack-owned graph when that model
+    /// has an installed, consumer-protected bridge. Only a missing graph for
+    /// this consumer takes the existing exact sqlite-vec route.
+    pub(crate) async fn note_search_vector_search(
+        &self,
+        token: &NamespaceToken,
+        query_embedding: Option<Vec<f32>>,
+        query_text: &str,
+        top_k: u32,
+    ) -> RuntimeResult<Vec<VectorSearchHit>> {
+        let embedding = match query_embedding {
+            Some(embedding) => embedding,
+            None => self.embed_query_for_token(token, query_text).await?,
+        };
+        let model = self.default_embedder_name();
+        if !model.is_empty() {
+            if let Some(provider) = self.note_search_ann_provider()? {
+                if let Some(hits) = provider.search(token, model, &embedding, top_k).await? {
+                    crate::note_search_ann::record_ann_route();
+                    crate::usage::count(crate::usage::UsageUnit::VectorPasses, 1);
+                    return Ok(hits);
+                }
+            }
+        }
+        crate::note_search_ann::record_fallback_route();
+        self.vector_search(
+            token,
+            Some(embedding),
+            None,
+            top_k,
+            Some(SubstrateKind::Note),
+        )
+        .await
     }
 
     /// Hybrid search: text (FTS5) + vector retrieval fused via Reciprocal Rank Fusion.
@@ -695,29 +678,34 @@ impl KhiveRuntime {
     ///
     /// `limit` caps the final returned list; internally pulls `limit * 4` candidates per path.
     ///
-    /// # Cross-namespace visibility (entity search — primary namespace only; deferred)
+    /// # Cross-namespace visibility (entity search — text leg: visible set; vector leg: primary)
     ///
-    /// Both the **FTS leg** and the **vector/ANN leg** of entity search (`hybrid_search`)
-    /// are restricted to the **primary namespace only**.
+    /// The two legs of entity search scope namespaces differently.
     ///
-    /// Rationale: each namespace owns a separate FTS table (`fts_entities_{ns}`)
-    /// and a separate ANN index instance. Cross-namespace entity-search fanout
-    /// requires iterating over every visible namespace's store, issuing parallel
-    /// search requests, and fusing the results: this is deferred.
+    /// **Text leg.** Entity full-text search is one shared table (`fts_entities`)
+    /// with a `namespace` column. The token's whole visible set (`visible_ns`) is
+    /// forwarded in `TextFilter.namespaces`, which the store applies as a
+    /// `namespace IN (...)` predicate, so one query returns text hits from every
+    /// visible namespace.
     ///
-    /// Note: this is distinct from `memory.recall`'s cross-namespace fanout, which
-    /// already iterates `visible_namespaces` across both the FTS and vector legs.
-    /// Entity search fanout is the remaining deferred piece; memory recall fanout
-    /// is not deferred.
+    /// **Vector leg.** The vector leg runs only when a query vector is supplied or
+    /// an embedding model is configured. It is an exact sqlite-vec search
+    /// (brute-force cosine, as in `knn`); no ANN index is involved. It issues a
+    /// single request scoped to the primary namespace, because a
+    /// `VectorSearchRequest` carries one namespace. Searching the visible set
+    /// would take one request per namespace and a merge of the per-namespace
+    /// lists; that fanout is not implemented for entities, so entity vector hits
+    /// come from the primary namespace only.
     ///
-    /// The `visible_ns` list is forwarded in the `TextFilter.namespaces` field,
-    /// which limits results to those namespaces within the primary store. Because
-    /// entities from extra namespaces live in their own FTS tables, this filter has
-    /// no cross-namespace effect today.
+    /// The fused candidates are then checked against the entity store with the
+    /// visible set, so an entity from an extra visible namespace is returned when
+    /// the text leg matched it, and is not returned on a vector-only match.
     ///
-    /// Callers with a multi-namespace visible set can READ cross-namespace entities
-    /// directly via `get_entity` / `resolve`, but `hybrid_search` returns only
-    /// primary-namespace hits until entity-search cross-namespace fanout ships.
+    /// This differs from `memory.recall`, whose vector leg already searches every
+    /// visible namespace.
+    ///
+    /// Callers can also read any visible entity directly via `get_entity` /
+    /// `resolve`.
     #[allow(clippy::too_many_arguments)]
     pub async fn hybrid_search(
         &self,
@@ -771,9 +759,58 @@ impl KhiveRuntime {
                 text_mode,
                 None,
                 false,
+                None,
             )
             .await?;
         Ok(hits)
+    }
+
+    /// Hybrid search over several entity kinds that issues the vector query once.
+    ///
+    /// Returns one list per entry of `entity_kinds`, in that order. Each list is what
+    /// [`Self::hybrid_search`] returns for that kind with the same `limit`: the text stage
+    /// is filtered to the kind and keeps its own `limit * 4` budget, and fusion, the kind
+    /// filter and the cut to `limit` run per kind. Only the vector stage is shared, because
+    /// it takes no entity kind: the single query is the one every per-kind search would have
+    /// issued. When `query_vector` is `None` and an embedding model is configured, the query
+    /// text is embedded once instead of once per kind. No entity-type, tag or property
+    /// filter is set. An empty `entity_kinds` returns no lists and runs no query.
+    pub async fn hybrid_search_each_kind(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        limit: u32,
+        entity_kinds: &[&str],
+    ) -> RuntimeResult<Vec<Vec<SearchHit>>> {
+        if entity_kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
+        let (vector_hits, _vector_error) = self
+            .hybrid_vector_stage(token, query_text, query_vector, candidates, None, false)
+            .await?;
+        let mut per_kind = Vec::with_capacity(entity_kinds.len());
+        for &kind in entity_kinds {
+            let (hits, _vector_error) = self
+                .hybrid_search_inner(
+                    token,
+                    query_text,
+                    None,
+                    limit,
+                    Some(kind),
+                    None,
+                    &[],
+                    None,
+                    TextQueryMode::Plain,
+                    None,
+                    false,
+                    Some(vector_hits.clone()),
+                )
+                .await?;
+            per_kind.push(hits);
+        }
+        Ok(per_kind)
     }
 
     /// `vector_similarity_floor` is a cosine-similarity value in `[-1.0,
@@ -806,6 +843,7 @@ impl KhiveRuntime {
                 TextQueryMode::Plain,
                 Some(vector_similarity_floor),
                 false,
+                None,
             )
             .await?;
         Ok(hits)
@@ -870,11 +908,14 @@ impl KhiveRuntime {
                 text_mode,
                 None,
                 true,
+                None,
             )
             .await?;
         Ok(HybridSearchOutcome { hits, vector_error })
     }
 
+    /// `vector_pool`, when `Some`, supplies the vector stage's hits and the stage does not
+    /// run; `None` runs it. The stage takes no entity kind, so one pool serves every kind.
     #[allow(clippy::too_many_arguments)]
     async fn hybrid_search_inner(
         &self,
@@ -889,6 +930,7 @@ impl KhiveRuntime {
         text_mode: TextQueryMode,
         vector_similarity_floor: Option<f64>,
         tolerate_vector_error: bool,
+        vector_pool: Option<Vec<VectorSearchHit>>,
     ) -> RuntimeResult<(Vec<SearchHit>, Option<String>)> {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
@@ -907,6 +949,15 @@ impl KhiveRuntime {
                 mode: text_mode,
                 filter: Some(TextFilter {
                     namespaces: visible_ns.clone(),
+                    // Push the entity-kind filter into the FTS query. Without it the
+                    // text arm returns the top `candidates` rows across EVERY entity
+                    // kind in the namespace and the kind is applied only afterwards,
+                    // so when one kind dominates the lexical ranking a search for a
+                    // rarer kind gets back fewer rows than exist, or none. The
+                    // `EntityFilter.kinds` check below stays as the backstop.
+                    record_kinds: entity_kind
+                        .map(|kind| vec![kind.to_string()])
+                        .unwrap_or_default(),
                     ..TextFilter::default()
                 }),
                 top_k: candidates,
@@ -923,34 +974,20 @@ impl KhiveRuntime {
             query_text,
         )?;
 
-        let mut vector_error: Option<String> = None;
-        let mut vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
-            match self
-                .vector_search(
+        let (vector_hits, vector_error) = match vector_pool {
+            Some(pool) => (pool, None),
+            None => {
+                self.hybrid_vector_stage(
                     token,
+                    query_text,
                     query_vector,
-                    Some(query_text),
                     candidates,
-                    Some(SubstrateKind::Entity),
+                    vector_similarity_floor,
+                    tolerate_vector_error,
                 )
-                .await
-            {
-                Ok(hits) => hits,
-                Err(e) if tolerate_vector_error => {
-                    vector_error = Some(e.to_string());
-                    Vec::new()
-                }
-                Err(e) => return Err(e),
+                .await?
             }
-        } else {
-            Vec::new()
         };
-        if let Some(cosine_floor) = vector_similarity_floor {
-            // Vector store scores use canonical cosine similarity (`1 - distance`),
-            // so the caller's raw-cosine floor is already on the comparison scale.
-            let score_floor = DeterministicScore::from_f64(cosine_floor);
-            vector_hits.retain(|hit| hit.score >= score_floor);
-        }
 
         // Each arm fetched `candidates` independently, so their union can contain
         // twice that many distinct IDs. Keep the complete fetched pool through
@@ -1014,6 +1051,49 @@ impl KhiveRuntime {
         Ok((fused, vector_error))
     }
 
+    /// The vector stage of hybrid entity search: one KNN query over the entity vectors of
+    /// the primary namespace. It does not depend on an entity kind, which only the text
+    /// stage and the filter after fusion apply.
+    async fn hybrid_vector_stage(
+        &self,
+        token: &NamespaceToken,
+        query_text: &str,
+        query_vector: Option<Vec<f32>>,
+        candidates: u32,
+        vector_similarity_floor: Option<f64>,
+        tolerate_vector_error: bool,
+    ) -> RuntimeResult<(Vec<VectorSearchHit>, Option<String>)> {
+        let mut vector_error: Option<String> = None;
+        let mut vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
+            match self
+                .vector_search(
+                    token,
+                    query_vector,
+                    Some(query_text),
+                    candidates,
+                    Some(SubstrateKind::Entity),
+                )
+                .await
+            {
+                Ok(hits) => hits,
+                Err(e) if tolerate_vector_error => {
+                    vector_error = Some(e.to_string());
+                    Vec::new()
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            Vec::new()
+        };
+        if let Some(cosine_floor) = vector_similarity_floor {
+            // Vector store scores use canonical cosine similarity (`1 - distance`),
+            // so the caller's raw-cosine floor is already on the comparison scale.
+            let score_floor = DeterministicScore::from_f64(cosine_floor);
+            vector_hits.retain(|hit| hit.score >= score_floor);
+        }
+        Ok((vector_hits, vector_error))
+    }
+
     /// Exact KNN over the full namespace's vector store.
     ///
     /// sqlite-vec uses brute-force cosine — results are exact, not approximate.
@@ -1075,11 +1155,52 @@ impl KhiveRuntime {
         Ok(hits)
     }
 
+    async fn embed_backfill_page(
+        &self,
+        token: &NamespaceToken,
+        model_name: &str,
+        inputs: &[(Uuid, String)],
+    ) -> Vec<Option<DocumentEmbeddingOutcome>> {
+        let texts: Vec<String> = inputs.iter().map(|(_, text)| text.clone()).collect();
+        match self
+            .embed_document_batch_with_model_outcomes_for_token(token, model_name, &texts)
+            .await
+        {
+            Ok(outcomes) => outcomes.into_iter().map(Some).collect(),
+            Err(error) => {
+                tracing::warn!(
+                    model = %model_name,
+                    error = %error,
+                    "backfill_missing_embeddings: batch embed failed; retrying records individually"
+                );
+                let mut outcomes = Vec::with_capacity(inputs.len());
+                for (id, text) in inputs {
+                    match self
+                        .embed_document_with_model_outcome_for_token(token, model_name, text)
+                        .await
+                    {
+                        Ok(outcome) => outcomes.push(Some(outcome)),
+                        Err(error) => {
+                            tracing::warn!(
+                                id = %id,
+                                model = %model_name,
+                                error = %error,
+                                "backfill_missing_embeddings: record embed failed"
+                            );
+                            outcomes.push(None);
+                        }
+                    }
+                }
+                outcomes
+            }
+        }
+    }
+
     /// Backfill vector and FTS index entries for entities and notes that are missing them.
     ///
     /// Intended to run once at startup as a background task (warm-up sequence steps 2–4).
-    /// Queries the SQL substrate for entity descriptions and note contents that have no
-    /// corresponding entry in the vector store for any registered embedding model, then
+    /// Queries the SQL substrate for entity bodies and note contents that have no
+    /// corresponding entry in an eligible embedding model's vector store, then
     /// embeds and inserts them. FTS entries missing for notes are also repopulated.
     ///
     /// The operation is best-effort: individual embed/insert failures are logged and
@@ -1103,27 +1224,37 @@ impl KhiveRuntime {
 
         for model_name in &model_names {
             let mut model_truncation = EmbeddingTruncationReport::default();
+            match self.vectors_for_model(token, model_name) {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(model = %model_name, error = %error,
+                        "backfill_missing_embeddings: vector store unavailable");
+                    continue;
+                }
+            };
             // Must match vec_model_key's naming logic.
             let vec_table = format!("vec_{}", sanitize_key(model_name));
 
-            // --- Entities: embed description where no vector entry exists ---
-            // Each inserted row satisfies the NOT IN (SELECT subject_id FROM vec_table ...)
-            // clause going forward, so no OFFSET is needed between pages.
-            const PAGE_SIZE: usize = 500;
+            // --- Entities: embed the canonical body where no vector exists ---
+            // Keyset pagination advances past failed or ineligible records too;
+            // they must not keep the first page full forever.
+            const PAGE_SIZE: usize = EMBEDDING_BATCH_PAGE_SIZE;
             let mut entity_total = 0usize;
+            let mut entity_cursor = String::new();
             loop {
                 let entity_sql = SqlStatement {
                     sql: format!(
-                        "SELECT id, name, description FROM entities \
-                         WHERE namespace = ?1 AND deleted_at IS NULL \
+                        "SELECT id FROM entities \
+                         WHERE namespace = ?1 AND deleted_at IS NULL AND id > ?3 \
                          AND id NOT IN (\
                              SELECT subject_id FROM {vec_table} \
                              WHERE namespace = ?1 AND embedding_model = ?2 \
-                         ) LIMIT {PAGE_SIZE}"
+                         ) ORDER BY id LIMIT {PAGE_SIZE}"
                     ),
                     params: vec![
                         SqlValue::Text(ns.clone()),
                         SqlValue::Text(model_name.clone()),
+                        SqlValue::Text(entity_cursor.clone()),
                     ],
                     label: Some("backfill_entities".into()),
                 };
@@ -1150,72 +1281,61 @@ impl KhiveRuntime {
 
                 let batch_len = entity_rows.len();
                 entity_total += batch_len;
+                if batch_len == 0 {
+                    break;
+                }
+                entity_cursor = match entity_rows.last().and_then(|row| row.columns.first()) {
+                    Some(column) => match &column.value {
+                        SqlValue::Text(id) => id.clone(),
+                        _ => {
+                            return Err(RuntimeError::Internal(
+                                "backfill entity ID is not text".into(),
+                            ))
+                        }
+                    },
+                    None => {
+                        return Err(RuntimeError::Internal(
+                            "backfill entity page is empty".into(),
+                        ))
+                    }
+                };
 
+                let entity_store = self.entities(token)?;
+                let mut entities = Vec::with_capacity(batch_len);
+                let mut inputs = Vec::with_capacity(batch_len);
                 for row in &entity_rows {
-                    let id_str = row.columns.first().and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    });
-                    let description = row.columns.get(2).and_then(|c| {
-                        if let SqlValue::Text(s) = &c.value {
-                            Some(s.clone())
-                        } else if let SqlValue::Null = &c.value {
-                            None
-                        } else {
-                            None
-                        }
-                    });
-
-                    let (Some(id_str), Some(desc)) = (id_str, description) else {
+                    let Some(SqlValue::Text(id)) = row.columns.first().map(|column| &column.value)
+                    else {
                         continue;
                     };
-                    let Ok(id) = id_str.parse::<Uuid>() else {
+                    let Ok(id) = id.parse::<Uuid>() else { continue };
+                    let Some(entity) = entity_store.get_entity(id).await? else {
                         continue;
                     };
-                    if desc.trim().is_empty() {
+                    if entity.namespace != ns || entity.deleted_at.is_some() {
                         continue;
                     }
-
+                    let text = crate::curation::entity_embedding_text(&entity);
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    inputs.push((id, text));
+                    entities.push(entity);
+                }
+                let outcomes = self.embed_backfill_page(token, model_name, &inputs).await;
+                for (entity, outcome) in entities.into_iter().zip(outcomes) {
+                    let Some(outcome) = outcome else { continue };
+                    model_truncation.observe(&outcome);
                     match self
-                        .embed_document_with_model_outcome_for_token(token, model_name, &desc)
+                        .publish_entity_vector_revision(token, &entity, model_name, &outcome.vector)
                         .await
                     {
-                        Ok(outcome) => {
-                            model_truncation.observe(&outcome);
-                            if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                                match vs
-                                    .insert(
-                                        id,
-                                        SubstrateKind::Entity,
-                                        &ns,
-                                        "entity.description",
-                                        vec![outcome.vector],
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        total_backfilled += 1;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            id = %id, model = %model_name,
-                                            error = %e,
-                                            "backfill_missing_embeddings: entity vector insert failed"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                id = %id, model = %model_name,
-                                error = %e,
-                                "backfill_missing_embeddings: entity embed failed"
-                            );
-                        }
+                        Ok(true) => total_backfilled += 1,
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            id = %entity.id, model = %model_name, error = %error,
+                            "backfill_missing_embeddings: entity vector insert failed"
+                        ),
                     }
                 }
 
@@ -1228,21 +1348,25 @@ impl KhiveRuntime {
             let text_store = self.text_for_notes(token).ok();
             let note_store = self.notes(token).ok();
             let mut note_total = 0usize;
+            // Excluded kinds remain absent from this model's vector table.
+            // Advancing by id prevents a full page of them from repeating.
+            let mut note_cursor = String::new();
             loop {
                 // Only the id is selected here; the full Note is fetched below so
                 // note_fts_document gets all fields and stays parity-correct.
                 let note_sql = SqlStatement {
                     sql: format!(
                         "SELECT id FROM notes \
-                         WHERE namespace = ?1 AND deleted_at IS NULL \
+                         WHERE namespace = ?1 AND deleted_at IS NULL AND id > ?3 \
                          AND id NOT IN (\
                              SELECT subject_id FROM {vec_table} \
                              WHERE namespace = ?1 AND embedding_model = ?2 \
-                         ) LIMIT {PAGE_SIZE}"
+                         ) ORDER BY id LIMIT {PAGE_SIZE}"
                     ),
                     params: vec![
                         SqlValue::Text(ns.clone()),
                         SqlValue::Text(model_name.clone()),
+                        SqlValue::Text(note_cursor.clone()),
                     ],
                     label: Some("backfill_notes".into()),
                 };
@@ -1269,7 +1393,25 @@ impl KhiveRuntime {
 
                 let batch_len = note_rows.len();
                 note_total += batch_len;
+                if batch_len == 0 {
+                    break;
+                }
+                note_cursor = match note_rows.last().and_then(|row| row.columns.first()) {
+                    Some(column) => match &column.value {
+                        SqlValue::Text(id) => id.clone(),
+                        _ => {
+                            return Err(RuntimeError::Internal(
+                                "backfill note ID is not text".into(),
+                            ))
+                        }
+                    },
+                    None => {
+                        return Err(RuntimeError::Internal("backfill note page is empty".into()))
+                    }
+                };
 
+                let mut notes_for_batch = Vec::with_capacity(batch_len);
+                let mut inputs = Vec::with_capacity(batch_len);
                 for row in &note_rows {
                     let id_str = row.columns.first().and_then(|c| {
                         if let SqlValue::Text(s) = &c.value {
@@ -1309,44 +1451,31 @@ impl KhiveRuntime {
                         }
                     }
 
-                    let content = note.content.clone();
+                    if !self
+                        .embedding_models_for_note_kind(&note.kind)
+                        .contains(model_name)
+                    {
+                        continue;
+                    }
+
+                    inputs.push((id, note.content.clone()));
+                    notes_for_batch.push(note);
+                }
+
+                let outcomes = self.embed_backfill_page(token, model_name, &inputs).await;
+                for (note, outcome) in notes_for_batch.into_iter().zip(outcomes) {
+                    let Some(outcome) = outcome else { continue };
+                    model_truncation.observe(&outcome);
                     match self
-                        .embed_document_with_model_outcome_for_token(token, model_name, &content)
+                        .publish_note_vector_revision(token, &note, model_name, &outcome.vector)
                         .await
                     {
-                        Ok(outcome) => {
-                            model_truncation.observe(&outcome);
-                            if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                                match vs
-                                    .insert(
-                                        id,
-                                        SubstrateKind::Note,
-                                        &ns,
-                                        "note.content",
-                                        vec![outcome.vector],
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        total_backfilled += 1;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            id = %id, model = %model_name,
-                                            error = %e,
-                                            "backfill_missing_embeddings: note vector insert failed"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                id = %id, model = %model_name,
-                                error = %e,
-                                "backfill_missing_embeddings: note embed failed"
-                            );
-                        }
+                        Ok(true) => total_backfilled += 1,
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            id = %note.id, model = %model_name, error = %error,
+                            "backfill_missing_embeddings: note vector insert failed"
+                        ),
                     }
                 }
 
@@ -1592,6 +1721,7 @@ fn rrf_fuse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use crate::runtime::{KhiveRuntime, NamespaceToken, RuntimeConfig};
@@ -2543,6 +2673,168 @@ mod tests {
         );
     }
 
+    /// Entity-branch kind-filter regression.
+    ///
+    /// Scenario: `limit=1`, so the text arm fetches 4 candidates, and
+    /// `entity_kind="document"`. Twelve `concept` entities repeat the query term and
+    /// outrank the one `document` entity that mentions it once in a long description.
+    ///
+    /// When the kind is applied only after the text arm has picked its candidates,
+    /// the filter sees four concepts and the document is never returned. The kind
+    /// has to reach the text query so the candidate budget is spent on documents.
+    #[tokio::test]
+    async fn hybrid_search_entity_kind_filter_pushed_into_text_arm() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        for i in 0..12 {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                &format!("quillfeather decoy {i}"),
+                Some("quillfeather quillfeather quillfeather"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+
+        let description = format!(
+            "A long administrative description that mentions quillfeather once. {}",
+            "Unrelated filing, scheduling and review words. ".repeat(20)
+        );
+        let target = rt
+            .create_entity(
+                &tok,
+                "document",
+                None,
+                "Archive filing report",
+                Some(description.as_str()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // Premise: without a kind filter the target ranks behind more entities than
+        // the 4 candidates the filtered `limit=1` search requests from the text arm.
+        let unfiltered = rt
+            .hybrid_search(&tok, "quillfeather", None, 13, None, None, &[], None)
+            .await
+            .unwrap();
+        let target_rank = unfiltered
+            .iter()
+            .position(|hit| hit.entity_id == target.id)
+            .expect("the document is found without a kind filter");
+        assert!(
+            target_rank >= 4,
+            "the document must rank behind the candidate window, got rank {target_rank}"
+        );
+
+        let hits = rt
+            .hybrid_search(
+                &tok,
+                "quillfeather",
+                None,
+                1,
+                Some("document"),
+                None,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "the kind-filtered search must return the matching document"
+        );
+        assert_eq!(
+            hits[0].entity_id, target.id,
+            "the returned hit must be the document, not a concept"
+        );
+    }
+
+    /// `hybrid_search_each_kind` gives each kind the list `hybrid_search` returns for it.
+    ///
+    /// Scenario: twenty `concept` entities repeat the query term and outrank three
+    /// `document` entities that mention it once, with `limit=2`. The text arm fetches 8
+    /// candidates per kind, so the concepts alone overflow it and the cut to `limit`
+    /// binds. A text budget shared by the two kinds would leave the documents none; each
+    /// kind has to keep its own, so both lists equal the per-kind search.
+    #[tokio::test]
+    async fn hybrid_search_each_kind_matches_per_kind_search_when_one_kind_dominates() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        for i in 0..20 {
+            rt.create_entity(
+                &tok,
+                "concept",
+                None,
+                &format!("quillfeather decoy {i}"),
+                Some("quillfeather quillfeather quillfeather"),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+        for i in 0..3 {
+            let description = format!(
+                "A long administrative description {i} that mentions quillfeather once. {}",
+                "Unrelated filing, scheduling and review words. ".repeat(20)
+            );
+            rt.create_entity(
+                &tok,
+                "document",
+                None,
+                &format!("Archive filing report {i}"),
+                Some(description.as_str()),
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        }
+
+        let kinds = ["concept", "document"];
+        let mut expected: Vec<Vec<Uuid>> = Vec::new();
+        for kind in kinds {
+            let hits = rt
+                .hybrid_search(&tok, "quillfeather", None, 2, Some(kind), None, &[], None)
+                .await
+                .unwrap();
+            expected.push(hits.iter().map(|hit| hit.entity_id).collect());
+        }
+        assert_eq!(
+            expected[0].len(),
+            2,
+            "premise: the concept list is cut to limit"
+        );
+        assert_eq!(
+            expected[1].len(),
+            2,
+            "premise: the document list is not starved"
+        );
+
+        let per_kind = rt
+            .hybrid_search_each_kind(&tok, "quillfeather", None, 2, &kinds)
+            .await
+            .unwrap();
+        let mut actual: Vec<Vec<Uuid>> = Vec::new();
+        for hits in &per_kind {
+            actual.push(hits.iter().map(|hit| hit.entity_id).collect());
+        }
+        assert_eq!(
+            actual, expected,
+            "each kind must get the ids and order its own per-kind search returns"
+        );
+    }
+
     // ---- embed intent tests ----
 
     struct CapturingEmbeddingService {
@@ -2993,9 +3285,10 @@ mod tests {
         let rt_ref = &rt;
         let (doc_emb, query_emb) = tokio::runtime::Runtime::new().unwrap().block_on(async {
             let d = rt_ref
-                .embed_document_with_model(&model.to_string(), &text)
+                .embed_document_with_model_outcome(&model.to_string(), &text)
                 .await
-                .unwrap();
+                .unwrap()
+                .vector;
             let q = rt_ref
                 .embed_query_with_model(&model.to_string(), &text)
                 .await
@@ -3028,9 +3321,10 @@ mod tests {
         let rt_ref = &rt;
         let (doc_emb, query_emb) = tokio::runtime::Runtime::new().unwrap().block_on(async {
             let d = rt_ref
-                .embed_document_with_model(&model.to_string(), &text)
+                .embed_document_with_model_outcome(&model.to_string(), &text)
                 .await
-                .unwrap();
+                .unwrap()
+                .vector;
             let q = rt_ref
                 .embed_query_with_model(&model.to_string(), &text)
                 .await
@@ -3115,6 +3409,313 @@ mod tests {
         assert!(
             err_msg.contains("injected failure"),
             "error must originate from the injected reader failure, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_skips_a_full_page_of_excluded_messages_and_reaches_eligible_tail() {
+        use crate::{NoteEmbeddingPolicy, NoteEmbeddingPolicySpec};
+        use khive_storage::note::Note;
+
+        const PAGE: u128 = EMBEDDING_BATCH_PAGE_SIZE as u128;
+        let primary = EmbeddingModel::AllMiniLmL6V2;
+        let primary_name = primary.to_string();
+        let secondary_name = "zz-backfill-secondary";
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: Some(primary),
+            packs: vec![],
+            ..RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        rt.register_embedder(ConstantEmbedderProvider {
+            name: primary_name.clone(),
+            dimensions: primary.dimensions(),
+        });
+        rt.register_embedder(ConstantEmbedderProvider {
+            name: secondary_name.into(),
+            dimensions: 4,
+        });
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }]);
+        let tok = NamespaceToken::local();
+        let primary_store = rt.vectors_for_model(&tok, &primary_name).unwrap();
+        let secondary_store = rt.vectors_for_model(&tok, secondary_name).unwrap();
+        let notes = rt.notes(&tok).unwrap();
+        let mut seeded = Vec::new();
+        for ordinal in 1..=PAGE + 1 {
+            let mut message = Note::new("local", "message", "excluded from secondary");
+            message.id = Uuid::from_u128(ordinal);
+            seeded.push(message);
+        }
+        let mut ordinary = Note::new("local", "observation", "eligible after full page");
+        ordinary.id = Uuid::from_u128(u128::MAX);
+        seeded.push(ordinary.clone());
+        notes.upsert_notes(seeded).await.unwrap();
+
+        let backfilled = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.backfill_missing_embeddings(&tok),
+        )
+        .await
+        .expect("backfill must advance past a full excluded page")
+        .unwrap();
+        assert_eq!(backfilled, (PAGE + 2) as u64 + 1);
+        assert_eq!(primary_store.count().await.unwrap(), (PAGE + 2) as u64);
+        assert_eq!(secondary_store.count().await.unwrap(), 1);
+        let excluded_document = rt
+            .text_for_notes(&tok)
+            .unwrap()
+            .get_document("local", Uuid::from_u128(1))
+            .await
+            .unwrap()
+            .expect("first-model pass must index an excluded message");
+        assert_eq!(excluded_document.body, "excluded from secondary");
+        assert!(
+            rt.text_for_notes(&tok)
+                .unwrap()
+                .get_document("local", ordinary.id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the first-model pass must still repopulate FTS"
+        );
+    }
+
+    const BACKFILL_BATCH_MODEL: &str = "backfill-batch-model";
+
+    struct CountingBackfillService {
+        calls: Arc<AtomicUsize>,
+        reject_poison: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for CountingBackfillService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_poison
+                && (texts.len() > 1 || texts.iter().any(|text| text.contains("poison")))
+            {
+                return Err(EmbedError::InferenceFailed("poison input".into()));
+            }
+            Ok(texts
+                .iter()
+                .map(|text| {
+                    vec![
+                        text.len() as f32,
+                        text.bytes().map(u32::from).sum::<u32>() as f32,
+                        text.as_bytes().first().copied().unwrap_or_default() as f32,
+                        text.as_bytes().last().copied().unwrap_or_default() as f32,
+                    ]
+                })
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "backfill-batch-counting-service"
+        }
+    }
+
+    struct CountingBackfillProvider {
+        calls: Arc<AtomicUsize>,
+        reject_poison: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for CountingBackfillProvider {
+        fn name(&self) -> &str {
+            BACKFILL_BATCH_MODEL
+        }
+
+        fn dimensions(&self) -> usize {
+            4
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(CountingBackfillService {
+                calls: Arc::clone(&self.calls),
+                reject_poison: self.reject_poison,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_batches_provider_calls_and_matches_single_record_vectors() {
+        let token = NamespaceToken::local();
+        let runtime = KhiveRuntime::memory().unwrap();
+        let mut entity_ids = Vec::new();
+        for index in 0..257 {
+            let entity = runtime
+                .create_entity(
+                    &token,
+                    "concept",
+                    None,
+                    &format!("Backfill entity {index}"),
+                    (index != 0).then_some("body"),
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap();
+            entity_ids.push(entity.id);
+        }
+        let mut note_ids = Vec::new();
+        for index in 0..3 {
+            let note = runtime
+                .create_note(
+                    &token,
+                    "observation",
+                    None,
+                    &format!("Backfill note {index}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap();
+            note_ids.push(note.id);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        runtime.register_embedder(CountingBackfillProvider {
+            calls: Arc::clone(&calls),
+            reject_poison: false,
+        });
+        let usage = crate::usage::UsageContext::new();
+        let backfilled =
+            crate::usage::scope(usage.clone(), runtime.backfill_missing_embeddings(&token))
+                .await
+                .unwrap();
+        assert_eq!(backfilled, 260);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two entity pages and one note page"
+        );
+        assert_eq!(
+            usage.snapshot()["embed_calls"],
+            260,
+            "ADR-103 counts texts, not provider calls"
+        );
+
+        let singles = KhiveRuntime::memory().unwrap();
+        let single_calls = Arc::new(AtomicUsize::new(0));
+        singles.register_embedder(CountingBackfillProvider {
+            calls: Arc::clone(&single_calls),
+            reject_poison: false,
+        });
+        for id in &entity_ids {
+            let entity = runtime.get_entity(&token, *id).await.unwrap();
+            singles
+                .entities(&token)
+                .unwrap()
+                .upsert_entity(entity.clone())
+                .await
+                .unwrap();
+            singles.reindex_entity(&token, &entity).await.unwrap();
+        }
+        for id in &note_ids {
+            let note = runtime
+                .notes(&token)
+                .unwrap()
+                .get_note(*id)
+                .await
+                .unwrap()
+                .unwrap();
+            singles
+                .notes(&token)
+                .unwrap()
+                .upsert_note(note.clone())
+                .await
+                .unwrap();
+            singles.reindex_note(&token, &note).await.unwrap();
+        }
+        assert_eq!(single_calls.load(Ordering::SeqCst), 260);
+        let batched_entities = runtime
+            .vectors_for_model(&token, BACKFILL_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&entity_ids, "local", "entity.body")
+            .await
+            .unwrap();
+        let single_entities = singles
+            .vectors_for_model(&token, BACKFILL_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&entity_ids, "local", "entity.body")
+            .await
+            .unwrap();
+        assert_eq!(batched_entities.len(), 257);
+        assert_eq!(batched_entities, single_entities);
+        let batched_notes = runtime
+            .vectors_for_model(&token, BACKFILL_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&note_ids, "local", "note.content")
+            .await
+            .unwrap();
+        let single_notes = singles
+            .vectors_for_model(&token, BACKFILL_BATCH_MODEL)
+            .unwrap()
+            .get_vectors(&note_ids, "local", "note.content")
+            .await
+            .unwrap();
+        assert_eq!(batched_notes.len(), 3);
+        assert_eq!(batched_notes, single_notes);
+    }
+
+    #[tokio::test]
+    async fn backfill_failed_pages_retry_singly_without_duplicate_index_rows() {
+        use khive_storage::types::{SqlStatement, SqlValue};
+
+        let token = NamespaceToken::local();
+        let runtime = KhiveRuntime::memory().unwrap();
+        for name in ["good one", "poison", "good two"] {
+            runtime
+                .create_entity(&token, "concept", None, name, Some("body"), None, vec![])
+                .await
+                .unwrap();
+            runtime
+                .create_note(&token, "observation", None, name, None, None, vec![])
+                .await
+                .unwrap();
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        runtime.register_embedder(CountingBackfillProvider {
+            calls: Arc::clone(&calls),
+            reject_poison: true,
+        });
+        let backfilled = runtime.backfill_missing_embeddings(&token).await.unwrap();
+        assert_eq!(backfilled, 4);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            8,
+            "two failed pages plus six singleton retries"
+        );
+        let mut reader = runtime.sql().reader().await.unwrap();
+        for (table, expected) in [("ann_write_log", 4), ("vector_provenance", 0)] {
+            let count = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT COUNT(*) FROM {table} WHERE namespace = ?1"),
+                    params: vec![SqlValue::Text("local".into())],
+                    label: Some("backfill-batch-no-duplicate-rows".into()),
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(count, Some(SqlValue::Integer(value)) if value == expected),
+                "{table} must match the guarded per-record writer"
+            );
+        }
+        assert_eq!(
+            runtime.backfill_missing_embeddings(&token).await.unwrap(),
+            0
         );
     }
 }

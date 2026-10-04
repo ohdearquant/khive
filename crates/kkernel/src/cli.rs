@@ -4,7 +4,11 @@
 //! Lives in the library (rather than `main.rs`) so downstream distributions
 //! can embed the full CLI in their own binary with additional packs linked
 //! in: `fn main() { kkernel::cli::cli_main() }` plus a force-link `use` per
-//! extra pack crate (ADR-027 self-registration).
+//! extra pack crate (ADR-027 self-registration). On verified 64-bit Linux/macOS,
+//! an embedding binary must first call the unsafe
+//! `khive_db::pool::initialize_claimed_file_observer` at process startup before
+//! any SQLite I/O or worker threads. Daemon claimed-file boot refuses without
+//! that initialization; the stock binary performs it before calling this CLI.
 //!
 //! See `crates/kkernel/docs/usage.md` for the full subcommand reference.
 
@@ -17,7 +21,8 @@ use clap::{Parser, Subcommand};
 use crate::{
     blob, code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, git_ingest, kg, pack_introspect, reindex, repo, sync, vector,
+    engine, exec, git_annotation_repair, git_ingest, kg, pack_introspect, reindex, repo, sync,
+    vector,
 };
 use khive_runtime::{
     runtime_config_from_khive_config, BackendId, BackendKind, KhiveConfig, KhiveRuntime,
@@ -127,6 +132,9 @@ enum Command {
     /// from a local git repository (ADR-088).
     GitIngest(git_ingest::GitIngestArgs),
 
+    /// Preview or apply one project's historical commit annotations (ADR-088).
+    GitAnnotationRepair(git_annotation_repair::GitAnnotationRepairArgs),
+
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
     CodeIngest(code_ingest::CodeIngestArgs),
@@ -145,6 +153,48 @@ struct EventsDaemonArgs {
     /// `.sock` extension, beside that database.
     #[arg(long)]
     socket: Option<PathBuf>,
+
+    /// Resolved main-backend WAL ceiling bytes, including an explicit zero.
+    #[arg(long, requires = "wal_ceiling_source")]
+    wal_ceiling_bytes: Option<u64>,
+
+    /// Configuration source of the resolved main-backend WAL ceiling.
+    #[arg(long, value_enum, requires = "wal_ceiling_bytes")]
+    wal_ceiling_source: Option<EventsWalCeilingSource>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum EventsWalCeilingSource {
+    #[value(name = "backend_field")]
+    BackendField,
+    #[value(name = "environment")]
+    Environment,
+    #[value(name = "default")]
+    Default,
+}
+
+#[cfg(any(unix, test))]
+impl EventsDaemonArgs {
+    fn wal_ceiling_policy(&self) -> Result<Option<khive_db::WalCeilingPolicy>> {
+        match (self.wal_ceiling_bytes, self.wal_ceiling_source) {
+            (None, None) => Ok(None),
+            (Some(bytes), Some(source)) => {
+                let source = match source {
+                    EventsWalCeilingSource::BackendField => khive_db::WalCeilingSource::BackendField,
+                    EventsWalCeilingSource::Environment => khive_db::WalCeilingSource::Environment,
+                    EventsWalCeilingSource::Default => khive_db::WalCeilingSource::Default,
+                };
+                let policy = khive_db::WalCeilingPolicy { bytes, source };
+                policy
+                    .validate_static(true, true, false)
+                    .context("events-daemon: invalid explicit WAL ceiling policy")?;
+                Ok(Some(policy))
+            }
+            _ => anyhow::bail!(
+                "events-daemon: --wal-ceiling-bytes and --wal-ceiling-source must be supplied together"
+            ),
+        }
+    }
 }
 
 /// Database schema lifecycle subcommands.
@@ -338,6 +388,7 @@ pub async fn cli_main() -> Result<()> {
         }
         #[cfg(unix)]
         Command::EventsDaemon(a) => {
+            let wal_ceiling = a.wal_ceiling_policy()?;
             let db = match a.db {
                 Some(db) => db,
                 None => {
@@ -353,7 +404,15 @@ pub async fn cli_main() -> Result<()> {
             let socket = a
                 .socket
                 .unwrap_or_else(|| khive_runtime::events_split::events_socket_path_beside(&db));
-            khive_runtime::events_split::run_events_daemon(&db, &socket).await
+            match wal_ceiling {
+                Some(policy) => {
+                    khive_runtime::events_split::run_events_daemon_with_wal_ceiling(
+                        &db, &socket, policy,
+                    )
+                    .await
+                }
+                None => khive_runtime::events_split::run_events_daemon(&db, &socket).await,
+            }
         }
         #[cfg(not(unix))]
         Command::EventsDaemon(_) => {
@@ -502,8 +561,8 @@ pub async fn cli_main() -> Result<()> {
                         &mut guards,
                         &plan.read_only_paths,
                     )?;
-                    // Check before pool construction, whose pathname open and
-                    // journal_mode setup precede the later post-open check.
+                    // Check the binding now; each pool also verifies the held
+                    // file identity before identity initialization and WAL setup.
                     khive_runtime::daemon::assert_daemon_store_identities(&guards)?;
                     Some(guards)
                 } else {
@@ -544,6 +603,7 @@ pub async fn cli_main() -> Result<()> {
         Command::Backend(b) => cmd_backend(b),
         Command::CodeAudit(a) => code_audit::run_code_audit(a).await,
         Command::GitIngest(a) => git_ingest::run_git_ingest(a).await,
+        Command::GitAnnotationRepair(a) => git_annotation_repair::run(a).await,
         Command::CodeIngest(a) => code_ingest::run_code_ingest(a).await,
     }
 }
@@ -1161,6 +1221,10 @@ fn cmd_backend(cmd: BackendCommand) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "cli_events_wal_policy_tests.rs"]
+mod events_wal_policy_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
@@ -1312,6 +1376,8 @@ mod tests {
             pack: Vec::new(),
             config: Some(config_path.clone()),
             daemon: false,
+            lifetime: None,
+            idle_timeout_secs: None,
             transport: None,
             bind: None,
             brain_profile: None,
@@ -1942,6 +2008,7 @@ mod tests {
                 path,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -2430,6 +2497,7 @@ no_embed = true
             path: None,
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         });
@@ -2469,6 +2537,7 @@ no_embed = true
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -2478,6 +2547,7 @@ no_embed = true
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -2601,4 +2671,5 @@ no_embed = true
         );
     }
     include!("cli_backend_batch_tests.rs");
+    include!("cli_file_identity_tests.rs");
 }

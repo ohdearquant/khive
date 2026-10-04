@@ -17,6 +17,10 @@ fn actor_registry(
     let runtime = KhiveRuntime::from_backend(
         backend,
         RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -37,6 +41,7 @@ fn actor_registry(
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some(actor.to_string()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         },
     );
     let mut builder = VerbRegistryBuilder::new();

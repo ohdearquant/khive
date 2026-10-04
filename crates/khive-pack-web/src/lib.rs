@@ -10,30 +10,14 @@ mod extract;
 mod fetch;
 #[cfg(test)]
 mod fhcrc_probe_tests;
-mod identity;
+pub mod identity;
 mod ingest;
 mod namespace;
 mod pack;
+pub mod producer;
 mod receipt;
 mod refresh;
 mod search;
 mod vocab;
 
 pub use pack::WebPack;
-
-use khive_runtime::{KhiveRuntime, RuntimeError};
-use khive_storage::BlobStore;
-use std::sync::Arc;
-
-/// The installed `BlobStore`, or an explicit `Unconfigured` refusal — the
-/// same pattern and the same message shape `khive-pack-blob` uses, so an
-/// operator sees one consistent error regardless of which pack's verb hit
-/// the missing configuration first.
-pub(crate) fn blob_store(runtime: &KhiveRuntime) -> Result<Arc<dyn BlobStore>, RuntimeError> {
-    runtime.blob_store().ok_or_else(|| {
-        RuntimeError::Unconfigured(
-            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or KHIVE_BLOB_ROOT)"
-                .to_string(),
-        )
-    })
-}

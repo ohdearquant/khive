@@ -308,7 +308,8 @@ enum FinalDisposition {
     Fired,
     Advanced,
     RetryPending,
-    Failed,
+    Indeterminate,
+    RecurrenceFailed,
 }
 
 #[derive(Debug, Default)]
@@ -418,6 +419,8 @@ pub async fn run_pending_events_with_config(
         pack: Vec::new(),
         config: config.map(std::path::Path::to_path_buf),
         daemon: false,
+        lifetime: None,
+        idle_timeout_secs: None,
         transport: None,
         bind: None,
         brain_profile: None,
@@ -966,6 +969,7 @@ async fn run_pending_events_on_with_lease(
                         .get("repeat")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    let mut recurrence_error = None;
                     match advance_repeat_past_missed_for_event(
                         &mut props,
                         &repeat_for_finalize,
@@ -987,11 +991,13 @@ async fn run_pending_events_on_with_lease(
                             props["status"] = json!("missed");
                         }
                         Err(error) => {
-                            props["status"] = json!("failed");
-                            let (error_key, error_at_key) = dispatch_error_property_keys(&props);
-                            props[error_key] = json!(error);
-                            props[error_at_key] = json!(Utc::now().to_rfc3339());
-                            summary.failed += 1;
+                            mark_recurrence_failure(&mut props, error, &Utc::now().to_rfc3339());
+                            recurrence_error = Some(error);
+                            tracing::error!(
+                                scheduled_event_id = %id,
+                                error = %error,
+                                "pending-events: missed recurrence could not advance"
+                            );
                         }
                     }
                     let updated_at = Utc::now().timestamp_micros();
@@ -1013,8 +1019,12 @@ async fn run_pending_events_on_with_lease(
                     .await
                     {
                         Ok(true) => {
-                            summary.missed.push(id);
                             summary.finalized += 1;
+                            if recurrence_error.is_some() {
+                                summary.failed += 1;
+                            } else {
+                                summary.missed.push(id);
+                            }
                         }
                         Ok(false) => {
                             if verbose {
@@ -1180,7 +1190,6 @@ async fn run_pending_events_on_with_lease(
                             ),
                             "pending-events: scheduled event delivery failed"
                         );
-                        summary.failed += 1;
                         Some(error.as_str().to_string())
                     }
                 };
@@ -1344,6 +1353,13 @@ async fn run_pending_events_on_with_lease(
                     trigger_offset,
                     &repeat,
                 );
+                if disposition == FinalDisposition::RecurrenceFailed {
+                    tracing::error!(
+                        scheduled_event_id = %id,
+                        error = %final_props["recurrence_error"].as_str().unwrap_or(UNADVANCEABLE_REPEAT),
+                        "pending-events: recurrence advancement failed after dispatch"
+                    );
+                }
                 match finalize_fired_event(
                     rt,
                     ns_str,
@@ -1355,7 +1371,14 @@ async fn run_pending_events_on_with_lease(
                 )
                 .await
                 {
-                    Ok(true) => apply_final_disposition(&mut summary, disposition),
+                    Ok(true) => {
+                        apply_final_disposition(&mut summary, disposition);
+                        if !matches!(completion, DispatchCompletion::Succeeded)
+                            && disposition != FinalDisposition::RecurrenceFailed
+                        {
+                            summary.failed += 1;
+                        }
+                    }
                     Ok(false) => summary.failed += 1,
                     Err(error) => {
                         tracing::error!(
@@ -1578,6 +1601,10 @@ async fn claim_pending_event(
     let receipt = claim.claimed_receipt();
     let receipt_json = serde_json::to_string(&receipt)
         .context("pending-events: serialize dispatch claim receipt")?;
+    let Some(snapshot) = current_note_properties_text(rt, namespace, id).await? else {
+        return Ok(None);
+    };
+    check_fixed_path_whole_object_snapshot(&snapshot)?;
     let mut writer = rt
         .sql()
         .writer()
@@ -1599,7 +1626,8 @@ async fn claim_pending_event(
                     AND kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
                     AND json_extract(properties, '$.status') = 'pending' \
-                    AND json_extract(properties, '$.trigger_at') = ?6"
+                    AND json_extract(properties, '$.trigger_at') = ?6 \
+                    AND properties = ?7"
                 .to_string(),
             params: vec![
                 SqlValue::Integer(updated_at),
@@ -1608,6 +1636,7 @@ async fn claim_pending_event(
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Text(expected_trigger_at.to_string()),
+                SqlValue::Text(snapshot),
             ],
             label: Some("pending_events_claim_firing".into()),
         })
@@ -1624,6 +1653,10 @@ async fn mark_dispatch_invoking(
     lease: DispatchLeaseConfig,
 ) -> Result<bool> {
     let now = Utc::now().timestamp_micros();
+    let Some(snapshot) = current_note_properties_text(rt, namespace, id).await? else {
+        return Ok(false);
+    };
+    check_fixed_path_whole_object_snapshot(&snapshot)?;
     let mut writer = rt
         .sql()
         .writer()
@@ -1646,7 +1679,8 @@ async fn mark_dispatch_invoking(
                     AND json_extract(properties, '$.status') = 'firing' \
                     AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5 \
                     AND json_extract(properties, '$.dispatch_receipt.invocation_id') = ?6 \
-                    AND json_extract(properties, '$.dispatch_receipt.state') = 'claimed'"
+                    AND json_extract(properties, '$.dispatch_receipt.state') = 'claimed' \
+                    AND properties = ?7"
                 .to_string(),
             params: vec![
                 SqlValue::Integer(now),
@@ -1655,6 +1689,7 @@ async fn mark_dispatch_invoking(
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(claim.firing_at),
                 SqlValue::Text(claim.invocation_id.to_string()),
+                SqlValue::Text(snapshot),
             ],
             label: Some("pending_events_mark_invoking".into()),
         })
@@ -1767,10 +1802,10 @@ async fn persist_dispatch_outcome(
     // Direct SQL write, bypassing the ordinary note-write path (and with it
     // curation.rs's write-time content scan) for durability reasons unique to
     // this seam. The dispatch already happened and the lease is already held
-    // by the time this runs, so a hard refusal here would not stop anything
+    // by the time this runs, so a hard credential-content refusal here would not stop anything
     // from occurring -- it would only lose the record of what did, leaving
     // the row `firing` forever and the occurrence permanently re-drainable.
-    // No caller can act on a refusal at this seam. Mask the handler-supplied
+    // No caller can act on a content-scan refusal at this seam. Mask the handler-supplied
     // failure content instead of blocking it, then run the same scan the
     // outbound-message path applies to `last_error` as a POST-MASK ASSERT on
     // exactly what is about to be embedded -- confirming the masker did its
@@ -1814,14 +1849,21 @@ async fn persist_dispatch_outcome(
     });
     let receipt_json = serde_json::to_string(&receipt)
         .context("pending-events: serialize dispatch outcome receipt")?;
-    let mut writer = rt
-        .sql()
-        .writer()
-        .await
-        .context("pending-events: open SQL writer for dispatch outcome")?;
-    let rows = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes \
+    // A lease renewal may win this exact-properties CAS; retry against its
+    // current object while the invocation identity remains guarded below.
+    for _ in 0..8 {
+        let Some(snapshot) = current_note_properties_text(rt, namespace, id).await? else {
+            return Ok(None);
+        };
+        check_fixed_path_whole_object_snapshot(&snapshot)?;
+        let mut writer = rt
+            .sql()
+            .writer()
+            .await
+            .context("pending-events: open SQL writer for dispatch outcome")?;
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes \
                   SET properties = json_set( \
                         properties, \
                         '$.dispatch_receipt', json(?1), \
@@ -1835,21 +1877,32 @@ async fn persist_dispatch_outcome(
                     AND json_extract(properties, '$.status') = 'firing' \
                     AND CAST(json_extract(properties, '$.firing_at') AS INTEGER) = ?5 \
                     AND json_extract(properties, '$.dispatch_receipt.invocation_id') = ?6 \
-                    AND json_extract(properties, '$.dispatch_receipt.state') = 'invoking'"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(receipt_json),
-                SqlValue::Integer(completed_at),
-                SqlValue::Text(id.to_string()),
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Integer(claim.firing_at),
-                SqlValue::Text(claim.invocation_id.to_string()),
-            ],
-            label: Some("pending_events_persist_dispatch_outcome".into()),
-        })
-        .await
-        .context("pending-events: persist dispatch outcome")?;
-    Ok((rows == 1).then_some(receipt))
+                    AND json_extract(properties, '$.dispatch_receipt.state') = 'invoking' \
+                    AND properties = ?7"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(receipt_json.clone()),
+                    SqlValue::Integer(completed_at),
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(namespace.to_string()),
+                    SqlValue::Integer(claim.firing_at),
+                    SqlValue::Text(claim.invocation_id.to_string()),
+                    SqlValue::Text(snapshot.clone()),
+                ],
+                label: Some("pending_events_persist_dispatch_outcome".into()),
+            })
+            .await
+            .context("pending-events: persist dispatch outcome")?;
+        if rows == 1 {
+            return Ok(Some(receipt));
+        }
+        drop(writer);
+        match current_note_properties_text(rt, namespace, id).await? {
+            Some(current) if current != snapshot => continue,
+            _ => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 fn completion_from_receipt(receipt: &Value) -> DispatchCompletion {
@@ -1892,6 +1945,12 @@ fn dispatch_error_property_keys(properties: &Value) -> (&'static str, &'static s
     } else {
         ("dispatch_error", "dispatch_failed_at")
     }
+}
+
+fn mark_recurrence_failure(properties: &mut Value, error: &str, failed_at: &str) {
+    properties["status"] = json!("failed");
+    properties["recurrence_error"] = json!(error);
+    properties["recurrence_failed_at"] = json!(failed_at);
 }
 
 fn mark_dispatch_receipt_indeterminate(
@@ -1952,10 +2011,8 @@ fn final_properties_after_dispatch(
                     (properties, FinalDisposition::Fired)
                 }
                 Err(error) => {
-                    properties["status"] = json!("failed");
-                    properties[error_key] = json!(error);
-                    properties[error_at_key] = json!(completed_at_rfc);
-                    (properties, FinalDisposition::Failed)
+                    mark_recurrence_failure(&mut properties, error, &completed_at_rfc);
+                    (properties, FinalDisposition::RecurrenceFailed)
                 }
             }
         }
@@ -1981,16 +2038,22 @@ fn final_properties_after_dispatch(
                         properties["dispatch_receipt"]["state"] =
                             json!(DispatchReceiptState::Indeterminate.as_str());
                         properties["status"] = json!("failed");
-                        (properties, FinalDisposition::Failed)
+                        (properties, FinalDisposition::Indeterminate)
                     } else {
                         properties["status"] = json!("pending");
                         (properties, FinalDisposition::RetryPending)
                     }
                 }
-                Err(anchor_error) => {
-                    properties["status"] = json!("failed");
-                    properties[error_key] = json!(anchor_error);
-                    (properties, FinalDisposition::Failed)
+                Err(error) => {
+                    if properties
+                        .pointer("/dispatch_receipt/error_payload")
+                        .is_some_and(action_error_disposition_may_have_committed)
+                    {
+                        properties["dispatch_receipt"]["state"] =
+                            json!(DispatchReceiptState::Indeterminate.as_str());
+                    }
+                    mark_recurrence_failure(&mut properties, error, &completed_at_rfc);
+                    (properties, FinalDisposition::RecurrenceFailed)
                 }
             }
         }
@@ -1998,7 +2061,7 @@ fn final_properties_after_dispatch(
             properties[error_key] = json!(error.as_str());
             properties[error_at_key] = json!(completed_at_rfc);
             properties["status"] = json!("failed");
-            (properties, FinalDisposition::Failed)
+            (properties, FinalDisposition::Indeterminate)
         }
     }
 }
@@ -2009,7 +2072,8 @@ fn apply_final_disposition(summary: &mut DrainSummary, disposition: FinalDisposi
         FinalDisposition::Fired => summary.fired += 1,
         FinalDisposition::Advanced => summary.advanced += 1,
         FinalDisposition::RetryPending => summary.retry_pending += 1,
-        FinalDisposition::Failed => summary.indeterminate += 1,
+        FinalDisposition::Indeterminate => summary.indeterminate += 1,
+        FinalDisposition::RecurrenceFailed => summary.failed += 1,
     }
 }
 
@@ -2021,6 +2085,7 @@ async fn requeue_legacy_claim(
     selected_properties: &str,
 ) -> Result<bool> {
     let updated_at = Utc::now().timestamp_micros();
+    check_fixed_path_whole_object_snapshot(selected_properties)?;
     let mut writer = rt
         .sql()
         .writer()
@@ -2072,6 +2137,7 @@ async fn finalize_corrupt_receipt(
         object.remove("firing_at");
         object.remove("lease_expires_at");
     }
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties))?;
     let serialized = serde_json::to_string(&properties)
         .context("pending-events: serialize corrupt receipt failure state")?;
     let updated_at = Utc::now().timestamp_micros();
@@ -2398,9 +2464,17 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, now_micros: i64) -> Resu
                 properties[error_key] =
                     json!("cannot recover dispatch outcome: trigger_at is invalid");
                 properties[error_at_key] = json!(Utc::now().to_rfc3339());
-                (properties, FinalDisposition::Failed)
+                (properties, FinalDisposition::Indeterminate)
             }
         };
+        if disposition == FinalDisposition::RecurrenceFailed {
+            tracing::error!(
+                scheduled_event_id = %id,
+                namespace,
+                error = %final_properties["recurrence_error"].as_str().unwrap_or(UNADVANCEABLE_REPEAT),
+                "pending-events: recurrence advancement failed during expired-claim recovery"
+            );
+        }
         match finalize_expired_firing_event(
             rt,
             &namespace,
@@ -2425,9 +2499,12 @@ async fn reclaim_stale_firing_events(rt: &KhiveRuntime, now_micros: i64) -> Resu
                     FinalDisposition::Fired => summary.fired += 1,
                     FinalDisposition::Advanced => summary.advanced += 1,
                     FinalDisposition::RetryPending => summary.retry_pending += 1,
-                    FinalDisposition::Failed => summary.indeterminate += 1,
+                    FinalDisposition::Indeterminate => summary.indeterminate += 1,
+                    FinalDisposition::RecurrenceFailed => {}
                 }
-                if !matches!(completion, DispatchCompletion::Succeeded) {
+                if disposition == FinalDisposition::RecurrenceFailed
+                    || !matches!(completion, DispatchCompletion::Succeeded)
+                {
                     summary.failed += 1;
                 }
             }
@@ -2488,6 +2565,18 @@ async fn current_note_properties_text(
             "pending-events: multiple rows for scheduled_event {id}"
         )),
     }
+}
+
+/// These direct SQL updates change only fixed, non-reserved JSON paths. The
+/// final object's top-level reserved-key membership is therefore identical to
+/// this snapshot's. Each caller either already has an exact-properties CAS or
+/// adds one to its UPDATE, so a concurrent writer cannot change the object
+/// between this check and the write.
+fn check_fixed_path_whole_object_snapshot(properties: &str) -> Result<()> {
+    let value: Value = serde_json::from_str(properties)
+        .context("pending-events: parse properties for reservation check")?;
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&value))?;
+    Ok(())
 }
 
 /// Parses a finalizer's freshly read current-properties CAS snapshot into the
@@ -2643,9 +2732,9 @@ async fn finalize_firing_event(
         obj.remove("lease_expires_at");
     }
     // Same direct-SQL seam as `persist_dispatch_outcome` above, mask-not-
-    // block for the same reason: this is the terminal write shared by
+    // block credential content for the same reason: this is the terminal write shared by
     // fresh-dispatch finalization and expired-lease recovery, no caller can
-    // act on a refusal here, and refusing would leave the row `firing`
+    // act on a content-scan refusal here, and refusing would leave the row `firing`
     // forever instead of recording the outcome that already happened. It
     // re-embeds the same handler-supplied failure content
     // (`dispatch_receipt.error`/`error_payload`, plus the legacy flat
@@ -2732,6 +2821,7 @@ async fn finalize_firing_event(
              persisting the masked record anyway"
         );
     }
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties))?;
     let props_json = serde_json::to_string(&properties)
         .map_err(|e| anyhow::anyhow!("pending-events: serialize properties: {e}"))?;
     let mut writer = rt
@@ -2783,9 +2873,9 @@ async fn finalize_firing_event(
 /// Compute the next `trigger_at` for a repeating event, given the current
 /// `trigger_at` and the `repeat` spec.
 ///
-/// Returns `Some(next)` for every form `khive_pack_schedule::repeat` parses.
-/// Returns `None` for an absent repeat. Unsupported expressions are rejected
-/// by schedule creation and fail closed before dispatch for legacy rows.
+/// Returns `None` for an absent, malformed, or exhausted repeat. Callers that
+/// finalize a row must use `next_trigger_at_for_event` to distinguish a
+/// one-shot from a stored recurrence that cannot advance.
 fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let repeat = khive_pack_schedule::repeat::parse_repeat(repeat.as_deref()?).ok()?;
     repeat.next_after(current)
@@ -2793,6 +2883,8 @@ fn next_trigger_at(repeat: &Option<String>, current: DateTime<Utc>) -> Option<Da
 
 const INVALID_MONTHLY_ANCHOR: &str =
     "monthly repeat_anchor must be a valid timestamp no later than trigger_at";
+const INVALID_STORED_REPEAT: &str = "stored repeat must be a string";
+const UNADVANCEABLE_REPEAT: &str = "stored repeat has no representable next occurrence";
 
 fn is_monthly_repeat(repeat: &Option<String>) -> bool {
     repeat
@@ -2840,18 +2932,33 @@ fn next_trigger_at_for_event(
     repeat: &Option<String>,
     current: DateTime<Utc>,
 ) -> std::result::Result<Option<DateTime<Utc>>, &'static str> {
+    if repeat.is_none() {
+        return if properties
+            .get("repeat")
+            .is_some_and(|value| !value.is_null())
+        {
+            Err(INVALID_STORED_REPEAT)
+        } else {
+            Ok(None)
+        };
+    }
     if is_monthly_repeat(repeat) {
-        monthly_next_after(properties, current, current)
+        monthly_next_after(properties, current, current)?
+            .map(Some)
+            .ok_or(UNADVANCEABLE_REPEAT)
     } else {
-        Ok(next_trigger_at(repeat, current))
+        next_trigger_at(repeat, current)
+            .map(Some)
+            .ok_or(UNADVANCEABLE_REPEAT)
     }
 }
 
 /// Advance a missed repeating event's `trigger_at` past every occurrence at
 /// or before `now`, landing on the first occurrence strictly after `now`
 /// (ADR-106 missed-event amendment) — avoids firing a catch-up burst.
-/// Returns `None` when the event does not repeat; the caller then marks it
-/// terminally `"missed"`.
+/// Returns `None` for an absent, malformed, or exhausted repeat. Callers that
+/// finalize a row must use `advance_repeat_past_missed_for_event` to distinguish
+/// a one-shot from a stored recurrence that cannot advance.
 /// See `crates/khive-mcp/docs/api/pending-events.md` for the termination
 /// argument.
 fn advance_repeat_past_missed(
@@ -2869,10 +2976,24 @@ fn advance_repeat_past_missed_for_event(
     current: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> std::result::Result<Option<DateTime<Utc>>, &'static str> {
+    if repeat.is_none() {
+        return if properties
+            .get("repeat")
+            .is_some_and(|value| !value.is_null())
+        {
+            Err(INVALID_STORED_REPEAT)
+        } else {
+            Ok(None)
+        };
+    }
     if is_monthly_repeat(repeat) {
-        monthly_next_after(properties, current, now)
+        monthly_next_after(properties, current, now)?
+            .map(Some)
+            .ok_or(UNADVANCEABLE_REPEAT)
     } else {
-        Ok(advance_repeat_past_missed(repeat, current, now))
+        advance_repeat_past_missed(repeat, current, now)
+            .map(Some)
+            .ok_or(UNADVANCEABLE_REPEAT)
     }
 }
 
@@ -3774,6 +3895,25 @@ mod tests {
         invocations: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct DenyOrdinaryHandlerFailureGate {
+        checks: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Gate for DenyOrdinaryHandlerFailureGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "test.ordinary_handler_failure" {
+                self.checks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(GateDecision::deny(
+                    "scheduled action refused before dispatch",
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
+
     impl khive_types::Pack for OrdinaryHandlerFailurePack {
         const NAME: &'static str = "ordinary-handler-failure-test";
         const NOTE_KINDS: &'static [&'static str] = &[];
@@ -4111,6 +4251,18 @@ mod tests {
             .expect("get_note")
             .expect("note exists");
         note.properties.unwrap_or(json!({}))
+    }
+
+    async fn set_repeat_anchor_for_test(rt: &KhiveRuntime, id: uuid::Uuid, anchor: Value) {
+        let mut properties = get_note_props(rt, id).await;
+        properties["repeat_anchor"] = anchor;
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        assert!(rt
+            .notes(&token)
+            .expect("notes")
+            .update_note_properties(id, Some(properties), Utc::now().timestamp_micros())
+            .await
+            .expect("set repeat anchor"));
     }
 
     async fn get_raw_note_properties(rt: &KhiveRuntime, id: uuid::Uuid) -> String {
@@ -6474,8 +6626,72 @@ mod tests {
             FixedOffset::east_opt(0).unwrap(),
             &None,
         );
-        assert_eq!(disposition, FinalDisposition::Failed);
+        assert_eq!(disposition, FinalDisposition::Indeterminate);
         assert_eq!(properties["status"], "failed");
+        assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
+    }
+
+    #[test]
+    fn committed_error_with_unadvanceable_repeat_keeps_indeterminate_receipt() {
+        let trigger_at = Utc::now();
+        let failure = DispatchFailure::with_payload(
+            "post-commit maintenance failed",
+            json!({"kind": "internal", "domain_disposition": "committed"}),
+        );
+        let receipt = json!({
+            "state": "failed",
+            "completed_at": trigger_at.timestamp_micros(),
+            "error_payload": failure.payload.clone(),
+        });
+        let repeat = Some("every:100000000d".to_string());
+        let (properties, disposition) = final_properties_after_dispatch(
+            json!({
+                "event_type": "schedule",
+                "repeat": "every:100000000d",
+                "trigger_at": trigger_at.to_rfc3339(),
+            }),
+            receipt,
+            &DispatchCompletion::Failed(failure),
+            trigger_at,
+            FixedOffset::east_opt(0).unwrap(),
+            &repeat,
+        );
+        assert_eq!(disposition, FinalDisposition::RecurrenceFailed);
+        assert_eq!(properties["status"], "failed");
+        assert_eq!(properties["recurrence_error"], UNADVANCEABLE_REPEAT);
+        assert!(properties["recurrence_failed_at"].as_str().is_some());
+        assert_eq!(properties["trigger_at"], trigger_at.to_rfc3339());
+        assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
+    }
+
+    #[test]
+    fn unknown_error_with_unadvanceable_repeat_keeps_indeterminate_receipt() {
+        let trigger_at = Utc::now();
+        let failure = DispatchFailure::with_payload(
+            "handler outcome is unknown",
+            json!({"kind": "internal", "domain_disposition": "unknown"}),
+        );
+        let receipt = json!({
+            "state": "failed",
+            "completed_at": trigger_at.timestamp_micros(),
+            "error_payload": failure.payload.clone(),
+        });
+        let repeat = Some("every:100000000d".to_string());
+        let (properties, disposition) = final_properties_after_dispatch(
+            json!({
+                "event_type": "schedule",
+                "repeat": "every:100000000d",
+                "trigger_at": trigger_at.to_rfc3339(),
+            }),
+            receipt,
+            &DispatchCompletion::Failed(failure),
+            trigger_at,
+            FixedOffset::east_opt(0).unwrap(),
+            &repeat,
+        );
+        assert_eq!(disposition, FinalDisposition::RecurrenceFailed);
+        assert_eq!(properties["status"], "failed");
+        assert_eq!(properties["recurrence_error"], UNADVANCEABLE_REPEAT);
         assert_eq!(properties["dispatch_receipt"]["state"], "indeterminate");
     }
 
@@ -6861,6 +7077,141 @@ mod tests {
             .await
             .expect("force update");
         assert_eq!(rows, 1, "test setup: row must exist");
+    }
+
+    fn assert_reserved_property_refusal(error: &anyhow::Error) {
+        match error.downcast_ref::<khive_runtime::RuntimeError>() {
+            Some(khive_runtime::RuntimeError::InvalidInput(message)) => {
+                assert!(message.contains("khive:secret_gate"), "{message}");
+            }
+            other => panic!("expected typed reserved-property refusal, got {other:?}: {error}"),
+        }
+    }
+
+    async fn plant_reserved_property(rt: &KhiveRuntime, id: uuid::Uuid) -> (Value, String) {
+        let mut properties = get_note_props(rt, id).await;
+        properties["khive:secret_gate"] = json!("caller-forged");
+        force_set_properties(rt, id, &properties).await;
+        let raw = get_raw_note_properties(rt, id).await;
+        (properties, raw)
+    }
+
+    #[tokio::test]
+    async fn whole_object_dispatch_writes_refuse_carried_reserved_property() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let trigger = due_rfc3339();
+        let lease = short_test_lease();
+
+        let claim_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let (_, before_claim) = plant_reserved_property(&rt, claim_id).await;
+        let claim_error = claim_pending_event(
+            &rt,
+            "local",
+            claim_id,
+            dispatch_occurrence_id(claim_id, trigger.parse::<DateTime<Utc>>().unwrap()),
+            &trigger,
+            "actor:test",
+            lease,
+        )
+        .await
+        .expect_err("claim must refuse reserved property");
+        assert_reserved_property_refusal(&claim_error);
+        assert_eq!(get_raw_note_properties(&rt, claim_id).await, before_claim);
+
+        let invoking_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let invoking_claim = claim_for_test(&rt, invoking_id, &trigger).await;
+        let (_, before_invoking) = plant_reserved_property(&rt, invoking_id).await;
+        let invoking_error =
+            mark_dispatch_invoking(&rt, "local", invoking_id, &invoking_claim, lease)
+                .await
+                .expect_err("invocation marker must refuse reserved property");
+        assert_reserved_property_refusal(&invoking_error);
+        assert_eq!(
+            get_raw_note_properties(&rt, invoking_id).await,
+            before_invoking
+        );
+
+        let outcome_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let outcome_claim = claim_for_test(&rt, outcome_id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", outcome_id, &outcome_claim, lease)
+                .await
+                .expect("mark clean row invoking")
+        );
+        let (_, before_outcome) = plant_reserved_property(&rt, outcome_id).await;
+        let outcome_error = persist_dispatch_outcome(
+            &rt,
+            "local",
+            outcome_id,
+            &outcome_claim,
+            &DispatchCompletion::Succeeded,
+        )
+        .await
+        .expect_err("outcome persistence must refuse reserved property");
+        assert_reserved_property_refusal(&outcome_error);
+        assert_eq!(
+            get_raw_note_properties(&rt, outcome_id).await,
+            before_outcome
+        );
+
+        let legacy_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let stale_firing_at =
+            Utc::now().timestamp_micros() - (LEGACY_STALE_FIRING_TIMEOUT_MICROS * 2);
+        let mut legacy = get_note_props(&rt, legacy_id).await;
+        legacy["status"] = json!("firing");
+        legacy["firing_at"] = json!(stale_firing_at);
+        legacy["khive:secret_gate"] = json!("caller-forged");
+        force_set_properties(&rt, legacy_id, &legacy).await;
+        let before_legacy = get_raw_note_properties(&rt, legacy_id).await;
+        let requeue_error =
+            requeue_legacy_claim(&rt, "local", legacy_id, stale_firing_at, &before_legacy)
+                .await
+                .expect_err("legacy requeue must refuse reserved property");
+        assert_reserved_property_refusal(&requeue_error);
+        assert_eq!(get_raw_note_properties(&rt, legacy_id).await, before_legacy);
+
+        let corrupt_error = finalize_corrupt_receipt(
+            &rt,
+            "local",
+            legacy_id,
+            stale_firing_at,
+            &legacy,
+            Utc::now().timestamp_micros(),
+            &before_legacy,
+        )
+        .await
+        .expect_err("corrupt receipt finalization must refuse reserved property");
+        assert_reserved_property_refusal(&corrupt_error);
+        assert_eq!(get_raw_note_properties(&rt, legacy_id).await, before_legacy);
+
+        let final_id =
+            create_scheduled_event(&rt, "local", &trigger, Some("stats()"), None, "schedule").await;
+        let final_claim = claim_for_test(&rt, final_id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", final_id, &final_claim, lease)
+                .await
+                .expect("mark final row invoking")
+        );
+        let (mut final_properties, before_final) = plant_reserved_property(&rt, final_id).await;
+        final_properties["status"] = json!("fired");
+        let final_error = finalize_fired_event(
+            &rt,
+            "local",
+            final_id,
+            &final_properties,
+            Utc::now().timestamp_micros(),
+            &final_claim,
+            &before_final,
+        )
+        .await
+        .expect_err("firing finalization must refuse reserved property");
+        assert_reserved_property_refusal(&final_error);
+        assert_eq!(get_raw_note_properties(&rt, final_id).await, before_final);
     }
 
     /// A row claimed by a drain that then crashed before finalizing —
@@ -7992,6 +8343,235 @@ mod tests {
     }
 
     #[test]
+    fn monthly_anchor_rejects_nonstring_and_later_than_trigger() {
+        let current: DateTime<Utc> = "2027-02-28T09:30:00Z".parse().unwrap();
+        for anchor in [json!(42), json!("2027-03-01T09:30:00Z")] {
+            let mut properties = json!({
+                "trigger_at": "2027-02-28T09:30:00Z",
+                "repeat": "monthly",
+                "repeat_anchor": anchor,
+            });
+            assert_eq!(
+                next_trigger_at_for_event(&mut properties, &Some("monthly".to_string()), current),
+                Err(INVALID_MONTHLY_ANCHOR)
+            );
+            assert_eq!(properties["repeat_anchor"], anchor);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn stored_unadvanceable_interval_fails_after_success_without_becoming_one_shot() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let trigger = due_rfc3339();
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &trigger,
+            Some("stats()"),
+            Some("every:100000000d"),
+            "schedule",
+        )
+        .await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain unadvanceable stored repeat");
+        assert_eq!(summary.invoked, 1, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert_eq!(summary.indeterminate, 0, "{summary:?}");
+        assert_eq!(summary.fired, 0, "repeat must not become a one-shot");
+        assert_eq!(
+            summary.retry_pending, 0,
+            "repeat must not retry at the same trigger"
+        );
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["trigger_at"], trigger);
+        assert_eq!(properties["recurrence_error"], UNADVANCEABLE_REPEAT);
+        assert_eq!(properties["dispatch_receipt"]["state"], "succeeded");
+        assert!(properties["fired_at"].as_str().is_some());
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("terminal row remains inert");
+        assert_eq!(second.invoked, 0, "{second:?}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn successful_action_with_invalid_monthly_anchor_is_a_known_failed_row() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+        set_repeat_anchor_for_test(&rt, id, json!("not-a-timestamp")).await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain invalid monthly anchor");
+        assert_eq!(summary.invoked, 1, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert_eq!(summary.indeterminate, 0, "{summary:?}");
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["dispatch_receipt"]["state"], "succeeded");
+        assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
+        assert!(properties.get("dispatch_error").is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn failed_action_keeps_its_error_when_monthly_anchor_is_invalid() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_invocations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut builder = khive_runtime::VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.with_gate(std::sync::Arc::new(DenyOrdinaryHandlerFailureGate {
+            checks: invocations.clone(),
+        }));
+        builder.register(OrdinaryHandlerFailurePack {
+            invocations: handler_invocations.clone(),
+        });
+        let server = KhiveMcpServer::from_registry(builder.build().expect("test registry"));
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("test.ordinary_handler_failure()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+        set_repeat_anchor_for_test(&rt, id, json!("not-a-timestamp")).await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain invalid monthly anchor");
+        assert_eq!(summary.invoked, 1, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(
+            summary.failed, 1,
+            "action and calendar failure count one row"
+        );
+        assert_eq!(
+            summary.indeterminate, 0,
+            "known action outcome is not indeterminate"
+        );
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["dispatch_receipt"]["state"], "failed");
+        assert_eq!(
+            properties["dispatch_receipt"]["error_payload"]["domain_disposition"],
+            "not_committed"
+        );
+        assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
+        assert_eq!(
+            properties["dispatch_error"], properties["dispatch_receipt"]["error"],
+            "the action's error must not be replaced by the anchor error"
+        );
+        assert_ne!(properties["dispatch_error"], properties["recurrence_error"]);
+
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("terminal row remains inert");
+        assert_eq!(second.invoked, 0, "{second:?}");
+        assert_eq!(invocations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            handler_invocations.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn recovered_known_success_with_invalid_anchor_counts_failed_not_indeterminate() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let trigger = due_rfc3339();
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &trigger,
+            Some("stats()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+        set_repeat_anchor_for_test(&rt, id, json!(42)).await;
+        let claim = claim_for_test(&rt, id, &trigger).await;
+        assert!(
+            mark_dispatch_invoking(&rt, "local", id, &claim, short_test_lease())
+                .await
+                .expect("mark invoking")
+        );
+        let receipt =
+            persist_dispatch_outcome(&rt, "local", id, &claim, &DispatchCompletion::Succeeded)
+                .await
+                .expect("persist outcome")
+                .expect("claim still owned");
+        expire_dispatch_lease_for_test(&rt, id).await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("recover invalid monthly anchor");
+        assert_eq!(summary.reclaimed, 1, "{summary:?}");
+        assert_eq!(summary.invoked, 0, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert_eq!(summary.indeterminate, 0, "{summary:?}");
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
+        assert_eq!(properties["dispatch_receipt"], receipt);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn missed_invalid_anchor_counts_once_and_does_not_enter_missed_list() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            "2000-01-01T00:00:00Z",
+            Some("stats()"),
+            Some("monthly"),
+            "schedule",
+        )
+        .await;
+        set_repeat_anchor_for_test(&rt, id, json!("not-a-timestamp")).await;
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain missed invalid anchor");
+        assert_eq!(summary.invoked, 0, "{summary:?}");
+        assert_eq!(summary.finalized, 1, "{summary:?}");
+        assert_eq!(summary.failed, 1, "{summary:?}");
+        assert!(summary.missed.is_empty(), "failed row is not a missed row");
+        let properties = get_note_props(&rt, id).await;
+        assert_eq!(properties["status"], "failed", "{properties}");
+        assert_eq!(properties["recurrence_error"], INVALID_MONTHLY_ANCHOR);
+        assert_eq!(properties["dispatch_receipt"]["state"], "missed");
+    }
+
+    #[test]
     fn advance_repeat_past_missed_interval_lands_on_the_first_future_occurrence() {
         let original: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
         let now: DateTime<Utc> = "2026-06-15T09:07:00Z".parse().unwrap();
@@ -8746,6 +9326,8 @@ mod tests {
             pack: Vec::new(),
             config: None,
             daemon: false,
+            lifetime: None,
+            idle_timeout_secs: None,
             transport: None,
             bind: None,
             brain_profile: None,
@@ -8801,6 +9383,8 @@ mod tests {
             pack: Vec::new(),
             config: None,
             daemon: false,
+            lifetime: None,
+            idle_timeout_secs: None,
             transport: None,
             bind: None,
             brain_profile: None,

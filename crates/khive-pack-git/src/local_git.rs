@@ -7,20 +7,19 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use khive_pack_exec::tree::{self, TreeEntry};
-use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_runtime::{KhiveRuntime, RuntimeError, VerifiedBlob};
 use khive_storage::{ContentRef, MAX_BLOB_WHOLE_BYTES};
 use serde::Serialize;
 
+use crate::git_env;
 use crate::write_argv::{validate_message, validate_ref_name};
 
+#[path = "local_git_checkout_batch.rs"]
+mod checkout_batch;
+
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+/// Settings only local invocations carry, passed after `git_env::SHARED_SETTINGS`.
 const HARDENING: &[&str] = &[
-    "core.hooksPath=/dev/null",
-    "core.fsmonitor=false",
-    "commit.gpgsign=false",
-    "credential.helper=",
-    "core.sshCommand=/usr/bin/false",
-    "protocol.allow=never",
     // Signature display and verification run a program the REPOSITORY names. `log` reads
     // `log.showSignature`, and every verifier path resolves through one of the `gpg*.program`
     // keys, so a repository whose config points them at a script executes that script the moment
@@ -48,7 +47,7 @@ const HARDENING: &[&str] = &[
 /// modified that its own `git status` calls clean. Reading a repository must not run its code.
 const FILTER_NEUTRALIZED: &[&str] = &["clean", "smudge", "process"];
 
-fn filter_overrides(program: &Path, repo: &Path) -> Vec<String> {
+fn filter_overrides(program: &Path, repo: &Path) -> Result<Vec<String>> {
     let mut command = base_command(program);
     command
         .arg("-C")
@@ -57,13 +56,22 @@ fn filter_overrides(program: &Path, repo: &Path) -> Vec<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let Ok(output) = khive_runtime::process_retry::spawn_retrying_executable_busy(
+    let output = khive_runtime::process_retry::spawn_retrying_executable_busy(
         &khive_runtime::process_retry::EXECUTABLE_BUSY_BACKOFF_MS,
         || command.spawn(),
     )
-    .and_then(|child| child.wait_with_output()) else {
-        return Vec::new();
-    };
+    .and_then(|child| child.wait_with_output())
+    .map_err(|_| LocalGitError::new("git_config", "could not enumerate repository filters"))?;
+    match output.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(Vec::new()),
+        _ => {
+            return Err(LocalGitError::new(
+                "git_config",
+                "repository filter enumeration did not complete successfully",
+            ))
+        }
+    }
     let mut drivers: Vec<String> = Vec::new();
     for name in String::from_utf8_lossy(&output.stdout).split('\0') {
         // `filter.<driver>.<key>`; a driver name is a config subsection and may itself hold dots,
@@ -85,7 +93,7 @@ fn filter_overrides(program: &Path, repo: &Path) -> Vec<String> {
         }
         overrides.push(format!("filter.{driver}.required=false"));
     }
-    overrides
+    Ok(overrides)
 }
 
 #[derive(Debug)]
@@ -175,23 +183,11 @@ pub(crate) struct DiffResult {
 /// the operation it is hardening, without recursing into the enumeration it exists to feed.
 fn base_command(program: &Path) -> Command {
     let mut command = Command::new(program);
-    // Inherited GIT_DIR, index/object paths, config injection, and identities
-    // must not redirect an operation away from the caller's authorized repo.
-    command.env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
-    command
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0");
-    for setting in HARDENING {
+    git_env::apply_shared_env(&mut command);
+    // Empty is a portable graft-file override that does not emit Git's deprecation hint.
+    command.env("GIT_GRAFT_FILE", "");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    for setting in git_env::SHARED_SETTINGS.iter().chain(HARDENING) {
         command.arg("-c").arg(setting);
     }
     command
@@ -202,6 +198,19 @@ pub(crate) fn git_command(
     repo: &Path,
     argv: &[&str],
     identity: Option<(&str, &str)>,
+) -> Result<Command> {
+    let overrides = filter_overrides(program, repo)?;
+    Ok(git_command_with_overrides(
+        program, repo, argv, identity, &overrides,
+    ))
+}
+
+fn git_command_with_overrides(
+    program: &Path,
+    repo: &Path,
+    argv: &[&str],
+    identity: Option<(&str, &str)>,
+    overrides: &[String],
 ) -> Command {
     let mut command = base_command(program);
     if let Some((name, email)) = identity {
@@ -213,7 +222,7 @@ pub(crate) fn git_command(
     }
     // Every invocation, not only the ones known today to convert content: a verb added later that
     // reads or writes the worktree inherits this rather than having to remember it.
-    for setting in filter_overrides(program, repo) {
+    for setting in overrides {
         command.arg("-c").arg(setting);
     }
     command.arg("-C").arg(repo).args(argv);
@@ -270,7 +279,7 @@ fn cas_refused(argv: &[&str], stderr: &[u8]) -> bool {
     else {
         return false;
     };
-    observed.len() == 40 && observed.bytes().all(|byte| byte.is_ascii_hexdigit())
+    crate::object_id::is_40_hex(observed.as_bytes())
 }
 
 fn run_git(
@@ -294,8 +303,18 @@ fn run_git_output(
     ref_effect: bool,
     allowed_exit: Option<i32>,
 ) -> Result<GitOutput> {
+    let command = git_command(program, repo, argv, identity)?;
+    run_git_command_output(command, argv, input, ref_effect, allowed_exit)
+}
+
+fn run_git_command_output(
+    mut command: Command,
+    argv: &[&str],
+    input: Option<&[u8]>,
+    ref_effect: bool,
+    allowed_exit: Option<i32>,
+) -> Result<GitOutput> {
     let operation = argv.first().copied().unwrap_or("operation");
-    let mut command = git_command(program, repo, argv, identity);
     command
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -400,8 +419,71 @@ async fn run_async(
     .map_err(|_| LocalGitError::new("git_failed", "git object worker did not complete"))?
 }
 
+/// Keep hydration admission while the blocking git writer consumes stdin.
+async fn run_async_hydrated(
+    program: &Path,
+    repo: &Path,
+    argv: &[&str],
+    input: VerifiedBlob,
+    filters: &mut Option<std::sync::Arc<[String]>>,
+) -> Result<Vec<u8>> {
+    let overrides = operation_filter_snapshot(program, repo, filters).await?;
+    let program = program.to_path_buf();
+    let repo = repo.to_path_buf();
+    let argv: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let command = git_command_with_overrides(&program, &repo, &args, None, &overrides);
+        run_git_command_output(command, &args, Some(input.bytes()), false, None)
+            .map(|output| output.stdout)
+    })
+    .await
+    .map_err(|_| LocalGitError::new("git_failed", "git object worker did not complete"))?
+}
+
+async fn operation_filter_snapshot(
+    program: &Path,
+    repo: &Path,
+    filters: &mut Option<std::sync::Arc<[String]>>,
+) -> Result<std::sync::Arc<[String]>> {
+    if let Some(filters) = filters {
+        return Ok(std::sync::Arc::clone(filters));
+    }
+    let program = program.to_path_buf();
+    let repo = repo.to_path_buf();
+    let settings = tokio::task::spawn_blocking(move || filter_overrides(&program, &repo))
+        .await
+        .map_err(|_| {
+            LocalGitError::new("git_config", "repository filter worker did not complete")
+        })??;
+    let settings: std::sync::Arc<[String]> = settings.into();
+    *filters = Some(std::sync::Arc::clone(&settings));
+    Ok(settings)
+}
+
+async fn run_async_with_snapshot(
+    program: &Path,
+    repo: &Path,
+    argv: &[&str],
+    input: Option<Vec<u8>>,
+    filters: &mut Option<std::sync::Arc<[String]>>,
+) -> Result<Vec<u8>> {
+    let overrides = operation_filter_snapshot(program, repo, filters).await?;
+    let program = program.to_path_buf();
+    let repo = repo.to_path_buf();
+    let argv: Vec<String> = argv.iter().map(|value| (*value).to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let command = git_command_with_overrides(&program, &repo, &args, None, &overrides);
+        run_git_command_output(command, &args, input.as_deref(), false, None)
+            .map(|output| output.stdout)
+    })
+    .await
+    .map_err(|_| LocalGitError::new("git_failed", "git object worker did not complete"))?
+}
+
 fn validate_oid(value: &str, field: &str) -> Result<()> {
-    if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !crate::object_id::is_40_hex(value.as_bytes()) {
         return Err(LocalGitError::new(
             "invalid_params",
             format!("{field} must be a 40-hex SHA"),
@@ -414,7 +496,7 @@ fn oid_output(bytes: &[u8]) -> Result<String> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| LocalGitError::new("git_output", "git returned a non-UTF-8 object id"))?
         .trim();
-    if text.len() != 40 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !crate::object_id::is_40_hex(text.as_bytes()) {
         return Err(LocalGitError::new(
             "git_output",
             "git did not return one SHA-1 object id",
@@ -601,28 +683,54 @@ fn parse_listing(bytes: &[u8]) -> Result<Vec<ListedBlob>> {
 pub(crate) async fn checkout(rt: &KhiveRuntime, repo: &Path, reference: &str) -> Result<Checkout> {
     let program = rt.config().git_write.git_program();
     let reference = checked_ref(reference)?;
+    let mut filters = None;
     let commit = oid_output(
-        &run_async(
+        &run_async_with_snapshot(
             program,
             repo,
             &["rev-parse", "--verify", "--end-of-options", &reference],
             None,
+            &mut filters,
         )
         .await?,
     )?;
-    let listing = run_async(program, repo, &["ls-tree", "-r", "-z", &commit], None).await?;
+    let listing = run_async_with_snapshot(
+        program,
+        repo,
+        &["ls-tree", "-r", "-z", &commit],
+        None,
+        &mut filters,
+    )
+    .await?;
     // Validate every mode and path before producing any manifest entries.
     let listed = parse_listing(&listing)?;
     let store = tree::blob_store(rt)?;
+    checkout_batch::admit_manifest(&listed)?;
     let mut entries = Vec::with_capacity(listed.len());
+    let mut reader = if listed.is_empty() {
+        None
+    } else {
+        Some(checkout_batch::BlobReader::start(program, repo, &listed, &mut filters).await?)
+    };
     for entry in listed {
-        let bytes = run_async(program, repo, &["cat-file", "blob", &entry.oid], None).await?;
-        let content_ref = store.put(bytes).await?;
+        let frame = reader
+            .as_mut()
+            .expect("nonempty tree has a blob reader")
+            .next()
+            .await?;
+        let content_ref = store.put(frame.bytes).await?;
+        frame
+            .consumed
+            .send(())
+            .map_err(|_| LocalGitError::after_start("cat-file", false))?;
         entries.push(TreeEntry {
             path: entry.path,
             content_ref: content_ref.as_str().to_string(),
             mode: entry.mode,
         });
+    }
+    if let Some(reader) = reader {
+        reader.finish().await?;
     }
     let value = tree::entries_json(&entries);
     let manifest = serde_json::json!({"schema": "khive-tree/v1", "entries": &value});
@@ -666,24 +774,36 @@ pub(crate) async fn write_manifest_tree(
     let program = rt.config().git_write.git_program();
     let entries = tree::load(rt, manifest_ref).await?;
     tree::verify_blobs(rt, &entries).await?;
-    let store = tree::blob_store(rt)?;
+    let hydrator = rt
+        .blob_hydrator()
+        .ok_or_else(|| RuntimeError::Unconfigured("git blob hydrator is not installed".into()))?;
     let mut directories: BTreeMap<String, Vec<GitEntry>> = BTreeMap::new();
+    let mut object_ids = BTreeMap::<ContentRef, String>::new();
+    let mut filters = None;
     directories.insert(String::new(), Vec::new());
     for entry in entries {
         let content_ref = ContentRef::from_hex(&entry.content_ref)
             .map_err(|error| LocalGitError::new("invalid_params", error))?;
-        let bytes = store
-            .get_bounded_verified(&content_ref, MAX_BLOB_WHOLE_BYTES)
+        let bytes = hydrator
+            .hydrate_verified(&content_ref, MAX_BLOB_WHOLE_BYTES)
             .await?;
-        let oid = oid_output(
-            &run_async(
-                program,
-                repo,
-                &["hash-object", "-w", "--no-filters", "--stdin"],
-                Some(bytes),
-            )
-            .await?,
-        )?;
+        let oid = if let Some(oid) = object_ids.get(&content_ref) {
+            drop(bytes);
+            oid.clone()
+        } else {
+            let oid = oid_output(
+                &run_async_hydrated(
+                    program,
+                    repo,
+                    &["hash-object", "-w", "--no-filters", "--stdin"],
+                    bytes,
+                    &mut filters,
+                )
+                .await?,
+            )?;
+            object_ids.insert(content_ref, oid.clone());
+            oid
+        };
         let (parent, name) = parent_and_name(&entry.path);
         directories
             .entry(parent.to_string())
@@ -718,11 +838,12 @@ pub(crate) async fn write_manifest_tree(
             .remove(&path)
             .expect("directory came from the same map");
         let oid = oid_output(
-            &run_async(
+            &run_async_with_snapshot(
                 program,
                 repo,
                 &["mktree", "-z"],
                 Some(mktree_input(&entries)),
+                &mut filters,
             )
             .await?,
         )?;
@@ -927,7 +1048,7 @@ fn parse_operation_recorded(bytes: &[u8], new_sha: &str, marker: &str) -> Result
             .position(|byte| *byte == 0)
             .ok_or_else(invalid)?;
         let oid = &remaining[..end];
-        if oid.len() != 40 || !oid.iter().all(u8::is_ascii_hexdigit) {
+        if !crate::object_id::is_40_hex(oid) {
             return Err(invalid());
         }
         remaining = &remaining[end + 1..];
@@ -1562,9 +1683,208 @@ pub(crate) async fn log(
     Ok(entries)
 }
 
+#[cfg(all(test, unix))]
+#[path = "local_git_gp_tests.rs"]
+mod gp_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn config_failure_program(directory: &Path, code: i32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let program = directory.join("fake-git");
+        let body = format!(
+            "#!/bin/sh\nfor arg do\n if [ \"$arg\" = config ]; then exit {code}; fi\ndone\nwhile [ \"$1\" != -C ]; do shift; done\nshift\nprintf executed > \"$1/filter-ran\"\n"
+        );
+        std::fs::write(&program, body).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        program
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_filter_enumeration_never_starts_git_add() {
+        for status in [2, 23] {
+            let temp = tempfile::tempdir().unwrap();
+            let program = config_failure_program(temp.path(), status);
+            let error = run_git(&program, temp.path(), &["add", "--all"], None, None, false)
+                .expect_err("failed hardening enumeration must refuse before add");
+            assert_eq!(error.code(), "git_config");
+            assert!(!temp.path().join("filter-ran").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filter_enumeration_no_matching_keys_still_allows_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let program = config_failure_program(temp.path(), 1);
+        run_git(&program, temp.path(), &["add", "--all"], None, None, false)
+            .expect("config status1 is the supported no-match outcome");
+        assert!(temp.path().join("filter-ran").exists());
+    }
+
+    #[test]
+    fn filter_enumeration_spawn_failure_is_authored_refusal() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = git_command(&temp.path().join("absent-git"), temp.path(), &["add"], None)
+            .expect_err("enumeration spawn must fail closed");
+        assert_eq!(error.code(), "git_config");
+        assert_eq!(
+            error.to_string(),
+            "git_config: could not enumerate repository filters"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enumeration_failure_refuses_real_configured_clean_filter() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "--quiet", "--template="],
+            vec!["config", "filter.fixture.clean", "sh .fixture-clean"],
+        ] {
+            assert!(base_command(Path::new("git"))
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=fixture\n").unwrap();
+        std::fs::write(repo.join("input.txt"), "input\n").unwrap();
+        std::fs::write(
+            repo.join(".fixture-clean"),
+            "printf executed > .filter-ran\ncat\n",
+        )
+        .unwrap();
+        let wrapper = temp.path().join("git-wrapper");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nfor arg do\n if [ \"$arg\" = config ]; then exit 23; fi\ndone\nexec git \"$@\"\n",
+        ).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = run_git(
+            &wrapper,
+            &repo,
+            &["add", "--", "input.txt"],
+            None,
+            None,
+            false,
+        )
+        .expect_err("failed enumeration must prevent the configured clean program");
+        assert_eq!(error.code(), "git_config");
+        assert!(
+            !repo.join(".filter-ran").exists(),
+            "repository clean filter ran"
+        );
+        assert!(
+            !repo.join(".git/index").exists(),
+            "no add should have started"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn checkout_and_tree_write_enumerate_filters_once_per_operation() {
+        use std::os::unix::fs::PermissionsExt;
+        for population in [1, 16, 64] {
+            let temp = tempfile::tempdir().unwrap();
+            let repo = temp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            let native = Path::new("git");
+            assert!(base_command(native)
+                .arg("-C")
+                .arg(&repo)
+                .args(["init", "--quiet", "--template="])
+                .status()
+                .unwrap()
+                .success());
+            for index in 0..population {
+                std::fs::write(
+                    repo.join(format!("file-{index:04}.txt")),
+                    format!("content {index}\n"),
+                )
+                .unwrap();
+            }
+            for args in [
+                vec!["add", "--all"],
+                vec![
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+            ] {
+                assert!(base_command(native)
+                    .arg("-C")
+                    .arg(&repo)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            let expected = base_command(native)
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap();
+            assert!(expected.status.success());
+            let expected_tree = oid_output(&expected.stdout).unwrap();
+            let wrapper = temp.path().join("git-trace-wrapper");
+            std::fs::write(&wrapper,
+                "#!/bin/sh\nrepo=\nnext_repo=0\nconfig=0\nfor arg do\n if [ \"$next_repo\" = 1 ]; then repo=\"$arg\"; next_repo=0; fi\n if [ \"$arg\" = -C ]; then next_repo=1; fi\n if [ \"$arg\" = config ]; then config=1; fi\ndone\nif [ \"$config\" = 1 ]; then printf 'config\\n' >> \"$repo/config-count\"; fi\nexec git \"$@\"\n"
+            ).unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = khive_runtime::RuntimeConfig::no_embeddings();
+            config.db_path = Some(temp.path().join("runtime.db"));
+            config.git_write.program = Some(wrapper);
+            let runtime = KhiveRuntime::new(config).unwrap();
+            runtime
+                .install_blob_store(std::sync::Arc::new(
+                    khive_db::stores::blob::FsBlobStore::new(temp.path().join("blobs"), 0).unwrap(),
+                ))
+                .unwrap();
+            let checked_out = checkout(&runtime, &repo, "HEAD").await.unwrap();
+            let entries = tree::load(&runtime, &checked_out.tree).await.unwrap();
+            assert_eq!(entries.len(), population);
+            assert_eq!(
+                std::fs::read_to_string(repo.join("config-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "checkout actual filter enumeration scaled with {population} files"
+            );
+            std::fs::write(repo.join("config-count"), "").unwrap();
+            let written = write_manifest_tree(&runtime, &repo, &checked_out.tree)
+                .await
+                .unwrap();
+            assert_eq!(
+                written, expected_tree,
+                "all original bytes and paths must survive"
+            );
+            assert_eq!(
+                std::fs::read_to_string(repo.join("config-count"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "tree writer actual filter enumeration scaled with {population} files"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -1834,5 +2154,53 @@ mod tests {
             assert!(validate_oid(invalid, "expected_head").is_err());
         }
         assert!(validate_oid(ZERO_OID, "expected_head").is_ok());
+    }
+
+    #[test]
+    fn base_command_argv_and_environment_are_pinned() {
+        // The environment carries PATH, which other cases rewrite while holding this guard.
+        let _guard = crate::cache::ENV_MUTEX.blocking_lock();
+        let command = base_command(Path::new("git"));
+        let (args, envs) = git_env::describe(&command);
+        assert_eq!(command.get_program(), "git");
+        let settings = [
+            "core.hooksPath=/dev/null",
+            "core.fsmonitor=false",
+            "commit.gpgsign=false",
+            "credential.helper=",
+            "core.sshCommand=/usr/bin/false",
+            "protocol.allow=never",
+            "log.showSignature=false",
+            "merge.verifySignatures=false",
+            "gpg.program=/usr/bin/false",
+            "gpg.openpgp.program=/usr/bin/false",
+            "gpg.x509.program=/usr/bin/false",
+            "gpg.ssh.program=/usr/bin/false",
+        ];
+        let mut expected_args = Vec::new();
+        for setting in settings {
+            expected_args.extend(["-c", setting]);
+        }
+        assert_eq!(args, expected_args);
+        let mut expected_envs = BTreeMap::new();
+        for (key, value) in [
+            ("GIT_ATTR_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+            ("GIT_GRAFT_FILE", ""),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("LC_ALL", "C"),
+        ] {
+            expected_envs.insert(key.to_owned(), Some(value.to_owned()));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            let path = path.to_string_lossy().into_owned();
+            expected_envs.insert("PATH".to_owned(), Some(path));
+        }
+        assert_eq!(envs, expected_envs);
     }
 }

@@ -21,22 +21,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority};
+use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_vamana::bridge::AnnBridgeCore;
+use khive_vamana::distance::l2_normalize;
 use khive_vamana::{
-    read_commit_fingerprint, read_commit_info, read_external_ids_sidecar, segment_commit_digest,
-    write_external_ids_sidecar, CorpusFingerprint, VamanaConfig, VamanaIndex, VamanaSnapshot,
+    read_commit_info, segment_commit_digest, CorpusFingerprint, VamanaIndex, VamanaSnapshot,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+// Reached by the test modules through `use super::*`.
+#[cfg(test)]
+use khive_vamana::{write_external_ids_sidecar, VamanaConfig};
+
 pub(crate) struct AnnBridge {
-    index: VamanaIndex,
-    id_map: Vec<Uuid>,
-    /// Digest of the v2 commit record this mmap bridge loaded. New
-    /// checkpoints carry a per-publication nonce, including semantically
-    /// identical rotations, so this identifies the mapped file generation.
-    commit_digest: Option<[u8; 32]>,
+    /// The index, its id map and its commit digest; they read as fields of the
+    /// bridge through `Deref`.
+    core: AnnBridgeCore,
     /// Namespace write-generation this build's corpus scan started at or after
     /// (issue #770). Stamped just before install; `install_if_fresher` uses it
     /// to reject a late-arriving build whose scan predates a `clear_namespace`
@@ -47,6 +50,20 @@ pub(crate) struct AnnBridge {
     drop_probe: Option<Arc<()>>,
     #[cfg(test)]
     search_pause: Option<Arc<TestSearchPause>>,
+}
+
+impl std::ops::Deref for AnnBridge {
+    type Target = AnnBridgeCore;
+
+    fn deref(&self) -> &AnnBridgeCore {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for AnnBridge {
+    fn deref_mut(&mut self) -> &mut AnnBridgeCore {
+        &mut self.core
+    }
 }
 
 #[cfg(test)]
@@ -343,16 +360,28 @@ pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate:
     }
 }
 
-/// Install `candidate`, replacing an equal-generation incumbent.
+/// Install `candidate` over whatever the slot holds.
 ///
-/// Same namespace-generation fence as `install_if_fresher` (a candidate that
-/// predates the namespace's current generation is rejected), but ties REPLACE
-/// instead of keeping the incumbent. Only two ordered-within-one-warm-task
-/// paths use it: swapping a just-persisted segment's mmap reopen in for the
-/// Owned build product (identical content), and replacing a served stale
-/// segment with its completed rebuild (rule 8 → rebuild completion). The
-/// A/B-race protection that motivates tie-keeps-incumbent in
-/// `install_if_fresher` does not apply inside a single single-flight task.
+/// The only check is the namespace-generation fence `install_if_fresher` also
+/// applies: a candidate that predates the namespace's current generation is
+/// rejected and `false` is returned. The incumbent's generation is never read,
+/// so an accepted candidate replaces an older, an equal and a newer incumbent
+/// alike, and clears the key's unavailable marker.
+///
+/// Callers are ordered by the per-key lock from `checkpoint_lock`, which each
+/// of them holds across the call:
+///
+/// - `checkpoint_raise_compact_readopt`, called from the warm path and from
+///   the index verb handler, installs the bridge it was handed or the reopened
+///   segment it published;
+/// - `adopt_checkpoint_winner`, reached only from that function, installs the
+///   segment another checkpoint already published;
+/// - `refresh_rotated_segment`, run by the rotation watcher, installs a newly
+///   published segment in place of the incumbent it supersedes.
+///
+/// `install_if_fresher` keeps the incumbent on a tie because its callers can
+/// race one another. The callers here are serialized by that lock, so the
+/// later install wins.
 pub(crate) async fn install_replacing(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) -> bool {
     let mut idxs = ann.indexes.write().await;
     let ns_generation = current_generation(ann, &key.namespace);
@@ -790,37 +819,20 @@ pub(crate) fn set_warm_wait_timeout_override_ms(ms: u64) {
 }
 
 impl AnnBridge {
-    pub fn build(mut vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
-        if dim == 0 {
-            return Err("dimension must be > 0".into());
-        }
-        if vectors.is_empty() || id_map.is_empty() {
-            return Err("no vectors to build ANN index from".into());
-        }
-        let n = vectors.len() / dim;
-        if n != id_map.len() {
-            return Err(format!(
-                "id_map length {} != vector count {}",
-                id_map.len(),
-                n
-            ));
-        }
-        // L2→cosine conversion requires unit vectors; normalize before building.
-        for row in vectors.chunks_exact_mut(dim) {
-            l2_normalize(row);
-        }
-        let cfg = VamanaConfig::with_dimensions(dim);
-        let index = VamanaIndex::build(&vectors, cfg).map_err(|e| format!("{e}"))?;
-        Ok(Self {
-            index,
-            id_map,
-            commit_digest: None,
+    fn from_core(core: AnnBridgeCore) -> Self {
+        Self {
+            core,
             generation: 0,
             #[cfg(test)]
             drop_probe: None,
             #[cfg(test)]
             search_pause: None,
-        })
+        }
+    }
+
+    pub fn build(vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
+        let core = AnnBridgeCore::build(vectors, dim, id_map)?;
+        Ok(Self::from_core(core))
     }
 
     /// Stamp this bridge with the namespace write-generation its corpus scan
@@ -945,17 +957,13 @@ impl AnnBridge {
         if let Some(pause) = &self.search_pause {
             pause.wait();
         }
-        let mut q = query.to_vec();
-        l2_normalize(&mut q);
-        match self.index.search(&q, k) {
-            Ok(results) => results
+        match self.core.search_hits(query, k) {
+            Ok(hits) => hits
                 .into_iter()
-                .filter_map(|(idx, dist)| {
-                    self.id_map.get(idx as usize).map(|uuid| {
-                        // L2² → cosine: cos(a,b) = 1 - L2²(a,b)/2 for unit vectors
-                        let cosine = 1.0 - dist / 2.0;
-                        (*uuid, cosine.max(0.0))
-                    })
+                .map(|(uuid, dist)| {
+                    // L2² → cosine: cos(a,b) = 1 - L2²(a,b)/2 for unit vectors
+                    let cosine = 1.0 - dist / 2.0;
+                    (uuid, cosine.max(0.0))
                 })
                 .collect(),
             Err(e) => {
@@ -977,16 +985,12 @@ impl AnnBridge {
             .collect::<Result<_, _>>()?;
         let index =
             VamanaIndex::from_snapshot(&snapshot).map_err(|e| format!("snapshot restore: {e}"))?;
-        Ok(Self {
+        let core = AnnBridgeCore {
             index,
             id_map,
             commit_digest: None,
-            generation: 0,
-            #[cfg(test)]
-            drop_probe: None,
-            #[cfg(test)]
-            search_pause: None,
-        })
+        };
+        Ok(Self::from_core(core))
     }
 
     /// Save this bridge to `dir` atomically: writes v2 Vamana segments (commits
@@ -1008,30 +1012,11 @@ impl AnnBridge {
     /// prevents two writers from pairing one commit digest with another
     /// writer's id map.
     fn save_atomic_locked(&self, dir: &std::path::Path) -> Result<(), String> {
-        let count = self.id_map.len();
-        if count != self.index.num_vectors() {
-            return Err(format!(
-                "id_map length {count} != index.num_vectors() {}",
-                self.index.num_vectors()
-            ));
-        }
-
-        // Step 1: write v2 segments atomically (metadata.bin is the commit gate).
-        self.index
-            .save_atomic(dir)
-            .map_err(|e| format!("VamanaIndex::save_atomic: {e}"))?;
-
-        // Step 2: digest the just-committed record. Must be Some — we committed it.
-        let digest = segment_commit_digest(dir)
-            .map_err(|e| format!("segment_commit_digest after save: {e}"))?
-            .ok_or_else(|| {
-                "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
-            })?;
-
-        // Step 3: write the id-map sidecar atomically (tmp rename), bound to the
-        // commit-record digest so any segment/sidecar pairing from different
-        // saves is self-detecting at load time.
-        write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())
+        // The core writes the v2 segments (metadata.bin is the commit gate), digests the
+        // just-committed record, then writes the id-map sidecar bound to that digest so any
+        // segment/sidecar pairing from different saves is self-detecting at load time.
+        self.core.save_atomic(dir)?;
+        Ok(())
     }
 
     /// Load a bridge from a segment directory previously written by
@@ -1043,54 +1028,11 @@ impl AnnBridge {
     /// Cold signal and rebuild from the corpus.
     #[allow(dead_code)]
     pub fn load(dir: &std::path::Path) -> Result<Self, String> {
-        // Step 1: require a v2 commit fingerprint. Absent/v1/torn → Cold.
-        read_commit_fingerprint(dir)
-            .map_err(|e| format!("read_commit_fingerprint: {e}"))?
-            .ok_or_else(|| {
-                "no v2 commit fingerprint: segment dir is absent, v1, or has a torn commit"
-                    .to_string()
-            })?;
-
-        // Step 2: raw-load the committed v2 index. VamanaIndex::load is v2-aware
-        // (ADR-079): it reads the segments, verifies their checksums, and restores
-        // graph + lifecycle without a corpus and without rebuilding. A torn or
-        // mismatched segment surfaces as an error, which the caller treats as Cold.
-        let index = VamanaIndex::load(dir).map_err(|e| format!("VamanaIndex::load: {e}"))?;
-
-        // Step 3: read the external_ids sidecar and run cross-checks.
-        let (sidecar_digest, id_map) = read_external_ids_sidecar(dir)?;
-
-        // Cross-check: the sidecar must be bound to the exact commit record on
-        // disk. A mismatch means a segment/sidecar pairing from different saves
-        // (crash between the segment commit and the sidecar write, either order).
-        let commit_digest = segment_commit_digest(dir)
-            .map_err(|e| format!("segment_commit_digest: {e}"))?
-            .ok_or_else(|| "metadata.bin vanished between fingerprint and digest".to_string())?;
-        if sidecar_digest != commit_digest {
-            return Err(
-                "external_ids.bin commit-digest mismatch: torn segment/sidecar pair".to_string(),
-            );
-        }
-
-        // Cross-check: sidecar UUID count must match the loaded index vector count.
-        if id_map.len() != index.num_vectors() {
-            return Err(format!(
-                "external_ids.bin count {} != index.num_vectors() {}",
-                id_map.len(),
-                index.num_vectors()
-            ));
-        }
-
-        Ok(Self {
-            index,
-            id_map,
-            commit_digest: Some(commit_digest),
-            generation: 0,
-            #[cfg(test)]
-            drop_probe: None,
-            #[cfg(test)]
-            search_pause: None,
-        })
+        // The core requires a v2 commit fingerprint (absent/v1/torn → Cold), raw-loads the
+        // committed v2 index (VamanaIndex::load is v2-aware, ADR-079), then cross-checks the
+        // external_ids sidecar against the exact commit record and the vector count.
+        let (core, _commit_digest) = AnnBridgeCore::load(dir)?;
+        Ok(Self::from_core(core))
     }
 }
 
@@ -1120,15 +1062,6 @@ async fn acquire_bridge_checkpoint_lock_async(
     tokio::task::spawn_blocking(move || acquire_bridge_checkpoint_lock(&dir))
         .await
         .map_err(|error| format!("ANN bridge lock task failed: {error}"))?
-}
-
-fn l2_normalize(v: &mut [f32]) {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 1e-8 {
-        for x in v.iter_mut() {
-            *x /= norm;
-        }
-    }
 }
 
 // ── persistence helpers ───────────────────────────────────────────────────────
@@ -1229,19 +1162,6 @@ fn persist_ann_v2_locked(
 /// so the same predicate always maps to the same `ann_consumer_watermark`
 /// row across restarts.
 const ANN_CONSUMER: &str = "knowledge:knowledge.atom";
-
-const ANN_REBUILD_THRESHOLD_DEFAULT: f64 = 0.20;
-
-/// `ann_rebuild_threshold` (ADR-079 Amendment 1 §5): the tail fraction of the
-/// live vector count above which replay costs more than a full rebuild.
-/// Values outside `(0, 1]` fall back to the default.
-fn ann_rebuild_threshold() -> f64 {
-    std::env::var("KHIVE_ANN_REBUILD_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0 && *v <= 1.0)
-        .unwrap_or(ANN_REBUILD_THRESHOLD_DEFAULT)
-}
 
 /// Durably register this consumer's watermark row as pending (`-2`).
 ///
@@ -1822,19 +1742,16 @@ struct FreshTailSnapshot {
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
 }
 
-/// Read the registry guard, optional live-count cap, selected log suffix, and
-/// every final upsert embedding in one SQLite statement.  A single statement
-/// is the snapshot primitive on every backend, including the in-memory
-/// pool-backed reader whose separate calls may use separate connections.
-async fn fetch_fresh_tail_snapshot(
-    rt: &KhiveRuntime,
+/// The snapshot statement.  `finals` reduces the selected log suffix to one row
+/// per subject (its last operation, at the position of its first appearance)
+/// before the vector join, so the join reads one embedding per distinct
+/// subject rather than one per raw log row.
+fn fresh_tail_snapshot_statement(
     ns: &str,
     model: &str,
-    watermark: u64,
+    watermark: i64,
     live_threshold: Option<f64>,
-) -> Result<FreshTailSnapshot, String> {
-    let watermark = i64::try_from(watermark)
-        .map_err(|_| "fresh-tail watermark exceeds SQLite INTEGER range".to_string())?;
+) -> SqlStatement {
     let table_name = format!("vec_{}", sanitize_model_key(model));
     let (live_cte, selected_order, live_join, live_column) = match live_threshold {
         Some(_) => (
@@ -1863,49 +1780,76 @@ async fn fetch_fresh_tail_snapshot(
     if let Some(threshold) = live_threshold {
         params.push(SqlValue::Float(threshold));
     }
+    SqlStatement {
+        sql: format!(
+            "WITH \
+             registry AS (\
+               SELECT MIN(watermark) AS registry_min \
+               FROM ann_consumer_watermark \
+               WHERE (namespace = ?1 OR namespace = '*') \
+                 AND embedding_model = ?2\
+             ), \
+             own AS (\
+               SELECT (SELECT watermark FROM ann_consumer_watermark \
+                       WHERE consumer = ?4 AND namespace = ?1 \
+                         AND embedding_model = ?2) AS own_watermark\
+             ), \
+             {live_cte} \
+             selected AS (\
+               SELECT seq, subject_id, op FROM ann_write_log \
+               WHERE namespace = ?1 AND embedding_model = ?2 \
+                 AND field = 'knowledge.atom' \
+                 AND seq > MAX(\
+                   ?3, COALESCE((SELECT registry_min FROM registry), ?3)\
+                 ) \
+               {selected_order}\
+             ), \
+             finals AS (\
+               SELECT first_seq AS seq, subject_id, op FROM (\
+                 SELECT MIN(seq) OVER (PARTITION BY subject_id) AS first_seq, \
+                        subject_id, op, \
+                        ROW_NUMBER() OVER (\
+                          PARTITION BY subject_id ORDER BY seq DESC\
+                        ) AS final_rank \
+                 FROM selected\
+               ) WHERE final_rank = 1\
+             ) \
+             SELECT finals.seq, finals.subject_id, finals.op, \
+                    vectors.namespace AS vector_namespace, \
+                    vectors.embedding_model AS vector_model, \
+                    vectors.field AS vector_field, \
+                    vectors.embedding, registry.registry_min, \
+                    own.own_watermark, {live_column} AS live_count \
+             FROM registry CROSS JOIN own {live_join} \
+             LEFT JOIN finals ON 1 = 1 \
+             LEFT JOIN {table_name} AS vectors \
+               ON vectors.subject_id = finals.subject_id \
+             ORDER BY finals.seq"
+        ),
+        params,
+        label: Some("knowledge_ann_fresh_tail_snapshot".into()),
+    }
+}
+
+/// Read the registry guard, optional live-count cap, selected log suffix, and
+/// every final upsert embedding in one SQLite statement.  A single statement
+/// is the snapshot primitive on every backend, including the in-memory
+/// pool-backed reader whose separate calls may use separate connections.
+async fn fetch_fresh_tail_snapshot(
+    rt: &KhiveRuntime,
+    ns: &str,
+    model: &str,
+    watermark: u64,
+    live_threshold: Option<f64>,
+) -> Result<FreshTailSnapshot, String> {
+    let watermark = i64::try_from(watermark)
+        .map_err(|_| "fresh-tail watermark exceeds SQLite INTEGER range".to_string())?;
+    let statement = fresh_tail_snapshot_statement(ns, model, watermark, live_threshold);
 
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|error| error.to_string())?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "WITH \
-                 registry AS (\
-                   SELECT MIN(watermark) AS registry_min \
-                   FROM ann_consumer_watermark \
-                   WHERE (namespace = ?1 OR namespace = '*') \
-                     AND embedding_model = ?2\
-                 ), \
-                 own AS (\
-                   SELECT (SELECT watermark FROM ann_consumer_watermark \
-                           WHERE consumer = ?4 AND namespace = ?1 \
-                             AND embedding_model = ?2) AS own_watermark\
-                 ), \
-                 {live_cte} \
-                 selected AS (\
-                   SELECT seq, subject_id, op FROM ann_write_log \
-                   WHERE namespace = ?1 AND embedding_model = ?2 \
-                     AND field = 'knowledge.atom' \
-                     AND seq > MAX(\
-                       ?3, COALESCE((SELECT registry_min FROM registry), ?3)\
-                     ) \
-                   {selected_order}\
-                 ) \
-                 SELECT selected.seq, selected.subject_id, selected.op, \
-                        vectors.namespace AS vector_namespace, \
-                        vectors.embedding_model AS vector_model, \
-                        vectors.field AS vector_field, \
-                        vectors.embedding, registry.registry_min, \
-                        own.own_watermark, {live_column} AS live_count \
-                 FROM registry CROSS JOIN own {live_join} \
-                 LEFT JOIN selected ON 1 = 1 \
-                 LEFT JOIN {table_name} AS vectors \
-                   ON vectors.subject_id = selected.subject_id \
-                 ORDER BY selected.seq"
-            ),
-            params,
-            label: Some("knowledge_ann_fresh_tail_snapshot".into()),
-        })
+        .query_all(statement)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -2802,23 +2746,8 @@ pub(crate) async fn load_and_build_from_vector_store(
 /// Called after any vector-corpus mutation to guarantee `ensure_ann_for_model` cannot
 /// load a snapshot that no longer matches the live corpus.  Best-effort: if
 /// the `retrieval_snapshots` table doesn't exist yet, the call is a no-op.
-/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
-/// character itself (`\`) so a caller-supplied namespace is matched literally
-/// under `LIKE ... ESCAPE '\'` rather than as a pattern (#819: an
-/// underscore-bearing namespace like `a_b` must not also match `aXb`).
-fn escape_like(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
-    let pattern = format!("{}::vamana::%", escape_like(namespace));
+    let pattern = format!("{}::vamana::%", khive_types::escape_like_literal(namespace));
     let sql = rt.sql();
     let mut w = match sql.writer().await {
         Ok(w) => w,
@@ -3666,11 +3595,26 @@ pub(crate) fn simulate_warming_in_flight(ann: &SharedAnn, key: AnnKey) {
 }
 
 #[cfg(test)]
+#[path = "vamana_owned_build_tests.rs"]
+mod owned_build_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    mod helper_reuse {
+        include!("vamana/helper_reuse_tests.rs");
+    }
     use khive_runtime::KhiveRuntime;
     use khive_storage::types::{SqlStatement, SqlValue};
     use serde_json::json;
+
+    mod timing {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_support/timing.rs"
+        ));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn loaded_traversal_leaves_the_lexical_executor_runnable() {
@@ -4486,17 +4430,16 @@ mod tests {
     // ── unavailable marker: terminal warm outcome (issue #1026) ──────────────
 
     fn assert_terminal_wait_latency(elapsed: std::time::Duration) {
-        // Keep the existing half-deadline discriminator under coverage. The
-        // ordinary lane also rejects a one-second delay on this immediate
-        // path, using ten polling intervals rather than half the full wait.
-        let bound_ms = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-            ANN_WARM_WAIT_TIMEOUT_MS / 2
-        } else {
-            ANN_WARM_WAIT_POLL_MS * 10
-        };
+        let bound = timing::duration_bound(
+            std::time::Duration::from_millis(ANN_WARM_WAIT_POLL_MS * 10),
+            Some(std::time::Duration::from_millis(
+                ANN_WARM_WAIT_TIMEOUT_MS / 2,
+            )),
+        )
+        .expect("terminal wait has a numeric bound in both test tiers");
         assert!(
-            elapsed < std::time::Duration::from_millis(bound_ms),
-            "terminal unavailable outcome must short-circuit within {bound_ms}ms: {elapsed:?}"
+            elapsed < bound,
+            "terminal unavailable outcome must short-circuit within {bound:?}: {elapsed:?}"
         );
     }
 
@@ -5193,6 +5136,10 @@ mod tests {
 
     fn rt_with_embedder(db_path: Option<std::path::PathBuf>) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -5213,6 +5160,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("test runtime");
         rt.register_embedder(TestEmbedderProvider);
@@ -5526,6 +5474,190 @@ mod tests {
             "two newest writes coalesce to one subject"
         );
         assert_eq!(repeated.ops[0].0, newest[0]);
+    }
+
+    async fn append_warm_log_row(rt: &KhiveRuntime, subject: Uuid, op: &str) {
+        let mut writer = rt.sql().writer().await.expect("writer");
+        writer
+            .execute(SqlStatement {
+                sql: "INSERT INTO ann_write_log \
+                      (namespace, embedding_model, kind, field, subject_id, op) \
+                      VALUES ('local', ?1, 'concept', 'knowledge.atom', ?2, ?3)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(WARM_TEST_MODEL.into()),
+                    SqlValue::Text(subject.to_string()),
+                    SqlValue::Text(op.into()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("append log row");
+    }
+
+    /// A tail whose raw rows outnumber its subjects: the first subject is
+    /// written `repeats` more times and stays an upsert, the second ends as a
+    /// delete, the third is deleted and then upserted again, and `singles` more
+    /// subjects are written once. Returns every subject's embedding.
+    async fn seed_repeated_tail(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        repeats: usize,
+        singles: usize,
+    ) -> HashMap<Uuid, Vec<f32>> {
+        let mut embeddings = HashMap::new();
+        let mut subjects = Vec::new();
+        for index in 0..3 + singles {
+            let mut embedding = [0.0_f32; WARM_DIMS];
+            embedding[index] = 1.0;
+            let subject = append_warm_vector(rt, token, embedding).await;
+            embeddings.insert(subject, embedding.to_vec());
+            subjects.push(subject);
+        }
+        for _ in 0..repeats {
+            append_warm_log_row(rt, subjects[0], "upsert").await;
+        }
+        append_warm_log_row(rt, subjects[1], "delete").await;
+        append_warm_log_row(rt, subjects[2], "delete").await;
+        append_warm_log_row(rt, subjects[2], "upsert").await;
+        embeddings
+    }
+
+    /// Final states of the newest `limit` raw log rows (all rows when `None`),
+    /// coalesced by a plain pass over the rows in `seq` order: the position of
+    /// a subject's first row, the operation of its last.
+    async fn reference_tail_ops(
+        rt: &KhiveRuntime,
+        embeddings: &HashMap<Uuid, Vec<f32>>,
+        limit: Option<usize>,
+    ) -> Vec<(Uuid, Option<Vec<f32>>)> {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT subject_id, op FROM ann_write_log \
+                      WHERE namespace = 'local' AND embedding_model = ?1 \
+                        AND field = 'knowledge.atom' \
+                      ORDER BY seq DESC"
+                    .into(),
+                params: vec![SqlValue::Text(WARM_TEST_MODEL.into())],
+                label: None,
+            })
+            .await
+            .expect("raw tail");
+        let mut raw: Vec<(Uuid, bool)> = rows
+            .iter()
+            .take(limit.unwrap_or(usize::MAX))
+            .map(|row| match (row.get("subject_id"), row.get("op")) {
+                (Some(SqlValue::Text(subject)), Some(SqlValue::Text(op))) => {
+                    (Uuid::parse_str(subject).expect("UUID"), op == "delete")
+                }
+                other => panic!("unexpected log row: {other:?}"),
+            })
+            .collect();
+        raw.reverse();
+
+        let mut order = Vec::new();
+        let mut last_is_delete = HashMap::new();
+        for (subject, is_delete) in raw {
+            if last_is_delete.insert(subject, is_delete).is_none() {
+                order.push(subject);
+            }
+        }
+        order
+            .into_iter()
+            .map(|subject| {
+                let is_live = !last_is_delete[&subject];
+                (subject, is_live.then(|| embeddings[&subject].clone()))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fresh_tail_snapshot_statement_joins_one_row_per_distinct_subject() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        // 30 raw log rows over 7 subjects.
+        let embeddings = seed_repeated_tail(&rt, &token, 20, 4).await;
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let statement = fresh_tail_snapshot_statement("local", WARM_TEST_MODEL, 0, None);
+        let rows = reader.query_all(statement).await.expect("snapshot rows");
+        let tail_rows = rows
+            .iter()
+            .filter(|row| matches!(row.get("seq"), Some(SqlValue::Integer(_))))
+            .count();
+        let joined = rows
+            .iter()
+            .filter(|row| matches!(row.get("embedding"), Some(SqlValue::Blob(_))))
+            .count();
+        assert_eq!(
+            tail_rows,
+            embeddings.len(),
+            "one tail row per distinct subject, not per raw log row"
+        );
+        assert_eq!(
+            joined,
+            embeddings.len(),
+            "one embedding joined per distinct subject, not per raw log row"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tail_snapshot_ops_match_per_row_coalescing_of_the_raw_log() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let embeddings = seed_repeated_tail(&rt, &token, 20, 4).await;
+
+        let full = fetch_fresh_tail_snapshot(&rt, "local", WARM_TEST_MODEL, 0, None)
+            .await
+            .expect("full snapshot");
+        assert_eq!(full.ops, reference_tail_ops(&rt, &embeddings, None).await);
+
+        // The cap keeps the newest raw rows before coalescing: 7 live vectors at
+        // 0.5 keep ceil(3.5) = 4 rows, which are the last repeat of the first
+        // subject, a delete, and a delete-then-upsert pair.
+        let capped = fetch_fresh_tail_snapshot(&rt, "local", WARM_TEST_MODEL, 0, Some(0.5))
+            .await
+            .expect("capped snapshot");
+        assert_eq!(capped.live_count, Some(7));
+        assert_eq!(
+            capped.ops,
+            reference_tail_ops(&rt, &embeddings, Some(4)).await
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_tail_snapshot_statement_probes_the_vector_table_by_point_lookup() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 1).await;
+
+        let mut reader = rt.sql().reader().await.expect("reader");
+        for threshold in [None, Some(0.2)] {
+            let statement = fresh_tail_snapshot_statement("local", WARM_TEST_MODEL, 0, threshold);
+            let rows = reader.explain(statement).await.expect("explain");
+            // sqlite-vec reports idxStr '2!...' for its primary-key POINT plan and
+            // '1' for a full scan. The capped form also scans the table once to
+            // count live vectors, so only the join's plan may be a point plan.
+            let mut point_plans = 0;
+            for row in &rows {
+                let Some(SqlValue::Text(detail)) = row.get("detail") else {
+                    continue;
+                };
+                if let Some((_, index)) = detail.rsplit_once(':') {
+                    if detail.contains("VIRTUAL TABLE INDEX ") && index.starts_with("2!") {
+                        point_plans += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                point_plans, 1,
+                "the vector join must be one point lookup per tail subject: {rows:?}"
+            );
+        }
     }
 
     /// `ann_segment_dir` encodes a round-trippable hex key that `decode_ann_dir_name` reverses.

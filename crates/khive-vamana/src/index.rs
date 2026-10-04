@@ -1,11 +1,12 @@
 //! Vamana index: build, search, save/load, and snapshot serialization.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 #[cfg(feature = "mmap")]
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
 };
 
@@ -44,6 +45,9 @@ const PORTABLE_IDS_VERSION: u32 = 1;
 
 /// Default ops-since-consolidation threshold (ADR-052 §2, OQ5 resolution).
 const DEFAULT_CONSOLIDATION_TAU: usize = 40_000;
+
+mod search_visited;
+use search_visited::SearchVisitedPool;
 
 #[cfg(feature = "mmap")]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,11 +368,12 @@ pub struct VamanaSnapshot {
     pub external_ids: Vec<String>,
 }
 
+#[derive(Clone)]
 enum VectorStorage {
     Owned(Vec<f32>),
     #[cfg(feature = "mmap")]
     Mmap {
-        mmap: memmap2::Mmap,
+        mmap: std::sync::Arc<memmap2::Mmap>,
         len_f32: usize,
     },
 }
@@ -389,7 +394,7 @@ impl VectorStorage {
             Self::Owned(v) => Ok(v.as_slice()),
             #[cfg(feature = "mmap")]
             Self::Mmap { mmap, len_f32 } => {
-                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref())
+                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref().as_ref())
                     .map_err(|_| VamanaError::invalid_format("vector mmap cast failed".into()))?;
                 if floats.len() != *len_f32 {
                     return Err(VamanaError::invalid_format(format!(
@@ -412,11 +417,12 @@ const CODES_HEADER_LEN: usize = 8 + 8 + 8 + 4 + 4;
 /// Storage for the per-node SQ8 code table: owned per-vector allocations
 /// (build and mutation paths) or the flat, memory-mapped `codes.bin` segment
 /// (v2 load path). Mirrors `VectorStorage`'s Owned/Mmap split.
+#[derive(Clone)]
 enum CodeStore {
     Owned(Vec<GsEncodedVector>),
     #[cfg(feature = "mmap")]
     Mmap {
-        mmap: memmap2::Mmap,
+        mmap: std::sync::Arc<memmap2::Mmap>,
         dims: usize,
         len: usize,
     },
@@ -438,7 +444,7 @@ impl CodeStore {
             Self::Owned(v) => CodesView::Owned(v),
             #[cfg(feature = "mmap")]
             Self::Mmap { mmap, dims, len } => CodesView::Flat {
-                bytes: &mmap.as_ref()[CODES_HEADER_LEN + dims * 4..][..len * dims],
+                bytes: &mmap.as_ref().as_ref()[CODES_HEADER_LEN + dims * 4..][..len * dims],
                 dims: *dims,
             },
         }
@@ -560,6 +566,7 @@ pub struct VamanaIndex {
     config: VamanaConfig,
     num_vectors: usize,
     dimensions: usize,
+    search_visited: SearchVisitedPool,
     // ---- PR2: lifecycle fields (ADR-052 §2; see docs/design.md#lifecycle-fields) ----
     /// Bit-packed tombstone marks. Bit `i` set ⇒ node `i` is soft-deleted.
     tombstones: Vec<u64>,
@@ -668,6 +675,15 @@ impl VamanaIndex {
     /// nested `par_iter` in graph construction inherits that bound instead of the
     /// global pool's one-thread-per-core.
     pub fn build(vectors: &[f32], config: VamanaConfig) -> Result<Self> {
+        Self::build_buffer(Cow::Borrowed(vectors), config)
+    }
+
+    /// Build while retaining the caller's row-major vector buffer.
+    pub fn build_owned(vectors: Vec<f32>, config: VamanaConfig) -> Result<Self> {
+        Self::build_buffer(Cow::Owned(vectors), config)
+    }
+
+    fn build_buffer(vectors: Cow<'_, [f32]>, config: VamanaConfig) -> Result<Self> {
         #[cfg(feature = "parallel")]
         {
             match build_pool() {
@@ -681,7 +697,7 @@ impl VamanaIndex {
         }
     }
 
-    fn build_on_current_pool(vectors: &[f32], config: VamanaConfig) -> Result<Self> {
+    fn build_on_current_pool(vectors: Cow<'_, [f32]>, config: VamanaConfig) -> Result<Self> {
         config.validate()?;
         if vectors.is_empty() {
             return Err(VamanaError::EmptyInput);
@@ -692,20 +708,20 @@ impl VamanaIndex {
                 actual: vectors.len() % config.dimensions,
             });
         }
-        require_finite(vectors, "build vectors")?;
+        require_finite(&vectors, "build vectors")?;
         let num_vectors = vectors.len() / config.dimensions;
         if num_vectors > u32::MAX as usize {
             return Err(VamanaError::TooManyVectors { count: num_vectors });
         }
 
-        let (gs_codec, gs_codes) = train_codec_and_encode(vectors, config.dimensions);
+        let (gs_codec, gs_codes) = train_codec_and_encode(&vectors, config.dimensions);
 
         let graph =
-            VamanaGraph::build_sq8(vectors, CodesView::Owned(&gs_codes), &gs_codec, &config)?;
+            VamanaGraph::build_sq8(&vectors, CodesView::Owned(&gs_codes), &gs_codec, &config)?;
         let dimensions = config.dimensions;
 
         Ok(Self {
-            vectors: VectorStorage::Owned(vectors.to_vec()),
+            vectors: VectorStorage::Owned(vectors.into_owned()),
             graph,
             config,
             num_vectors,
@@ -715,6 +731,7 @@ impl VamanaIndex {
             ops_since_consolidation: 0,
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            search_visited: SearchVisitedPool::default(),
             gs_codec,
             gs_codes: CodeStore::Owned(gs_codes),
             last_applied_seq: None,
@@ -742,7 +759,7 @@ impl VamanaIndex {
         } else {
             None
         };
-        let mut visited = VisitedSet::new(self.num_vectors);
+        let mut visited = self.search_visited.checkout(self.num_vectors);
 
         // OOD fallback (ADR-052 §2): if any query component lies outside the codec's
         // trained range [min_d, min_d + 255·gs], encoding clamps that dimension and
@@ -931,6 +948,7 @@ impl VamanaIndex {
             ops_since_consolidation: parsed.ops_since_consolidation,
             free_slots: parsed.free_slots,
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            search_visited: SearchVisitedPool::default(),
             gs_codec,
             gs_codes: CodeStore::Owned(gs_codes),
             last_applied_seq: commit.last_applied_seq,
@@ -1171,6 +1189,7 @@ impl VamanaIndex {
             ops_since_consolidation: 0,
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            search_visited: SearchVisitedPool::default(),
             gs_codec,
             gs_codes: CodeStore::Owned(gs_codes),
             last_applied_seq: None,
@@ -1365,7 +1384,7 @@ impl VamanaIndex {
             };
 
             // Verify checksums of all three segments.
-            let vectors_data = match fs::read(path.join("vectors.bin")) {
+            let (vhash, _) = match hash_vectors_file(&path.join("vectors.bin")) {
                 Ok(d) => d,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     let config = VamanaConfig {
@@ -1405,7 +1424,6 @@ impl VamanaIndex {
                 Err(e) => return Err(e.into()),
             };
 
-            let vhash = *blake3::hash(&vectors_data).as_bytes();
             let ghash = *blake3::hash(&graph_data).as_bytes();
             let lhash = *blake3::hash(&lifecycle_data).as_bytes();
 
@@ -1539,11 +1557,11 @@ impl VamanaIndex {
         }
         let commit = parse_v2_commit(&metadata_bytes)?;
 
-        let vectors_data = fs::read(path.join("vectors.bin"))?;
+        let (vectors_hash, _) = hash_vectors_file(&path.join("vectors.bin"))?;
         let graph_data = fs::read(path.join("graph.bin"))?;
         let lifecycle_data = fs::read(path.join("lifecycle.bin"))?;
 
-        if *blake3::hash(&vectors_data).as_bytes() != commit.vectors_hash
+        if vectors_hash != commit.vectors_hash
             || *blake3::hash(&graph_data).as_bytes() != commit.graph_hash
             || *blake3::hash(&lifecycle_data).as_bytes() != commit.lifecycle_hash
         {
@@ -1616,7 +1634,7 @@ impl VamanaIndex {
                 (
                     codec,
                     CodeStore::Mmap {
-                        mmap,
+                        mmap: std::sync::Arc::new(mmap),
                         dims: dimensions,
                         len: num_vectors,
                     },
@@ -1639,6 +1657,7 @@ impl VamanaIndex {
             ops_since_consolidation: lifecycle.ops_since_consolidation,
             free_slots: lifecycle.free_slots,
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            search_visited: SearchVisitedPool::default(),
             gs_codec,
             gs_codes,
             last_applied_seq: commit.last_applied_seq,
@@ -1878,6 +1897,7 @@ impl VamanaIndex {
             ops_since_consolidation: 0,
             free_slots: Vec::new(),
             consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            search_visited: SearchVisitedPool::default(),
             gs_codec,
             gs_codes: CodeStore::Owned(gs_codes),
             last_applied_seq: None,
@@ -1942,6 +1962,28 @@ impl VamanaIndex {
     /// Cumulative delete+insert churn since the last consolidation.
     pub fn ops_since_consolidation(&self) -> usize {
         self.ops_since_consolidation
+    }
+
+    /// Fork the complete mutable state for maintenance while retaining any
+    /// read-only vector and SQ8 mappings. Owned buffers are copied; mutation
+    /// promotes mappings through the same path as an ordinary insert.
+    pub fn fork_for_maintenance(&self) -> Self {
+        Self {
+            vectors: self.vectors.clone(),
+            graph: self.graph.clone(),
+            config: self.config.clone(),
+            num_vectors: self.num_vectors,
+            dimensions: self.dimensions,
+            search_visited: SearchVisitedPool::default(),
+            tombstones: self.tombstones.clone(),
+            tombstone_count: self.tombstone_count,
+            ops_since_consolidation: self.ops_since_consolidation,
+            free_slots: self.free_slots.clone(),
+            consolidation_tau: self.consolidation_tau,
+            gs_codec: self.gs_codec.clone(),
+            gs_codes: self.gs_codes.clone(),
+            last_applied_seq: self.last_applied_seq,
+        }
     }
 
     /// True when `ops_since_consolidation >= consolidation_tau`.
@@ -2024,7 +2066,7 @@ impl VamanaIndex {
                 VectorStorage::Mmap { .. } => {
                     return Err(VamanaError::invalid_format(
                         "insert: unexpected Mmap after ensure_owned".into(),
-                    ))
+                    ));
                 }
             }
             // Update SQ8 code for the recycled slot.
@@ -2051,7 +2093,7 @@ impl VamanaIndex {
                 VectorStorage::Mmap { .. } => {
                     return Err(VamanaError::invalid_format(
                         "insert: unexpected Mmap after ensure_owned".into(),
-                    ))
+                    ));
                 }
             }
             // Append SQ8 code for the new slot.
@@ -2264,6 +2306,7 @@ impl VamanaIndex {
         self.free_slots.clear();
         self.ops_since_consolidation = 0;
         self.gs_codes = CodeStore::Owned(new_gs_codes);
+        self.search_visited.clear();
 
         Ok(new_to_old)
     }
@@ -2379,7 +2422,7 @@ impl VamanaIndex {
             VectorStorage::Owned(v) => v.as_slice(),
             #[cfg(feature = "mmap")]
             VectorStorage::Mmap { mmap, len_f32 } => {
-                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref())
+                let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref().as_ref())
                     .map_err(|_| VamanaError::invalid_format("vector mmap cast failed".into()))?;
                 if floats.len() != *len_f32 {
                     return Err(VamanaError::invalid_format(format!(
@@ -3067,13 +3110,19 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
     let Ok(commit) = parse_v2_commit(&metadata) else {
         return Ok(());
     };
+    let (vectors_hash, vectors_len) = match hash_vectors_file(&path.join("vectors.bin")) {
+        Ok(result) => result,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if vectors_hash != commit.vectors_hash {
+        return Ok(());
+    }
     let segments = [
-        ("vectors.bin", commit.vectors_hash),
         ("graph.bin", commit.graph_hash),
         ("lifecycle.bin", commit.lifecycle_hash),
     ];
     let mut lifecycle_data: Option<Vec<u8>> = None;
-    let mut vectors_len: Option<usize> = None;
     for (name, expected) in segments {
         let data = match fs::read(path.join(name)) {
             Ok(data) => data,
@@ -3085,8 +3134,6 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
         }
         if name == "lifecycle.bin" {
             lifecycle_data = Some(data);
-        } else if name == "vectors.bin" {
-            vectors_len = Some(data.len());
         }
     }
     let mut codes_data: Option<Vec<u8>> = None;
@@ -3106,7 +3153,6 @@ fn reject_checkpoint_sequence_regression(path: &Path, candidate: Option<u64>) ->
     };
 
     let lifecycle_data = lifecycle_data.expect("lifecycle.bin hashed above");
-    let vectors_len = vectors_len.expect("vectors.bin hashed above");
     let max_degree = commit.index_meta.max_degree;
     let num_vectors = commit.index_meta.num_vectors;
     let dimensions = commit.index_meta.dimensions;
@@ -3980,6 +4026,36 @@ fn parse_graph(data: &[u8], max_degree: usize, num_vectors: usize) -> Result<Vam
 }
 
 #[cfg(feature = "mmap")]
+const VECTOR_HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+#[cfg(feature = "mmap")]
+fn hash_vectors_file(path: &Path) -> std::io::Result<([u8; 32], usize)> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut chunk = [0_u8; VECTOR_HASH_CHUNK_BYTES];
+    let mut len = 0_usize;
+    loop {
+        let read = match file.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        #[cfg(test)]
+        perf_tests::record_vector_hash_read(chunk.len(), read);
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+        len = len.checked_add(read).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "vectors.bin length overflow",
+            )
+        })?;
+    }
+    Ok((*hasher.finalize().as_bytes(), len))
+}
+
+#[cfg(feature = "mmap")]
 fn hash_file_mmap(path: &Path) -> Result<[u8; 32]> {
     let file = File::open(path)?;
     if file.metadata()?.len() == 0 {
@@ -4011,7 +4087,7 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
     let mmap = unsafe { MmapOptions::new().len(expected_bytes).map(&file)? };
 
     Ok(VectorStorage::Mmap {
-        mmap,
+        mmap: std::sync::Arc::new(mmap),
         len_f32: expected_len_f32,
     })
 }
@@ -4105,6 +4181,18 @@ pub fn read_commit_fingerprint(path: &Path) -> Result<Option<PersistedFingerprin
 pub fn corpus_content_hash(vectors: &[f32]) -> [u8; 32] {
     *blake3::hash(cast_slice(vectors)).as_bytes()
 }
+
+#[cfg(test)]
+#[path = "index_perf_compat_tests.rs"]
+mod perf_compat_tests;
+
+#[cfg(test)]
+#[path = "index_perf_tests.rs"]
+mod perf_tests;
+
+#[cfg(test)]
+#[path = "index_search_visited_tests.rs"]
+mod search_visited_tests;
 
 // Kept inline (not in tests/) because these tests exercise private helpers and the
 // internal `VectorStorage` enum, which moving out would require re-exporting.
@@ -5203,7 +5291,9 @@ mod tests {
         let sq8_recall = sq8_total / NUM_QUERIES as f64;
         let delta = f32_recall - sq8_recall;
 
-        println!("sq8_recall_parity | f32_recall@10={f32_recall:.4}  sq8_recall@10={sq8_recall:.4}  delta={delta:.4}");
+        println!(
+            "sq8_recall_parity | f32_recall@10={f32_recall:.4}  sq8_recall@10={sq8_recall:.4}  delta={delta:.4}"
+        );
 
         assert!(
             sq8_recall >= f32_recall - 0.02,
@@ -6691,3 +6781,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "index_maintenance_tests.rs"]
+mod maintenance_tests;

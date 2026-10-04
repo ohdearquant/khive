@@ -55,6 +55,24 @@ async fn latest_annotating_note_default_refuses_without_silent_history_scan() {
             ..
         } if operation == "latest_annotating_note"
     ));
+    let error = store
+        .latest_annotating_note_with_property(
+            Uuid::new_v4(),
+            "observation",
+            "web.receipt",
+            "khive:web_receipt",
+            "v1",
+        )
+        .await
+        .expect_err("the filtered lookup must also refuse without an indexed implementation");
+    assert!(matches!(
+        error,
+        StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation,
+            ..
+        } if operation == "latest_annotating_note_with_property"
+    ));
 }
 
 #[async_trait]

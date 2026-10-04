@@ -525,6 +525,51 @@ async fn a3_predispatch_refusals_leave_real_stats_unchanged() {
 
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
+async fn wire_subhandler_refusal_covers_chains_batches_and_bracketed_units() {
+    let fixture = Fixture::new();
+    let refusal = "permission denied for verb \"hidden\": verb 'hidden' is an internal \
+                   subhandler and cannot be invoked via the MCP request surface";
+    for (ops, hidden_index, aborted_index) in [
+        ("stats() | hidden()", 1, None),
+        ("hidden() | stats()", 0, Some(1)),
+        ("[stats(), hidden()]", 1, None),
+        (
+            r#"[{"tool":"stats","args":{}},{"tool":"hidden","args":{}}]"#,
+            1,
+            None,
+        ),
+        ("[stats() | hidden(), stats()]", 1, None),
+        ("[hidden() | stats(), stats()]", 0, Some(1)),
+    ] {
+        let before = fixture.stats().await;
+        let response = fixture.request(ops).await;
+        let entries = response["results"].as_array().expect("result entries");
+        let hidden = &entries[hidden_index];
+        assert_eq!(hidden["ok"], false, "{ops}: {response}");
+        assert_eq!(hidden["error"]["message"], refusal, "{ops}: {response}");
+        assert_eq!(
+            hidden["error"]["domain_disposition"], "not_committed",
+            "{ops}: {response}"
+        );
+        assert_eq!(hidden["domain_disposition"], "not_committed");
+        assert_ne!(hidden["aborted"], true, "guard must refuse the named leaf");
+        for (index, entry) in entries.iter().enumerate() {
+            if index == hidden_index {
+                continue;
+            }
+            if Some(index) == aborted_index {
+                assert_eq!(entry["aborted"], true, "{ops}: {response}");
+                assert_eq!(entry["domain_disposition"], "not_committed");
+            } else {
+                assert_eq!(entry["ok"], true, "{ops}: {response}");
+            }
+        }
+        assert_eq!(fixture.stats().await, before, "{ops}: {response}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
 async fn a3_handler_errors_and_nested_child_refusal_remain_unknown() {
     let fixture = Fixture::new();
     for ops in [
@@ -823,7 +868,7 @@ async fn a3_degrade_safe_read_keeps_success_under_both_transient_reasons() {
 enum JsonSyntax {
     Object(Vec<(Option<String>, JsonSyntax)>),
     Array(Vec<JsonSyntax>),
-    Rust(syn::Expr),
+    Rust(Box<syn::Expr>),
 }
 
 impl syn::parse::Parse for JsonSyntax {
@@ -858,7 +903,7 @@ impl syn::parse::Parse for JsonSyntax {
             }
             Ok(Self::Array(items))
         } else {
-            Ok(Self::Rust(input.parse()?))
+            Ok(Self::Rust(Box::new(input.parse()?)))
         }
     }
 }
@@ -873,7 +918,14 @@ impl JsonSyntax {
             .find_map(|(name, value)| (name.as_deref() == Some(key)).then_some(value))
     }
     fn bool_is(&self, expected: bool) -> bool {
-        matches!(self, Self::Rust(syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Bool(value), .. })) if value.value == expected)
+        matches!(
+            self,
+            Self::Rust(expr)
+                if matches!(expr.as_ref(), syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Bool(value),
+                    ..
+                }) if value.value == expected)
+        )
     }
 }
 
@@ -985,7 +1037,7 @@ impl ErrorConstructorCensus {
             }
             // json! delegates expressions to Rust. Parentheses or a block
             // around a nested constructor must not make it invisible.
-            JsonSyntax::Rust(expr) => syn::visit::Visit::visit_expr(self, expr),
+            JsonSyntax::Rust(expr) => syn::visit::Visit::visit_expr(self, expr.as_ref()),
         }
     }
     fn inspect_literal_pairs<'a>(&mut self, values: impl IntoIterator<Item = &'a syn::Expr>) {
@@ -1099,7 +1151,7 @@ impl ErrorConstructorCensus {
                         || self.root_function("khive-mcp/src/daemon.rs", "request_too_large_error")
                         || self.root_function(
                             "khive-runtime/src/daemon.rs",
-                            "handle_conn_with_shutdown",
+                            "handle_conn_with_lifecycle",
                         ))
             }
             _ => false,
@@ -1412,6 +1464,46 @@ fn a3_production_error_constructor_census_is_closed_and_runtime_match_is_total()
         })
         .expect("RuntimeError declaration must be present");
     assert_eq!(runtime_variants, variants, "every real runtime variant must have an explicit projection arm; adding a catch-all is not coverage");
+}
+
+#[test]
+fn a3_constructor_census_limits_normalized_carrier_to_lifecycle_owner() {
+    use syn::visit::Visit;
+    let frame = r#"DaemonResponseFrame { ok: false, error: Some(error.message), error_detail: Some(error.error_detail) }"#;
+    for (source, body, allowed) in [
+        (
+            "khive-runtime/src/daemon.rs",
+            format!("fn handle_conn_with_lifecycle() {{ let error = DaemonDispatchError::new(error.message, Some(error.error_detail)); {frame}; }}"),
+            true,
+        ),
+        (
+            "khive-runtime/src/daemon.rs",
+            format!("fn handle_conn_with_shutdown() {{ {frame}; }}"),
+            false,
+        ),
+        (
+            "khive-runtime/src/daemon.rs",
+            format!("mod unchecked {{ fn handle_conn_with_lifecycle() {{ {frame}; }} }}"),
+            false,
+        ),
+        (
+            "khive-mcp/src/server.rs",
+            format!("fn handle_conn_with_lifecycle() {{ {frame}; }}"),
+            false,
+        ),
+    ] {
+        let mut census = ErrorConstructorCensus {
+            source: source.into(),
+            ..Default::default()
+        };
+        census.visit_file(&syn::parse_file(&body).expect("valid carrier fixture"));
+        assert!(census.constructors_seen > 0);
+        assert_eq!(
+            census.offenders.is_empty(),
+            allowed,
+            "normalized carrier owner: {source}: {body}"
+        );
+    }
 }
 
 #[test]

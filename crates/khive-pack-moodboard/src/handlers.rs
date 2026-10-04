@@ -14,7 +14,9 @@ use khive_storage::blob::ContentRef;
 use khive_storage::types::{
     SqlStatement, SqlValue, VectorIndexKind, VectorSearchHit, VectorSearchRequest,
 };
-use khive_storage::{BlobStore, Entity, NewAttachment, VectorStore};
+use khive_storage::{
+    BlobStore, Entity, NewAttachment, StorageCapability, StorageError, VectorStore,
+};
 use khive_types::SubstrateKind;
 
 use crate::model::{validate_embedding, DescriptorIdentity, LoadedVisionModel, VisionModelState};
@@ -77,7 +79,7 @@ pub(crate) async fn handle_ingest(
     let content_ref = blob_store.put(raw).await?;
     drop(preprocessing_permit);
 
-    let (asset, created) = find_or_create_visual_asset(
+    let (asset, created, embedding_truncation) = find_or_create_visual_asset(
         &core,
         token,
         &content_ref,
@@ -97,7 +99,7 @@ pub(crate) async fn handle_ingest(
     .await?;
     index_embedding(pack.runtime(), token, &descriptor, asset.id, &embedding).await?;
 
-    Ok(json!({
+    let mut response = json!({
         "asset_id": asset.id.to_string(),
         "content_ref": content_ref.to_string(),
         "created": created,
@@ -105,7 +107,11 @@ pub(crate) async fn handle_ingest(
         "descriptor": descriptor,
         "experimental": true,
         "embedding": embedding,
-    }))
+    });
+    if embedding_truncation.any_truncated() {
+        response["warnings"] = json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+    }
+    Ok(response)
 }
 
 pub(crate) async fn handle_search(
@@ -383,9 +389,30 @@ async fn prepare_source_raster(
     content_ref: &ContentRef,
 ) -> Result<PreparedRaster, RuntimeError> {
     let hydrator = require_blob_hydrator(runtime)?;
-    let original = hydrator
-        .hydrate_verified(content_ref, MAX_OBJECT_BYTES as u64)
-        .await?;
+    let blob_store = require_blob_store(runtime)?;
+    let size = match khive_storage::await_request_read_phase(
+        "moodboard_search_blob_size",
+        blob_store.size(content_ref),
+    )
+    .await?
+    {
+        Ok(Some(size)) => size,
+        Ok(None)
+        | Err(StorageError::Unsupported {
+            capability: StorageCapability::Blob,
+            ..
+        }) => MAX_OBJECT_BYTES as u64,
+        Err(error) => return Err(error.into()),
+    };
+    if size > MAX_OBJECT_BYTES as u64 {
+        return Err(StorageError::BlobTooLarge {
+            content_ref: content_ref.clone(),
+            max_bytes: MAX_OBJECT_BYTES as u64,
+            observed_at_least: size,
+        }
+        .into());
+    }
+    let original = hydrator.hydrate_verified(content_ref, size).await?;
     let preprocessing_permit = pack.model_state().acquire_preprocessing_permit().await?;
     // The verified raw-byte lease moves with the permit into the blocking
     // worker. Cancellation of the waiter cannot admit a second decoder while
@@ -478,20 +505,30 @@ async fn find_or_create_visual_asset(
     caption: Option<&str>,
     prepared: &PreparedRaster,
     original_len: usize,
-) -> Result<(Entity, bool), RuntimeError> {
+) -> Result<
+    (
+        Entity,
+        bool,
+        khive_runtime::retrieval::EmbeddingTruncationReport,
+    ),
+    RuntimeError,
+> {
     let bytes = content_ref.as_str().as_bytes();
     let stripe = usize::from(hex_nibble(bytes[0])) * 16 + usize::from(hex_nibble(bytes[1]));
     let _guard = INGEST_CONTENT_LOCKS[stripe].lock().await;
     if let Some(asset) = find_visual_asset(runtime, token, content_ref).await? {
-        return Ok((asset, false));
+        return Ok((asset, false, Default::default()));
     }
 
     let default_name = format!("asset-{}", &content_ref.as_str()[..12]);
     let size_bytes = u64::try_from(original_len).map_err(|_| {
         RuntimeError::Internal("moodboard visual asset size exceeds u64".to_string())
     })?;
-    let asset = runtime
-        .create_entity_with_attachments(
+    // The report-returning variant keeps a truncated caption embedding from
+    // failing the call after the asset is committed, which would skip the
+    // visual embedding index the ingest verb promises.
+    let (asset, embedding_truncation) = runtime
+        .create_entity_with_attachments_and_report(
             token,
             "artifact",
             Some("visual_asset"),
@@ -507,7 +544,7 @@ async fn find_or_create_visual_asset(
             }],
         )
         .await?;
-    Ok((asset, true))
+    Ok((asset, true, embedding_truncation))
 }
 
 fn hex_nibble(byte: u8) -> u8 {
@@ -650,6 +687,10 @@ async fn search_embedding(
 }
 
 #[cfg(test)]
+#[path = "embedding_warning_tests.rs"]
+mod embedding_warning_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{
         sync::{
@@ -670,8 +711,12 @@ mod tests {
     struct OrderedHydrationStore {
         bytes: Vec<u8>,
         content_ref: ContentRef,
+        reported_size: Option<u64>,
+        unsupported_size: bool,
+        first_expected_max: u64,
         started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
         calls: AtomicUsize,
+        size_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -686,10 +731,18 @@ mod tests {
             max_bytes: u64,
         ) -> khive_storage::StorageResult<Vec<u8>> {
             assert_eq!(content_ref, &self.content_ref);
-            assert_eq!(max_bytes, MAX_OBJECT_BYTES as u64);
-            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                assert_eq!(max_bytes, self.first_expected_max);
+            }
             if let Some(started) = self.started.lock().unwrap().take() {
                 let _ = started.send(());
+            }
+            if self.bytes.len() as u64 > max_bytes {
+                return Err(StorageError::BlobTooLarge {
+                    content_ref: content_ref.clone(),
+                    max_bytes,
+                    observed_at_least: self.bytes.len() as u64,
+                });
             }
             Ok(self.bytes.clone())
         }
@@ -700,9 +753,18 @@ mod tests {
 
         async fn size(
             &self,
-            _content_ref: &ContentRef,
+            content_ref: &ContentRef,
         ) -> khive_storage::StorageResult<Option<u64>> {
-            panic!("search source hydration must not compose size with a read")
+            self.size_calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(content_ref, &self.content_ref);
+            if self.unsupported_size {
+                return Err(StorageError::Unsupported {
+                    capability: StorageCapability::Blob,
+                    operation: "size".into(),
+                    message: "stat unavailable".into(),
+                });
+            }
+            Ok(self.reported_size)
         }
 
         async fn delete(&self, _content_ref: &ContentRef) -> khive_storage::StorageResult<bool> {
@@ -790,13 +852,18 @@ mod tests {
     #[tokio::test]
     async fn source_hydration_precedes_and_waits_through_preprocessing_admission() {
         let bytes = b"digest-valid but not a raster".to_vec();
+        let source_size = bytes.len() as u64;
         let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let store = Arc::new(OrderedHydrationStore {
             bytes,
             content_ref: content_ref.clone(),
+            reported_size: Some(source_size),
+            unsupported_size: false,
+            first_expected_max: source_size,
             started: StdMutex::new(Some(started_tx)),
             calls: AtomicUsize::new(0),
+            size_calls: AtomicUsize::new(0),
         });
         let mut config = RuntimeConfig::no_embeddings();
         config.db_path = None;
@@ -829,6 +896,16 @@ mod tests {
         );
 
         let hydrator = runtime.blob_hydrator().expect("installed hydrator");
+        let sibling = tokio::time::timeout(
+            Duration::from_secs(1),
+            hydrator.hydrate_verified(&content_ref, source_size),
+        )
+        .await
+        .expect("a second small hydration fits beside the source lease")
+        .expect("second small hydration succeeds");
+        drop(sibling);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 2);
+
         let mut second_hydration =
             Box::pin(hydrator.hydrate_verified(&content_ref, MAX_OBJECT_BYTES as u64));
         assert!(
@@ -839,7 +916,7 @@ mod tests {
         );
         assert_eq!(
             store.calls.load(Ordering::SeqCst),
-            1,
+            2,
             "the queued hydration must not reach the backend before lease release"
         );
 
@@ -851,7 +928,142 @@ mod tests {
             .await
             .expect("queued hydration proceeds after source lease release")
             .expect("second hydration succeeds");
-        assert_eq!(store.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn source_size_stops_before_backend_on_expired_deadline_or_cancellation() {
+        let bytes = b"source".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        let store = Arc::new(OrderedHydrationStore {
+            bytes,
+            content_ref: content_ref.clone(),
+            reported_size: Some(6),
+            unsupported_size: false,
+            first_expected_max: 6,
+            started: StdMutex::new(None),
+            calls: AtomicUsize::new(0),
+            size_calls: AtomicUsize::new(0),
+        });
+        let mut config = RuntimeConfig::no_embeddings();
+        config.db_path = None;
+        config.packs = vec!["kg".to_string()];
+        let runtime = KhiveRuntime::new(config).expect("memory runtime");
+        runtime
+            .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+            .expect("install blob store");
+        let pack = MoodboardPack::new(runtime.clone());
+
+        let expired = khive_storage::RequestReadDeadline::after(Duration::ZERO);
+        let error = khive_storage::scope_request_read_deadline_at(
+            expired,
+            prepare_source_raster(&pack, &runtime, &content_ref),
+        )
+        .await
+        .expect_err("expired deadline must stop source size");
+        assert!(matches!(error,
+            RuntimeError::Storage(StorageError::Timeout { ref operation })
+            if operation == "moodboard_search_blob_size"));
+
+        let (_cancel, cancelled) = tokio::sync::watch::channel(true);
+        let error = khive_storage::scope_request_read_cancellation(
+            cancelled,
+            prepare_source_raster(&pack, &runtime, &content_ref),
+        )
+        .await
+        .expect_err("cancelled request must stop source size");
+        assert!(matches!(error,
+            RuntimeError::Storage(StorageError::Timeout { ref operation })
+            if operation == "moodboard_search_blob_size"));
+        assert_eq!(store.size_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn source_hydration_refuses_underreported_or_oversized_object() {
+        let bytes = b"not a raster".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        for (reported_size, expected_reads) in [(1, 1usize), (MAX_OBJECT_BYTES as u64 + 1, 0usize)]
+        {
+            let store = Arc::new(OrderedHydrationStore {
+                bytes: bytes.clone(),
+                content_ref: content_ref.clone(),
+                reported_size: Some(reported_size),
+                unsupported_size: false,
+                first_expected_max: reported_size.min(MAX_OBJECT_BYTES as u64),
+                started: StdMutex::new(None),
+                calls: AtomicUsize::new(0),
+                size_calls: AtomicUsize::new(0),
+            });
+            let mut config = RuntimeConfig::no_embeddings();
+            config.db_path = None;
+            config.packs = vec!["kg".to_string()];
+            let runtime = KhiveRuntime::new(config).expect("memory runtime");
+            runtime
+                .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+                .expect("install blob store");
+            let pack = MoodboardPack::new(runtime.clone());
+
+            let error = prepare_source_raster(&pack, &runtime, &content_ref)
+                .await
+                .expect_err("wrong size must refuse before raster preparation");
+            let (max_bytes, observed_at_least) = match error {
+                RuntimeError::Storage(StorageError::BlobTooLarge {
+                    max_bytes,
+                    observed_at_least,
+                    ..
+                }) => (max_bytes, observed_at_least),
+                other => panic!("expected BlobTooLarge, got {other:?}"),
+            };
+            assert_eq!(max_bytes, reported_size.min(MAX_OBJECT_BYTES as u64));
+            assert!(observed_at_least > max_bytes);
+            assert_eq!(store.calls.load(Ordering::SeqCst), expected_reads);
+            if reported_size > MAX_OBJECT_BYTES as u64 {
+                let verified = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    runtime
+                        .blob_hydrator()
+                        .unwrap()
+                        .hydrate_verified(&content_ref, MAX_OBJECT_BYTES as u64),
+                )
+                .await
+                .expect("the refused preflight did not consume admission")
+                .expect("full-budget probe succeeds");
+                assert_eq!(verified.bytes(), bytes.as_slice());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_hydration_uses_caller_cap_when_size_is_unknown() {
+        let bytes = b"not a raster".to_vec();
+        let content_ref = ContentRef::from_digest_bytes(blake3::hash(&bytes).as_bytes());
+        for unsupported_size in [false, true] {
+            let store = Arc::new(OrderedHydrationStore {
+                bytes: bytes.clone(),
+                content_ref: content_ref.clone(),
+                reported_size: None,
+                unsupported_size,
+                first_expected_max: MAX_OBJECT_BYTES as u64,
+                started: StdMutex::new(None),
+                calls: AtomicUsize::new(0),
+                size_calls: AtomicUsize::new(0),
+            });
+            let mut config = RuntimeConfig::no_embeddings();
+            config.db_path = None;
+            config.packs = vec!["kg".to_string()];
+            let runtime = KhiveRuntime::new(config).expect("memory runtime");
+            runtime
+                .install_blob_store(Arc::clone(&store) as Arc<dyn BlobStore>)
+                .expect("install blob store");
+            let pack = MoodboardPack::new(runtime.clone());
+
+            let error = prepare_source_raster(&pack, &runtime, &content_ref)
+                .await
+                .expect_err("fixture bytes are not a raster");
+            assert!(matches!(error, RuntimeError::InvalidInput(_)));
+            assert_eq!(store.calls.load(Ordering::SeqCst), 1);
+        }
     }
 
     async fn moodboard_ann_delta_count(
@@ -1180,7 +1392,7 @@ mod tests {
             original_height: 32,
         };
         let core = pack.runtime().core();
-        let (query, _) = find_or_create_visual_asset(
+        let (query, _, _) = find_or_create_visual_asset(
             &core,
             &token,
             &query_ref,
@@ -1191,7 +1403,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let (candidate, _) = find_or_create_visual_asset(
+        let (candidate, _, _) = find_or_create_visual_asset(
             &core,
             &token,
             &candidate_ref,
@@ -1408,5 +1620,88 @@ mod tests {
         let (first, second) = (first.unwrap(), second.unwrap());
         assert_eq!(first.0.id, second.0.id);
         assert_ne!(first.1, second.1, "exactly one caller creates the entity");
+    }
+
+    struct TruncationEmbeddingService;
+
+    #[async_trait]
+    impl lattice_embed::EmbeddingService for TruncationEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(vec![vec![1.0]; texts.len()])
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "moodboard-truncation-test"
+        }
+    }
+
+    struct TruncationEmbedderProvider;
+
+    #[async_trait]
+    impl khive_runtime::EmbedderProvider for TruncationEmbedderProvider {
+        fn name(&self) -> &str {
+            "moodboard-truncation-test"
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn build(&self) -> Result<Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(Arc::new(TruncationEmbeddingService))
+        }
+    }
+
+    #[tokio::test]
+    async fn over_budget_caption_creates_asset_and_reports_truncation() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        runtime.register_embedder(TruncationEmbedderProvider);
+        let token = runtime.authorize(Namespace::local()).expect("authorize");
+        let root = tempfile::tempdir().unwrap();
+        let blob_store = Arc::new(FsBlobStore::new(root.path().to_path_buf(), 0).unwrap());
+        runtime
+            .install_blob_store(blob_store.clone())
+            .expect("install blob store");
+        let content_ref = blob_store
+            .put(b"long caption bytes".to_vec())
+            .await
+            .unwrap();
+        let prepared = PreparedRaster {
+            inference_png: Vec::new(),
+            media_type: "image/png",
+            original_width: 32,
+            original_height: 32,
+        };
+        let caption = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+
+        let (asset, created, truncation) = find_or_create_visual_asset(
+            &runtime,
+            &token,
+            &content_ref,
+            Some("long-caption"),
+            Some(&caption),
+            &prepared,
+            18,
+        )
+        .await
+        .expect("an over-budget caption must not fail after the asset is committed");
+
+        assert!(created);
+        assert!(truncation.any_truncated(), "{truncation:?}");
+        assert_eq!(
+            find_visual_asset(&runtime, &token, &content_ref)
+                .await
+                .unwrap()
+                .map(|found| found.id),
+            Some(asset.id)
+        );
     }
 }

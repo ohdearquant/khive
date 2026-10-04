@@ -5,6 +5,9 @@
 //! the `Channel` trait; the MCP server polls registered channels and ingests inbound
 //! messages via the `comm.ingest` subhandler verb.
 
+mod signing;
+pub use signing::{ReceiptSignatureError, ReceiptSigningPublicKey};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -267,11 +270,21 @@ pub struct DeliveryReceiptBinding {
 }
 
 /// The recipient's durable ingest outcome; this says nothing about read state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptDisposition {
     Stored,
     Quarantined,
+}
+
+impl<'de> Deserialize<'de> for ReceiptDisposition {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match String::deserialize(d)?.as_str() {
+            "stored" => Ok(Self::Stored),
+            "quarantined" => Ok(Self::Quarantined),
+            _ => Err(serde::de::Error::custom("invalid receipt disposition")),
+        }
+    }
 }
 
 /// A signed recipient commit receipt, containing no message content or local note id.
@@ -285,6 +298,43 @@ pub struct DeliveryReceipt {
     pub binding: DeliveryReceiptBinding,
     pub disposition: ReceiptDisposition,
     pub signature: Vec<u8>,
+}
+
+/// A receipt identifier that cannot enter the canonical signed input.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ReceiptSigningError {
+    #[error("receipt agent identifier is not a canonical UUID")]
+    InvalidAgentId,
+}
+
+fn canonical_agent_id(value: &str) -> Result<Uuid, ReceiptSigningError> {
+    let id = Uuid::parse_str(value).map_err(|_| ReceiptSigningError::InvalidAgentId)?;
+    if id.to_string() != value {
+        return Err(ReceiptSigningError::InvalidAgentId);
+    }
+    Ok(id)
+}
+
+/// Canonical node wire protocol v1 receipt input (ADR-105 A.6.4).
+/// This constructs bytes only; it does not verify a signature or authorize a commit.
+pub fn receipt_signing_input(receipt: &DeliveryReceipt) -> Result<Vec<u8>, ReceiptSigningError> {
+    let binding = &receipt.binding;
+    let sender_agent_id = canonical_agent_id(&binding.sender_agent_id)?;
+    let recipient_agent_id = canonical_agent_id(&binding.recipient_agent_id)?;
+    let mut input = b"khive-node-v1/receipt\0".to_vec();
+    input.extend_from_slice(&binding.protocol_version.to_be_bytes());
+    input.extend_from_slice(binding.logical_message_id.as_bytes());
+    input.extend_from_slice(sender_agent_id.as_bytes());
+    input.extend_from_slice(recipient_agent_id.as_bytes());
+    input.extend_from_slice(binding.recipient_device_id.as_bytes());
+    input.extend_from_slice(&binding.recipient_key_epoch.to_be_bytes());
+    input.extend_from_slice(&binding.contact_generation.to_be_bytes());
+    input.extend_from_slice(binding.delivery_attempt_id.as_bytes());
+    input.push(match receipt.disposition {
+        ReceiptDisposition::Stored => 1,
+        ReceiptDisposition::Quarantined => 2,
+    });
+    Ok(input)
 }
 
 /// Result of a receipt-aware outbound submission.
@@ -522,6 +572,15 @@ pub trait Channel: Send + Sync + 'static {
     /// `poll` or `send` on every call.
     fn is_configured(&self) -> bool {
         true
+    }
+
+    /// Most quarantine records that may hold a stored original message at once.
+    ///
+    /// Once the ingest namespace holds this many live quarantine records, the
+    /// poller still records each further quarantined message but does not
+    /// store its original bytes. `None`, the default, applies no bound.
+    fn quarantine_retention_limit(&self) -> Option<usize> {
+        None
     }
 
     /// Send a single outbound message.

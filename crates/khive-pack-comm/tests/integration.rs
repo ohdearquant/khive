@@ -7,7 +7,7 @@ use khive_runtime::{
     AllowAllGate, BackendId, EmailMessageIdDomains, KhiveRuntime, Namespace, NamespaceToken,
     NotePatch, RequestIdentity, RuntimeConfig, VerbRegistry, VerbRegistryBuilder,
 };
-use khive_storage::types::{SqlRow, SqlValue};
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_storage::Note;
 use khive_types::{Pack, Visibility};
 
@@ -125,11 +125,12 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_fifteen_handlers() {
+fn comm_pack_declares_sixteen_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        15,
-        "comm pack must declare 15 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
+        16,
+        "comm pack must declare 16 handlers: send, delivered, transport_status, inbox, read, \
+         mark_read, unread, reply, \
          thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit \
          (khive #1387, #1447, #449, #66)"
     );
@@ -139,6 +140,7 @@ fn comm_pack_declares_fifteen_handlers() {
         names.contains(&"comm.delivered"),
         "comm.delivered verb must be registered (khive #1447)"
     );
+    assert!(names.contains(&"comm.transport_status"));
     assert!(names.contains(&"comm.inbox"));
     assert!(names.contains(&"comm.read"));
     assert!(
@@ -3576,6 +3578,10 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         "schema plan must declare idx_comm_message_outbound_ref; got: {combined}"
     );
     assert!(
+        !combined.contains("idx_comm_message_outbound_due"),
+        "the function-backed channel deadline index must be installed by a numbered core migration"
+    );
+    assert!(
         combined.contains("CREATE INDEX IF NOT EXISTS"),
         "schema plan DDL must be idempotent; got: {combined}"
     );
@@ -4078,6 +4084,10 @@ fn build_crossns_registry(
     allowed_outbound: Vec<Namespace>,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -4098,6 +4108,7 @@ fn build_crossns_registry(
         allowed_outbound_namespaces: allowed_outbound,
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -5032,6 +5043,10 @@ fn build_identity_registry(
     actor_id: Option<&str>,
 ) -> (VerbRegistry, KhiveRuntime) {
     let config = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -5052,6 +5067,7 @@ fn build_identity_registry(
         allowed_outbound_namespaces: vec![],
         actor_id: actor_id.map(str::to_string),
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -5064,6 +5080,83 @@ fn build_identity_registry(
     builder.with_actor_id(actor_id.map(str::to_string));
     let registry = builder.build().expect("actor registry builds");
     (registry, rt)
+}
+
+#[tokio::test]
+async fn generic_message_lists_keep_same_namespace_mailboxes_separate() {
+    let backend = shared_backend();
+    let (sender, _) = build_actor_registry(backend.clone(), "lambda:sender");
+    let (recipient, _) = build_actor_registry(backend.clone(), "lambda:recipient");
+    let (other, _) = build_actor_registry(backend, "lambda:other");
+
+    let public = other
+        .dispatch(
+            "create",
+            serde_json::json!({"kind": "observation", "content": "visible observation"}),
+        )
+        .await
+        .expect("other actor creates a non-message note");
+    let public_id = public["id"].as_str().expect("observation id");
+    let sent = sender
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:recipient",
+                "content": "private same-namespace message"
+            }),
+        )
+        .await
+        .expect("sender writes a dual-copy message");
+    let thread_prefix = &sent["full_id"].as_str().expect("outbound id")[..8];
+
+    for (actor, registry, expected_messages) in [
+        ("sender", &sender, 1),
+        ("recipient", &recipient, 1),
+        ("other", &other, 0),
+    ] {
+        let explicit = registry
+            .dispatch("list", serde_json::json!({"kind": "message", "limit": 10}))
+            .await
+            .expect("explicit message list");
+        assert_eq!(
+            list_items(&explicit).len(),
+            expected_messages,
+            "{actor}: {explicit}"
+        );
+    }
+
+    for args in [
+        serde_json::json!({"kind": "note", "limit": 1}),
+        serde_json::json!({"kind": "note", "limit": 1, "after": ""}),
+    ] {
+        let broad = other.dispatch("list", args).await.expect("broad note list");
+        let notes = broad["items"]
+            .as_array()
+            .or_else(|| broad["notes"].as_array())
+            .expect("note page");
+        assert_eq!(notes.len(), 1, "{broad}");
+        assert_eq!(notes[0]["id"], public_id, "{broad}");
+        assert!(!broad.to_string().contains("private same-namespace message"));
+    }
+
+    let hidden_prefix = other
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": thread_prefix}),
+        )
+        .await
+        .expect_err("a foreign thread prefix is outside this mailbox");
+    assert!(hidden_prefix
+        .to_string()
+        .contains("no message thread matches"));
+    let own_prefix = recipient
+        .dispatch(
+            "list",
+            serde_json::json!({"kind": "message", "thread_id": thread_prefix}),
+        )
+        .await
+        .expect("recipient resolves its thread prefix");
+    assert_eq!(list_items(&own_prefix).len(), 1, "{own_prefix}");
 }
 
 /// Actor A sends to actor B.
@@ -5337,6 +5430,10 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
 
     let backend = shared_backend();
     let config = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -5357,6 +5454,7 @@ async fn t_c2_gate_receives_configured_actor_not_anonymous() {
         allowed_outbound_namespaces: vec![],
         actor_id: Some("lambda:tenant-x".to_string()),
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     };
     let rt = KhiveRuntime::from_backend(backend, config);
     let mut builder = VerbRegistryBuilder::new();
@@ -5459,6 +5557,10 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
 
     // An anonymous (unconfigured) caller on the same backend must NOT see B's message.
     let config_anon = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -5479,6 +5581,7 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
         allowed_outbound_namespaces: vec![],
         actor_id: None, // anonymous
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     };
     let rt_anon = KhiveRuntime::from_backend(backend, config_anon);
     let mut builder_anon = VerbRegistryBuilder::new();
@@ -5688,7 +5791,7 @@ async fn imap_account_keys_keep_accounts_distinct_and_recognize_same_account_leg
 }
 
 #[tokio::test]
-async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
+async fn imap_legacy_key_repairs_duplicate_quarantine_before_ack() {
     use khive_storage::BlobStore as _;
 
     let (registry, runtime) = build_registry_for_ns("local");
@@ -5701,6 +5804,10 @@ async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
         .put(b"quarantined original".to_vec())
         .await
         .expect("publish original");
+    let wrong_ref = blob_store
+        .put(b"different original".to_vec())
+        .await
+        .expect("publish different original");
     runtime
         .install_blob_store(blob_store)
         .expect("install blob store");
@@ -5732,32 +5839,137 @@ async fn imap_legacy_key_cannot_ack_a_quarantine_repair_without_inspection() {
         .await
         .expect("leave metadata-only legacy row"));
 
+    let replay = |content_ref: String| {
+        serde_json::json!({
+            "from": "email:quarantine", "to": "email:a@example.com",
+            "content": "quarantined replay", "channel_kind": "email",
+            "channel_slug": "a@example.com", "external_id": new_id,
+            "legacy_external_id": old_id,
+            "metadata": {
+                "quarantined": true,
+                "quarantine_content_ref": content_ref,
+            },
+        })
+    };
     let error = registry
-        .dispatch(
-            "comm.ingest",
-            serde_json::json!({
-                "from": "email:quarantine", "to": "email:a@example.com",
-                "content": "quarantined replay", "channel_kind": "email",
-                "channel_slug": "a@example.com", "external_id": new_id,
-                "legacy_external_id": old_id,
-                "metadata": {
-                    "quarantined": true,
-                    "quarantine_content_ref": original_ref.to_string(),
-                },
-            }),
-        )
+        .dispatch("comm.ingest", replay(wrong_ref.to_string()))
         .await
-        .expect_err("a legacy-key ack must not bypass quarantine ownership repair");
+        .expect_err("different original bytes must not receive a duplicate ack");
     assert!(matches!(
         error,
         khive_runtime::RuntimeError::InvalidInput(message)
-            if message.contains("legacy_external_id cannot be combined with quarantine metadata")
+            if message.contains("duplicate quarantine external_id holds different original bytes")
     ));
     assert!(attachments
         .get_attachment(note_id, "quarantine-original")
         .await
         .expect("attachment lookup")
         .is_none());
+
+    let duplicate = registry
+        .dispatch("comm.ingest", replay(original_ref.to_string()))
+        .await
+        .expect("matching legacy quarantine replay repairs before ack");
+    assert_eq!(duplicate["deduplicated"], true);
+    assert_eq!(duplicate["thread_id"], original["thread_id"]);
+    let attachment = attachments
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("attachment lookup")
+        .expect("owner repaired");
+    assert_eq!(attachment.content_ref, original_ref);
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let notes = runtime.notes(&token).expect("note store");
+    assert_eq!(
+        notes.count_notes("local", Some("message")).await.unwrap(),
+        1
+    );
+    let old_note = notes
+        .get_note(note_id)
+        .await
+        .unwrap()
+        .expect("old row retained");
+    assert_eq!(old_note.properties.unwrap()["external_id"], old_id);
+}
+
+#[tokio::test]
+async fn imap_legacy_key_backfills_original_on_note_only_quarantine() {
+    use khive_storage::BlobStore as _;
+
+    let (registry, runtime) = build_registry_for_ns("local");
+    let blob_root = tempfile::tempdir().expect("blob root");
+    let blob_store = Arc::new(
+        khive_db::stores::blob::FsBlobStore::new(blob_root.path().to_path_buf(), 0)
+            .expect("blob store"),
+    );
+    let original_ref = blob_store
+        .put(b"byte-exact legacy quarantine original".to_vec())
+        .await
+        .expect("publish original");
+    runtime
+        .install_blob_store(blob_store)
+        .expect("install blob store");
+    let old_id = "imap:mail.example.com:17:note-only";
+    let new_id = "imap:mail.example.com:a@example.com:17:note-only";
+    let old = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "old note-only quarantine", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": old_id,
+                "metadata": {"quarantined": "true", "quarantine_reason": "off-allowlist"},
+            }),
+        )
+        .await
+        .expect("seed note-only quarantine");
+    let replay = registry
+        .dispatch(
+            "comm.ingest",
+            serde_json::json!({
+                "from": "email:quarantine", "to": "email:a@example.com",
+                "content": "replayed quarantine", "channel_kind": "email",
+                "channel_slug": "a@example.com", "external_id": new_id,
+                "legacy_external_id": old_id,
+                "metadata": {
+                    "quarantined": "true",
+                    "quarantine_content_ref": original_ref.to_string(),
+                },
+            }),
+        )
+        .await
+        .expect("same-mailbox old key must repair before duplicate acknowledgement");
+    assert_eq!(replay["deduplicated"], true);
+    assert_eq!(replay["thread_id"], old["thread_id"]);
+
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let notes = runtime.notes(&token).expect("note store");
+    assert_eq!(
+        notes.count_notes("local", Some("message")).await.unwrap(),
+        1
+    );
+    let note_id = old["full_id"]
+        .as_str()
+        .expect("old note id")
+        .parse()
+        .expect("canonical UUID");
+    let note = notes
+        .get_note(note_id)
+        .await
+        .unwrap()
+        .expect("old row retained");
+    let props = note.properties.expect("old row properties");
+    assert_eq!(props["external_id"], old_id);
+    assert_eq!(props["quarantine_content_ref"], original_ref.to_string());
+    let owner = runtime
+        .core()
+        .attachments()
+        .expect("attachment store")
+        .get_attachment(note_id, "quarantine-original")
+        .await
+        .expect("attachment lookup")
+        .expect("legacy note roots its original");
+    assert_eq!(owner.content_ref, original_ref);
 }
 
 /// Dedup ack for a legacy row whose stored thread_id is a non-UUID label must echo the literal stored value — not fabricate the duplicate's note UUID (which would route a caller into a DIFFERENT thread on a later send).
@@ -11400,15 +11612,16 @@ async fn i66_inbox_limit_zero_carries_real_unread_count() {
     assert_eq!(inbox["unread_count_saturated"], false);
 }
 
-/// A send must land the outbound + inbound note, an FTS document for each, and one vector row PER registered embedding model for EACH note, all inside the single atomic unit.
+/// Each message gets one vector row in the configured default space, while an
+/// ordinary note still writes every configured space.
 #[tokio::test]
-async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
+async fn send_uses_default_space_while_ordinary_note_uses_all_models() {
     use async_trait::async_trait;
-    use khive_runtime::EmbedderProvider;
+    use khive_runtime::{EmbedderProvider, NoteEmbeddingPolicy, NoteEmbeddingPolicySpec};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 
     macro_rules! stub_model {
-        ($provider:ident, $service:ident, $name:literal, $dims:literal) => {
+        ($provider:ident, $service:ident, $name:literal, $dims:expr) => {
             struct $service;
             #[async_trait]
             impl EmbeddingService for $service {
@@ -11444,27 +11657,54 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
     stub_model!(
         SendCountsModelA,
         SendCountsServiceA,
-        "send-counts-model-a",
-        4
+        "all-minilm-l6-v2",
+        EmbeddingModel::AllMiniLmL6V2.dimensions()
     );
     stub_model!(
         SendCountsModelB,
         SendCountsServiceB,
-        "send-counts-model-b",
-        6
+        "paraphrase-multilingual-minilm-l12-v2",
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2.dimensions()
     );
 
-    let (registry, rt) = build_registry_for_ns("agent:sender");
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
+        additional_embedding_models: vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2],
+        packs: vec!["kg".into(), "comm".into()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("two configured models");
     rt.register_embedder(SendCountsModelA);
     rt.register_embedder(SendCountsModelB);
+    let mut builder = VerbRegistryBuilder::new();
+    khive_runtime::PackRegistry::register_packs(
+        &["kg".into(), "comm".into()],
+        rt.clone(),
+        &mut builder,
+    )
+    .expect("register kg and comm");
+    builder.with_default_namespace("agent:sender");
+    let registry = builder.build().expect("registry builds");
 
-    registry
-        .dispatch(
-            "comm.send",
-            serde_json::json!({ "to": "agent:sender", "content": "multi-model counts" }),
-        )
-        .await
-        .expect("send succeeds");
+    let send_usage = khive_runtime::usage::UsageContext::new();
+    khive_runtime::usage::scope(send_usage.clone(), async {
+        for content in ["first message", "second message"] {
+            registry
+                .dispatch(
+                    "comm.send",
+                    serde_json::json!({ "to": "agent:sender", "content": content }),
+                )
+                .await
+                .expect("send succeeds");
+        }
+    })
+    .await;
+    assert_eq!(
+        send_usage.snapshot()["embed_calls"],
+        2,
+        "two distinct message texts must cause two embeds, not four"
+    );
 
     let local_tok = rt.authorize(Namespace::parse("local").unwrap()).unwrap();
     let notes = rt
@@ -11472,7 +11712,11 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
         .await
         .expect("list_notes");
     let alive: Vec<_> = notes.iter().filter(|n| n.deleted_at.is_none()).collect();
-    assert_eq!(alive.len(), 2, "expected outbound + inbound; got {alive:?}");
+    assert_eq!(
+        alive.len(),
+        4,
+        "expected two outbound + inbound pairs; got {alive:?}"
+    );
 
     let fts = rt.text_for_notes(&local_tok).expect("text store");
     for note in &alive {
@@ -11486,14 +11730,96 @@ async fn send_lands_outbound_inbound_fts_and_vectors_with_multi_model_counts() {
         );
     }
 
-    for model in ["send-counts-model-a", "send-counts-model-b"] {
-        let vs = rt.vectors_for_model(&local_tok, model).expect("vec store");
-        assert_eq!(
-            vs.count().await.expect("count"),
-            2,
-            "expected one vector row per note ({model}): outbound + inbound"
-        );
+    let primary = rt
+        .vectors_for_model(&local_tok, "all-minilm-l6-v2")
+        .expect("primary vector store");
+    let secondary = rt
+        .vectors_for_model(&local_tok, "paraphrase-multilingual-minilm-l12-v2")
+        .expect("secondary vector store");
+    assert_eq!(primary.count().await.expect("primary rows"), 4);
+    assert_eq!(secondary.count().await.expect("secondary rows"), 0);
+
+    let note_usage = khive_runtime::usage::UsageContext::new();
+    khive_runtime::usage::scope(note_usage.clone(), async {
+        rt.create_note(
+            &local_tok,
+            "observation",
+            None,
+            "ordinary note text",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("ordinary note succeeds");
+    })
+    .await;
+    assert_eq!(
+        note_usage.snapshot()["embed_calls"],
+        2,
+        "ordinary note must still embed once per configured model"
+    );
+    assert_eq!(primary.count().await.expect("primary rows"), 5);
+    assert_eq!(secondary.count().await.expect("secondary rows"), 1);
+
+    let mut all_model_us = 0;
+    let mut default_model_us = 0;
+    for (arm, policy) in [
+        (0, NoteEmbeddingPolicy::AllModels),
+        (1, NoteEmbeddingPolicy::DefaultModel),
+        (2, NoteEmbeddingPolicy::DefaultModel),
+        (3, NoteEmbeddingPolicy::AllModels),
+    ] {
+        rt.install_note_embedding_policies(&[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy,
+        }]);
+        let secondary_before = secondary.count().await.expect("secondary rows before arm");
+        let started = std::time::Instant::now();
+        for round in 0..8 {
+            let message = format!("contention message {arm} {round}");
+            let contender = format!("contention note {arm} {round}");
+            let (send, note) = tokio::join!(
+                registry.dispatch(
+                    "comm.send",
+                    serde_json::json!({ "to": "agent:sender", "content": message }),
+                ),
+                rt.create_note(
+                    &local_tok,
+                    "observation",
+                    None,
+                    &contender,
+                    None,
+                    None,
+                    vec![]
+                )
+            );
+            send.expect("contended send succeeds");
+            note.expect("contending note succeeds");
+        }
+        let elapsed_us = started.elapsed().as_micros();
+        let secondary_delta =
+            secondary.count().await.expect("secondary rows after arm") - secondary_before;
+        match policy {
+            NoteEmbeddingPolicy::AllModels => {
+                assert_eq!(
+                    secondary_delta, 24,
+                    "eight sends and notes each write secondary rows"
+                );
+                all_model_us += elapsed_us;
+            }
+            NoteEmbeddingPolicy::DefaultModel => {
+                assert_eq!(
+                    secondary_delta, 8,
+                    "only eight ordinary notes write secondary rows"
+                );
+                default_model_us += elapsed_us;
+            }
+        }
     }
+    eprintln!(
+        "paired writer-contention diagnostic (16 sends and 16 competing notes per policy): all_models_us={all_model_us} default_model_us={default_model_us}"
+    );
 }
 
 async fn insert_i1422_message(
@@ -12589,7 +12915,7 @@ async fn direct_runtime_update_refuses_transport_owned_message_properties() {
         ("channel_slug", serde_json::json!("forged-account")),
     ] {
         let error = runtime
-            .update_note(
+            .update_note_with_embedding_report(
                 &token,
                 id,
                 NotePatch::new(
@@ -12601,6 +12927,7 @@ async fn direct_runtime_update_refuses_transport_owned_message_properties() {
                 ),
             )
             .await
+            .map(|(row, _report)| row)
             .expect_err("direct runtime update must refuse transport-owned message properties");
         assert!(
             error.to_string().contains(key),
@@ -12689,7 +13016,7 @@ async fn direct_runtime_update_allows_transport_named_properties_on_other_kinds(
     let token = runtime.authorize(Namespace::local()).expect("local token");
 
     let updated = runtime
-        .update_note(
+        .update_note_with_embedding_report(
             &token,
             id,
             NotePatch::new(
@@ -12705,6 +13032,7 @@ async fn direct_runtime_update_allows_transport_named_properties_on_other_kinds(
             ),
         )
         .await
+        .map(|(row, _report)| row)
         .expect("transport-named keys are not reserved on an observation");
     assert_eq!(updated.properties.unwrap()["quarantined"], true);
 }
@@ -12975,10 +13303,7 @@ async fn comm_send_still_stamps_from_actor_with_validator_installed() {
         .and_then(serde_json::Value::as_str)
         .expect("send must return full_id")
         .to_string();
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": full_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, true_actor, &full_id).await;
     assert_eq!(
         after["properties"]["from_actor"], true_actor,
         "comm.send's own from_actor stamp must still be the sending actor"
@@ -13056,6 +13381,21 @@ async fn send_message_as(registry: &VerbRegistry, actor: &str, content: &str) ->
         .to_string()
 }
 
+async fn get_message_as(registry: &VerbRegistry, actor: &str, id: &str) -> serde_json::Value {
+    registry
+        .dispatch_with_identity(
+            "get",
+            serde_json::json!({"id": id}),
+            Some(RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: Some(actor.to_string()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("get must succeed")
+}
+
 /// FORGERY-BLOCKED arm: merging a `message` note authored by Y into one authored by X with `strategy="prefer_from"` — the attack this guard exists for — must leave the surviving note's `from_actor` as X, not Y.
 #[tokio::test]
 async fn merge_preserves_into_note_from_actor_under_prefer_from() {
@@ -13077,10 +13417,7 @@ async fn merge_preserves_into_note_from_actor_under_prefer_from() {
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:x", &into_id).await;
     assert_eq!(
         after["properties"]["from_actor"], "lambda:x",
         "prefer_from must not be able to transfer attribution from the absorbed note"
@@ -13108,10 +13445,7 @@ async fn merge_preserves_into_note_from_actor_under_prefer_into() {
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:x", &into_id).await;
     assert_eq!(after["properties"]["from_actor"], "lambda:x");
 }
 
@@ -13369,10 +13703,7 @@ async fn merge_still_folds_non_owned_properties_by_strategy() {
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:x", &into_id).await;
     assert_eq!(
         after["properties"]["tag"], "from-tag",
         "a non-owned key must still fold by strategy — only owner-established keys are pinned"
@@ -13454,7 +13785,7 @@ async fn merge_reports_properties_merged_for_key_that_actually_survives() {
             serde_json::json!({
                 "kind": "message",
                 "content": "into note, properties_merged accuracy arm",
-                "properties": {"to_actor": "into", "base": "i"},
+                "properties": {"direction": "outbound", "to_actor": "into", "base": "i"},
             }),
         )
         .await
@@ -13470,7 +13801,7 @@ async fn merge_reports_properties_merged_for_key_that_actually_survives() {
             serde_json::json!({
                 "kind": "message",
                 "content": "from note, properties_merged accuracy arm",
-                "properties": {"to_actor": "from", "added": "x"},
+                "properties": {"direction": "outbound", "to_actor": "from", "added": "x"},
             }),
         )
         .await
@@ -13534,7 +13865,7 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
             serde_json::json!({
                 "kind": "message",
                 "content": "into note, nested-union accuracy arm",
-                "properties": {"thread_id": {"keep": 1}},
+                "properties": {"direction": "outbound", "thread_id": {"keep": 1}},
             }),
             Some(identity.clone()),
         )
@@ -13551,7 +13882,7 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
             serde_json::json!({
                 "kind": "message",
                 "content": "from note, nested-union accuracy arm",
-                "properties": {"thread_id": {"discarded": 2}},
+                "properties": {"direction": "outbound", "thread_id": {"discarded": 2}},
             }),
             Some(identity),
         )
@@ -13575,10 +13906,7 @@ async fn merge_reports_zero_properties_merged_for_nested_union_reversion() {
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:z", &into_id).await;
     assert_eq!(
         after["properties"]["thread_id"],
         serde_json::json!({"keep": 1}),
@@ -13629,10 +13957,7 @@ async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_
         "fixture invariant: the absorbed note must carry transport-established external_id"
     );
 
-    let before = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let before = get_message_as(&registry, "lambda:x", &into_id).await;
     assert!(
         before["properties"].get("external_id").is_none(),
         "fixture invariant: the into-note must not already carry an \
@@ -13652,10 +13977,7 @@ async fn merge_reports_zero_properties_merged_when_restoration_reverts_the_only_
         .await
         .expect("merge must succeed");
 
-    let after = registry
-        .dispatch("get", serde_json::json!({"id": into_id}))
-        .await
-        .expect("get must succeed");
+    let after = get_message_as(&registry, "lambda:x", &into_id).await;
     assert!(
         after["properties"].get("external_id").is_none(),
         "restoration must strip the absorbed note's `external_id`, since the \
@@ -14611,6 +14933,62 @@ async fn generic_create_refuses_the_channel_health_kind_and_names_its_writer() {
         channels[0]["channel_slug"].as_str(),
         Some("recipient@example.com")
     );
+}
+
+/// Coordinate patches must fail before any sibling property or note revision changes (#2990).
+#[tokio::test]
+async fn heartbeat_refuses_carried_reserved_property_without_changing_row() {
+    let (registry, runtime) = build_registry_for_ns("local");
+    let heartbeat = serde_json::json!({
+        "namespace": "local",
+        "channel_kind": "email",
+        "channel_slug": "reserved@example.com",
+        "poll_interval_secs": 5,
+        "outcome": "success",
+    });
+    registry
+        .dispatch("comm.heartbeat", heartbeat.clone())
+        .await
+        .expect("seed heartbeat");
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let rows = runtime
+        .list_notes(&token, Some("channel_health"), 10, 0)
+        .await
+        .expect("read heartbeat");
+    assert_eq!(rows.len(), 1);
+    let before = &rows[0];
+    let mut planted = before.properties.clone().expect("properties");
+    planted["khive:secret_gate"] = serde_json::json!({"legacy": true});
+    let mut writer = runtime.sql().writer().await.expect("writer");
+    writer
+        .execute(SqlStatement {
+            sql: "UPDATE notes SET properties = ?1 WHERE id = ?2".into(),
+            params: vec![
+                SqlValue::Text(planted.to_string()),
+                SqlValue::Text(before.id.to_string()),
+            ],
+            label: None,
+        })
+        .await
+        .expect("plant stored key");
+    drop(writer);
+
+    let error = registry
+        .dispatch("comm.heartbeat", heartbeat)
+        .await
+        .expect_err("carried reserved key must be refused");
+    assert!(
+        matches!(&error, khive_runtime::RuntimeError::InvalidInput(_)),
+        "{error}"
+    );
+    assert!(error.to_string().contains("khive:secret_gate"), "{error}");
+    let after = runtime
+        .get_note_including_deleted(&token, before.id)
+        .await
+        .expect("read row")
+        .expect("heartbeat row");
+    assert_eq!(after.properties, Some(planted), "row changed");
+    assert_eq!(after.updated_at, before.updated_at, "revision changed");
 }
 
 /// Coordinate patches must fail before any sibling property or note revision changes (#2990).
@@ -16343,5 +16721,210 @@ mod mailbox_views {
             .unwrap();
         assert_eq!(count["unread_count"], 1000);
         assert_eq!(count["unread_count_saturated"], true);
+    }
+}
+
+#[tokio::test]
+async fn wire_ingest_cannot_select_verified_recipient_commit() {
+    let (registry, runtime) = build_registry();
+    registry.dispatch("comm.ingest",serde_json::json!({"from":"remote","to":"local","content":"ordinary wire message","verified":true,"verified_recipient":true,"receipt_ticket":{"logical_message_id":uuid::Uuid::new_v4(),"sender_agent_id":uuid::Uuid::new_v4()},"disposition":"stored"})).await.expect("ordinary ingest remains accepted");
+    let guard = runtime.backend().pool().writer().unwrap();
+    for table in [
+        "comm_recipient_replay",
+        "comm_ack_work",
+        "comm_recipient_quarantine",
+    ] {
+        let count: i64 = guard
+            .conn()
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "wire parameters must not select verified ingest");
+    }
+}
+
+mod transport_status_tests {
+    use super::*;
+    use khive_runtime::comm_transport::{
+        FailureClass, SenderAssurance, SenderEnvelope, TransportState,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn envelope(outbound_note_id: Uuid) -> SenderEnvelope {
+        SenderEnvelope {
+            namespace: "local".into(),
+            logical_message_id: Uuid::new_v4(),
+            outbound_note_id,
+            kind: "khive".into(),
+            slug: "device".into(),
+            credential_ref: "keys/device".into(),
+            recipient_address: format!("khive1:example/{}", Uuid::nil()),
+            protocol_version: 1,
+            sender_agent_id: Uuid::new_v4().to_string(),
+            sender_assurance: SenderAssurance::Claimed,
+            recipient_agent_id: Uuid::nil().to_string(),
+            recipient_device_id: Uuid::new_v4(),
+            recipient_key_epoch: 1,
+            contact_generation: 1,
+            sender_key_epoch: 1,
+            recipient_key_fingerprint: "ab".repeat(32),
+            enc: vec![1; 32],
+            ciphertext: vec![2, 0, 255],
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dispatch_returns_exact_status_object_and_full_uuid_in_agent_mode() {
+        let (registry, runtime) = build_registry();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let e = envelope(Uuid::new_v4());
+        runtime
+            .create_sender_transport(&token, e.clone())
+            .await
+            .unwrap();
+        let response = registry
+            .dispatch("comm.transport_status", json!({"id": e.outbound_note_id}))
+            .await
+            .unwrap();
+        let expected = json!({"id": e.outbound_note_id, "status": "pending"});
+        assert_eq!(
+            response, expected,
+            "the real dispatch returns exactly two fields"
+        );
+        let handler = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.transport_status")
+            .unwrap();
+        assert_eq!(handler.visibility, Visibility::Verb);
+        assert_eq!(handler.category, khive_types::VerbCategory::Assertive);
+        assert_eq!(
+            khive_runtime::presentation::present_with_policy(
+                response,
+                khive_runtime::presentation::PresentationMode::Agent,
+                0,
+                handler.presentation_policy(),
+            ),
+            expected,
+            "Agent presentation preserves the canonical outbound UUID"
+        );
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            registry
+                .dispatch("comm.transport_status", json!({"id": unknown}))
+                .await
+                .unwrap(),
+            json!({"id": unknown, "status": "unknown"})
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dispatch_refuses_short_uuid_and_normalizes_complete_spellings() {
+        let (registry, _) = build_registry();
+        let id = Uuid::new_v4();
+        let error = registry
+            .dispatch("comm.transport_status", json!({"id": &id.to_string()[..8]}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            khive_runtime::RuntimeError::InvalidInput(_)
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("short prefix")
+                && message.contains("scoped resolution")
+                && message.contains("full outbound UUID"),
+            "{message}"
+        );
+        assert_eq!(
+            registry
+                .dispatch(
+                    "comm.transport_status",
+                    json!({"id": format!("  {}  ", id.simple().to_string().to_uppercase())})
+                )
+                .await
+                .unwrap(),
+            json!({"id": id, "status": "unknown"})
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn delivered_ignores_failed_and_recipient_stored_transport_rows() {
+        let (registry, runtime) = build_registry();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        // One real dual-write and one UUID with no internal sibling pin both outcomes.
+        let sent = registry
+            .dispatch(
+                "comm.send",
+                json!({"to": "agent:recipient", "content": "transport independence"}),
+            )
+            .await
+            .unwrap();
+        let sent_id = Uuid::parse_str(sent["full_id"].as_str().unwrap()).unwrap();
+        for (id, count) in [(sent_id, 1), (Uuid::new_v4(), 0)] {
+            let expected = json!({
+                "id": id,
+                "status": if count > 0 { "delivered" } else { "undelivered" },
+                "delivered": count > 0,
+                "inbound_count": count,
+            });
+            let before = registry
+                .dispatch("comm.delivered", json!({"id": id}))
+                .await
+                .unwrap();
+            assert_eq!(before, expected, "the internal sibling fixture is real");
+            let e = envelope(id);
+            runtime
+                .create_sender_transport(&token, e.clone())
+                .await
+                .unwrap();
+            runtime
+                .record_sender_transport_failure(e.key(), FailureClass::Permanent, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.delivered", json!({"id": id}))
+                    .await
+                    .unwrap(),
+                before,
+                "a failed transport row cannot alter dual-write confirmation"
+            );
+            // The trusted store boundary is sufficient here: signature verification is
+            // exercised by the runtime status matrix, not by this independent read.
+            let receipt = json!({
+                "binding": {
+                    "protocol_version": e.protocol_version,
+                    "logical_message_id": e.logical_message_id,
+                    "sender_agent_id": e.sender_agent_id,
+                    "recipient_agent_id": e.recipient_agent_id,
+                    "recipient_device_id": e.recipient_device_id,
+                    "recipient_key_epoch": e.recipient_key_epoch,
+                    "contact_generation": e.contact_generation,
+                    "delivery_attempt_id": Uuid::new_v4(),
+                },
+                "disposition": "stored",
+                "signature": [1],
+            });
+            khive_db::stores::note::transport::SenderTransportStore::new(
+                runtime.backend().pool_arc(),
+            )
+            .accept_receipt(e.key(), TransportState::RecipientStored, receipt)
+            .await
+            .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.delivered", json!({"id": id}))
+                    .await
+                    .unwrap(),
+                before,
+                "a recipient-stored transport row cannot alter dual-write confirmation"
+            );
+        }
     }
 }

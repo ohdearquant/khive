@@ -38,6 +38,7 @@ mod sql;
 mod backend_policy_tests;
 pub mod cache;
 mod credentials;
+mod git_env;
 pub mod handlers;
 pub mod hook;
 pub mod ingest;
@@ -48,6 +49,7 @@ mod local_handlers;
 #[cfg(all(test, unix))]
 mod local_remote_tests;
 mod local_vocab;
+mod object_id;
 mod pack;
 mod params;
 #[cfg(all(test, unix))]
@@ -55,6 +57,7 @@ mod params_tests;
 #[cfg(test)]
 mod policy_tests;
 mod receipts;
+pub mod reconcile;
 #[cfg(test)]
 mod recovery_tests;
 pub mod refs;

@@ -28,10 +28,39 @@ kkernel <command> [flags]
   mcp       Serve the MCP `request` surface (stdio / daemon / transports)
   supervisor Launch a supervised daemon or release its startup marker
   backend   Inspect registered backends (list, info <name>)
+  git-annotation-repair  Preview/apply historical commit→project links
 ```
 
 The default database is `~/.khive/khive.db`. Override per-command with `--db`
 (or `KHIVE_DB` for `mcp`/`exec`). Use `:memory:` for an ephemeral database.
+
+---
+
+## `kkernel git-annotation-repair` — historical project links
+
+Select one live project by full UUID, its local repository source, namespace,
+and a full frozen commit tip. The first invocation only previews the
+acknowledged commit prefix and prints a `preview_id` with per-project counts.
+Apply that exact preview with a second invocation:
+
+```bash
+kkernel git-annotation-repair --repo /absolute/repo --project <full-uuid> --frozen-tip <full-oid>
+kkernel git-annotation-repair --repo /absolute/repo --project <full-uuid> --frozen-tip <full-oid> --apply-preview <preview-id>
+```
+
+Apply refuses an incomplete checkpoint, changed cursor, missing/deleted or
+ambiguous commit note, unavailable or diverged Git tip, or stale preview ID.
+This implementation reports **incomplete coverage** when the surviving
+checkpoint has `base_cursor` other than null: that SHA alone is not the head
+of a recorded earlier walk and cannot prove which merge siblings were
+previously acknowledged. This is a conservative limit under the
+[accepted ADR-088 Amendment 1 rider — historical shared-commit project annotations (#3532)](../../../docs/adr/ADR-088-amendment-1-git-digest.md#adr-088-amendment-1-rider--historical-shared-commit-project-annotations-3532).
+The frozen walk is capped at 250,000 SHAs. Preview does not
+write repair data, though normal runtime startup may run migrations.
+It creates only absent `annotates` edges. Existing live and soft-deleted edges
+retain their bytes; the two ingest cursor rows are asserted unchanged.
+The JSON response includes the before/after counts and partial-write counter
+when a link fails. This is an operator command, not an MCP verb.
 
 ---
 
@@ -215,15 +244,18 @@ separate whole-file transaction contract.
 
 Serial scheduling does not renew Khive's established request-read deadline per
 operation: one logical chunk retains one deadline. A trusted long-running local
-model batch whose inference can exceed the 30-second default must opt into a
-bounded documented override (1–3600 seconds), for example:
+model batch or bulk ingest whose work can exceed the 30-second default must opt
+into a bounded documented override (1–86400 seconds), for example:
 
 ```bash
-KHIVE_REQUEST_READ_TIMEOUT_SECS=3600 \
+KHIVE_REQUEST_READ_TIMEOUT_SECS=7200 \
   kkernel exec --ops-file image-batch.jsonl --serial
 ```
 
-Record this operator setting with run evidence; it is not a wire-limit bypass.
+A value above 86400 is clamped to 86400, and zero or a non-integer uses the
+30-second default; either correction logs a warning naming the value that was
+set. Record this operator setting with run evidence; it is not a wire-limit
+bypass.
 
 ### Stable refusal reasons
 

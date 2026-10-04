@@ -3,7 +3,9 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::keyed_memory::{create_keyed_memory, validate_memory_key, KeyedMemorySpec};
+use khive_runtime::keyed_memory::{
+    create_keyed_memory_with_receipt_and_report, validate_memory_key, KeyedMemorySpec,
+};
 use khive_runtime::{micros_to_iso, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
@@ -117,38 +119,41 @@ impl MemoryPack {
 
         let annotates_target = annotates.first().copied();
 
-        let (note, keyed_edge_id, replayed) = if let Some(key) = p.key.as_deref() {
-            create_keyed_memory(
-                &self.runtime,
-                write_token,
-                KeyedMemorySpec {
-                    content: &p.content,
-                    key,
-                    salience,
-                    decay_factor,
-                    properties: props,
-                    source_id: annotates_target,
-                    embedding_model: p.embedding_model.as_deref(),
-                },
-            )
-            .await?
-        } else {
-            let note = self
-                .runtime
-                .create_note_with_decay_for_embedding_model(
+        let (note, keyed_edge_id, replayed, vector_fences, embedding_truncation) =
+            if let Some(key) = p.key.as_deref() {
+                create_keyed_memory_with_receipt_and_report(
+                    &self.runtime,
                     write_token,
-                    "memory",
-                    None,
-                    &p.content,
-                    Some(salience),
-                    decay_factor,
-                    Some(props),
-                    annotates,
-                    p.embedding_model.as_deref(),
+                    KeyedMemorySpec {
+                        content: &p.content,
+                        key,
+                        salience,
+                        decay_factor,
+                        properties: props,
+                        source_id: annotates_target,
+                        embedding_model: p.embedding_model.as_deref(),
+                    },
                 )
-                .await?;
-            (note, None, false)
-        };
+                .await?
+            } else {
+                // Retain both diagnostics after the committed write so bounded
+                // embedding input does not skip the ANN generation bump below.
+                let (note, fences, truncation) = self
+                    .runtime
+                    .create_note_with_decay_for_embedding_model_with_visibility_and_report(
+                        write_token,
+                        "memory",
+                        None,
+                        &p.content,
+                        Some(salience),
+                        decay_factor,
+                        Some(props),
+                        annotates,
+                        p.embedding_model.as_deref(),
+                    )
+                    .await?;
+                (note, None, false, fences, truncation)
+            };
 
         if !replayed {
             // Preserve the stale graph as a fast fallback; generation is the invalidation signal.
@@ -220,12 +225,27 @@ impl MemoryPack {
             "decay_factor": note.decay_factor,
             "memory_type": response_memory_type,
             "created_at": micros_to_iso(note.created_at),
+            "visibility_token": {
+                "version": 1,
+                "namespace": note.namespace,
+                "fences": vector_fences
+                    .iter()
+                    .map(|(model, seq)| json!({
+                        "model": model,
+                        "ann_write_log_seq": seq,
+                    }))
+                    .collect::<Vec<_>>(),
+            },
         });
         if let Some(eid) = edge_id {
             response["edge_id"] = json!(eid);
         }
         if replayed {
             response["replayed"] = json!(true);
+        }
+        if embedding_truncation.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
         to_json(&response)
     }
@@ -235,8 +255,9 @@ impl MemoryPack {
 mod tests {
     use khive_pack_kg::KgPack;
     use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_storage::{SqlStatement, SqlValue};
 
-    use crate::MemoryPack;
+    use crate::{test_support::HashVecProvider, MemoryPack};
 
     /// `memory.remember` must persist exactly ONE `NoteCreated` event carrying
     /// the calling actor, the new note's id as `target_id`, and
@@ -305,6 +326,58 @@ mod tests {
         // in the event payload: the runtime emitter knows the note, not the verb
         // that asked for it. The response is the caller-facing surface for it.
         assert_eq!(result["memory_type"], serde_json::json!("semantic"));
+        assert_eq!(
+            result["visibility_token"],
+            serde_json::json!({"version": 1, "namespace": "local", "fences": []}),
+            "a text-only memory has an explicit empty vector fence set"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_returns_the_vector_writes_transactional_ann_sequence() {
+        const MODEL: &str = "remember-visibility-test-model";
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: 8,
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": "transactional visibility receipt for one memory vector",
+                    "memory_type": "semantic",
+                }),
+            )
+            .await
+            .expect("remember vector");
+        let token = &result["visibility_token"];
+        assert_eq!(token["version"], serde_json::json!(1));
+        assert_eq!(token["namespace"], serde_json::json!("local"));
+        assert_eq!(token["fences"][0]["model"], serde_json::json!(MODEL));
+        let seq = token["fences"][0]["ann_write_log_seq"]
+            .as_u64()
+            .expect("positive log sequence");
+        assert!(seq > 0);
+        assert_eq!(token["fences"].as_array().map(Vec::len), Some(1));
+
+        // AUTOINCREMENT retains the committed high sequence even if an ANN
+        // checkpoint compacts the individual log row before this assertion.
+        let mut reader = rt.sql().reader().await.expect("sql reader");
+        let observed = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT seq FROM sqlite_sequence WHERE name = 'ann_write_log'".into(),
+                params: vec![],
+                label: Some("remember-visibility-sequence-test".into()),
+            })
+            .await
+            .expect("read sequence");
+        assert!(matches!(observed, Some(SqlValue::Integer(value)) if value == seq as i64));
     }
 
     #[tokio::test]
@@ -333,6 +406,7 @@ mod tests {
 
         assert_eq!(second["id"], first["id"]);
         assert_eq!(second["replayed"], serde_json::json!(true));
+        assert_eq!(second["visibility_token"], first["visibility_token"]);
         let notes = rt
             .notes(&token)
             .expect("note store")
@@ -377,8 +451,17 @@ mod tests {
         let registry = builder.build().expect("registry");
 
         let source = rt
-            .create_entity(&token, "concept", None, "replay source", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &token,
+                "concept",
+                None,
+                "replay source",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(row, _report)| row)
             .expect("source entity");
         let args = serde_json::json!({
             "content": "replayed memory answers from the store",

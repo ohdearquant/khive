@@ -72,7 +72,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::checkpoint;
-use crate::pool::ConnectionPool;
+use crate::pool::{ConnectionPool, WalCeilingSource};
 
 /// Raw `PRAGMA wal_checkpoint(PASSIVE)` return row.
 ///
@@ -834,6 +834,11 @@ pub struct ReaderContentionDiagnostics {
     /// Pool-wide reader-admission waits that exhausted `checkout_timeout`
     /// before work began. Cooperative request cancellation is excluded.
     pub reader_checkout_timeouts: u64,
+    /// Queries on a checked-out pooled reader that SQLite refused with
+    /// `SQLITE_BUSY` after `configured_busy_timeout_ms` elapsed. Counted after
+    /// checkout succeeded, so it is disjoint from `reader_checkout_timeouts`.
+    /// Writer refusals are not included; see `writer_task_begin_busy`.
+    pub reader_busy_timeouts: u64,
     /// Pooled reader guards live when the snapshot was captured.
     pub active_pooled_reader_checkouts: u64,
     /// Highest observed concurrent pooled-reader guard count.
@@ -872,6 +877,7 @@ impl ReaderContentionDiagnostics {
             standalone_reader_opens: reader.standalone_opens,
             infrastructure_standalone_reader_opens: reader.infrastructure_standalone_opens,
             reader_checkout_timeouts: reader.checkout_timeouts,
+            reader_busy_timeouts: reader.busy_timeouts,
             active_pooled_reader_checkouts: reader.active_pooled_checkouts,
             peak_active_pooled_reader_checkouts: reader.peak_active_pooled_checkouts,
             completed_pooled_reader_checkouts: reader.completed_pooled_checkouts,
@@ -1457,13 +1463,55 @@ fn request_census_budget() -> Option<Duration> {
 
 /// The full database-integrity, reader/writer-contention, and WAL/checkpoint
 /// payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct WalCeilingDiagnostics {
+    /// Resolved configuration value, retained even on a read-only backend.
+    pub configured_bytes: u64,
+    /// Active writer-policy limit; zero on read-only backends and when disabled.
+    pub effective_bytes: u64,
+    pub source: WalCeilingSource,
+    pub enabled: bool,
+    /// Why the configured policy is active or inactive for this backend.
+    pub status: &'static str,
+}
+
+impl WalCeilingDiagnostics {
+    fn from_pool(pool: &ConnectionPool) -> Self {
+        let policy = pool.config().wal_ceiling;
+        let read_only = pool.config().read_only;
+        let effective_bytes = policy.effective_bytes(read_only);
+        Self {
+            configured_bytes: policy.bytes,
+            effective_bytes,
+            source: policy.source,
+            enabled: effective_bytes > 0,
+            status: if effective_bytes > 0 {
+                "enforced"
+            } else if read_only && policy.bytes > 0 {
+                "read_only_not_enforced"
+            } else {
+                "disabled"
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DbDiagnostics {
     pub build: BuildIdentity,
     pub process: ProcessIdentity,
+    /// Process-lifetime note-search vector route counts, independent of this
+    /// report's database file and reset only with the serving process.
+    pub note_search_ann_route_total: u64,
+    pub note_search_fallback_route_total: u64,
+    /// Pool-scoped, monotonic coordinator dispatch and note-candidate
+    /// hydration counts used by ADR-166 G4/G5. Reset on pool reconstruction.
+    pub search_mechanism: crate::pool::SearchMechanismSnapshot,
     /// `None` for an in-memory backend — the file-backed sections then carry
     /// their own unavailability reasons.
     pub db_path: Option<String>,
+    /// Explicit WAL ceiling policy for this already-open database.
+    pub wal_ceiling: WalCeilingDiagnostics,
     pub wal_file: Option<WalFileState>,
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
@@ -1729,6 +1777,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     let started = Instant::now();
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(&pool);
+    let search_mechanism = pool.search_mechanism_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         &pool,
         Some(audit_append_failures),
@@ -1740,7 +1789,11 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         return Ok(DbDiagnostics {
             build,
             process,
+            note_search_ann_route_total: 0,
+            note_search_fallback_route_total: 0,
+            search_mechanism,
             db_path: None,
+            wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1793,7 +1846,11 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
     Ok(DbDiagnostics {
         build,
         process,
+        note_search_ann_route_total: 0,
+        note_search_fallback_route_total: 0,
+        search_mechanism,
         db_path: Some(path.display().to_string()),
+        wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -1849,6 +1906,7 @@ fn collect_inner(
     let process = ProcessIdentity::current(pool);
     let counters = checkpoint_counters();
     let reader_contention = ReaderContentionDiagnostics::snapshot(pool);
+    let search_mechanism = pool.search_mechanism_snapshot();
     let writer_contention = WriterContentionDiagnostics::snapshot(
         pool,
         audit_append_failures,
@@ -1859,7 +1917,11 @@ fn collect_inner(
         return DbDiagnostics {
             build,
             process,
+            note_search_ann_route_total: 0,
+            note_search_fallback_route_total: 0,
+            search_mechanism,
             db_path: None,
+            wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1907,7 +1969,11 @@ fn collect_inner(
     DbDiagnostics {
         build,
         process,
+        note_search_ann_route_total: 0,
+        note_search_fallback_route_total: 0,
+        search_mechanism,
         db_path: Some(path.display().to_string()),
+        wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -2292,7 +2358,66 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
-    use crate::pool::{ConnectionPool, PoolConfig};
+    use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy, WalCeilingSource};
+
+    #[test]
+    fn default_wal_ceiling_is_explicitly_disabled_in_diagnostics() {
+        let pool = ConnectionPool::new(PoolConfig::for_test()).expect("in-memory pool");
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let json = serde_json::to_value(report).expect("report serializes");
+        assert_eq!(
+            json.get("wal_ceiling"),
+            Some(&serde_json::json!({
+                "configured_bytes": 0,
+                "effective_bytes": 0,
+                "source": "default",
+                "enabled": false,
+                "status": "disabled"
+            })),
+            "zero is an explicit disabled policy, not an omitted field"
+        );
+    }
+
+    #[test]
+    fn read_only_wal_ceiling_keeps_configured_value_without_enforcement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("read-only-ceiling.db");
+        rusqlite::Connection::open(&path)
+            .expect("create source database")
+            .execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .expect("persist source database");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            read_only: true,
+            write_queue_enabled: Some(false),
+            wal_ceiling: WalCeilingPolicy {
+                bytes: 8192,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        })
+        .expect("read-only backend must accept configured policy");
+        let report = collect(
+            &pool,
+            BuildIdentity::from_env("test", None),
+            Duration::from_secs(30),
+        );
+        let json = serde_json::to_value(report).expect("report serializes");
+        assert_eq!(
+            json["wal_ceiling"],
+            serde_json::json!({
+                "configured_bytes": 8192,
+                "effective_bytes": 0,
+                "source": "backend_field",
+                "enabled": false,
+                "status": "read_only_not_enforced"
+            })
+        );
+    }
 
     /// The budget knob is read per request, so a wrong read is a wrong bound
     /// on every call. `0` has to mean unbounded rather than "spend nothing",
@@ -2743,6 +2868,30 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_probe_reports_replaced_pool_file_instead_of_probing_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (pool, path) = seeded_pool(&dir);
+        let replacement = dir.path().join("replacement.db");
+        let replacement_conn = Connection::open(&replacement).expect("replacement database");
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .expect("initialize replacement database");
+        drop(replacement_conn);
+        std::fs::rename(&replacement, &path).expect("replace the pool's path");
+
+        let inspection = inspect_pool(&pool);
+        assert!(inspection.checkpoint_probe.is_none());
+        assert!(
+            inspection
+                .checkpoint_probe_error
+                .as_deref()
+                .is_some_and(|error| error.contains("file identity changed")),
+            "replacement must be reported as a probe failure"
+        );
+    }
+
     #[test]
     fn checkpoint_probe_backfill_gap_is_a_row_difference_not_a_pin_claim() {
         let probe = CheckpointProbe {
@@ -3088,6 +3237,7 @@ mod tests {
                 standalone_reader_opens: 0,
                 infrastructure_standalone_reader_opens: 0,
                 reader_checkout_timeouts: 0,
+                reader_busy_timeouts: 0,
                 active_pooled_reader_checkouts: 0,
                 peak_active_pooled_reader_checkouts: 0,
                 completed_pooled_reader_checkouts: 0,
@@ -3197,6 +3347,78 @@ mod tests {
             json.pointer("/reader_contention/max_completed_reader_hold_micros")
                 .is_some(),
             "the operator wire payload must expose completed hold-time evidence"
+        );
+    }
+
+    /// A query refused with SQLITE_BUSY after the busy handler gives up shows up
+    /// in `reader_busy_timeouts`, apart from `reader_checkout_timeouts`. WAL
+    /// readers are never blocked by a writer, so the fixture uses a
+    /// rollback-journal database, where a connection holding an exclusive lock
+    /// refuses every other reader.
+    #[test]
+    fn diagnostics_counts_reader_busy_handler_timeouts_apart_from_checkout_timeouts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("reader_busy_timeouts.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            busy_timeout: Duration::from_millis(50),
+            ..PoolConfig::default()
+        })
+        .expect("rollback-journal file-backed pool");
+        pool.writer()
+            .expect("writer")
+            .conn()
+            .execute_batch("CREATE TABLE busy_fixture (id INTEGER PRIMARY KEY)")
+            .expect("fixture table");
+
+        // Control: with no lock held the read succeeds and nothing is counted.
+        let reader = pool.reader().expect("reader checkout");
+        let rows = reader
+            .query_row("SELECT count(*) FROM busy_fixture", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("unlocked read");
+        assert_eq!(rows, 0);
+        drop(reader);
+        assert_eq!(
+            ReaderContentionDiagnostics::snapshot(&pool).reader_busy_timeouts,
+            0
+        );
+
+        let holder = Connection::open(&path).expect("second connection");
+        holder
+            .execute_batch("BEGIN EXCLUSIVE")
+            .expect("exclusive lock");
+        let reader = pool.reader().expect("reader checkout");
+        let refused = reader
+            .query_row("SELECT count(*) FROM busy_fixture", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect_err("a read behind an exclusive lock must be refused");
+        assert!(
+            matches!(
+                &refused,
+                crate::SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                    if code.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "the refusal must be SQLITE_BUSY: {refused}"
+        );
+        holder.execute_batch("ROLLBACK").expect("release lock");
+        drop(reader);
+
+        let snapshot = ReaderContentionDiagnostics::snapshot(&pool);
+        assert_eq!(snapshot.reader_busy_timeouts, 1);
+        assert_eq!(
+            snapshot.reader_checkout_timeouts, 0,
+            "a busy-handler refusal after checkout is not a checkout timeout"
+        );
+        let json = serde_json::to_value(snapshot).expect("snapshot serializes");
+        assert_eq!(
+            json.pointer("/reader_busy_timeouts"),
+            Some(&serde_json::json!(1)),
+            "the operator wire payload must expose the busy-handler count"
         );
     }
 

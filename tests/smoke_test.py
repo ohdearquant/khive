@@ -271,12 +271,13 @@ def main():
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 140 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 145 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
-        # pack contributes five verbs: 4 agent-facing T1 verbs
+        # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
         # Visibility::Verb per ADR-083, and transcript search (ADR-117a), which
-        # stays unavailable until its required features are ready;
+        # stays unavailable until its required features are ready; stats and vacuum
+        # provide database-wide maintenance;
         # brain.register_adapter (#354), context
         # (ADR-089, the 17th kg-substrate bare verb), resolve (unified-verb
         # draft ADR Slice 1, the 18th kg-substrate bare verb), whoami (caller
@@ -294,9 +295,11 @@ def main():
         # `kkernel code-ingest` admin CLI, never this MCP verb surface);
         # workspace (#873) contributes zero verbs, adding only the
         # `workspace` entity kind and `contains` endpoint rules; blob
-        # contributes seven verbs (put/get/stat and begin/put_part/commit/abort, ADR-173)
-        # over the `BlobStore` CAS trait, unconfigured (erroring at dispatch)
-        # until a backend is installed via [storage.blob] or KHIVE_BLOB_ROOT.
+        # contributes nine verbs (put/get/stat, begin/put_part/commit/abort,
+        # and opt-in import/export; ADR-173)
+        # over the `BlobStore` CAS trait. Import/export refuse until enabled
+        # by [blob] file_transfers = true or KHIVE_FILE_TRANSFERS=1; storage
+        # operations require an installed backend.
         # The kg pack also carries its one documented sub-namespace,
         # stream.append / stream.batch / stream.read / stream.stat (ADR-174
         # §2); git grew from four verbs to seventeen with the dev-loop surface
@@ -307,10 +310,10 @@ def main():
         # exec nine (the tool registry with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 140, (
-            f"expected 140 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 145, (
+            f"expected 145 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
-            f"ADR-083 plus dependency-gated transcript search; "
+            f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; whoami is the 19th kg-substrate bare verb "
@@ -322,7 +325,8 @@ def main():
             f"git.commit/git.branch/git.update_ref/git.push (ADR-108 and ADR-182); "
             f"code contributes code.ingest per ADR-085 Amendment 2 (PR #1039); "
             f"workspace (#873) contributes zero verbs; "
-            f"blob contributes put/get/stat and begin/put_part/commit/abort per ADR-173; "
+            f"blob contributes put/get/stat, begin/put_part/commit/abort per ADR-173, "
+            f"and opt-in import/export; "
             f"brain.mark_turn is the per-actor work-unit marker; "
             f"comm.unread lists unread inbound messages; comm.mark_read is the "
             f"named atomic-capable mark-read surface; comm.delivered confirms "
@@ -350,6 +354,9 @@ def main():
         )
         assert "comm.delivered" in verb_names, (
             f"'comm.delivered' (#1447) must appear in verbs listing: {verb_names}"
+        )
+        assert "comm.transport_status" in verb_names, (
+            f"comm.transport_status must appear in verbs listing: {verb_names}"
         )
         assert "comm.mark_read" in verb_names, (
             f"'comm.mark_read' (#1387) must appear in verbs listing: {verb_names}"

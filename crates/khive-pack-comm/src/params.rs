@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use khive_runtime::RuntimeError;
+pub(crate) use khive_runtime::deser_params as deser;
 
 // deny_unknown_fields so typo kwargs are rejected at deserialization rather than silently dropped.
 #[derive(Deserialize)]
@@ -11,6 +11,8 @@ use khive_runtime::RuntimeError;
 pub(crate) struct SendParams {
     pub to: String,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default)]
@@ -31,6 +33,13 @@ pub(crate) struct SendParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DeliveredParams {
+    pub id: String,
+}
+
+/// Exact outbound UUID for the sender-local transport status read.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransportStatusParams {
     pub id: String,
 }
 
@@ -120,6 +129,8 @@ pub(crate) struct UnreadParams {}
 pub(crate) struct ReplyParams {
     pub id: String,
     pub content: String,
+    #[serde(default)]
+    pub attachments: Vec<String>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
     /// Structured provenance tags, persisted verbatim to `properties["tags"]` on
@@ -292,9 +303,4 @@ pub(crate) struct CursorCommitParams {
     pub generation: u64,
     #[serde(default)]
     pub high_water: Option<u64>,
-}
-
-pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }

@@ -29,6 +29,13 @@ Revision `domain-effects-v7` classifies the internal
 `comm.cleanup_expired_quarantine` subhandler as `Write`: a caller-requested
 maintenance tick hard-deletes due quarantine notes and their attachment rows.
 Its bounded scope and internal-only visibility do not make that deletion a read.
+Revision `domain-effects-v8` classifies `session.stats` as `Read` because it
+calculates aggregate store statistics without a domain write, and
+`session.vacuum` as `Write` because it explicitly compacts the store.
+Revision `domain-effects-v9` classifies `blob.import` and `blob.export` as `Write`: importing publishes an object and exporting writes a server file.
+
+Revision `domain-effects-v10` classifies `comm.transport_status` as `Read`: it reads
+namespace-scoped sender records and receipts without changing transport metadata.
 
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
@@ -40,7 +47,9 @@ Its bounded scope and internal-only visibility do not make that deletion a read.
 | `blob.abort`                 | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L133)              |
 | `blob.begin`                 | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L67)               |
 | `blob.commit`                | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L118)              |
+| `blob.export` | Write | Verb | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs) |
 | `blob.get`                   | Read   | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L28)               |
+| `blob.import` | Write | Verb | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs) |
 | `blob.put`                   | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L13)               |
 | `blob.put_part`              | Write  | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L89)               |
 | `blob.stat`                  | Read   | Verb       | [khive-pack-blob/src/pack.rs](../../../khive-pack-blob/src/pack.rs#L52)               |
@@ -80,6 +89,7 @@ Its bounded scope and internal-only visibility do not make that deletion a read.
 | `comm.reply`                 | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L300)            |
 | `comm.send`                  | Write  | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L47)             |
 | `comm.thread`                | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L336)            |
+| `comm.transport_status` | Read | Verb | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L139) |
 | `comm.unread`                | Read   | Verb       | [khive-pack-comm/src/vocab.rs](../../../khive-pack-comm/src/vocab.rs#L293)            |
 | `context`                    | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L1091) |
 | `create`                     | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L71)   |
@@ -175,7 +185,9 @@ Its bounded scope and internal-only visibility do not make that deletion a read.
 | `session.list`               | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L115)      |
 | `session.resume`             | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L158)      |
 | `session.search`             | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L193)      |
+| `session.stats`              | Read   | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L239)      |
 | `session.store`              | Write  | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L72)       |
+| `session.vacuum`             | Write  | Verb       | [khive-pack-session/src/vocab.rs](../../../khive-pack-session/src/vocab.rs#L246)      |
 | `stats`                      | Read   | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L475)  |
 | `stream.append`              | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L18)   |
 | `stream.batch`               | Write  | Verb       | [khive-pack-kg/src/handler_defs.rs](../../../khive-pack-kg/src/handler_defs.rs#L57)   |
@@ -232,7 +244,10 @@ See [runtime token minting](../../../khive-runtime/src/runtime.rs#L1086).
   `knowledge.eval_retrieval` persists evaluation runs and is Write.
 - `session.resume` and `session.export` return stored data; they do not resume a
   process or write an export file. `agent.resume` controls a process and is Write.
-- `memory.vacuum` explicitly requests maintenance and is Write. `db_diagnostics`
+- `memory.vacuum` and `session.vacuum` explicitly request maintenance and are
+  Write. `session.stats` reports database-wide aggregates, so its `Read`
+  classification presumes the supported one-store-per-tenant deployment shape
+  in [ADR-007 Rule 9](../../../../docs/adr/ADR-007-namespace.md). `db_diagnostics`
   is Read, including its existing PASSIVE checkpoint I/O; `comm.cursor_get` may
   lazily initialize its cursor schema. Search/recall may persist normal telemetry.
 - `memory.recall` is Read, but its nested `brain.record_serve` dispatch keeps the

@@ -1068,3 +1068,121 @@ async fn non_pending_transport_cannot_hold() {
         }
     }
 }
+
+#[tokio::test]
+async fn transport_status_latest_envelope_without_receipt() {
+    let (backend, mut first) = fixture();
+    first.recipient_device_id = Uuid::from_u128(1);
+    let store = SenderTransportStore::new(backend.pool_arc());
+    store.create(first.clone(), false).await.unwrap();
+    store
+        .hold(first.key(), Some(HoldReason::RecipientKeyChanged))
+        .await
+        .unwrap();
+    let mut latest = first.clone();
+    latest.recipient_device_id = Uuid::from_u128(2);
+    let expected = store.create(latest.clone(), true).await.unwrap();
+    assert_eq!(expected.envelope_seq, 2, "the second envelope exists");
+    let selected = store
+        .get_by_outbound_note_id("local", first.outbound_note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        selected, expected,
+        "without a receipt, select the highest envelope sequence"
+    );
+}
+
+#[tokio::test]
+async fn transport_status_receipt_wins_over_newer_envelope() {
+    let (backend, mut first) = fixture();
+    first.recipient_device_id = Uuid::from_u128(1);
+    let store = SenderTransportStore::new(backend.pool_arc());
+    store.create(first.clone(), false).await.unwrap();
+    store
+        .hold(first.key(), Some(HoldReason::RecipientKeyChanged))
+        .await
+        .unwrap();
+    let mut latest = first.clone();
+    latest.recipient_device_id = Uuid::from_u128(2);
+    store.create(latest.clone(), true).await.unwrap();
+    store
+        .accept_receipt(
+            first.key(),
+            TransportState::RecipientStored,
+            receipt(&first),
+        )
+        .await
+        .unwrap();
+    let expected = store.get(first.key()).await.unwrap().unwrap();
+    assert_eq!(expected.envelope_seq, 1);
+    assert!(
+        expected.receipt.is_some(),
+        "the older envelope has a receipt"
+    );
+    assert!(store
+        .get(latest.key())
+        .await
+        .unwrap()
+        .unwrap()
+        .receipt
+        .is_none());
+    let selected = store
+        .get_by_outbound_note_id("local", first.outbound_note_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        selected, expected,
+        "a receipted envelope wins over a newer pending envelope"
+    );
+}
+
+#[tokio::test]
+async fn transport_status_store_read_preserves_physical_row_values() {
+    let (backend, e) = fixture();
+    let store = SenderTransportStore::new(backend.pool_arc());
+    store.create(e.clone(), false).await.unwrap();
+    let snapshot = || {
+        let notes = &store.notes;
+        let id = e.outbound_note_id.to_string();
+        async move {
+            notes
+                .with_reader("transport_status_snapshot", move |conn| {
+                    conn.query_row(
+                        "SELECT * FROM comm_sender_transport WHERE outbound_note_id = ?1",
+                        [id],
+                        |row| {
+                            (0..row.as_ref().column_count())
+                                .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                        },
+                    )
+                })
+                .await
+                .unwrap()
+        }
+    };
+    let before = snapshot().await;
+    assert!(store
+        .get_by_outbound_note_id("local", e.outbound_note_id)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_by_outbound_note_id("another", e.outbound_note_id)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(store
+        .get_by_outbound_note_id("local", Uuid::new_v4())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        snapshot().await,
+        before,
+        "every stored value, including updated_at and BLOB bytes, is unchanged"
+    );
+}

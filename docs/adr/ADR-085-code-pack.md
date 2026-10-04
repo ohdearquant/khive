@@ -1141,6 +1141,8 @@ recipe that could have been written instead.
 
 ### E7: Target database posture — the production-db fence is restated, hardened, not relaxed
 
+**Superseded in part by Amendment 12:** E7's thin VFS wrapper over the platform default VFS and its allowance for steady-state target WAL/SHM side effects are replaced by the native guarded VFS and rollback DELETE posture.
+
 `code.coupling`, `code.health`, and `code.cycles` resolve their `db`
 parameter through the same db-target resolution `code.ingest` uses (B1,
 B7), and each refuses the shared production database exactly as
@@ -1900,3 +1902,607 @@ This amendment narrows E7's present-tense implementation claim. It does not remo
 - `crates/khive-pack-code/src/db_target.rs` and `crates/khive-pack-code/src/pack.rs`
 - `crates/khive-db/src/pool.rs` SQLite connection opens
 - #1855 and #3552
+
+## Amendment 12 (2026-09-28): native opened-handle proof for code-map databases
+
+**Amends:** Amendment 4 E7's VFS mechanism and WAL/SHM side-effect allowance, and Amendment 11's deferred implementation description. **Retains:** E7's production exclusion objective, Amendment 9's complete configured production deny set and populated-prior-map acceptance, the explicit-target existence rule, and the analysis verbs' read-only/no-migration design.
+
+E7's “thin VFS wrapper layered over the platform's default VFS” is replaced by a guarded **native** VFS for code-pack target runtimes. Its own `xOpen` opens and retains the actual OS handle for each target main database and rollback journal; its file I/O, SQLite-compatible rollback locking, sync, close, `xAccess`, and `xDelete` operate on those proved handles or a proved parent. Delegating an open or lock to the platform default VFS and re-probing a pathname is not proof. Every code-pack-created pooled writer/reader, replacement reader, standalone writer/reader, writer task, checkpoint/diagnostics handle, guarded transition handle, and future analysis connection must select this VFS; an unguarded target connection is a fence failure.
+
+The steady-state code-map target uses rollback `journal_mode=DELETE`, confirmed before any schema write, rather than WAL. A fresh map uses DELETE from its first write. WAL and SHM are **not opened by construction** after the guarded transition: the target header's format bytes 18–19 must both be 1 and neither `-wal` nor `-shm` may be present at every steady-state open. An unexpected WAL `xOpen` or `xShmMap`/`xShmLock`/`xShmUnmap` must fail closed; every shared-memory callback, including the void `xShmBarrier`, is counted as a contract violation. A change of journal mode while the target is open is refused. The code-map-only rollback configuration does not change ordinary khive databases. Separate code-map runtimes remain able to read and rebase concurrently under the ordinary bounded busy timeout; exclusive WAL is never their steady-state mode.
+
+A populated prior code map in persistent WAL mode remains an accepted explicit target under Amendment 9. Before the rollback constructor or any SQLite access, a separate guarded, **quiescent transition** uses no-follow `fstatat` through a pinned parent directory (and the equivalent reparse-safe native metadata operation on Windows) to inspect the main name and every existing `-wal`/`-shm` sidecar name, checking type, link count, and identity against every protected production member and companion. This early companion check must not open a sidecar: opening and then closing a production alias could release POSIX locks held by another connection in the same process. A symlink/reparse point, a multiply linked writable sidecar, or any cross-role protected identity found at admission refuses before mutation. The transition selects the guarded VFS; it sets `locking_mode=EXCLUSIVE` **before first WAL access** so SQLite uses an in-memory WAL index and never calls `xShm*`. Its actual main and `-wal` opens are performed by that VFS's attested `xOpen`, with no default-VFS fallback; the pre-open name check is not substituted for proof of the opened handle. A target held by another client returns BUSY promptly; the transition does not wait. After durably checkpointing the WAL, and while its EXCLUSIVE lock remains held, it repeats no-follow metadata checks on any remaining `-shm`/`-wal` names against their earlier attestation and Amendment 9's protected set. Every transition-refusing check—including admission identity, guarded-VFS attestation, EXCLUSIVE ownership, and prompt BUSY detection—must finish before `PRAGMA journal_mode=DELETE`; after that PRAGMA succeeds, while the EXCLUSIVE lock remains held, the transition re-checks any remaining `-wal`/`-shm` names—including a pre-existing `-shm` from the map's WAL past—against their earlier attestation and Amendment 9's protected set, then unlinks only attested target sidecar names through the pinned parent before closing the transition handle and performing post-reopen proof. Any sidecar unlink is confined by pinned-parent identity to a `-wal` or `-shm` name in the target directory. A competing opener planted between checkpoint and cleanup may cause at most such a target-directory name to be unlinked; Amendment 9's protected cross-role collision refusal and the pinned-parent identity bound ensure that no protected production member or companion loses its name or data. A deterministic competing-opener test must assert this bound. A refusal before the PRAGMA reports an incomplete transition with every sidecar still in place. A failure at or after the PRAGMA reports a **PARTIAL** target, never an all-sidecars-intact state: the checkpoint is durable; SQLite may have removed the WAL, and the main may have entered rollback mode. If the PRAGMA succeeds, SQLite's WAL removal and the main's rollback mode are retained even if a later proof fails. After a successful mode switch, it reopens under rollback mode and proves the header/sidecar/zero-`xShm*` invariant before migration or ingest; failure of that post-reopen proof refuses ingest on the partial target. A failed transition leaves the protected production files unchanged and does not expose an unproved target handle. The transition's temporary WAL open is the sole code-map exception to steady-state WAL absence, not an ordinary code-map writer route.
+
+For each governed main, journal, or transition-WAL open, traverse **every** target path component without following a symlink or Windows reparse point. Unix uses descriptor-relative no-follow directory/leaf opens and `fstat` on the exact fd SQLite retains; Windows uses reparse-safe directory-relative native opens and reads type, link count, volume, and file ID from the exact retained HANDLE. Refuse before SQLite reads, writes, maps, truncates, locks, or otherwise uses an unproved handle. At each admission, obtain a **best-effort path-stat snapshot** of Amendment 9's configured production main and event names plus all presently existing `-journal`, `-wal`, and `-shm` companions, using a pinned parent and no-follow metadata reads. A production inode renamed away from every configured path, or swapped after that stat sample while its production handle stays open, can be absent from this snapshot; the tracked opened-handle registry planned in follow-up #3593 is required to close that gap. A role-tagged admission ledger combines those sampled production-path identities with the exact `fstat`/native-handle identities of every handle the guarded VFS itself opens. Reject a target-to-production cross-role identity match regardless of suffix pairing; a second handle to the same code-map target is not itself a production collision. Refresh the path-stat samples on each new open and after a refusal while retaining the guarded-handle identities for their process lifetime. Refuse when a protected member cannot be read safely or changes during admission. Before first main-file use, inspect existing target companions with pinned-parent no-follow metadata, without opening them as a preflight. Production connections opened through the ordinary SQLite VFS do not expose stable native handles to this guard: a production inode moved away from every configured path, or swapped between a production-path stat and its use, can escape the sampled set. This admission is therefore **not** an exact lifetime registry. Follow-up #3593 remains open for exact production-handle coverage. Moving code-map opens into a separate worker process (F5) is the recorded retirement path for both this inexact in-process set and the quarantine below.
+
+If a target path changes from a harmless name at its pre-open check to a protected alias before the guarded `xOpen`, post-open comparison uses the exact retained handle. On a protected-identity match, the VFS refuses before SQLite uses the handle and retains that fd in a bounded, process-lifetime quarantine rather than closing it: closing an aliased fd can release POSIX locks held by a production connection in the same process. This quarantine is solely for the stat-to-open swap; pre-open companion refusals and no-follow open failures do not consume it. At the quarantine cap, every further code-map open fails **before another OS open** with a typed error that names process restart as the remedy. An attacker who repeatedly wins this race can therefore deny code-map availability until restart. Non-adversarial runs must end with quarantine occupancy zero.
+
+An explicit `db` receives **no parent-path canonicalization transform** before the guarded open. Any symlink/reparse component refuses even if a path-level courtesy check would normalize it. Only an omitted-`db` default may canonicalize its configured parent **once** before creating/opening `<path>/.khive/code-map.db`, for platform aliases such as macOS `/var/folders`; native no-follow traversal and retained-handle proof still follow. Controls must fail if the default transform is removed or applied to an explicit `/var/...` path.
+
+Deterministic barriers between the pinned-parent preflight and guarded SQLite open must make a target main or journal swap to a protected hard link, symlink, or reparse point refuse before schema or companion mutation; the transition repeats these arms for existing WAL/SHM sidecars, including a sidecar hard-linked to any protected member. Every identity-swap arm that reaches post-open protected-handle refusal raises quarantine occupancy by exactly one, and a same-process production write after refusal must still succeed, proving its POSIX locks survived. A no-follow symlink/reparse refusal with no opened handle leaves occupancy unchanged; it also must be followed by a successful same-process production write. Run to the cap and prove every further code-map open fails closed with the typed restart remedy. A multiply linked unrelated writable journal/WAL/SHM refuses; an independent byte copy and a dedicated map succeed. Compare protected main/WAL/SHM presence, bytes, size, and modification time across refusals. Exercise all code-pack connection classes on Unix and Windows, protected-set refresh, hot rollback-journal recovery, prior-WAL checkpoint/DELETE transition, native locking, and the zero-`xShm*` trap/absence controls. The entire non-adversarial suite must finish with quarantine occupancy zero; any occupant is a finding. Mutating the code-only rollback choice, removing a pre-open sidecar check, closing a refused aliased handle, or bypassing the cap must make a named arm red. Existing Amendment 8's three concurrent-rebase acceptance arms run under DELETE plus busy timeout; a BUSY outcome is a retry defect to repair, never a reason to restore WAL. The measured same-fixture two-runtime ingest wall times are **WAL: median 190 ms (range 135–333 ms); DELETE: median 242 ms (range 197–632 ms)** on `code-map-a8-32` with 32 commits, across six runs paired within process on the Mac mini under concurrent cargo build load (1-minute load 3.9–5.6).
+
+The three analysis verbs remain unshipped. Their later read-only constructor must use this native guard and never run migration; an old WAL map requires the separate guarded transition before a read-only analysis open. No change to Amendment 9's configured production member definition is made here.
+
+### Proposed clarification: guarded identity lifetime
+
+**Status**: Proposed; pending ratification with Amendment 13. The accepted Amendment 12 wording remains binding until this clarification is ratified. Upon ratification, it replaces exactly this sentence in Amendment 12's admission-ledger paragraph:
+
+> Refresh the path-stat samples on each new open and after a refusal while retaining the guarded-handle identities for their process lifetime.
+
+The proposed replacement sentence is:
+
+> Refresh the path-stat samples on each new open and after a refusal while retaining each guarded-handle identity until its last actual native handle close.
+
+All other accepted Amendment 12 sentences remain unchanged. The proposed lifetime semantics are: A guarded file identity remains in the live, role-tagged set until the **last native handle close**, rather than for the process lifetime. Each admitted descriptor has a lifetime witness; additional descriptors and duplicated native-handle owners count independently or share an explicit reference count. Closing the first descriptor or completing SQLite's logical `xClose` must not retire an identity still retained by a deferred native close or another owner. Once every native owner has closed, the identity leaves the live set before another admission can classify a recreated file under a reused device/inode or platform file ID. A historical identity alone is not evidence that the new file has the historical role.
+
+Protected-alias quarantine entries never leave during the process lifetime, and the quarantine cap and restart remedy remain unchanged. The configured-production path-stat snapshot is refreshed with the same checks as before. This clarification neither implements nor narrows the exact production-handle registry gap tracked by #3593: a production file moved away from all configured names, or swapped after the path-stat sample while its production handle remains open, can still escape the sampled set.
+
+Acceptance must cover multiple admitted descriptors, duplicated owners and deferred native closes. A remaining native owner must keep its identity live after another owner's logical or native close. After the last native close, recreating a file with a reused identity and a different role must succeed without a stale-role refusal; the existing protected-identity swap refusal must still fail when that protection is removed. Quarantine entries must remain live. This lifetime correction and Amendment 13 must be evaluated in the same document revision.
+
+## Amendment 13 (2026-09-30): native routing for in-process code-map clients
+
+**Status: Proposed; architecture fork unchosen; pending ratification.**
+
+**Amends:** Amendment 12's connection coverage and lock-ownership boundary. **Retains:** its native opened-handle proof, complete configured production deny set, rollback DELETE posture, guarded prior-WAL transition, read-only/no-migration requirements and protected-alias quarantine. The Proposed lifetime clarification above is part of this decision. The configured-production path-stat snapshot and exact production-handle registry gap in #3593 are unchanged. Worker-process isolation, moving code-map work to a separate worker process, remains the recorded retirement path for the inexact in-process set and quarantine; this amendment does not implement that worker. The historical `(F5)` parenthetical retained in Amendment 12 names that retirement path, not a section in Amendment 5 or ADR-135.
+
+### Lock interference and proposed ownership boundary
+
+POSIX record locks belong to a process, not to the descriptor or SQLite connection that acquired them. Closing **any descriptor** for that file can remove that process's locks. A process-owned whole-file `F_UNLCK` can remove another client's locks without a close, and a same-process `F_RDLCK` over a previously write-locked range can replace its lock type. SQLite's default Unix VFS calls `posixUnlock` from `unixUnlock`; when its last shared holder releases, it issues `F_UNLCK` with `l_start = l_len = 0`. A separate native lock table cannot see that default-VFS owner's bookkeeping. These hazards apply on **every Unix host gate, including Linux and macOS**, in both directions between guarded and ordinary clients.
+
+For an in-process design, the proposed boundary is **one native VFS per code-map inode per process**: every in-process open of a governed main or companion file, including same-inode aliases, must route through that owner or return a typed routing refusal before an ordinary/default OS open. A raw-file helper must obtain its proved descriptor and lock/close lifecycle through the same ownership boundary; routing only a later SQLite connection leaves its earlier raw open uncovered. The refusal names the target path and opening path class and preserves that operation's contract; an unrelated blanket refusal is not evidence of safe routing. The rule covers initial and later connections and independently constructed runtimes. It is not currently enforced, and the architecture needed to enforce it remains a decision below.
+
+Ordinary databases retain their VFS and operational behavior. A code-map route must not transfer canonical main/core attachment or GC-liveness authority to a secondary backend. Successfully proved handles must not become process-lifetime quarantine entries to avoid designing their close lifecycle. Amendment 12 confines quarantine to protected-alias stat-to-open races and requires zero occupancy after non-adversarial runs.
+
+A shim sharing SQLite's default Unix VFS inode and deferred-close bookkeeping may address interference between its SQLite clients, but that bookkeeping does not attest the exact retained native handle required by Amendment 12, and it does not cover independent raw descriptors. Such a design requires a new opened-handle proof and the full acceptance population below; a delegating wrapper or reusable-fd lookup alone is insufficient.
+
+### Census and required dispositions
+
+The opening census and executable acceptance population must be the **same population**. The five core classes are **ordinary pool/runtime construction**, **schema/snapshot inspection**, **embedding-model reads**, **showcase map reads**, and **writer attachment**; the first five table rows mark them explicitly. They and the additional known paths below are minimum obligations, not a closed list. The baseline operations below exist at this amendment's landing base; operations introduced only by PR #3674 are labeled separately. Each entry denotes the actual API or helper and all its relevant callers; main files, companions, initial/later opens and same-inode aliases remain included. A source argument that a path usually reaches a different inode, is exported without current callers, or cannot read SQLite-formatted contents does not remove its open/close from acceptance.
+
+| Opening path class and actual operation                                                                                                                                                                                                                                                                                                                                | Required disposition for a governed file or alias                                                                                                                                                                                                                                                                                                                                                      |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Core — `pool_runtime`**: ordinary `ConnectionPool` and `StorageBackend`/`KhiveRuntime` construction; baseline `khive-db/src/pool.rs::open_standalone_writer_untracked`, `open_standalone_reader`, `open_writer_connection`, the free `open_reader_connection`, and raw `sqlite_header_uses_wal`. PR #3674 introduces the native-aware `open_file_connection` funnel. | Route an authorized map operation through the native constructor, or refuse the ordinary constructor before opening. Include the raw header read as well as initial writers/readers, replacement readers, standalone transactions, writer tasks, checkpoint and diagnostics connections. The baseline ordinary pool/runtime class already exists; its native-aware funnel is introduced only by #3674. |
+| **Core — `schema_snapshot`**: `migrations::inspect_schema_version`, `inspect_schema_is_current` and `pool::open_read_only_snapshot_connection`, including `sqlite_header_uses_wal`                                                                                                                                                                                     | Provide an attested native read-only route for both the SQLite connection and raw header helper, or refuse. Preserve snapshot semantics; inspection cannot migrate or silently perform a prior-WAL transition. Include CLI schema and blob preflight callers.                                                                                                                                          |
+| **Core — `embedding_models`**: `migrations::query_embedding_models`                                                                                                                                                                                                                                                                                                    | Route the exported read through the native read-only owner, or refuse its map target. A missing current production caller does not establish that this API is unreachable.                                                                                                                                                                                                                             |
+| **Core — `showcase_read_map`**: `khive-repo-showcase/src/read.rs::read_map` through `open_read_only`                                                                                                                                                                                                                                                                   | Use an attested native read-only map reader, or refuse. Include export and build callers; a prior-WAL map needs a separate authorized transition. History-store reads retain their ordinary role.                                                                                                                                                                                                      |
+| **Core — `writer_attach`**: writable SQL `ATTACH` through `SqlWriter::execute`, scripts and exposed raw/legacy writer connections                                                                                                                                                                                                                                      | Support native attachment with the same identity, protected-set and lock/close guarantees, or refuse before SQLite opens the attachment. Existing pooled-reader `ATTACH` refusal remains. SQL execution can reach attachment even without a literal production `ATTACH DATABASE` string.                                                                                                               |
+| `replacement_verify`: `khive-vcs/src/sync.rs::verify_replaced_db`, reached from `run_sync` and the CLI sync command                                                                                                                                                                                                                                                    | Route or refuse the actual verification connection. The usual replacement of the database with a newly built inode is source context, not an executed exclusion of a live governed identity or alias.                                                                                                                                                                                                  |
+| `snapshot_copy`: `kkernel/src/code_ingest.rs::open_read_only_snapshot`, used by findings dry-run and entity-type backfill                                                                                                                                                                                                                                              | Route or refuse the original main/WAL/SHM copy opens and closes, as well as subsequent snapshot inspection. Opening only the scratch database through a safe constructor does not cover the source descriptor.                                                                                                                                                                                         |
+| `exec_binary_hash`: `khive-pack-exec/src/handlers.rs::hash_tool_binary`                                                                                                                                                                                                                                                                                                | Route its registered-tool path read through the ownership boundary, refuse a governed identity before ordinary open, or move that operation to a worker. No-follow/type checks alone do not exclude a regular-file hard-link alias. Execute the real registration/hash path to establish its reachability or refusal.                                                                                  |
+| `code_source`: `khive-pack-code/src/safe_source.rs::open_contained_file` and `read_contained_to_string`, called by manifest and source ingestion                                                                                                                                                                                                                       | Route, refuse or isolate source reads that reach a governed identity. Containment and extension filters are not an identity-based lock boundary; use the actual walker/manifest paths with eligible aliases.                                                                                                                                                                                           |
+| Other raw-file operations, including knowledge import/query-set reads and git cache helpers                                                                                                                                                                                                                                                                            | Complete classification and use the selected architecture's route, pre-open refusal or worker disposition. `knowledge/sections.rs::open_import_file_handle`, `knowledge/eval.rs` query-set reads, and git cache staging locks/native directory helpers are known candidates. Directory-only opens and parser rejection require demonstrated dispositions; they are not silently omitted.               |
+
+The implementation review must repeat a whole-tree census of SQLite constructors, writable attachment capabilities, backup/export mechanisms, SQLite CLI/FFI entry points and raw filesystem/native opens. Include a known-positive native-open control in the same search pass, retain match counts and manual production/test classifications, and report residual packs and indirect/imported/macro-generated openers. A zero grep count is not a caller or alias proof. Workspace, git and knowledge must be explicitly accounted for; a partially inspected pack remains residual. An unclassified opener must fail the selected mechanical gate or be confined to the worker boundary. Until that condition is demonstrated, the claim remains limited to the named, executed paths and does not establish arbitrary in-process safety.
+
+### Admission mechanisms still to decide
+
+A first guarded admission must account for an ordinary handle already live on the same native identity. One candidate is enumeration of the process's own descriptors and `fstat`/native identity checks, such as Linux `/proc/self/fd` or macOS descriptor information, combined with a gate serializing **all relevant opens and closes** against admission. Enumeration alone is not atomic, pathname-only registries miss aliases, and an opaque existing descriptor cannot be retroactively relabeled as a proved native owner. If compatible ownership cannot be established, activation must refuse before the new guarded open or use the worker boundary.
+
+Ordinary openers also have a stat-to-open race. An in-process candidate must demonstrate a mechanically enforced admission gate plus retained-native-handle identity proof covering every classified opener and its first use. It must handle substitutions without opening and then closing an incompatible governed alias: that close may already destroy another client's locks. Amendment 12's protected-alias quarantine is not permission to retain every ordinary or successful descriptor. Descriptor enumeration, a proposed gate and a pre-open path check are **unimplemented alternatives**, not claims that this race is closed. If the full process cannot be controlled, worker-process isolation is the alternative.
+
+### Architecture fork and costs
+
+The architecture is **unchosen**. The decision follows the routing-free lock-mechanism evidence and must state the actual scope of its guarantee:
+
+0. **Withdraw the in-process native VFS.** Close PR #3674 without merging and keep Amendment 11's shipped fence as the contract. Amendment 12's opened-handle proof stays specified and unimplemented. The cost is that the gaps Amendment 12 was written to close stay open and must be stated where Amendment 11 states what ships; no guarded client exists, so the guarded-versus-ordinary lock interference described above does not arise, while the pre-existing raw-descriptor hazards on a production identity are unchanged. This option needs no routing, admission gate or worker.
+1. **A narrowed in-process boundary plus worker-process isolation for residual raw readers.** Route or refuse SQLite connections and the named raw helpers; move all remaining operations that could open the governed inode into a separate worker. The cost is a maintained caller inventory and cross-process interfaces for residual operations. If a remaining opener can still run beside a guarded handle, the narrowed boundary does not protect that coexistence and cannot support a whole-process guarantee.
+2. **An in-process boundary with a mechanical opener gate.** For example, disallow the rusqlite constructor family and raw/native opener APIs outside reviewed, class-tagged admission wrappers. The gate must cover imported aliases, dependencies, indirect calls and new opening paths, with controls proving a newly added unclassified opener fails. A clippy `disallowed-methods` list is only an untested candidate, not an implemented boundary. The cost is broad wrapper/interface changes, complete lifecycle coordination and maintaining enforcement across platforms; a gate covering SQLite alone leaves raw closes outside the claim.
+3. **Worker-process isolation as the lock-isolation fix.** Keep code-map descriptors and their lock manager in a dedicated process, so unrelated parent-process opens/unlocks/closes do not share its process-owned locks. The cost is worker lifecycle, IPC, operation/snapshot transfer and failure handling. Every operation that needs a map descriptor must remain inside that boundary. Worker isolation does not remove Amendment 9's protected-file objective or the exact production-handle registry gap by assertion.
+
+No building option can claim closure from green probes of only the five core classes. A proposed OFD primitive must pass reverse-direction controls too: even where its locks survive an unrelated close, closing its descriptor can still erase a same-process ordinary client's classic POSIX locks. Deferring descriptor close is likewise insufficient against whole-file unlock or lock-type replacement.
+
+### Executable acceptance and sequencing
+
+First, a **routing-free lock-mechanism probe** using the pinned bundled SQLite and process-owned `fcntl` locks must reproduce three losses: a second descriptor's close, a default-VFS last-shared whole-file unlock, and a default reader's lock-type downgrade. Each uses one lock per fixture, independent-process `F_GETLK` before and after, and the same fixture without the second client as a lock-survival control. Run on macOS and Linux with fixture files on each test environment's own filesystem. These controls establish the hazard, not a routing implementation or a closed census.
+
+Then review this text and choose the staged architecture decision above. Only after that design decision may a candidate implement its routing, admission and interfaces. **PR #3674's Amendment 12 native-VFS implementation is held and may not merge until this amendment's final acceptance and ratification, below.** The hold is a merge-sequencing statement about that pull request and applies from the time this text lands, whatever the Proposed status of this amendment. The reason is a property of the code, so a decision on paper does not remove it: at the examined #3674 revision, `code.ingest` directly constructs the native code-map runtime; there is no default-OFF rollout switch protecting that route. The ordinary pool's default `code_map_vfs = None` does not disable native-VFS activation in the dedicated code-map constructor. The hold releases only when the executed acceptance of this amendment has passed for the full census population under the selected architecture, the `code.ingest` native constructor included, and the amendment is ratified on that executed evidence; a status change without that executed evidence does not release the hold. No default-OFF merge exception is established here.
+
+Final ratification requires executed evidence for the resulting full population and the lifetime clarification in the same document revision. Production implementation, including PR #3674, remains held under the release condition stated above; a text decision or authored control is not executable lock evidence. This sequencing chooses the design-decision-before-candidate order, **not** one of the architecture options.
+
+For every census entry, invoke its **actual opening path** with direct names and same-inode aliases, all represented initial/later connection classes and a pre-existing ordinary peer. The arm must demonstrate compatible routed ownership, a typed class-specific refusal before an ordinary OS open, or the selected worker disposition. A substituted `File::open`, mock, unselected test, compile failure or narrative about normal inputs cannot prove the caller's behavior. An unreachable claim requires the same executed caller probe, showing no incompatible OS open and unchanged lock state; parser rejection after an open is not pre-open refusal.
+
+Every Unix host gate must include **both directions** for close, whole-file unlock and lock-type replacement. Establish a guarded RESERVED or EXCLUSIVE lock and observe it independently before a default/raw client opens, during its operation, after a completed read transaction and after its close. Observe transaction unlock separately from final descriptor close. Reverse the roles: establish an ordinary/default client's classic lock and prove guarded unlock, downgrade and close cannot erase or weaken it. Use one lock per observation fixture so an observer reporting only the first conflict cannot hide another result. On incompatible-client refusal/isolation arms, prove that actual disposition and retained owner lock; on routed arms, prove the remaining compatible owner's required lock survives. A same-process `F_GETLK` does not report its own process-owned lock as a conflict, and a local lock table is not kernel-lock evidence. The original/unrouted control must reproduce the relevant loss; removing the route, refusal, gate or worker boundary must make the corresponding named runtime arm fail.
+
+Acceptance must also make a newly introduced unclassified SQLite **and raw** opener fail the chosen enforcement boundary. This tests census closure rather than only the paths already listed. If the narrowed option is chosen, the residual worker placement and inability to run those operations beside the in-process guarded owner require executed controls. Concurrent admissions and deterministic barriers around ordinary preflight/open must cover identity substitution and pre-existing peers; a scan without a concurrent-opener arm cannot prove serialization.
+
+Unix and Windows gates retain Amendment 12's native identity/alias refusal, protected-file presence/bytes/size/mtime, prior-WAL transition, hot-journal recovery, DELETE rebase concurrency, retained-owner lifetime and zero-`xShm*` controls. Non-adversarial quarantine occupancy remains zero. Record the exact source revision, named commands and selected tests, OS/filesystem and actual caller/open/unlock/close events, together with independent before/after lock observations. None of the mechanisms, routes, admission alternatives or acceptance obligations here is asserted to have passed merely because this text or its census exists.
+
+## Amendment 14 (2026-10-02): sequential recovery of interrupted L2 sweeps
+
+**Status: Accepted; ratified by the maintainer, 2026-10-03.**
+
+**Amends:** Amendment 2 B5's L2 freshness protocol. **Retains:** deterministic
+project/module/symbol ownership, observed `last_seen_at` and per-project/language
+`sweep_clock`, historical and manually authored edges, the existing secret gate,
+and the existing L1/L1.5 clock behavior. This amendment does not change Amendment
+12, Amendment 13 or their implementation and ratification holds. It specifies
+new project properties and recovery behavior; it does not assert an implemented
+or verified recovery path.
+
+### Interrupted runs and the sequential guarantee
+
+The current project clock advances before file and edge work. A failed or
+cancelled L2 invocation can therefore retain a committed prefix: some natural
+edges carry an earlier sweep stamp, while others already carry the failed
+invocation's stamp. A subsequent unchanged-file fast path that refreshes only an
+exact predecessor stamp cannot recover both populations. Recording only a
+completed timestamp is also insufficient once a failed invocation has committed
+some edge refreshes. Widening refresh to older timestamps would promote retained
+removed references and is not the recovery rule.
+
+Recovery is guaranteed for **sequential invocations** of one
+`(source_project, language)` owner. Attempt and completion identities are not
+leases, fences or a serialization mechanism. This amendment establishes no
+correctness guarantee for overlapping writers of that owner, including writers
+using separate runtimes or processes. Existing per-row compare-and-set/rebase
+behavior remains; no clock maximum, stale-lease stealing, process-local mutex or
+new serialization is introduced. A caller-supplied sweep time may repeat or move
+backward and must not serve as invocation identity or invocation order.
+
+### Versioned durable owner state
+
+The project entity retains `properties.sweep_clock` and gains
+`properties.l2_sweep_runs`, an object keyed by the same language used for that
+owner's sweep clock. Each participating owner's language entry has this shape:
+
+```json
+{
+  "version": 1,
+  "attempted": {
+    "run_id": "b024eb06-bd98-44c5-8542-74b49df6e528",
+    "sweep_time": "2026-10-02T04:00:00+00:00"
+  },
+  "completed": {
+    "run_id": "b024eb06-bd98-44c5-8542-74b49df6e528",
+    "sweep_time": "2026-10-02T04:00:00+00:00"
+  }
+}
+```
+
+The example is a completed invocation, not a shared identity. `run_id` is a
+fresh, unpredictable UUID v4, stored in canonical lowercase dashed spelling.
+One invocation retains the same identity for every write of a given owner;
+repeated upserts of that owner do not create new attempts. `sweep_time` is the
+exact string emitted by that invocation's existing sweep-time serialization. It
+is compared as opaque text, not normalized or ordered. The new reader does not
+add RFC3339 validation to legacy sweep clocks or edge metadata.
+
+`version` must be the JSON integer `1`. `attempted` must be an object containing
+exactly the string fields `run_id` and `sweep_time`. `completed` is either `null`
+or an object with those same two fields. The owner entry has exactly the three
+fields shown. Unknown versions, unknown owner-entry fields, missing fields,
+wrong types or noncanonical/non-v4 run IDs provide **no reuse authority**. A
+missing or malformed `l2_sweep_runs` object or target-language entry likewise
+requires recovery. An incomplete attempt is valid stored state, but is not a
+completed predecessor. These checks govern the new markers only; they do not
+introduce stricter legacy project-kind, language, namespace or timestamp
+predicates.
+
+A predecessor authorizes the unchanged-file fast path only when its new entry
+is valid, both markers are non-null, their run IDs and sweep-time strings are
+identical, and the retained `sweep_clock[language]` is exactly that completed
+sweep-time string. Capture that authority once, before any selected-L2 path
+advances the owner's visible clock, including an earlier selected L1 or L1.5
+upsert. A later L1-only invocation may advance the visible clock without changing
+L2 markers; the resulting mismatch requires real L2 recovery on the next L2
+invocation. No-L2 invocations create neither new L2 attempts nor completions.
+
+The current attempt is written in the existing `upsert_project` mutation that
+advances the visible clock; it adds no separate attempt mutation. Preserve a
+valid predecessor's completed marker while replacing its attempted marker.
+When the target marker is absent or malformed, initialize a valid current
+attempt with `completed: null`; never reinterpret malformed data as a completed
+predecessor. Merge against fresh project state, preserving unrelated properties
+and other languages' entries. A project write refused by the existing gate
+remains refused; the marker does not provide alternate write authority.
+
+### Re-observation and historical-edge eligibility
+
+Without a fully completed predecessor, every encountered file of that owner
+must follow the real source read, parse, persistence and re-resolution path,
+even when its content hash, scanner identity and declaration ownership match.
+Select recovery before the unchanged-file decision and `preserve_l2_state`.
+Existing failures or refusals may still skip a file; recovery does not replace a
+read/parse/gate refusal with a refresh. Successful empty declaration sets remain
+observed coverage.
+
+Recovery republishes only references actually observed through the existing
+scanner and resolution rules. It does not make every failed-run stamp eligible,
+revive removed references, refresh manual edges, delete historical rows or
+change owner/endpoint authority. On a fully completed predecessor, retain the
+unchanged-file fast path and the existing exact predecessor-stamp guard for
+natural `depends_on` and `implements` refresh. The inbound `contains` refresh
+retains its existing owner/derived predicates; this amendment does not claim it
+has the same predecessor-stamp predicate as the natural-edge refresh.
+
+The existing `sweep_clock` and `last_seen_at` keep B5's meaning: they record the
+latest invocation time and actual entity observation, respectively. The new
+completion marker supplies L2 reuse authority, rather than replacing visible
+clocks with a completed-only clock. Owners and languages are independent. No
+selected L2 work means no L2 completion state. Reuse authority is owner-wide, so
+only an invocation that covered the whole owner may grant it: an invocation
+whose ingest `path` lies strictly inside an owner's project root (the directory
+of that owner's manifest, compared after the canonicalization ingest already
+applies) writes that owner's attempted marker like any L2 invocation and never
+its completed marker. The next invocation that covers the whole owner therefore
+finds no completed predecessor and recovers, instead of fast-pathing unchanged
+files outside the earlier subtree whose edges carry older stamps.
+
+### Graph completion, skips and accounting
+
+For each participating owner whose project root lies inside this invocation's
+ingest `path`, write its completed marker only after this invocation's file
+work, pending-write flush, synchronous re-resolution, natural unchanged-edge
+refresh and inbound containment refresh have all finished. The
+completed marker carries this invocation's own run ID and exact sweep-time
+string. When the fresh project state's attempted marker for that owner does not
+carry this invocation's run ID, the invocation writes no completed marker, and
+the entry stays without reuse authority. This is one additional guarded project
+mutation after graph work, merged with fresh properties and other languages'
+state. It is not a request-wide
+transaction: prior graph/entity/FTS writes remain committed when a later
+operation fails or the future is cancelled.
+
+Completion means **graph completion of this invocation's observed coverage**.
+It does not mean every source file was successfully read or parsed, every gate
+accepted, or the response was delivered. Read/parse/gate-skipped files' historical
+edges are never promoted. Their existing stale-edge strand after an otherwise
+completed invocation remains a known limitation outside this amendment. Missing
+files, removed references and unvisited subtree members remain historical.
+
+An owner whose manifests sit under more than one project root is outside the
+whole-owner guarantee. An invocation whose `path` covers only one of those roots
+can write that owner's completed marker, and the next whole-owner invocation then
+takes the unchanged fast path for the other root's files, whose edges keep their
+older stamp until a file under that root changes. This is a known limitation,
+tracked as #3752.
+
+The entity compare-and-set can commit the completed marker before its following
+FTS document write fails. In that case the invocation returns its existing
+error while graph completion remains durable. A crash after the completion row
+commit and before response acknowledgement has the same durable interpretation.
+This does not promise FTS convergence or a successful response, and must not be
+reported as a rollback of the completed row. Failure before completion leaves
+an incomplete attempt and requires real re-observation on the next sequential
+invocation.
+
+Public report fields retain their meanings. The attempted marker shares the
+existing project mutation and adds no separate project/FTS accounting. A
+successful completion update adds one to `projects_updated`; its successful FTS
+write adds one to `fts_indexed`. Existing entity revision/version history also
+advances for that additional mutation. No new report field is introduced, and
+an invocation returning an error does not acquire a successful report merely
+because its completed row is durable. The dependent change must disclose these
+counter and mutation changes, the sequential-only guarantee, the durable
+completion/FTS-error boundary and the remaining skipped-file strand.
+
+### Acceptance and sequencing
+
+Before dependent recovery code merges, review and ratify this final amendment
+through the existing ADR process. Landing Proposed text alone does not adopt it
+or release its dependent code. The code change must follow the already frozen
+L2 batching change (#3715), preserve its pending-write ordering and failure
+behavior, and use a separate private recovery fixture. This amendment neither
+ratifies Amendment 13 nor releases that amendment's native-routing hold.
+
+Acceptance must use real file-backed runtimes and actual committed storage
+failures. Cover WAL and rollback DELETE for the sequential recovery mechanism;
+the WAL fixture does not change the dedicated code-map target's governed journal
+posture. Retain an original-source baseline and independently applicable removal
+controls. A timeout, compile failure, zero selected tests or an authored fixture
+is not an executed proof.
+
+- Reproduce an interrupted early file/persistence run and a partial final refresh
+  that leaves both old and failed-run edge stamps. After removing the actual
+  SQLite fault, unchanged disk must trigger real parsing and republish every
+  still-observed reference. Removed, manual, foreign-owner and unvisited edges
+  must retain their historical state. Removing forced reparse must fail the
+  mixed-stamp witness.
+- Fail after changed-file or re-resolution work has committed, and cancel after
+  a real committed edge update. Reopen an independent runtime before recovery;
+  observe the committed prefix rather than simulate an error before the write.
+  An attempt marker moved after destructive work must fail the corresponding
+  recovery control.
+- Complete a whole-owner invocation, then complete an invocation whose `path` is a
+  subdirectory of that owner, then change nothing and run a whole-owner
+  invocation again. The subtree invocation must leave no completed marker, and
+  the final invocation must parse for real every file outside the subtree.
+  Letting the subtree invocation write its completed marker must fail this arm.
+- Exercise missing, malformed, unknown-version, incomplete and clock-mismatched
+  new marker entries. Such entries must force real parsing without broadening
+  legacy predicates. Repeat and reverse sweep times with distinct run IDs; a
+  timestamp-equality completion control must fail. Replace the attempted marker
+  with a different valid run ID after this invocation's attempt and before its
+  completion: no completed marker is written and the next invocation parses for
+  real. A completion that copies the stored attempt must fail this arm.
+- Inject a real fault on the completion row, then a separate real fault on its
+  post-row FTS write. Assert incomplete recovery in the first case and durable
+  graph completion plus the returned FTS error in the second. Completing before
+  either refresh phase or pending flush must fail a named witness.
+- Observe successful recovery followed by unchanged fast-path reuse, independent
+  project/language state, no-L2 calls, successful empty files and skipped files.
+  Assert the extra successful completion mutation and report accounting. A
+  skipped-file fixture must retain, rather than conceal, the known stale-edge
+  limitation.
+
+Ratification releases the dependent recovery change (#3736) to its normal
+review. No implementation or native acceptance is asserted by this amendment.
+
+## Amendment 15 (2026-10-03): fallback owners neither grant nor use L2 reuse authority
+
+**Status: Accepted; ratified by the maintainer, 2026-10-03.**
+
+**Clarifies:** Amendment 14's whole-owner rule. **Retains:** Amendment 10's read
+boundary, project/module/symbol identities, the Amendment 14 marker shape and
+every other Amendment 14 rule. No project property is added.
+
+### The gap
+
+Amendment 14 lets an invocation write an owner's completed marker only when that
+owner's project root, the directory of its manifest, lies inside the
+invocation's ingest `path`. When no governing manifest is found inside the
+ingest root, source ingest assigns the files to an owner named after the ingest
+root's basename and uses the ingest root itself as the project root. That
+fallback root always lies inside the invocation's `path`, so the whole-owner
+test cannot fail for it, and a subtree invocation can reach the same owner as a
+whole-owner invocation.
+
+A witness with a single manifest:
+
+```text
+/repo/Cargo.toml     [package] name = "src"
+/repo/src/alpha.rs
+/repo/other.rs
+```
+
+A whole `/repo` invocation assigns both files to owner `src` with project root
+`/repo`. An invocation whose `path` is `/repo/src` cannot read
+`/repo/Cargo.toml`, because Amendment 10 confines manifest reads to the ingest
+root. It falls back to the basename `src` and reaches the same project identity,
+and the Rust leading-`src/` rule gives `alpha.rs` the same module path under
+both invocations. Its fallback root equals its own `path`, so under Amendment 14
+alone it would write a completed marker, and the next whole invocation would
+take the unchanged-file fast path for `other.rs` while that file's edges carry
+older stamps. There is one manifest here, so the multiple-root limitation
+(#3752) does not cover this case.
+
+### Decision
+
+An owner obtained through the basename fallback has no project root in
+Amendment 14's sense, so no invocation covers it whole. Three rules follow.
+
+1. **No grant.** An invocation writes a fallback owner's attempted marker as
+   Amendment 14 requires and never its completed marker.
+2. **No use.** An invocation that reaches an owner through the fallback
+   captures no reuse authority for that owner, whatever its stored markers say,
+   and re-observes every encountered file of that owner. A completed marker
+   written by an earlier manifest-governed invocation does not cover files that
+   this invocation reaches without that manifest.
+3. **Whole invocation.** If any file of an owner is reached through the
+   fallback in an invocation, that owner is a fallback owner for the whole
+   invocation: rules 1 and 2 apply to all of its files in that invocation,
+   including files that the same invocation resolves through a manifest.
+
+The fallback is recorded when the governing-manifest lookup returns no
+manifest, and is carried for the rest of that invocation. It is not
+inferred afterwards by comparing the project root with the ingest root: for a
+fallback owner the two are equal by construction, so that comparison cannot
+separate a whole invocation from a subtree one. Owners resolved through a
+manifest keep Amendment 14's rule unchanged.
+
+In the witness above, the subtree invocation replaces the owner's attempted
+marker with its own run ID and leaves the earlier completed marker in place.
+The two run IDs then differ, so the next whole invocation finds no completed
+predecessor and re-observes every file.
+
+Rule 2 closes the same collision in the other direction. With a manifest at
+`/repo/src/sub/Cargo.toml` declaring package `src` and a loose file
+`/repo/src/x.rs`, an invocation whose `path` is `/repo/src/sub` reaches owner
+`src` through the manifest, covers its project root and completes. A later
+invocation whose `path` is `/repo/src` reaches the same owner through the
+fallback for `x.rs`. Without rule 2 it would capture the earlier completion as
+reuse authority and take the unchanged-file fast path for `x.rs`, whose edges
+carry stamps older than that completion.
+
+The cost is stated rather than hidden. An owner reached through the fallback
+never has usable reuse authority, so every L2 invocation for it re-observes every
+encountered file through the real read, parse and re-resolution path; such
+owners lose the unchanged-file fast path. Durable owner-root provenance, which
+could restore that fast path, is not specified here. It would be a separate
+amendment, proposed only with a measured cost.
+
+### Acceptance
+
+These arms join Amendment 14's acceptance under the same executed-evidence
+rules.
+
+- Run the single-manifest witness: a whole invocation, a subtree invocation,
+  then an unchanged whole invocation. The subtree invocation leaves no completed
+  marker that matches its attempt, and the final invocation parses every file
+  outside the subtree for real. Removing the fallback rule must fail this arm.
+- A manifest-governed whole invocation followed by an unchanged whole invocation
+  still writes its completed marker and takes the unchanged-file fast path.
+- A manifestless whole invocation followed by an unchanged whole invocation
+  parses for real both times, asserting the stated cost.
+- A manifest-governed subtree invocation completes, then an unchanged
+  invocation that reaches the same owner through the fallback parses the
+  fallback files for real. Removing rule 2 must fail this arm.
+
+The multiple-root limitation (#3752) remains outside the whole-owner guarantee.
+Ratifying this amendment, with Amendment 14, releases the dependent recovery
+change (#3736) to its normal review. No implementation or native acceptance is
+asserted by this amendment.
+
+## Amendment 16 (2026-10-03): retained declaration and edge observations gate L2 reuse
+
+**Status: Proposed.**
+
+This amendment addresses the remaining manifest-governed case of #3752.
+
+**Amends:** Amendment 14's unchanged-file reuse prerequisite and its deferred
+multiple-root and restored-file strands; Amendment 15's retained multiple-root
+exclusion and its unconditional whole-invocation fast-path acceptance. **Retains:**
+B5 observation semantics, deterministic owner/module/symbol
+identities, marker shape, opaque time comparison, sequential-only recovery,
+fallback refusal of reuse authority, pending-write ordering, the existing secret
+gate and every other rule of Amendments 14 and 15. No stored root provenance,
+property, schema, lease, serialization or clock ordering is introduced.
+
+### Superseded deferrals and acceptance
+
+The following accepted text remains recorded above. This amendment replaces the
+listed deferrals, narrows Amendment 14's completed-predecessor fast path with the
+declaration and edge prerequisite, and replaces the quoted Amendment 15 acceptance
+below:
+
+- Amendment 14: “Their existing stale-edge strand after an otherwise completed
+  invocation remains a known limitation outside this amendment.” A restored file
+  whose retained declaration observations fail the new prerequisite must now
+  re-observe its actual source.
+- Amendment 14's multiple-root paragraph: “This is a known limitation, tracked as
+  #3752.” Manifest-governed roots sharing an owner now obey the same per-file
+  observation prerequisite; completion still describes the invocation's observed
+  coverage and grants no observation of an unvisited root.
+- Amendment 14's acceptance: “A skipped-file fixture must retain, rather than
+  conceal, the known stale-edge limitation.” Retain the actual read refusal and
+  durable completion assertions, then prove real re-observation of a restored
+  file when the prerequisite fails instead of retaining the final stale strand.
+- Amendment 15: “The multiple-root limitation (#3752) remains outside the
+  whole-owner guarantee.” The prerequisite now governs that remaining case.
+
+Amendment 15 also contains this acceptance requirement:
+
+```text
+- A manifest-governed whole invocation followed by an unchanged whole invocation
+  still writes its completed marker and takes the unchanged-file fast path.
+```
+
+Replace that acceptance with: A manifest-governed whole invocation followed by an
+unchanged whole invocation still writes its completed marker. Each unchanged file
+takes the unchanged-file fast path only when its retained declaration and outgoing
+derived-edge observations satisfy this amendment's prerequisites; otherwise it
+re-observes actual source through the existing read, parse and re-resolution path.
+
+### Decision and current-coverage proof
+
+An unchanged file may refresh retained declarations only when every retained row
+has a canonical code declaration kind, belongs to the file's existing owner and
+language, and carries `last_seen_at` exactly equal to that owner/language's
+captured completed predecessor stamp. Check all retained rows before refreshing
+any of them. Also require every live outgoing `depends_on` or `implements` edge
+from those retained IDs with `l2_derived: true` to carry that exact predecessor
+observation. This includes an edge whose target was not visited by another root:
+partially shared declaration identities alone cannot prove prior edge coverage.
+Other relations, soft-deleted edges and edges without boolean `l2_derived: true`
+do not block reuse. A caller-authored edge marked derived follows that same rule;
+an ordinary manual edge does not. No target history is made current by the audit.
+Compare the existing serialized observations as opaque text; do not
+parse, normalize or order timestamps. Recheck declaration kind, owner/language and
+observation against the fresh row inside each guarded declaration mutation. After
+those mutations, repeat the live edge audit with fresh graph reads before
+returning reusable authority. These are separate observations, not a transaction
+across entity and edge rows or a guarantee against concurrent owner writers.
+A missing declaration or audited edge, invalid predicate or refused refresh
+selects the existing actual source
+parse/persist/re-resolution path for that file. A storage error retains its
+existing error and committed-prefix behavior.
+
+Successful reuse stamps every retained declaration with this invocation's
+observation before marking its declarations current and unchanged. Successful
+parse stamps each allowed observed declaration and records only those retained
+declaration IDs before marking them current. Thus, after one completed invocation,
+every retained declaration marked current for its owner/language has this
+invocation's stamp, including declarations of reused files. No second repair
+ingest is required to establish that coverage. This remains a sequential
+guarantee, not authority over overlapping writers.
+
+Filtered, missing, outside-root, unreadable and parse-refused files supply no
+current declarations. Their unobserved history remains historical; a later
+encounter retries ordinary read/parse checks, and a successful read follows the
+new prerequisite or existing missing-coverage reparse rule. A persistent refusal
+never becomes observation. Gate-refused declarations and descendants of a
+gate-refused inline module remain outside retained current coverage. When a
+successful parse records only an allowed subset, an unchanged later invocation
+can reuse that subset; clearing the gate refusal alone does not force discovery
+of an excluded declaration. A subsequent real parse retries it under existing
+gate rules. Gate-refused scaffolding or ownership writes can leave unusable
+coverage and force repeated parsing on later invocations. Another unvisited root
+does not gain current declarations; its next successful encounter must satisfy
+the prerequisite or reparse. Files with successful empty declaration sets remain
+valid observed empty coverage.
+
+Natural unchanged-edge refresh keeps **both** existing exact predecessor-stamp
+checks, the `l2_derived` checks and current same-owner endpoint authority. A
+reparsed file republishes only references the scanner actually observes and
+resolves. Removed references, unobserved deleted rows and manually authored edges
+remain historical. Inbound `contains` refresh retains its existing predicates.
+No historical timestamp range is made eligible.
+
+### Cost and boundaries
+
+Reuse checking applies to every unchanged project file encountered by the
+invocation, so refresh work scales with all those files. Successful reuse of a
+nonempty retained declaration set performs two outgoing-edge audits, before and
+after the guarded declaration writes. Each audit calls `GraphStore::batch_neighbors`
+and `GraphStore::get_edges`: four graph capability calls in total. Physical SQLite
+SELECT counts depend on the declaration and edge-hydration chunks; an audit with no
+matching outgoing edges has no edge-hydration SELECT. Empty declaration sets issue
+no graph read, and an earlier declaration refusal or failed first audit prevents
+later audits. A successful warm same-root repeat still writes every retained
+declaration with that invocation's observation.
+
+With different non-empty retained declaration identities and different sweep-time
+strings, each alternating manifest-governed A/B invocation sharing an owner finds
+the visited root's declarations different from the completed predecessor and
+reparses its encountered files. That cost persists for every such alternation;
+the first return alone is insufficient acceptance evidence. One immediately
+repeated same-root invocation can reuse the now-current retained declarations.
+No measurement of how often shared owners occur in practice is claimed.
+
+Root alternation alone is not an unconditional prohibition on reuse. Empty sets
+satisfy the all-declaration predicate vacuously. Identical module/declaration
+identities with unchanged bytes can share refreshed declaration and edge rows.
+Repeated identical
+opaque sweep-time strings can satisfy equality even for different declarations.
+These cases retain the accepted identity, empty-coverage and opaque-time rules;
+they do not introduce root provenance. Partially aliased declarations must still
+pass both edge audits. A file that retains a removed live derived natural edge
+whose historical observation differs from the captured predecessor reparses on every unchanged
+ingest that sees that mismatch. This cost is permanent while successive
+predecessor stamps keep differing from that historical observation, for every
+owner, shared or not. No stored complete reference list exists to distinguish that
+history from an unobserved still-present reference. Missing or wrong-type edge
+observations likewise refuse reuse. Audit read errors retain the existing storage
+error type.
+
+### Acceptance
+
+Use real file-backed WAL and rollback DELETE runtimes and observe actual parser
+calls.
+
+- Manifest-governed A/proj/alpha.rs → B/proj/beta.rs → unchanged A/proj/alpha.rs
+  must reparse actual references and stamp its natural call and positive impl at
+  the new owner stamp without changing identity or evidence. Repeat alternation
+  at least twice more; each visited file parses once. Assert every retained
+  current declaration after one completed ingest and after warm same-root reuse.
+  Removing only the declaration observation prerequisite must fail the old-row
+  refusal assertion; removing the complete observation prerequisite must fail the
+  natural-edge timestamp assertion. Removing its guarded rebase recheck must fail a separate
+  real changed-row witness.
+- With identical common.rs callers in both roots but an exclusive alpha.rs target
+  in A, A T10/B T20/A T30 must really re-observe the shared caller's cross-file
+  reference. Removing both edge audits must fail that natural-call timestamp.
+  Change an audited edge after the declaration read pause and before its guarded
+  write resumes: the final fresh audit must force real parsing. Removing only
+  that final audit must fail the edge timestamp assertion.
+- Distinct manifest owners and completed same-root invocations keep reuse.
+  Pin empty/aliased/repeated-stamp cost boundaries with actual source files.
+  Preserve Amendment 15's real fallback reparse arms.
+- Restore a file after an actual read refusal and completed sweep with a
+  different stamp: parse actual source and refresh only observed references.
+  A removed call, an unobserved deleted edge and a manual edge must remain
+  unchanged. Pin the permanent repeated-parse cost of retained removed live
+  natural history. Independent direct edge-refresh predecessor-filter and derived-filter controls must
+  each fail their corresponding historical-row assertion.
+- Preserve Amendment 14's committed-fault/cancellation recovery, mixed-stamp
+  re-observation, strict marker and completion/FTS durability acceptance.

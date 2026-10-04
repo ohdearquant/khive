@@ -20,7 +20,7 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
-use khive_storage::EdgeRelation;
+use khive_storage::{EdgeRelation, NeighborQuery};
 use serde_json::{json, Value};
 use url::Url;
 use uuid::Uuid;
@@ -293,14 +293,22 @@ where
                     continue;
                 }
             };
+            // Only the node id of each neighbour is read, so skip the name and
+            // kind lookups.
             let neighbors = match pack
                 .runtime
-                .neighbors(
+                .neighbors_with_query_page(
                     token,
                     id,
-                    khive_storage::Direction::Out,
+                    NeighborQuery {
+                        direction: khive_storage::Direction::Out,
+                        relations: Some(vec![EdgeRelation::LinksTo]),
+                        limit: None,
+                        min_weight: None,
+                    },
                     None,
-                    Some(vec![EdgeRelation::LinksTo]),
+                    None,
+                    false,
                 )
                 .await
             {
@@ -395,6 +403,9 @@ impl WebPack {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    mod descriptor_tests;
+
     use super::*;
     use khive_pack_kg::KgPack;
     use khive_runtime::engine_config::WebSectionConfig;
@@ -565,7 +576,7 @@ mod tests {
 
         let origin = Url::parse("https://served.example.test").unwrap();
         let canonical_origin = identity::canonicalize(origin);
-        let site = identity::site_id(&canonical_origin);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical_origin);
         assert_eq!(reply["site"], site.to_string());
 
         let expected_index = identity::document_id(
@@ -836,6 +847,134 @@ mod tests {
         );
     }
 
+    // The crawl's link walk reads each queued page's `links_to` neighbours for
+    // their ids only. Two crawls over identical pages differ in whether that
+    // walk runs: depth 1 walks, depth 0 with links requested extracts the same
+    // links and stops. A one-document budget keeps the queued target from being
+    // fetched, so the whole difference in store reads is the walk itself. It
+    // must equal the plain neighbour lookup plus the target row read, with no
+    // enrichment batch on top.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn crawl_link_walk_reads_no_neighbor_enrichment() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let pack = WebPack::new(runtime.clone());
+        let files = std::collections::HashMap::from([
+            ("/".to_string(), b"<a href=\"/a\">a</a>".to_vec()),
+            ("/a".to_string(), b"a".to_vec()),
+        ]);
+        let port = spawn_http_tree_server(files).await;
+        let fetch_one = served_fetch(&runtime, &token, port);
+        let pool = runtime.backend().pool();
+        let links_to = || NeighborQuery {
+            direction: khive_storage::Direction::Out,
+            relations: Some(vec![EdgeRelation::LinksTo]),
+            limit: None,
+            min_weight: None,
+        };
+        let id_of = |reply: &Value| -> Uuid {
+            let id = reply["ingested"][0].as_str().expect("ingested id");
+            Uuid::parse_str(id).expect("ingested id is a uuid")
+        };
+
+        // A crawl and a lookup on a third host first, so a cost the store pays
+        // only once is charged to neither measured crawl nor to the lookups.
+        let warm = super::crawl(
+            &pack,
+            &token,
+            vec!["https://walk-warm.example.test/".to_string()],
+            0,
+            1,
+            true,
+            &fetch_one,
+        )
+        .await
+        .expect("warm-up crawl succeeds");
+        let warm_hits = runtime
+            .neighbors_with_query_page(&token, id_of(&warm), links_to(), None, None, false)
+            .await
+            .expect("warm-up lookup");
+        assert_eq!(warm_hits.len(), 1);
+        runtime
+            .entities(&token)
+            .expect("entities")
+            .get_entity(warm_hits[0].node_id)
+            .await
+            .expect("warm-up row");
+
+        let before = pool.reader_acquisition_snapshot().acquisitions;
+        let walking = super::crawl(
+            &pack,
+            &token,
+            vec!["https://walk-on.example.test/".to_string()],
+            1,
+            1,
+            false,
+            &fetch_one,
+        )
+        .await
+        .expect("walking crawl succeeds");
+        let walking_reads = pool.reader_acquisition_snapshot().acquisitions - before;
+        let before = pool.reader_acquisition_snapshot().acquisitions;
+        let stopped = super::crawl(
+            &pack,
+            &token,
+            vec!["https://walk-off.example.test/".to_string()],
+            0,
+            1,
+            true,
+            &fetch_one,
+        )
+        .await
+        .expect("stopped crawl succeeds");
+        let stopped_reads = pool.reader_acquisition_snapshot().acquisitions - before;
+        assert_eq!(walking["ingested"].as_array().unwrap().len(), 1);
+        assert_eq!(stopped["ingested"].as_array().unwrap().len(), 1);
+
+        // What the walk may cost, measured on the page the stopped crawl left.
+        let stopped_page = id_of(&stopped);
+        let before = pool.reader_acquisition_snapshot().acquisitions;
+        let hits = runtime
+            .neighbors_with_query_page(&token, stopped_page, links_to(), None, None, false)
+            .await
+            .expect("plain lookup");
+        let plain_lookup = pool.reader_acquisition_snapshot().acquisitions - before;
+        assert_eq!(hits.len(), 1);
+        let before = pool.reader_acquisition_snapshot().acquisitions;
+        runtime
+            .entities(&token)
+            .expect("entities")
+            .get_entity(hits[0].node_id)
+            .await
+            .expect("target row");
+        let target_row = pool.reader_acquisition_snapshot().acquisitions - before;
+
+        // Control: on this fixture the enriched lookup really does cost more,
+        // so an equal total cannot come from enrichment being free here.
+        let before = pool.reader_acquisition_snapshot().acquisitions;
+        runtime
+            .neighbors(
+                &token,
+                stopped_page,
+                khive_storage::Direction::Out,
+                None,
+                Some(vec![EdgeRelation::LinksTo]),
+            )
+            .await
+            .expect("enriched lookup");
+        let enriched_lookup = pool.reader_acquisition_snapshot().acquisitions - before;
+        assert!(
+            enriched_lookup > plain_lookup,
+            "the fixture must show the enrichment reads this test guards against"
+        );
+
+        assert_eq!(
+            walking_reads - stopped_reads,
+            plain_lookup + target_row,
+            "the link walk must read only the plain neighbour lookup and the target row"
+        );
+    }
+
     // A5 compares independent databases. Only the HTTP fetch is supplied:
     // it reads real local HTTP bytes, then settles under the declared origin.
     // Both arms use production applicable extraction, with receipts excluded
@@ -925,11 +1064,11 @@ mod tests {
         assert_eq!(sorted_ids(&disk_reply), sorted_ids(&crawl_reply));
         let http_graph = graph_snapshot(&http_runtime, &http_token).await;
         // Disk ingestion sent no HTTP request. The served GET sent the
-        // client's fixed gzip negotiation, so that one provenance field must
+        // client's fixed identity negotiation, so that one provenance field must
         // differ even though document identities, bodies and edges agree.
         for (graph, expected_context) in [
             (&disk_graph, json!({})),
-            (&http_graph, json!({"accept-encoding": ["gzip"]})),
+            (&http_graph, json!({"accept-encoding": ["identity"]})),
         ] {
             for entity in graph.0.as_array().unwrap() {
                 if entity["entity_type"] == "page" {
@@ -1028,8 +1167,10 @@ mod tests {
             "{error}"
         );
         let url = identity::canonicalize(Url::parse(origin).unwrap().join("a-large.bin").unwrap());
-        let large_id =
-            identity::document_id(identity::site_id(&url), &identity::path_and_query(&url));
+        let large_id = identity::document_id(
+            identity::site_id(&khive_types::Namespace::local(), &url),
+            &identity::path_and_query(&url),
+        );
         assert!(runtime
             .entities(&token)
             .unwrap()

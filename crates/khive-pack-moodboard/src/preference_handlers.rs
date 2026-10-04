@@ -1733,6 +1733,10 @@ mod tests {
 
     fn persistent_runtime_config(db_path: &Path, actor_id: &str) -> RuntimeConfig {
         RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -1753,6 +1757,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: Some(actor_id.to_string()),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         }
     }
 

@@ -1,12 +1,12 @@
 //! Atomic multi-note write primitive: commits a set of notes — each with its
-//! FTS document and every registered embedding model's vector row — in ONE
+//! FTS document and its kind-selected embedding model rows — in ONE
 //! writer transaction, instead of one `create_note` call per note.
 //!
 //! Built for `khive-pack-comm`'s `dual_write_message` (outbound + inbound
 //! copy of a `comm.send`/`comm.reply`), which previously cost roughly a
 //! dozen separate writer acquisitions per send: two `create_note_inner`
 //! calls (row + FTS + one vector insert per registered model each) plus a
-//! root-send `thread_id` patch. Shaped as `create_notes_atomic(Vec<AtomicNoteSpec>)`
+//! root-send `thread_id` patch. Shaped as `create_notes_atomic_with_report(Vec<AtomicNoteSpec>)`
 //! rather than a comm-specific pair primitive so other multi-write verbs
 //! can share the same preparation. Keyed `memory.remember` appends a required
 //! annotation and final key claim before committing its prepared plan.
@@ -14,7 +14,7 @@
 //! # Embed-first
 //!
 //! Embedding is slow compute (network/model calls). Every distinct content's
-//! embeddings, across every registered model, are computed **before** any
+//! embeddings, across the selected models, are computed **before** any
 //! transaction opens — the writer is held only for synchronous DML, exactly
 //! like the rest of the ADR-099 atomic-unit machinery
 //! (`atomic_plan`/`atomic_runner`).
@@ -23,7 +23,7 @@
 //! here is embeddings are computed *before* commit instead of *after*, so
 //! the vector rows land in the SAME atomic unit as the note row and FTS
 //! document, and no post-commit reindex is needed at all — every plan built
-//! by [`create_notes_atomic`] carries `post_commit: PostCommitEffect::None`.
+//! by [`create_notes_atomic_with_report`] carries `post_commit: PostCommitEffect::None`.
 //!
 //! # One writer acquisition
 //!
@@ -81,6 +81,9 @@ pub(crate) struct AtomicNoteOptions<'a> {
     pub embedding_content: Option<&'a str>,
     pub embed: Option<bool>,
     pub key: Option<&'a str>,
+    /// Keyed memory only: persist a zero-model receipt header and each model's
+    /// exact log-upsert rowid in this same atomic unit.
+    pub memory_visibility_receipt: bool,
     /// Ask the writer transaction to compare a live key holder against this
     /// candidate and report the result (ADR-172 Amendment 6). Every other
     /// keyed route defaults this to `false` and gets today's Details shape
@@ -306,14 +309,15 @@ pub(crate) fn vector_insert_statements(
 /// document, or vector row from any spec is left behind (embed failures
 /// occur before any write is attempted; commit-pass failures roll back the
 /// whole unit per [`crate::atomic_runner::run_atomic_unit`]'s guarantee).
-pub async fn create_notes_atomic(
+#[cfg(test)]
+pub(crate) async fn create_notes_atomic(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
 ) -> RuntimeResult<Vec<Note>> {
     Ok(create_notes_atomic_with_report(runtime, specs).await?.0)
 }
 
-/// The truncation-reporting form of [`create_notes_atomic`]. The report keeps
+/// Build and commit notes with an embedding-truncation report. The report keeps
 /// logical per-note/model accounting even when identical content shares one
 /// provider result, and is returned only when the whole note set commits
 /// successfully.
@@ -321,7 +325,19 @@ pub async fn create_notes_atomic_with_report(
     runtime: &KhiveRuntime,
     specs: Vec<AtomicNoteSpec<'_>>,
 ) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
+    create_notes_atomic_with_attachments(runtime, specs, &[]).await
+}
+
+/// Create notes and their role-keyed attachments in the same writer transaction.
+/// The existing note, FTS, vector and revision accounting is preserved.
+pub async fn create_notes_atomic_with_attachments(
+    runtime: &KhiveRuntime,
+    specs: Vec<AtomicNoteSpec<'_>>,
+    attachments: &[khive_storage::NewAttachment],
+) -> RuntimeResult<(Vec<Note>, crate::retrieval::EmbeddingTruncationReport)> {
+    validate_note_attachments(runtime, attachments)?;
     let mut prepared = prepare_atomic_notes(runtime, specs, AtomicNoteOptions::default()).await?;
+    append_note_attachments(&mut prepared, attachments)?;
     match crate::atomic_runner::run_atomic_unit_with_note_versions(
         runtime.sql().as_ref(),
         prepared.plans,
@@ -351,6 +367,49 @@ pub async fn create_notes_atomic_with_report(
         ))),
         Err(e) => Err(RuntimeError::Storage(e.0)),
     }
+}
+
+pub(crate) fn validate_note_attachments(
+    runtime: &KhiveRuntime,
+    attachments: &[khive_storage::NewAttachment],
+) -> RuntimeResult<()> {
+    if !attachments.is_empty() {
+        // Note plans execute on runtime.sql(); attachment liveness belongs to
+        // main. Refuse a split placement before preparing any write.
+        runtime.attachments()?;
+    }
+    for attachment in attachments {
+        attachment.validate()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn append_note_attachments(
+    prepared: &mut PreparedAtomicNotes,
+    attachments: &[khive_storage::NewAttachment],
+) -> RuntimeResult<()> {
+    for (plan, note) in prepared.plans.iter_mut().zip(&prepared.notes) {
+        let AtomicOpPlan::AddNote(plan) = plan else {
+            return Err(RuntimeError::Internal(
+                "expected prepared attachment owner note".into(),
+            ));
+        };
+        for attachment in attachments {
+            let row = khive_storage::Attachment::from_new(
+                note.id,
+                khive_storage::AttachmentSubstrate::Note,
+                attachment.clone(),
+                note.created_at,
+            );
+            // Append after the note's complete index plan, preserving adjacent
+            // last_insert_rowid-dependent FTS statements and their counters.
+            plan.statements.push(PlanStatement {
+                statement: khive_db::stores::attachment::attachment_upsert_statement(&row)?,
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn prepare_atomic_notes(
@@ -407,7 +466,7 @@ pub(crate) async fn prepare_atomic_note_requests(
             runtime.resolve_embedding_model(Some(model))?;
             vec![model.to_owned()]
         } else {
-            runtime.registered_embedding_model_names()
+            runtime.embedding_models_for_note_kind(request.spec.kind)
         };
         let mut indices = Vec::with_capacity(models.len());
         for model in models {
@@ -646,6 +705,24 @@ pub(crate) async fn prepare_atomic_note_requests(
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
 
+        if requests[note_idx].options.memory_visibility_receipt {
+            statements.push(PlanStatement {
+                statement: SqlStatement {
+                    sql:
+                        "INSERT INTO memory_visibility_receipts (namespace, note_id, model_count) \
+                          VALUES (?1, ?2, ?3)"
+                            .into(),
+                    params: vec![
+                        SqlValue::Text(note.namespace.clone()),
+                        SqlValue::Text(note.id.to_string()),
+                        SqlValue::Integer(note_models[note_idx].len() as i64),
+                    ],
+                    label: Some("memory-visibility-receipt".into()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
+        }
+
         if let Some(fault) = maybe_inject_fts_failure(&note.namespace, "fault-injected-fts") {
             statements.push(fault);
         } else {
@@ -700,6 +777,27 @@ pub(crate) async fn prepare_atomic_note_requests(
                     &outcome.vector,
                     &format!("atomic-message-vec-{table}-{}", note.id),
                 ));
+                if requests[note_idx].options.memory_visibility_receipt {
+                    // The preceding statement is the model's ann_write_log
+                    // upsert. Keep this insert adjacent: last_insert_rowid()
+                    // reads that exact transaction-local sequence, never a
+                    // later MAX(seq) vulnerable to concurrency/compaction.
+                    statements.push(PlanStatement {
+                        statement: SqlStatement {
+                            sql: "INSERT INTO memory_visibility_fences \
+                                  (namespace, note_id, model, ann_write_log_seq) \
+                                  VALUES (?1, ?2, ?3, last_insert_rowid())"
+                                .into(),
+                            params: vec![
+                                SqlValue::Text(note.namespace.clone()),
+                                SqlValue::Text(note.id.to_string()),
+                                SqlValue::Text(model_name.clone()),
+                            ],
+                            label: Some("memory-visibility-fence".into()),
+                        },
+                        guard: Some(AffectedRowGuard::exactly(1)),
+                    });
+                }
             }
         }
 

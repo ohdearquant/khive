@@ -14,10 +14,7 @@ use crate::KnowledgePack;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+use khive_runtime::deser_params as deser;
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
@@ -146,10 +143,10 @@ impl KnowledgePack {
         // Concept entities are linkable graph rows and must live on the core
         // (main) backend even when the pack is assigned a secondary backend
         // (ADR-073; same seam as the session pack's ADR-083 §4 fix).
-        let entity = self
+        let (entity, embedding_report) = self
             .runtime
             .core()
-            .create_entity(
+            .create_entity_with_embedding_report(
                 token,
                 "concept",
                 None,
@@ -160,7 +157,7 @@ impl KnowledgePack {
             )
             .await?;
 
-        Ok(json!({
+        let mut response = json!({
             "id": short_id(entity.id),
             "full_id": entity.id.as_hyphenated().to_string(),
             "kind": "concept",
@@ -169,7 +166,12 @@ impl KnowledgePack {
             "domain": domain_norm,
             "tags": entity.tags,
             "namespace": entity.namespace,
-        }))
+        });
+        if embedding_report.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+        }
+        Ok(response)
     }
 
     /// Link a concept to the paper/source that introduced it (`introduced_by` edge).
@@ -508,7 +510,7 @@ mod tests {
         // links against in production).
         let source = rt
             .core()
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "document",
                 None,
@@ -518,6 +520,7 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(entity, _report)| entity)
             .expect("source document entity");
         let source_id = source.id.to_string();
         pack.dispatch(
@@ -922,6 +925,10 @@ mod tests {
         // `embedding_model` to a real on-disk model, which is absent on CI
         // runners and fails entity creation with `ModelInitialization`.
         let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -942,6 +949,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: Some("leo".to_string()),
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime with actor");
 

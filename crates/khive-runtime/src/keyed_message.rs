@@ -27,6 +27,17 @@ pub async fn create_keyed_message_pair(
     specs: [AtomicNoteSpec<'_>; 2],
     physical_key: &str,
 ) -> RuntimeResult<KeyedMessageWrite> {
+    create_keyed_message_pair_with_attachments(runtime, specs, physical_key, &[]).await
+}
+
+/// Include every copy's attachments before the final key claim in the same unit.
+pub async fn create_keyed_message_pair_with_attachments(
+    runtime: &KhiveRuntime,
+    specs: [AtomicNoteSpec<'_>; 2],
+    physical_key: &str,
+    attachments: &[khive_storage::NewAttachment],
+) -> RuntimeResult<KeyedMessageWrite> {
+    crate::atomic_message::validate_note_attachments(runtime, attachments)?;
     let namespace = specs[0].token.namespace().as_str().to_owned();
     if specs.iter().any(|spec| spec.kind != "message")
         || specs[1].token.namespace().as_str() != namespace
@@ -41,6 +52,10 @@ pub async fn create_keyed_message_pair(
     }
     let mut prepared =
         prepare_atomic_notes(runtime, specs.into(), AtomicNoteOptions::default()).await?;
+    crate::atomic_message::append_note_attachments(&mut prepared, attachments)?;
+    for note in &prepared.notes {
+        crate::secret_gate::reject_reserved_secret_gate_property(note.properties.as_ref())?;
+    }
     let outbound_id = prepared.notes[0].id;
     for (plan, note) in prepared.plans.iter_mut().zip(&prepared.notes) {
         let AtomicOpPlan::AddNote(plan) = plan else {

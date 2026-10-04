@@ -11,9 +11,10 @@
 //! redirected 304 is refused before any graph mutation.
 //! A genuinely changed body puts the new blob and patches the entity in
 //! place, same as `fetch`. Every refresh receipt chains to the immediately
-//! prior one for the same entity via `note supersedes note` (D4's "receipt
-//! chain: the history of one resource's fetches"), whether or not the body
-//! changed.
+//! prior web-provenanced receipt for the same entity via `note supersedes
+//! note` (D4's receipt chain), whether or not the body changed. Pre-marker
+//! receipts remain stored but the first provenanced receipt starts a new chain
+//! (ADR-191 Amendment 9).
 //!
 //! Follows redirects the same bounded chain `fetch` does, through the same
 //! egress checks on every hop — [`crate::fetch::run_hop_chain`], shared
@@ -28,6 +29,7 @@
 //! the content — `id` itself when there was no redirect, the terminal row
 //! otherwise.
 
+use khive_runtime::retrieval::EmbeddingTruncationReport;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::{EdgeRelation, Entity};
 use serde_json::{json, Value};
@@ -41,24 +43,37 @@ use crate::receipt::write_receipt;
 use crate::vocab::RefreshParams;
 use crate::WebPack;
 
-/// The newest `web.receipt`-tagged `observation` annotating `entity_id` —
-/// never a decoy `annotates` note a caller wrote by hand, since only the
-/// receipt-tag/kind pair identifies a row this function may chain onto or
-/// supersede.
+/// The newest web-written receipt annotating `entity_id`. An unmarked legacy
+/// receipt or generic note carrying the same tag is not eligible for the chain.
 async fn latest_receipt(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     entity_id: Uuid,
 ) -> Result<Option<Uuid>, RuntimeError> {
-    runtime
-        .latest_annotating_note(token, entity_id, "observation", crate::receipt::RECEIPT_TAG)
-        .await
+    let latest = runtime
+        .latest_annotating_note_with_property(
+            token,
+            entity_id,
+            "observation",
+            crate::receipt::RECEIPT_TAG,
+            crate::receipt::RECEIPT_PROVENANCE_KEY,
+            crate::receipt::RECEIPT_PROVENANCE_VALUE,
+        )
+        .await?;
+    let Some(id) = latest else {
+        return Ok(None);
+    };
+    let note = runtime.notes(token)?.get_note(id).await?;
+    Ok(note
+        .as_ref()
+        .filter(|note| crate::receipt::has_receipt_provenance(note.properties.as_ref()))
+        .map(|_| id))
 }
 
-fn document_id_for_url(url: &Url) -> Uuid {
+fn document_id_for_url(token: &NamespaceToken, url: &Url) -> Uuid {
     let canonical = crate::identity::canonicalize(url.clone());
     crate::identity::document_id(
-        crate::identity::site_id(&canonical),
+        crate::identity::site_id(token.namespace(), &canonical),
         &crate::identity::path_and_query(&canonical),
     )
 }
@@ -79,10 +94,10 @@ async fn apply_refresh_metadata(
     status: u16,
     headers: &reqwest::header::HeaderMap,
     request_context: Option<&[(String, String)]>,
-) -> Result<bool, RuntimeError> {
+) -> Result<(bool, EmbeddingTruncationReport), RuntimeError> {
     let properties = expected.properties.clone().unwrap_or(Value::Null);
     if properties.get("blob_ref").and_then(Value::as_str) != Some(expected_content_ref) {
-        return Ok(false);
+        return Ok((false, EmbeddingTruncationReport::default()));
     }
     let mut patch = serde_json::Map::new();
     let mut entity_type = None;
@@ -133,8 +148,8 @@ async fn apply_refresh_metadata(
             patch.insert("request_headers".to_string(), selected);
         }
     }
-    match runtime
-        .update_entity_if_unchanged(
+    let embedding = match runtime
+        .update_entity_if_unchanged_with_embedding_report(
             token,
             expected,
             khive_runtime::EntityPatch {
@@ -146,13 +161,13 @@ async fn apply_refresh_metadata(
         )
         .await
     {
-        Ok(_) => {}
+        Ok((_, embedding)) => embedding,
         Err(RuntimeError::Khive(error)) if error.kind() == khive_types::ErrorKind::Conflict => {
-            return Ok(false);
+            return Ok((false, EmbeddingTruncationReport::default()));
         }
         Err(error) => return Err(error),
-    }
-    Ok(true)
+    };
+    Ok((true, embedding))
 }
 
 fn stored_request_url(properties: &Value) -> Result<Url, RuntimeError> {
@@ -199,7 +214,7 @@ fn vary_is_replayable(vary: &Value, headers: &[(String, String)]) -> bool {
 }
 
 /// A 304's new Vary describes the request that actually reached the origin.
-/// The client fixes gzip on that wire request even for a legacy body whose
+/// The client fixes identity on that wire request even for a legacy body whose
 /// stored map predates the encoding field. The cached-body gate above still
 /// requires an explicit stored selector before sending a later validator.
 fn vary_is_represented_on_wire(vary: &Value, headers: &[(String, String)]) -> bool {
@@ -215,12 +230,27 @@ fn vary_is_represented_on_wire(vary: &Value, headers: &[(String, String)]) -> bo
     vary_is_replayable(vary, &effective)
 }
 
+fn stored_legacy_gzip_body(properties: &Value) -> bool {
+    properties
+        .pointer("/request_headers/accept-encoding")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values.len() == 1 && values[0].as_str() == Some(crate::fetch::LEGACY_ACCEPT_ENCODING)
+        })
+}
+
 fn conditional_headers_for_hop(
     properties: &Value,
     original_url: &Url,
     current_url: &Url,
     first_hop: bool,
 ) -> Vec<(String, String)> {
+    // A legacy gzip-negotiated body may have passed through the old decoder.
+    // Replaying its selector as identity does not make its cached bytes an
+    // identity representation. Fetch a body under identity before validating.
+    if stored_legacy_gzip_body(properties) {
+        return Vec::new();
+    }
     let Ok(negotiation) = crate::fetch::stored_negotiation_headers(properties) else {
         return Vec::new();
     };
@@ -267,6 +297,7 @@ async fn run_refresh(
     resolver: &dyn Resolver,
     cfg: &khive_runtime::engine_config::WebSectionConfig,
     params: RefreshParams,
+    clients: &egress::PinnedClients,
 ) -> Result<Value, RuntimeError> {
     let entities = runtime.entities(token)?;
     let entity = entities.get_entity(params.id).await?.ok_or_else(|| {
@@ -317,35 +348,37 @@ async fn run_refresh(
     let original_url = url.clone();
     let mut first_hop = true;
     let mut first_observed_hop = true;
-    let (outcome, redirect_hops, terminal_request_snapshot) = crate::fetch::run_hop_chain_observed(
-        resolver,
-        cfg,
-        url,
-        reqwest::Method::GET,
-        max_bytes,
-        deadline,
-        |current_url| {
-            let initial = std::mem::take(&mut first_hop);
-            refresh_headers_for_hop(&properties, &original_url, current_url, initial)
-        },
-        |current_url| {
-            let initial = std::mem::take(&mut first_observed_hop);
-            async move {
-                // The original row was already read before the first request.
-                // Only redirected hops need a separate terminal-row snapshot.
-                if initial {
-                    return Ok(None);
+    let (outcome, redirect_hops, terminal_request_snapshot) =
+        crate::fetch::run_hop_chain_with_clients_observed(
+            clients,
+            resolver,
+            cfg,
+            url,
+            reqwest::Method::GET,
+            max_bytes,
+            deadline,
+            |current_url| {
+                let initial = std::mem::take(&mut first_hop);
+                refresh_headers_for_hop(&properties, &original_url, current_url, initial)
+            },
+            |current_url| {
+                let initial = std::mem::take(&mut first_observed_hop);
+                async move {
+                    // The original row was already read before the first request.
+                    // Only redirected hops need a separate terminal-row snapshot.
+                    if initial {
+                        return Ok(None);
+                    }
+                    let document_id = document_id_for_url(token, &current_url);
+                    let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
+                    if let Some(entity) = &snapshot {
+                        crate::entities::require_entity_namespace(token, entity)?;
+                    }
+                    Ok(snapshot)
                 }
-                let document_id = document_id_for_url(&current_url);
-                let snapshot = runtime.entities(token)?.get_entity(document_id).await?;
-                if let Some(entity) = &snapshot {
-                    crate::entities::require_entity_namespace(token, entity)?;
-                }
-                Ok(snapshot)
-            }
-        },
-    )
-    .await?;
+            },
+        )
+        .await?;
 
     settle_refresh_from_snapshot(
         runtime,
@@ -397,7 +430,7 @@ async fn settle_refresh_with_request_headers(
         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
     let terminal_request_snapshot = runtime
         .entities(token)?
-        .get_entity(document_id_for_url(&outcome.final_url))
+        .get_entity(document_id_for_url(token, &outcome.final_url))
         .await?;
     settle_refresh_from_snapshot(
         runtime,
@@ -435,7 +468,7 @@ async fn settle_refresh_with_request_headers_after_body_settlement(
         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
     let terminal_request_snapshot = runtime
         .entities(token)?
-        .get_entity(document_id_for_url(&outcome.final_url))
+        .get_entity(document_id_for_url(token, &outcome.final_url))
         .await?;
     settle_refresh_from_snapshot(
         runtime,
@@ -475,7 +508,7 @@ async fn settle_refresh_with_request_headers_before_settlement(
     // pauses after that request but before settlement, while retaining the
     // snapshot that production captures immediately before the send.
     let terminal_request_snapshot = entities
-        .get_entity(document_id_for_url(&outcome.final_url))
+        .get_entity(document_id_for_url(token, &outcome.final_url))
         .await?;
     before_settlement.await;
     settle_refresh_from_snapshot(
@@ -515,7 +548,7 @@ async fn settle_refresh_from_snapshot(
     let final_id = if redirect_hops.is_empty() {
         id
     } else {
-        document_id_for_url(&outcome.final_url)
+        document_id_for_url(token, &outcome.final_url)
     };
     if outcome.status == 304 && !redirect_hops.is_empty() {
         return Err(Refusal::new(
@@ -647,6 +680,7 @@ async fn settle_refresh_from_snapshot(
     }
 
     let mut changed = false;
+    let mut embedding_truncation_report = EmbeddingTruncationReport::default();
     let mut was_truncated = prior_truncated;
     let body_present = outcome.body.is_some();
     let body_bytes = outcome
@@ -658,7 +692,7 @@ async fn settle_refresh_from_snapshot(
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = outcome.body.take() {
             was_truncated = Some(truncated);
-            let store = crate::blob_store(runtime)?;
+            let store = runtime.require_blob_store()?;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
             response_content_ref = content_ref_str.clone();
@@ -692,8 +726,8 @@ async fn settle_refresh_from_snapshot(
                     let expected = metadata_snapshot
                         .as_ref()
                         .ok_or_else(|| RuntimeError::NotFound(id.to_string()))?;
-                    let mut settled = runtime
-                        .update_entity_if_unchanged(
+                    let (mut settled, embedding) = runtime
+                        .update_entity_if_unchanged_with_embedding_report(
                             token,
                             expected,
                             khive_runtime::EntityPatch {
@@ -704,6 +738,7 @@ async fn settle_refresh_from_snapshot(
                             &[],
                         )
                         .await?;
+                    embedding_truncation_report.merge(embedding);
                     if body_changed {
                         crate::fetch::root_body(
                             runtime,
@@ -747,7 +782,7 @@ async fn settle_refresh_from_snapshot(
                     let settled = match terminal_body_guard.as_ref() {
                         Some(expected) => {
                             match runtime
-                                .update_entity_if_unchanged(
+                                .update_entity_if_unchanged_with_embedding_report(
                                     token,
                                     expected,
                                     khive_runtime::EntityPatch {
@@ -759,7 +794,10 @@ async fn settle_refresh_from_snapshot(
                                 )
                                 .await
                             {
-                                Ok(entity) => Some(entity),
+                                Ok((entity, embedding)) => {
+                                    embedding_truncation_report.merge(embedding);
+                                    Some(entity)
+                                }
                                 Err(RuntimeError::Khive(error))
                                     if error.kind() == khive_types::ErrorKind::Conflict =>
                                 {
@@ -810,7 +848,7 @@ async fn settle_refresh_from_snapshot(
     }
 
     after_body_settlement.await;
-    let metadata_applied = match metadata_snapshot.as_ref() {
+    let (metadata_applied, metadata_embedding) = match metadata_snapshot.as_ref() {
         Some(expected) => {
             apply_refresh_metadata(
                 runtime,
@@ -819,13 +857,24 @@ async fn settle_refresh_from_snapshot(
                 &response_content_ref,
                 outcome.status,
                 &outcome.headers,
-                (!redirect_hops.is_empty() && final_id != id && body_present)
-                    .then_some(request_headers),
+                ((!redirect_hops.is_empty() && final_id != id && body_present)
+                    || (redirect_hops.is_empty()
+                        && outcome.status == 200
+                        && body_present
+                        && source_snapshot
+                            .properties
+                            .as_ref()
+                            .is_some_and(|properties| {
+                                stored_legacy_gzip_body(properties)
+                                    && crate::fetch::stored_negotiation_headers(properties).is_ok()
+                            })))
+                .then_some(request_headers),
             )
             .await?
         }
-        None => false,
+        None => (false, EmbeddingTruncationReport::default()),
     };
+    embedding_truncation_report.merge(metadata_embedding);
     let lost_race = !metadata_applied;
     if lost_race && !redirect_hops.is_empty() {
         // The response's bytes were not committed as the terminal row's
@@ -840,7 +889,7 @@ async fn settle_refresh_from_snapshot(
         })
         .collect();
 
-    let request_record = json!({
+    let mut request_record = json!({
         "verb": "web.refresh",
         "url": url_str,
         "final_url": final_url_str,
@@ -855,6 +904,9 @@ async fn settle_refresh_from_snapshot(
         "redirects": redirect_hops.len() as u32,
         "redirect_chain": redirect_chain,
     });
+    if embedding_truncation_report.any_truncated() {
+        request_record["embedding_truncation_report"] = json!(embedding_truncation_report);
+    }
     let receipt_id = write_receipt(
         runtime,
         token,
@@ -883,7 +935,7 @@ async fn settle_refresh_from_snapshot(
             .await?;
     }
 
-    Ok(json!({
+    let mut reply = json!({
         "id": id.to_string(),
         "status": outcome.status,
         "changed": changed,
@@ -892,7 +944,11 @@ async fn settle_refresh_from_snapshot(
         "receipt_id": receipt_id.to_string(),
         "redirects": redirect_hops.len() as u32,
         "final_id": final_id.to_string(),
-    }))
+    });
+    if embedding_truncation_report.any_truncated() {
+        reply["embedding_truncation_report"] = json!(embedding_truncation_report);
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]
@@ -940,6 +996,7 @@ impl WebPack {
             &SystemResolver,
             &self.runtime.config().web,
             params,
+            &egress::PinnedClients::default(),
         )
         .await
     }
@@ -1060,7 +1117,7 @@ mod tests {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://legacy-capture.example.test/body").unwrap();
         let prefix = b"synthetic prefix only";
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(prefix.to_vec()).await.unwrap();
         let reference = content_ref.to_string();
         let (_, id) = crate::fetch::mint_bare(&runtime, &token, &url)
@@ -1128,7 +1185,7 @@ mod tests {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://legacy-capture.example.test/complete").unwrap();
         let body = b"synthetic complete body";
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         let reference = content_ref.to_string();
         let (_, id) = crate::fetch::mint_bare(&runtime, &token, &url)
@@ -1336,7 +1393,7 @@ mod tests {
     async fn seed(runtime: &KhiveRuntime, token: &NamespaceToken, port: u16, body: &[u8]) -> Uuid {
         let url = Url::parse(&format!("http://127.0.0.1:{port}/r")).unwrap();
         let canonical = identity::canonicalize(url);
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical);
         crate::entities::get_or_create(
             runtime,
             token,
@@ -1349,7 +1406,7 @@ mod tests {
         .await
         .unwrap();
         let id = identity::document_id(site, &identity::path_and_query(&canonical));
-        let store = crate::blob_store(runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         crate::entities::get_or_create(
             runtime,
@@ -1388,8 +1445,9 @@ mod tests {
             let cfg = Default::default();
             // Arm the watchdog after the stored-entity read completes and DNS
             // begins, so paused time cannot race the database's blocking task.
+            let clients = egress::PinnedClients::default();
             let error = tokio::select! {
-                result = run_refresh(&runtime, &token, &resolver, &cfg, params) => result.unwrap_err(),
+                result = run_refresh(&runtime, &token, &resolver, &cfg, params, &clients) => result.unwrap_err(),
                 () = async {
                     resolver.pending_started.notified().await;
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1429,7 +1487,7 @@ mod tests {
                 "status": 200,
                 "vary": [],
                 "content_language": null,
-                "request_headers": {"accept-encoding": ["gzip"]}
+                "request_headers": {"accept-encoding": ["identity"]}
             }),
         )
         .await
@@ -1500,7 +1558,7 @@ mod tests {
         let after2_props = after2.properties.unwrap();
         assert_eq!(after2_props["content_type"], "text/plain");
         let new_ref = after2_props["blob_ref"].as_str().unwrap();
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let stored = store
             .get_bounded_verified(
                 &khive_storage::ContentRef::from_hex(new_ref).unwrap(),
@@ -1568,6 +1626,95 @@ mod tests {
             "the second refresh's receipt supersedes the first"
         );
         assert_eq!(second_neighbors[0].node_id, first_receipt);
+    }
+
+    #[tokio::test]
+    async fn first_refresh_after_legacy_receipt_starts_a_new_chain() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"same every time".to_vec();
+        let (port, _hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let id = seed(&runtime, &token, port, &body).await;
+        let entity = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let body_ref = entity.properties.as_ref().unwrap()["blob_ref"]
+            .as_str()
+            .unwrap();
+        let legacy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "pre-upgrade web receipt",
+                None,
+                Some(json!({
+                    "tags": [crate::receipt::RECEIPT_TAG],
+                    "request": {
+                        "verb": "web.fetch",
+                        "status": 200,
+                        "content_ref": body_ref,
+                        "body_entity_id": id.to_string(),
+                    },
+                })),
+                vec![id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(latest_receipt(&runtime, &token, id).await.unwrap(), None);
+
+        let first = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let first_id = Uuid::parse_str(first["receipt_id"].as_str().unwrap()).unwrap();
+        let first_previous = runtime
+            .neighbors(
+                &token,
+                first_id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert!(
+            first_previous.is_empty(),
+            "legacy receipt is not superseded"
+        );
+        assert!(runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(legacy.id)
+            .await
+            .unwrap()
+            .is_some());
+
+        let (next_port, _hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        crate::entities::patch(
+            &runtime,
+            &token,
+            id,
+            None,
+            json!({ "url": format!("http://127.0.0.1:{next_port}/r") }),
+        )
+        .await
+        .unwrap();
+        let second = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let second_id = Uuid::parse_str(second["receipt_id"].as_str().unwrap()).unwrap();
+        let second_previous = runtime
+            .neighbors(
+                &token,
+                second_id,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_previous.len(), 1);
+        assert_eq!(second_previous[0].node_id, first_id);
+        assert_ne!(second_previous[0].node_id, legacy.id);
     }
 
     // `latest_receipt` filters on kind+tag, not just "newest annotates
@@ -1649,6 +1796,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refresh_supersedes_genuine_receipt_behind_newer_tagged_decoy() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"same every time".to_vec();
+        let (port, _hits) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let id = seed(&runtime, &token, port, &body).await;
+        let first = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let genuine = Uuid::parse_str(first["receipt_id"].as_str().unwrap()).unwrap();
+        let genuine_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(genuine)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::receipt::has_receipt_provenance(
+            genuine_note.properties.as_ref()
+        ));
+
+        let decoy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "caller-written tagged decoy",
+                None,
+                Some(json!({"tags": [crate::receipt::RECEIPT_TAG]})),
+                vec![id],
+            )
+            .await
+            .unwrap();
+        let mut newer_decoy = decoy.clone();
+        newer_decoy.created_at = genuine_note.created_at + 1;
+        newer_decoy.updated_at = newer_decoy.created_at;
+        runtime
+            .backend()
+            .notes()
+            .unwrap()
+            .upsert_note(newer_decoy)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .latest_annotating_note(&token, id, "observation", crate::receipt::RECEIPT_TAG)
+                .await
+                .unwrap(),
+            Some(decoy.id),
+            "the tagged decoy must be newer than the genuine receipt"
+        );
+        assert_eq!(
+            latest_receipt(&runtime, &token, id).await.unwrap(),
+            Some(genuine)
+        );
+
+        let (port2, _hits2) = spawn_once(http_response(200, "OK", &[], &body)).await;
+        let repointed_url = format!("http://127.0.0.1:{port2}/r");
+        crate::entities::patch(&runtime, &token, id, None, json!({ "url": repointed_url }))
+            .await
+            .unwrap();
+        let second = run_refresh_local(&runtime, &token, id, &[]).await.unwrap();
+        let second_receipt = Uuid::parse_str(second["receipt_id"].as_str().unwrap()).unwrap();
+        let previous = runtime
+            .neighbors(
+                &token,
+                second_receipt,
+                Direction::Out,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(previous.len(), 1);
+        assert_eq!(previous[0].node_id, genuine);
+        let decoy_incoming = runtime
+            .neighbors(
+                &token,
+                decoy.id,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Supersedes]),
+            )
+            .await
+            .unwrap();
+        assert!(decoy_incoming.is_empty());
+    }
+
     // ADR-191 D2/D6: refresh follows redirects the same way fetch does and
     // emits `document supersedes document` on 301/308 — through the shared
     // `crate::fetch::settle_redirect_hops`, exercised
@@ -1704,7 +1937,10 @@ mod tests {
         assert_eq!(reply["redirects"], 1);
 
         let new_id = identity::document_id(
-            identity::site_id(&identity::canonicalize(new_url.clone())),
+            identity::site_id(
+                &khive_types::Namespace::local(),
+                &identity::canonicalize(new_url.clone()),
+            ),
             &identity::path_and_query(&identity::canonicalize(new_url.clone())),
         );
         let neighbors = runtime
@@ -1773,7 +2009,10 @@ mod tests {
         assert_eq!(reply2["redirects"], 1);
 
         let new_id2 = identity::document_id(
-            identity::site_id(&identity::canonicalize(new_url2.clone())),
+            identity::site_id(
+                &khive_types::Namespace::local(),
+                &identity::canonicalize(new_url2.clone()),
+            ),
             &identity::path_and_query(&identity::canonicalize(new_url2.clone())),
         );
         let neighbors2 = runtime
@@ -1839,7 +2078,7 @@ mod tests {
                 }
                 let canonical = identity::canonicalize(final_url.clone());
                 let final_id = identity::document_id(
-                    identity::site_id(&canonical),
+                    identity::site_id(&khive_types::Namespace::local(), &canonical),
                     &identity::path_and_query(&canonical),
                 );
                 let before_terminal = runtime

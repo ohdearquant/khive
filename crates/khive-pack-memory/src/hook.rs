@@ -150,15 +150,6 @@ impl KindHook for MemoryHook {
         ))
     }
 
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: uuid::Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
     async fn normalize_note_update(
         &self,
         _runtime: &KhiveRuntime,

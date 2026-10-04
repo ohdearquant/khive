@@ -23,6 +23,8 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
+#[cfg(unix)]
+use khive_fs::fd_relative::{clear_errno, current_errno};
 use khive_storage::blob::{
     BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, UploadId,
     MAX_BLOB_WHOLE_BYTES,
@@ -1291,37 +1293,6 @@ fn acquire_database_gc_lock(database_path: Option<&Path>) -> StorageResult<Optio
     Ok(Some(lock_file))
 }
 
-#[cfg(all(unix, target_os = "macos"))]
-fn errno_location() -> *mut libc::c_int {
-    // SAFETY: `__error` returns this thread's errno cell; obtaining the
-    // pointer has no preconditions beyond running on a thread, which every
-    // caller here does.
-    unsafe { libc::__error() }
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn errno_location() -> *mut libc::c_int {
-    // SAFETY: see the macOS arm above; `__errno_location` is the Linux/glibc
-    // equivalent thread-local errno accessor.
-    unsafe { libc::__errno_location() }
-}
-
-/// Zero `errno` on the current thread. `readdir` never clears `errno` itself
-/// on success, so this must run immediately before each call for the
-/// NULL-return ambiguity below to be resolvable afterward.
-#[cfg(unix)]
-fn clear_errno() {
-    // SAFETY: `errno_location` returns a valid, live thread-local `c_int`
-    // cell for the duration of this call.
-    unsafe { *errno_location() = 0 };
-}
-
-#[cfg(unix)]
-fn current_errno() -> libc::c_int {
-    // SAFETY: see `clear_errno`.
-    unsafe { *errno_location() }
-}
-
 /// List non-dot entry names of an open directory descriptor via `fdopendir`
 /// on an INDEPENDENTLY reopened fd for the same directory (`openat(dir_fd,
 /// ".", O_NOFOLLOW)`, never `dup(dir_fd)`) — the caller's descriptor stays
@@ -2140,6 +2111,28 @@ async fn release_abandoned_blob_gc_claim_batch(sql: &dyn SqlAccess) -> StorageRe
     })
 }
 
+/// Candidate ownership for every GC accounting and claim site.
+///
+/// The exact-V21 admission gate remains unchanged. Its legacy schema has no
+/// quarantine table, so callers select the canonical-only fragment when that
+/// table is absent rather than preparing a reference to a missing table.
+fn blob_gc_unowned_attachment_predicate(quarantine_present: bool) -> &'static str {
+    if quarantine_present {
+        "NOT EXISTS ( \
+           SELECT 1 FROM attachments \
+           WHERE content_ref = candidate.value \
+         ) AND NOT EXISTS ( \
+           SELECT 1 FROM attachment_quarantine \
+           WHERE content_ref = candidate.value \
+         )"
+    } else {
+        "NOT EXISTS ( \
+           SELECT 1 FROM attachments \
+           WHERE content_ref = candidate.value \
+         )"
+    }
+}
+
 async fn claim_blob_gc_batch(
     sql: &dyn SqlAccess,
     root_key: String,
@@ -2170,15 +2163,34 @@ async fn claim_blob_gc_batch(
     let claimed_at = chrono::Utc::now().timestamp_micros();
     let op: AtomicUnitOp = Box::new(move |writer| {
         Box::pin(async move {
+            let quarantine_present = required_nonnegative_count(
+                writer
+                    .query_scalar(SqlStatement {
+                        sql: "SELECT COUNT(*) FROM sqlite_master \
+                              WHERE type = 'table' AND name = 'attachment_quarantine'"
+                            .to_string(),
+                        params: vec![],
+                        label: Some("blob_gc_quarantine_table_present".to_string()),
+                    })
+                    .await?,
+                "blob_gc_quarantine_table_present",
+            )?;
+            let ownership_predicate = match quarantine_present {
+                0 => blob_gc_unowned_attachment_predicate(false),
+                1 => blob_gc_unowned_attachment_predicate(true),
+                _ => {
+                    return Err(StorageError::Internal(
+                        "blob GC quarantine table presence returned an invalid count".into(),
+                    ));
+                }
+            };
             let grace_period_skipped = required_nonnegative_count(
                 writer
                     .query_scalar(SqlStatement {
-                        sql: "SELECT COUNT(*) FROM json_each(?1) AS candidate \
-                              WHERE NOT EXISTS ( \
-                                SELECT 1 FROM attachments \
-                                WHERE content_ref = candidate.value \
-                              )"
-                        .to_string(),
+                        sql: format!(
+                            "SELECT COUNT(*) FROM json_each(?1) AS candidate \
+                             WHERE {ownership_predicate}"
+                        ),
                         params: vec![SqlValue::Text(grace_json)],
                         label: Some("blob_gc_count_grace_candidates_batch".to_string()),
                     })
@@ -2190,12 +2202,10 @@ async fn claim_blob_gc_batch(
                 let would_delete = required_nonnegative_count(
                     writer
                         .query_scalar(SqlStatement {
-                            sql: "SELECT COUNT(*) FROM json_each(?1) AS candidate \
-                                  WHERE NOT EXISTS ( \
-                                    SELECT 1 FROM attachments \
-                                    WHERE content_ref = candidate.value \
-                                  )"
-                            .to_string(),
+                            sql: format!(
+                                "SELECT COUNT(*) FROM json_each(?1) AS candidate \
+                                 WHERE {ownership_predicate}"
+                            ),
                             params: vec![SqlValue::Text(eligible_json)],
                             label: Some("blob_gc_count_dry_run_candidates_batch".to_string()),
                         })
@@ -2211,14 +2221,12 @@ async fn claim_blob_gc_batch(
 
             writer
                 .execute(SqlStatement {
-                    sql: "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
-                          SELECT ?1, candidate.value, ?3 \
-                          FROM json_each(?2) AS candidate \
-                          WHERE NOT EXISTS ( \
-                            SELECT 1 FROM attachments \
-                            WHERE content_ref = candidate.value \
-                          )"
-                    .to_string(),
+                    sql: format!(
+                        "INSERT INTO blob_gc_claims (root_key, content_ref, claimed_at) \
+                         SELECT ?1, candidate.value, ?3 \
+                         FROM json_each(?2) AS candidate \
+                         WHERE {ownership_predicate}"
+                    ),
                     params: vec![
                         SqlValue::Text(root_key.clone()),
                         SqlValue::Text(eligible_json),
@@ -3458,6 +3466,10 @@ mod db_ownership_sync_hook {
             .and_then(VecDeque::pop_front)
     }
 }
+
+#[cfg(test)]
+#[path = "blob/quarantine_liveness_tests.rs"]
+mod quarantine_liveness_tests;
 
 #[cfg(test)]
 mod tests {

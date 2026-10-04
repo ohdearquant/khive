@@ -21,18 +21,30 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use khive_pack_tool::policy::{actor_label, decide};
+use khive_pack_tool::policy::{
+    actor_label, decide_with_receipt, opt_u32 as opt_limit, DecisionCaller, DecisionInvocation,
+};
 use khive_pack_tool::{registry_policy_inputs, RegistryPin};
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::ContentRef;
 
-use crate::capture::{drain, walk, CaptureRead, Tail};
+#[cfg(unix)]
+use crate::capture::{drain_until, walk, CaptureRead, CaptureRoot, DrainStop, Drained, Tail};
+use crate::membership::{MembershipWork, SuppliedRefs};
+use crate::process_cleanup::{ProcessCleanup, TreeQuiescence};
 use crate::receipts;
 use crate::sandbox::{self, check_binary, render_profile, Resolved};
 use crate::tree::{self, digest_hex, Change, TreeEntry};
 
 const MAX_RUN_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_TOOL_BINARY_BYTES: u64 = MAX_RUN_INPUT_BYTES;
+#[cfg(unix)]
+const OUTPUT_CLOSE_GRACE: Duration = Duration::from_millis(250);
+
+#[cfg(test)]
+type CaptureBeforeReadHook = (PathBuf, Arc<dyn Fn(&Path) + Send + Sync>);
+#[cfg(test)]
+static CAPTURE_BEFORE_READ_HOOK: Mutex<Vec<CaptureBeforeReadHook>> = Mutex::new(Vec::new());
 
 // ── parameter helpers ────────────────────────────────────────────────────────
 
@@ -50,16 +62,6 @@ fn req_str(params: &Value, key: &str) -> Result<String, RuntimeError> {
     match opt_str(params, key)? {
         Some(s) if !s.trim().is_empty() => Ok(s),
         _ => Err(RuntimeError::InvalidInput(format!("{key} is required"))),
-    }
-}
-
-fn opt_limit(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
-    match params.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(v) => v
-            .as_u64()
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
-            .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} must be a positive integer"))),
     }
 }
 
@@ -227,10 +229,11 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
             .collect(),
     );
     let next = tree::parse_entries(&candidate)?;
+    let supplied = SuppliedRefs::new(&supplied_refs, MembershipWork::for_runtime(rt));
     // A caller-supplied ref that names no object refuses here, still before any write.
     let referenced: Vec<TreeEntry> = next
         .iter()
-        .filter(|entry| supplied_refs.contains(&entry.content_ref))
+        .filter(|entry| supplied.contains(&entry.content_ref))
         .cloned()
         .collect();
     tree::verify_blobs(rt, &referenced).await?;
@@ -352,7 +355,10 @@ struct Receipt {
     exit_code: Option<i64>,
     exit_signal: Option<i64>,
     limiting_resource: Option<&'static str>,
+    // Deadline outcome only; detached descendants can outlive the run (ADR-181 Amendment 11).
     timed_out: bool,
+    process_cleanup: ProcessCleanup,
+    tree_quiescence: TreeQuiescence,
     denied: bool,
     success: bool,
     reason: Option<String>,
@@ -368,6 +374,10 @@ struct Receipt {
     stderr_retained: u64,
     stdout_capture: &'static str,
     stderr_capture: &'static str,
+    // "none" before capture runs, then "complete", "failed", or "degraded"
+    // when the run directory no longer resolves to the pinned descriptor.
+    tree_capture: &'static str,
+    tree_capture_detail: Option<String>,
     changed: Vec<Change>,
     undeclared: Vec<String>,
     skipped: Vec<String>,
@@ -400,6 +410,8 @@ impl Receipt {
             "exit_signal": self.exit_signal,
             "limiting_resource": self.limiting_resource,
             "timed_out": self.timed_out,
+            "process_cleanup": self.process_cleanup,
+            "tree_quiescence": self.tree_quiescence,
             "denied": self.denied,
             "success": self.success,
             "reason": self.reason,
@@ -413,6 +425,8 @@ impl Receipt {
             "stderr_retained_bytes": self.stderr_retained,
             "stdout_capture": self.stdout_capture,
             "stderr_capture": self.stderr_capture,
+            "tree_capture": self.tree_capture,
+            "tree_capture_detail": self.tree_capture_detail,
             "changed": self.changed.iter().map(Change::to_json).collect::<Vec<_>>(),
             "undeclared_changes": self.undeclared,
             "skipped": self.skipped,
@@ -790,6 +804,8 @@ fn refusal_error(reason: &str, receipt: &Receipt) -> RuntimeError {
         "effective_max_output_bytes".into(),
         json!(receipt.effective_max_output_bytes),
     );
+    detail.insert("process_cleanup".into(), json!(receipt.process_cleanup));
+    detail.insert("tree_quiescence".into(), json!(receipt.tree_quiescence));
     RuntimeError::RefusedWithReceipt(Box::new(khive_runtime::ReceiptRefusal {
         code: receipt.refusal_code,
         // Unchanged wording: the id stays inside the sentence for readers that
@@ -825,6 +841,8 @@ pub async fn run(
         exit_signal: None,
         limiting_resource: None,
         timed_out: false,
+        process_cleanup: ProcessCleanup::seatbelt_unobserved(),
+        tree_quiescence: TreeQuiescence::Unverified,
         denied: false,
         success: false,
         reason: None,
@@ -840,6 +858,8 @@ pub async fn run(
         stderr_retained: 0,
         stdout_capture: "none",
         stderr_capture: "none",
+        tree_capture: "none",
+        tree_capture_detail: None,
         changed: vec![],
         undeclared: vec![],
         skipped: vec![],
@@ -970,11 +990,15 @@ async fn preflight_policy(
         .as_ref()
         .and_then(|properties| properties.get("side_effect"))
         .and_then(Value::as_str);
-    decide(
+    decide_with_receipt(
         rt,
-        token.namespace().as_str(),
-        actor,
-        &entity.name,
+        DecisionInvocation {
+            token,
+            actor,
+            tool: &entity.name,
+            registered: true,
+            caller: DecisionCaller::ExecRun,
+        },
         side_effect,
         Some(&pin),
     )
@@ -1272,12 +1296,6 @@ fn materialize_entries(
     Ok(())
 }
 
-fn declared_covers(declared: &[String], path: &str) -> bool {
-    declared
-        .iter()
-        .any(|d| d == path || path.starts_with(&format!("{d}/")))
-}
-
 /// The resource identifier `setrlimit` takes: an enum-typed integer on glibc,
 /// a plain `c_int` on every other unix libc.
 #[cfg(all(unix, target_os = "linux", target_env = "gnu"))]
@@ -1415,6 +1433,9 @@ async fn execute(
         return Ok(());
     }
     receipt.owned_run_dir = Some(run_dir.clone());
+    let capture_root = CaptureRoot::open(&run_dir).map_err(|error| {
+        RuntimeError::Unconfigured(format!("open capture root {}: {error}", run_dir.display()))
+    })?;
     if let Err(error) = receipts::event(
         rt,
         ns,
@@ -1536,8 +1557,9 @@ async fn execute(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
     let cap = cfg.max_output_bytes;
-    let out_task = tokio::spawn(async move { drain(stdout, cap).await });
-    let err_task = tokio::spawn(async move { drain(stderr, cap).await });
+    let deadline = wall_started + req.timeout;
+    let out_task = tokio::spawn(async move { drain_until(stdout, cap, deadline).await });
+    let err_task = tokio::spawn(async move { drain_until(stderr, cap, deadline).await });
 
     let (enforced, waited) = collect_report_and_wait(
         wall_started,
@@ -1568,11 +1590,20 @@ async fn execute(
             None
         }
     };
-    // Whatever the child left behind in its group ends with the run.
+    // Signal any remaining members of the initial group. A descendant that
+    // called setsid is outside this group and can outlive the run.
     kill_group(pid);
-    let out: Tail = out_task.await.unwrap_or_else(|_| Tail::new(cap));
-    let err: Tail = err_task.await.unwrap_or_else(|_| Tail::new(cap));
+    let out = collect_stream(out_task, deadline, cap).await;
+    let err = collect_stream(err_task, deadline, cap).await;
+    if out.stop == DrainStop::Deadline || err.stop == DrainStop::Deadline {
+        receipt.timed_out = true;
+        append_failure_reason(receipt, "output collection reached the run deadline".into());
+    }
+    if out.stop == DrainStop::ReadError || err.stop == DrainStop::ReadError {
+        append_failure_reason(receipt, "output collection failed to read a stream".into());
+    }
     receipt.finished_at = Some(receipts::now_micros());
+    // "exited" observes the directly waited child, not the whole process tree.
     if let Err(error) = receipts::event(
         rt,
         ns,
@@ -1592,18 +1623,18 @@ async fn execute(
     }
 
     // Outputs.
-    receipt.stdout_produced = out.produced();
-    receipt.stderr_produced = err.produced();
-    let out_bytes = out.retained();
-    let err_bytes = err.retained();
+    receipt.stdout_produced = out.tail.produced();
+    receipt.stderr_produced = err.tail.produced();
+    let out_bytes = out.tail.retained();
+    let err_bytes = err.tail.retained();
     receipt.stdout_retained = out_bytes.len() as u64;
     receipt.stderr_retained = err_bytes.len() as u64;
-    receipt.stdout_capture = if out.complete() {
+    receipt.stdout_capture = if out.stop == DrainStop::Eof && out.tail.complete() {
         "complete"
     } else {
         "incomplete"
     };
-    receipt.stderr_capture = if err.complete() {
+    receipt.stderr_capture = if err.stop == DrainStop::Eof && err.tail.complete() {
         "complete"
     } else {
         "incomplete"
@@ -1613,9 +1644,33 @@ async fn execute(
 
     // Capture errors describe a completed, unsuccessful run. Finalize its
     // receipt rather than propagating past receipt insertion in `run`.
+    let mut root_unconfirmed: Option<String> = None;
+    let declared = req
+        .declared
+        .as_ref()
+        .map(|paths| tree::DeclaredCoverage::new(paths, MembershipWork::for_runtime(rt)));
     let captured: Result<(), RuntimeError> = async {
         let (found, skipped) =
-            walk(&run_dir).map_err(|e| RuntimeError::Unconfigured(format!("capture tree: {e}")))?;
+            walk(&capture_root)
+                .map_err(|e| RuntimeError::Unconfigured(format!("capture tree: {e}")))?;
+        // A run directory the tool removed, or removed and recreated, lists as
+        // empty through the pinned descriptor. That is not evidence the tool
+        // wrote nothing, so the walk result is withheld rather than published
+        // as its output; so is one whose current path cannot be confirmed.
+        match capture_root.missing_root() {
+            Ok(None) => {}
+            Ok(Some(detail)) => {
+                root_unconfirmed = Some(detail);
+                return Ok(());
+            }
+            // No descriptor-to-path query on this platform (ADR-181 Amendment 11).
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(error) => {
+                return Err(RuntimeError::Unconfigured(format!(
+                    "capture root check: {error}"
+                )))
+            }
+        }
         receipt.skipped = skipped;
         let input: BTreeMap<&str, &TreeEntry> =
             ready.entries.iter().map(|e| (e.path.as_str(), e)).collect();
@@ -1636,6 +1691,16 @@ async fn execute(
                     out_entries.push((*old).clone());
                 }
                 continue;
+            }
+            #[cfg(test)]
+            if let Some(hook) = CAPTURE_BEFORE_READ_HOOK
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(root, _)| run_dir.starts_with(root))
+                .map(|(_, hook)| Arc::clone(hook))
+            {
+                hook(&run_dir.join(path));
             }
             let captured = file
                 .read_content_bounded(khive_storage::MAX_BLOB_WHOLE_BYTES)
@@ -1660,10 +1725,9 @@ async fn execute(
                     out_entries.push((*old).clone());
                 }
                 existing => {
-                    let allowed = req
-                        .declared
+                    let allowed = declared
                         .as_ref()
-                        .is_none_or(|d| declared_covers(d, path));
+                        .is_none_or(|d| d.covers(path));
                     if !allowed {
                         undeclared.insert(path.clone());
                         if let Some(old) = existing {
@@ -1695,10 +1759,9 @@ async fn execute(
             if found.contains_key(*path) {
                 continue;
             }
-            let allowed = req
-                .declared
+            let allowed = declared
                 .as_ref()
-                .is_none_or(|d| declared_covers(d, path));
+                .is_none_or(|d| d.covers(path));
             if !allowed {
                 undeclared.insert(path.to_string());
                 out_entries.push((*old).clone());
@@ -1729,6 +1792,7 @@ async fn execute(
     }
     .await;
     if let Err(error) = captured {
+        receipt.tree_capture = "failed";
         append_failure_reason(receipt, error.to_string());
         receipt.tree_out = None;
         receipt.changed.clear();
@@ -1738,7 +1802,20 @@ async fn execute(
         finish_cleanup(receipt, &run_dir, &profile_path, false);
         return Ok(());
     }
+    if let Some(detail) = root_unconfirmed {
+        // The tool's own exit status stays as recorded; only capture's verdict
+        // changes, and no output tree is claimed for the run.
+        receipt.tree_capture = "degraded";
+        append_failure_reason(receipt, format!("capture degraded: {detail}"));
+        receipt.tree_capture_detail = Some(detail);
+        receipt.tree_out = None;
+        receipt.changed.clear();
+        receipt.undeclared.clear();
+        finish_cleanup(receipt, &run_dir, &profile_path, false);
+        return Ok(());
+    }
 
+    receipt.tree_capture = "complete";
     finish_cleanup(receipt, &run_dir, &profile_path, cfg.keep);
     Ok(())
 }
@@ -1776,12 +1853,7 @@ fn finish_cleanup(receipt: &mut Receipt, run_dir: &Path, profile_path: &Path, ke
 
 #[cfg(unix)]
 fn kill_group(pid: i32) {
-    if pid <= 0 {
-        return;
-    }
-    unsafe {
-        libc::killpg(pid, libc::SIGKILL);
-    }
+    let _ = khive_runtime::process_group::signal_process_group(pid, libc::SIGKILL);
 }
 
 #[cfg(unix)]
@@ -1828,6 +1900,29 @@ fn limit_pipe() -> Result<(libc::c_int, libc::c_int), RuntimeError> {
         }
     }
     Ok((fds[0], fds[1]))
+}
+
+#[cfg(unix)]
+async fn collect_stream(
+    mut task: tokio::task::JoinHandle<Drained>,
+    deadline: tokio::time::Instant,
+    cap: u64,
+) -> Drained {
+    match tokio::time::timeout_at(deadline + OUTPUT_CLOSE_GRACE, &mut task).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => Drained {
+            tail: Tail::new(cap),
+            stop: DrainStop::ReadError,
+        },
+        Err(_) => {
+            task.abort();
+            let _ = task.await;
+            Drained {
+                tail: Tail::new(cap),
+                stop: DrainStop::Deadline,
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1893,9 +1988,21 @@ fn read_limit_report(reader: libc::c_int, wait: Duration) -> Value {
     }
 }
 
+#[cfg(test)]
+#[path = "parameter_helpers_tests.rs"]
+mod parameter_helpers_tests;
+
+#[cfg(test)]
+#[path = "process_cleanup_tests.rs"]
+mod process_cleanup_tests;
+
 #[cfg(all(test, unix))]
 #[path = "grant_pin_tests.rs"]
 mod grant_pin_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "capture_run_tests.rs"]
+mod capture_run_tests;
 
 #[cfg(all(test, unix))]
 mod tests {

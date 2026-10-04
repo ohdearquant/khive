@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use khive_gate::{check_with_mailbox_policy, mailbox_read_owner};
+use khive_storage::note::{Note, NoteMailboxScope};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -14,6 +15,75 @@ use crate::{
 pub struct MailboxView {
     pub actor_id: String,
     pub delegated: bool,
+}
+
+impl MailboxView {
+    fn legacy_local(&self, token: &NamespaceToken) -> bool {
+        !self.delegated && token.actor().is_anonymous() && token.actor().id == "local"
+    }
+
+    /// The same partition as [`Self::permits_message_note`], in the form a
+    /// note store applies inside its query so a scan window never holds rows
+    /// this view hides.
+    pub fn note_scope(&self, token: &NamespaceToken) -> NoteMailboxScope {
+        NoteMailboxScope {
+            actor_id: self.actor_id.clone(),
+            legacy_local: self.legacy_local(token),
+        }
+    }
+
+    /// The same actor partitions as Comm's inbox and sent views. Generic note
+    /// reads apply this before returning message rows, including broad
+    /// kind=note reads that encounter a message row.
+    pub fn permits_message_note(&self, token: &NamespaceToken, note: &Note) -> bool {
+        permits_message_note(&self.actor_id, self.legacy_local(token), note)
+    }
+
+    /// [`Self::permits_message_note`] for a view already reduced to its
+    /// store-side [`NoteMailboxScope`], so a caller-supplied cursor or key
+    /// anchor is judged by the same rule as the rows the scope admits.
+    pub fn scope_permits_message_note(scope: &NoteMailboxScope, note: &Note) -> bool {
+        permits_message_note(&scope.actor_id, scope.legacy_local, note)
+    }
+}
+
+fn permits_message_note(actor_id: &str, legacy_local: bool, note: &Note) -> bool {
+    if note.kind != "message" {
+        return true;
+    }
+    let properties = note.properties.as_ref();
+    let text = |key: &str| -> Option<&str> {
+        properties
+            .and_then(|value| value.get(key))
+            .and_then(Value::as_str)
+    };
+    match text("direction") {
+        Some("inbound") => {
+            text("to_actor") == Some(actor_id)
+                || (legacy_local
+                    && properties
+                        .and_then(|p| p.get("to_actor"))
+                        .is_none_or(Value::is_null))
+        }
+        Some("outbound") => {
+            text("from_actor") == Some(actor_id)
+                || (legacy_local
+                    && properties
+                        .and_then(|p| p.get("from_actor"))
+                        .is_none_or(Value::is_null))
+        }
+        // Pre-v1 local rows can lack all routing fields. Named callers
+        // never inherit that unattributed pool.
+        None => {
+            legacy_local
+                && properties
+                    .and_then(|p| p.get("direction"))
+                    .is_none_or(Value::is_null)
+                && text("from_actor").is_none()
+                && text("to_actor").is_none()
+        }
+        _ => false,
+    }
 }
 
 /// The same strict selector check is used before ordinary/intercepted dispatch
@@ -38,11 +108,15 @@ impl KhiveRuntime {
         args: &Value,
     ) -> RuntimeResult<MailboxView> {
         let selector_field = match verb {
-            "comm.inbox" | "comm.thread" => "mailbox_actor",
-            "comm.probe" => "actor",
+            "comm.inbox" | "comm.thread" => Some("mailbox_actor"),
+            "comm.probe" => Some("actor"),
+            // Generic message reads have no cross-actor selector. The caller
+            // still needs the ordinary verb gate decision and a row-level
+            // mailbox filter before any message can be returned.
+            "list" | "search" | "get" | "context" | "neighbors" => None,
             _ => {
                 return Err(RuntimeError::InvalidInput(
-                    "mailbox views are supported only by comm.inbox, comm.thread and comm.probe"
+                    "mailbox views are supported only by comm.inbox, comm.thread, comm.probe, list, search, get, context and neighbors"
                         .into(),
                 ));
             }
@@ -54,9 +128,15 @@ impl KhiveRuntime {
             args.clone(),
         );
         validate_mailbox_request(&req)?;
-        if args.get(selector_field).and_then(Value::as_str) != selector {
+        if let Some(selector_field) = selector_field {
+            if args.get(selector_field).and_then(Value::as_str) != selector {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "mailbox selector must match the original {selector_field} argument"
+                )));
+            }
+        } else if selector.is_some() {
             return Err(RuntimeError::InvalidInput(format!(
-                "mailbox selector must match the original {selector_field} argument"
+                "{verb} has no cross-actor mailbox selector"
             )));
         }
         match check_with_mailbox_policy(self.config().gate.as_ref(), &req) {

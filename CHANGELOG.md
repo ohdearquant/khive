@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- Five public `khive-runtime` methods that returned only a vector or a record and so hid
+  embedding-input truncation are no longer public entry points. This is a source-breaking change
+  for an out-of-tree Rust consumer. `KhiveRuntime::embed_document_with_model` is removed; migrate
+  to `embed_document_with_model_outcome`. `KhiveRuntime::create_entity`,
+  `KhiveRuntime::update_entity` and `KhiveRuntime::update_note` are no longer public; migrate to
+  `create_entity_with_embedding_report`, `update_entity_with_embedding_report` and
+  `update_note_with_embedding_report`. The `create_notes_atomic` re-export is dropped from the
+  crate root; migrate to `create_notes_atomic_with_report`, which keeps the same all-or-none note
+  write and adds the aggregate report.
+- `KhiveRuntime::hybrid_search_with_strategy` is removed. Nothing in the workspace called it
+  outside its own tests, and `KhiveRuntime::hybrid_search` remains the one entity search entry
+  point. This is a source-breaking change for an out-of-tree Rust consumer. `hybrid_search` takes
+  no fusion strategy, and its text leg covers every namespace visible to the caller, where the
+  removed method searched the caller's primary namespace only.
+
+### Changed
+
+- Legacy write methods that previously returned `Ok(record)` when the embedder bounded their input
+  now return an error that carries `committed=true`, the committed `record_id` and the serialized
+  truncation report, with `retryable=false`. The stored record is complete, so reconcile by
+  `record_id` rather than retrying the mutation. The affected methods are
+  `create_entity_with_attachments`, `create_note`, `create_note_with_embedding_content`,
+  `create_note_with_decay`, `create_note_with_decay_for_embedding_model` and
+  `update_entity_if_unchanged`. Input within the embedder limit keeps the previous return value.
+  Report-aware counterparts return the record and the report together:
+  `create_entity_with_attachments_and_report`, `create_note_with_embedding_content_and_report`
+  (pass `None` for the default note path, which also replaces `create_note`),
+  `create_note_with_decay_and_report`, `create_note_with_decay_for_embedding_model_and_report` and
+  `update_entity_if_unchanged_with_embedding_report`.
+- `embed_document`, `embed_document_batch_with_model` and `embed_document_batch` now return an
+  error when the embedder bounds any input. Use `embed_document_outcome`,
+  `embed_document_batch_with_model_outcomes` or `embed_document_batch_outcomes` to receive the
+  bounded vectors with their byte counts.
+- `memory.remember` retains its visibility token while disclosing bounded embedding input on a
+  fresh keyed or unkeyed write. An identical keyed replay keeps the original fences and reports
+  the truncation computed for that content. Receipt-only Rust entry points remain available, and
+  report-returning entry points are added.
+
+- Fresh, uncorrelated inbound email now defaults to the `channel:email` mailbox
+  when `KHIVE_EMAIL_DEFAULT_ACTOR` is unset or blank. Deployments currently
+  reading new mail from `local` must configure a `channel:email` serving actor
+  with `[actor].mailbox_readers` and select that mailbox, or explicitly set
+  `KHIVE_EMAIL_DEFAULT_ACTOR=local` to retain the previous routing. Correlated
+  replies still route to the original sender.
+- `khive-retrieval` no longer compiles `khive-hnsw`, `khive-bm25` or `khive-db` by default. The
+  `khive-hnsw` and `khive-bm25` types it re-exports at the crate root (`HnswIndex`, `HnswConfig`,
+  `Bm25Index`, `Bm25Config` and the rest) are now behind the new `hnsw` and `bm25` features, so a
+  Rust consumer that uses them must enable the matching feature. `persist` implies both and
+  `checkpoint` implies `hnsw`, so those consumers need no change. `khive-db` is now a
+  dev-dependency only.
+
 ## [0.9.0] - 2026-09-27
 
 ### Removed

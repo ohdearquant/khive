@@ -88,14 +88,22 @@ fn registry() -> khive_runtime::VerbRegistry {
     builder.build().expect("real registry")
 }
 
+/// Stored inbound rows belong to the poll loop's landing actor, so they are
+/// listed through that mailbox owner. `None` reads as the anonymous caller.
 async fn messages(
     registry: &khive_runtime::VerbRegistry,
+    actor_id: Option<&str>,
 ) -> Result<serde_json::Value, khive_runtime::RuntimeError> {
     registry
-        .dispatch(
+        .dispatch_with_identity(
             "list",
             serde_json::json!({
                 "namespace": "local", "kind": "message", "limit": 50,
+            }),
+            Some(khive_runtime::RequestIdentity {
+                namespace: "local".to_string(),
+                actor_id: actor_id.map(str::to_string),
+                ..Default::default()
             }),
         )
         .await
@@ -180,7 +188,10 @@ mod email {
             .unwrap()
             .unwrap();
         assert_eq!(initial.checkpoint, checkpoint(7));
-        assert_eq!(messages(&registry).await.unwrap(), serde_json::json!([]));
+        assert_eq!(
+            messages(&registry, Some("actor:test")).await.unwrap(),
+            serde_json::json!([])
+        );
         let channel = Arc::new(ReadyPage {
             calls: AtomicUsize::new(0),
         });
@@ -204,7 +215,7 @@ mod email {
             async {
                 (
                     load_channel_cursor(&registry, KIND, KIND).await,
-                    messages(&registry).await,
+                    messages(&registry, Some("actor:test")).await,
                 )
             },
             &mut task,
@@ -237,7 +248,7 @@ mod email {
             .await
             .unwrap()
             .unwrap();
-        let final_messages = messages(&registry).await.unwrap();
+        let final_messages = messages(&registry, Some("actor:test")).await.unwrap();
         eprintln!("email timing controls passed: {boundary:?}; existing checkpoint and real ingest observed");
         assert_eq!(
             final_checkpoint.checkpoint,
@@ -305,7 +316,10 @@ mod telegram {
             "the third transport response is immediately ready"
         );
         let registry = registry();
-        assert_eq!(messages(&registry).await.unwrap(), serde_json::json!([]));
+        assert_eq!(
+            messages(&registry, None).await.unwrap(),
+            serde_json::json!([])
+        );
         let token = CancellationToken::new();
         let gate = Gate::new(boundary);
         let mut task = tokio::spawn(ACTIVE.scope(
@@ -322,7 +336,7 @@ mod telegram {
         let parked_offsets = fixture.offsets();
         let parked_requests = fixture.requested_offsets();
         let parked_pages = fixture.remaining_pages();
-        let parked_messages = observe(messages(&registry), &mut task).await;
+        let parked_messages = observe(messages(&registry, None), &mut task).await;
         let cancelled_before = token.is_cancelled();
         token.cancel();
         gate.release.add_permits(1);
@@ -353,7 +367,7 @@ mod telegram {
         if expect_commit {
             assert_eq!(parked_messages[0]["properties"]["external_id"], "tg:555:10");
         }
-        let final_messages = messages(&registry).await.unwrap();
+        let final_messages = messages(&registry, None).await.unwrap();
         eprintln!("telegram timing controls passed: {boundary:?}; actual adapter offsets and real ingest observed");
         assert_eq!(
             fixture.offsets(),

@@ -21,6 +21,7 @@ khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
 khive-retrieval = { version = "0.9.0", path = "../khive-retrieval" }
 khive-score = { version = "0.9.0", path = "../khive-score" }
 khive-brain-core = { version = "0.9.0", path = "../khive-brain-core" }
+khive-text = { version = "0.9.0", path = "../khive-text" }
 khive-vamana = { version = "0.9.0", path = "../khive-vamana" }
 blake3 = { workspace = true }
 inventory = { workspace = true }
@@ -37,7 +38,7 @@ lru = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-khive-db = { version = "0.9.0", path = "../khive-db" }
+khive-db = { version = "0.9.0", path = "../khive-db", features = ["test-support"] }
 khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
 khive-pack-brain = { version = "0.9.0", path = "../khive-pack-brain" }
 # Dev-only: the acceptance arm for this pack's creation-admission hook proves it

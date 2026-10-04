@@ -168,6 +168,9 @@ impl AuditObligationFailure {
 /// checkout that expires before SQLite executes.
 pub const WRITER_POOL_CHECKOUT_TIMEOUT_STAGE: &str = "writer_pool_checkout_timeout";
 
+/// Stable ADR-194 WAL capacity stages, shared with the SQLite error source.
+pub use khive_db::{SQLITE_WAL_CAPACITY_REFUSED_STAGE, SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE};
+
 /// Stable wire code/stage for a bounded write-queue enqueue that never
 /// accepted the request within its configured deadline (#1382, #1643).
 pub const WRITER_QUEUE_SATURATED_STAGE: &str = "writer_queue_saturated";
@@ -579,6 +582,36 @@ impl std::error::Error for RefusalEventContext {
     }
 }
 
+/// Repo-anchor facts established before a `git.digest` ingest failed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ResolutionFacts {
+    pub project_id: Uuid,
+    pub duplicate_anchor_ids: Vec<Uuid>,
+    pub slug_backfilled: bool,
+    pub project_created: bool,
+    pub orphaned_project_id: Option<Uuid>,
+    pub orphaned_note_count: u64,
+}
+
+/// Preserve a resolved anchor's facts while exposing the original typed error.
+#[derive(Debug)]
+pub struct ResolutionFailureContext {
+    pub source: Box<RuntimeError>,
+    pub resolution: ResolutionFacts,
+}
+
+impl std::fmt::Display for ResolutionFailureContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self.source.as_ref(), formatter)
+    }
+}
+
+impl std::error::Error for ResolutionFailureContext {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Variants cover storage, query, validation, namespace isolation, and permission failures.
 /// Callers should match on `InvalidInput` for bad arguments, `NotFound` for missing records,
 /// and `NamespaceMismatch` (reported as not-found) for cross-namespace access attempts.
@@ -711,6 +744,11 @@ pub enum RuntimeError {
     /// an unchanged, unadorned refusal.
     #[error(transparent)]
     RefusedWithEvents { context: RefusalEventContext },
+
+    /// Preserve the original typed failure while carrying facts established
+    /// before a `git.digest` ingest failed.
+    #[error(transparent)]
+    WithResolution { context: ResolutionFailureContext },
 
     /// Gate denied this verb invocation.
     ///
@@ -852,6 +890,16 @@ impl From<khive_db::SqliteError> for RuntimeError {
 }
 
 impl RuntimeError {
+    /// Attach established repo-anchor facts without changing the source error.
+    pub fn with_resolution(self, resolution: ResolutionFacts) -> Self {
+        Self::WithResolution {
+            context: ResolutionFailureContext {
+                source: Box::new(self),
+                resolution,
+            },
+        }
+    }
+
     /// Attach only evidence for established, eligible targets. Missing/new targets
     /// contribute no entry, and an empty batch leaves the error variant unchanged.
     pub fn with_refusal_events(self, mut recordings: Vec<RefusalEventRecording>) -> Self {
@@ -872,14 +920,17 @@ impl RuntimeError {
         }
     }
 
-    /// Inspect the original typed error without treating event-recording failure
-    /// as the failed domain operation or losing its policy/retry classification.
+    /// Inspect the original typed error without losing its policy/retry
+    /// classification through evidence wrappers.
     pub fn refusal_source(&self) -> &Self {
         let mut error = self;
-        while let Self::RefusedWithEvents { context } = error {
-            error = &context.source;
+        loop {
+            error = match error {
+                Self::RefusedWithEvents { context } => &context.source,
+                Self::WithResolution { context } => context.source.as_ref(),
+                _ => return error,
+            };
         }
-        error
     }
 
     /// Whether the immutable stream record policy refused this write.
@@ -902,6 +953,14 @@ impl RuntimeError {
             reason: reason.into(),
             receipt: Box::new(DenialReceipt::not_audited()),
         }
+    }
+
+    /// An [`Internal`](Self::Internal) error whose message is `context: source`.
+    ///
+    /// Storage and SQL failures that have no typed variant of their own use
+    /// this shape, so the rendered text is defined here once.
+    pub fn internal_with_context(context: impl fmt::Display, source: impl fmt::Display) -> Self {
+        Self::Internal(format!("{context}: {source}"))
     }
 
     /// Classify a failed inbound channel write without inspecting rendered
@@ -964,6 +1023,7 @@ impl RuntimeError {
             Self::IncompatibleEventStore(_) => "IncompatibleEventStore",
             Self::RefusedWithReceipt { .. } => "RefusedWithReceipt",
             Self::RefusedWithEvents { context } => context.source.variant_name(),
+            Self::WithResolution { context } => context.source.variant_name(),
         }
     }
 
@@ -1423,9 +1483,10 @@ mod stream_policy_refusal_tests {
 
 #[cfg(test)]
 mod channel_ingest_failure_class_tests {
-    use super::{ChannelIngestFailureClass, RuntimeError};
+    use super::{ChannelIngestFailureClass, ResolutionFacts, RuntimeError};
     use crate::secret_gate::SecretMatch;
     use std::time::Duration;
+    use uuid::Uuid;
 
     #[test]
     fn secret_detected_is_permanent_by_typed_variant_not_display_text() {
@@ -1491,6 +1552,41 @@ mod channel_ingest_failure_class_tests {
                 reason: "InvalidInput"
             },
             "a rendered message resembling SecretDetected must remain Unknown unless its typed variant is SecretDetected"
+        );
+    }
+
+    #[test]
+    fn resolution_wrapper_keeps_remote_fetch_retry_classification() {
+        let wrapped = RuntimeError::RemoteFetchError {
+            remote: "https://example.com/repo".into(),
+            message: "cache repair failed".into(),
+        }
+        .with_resolution(ResolutionFacts {
+            project_id: Uuid::from_u128(1),
+            duplicate_anchor_ids: vec![],
+            slug_backfilled: false,
+            project_created: false,
+            orphaned_project_id: None,
+            orphaned_note_count: 0,
+        });
+        let RuntimeError::WithResolution { context } = &wrapped else {
+            panic!("expected resolution context");
+        };
+        assert!(matches!(
+            std::error::Error::source(context)
+                .and_then(|source| source.downcast_ref::<RuntimeError>()),
+            Some(RuntimeError::RemoteFetchError { .. })
+        ));
+        assert!(matches!(
+            wrapped.refusal_source(),
+            RuntimeError::RemoteFetchError { .. }
+        ));
+        assert!(wrapped.retryable_failure_context().is_none());
+        assert_eq!(
+            wrapped.channel_ingest_failure_class(),
+            ChannelIngestFailureClass::Unknown {
+                reason: "RemoteFetchError"
+            }
         );
     }
 

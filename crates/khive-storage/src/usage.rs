@@ -30,7 +30,7 @@
 //! counter *after* the resource is resolved (so a lookup that never reached
 //! the engine counts nothing) and *before* the error propagates.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -62,6 +62,7 @@ pub enum UsageUnit {
 #[derive(Debug, Default)]
 struct UsageInner {
     frozen: std::sync::OnceLock<Value>,
+    unmeasured: AtomicBool,
     embed_calls: AtomicU64,
     fts_passes: AtomicU64,
     vector_passes: AtomicU64,
@@ -80,6 +81,21 @@ pub struct UsageContext {
 impl UsageContext {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Permanently suppress shipping counters whose completeness is unknown.
+    pub fn mark_unmeasured(&self) {
+        self.inner.unmeasured.store(true, Ordering::Release);
+    }
+
+    /// The shipping snapshot, unless completeness became unknown. A mark wins
+    /// even when the counters were already frozen; later adds cannot clear it.
+    pub fn shipping_snapshot(&self) -> Option<Value> {
+        if self.inner.unmeasured.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.frozen_or_snapshot())
+        }
     }
 
     /// Add `n` to one counter. Saturating: a counter never wraps.
@@ -106,10 +122,9 @@ impl UsageContext {
     /// Freeze the counters once, at the audit-snapshot point (Amendment 2
     /// Part 3 ordering: after request-owned children are joined and non-audit
     /// appends have resolved, before the enclosing audit row is written).
-    /// The first call takes the snapshot; every later call — including the
-    /// response-envelope read — returns the same frozen object, so both read
-    /// paths carry the identical value even if stray increments (e.g. the
-    /// post-audit dispatch hook) land afterwards.
+    /// The first call takes the snapshot; later internal reads return the
+    /// same object even if stray increments land afterwards. Shipping reads
+    /// additionally check completeness with [`Self::shipping_snapshot`].
     pub fn freeze(&self) -> Value {
         self.inner.frozen.get_or_init(|| self.snapshot()).clone()
     }
@@ -122,10 +137,10 @@ impl UsageContext {
         }
     }
 
-    /// Freeze the counters into the wire `usage` object. Zero-valued counters
+    /// Read the counters for internal accounting. Zero-valued counters
     /// are omitted; a fully zero snapshot still returns an (empty) object —
     /// "measured, nothing counted" is distinct from "not measured", which is
-    /// represented by the absence of the object entirely.
+    /// represented by [`Self::shipping_snapshot`] returning `None`.
     pub fn snapshot(&self) -> Value {
         let mut map = serde_json::Map::new();
         let mut put = |key: &str, cell: &AtomicU64| {
@@ -170,6 +185,30 @@ pub fn count(unit: UsageUnit, n: u64) {
     }
     if let Ok(ctx) = CURRENT.try_with(Clone::clone) {
         ctx.add(unit, n);
+    }
+}
+
+/// Publish event rows only after a write has a known committed outcome.
+/// An unknown writer-task outcome makes the entire shipping snapshot unavailable,
+/// even if earlier work already produced measured counters. The original result
+/// and error remain unchanged.
+pub fn account_event_write(outcome: Result<u64, &crate::StorageError>) {
+    match outcome {
+        Ok(committed_rows) => count(UsageUnit::EventRows, committed_rows),
+        Err(
+            crate::StorageError::WriterTaskRequestFailed {
+                request_state: crate::WriterTaskRequestState::SideEffectsUnknown,
+                ..
+            }
+            | crate::StorageError::WriterTaskTerminated {
+                request_state: crate::WriterTaskRequestState::SideEffectsUnknown,
+            },
+        ) => {
+            if let Some(context) = current() {
+                context.mark_unmeasured();
+            }
+        }
+        Err(_) => {}
     }
 }
 
@@ -235,5 +274,34 @@ mod tests {
         ctx.add(UsageUnit::EventRows, u64::MAX);
         ctx.add(UsageUnit::EventRows, 5);
         assert_eq!(ctx.snapshot()["event_rows"], u64::MAX);
+    }
+
+    #[test]
+    fn unmeasured_mark_wins_after_freeze_and_later_increments() {
+        let ctx = UsageContext::new();
+        ctx.add(UsageUnit::EventRows, 2);
+        let frozen = ctx.freeze();
+        assert_eq!(ctx.shipping_snapshot(), Some(frozen.clone()));
+
+        ctx.clone().mark_unmeasured();
+        assert_eq!(ctx.shipping_snapshot(), None);
+        ctx.add(UsageUnit::EventRows, 3);
+        ctx.add(UsageUnit::EmbedCalls, 1);
+        assert_eq!(ctx.shipping_snapshot(), None);
+        assert_eq!(ctx.freeze(), frozen);
+        assert_eq!(ctx.frozen_or_snapshot(), frozen);
+        assert_eq!(ctx.snapshot()["event_rows"], 5);
+    }
+
+    #[test]
+    fn unmeasured_mark_before_freeze_preserves_internal_readers() {
+        let ctx = UsageContext::new();
+        assert_eq!(ctx.shipping_snapshot(), Some(serde_json::json!({})));
+        ctx.mark_unmeasured();
+        ctx.mark_unmeasured();
+        ctx.add(UsageUnit::DbRoundTrips, 1);
+        assert_eq!(ctx.shipping_snapshot(), None);
+        assert_eq!(ctx.freeze(), serde_json::json!({"db_round_trips": 1}));
+        assert_eq!(ctx.shipping_snapshot(), None);
     }
 }

@@ -1443,6 +1443,10 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     // Reopen through the normal runtime boot path -- this runs
     // `run_migrations` to latest, including V7's backfill.
     let config = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -1463,6 +1467,7 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
         allowed_outbound_namespaces: vec![],
         actor_id: Some(actor.into()),
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 
@@ -1636,6 +1641,10 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     // `run_migrations` to latest (including V8's forward repair) and the
     // fixed anti-join lazy bootstrap.
     let config = RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -1656,6 +1665,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
         allowed_outbound_namespaces: vec![],
         actor_id: Some(actor.into()),
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     };
     let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
 

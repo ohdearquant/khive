@@ -1,0 +1,231 @@
+# Base db226c9abf4c705ec2451ca6014a25ac042e0e84; open PRs observed 2026-09-28; held package manifests listed in packet.
+# path	owner(s)
+.github/workflows/bench-pipeline.yml	PR #3390
+.khive/.gitignore	PR #3475
+CHANGELOG.md	PR #3196
+cli/kg/init.ts	PR #3475
+cli/kg/init_test.ts	PR #3475
+cli/lib/paths.ts	PR #3475
+crates/Cargo.lock	PR #3485
+crates/khive-channel-email/src/lib.rs	PR #3269
+crates/khive-channel-telegram/docs/design.md	PR #3196
+crates/khive-db/benches/db_hot_path.rs	PR #3485
+crates/khive-db/docs/api/pool.md	package 2357
+crates/khive-db/sql/043-blob-pack-owners.sql	package 3327-3324-r6
+crates/khive-db/sql/043-graph-neighbor-weight-seek.sql	package 3487-package1-r10
+crates/khive-db/sql/043-memory-visibility-receipts.sql	package 3465-r6
+crates/khive-db/sql/043-recipient-transport.sql	PR #3506, package k3-r3, package k3-recipient-restack
+crates/khive-db/sql/043-vector-provenance.sql	PR #3485
+crates/khive-db/sql/044-blob-root-binding.sql	package 3327-3324-r6
+crates/khive-db/sql/graph-ddl.sql	package 3487-package1-r10
+crates/khive-db/sql/schema.sql	package 3487-package1-r10
+crates/khive-db/src/backend.rs	PR #3485
+crates/khive-db/src/diagnostics.rs	package 2025-adr165-slice3-r2, package 2357
+crates/khive-db/src/migrations.rs	PR #3485, PR #3506, package 3327-3324-r6, package 3465-r6, package 3487-package1-r10, package k3-recipient-restack
+crates/khive-db/src/migrations_tests.rs	PR #3485, PR #3506, package 3327-3324-r6, package 3487-package1-r10, package k3-r3, package k3-recipient-restack
+crates/khive-db/src/namespace_move.rs	PR #3485
+crates/khive-db/src/stores/blob.rs	package 3327-3324-r6
+crates/khive-db/src/stores/blob_binding.rs	package 3327-3324-r6
+crates/khive-db/src/stores/entity.rs	package hydration-class
+crates/khive-db/src/stores/entity_tests.rs	package hydration-class
+crates/khive-db/src/stores/graph.rs	package 3487-package1-r10
+crates/khive-db/src/stores/graph_tests.rs	package 3487-package1-r10
+crates/khive-db/src/stores/note.rs	PR #3506, package 3487-b-read-r5, package 3487-package1-r10, package k3-recipient-restack
+crates/khive-db/src/stores/note/recipient/mod.rs	PR #3506, package k3-recipient-restack
+crates/khive-db/src/stores/note/recipient/tests.rs	PR #3506, package k3-recipient-restack
+crates/khive-db/src/stores/note_tests.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-db/src/stores/orphan_sweep_dml_tests.rs	PR #3485
+crates/khive-db/src/stores/vectors.rs	PR #3485, package 2025-adr165-slice3-r2
+crates/khive-db/tests/vector_writer_census.rs	PR #3485
+crates/khive-mcp/src/daemon.rs	package etxtbsy-credential
+crates/khive-mcp/src/legacy_quarantine.rs	package 3503
+crates/khive-mcp/src/serve.rs	PR #3196, PR #3269, PR #3467, package 2025-adr165-slice3-r2, package 2357, package 3327-3324-r6, package 3467-r4, package 3487-b-read-r5, package 3487-package1-r10, package 3503
+crates/khive-mcp/src/serve_outbox.rs	PR #3269
+crates/khive-mcp/src/serve_outbox_claim_tests.rs	PR #3269
+crates/khive-mcp/src/serve_outbox_parity_tests.rs	PR #3269
+crates/khive-mcp/src/serve_outbox_slug_tests.rs	PR #3269
+crates/khive-mcp/src/serve_poll_cancel_tests.rs	PR #3196, package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-mcp/src/serve_poll_timing_tests.rs	PR #3196, package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-mcp/src/serve_reader_pool_tests.rs	PR #3467
+crates/khive-mcp/src/server.rs	package 2025-adr165-slice3-r2, package 3327-3324-r6
+crates/khive-merge/Cargo.lock	PR #3485
+crates/khive-mounts/src/client.rs	PR #3390
+crates/khive-mounts/tests/acceptance.rs	PR #3390
+crates/khive-mounts/tests/fixture.rs	PR #3390
+crates/khive-pack-brain/docs/api/fold-gate.md	PR #3492
+crates/khive-pack-brain/src/fold_gate.rs	PR #3492
+crates/khive-pack-brain/src/handlers.rs	PR #3492
+crates/khive-pack-brain/src/persist.rs	PR #3492
+crates/khive-pack-brain/src/serve_ledger.rs	PR #3492
+crates/khive-pack-brain/src/tests.rs	PR #3492
+crates/khive-pack-code/docs/api/clippy-adapter.md	PR #3410
+crates/khive-pack-code/docs/api/findings-ingest.md	PR #3410
+crates/khive-pack-code/docs/code-ontology.md	PR #3510
+crates/khive-pack-code/src/clippy_adapter.rs	PR #3410
+crates/khive-pack-code/src/lib.rs	PR #3410
+crates/khive-pack-code/src/manifest.rs	PR #3510
+crates/khive-pack-code/src/safe_source.rs	PR #3510
+crates/khive-pack-code/src/source_ingest.rs	PR #3510
+crates/khive-pack-code/tests/clippy_adapter.rs	PR #3410
+crates/khive-pack-code/tests/clippy_conversion_semantics.rs	PR #3410
+crates/khive-pack-code/tests/source_ingest.rs	PR #3510
+crates/khive-pack-code/tests/source_ingest_l2.rs	PR #3510
+crates/khive-pack-comm/docs/integration-tests.md	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-comm/src/handlers.rs	PR #3269, package 3503
+crates/khive-pack-comm/src/pack.rs	PR #3269, package 3503
+crates/khive-pack-comm/src/params.rs	package 3503
+crates/khive-pack-comm/src/vocab.rs	package 3503
+crates/khive-pack-comm/tests/integration.rs	PR #3269, PR #3506, package 3487-b-read-r5, package 3487-package1-r10, package k3-recipient-restack
+crates/khive-pack-exec/src/receipts.rs	package 3327-3324-r6
+crates/khive-pack-exec/src/tree.rs	package 3327-3324-r6
+crates/khive-pack-exec/tests/verbs.rs	PR #3402, package 3327-3324-r6
+crates/khive-pack-git/src/cache.rs	package etxtbsy-credential
+crates/khive-pack-git/src/credentials.rs	package etxtbsy-credential
+crates/khive-pack-git/src/ingest.rs	package etxtbsy-credential
+crates/khive-pack-git/src/local_git.rs	package 3327-3324-r6, package etxtbsy-credential
+crates/khive-pack-git/src/receipts.rs	package 3327-3324-r6
+crates/khive-pack-git/src/remote_transport.rs	package etxtbsy-credential
+crates/khive-pack-git/src/source.rs	package etxtbsy-credential
+crates/khive-pack-git/src/write_handlers.rs	package etxtbsy-credential
+crates/khive-pack-git/tests/dev_loop.rs	package 3327-3324-r6
+crates/khive-pack-kg/Cargo.toml	package 3487-package1-r10
+crates/khive-pack-kg/sql/message_threads_list.sql	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/apply_worker/tests.rs	PR #3402
+crates/khive-pack-kg/src/apply_worker/worker.rs	PR #3402
+crates/khive-pack-kg/src/dispatch.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handler_defs.rs	package 2357
+crates/khive-pack-kg/src/handlers/common.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/context.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/create.rs	PR #3402, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/db_diagnostics.rs	package 2357
+crates/khive-pack-kg/src/handlers/get.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/graph.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/link.rs	package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/list.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/merge.rs	PR #3402, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/mod.rs	package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/note_list.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/search.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/tests.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/update.rs	PR #3402, package 3487-package1-r10
+crates/khive-pack-kg/src/handlers/write_visibility.rs	package 3487-package1-r10
+crates/khive-pack-kg/tests/integration.rs	package 3487-package1-r10
+crates/khive-pack-knowledge/Cargo.toml	PR #3485
+crates/khive-pack-knowledge/README.md	package lexical-health-suggest
+crates/khive-pack-knowledge/docs/api/scoring-and-retrieval.md	package lexical-health-suggest
+crates/khive-pack-knowledge/src/knowledge/index_handler.rs	PR #3485
+crates/khive-pack-knowledge/src/knowledge/search.rs	package lexical-health-suggest
+crates/khive-pack-knowledge/src/knowledge/suggest_provenance_tests.rs	package lexical-health-suggest
+crates/khive-pack-knowledge/src/vocab.rs	package lexical-health-suggest
+crates/khive-pack-knowledge/tests/integration.rs	PR #3485
+crates/khive-pack-memory/docs/api/pack-integration.md	package 2025-adr165-slice3-r2
+crates/khive-pack-memory/docs/recall-reliability.md	package 3507-r2
+crates/khive-pack-memory/src/ann.rs	package 2025-adr165-slice3-r2, package 3465-r6
+crates/khive-pack-memory/src/handlers/common.rs	package 2025-adr165-slice3-r2, package 3465-r6
+crates/khive-pack-memory/src/handlers/mod.rs	package 2025-adr165-slice3-r2, package 3465-r6
+crates/khive-pack-memory/src/handlers/recall.rs	package 3465-r6, package 3487-package1-r10, package 3507-r2
+crates/khive-pack-memory/src/handlers/remember.rs	package 3465-r6, package 3487-package1-r10
+crates/khive-pack-memory/src/handlers/session_visibility_tests.rs	package 3465-r6
+crates/khive-pack-memory/src/handlers/sub_handlers.rs	package 3465-r6
+crates/khive-pack-memory/src/handlers/tests.rs	package 3465-r6
+crates/khive-pack-memory/src/lib.rs	package 2025-adr165-slice3-r2, package 3465-r6
+crates/khive-pack-memory/src/note_search.rs	package 2025-adr165-slice3-r2
+crates/khive-pack-memory/src/pack.rs	package 2025-adr165-slice3-r2, package 3465-r6, package 3487-package1-r10
+crates/khive-pack-memory/src/visibility.rs	package 3465-r6
+crates/khive-pack-session/Cargo.toml	package hydration-class
+crates/khive-pack-session/src/handlers/search.rs	package hydration-class
+crates/khive-pack-tool/Cargo.toml	PR #3402
+crates/khive-pack-tool/src/claim_tests.rs	PR #3402
+crates/khive-pack-tool/src/handlers.rs	PR #3402
+crates/khive-pack-tool/src/pin.rs	PR #3402
+crates/khive-pack-tool/tests/grant_pins.rs	PR #3402
+crates/khive-pack-tool/tests/verbs.rs	PR #3402
+crates/khive-pack-web/src/extract.rs	package 3327-3324-r6
+crates/khive-pack-web/src/fetch.rs	PR #3486, package 3327-3324-r6, package 3486-r10
+crates/khive-pack-web/src/ingest.rs	PR #3486
+crates/khive-pack-web/src/refresh.rs	PR #3486, package 3327-3324-r6, package 3486-r10
+crates/khive-pack-web/src/refresh_metadata_tests.rs	PR #3486, package 3486-r10
+crates/khive-pack-web/src/refresh_query_tests.rs	PR #3486
+crates/khive-pack-web/src/refresh_reuse_tests.rs	PR #3486
+crates/khive-pack-web/tests/backend_routing.rs	PR #3486
+crates/khive-query/README.md	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-query/src/compilers/sql.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-query/tests/compile_integration.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-runtime/docs/api/daemon.md	PR #3467
+crates/khive-runtime/docs/api/pack.md	package 2025-adr165-slice3-r2
+crates/khive-runtime/src/atomic_message.rs	PR #3485, package 3465-r6
+crates/khive-runtime/src/atomic_prepare.rs	PR #3402, PR #3485, package 3487-package1-r10
+crates/khive-runtime/src/blob.rs	package 3327-3324-r6
+crates/khive-runtime/src/comm_recipient.rs	PR #3506, package k3-recipient-restack
+crates/khive-runtime/src/comm_recipient/tests.rs	PR #3506, package k3-recipient-restack
+crates/khive-runtime/src/config.rs	PR #3485
+crates/khive-runtime/src/curation.rs	PR #3269, PR #3485
+crates/khive-runtime/src/daemon.rs	PR #3467, package 3467-r4
+crates/khive-runtime/src/email_message_id.rs	PR #3269
+crates/khive-runtime/src/embedder_registry.rs	PR #3485
+crates/khive-runtime/src/error_projection.rs	PR #3269, package 3467-r4
+crates/khive-runtime/src/keyed_memory.rs	package 3465-r6
+crates/khive-runtime/src/keyed_memory_tests.rs	package 3465-r6
+crates/khive-runtime/src/kg_read.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-runtime/src/lib.rs	PR #3269, PR #3506, package 2025-adr165-slice3-r2, package 2357, package 3487-b-read-r5, package 3487-package1-r10, package etxtbsy-credential, package k3-recipient-restack
+crates/khive-runtime/src/mailbox_view.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-runtime/src/note_index.rs	package 3465-r6
+crates/khive-runtime/src/note_read.rs	package 3487-package1-r10
+crates/khive-runtime/src/note_search_ann.rs	package 2025-adr165-slice3-r2
+crates/khive-runtime/src/note_store_guard.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-runtime/src/note_write.rs	PR #3485, package 3465-r6, package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-runtime/src/note_write_tests.rs	PR #3485
+crates/khive-runtime/src/operations.rs	PR #3402, package 2025-adr165-slice3-r2, package 3465-r6, package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-runtime/src/pack.rs	package 2025-adr165-slice3-r2, package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-runtime/src/process_retry.rs	package etxtbsy-credential
+crates/khive-runtime/src/retrieval.rs	PR #3485, package 2025-adr165-slice3-r2
+crates/khive-runtime/src/runtime.rs	PR #3485, package 2025-adr165-slice3-r2, package 2357, package 3327-3324-r6
+crates/khive-score/src/distance.rs	package 2025-adr165-slice3-r2
+crates/khive-score/src/lib.rs	package 2025-adr165-slice3-r2
+crates/khive-storage/Cargo.toml	PR #3485
+crates/khive-storage/src/blob.rs	package 3327-3324-r6
+crates/khive-storage/src/lib.rs	package 3327-3324-r6
+crates/khive-storage/src/note.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/khive-storage/src/types/graph.rs	package 3487-package1-r10
+crates/khive-storage/src/types/mod.rs	PR #3485
+crates/khive-storage/src/types/vector.rs	PR #3485
+crates/khive-storage/src/vectors.rs	PR #3485
+crates/khive-types/src/pack.rs	PR #3402
+crates/khive-vcs/src/sync.rs	PR #3475
+crates/kkernel/Cargo.toml	PR #3485
+crates/kkernel/src/atomic_apply.rs	package 3487-package1-r10
+crates/kkernel/src/cli.rs	PR #3467, package 3467-r4
+crates/kkernel/src/exec.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/kkernel/src/kg/fetch.rs	PR #3475
+crates/kkernel/src/kg/init.rs	PR #3475
+crates/kkernel/src/reindex.rs	PR #3485
+crates/kkernel/tests/memory_remember_keys.rs	PR #3467, package 3467-r4
+crates/kkernel/tests/message_atomic_write_measure.rs	package 3487-package1-r10
+crates/kkernel/tests/message_feedback_routing.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/kkernel/tests/message_generic_read_measure.rs	package 3487-b-read-r5, package 3487-package1-r10
+crates/kkernel/tests/message_generic_write_measure.rs	package 3487-package1-r10
+crates/kkernel/tests/message_memory_source_scope.rs	package 3487-package1-r10
+docs/adr/ADR-040-communication-and-schedule-packs.md	package 3487-b-read-r5, package 3487-package1-r10
+docs/adr/ADR-044-vector-store-extensions.md	PR #3485
+docs/adr/ADR-049-khived-daemon.md	PR #3467, package 3467-r4
+docs/adr/ADR-056-channel-transport-layer.md	PR #3196
+docs/adr/ADR-085-code-pack.md	PR #3510
+docs/adr/ADR-118-fresh-tail-recall-visibility.md	package 2025-adr165-slice3-r2
+docs/adr/ADR-122-email-outbound-delivery.md	PR #3269
+docs/adr/ADR-144-memory-write-visibility-fence.md	package 3465-r6
+docs/adr/ADR-165-read-path-performance-recovery.md	package 2025-adr165-slice3-r2
+docs/adr/ADR-179-operation-identity-memory-remember.md	PR #3467
+docs/adr/ADR-180-tool-pack.md	PR #3402
+docs/adr/ADR-191-web-pack-ontology-and-operations.md	PR #3486
+docs/guide/api-reference.md	package 2025-adr165-slice3-r2, package 2357, package 3487-b-read-r5, package 3487-package1-r10, package lexical-health-suggest
+docs/guide/communication.md	package 3487-b-read-r5, package 3487-package1-r10
+docs/operations.md	PR #3475
+docs/packs/mounts.md	PR #3390
+docs/packs/web.md	PR #3486
+python/docs/RESPONSE_WIRE_CONTRACT.md	PR #3269, package 3467-r4
+python/tests/test_fence_lists.py	PR #3467
+python/tests/test_memory_keys.py	package 3467-r4
+scripts/perf/bench_pipeline_daemon.py	PR #3390
+scripts/perf/mcp_bench_client.py	PR #3390
+scripts/perf/test_bench_pipeline_daemon.py	PR #3390
+scripts/perf/test_mcp_bench_client.py	PR #3390

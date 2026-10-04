@@ -186,18 +186,72 @@ fn non_whitespace_literal_edit_changes_fingerprint() {
 }
 
 #[test]
-fn same_fingerprint_at_distinct_lines_is_explicitly_refused() {
-    let err = ingest(
+fn same_lint_at_distinct_lines_keeps_both_findings() {
+    let batch = ingest(
         &[diagnostic(SOURCE_A, 12), diagnostic(SOURCE_A, 32)],
         "synthetic-commit",
     )
-    .expect_err("same stable fingerprint at distinct spans is ambiguous");
-    match err {
-        ClippyAdapterError::Line { line, reason } => {
+    .expect("both lint occurrences are valid");
+    assert_eq!(batch.notes.len(), 2);
+    assert_eq!(props(&batch, 0)["evidence"][0]["line"], 12);
+    assert_eq!(props(&batch, 1)["evidence"][0]["line"], 32);
+    assert_ne!(
+        props(&batch, 0)["finding_id"],
+        props(&batch, 1)["finding_id"]
+    );
+}
+
+#[test]
+fn repeated_lints_keep_first_identity_across_line_shifts_and_record_order() {
+    let first = diagnostic(SOURCE_A, 12);
+    let later = diagnostic(SOURCE_A, 44);
+    let alone = ingest(std::slice::from_ref(&first), "synthetic-commit").unwrap();
+    let reversed = ingest(&[later, first], "synthetic-commit").unwrap();
+    let shifted = ingest(
+        &[diagnostic(SOURCE_A, 45), diagnostic(SOURCE_A, 13)],
+        "synthetic-commit",
+    )
+    .unwrap();
+
+    assert_eq!(reversed.notes.len(), 2);
+    assert_eq!(shifted.notes.len(), 2);
+    assert_eq!(
+        props(&reversed, 1)["finding_id"],
+        props(&alone, 0)["finding_id"]
+    );
+    assert_eq!(
+        props(&shifted, 1)["finding_id"],
+        props(&alone, 0)["finding_id"]
+    );
+    assert_eq!(
+        props(&reversed, 0)["finding_id"],
+        props(&shifted, 0)["finding_id"]
+    );
+    assert_ne!(
+        props(&reversed, 0)["finding_id"],
+        props(&reversed, 1)["finding_id"]
+    );
+    assert_ne!(
+        props(&reversed, 0)["evidence"],
+        props(&shifted, 0)["evidence"]
+    );
+}
+
+#[test]
+fn conflicting_records_at_one_primary_span_refuse_with_input_line() {
+    let warning = diagnostic(SOURCE_A, 12);
+    let mut error = warning.clone();
+    error["message"]["level"] = json!("error");
+
+    match ingest(&[warning, error], "synthetic-commit") {
+        Err(ClippyAdapterError::Line { line, reason }) => {
             assert_eq!(line, 2);
-            assert!(reason.contains("ambiguous Clippy fingerprint"), "{reason}");
+            assert!(
+                reason.contains("conflicting") && reason.contains("primary span"),
+                "{reason}"
+            );
         }
-        other => panic!("expected a line-specific ambiguity, got {other}"),
+        other => panic!("expected a same-span conflict refusal, got {other:?}"),
     }
 }
 
@@ -219,12 +273,7 @@ fn all_documented_severity_levels_remain_mapped() {
 
 #[test]
 fn lexical_path_and_ambiguous_span_refusals_remain() {
-    for path in [
-        "/outside/lib.rs",
-        "../lib.rs",
-        r"C:\outside\lib.rs",
-        "\0.rs",
-    ] {
+    for path in ["/outside/lib.rs", "../lib.rs", "\0.rs"] {
         let mut record = diagnostic(SOURCE_A, 12);
         record["message"]["spans"][0]["file_name"] = json!(path);
         assert!(
@@ -242,6 +291,30 @@ fn lexical_path_and_ambiguous_span_refusals_remain() {
     assert!(
         err.to_string().contains("more than one primary span"),
         "{err}"
+    );
+}
+
+#[test]
+fn windows_absolute_drive_paths_refuse_under_both_separator_spellings() {
+    for path in [r"C:\outside\lib.rs", "C:/outside/lib.rs"] {
+        let mut record = diagnostic(SOURCE_A, 12);
+        record["message"]["spans"][0]["file_name"] = json!(path);
+        assert!(
+            ingest(&[record], "synthetic-commit").is_err(),
+            "accepted Windows absolute path {path:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_colon_filename_remains_relative_evidence() {
+    let mut record = diagnostic(SOURCE_A, 12);
+    record["message"]["spans"][0]["file_name"] = json!("src/generated:part.rs");
+    let batch = ingest(&[record], "synthetic-commit").expect("valid Unix filename");
+    assert_eq!(
+        props(&batch, 0)["evidence"][0]["path"],
+        "src/generated:part.rs"
     );
 }
 

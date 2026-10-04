@@ -223,7 +223,7 @@ pub enum VerbPresentationPolicy {
     ///
     /// Declared verbs: `get`, `link`, `query`, `traverse`, `neighbors`,
     /// `brain.feedback`, `brain.auto_feedback`, `memory.feedback`,
-    /// `comm.delivered`, `git.digest`, `git.ingest_cursor`.
+    /// `comm.delivered`, `comm.transport_status`, `git.digest`, `git.ingest_cursor`.
     ///
     /// `link` is included because the returned edge ID is the only handle for
     /// follow-up `neighbors`/`traverse` calls; short-form IDs risk prefix
@@ -238,6 +238,7 @@ pub enum VerbPresentationPolicy {
     /// feeds those strict paths, so it carries the same guarantee.
     /// `comm.delivered` is included because its `id` is an exact correlation
     /// key and the verb deliberately rejects prefix resolution (#1482).
+    /// `comm.transport_status` preserves the same exact outbound correlation key.
     ///
     /// `git.digest` is included because its successful response is also the
     /// durable receipt payload. Presentation must not shorten `receipt_id` or
@@ -272,6 +273,7 @@ impl HandlerDef {
             | "brain.auto_feedback"
             | "memory.feedback"
             | "comm.delivered"
+            | "comm.transport_status"
             | "git.digest"
             | "git.ingest_cursor" => VerbPresentationPolicy::AlwaysVerbose,
             "stream.append" => VerbPresentationPolicy::StreamAppendReceipt,
@@ -377,6 +379,21 @@ pub struct NoteKindSpec {
     pub aliases: &'static [&'static str],
     /// Lifecycle state machine for this kind.
     pub lifecycle: NoteLifecycleSpec,
+}
+
+/// Which registered embedding spaces a note kind writes by default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoteEmbeddingPolicy {
+    #[default]
+    AllModels,
+    DefaultModel,
+}
+
+/// Pack-owned embedding policy for one declared note kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoteEmbeddingPolicySpec {
+    pub kind: &'static str,
+    pub policy: NoteEmbeddingPolicy,
 }
 
 /// SQLite storage type for a nullable pack-auxiliary column addition.
@@ -495,6 +512,10 @@ pub trait Pack {
     /// these at boot time for introspection and future enforcement.  Defaults
     /// to empty so existing packs compile without changes.
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &[];
+
+    /// Write-time embedding policy for note kinds declared in `NOTE_KINDS`.
+    /// Unlisted kinds retain the all-model default.
+    const NOTE_EMBEDDING_POLICIES: &'static [NoteEmbeddingPolicySpec] = &[];
 
     /// Pack-auxiliary schema plan.
     ///
@@ -721,6 +742,7 @@ mod tests {
             "brain.auto_feedback",
             "memory.feedback",
             "comm.delivered",
+            "comm.transport_status",
             "git.digest",
             "git.ingest_cursor",
         ];

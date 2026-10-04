@@ -492,6 +492,24 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         self.pool()
     }
 
+    fn idle_retirement_blockers(&self) -> Vec<String> {
+        let main = self.pool();
+        let mut blockers: Vec<String> = main
+            .clone()
+            .into_iter()
+            .chain(self.secondary_pools())
+            .enumerate()
+            .filter_map(|(index, pool)| {
+                (pool.retirement_writer_holds() != 0)
+                    .then(|| format!("backend:{index}:held_writer"))
+            })
+            .collect();
+        if main.is_none() {
+            blockers.push("main_backend_pool_inventory_unavailable".to_owned());
+        }
+        blockers
+    }
+
     fn secondary_pools_for_checkpoint(&self) -> Vec<std::sync::Arc<khive_db::ConnectionPool>> {
         self.secondary_pools()
     }
@@ -1293,19 +1311,19 @@ fn spawn_daemon_with_exe(exe: &std::path::Path) -> std::io::Result<std::process:
     spawn_daemon_with_exe_and_config(exe, None, None, None)
 }
 
-fn spawn_daemon_with_exe_and_config(
+fn daemon_launch_command(
     exe: &std::path::Path,
     config: Option<&std::path::Path>,
     db: Option<&str>,
     packs: Option<&[String]>,
-) -> std::io::Result<std::process::Child> {
-    #[cfg(test)]
-    SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
+) -> std::process::Command {
     // The binary is `kkernel`; the MCP server (and its daemon mode) live under
     // the `mcp` subcommand.
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("mcp").arg("--daemon");
+    cmd.arg("mcp")
+        .arg("--daemon")
+        .arg("--lifetime")
+        .arg("demand");
     // A client-started daemon must not inherit a launcher incarnation claim
     // from an embedding process that happened to originate under supervision.
     #[cfg(unix)]
@@ -1350,6 +1368,19 @@ fn spawn_daemon_with_exe_and_config(
             cmd.arg("--pack").arg(pack);
         }
     }
+    cmd
+}
+
+fn spawn_daemon_with_exe_and_config(
+    exe: &std::path::Path,
+    config: Option<&std::path::Path>,
+    db: Option<&str>,
+    packs: Option<&[String]>,
+) -> std::io::Result<std::process::Child> {
+    #[cfg(test)]
+    SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let mut cmd = daemon_launch_command(exe, config, db, packs);
     cmd.stdin(Stdio::null()).stdout(Stdio::null());
     // The daemon's tracing (including WAL/checkpoint telemetry) goes to
     // stderr honoring KHIVE_LOG (init_tracing in kkernel's main.rs) — wiring
@@ -3612,6 +3643,51 @@ pub(crate) fn map_response_for_test(
 }
 
 #[cfg(test)]
+mod demand_launch_tests {
+    use super::*;
+
+    #[test]
+    fn shared_builder_selects_demand_and_recognizes_both_launch_modes() {
+        let packs = vec!["kg".to_owned(), "schedule".to_owned()];
+        let command = daemon_launch_command(
+            std::path::Path::new("kkernel"),
+            Some(std::path::Path::new("fixture.toml")),
+            Some("fixture.db"),
+            Some(&packs),
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "mcp",
+                "--daemon",
+                "--lifetime",
+                "demand",
+                "--config",
+                "fixture.toml",
+                "--db",
+                "fixture.db",
+                "--pack",
+                "kg",
+                "--pack",
+                "schedule"
+            ]
+        );
+        assert!(argv_is_khive_daemon(
+            "kkernel mcp --daemon --lifetime demand --config fixture.toml"
+        ));
+        assert!(argv_is_khive_daemon(
+            "kkernel mcp --daemon --lifetime persistent"
+        ));
+        assert!(argv_is_khive_daemon("kkernel mcp --daemon"));
+        assert!(!argv_is_khive_daemon("kkernel exec stats()"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -5740,7 +5816,10 @@ mod tests {
         let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
         assert_eq!(
             recorded.trim_end(),
-            format!("mcp --daemon --config {}", config_path.display()),
+            format!(
+                "mcp --daemon --lifetime demand --config {}",
+                config_path.display()
+            ),
             "the explicit config selection must reach the daemon command line"
         );
     }
@@ -5774,7 +5853,7 @@ mod tests {
         let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
         assert_eq!(
             recorded.trim_end(),
-            "mcp --daemon --pack kg --pack gtd --pack formal",
+            "mcp --daemon --lifetime demand --pack kg --pack gtd --pack formal",
             "the caller's resolved pack set must reach the daemon command line as --pack flags"
         );
     }
@@ -5806,7 +5885,7 @@ mod tests {
         let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
         assert_eq!(
             recorded.trim_end(),
-            "mcp --daemon",
+            "mcp --daemon --lifetime demand",
             "no packs supplied must mean no --pack flags on the daemon command line"
         );
     }
@@ -5841,7 +5920,7 @@ mod tests {
         assert_eq!(
             recorded.trim_end(),
             format!(
-                "mcp --daemon --config {} --db :memory:",
+                "mcp --daemon --lifetime demand --config {} --db :memory:",
                 config_path.display()
             ),
             "the ephemeral :memory: override must reach the daemon command line"
@@ -5882,7 +5961,7 @@ mod tests {
         let recorded = std::fs::read_to_string(&record).expect("read recorded argv");
         assert_eq!(
             recorded.trim_end(),
-            "mcp --daemon --db /tmp/main.db",
+            "mcp --daemon --lifetime demand --db /tmp/main.db",
             "the concrete override handed to the spawn seam must reach the daemon command line"
         );
     }

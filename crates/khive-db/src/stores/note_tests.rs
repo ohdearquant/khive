@@ -120,6 +120,39 @@ fn make_note(namespace: &str, kind: &str, content: &str) -> Note {
     Note::new(namespace, kind, content)
 }
 
+#[tokio::test]
+async fn note_batch_including_deleted_keeps_tombstones_and_chunk_boundaries() {
+    let store = setup_memory_store();
+    let notes: Vec<_> = (0..901)
+        .map(|_| make_note("local", "observation", "batch row"))
+        .collect();
+    store.upsert_notes(notes.clone()).await.unwrap();
+    assert!(store
+        .delete_note(notes[0].id, DeleteMode::Soft)
+        .await
+        .unwrap());
+    let mut ids: Vec<_> = notes.iter().map(|note| note.id).collect();
+    ids.push(notes[0].id);
+    ids.push(Uuid::new_v4());
+    let fetched = store.get_notes_batch_including_deleted(&ids).await.unwrap();
+    let fetched_ids: HashSet<_> = fetched.iter().map(|note| note.id).collect();
+    assert_eq!(fetched_ids, notes.iter().map(|note| note.id).collect());
+    assert!(fetched
+        .iter()
+        .find(|note| note.id == notes[0].id)
+        .unwrap()
+        .deleted_at
+        .is_some());
+    let live = store.get_notes_batch(&ids).await.unwrap();
+    assert_eq!(live.len(), 900);
+    assert!(live.iter().all(|note| note.deleted_at.is_none()));
+    assert!(store
+        .get_notes_batch_including_deleted(&[])
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 fn keyed_note(namespace: &str, kind: &str, key: &str) -> Note {
     let mut note = make_note(namespace, kind, key);
     note.key = Some(key.to_string());
@@ -131,6 +164,41 @@ fn assert_note_keys(notes: &[Note], expected_len: usize) {
     for note in notes {
         assert_eq!(note.key.as_deref(), Some(note.content.as_str()));
     }
+}
+
+#[tokio::test]
+async fn note_visibility_batch_projects_namespace_and_tombstones() {
+    let store = setup_memory_store();
+    let local = make_note("local", "memory", "local content");
+    let foreign = make_note("foreign", "memory", "foreign content");
+    let deleted = make_note("local", "memory", "deleted content");
+    for note in [&local, &foreign, &deleted] {
+        store.upsert_note((*note).clone()).await.unwrap();
+    }
+    store
+        .delete_note(deleted.id, DeleteMode::Soft)
+        .await
+        .unwrap();
+
+    let projection = store
+        .get_note_visibility_batch(&[local.id, foreign.id, deleted.id, Uuid::new_v4()])
+        .await
+        .unwrap();
+    assert_eq!(projection.len(), 3);
+    assert!(projection
+        .iter()
+        .any(|row| { row.id == local.id && row.namespace == "local" && row.deleted_at.is_none() }));
+    assert!(projection.iter().any(|row| {
+        row.id == foreign.id && row.namespace == "foreign" && row.deleted_at.is_none()
+    }));
+    assert!(projection.iter().any(|row| {
+        row.id == deleted.id && row.namespace == "local" && row.deleted_at.is_some()
+    }));
+    assert!(store
+        .get_note_visibility_batch(&[])
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -1602,6 +1670,34 @@ async fn text_starts_with_indexed_matches_prefix_only() {
     let mut names: Vec<_> = page.items.iter().map(|n| n.content.clone()).collect();
     names.sort();
     assert_eq!(names, vec!["email:", "email:a@b.c"]);
+
+    let mut bucket_filter = filter.clone();
+    bucket_filter.property_filters[0].op = FilterOp::TextColonPrefixBucketIndexed;
+    let bucket_page = store
+        .query_notes_filtered_count_free(
+            "default",
+            &bucket_filter,
+            PageRequest {
+                limit: 50,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let mut bucket_names: Vec<_> = bucket_page
+        .items
+        .iter()
+        .map(|n| n.content.clone())
+        .collect();
+    bucket_names.sort();
+    assert_eq!(
+        bucket_names, names,
+        "channel bucket must match the full prefix"
+    );
+    for invalid in ["", "email", "email::"] {
+        bucket_filter.property_filters[0].value = SqlValue::Text(invalid.into());
+        assert!(build_note_filter_where("default", &bucket_filter).is_err());
+    }
 
     let every_text = NoteFilter {
         kind: Some("message".into()),
@@ -4373,6 +4469,72 @@ async fn instant_ordered_window_excludes_outside_rows() {
         page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
         vec![Uuid::from_u128(2), Uuid::from_u128(3)],
         "SQL must return only the exact UTC window, including a crossing offset and nanosecond bound"
+    );
+}
+
+#[tokio::test]
+async fn rfc3339_due_or_invalid_filter_keeps_legacy_values() {
+    use khive_storage::note::{FilterOp, PropertyFilter};
+
+    let store = setup_memory_store();
+    let values = [
+        (
+            1,
+            serde_json::json!({"next_attempt_at": "2099-01-01T05:00:00-05:00"}),
+        ),
+        (
+            2,
+            serde_json::json!({"next_attempt_at": "2099-01-01T10:00:00.000001Z"}),
+        ),
+        (3, serde_json::json!({"next_attempt_at": "not-a-timestamp"})),
+        (4, serde_json::json!({"next_attempt_at": null})),
+        (5, serde_json::json!({"next_attempt_at": 42})),
+        (6, serde_json::json!({})),
+        (
+            7,
+            serde_json::json!({"next_attempt_at": "2999-01-01T00:00:00+0000"}),
+        ),
+        (
+            8,
+            serde_json::json!({"next_attempt_at": "2099-01-01T10:00:00.000000999Z"}),
+        ),
+    ];
+    for (id, properties) in values {
+        let mut note = make_note("local", "message", "retry fixture");
+        note.id = Uuid::from_u128(id);
+        note.created_at = id as i64;
+        note.updated_at = note.created_at;
+        note.properties = Some(properties);
+        store.upsert_note(note).await.unwrap();
+    }
+
+    let filter = NoteFilter {
+        kind: Some("message".into()),
+        property_filters: vec![PropertyFilter {
+            json_path: "$.next_attempt_at".into(),
+            op: FilterOp::Rfc3339LteOrInvalid,
+            value: SqlValue::Text("2099-01-01T10:00:00.000000999Z".into()),
+        }],
+        ..Default::default()
+    };
+    let page = store
+        .query_notes_filtered_count_free(
+            "local",
+            &filter,
+            PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items.iter().map(|note| note.id).collect::<Vec<_>>(),
+        vec![8, 7, 6, 5, 4, 3, 1]
+            .into_iter()
+            .map(Uuid::from_u128)
+            .collect::<Vec<_>>(),
+        "missing, null, non-text, and strictly malformed deadlines are due; a value in the current microsecond is due and the next microsecond is not"
     );
 }
 

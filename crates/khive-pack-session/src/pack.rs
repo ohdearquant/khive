@@ -8,7 +8,7 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
     KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry,
 };
-use khive_types::{EdgeEndpointRule, HandlerDef, Pack, PackSchemaPlan};
+use khive_types::{EdgeEndpointRule, HandlerDef, Pack, PackColumnAddition, PackSchemaPlan};
 
 use crate::{handlers, vocab::SESSION_HANDLERS};
 
@@ -36,6 +36,8 @@ impl Pack for SessionPack {
         pack: "session",
         statements: &crate::vocab::SESSION_SCHEMA_PLAN_STMTS,
     });
+    const SCHEMA_COLUMN_ADDITIONS: &'static [PackColumnAddition] =
+        &crate::vocab::SESSION_SCHEMA_COLUMN_ADDITIONS;
 }
 
 struct SessionPackFactory;
@@ -93,6 +95,10 @@ impl PackRuntime for SessionPack {
         }
     }
 
+    fn schema_column_additions(&self) -> &'static [PackColumnAddition] {
+        <Self as Pack>::SCHEMA_COLUMN_ADDITIONS
+    }
+
     async fn warm(&self) {
         // Mirror services ingest external sessions and therefore write notes.
         // A snapshot-inspection runtime may expose session read verbs, but it
@@ -128,9 +134,12 @@ impl PackRuntime for SessionPack {
             "session.resume" => handlers::resume::handle_resume(runtime, token, params).await,
             "session.export" => handlers::export::handle_export(runtime, token, params).await,
             "session.search" => handlers::search::handle_search(runtime, token, params).await,
+            "session.stats" => handlers::maintenance::handle_stats(runtime, params).await,
+            "session.vacuum" => handlers::maintenance::handle_vacuum(runtime, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "session pack does not handle verb {verb:?}; valid verbs: \
-                 session.store, session.list, session.resume, session.export, session.search"
+                 session.store, session.list, session.resume, session.export, session.search, \
+                 session.stats, session.vacuum"
             ))),
         }
     }

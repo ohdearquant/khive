@@ -4,6 +4,7 @@ pub(crate) mod ann;
 pub mod config;
 pub mod handlers;
 mod hook;
+mod note_search;
 mod pack;
 pub(crate) mod query_cache;
 pub mod recall_feedback;
@@ -13,6 +14,7 @@ mod store_access;
 #[doc(hidden)]
 pub mod text_gather;
 pub mod tunable;
+pub(crate) mod visibility;
 
 #[cfg(test)]
 mod test_support;

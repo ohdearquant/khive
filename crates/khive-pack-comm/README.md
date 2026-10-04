@@ -10,6 +10,7 @@ delivery confirmation, and channel polling observability.
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `comm.send`      | Send a message, optionally threaded                                                                                                                           |
 | `comm.delivered` | Confirm the internal inbound sibling for an outbound UUID                                                                                                     |
+| `comm.transport_status` | Read the sender-local transport state for an outbound UUID |
 | `comm.inbox`     | Page and filter the caller's inbound inbox or sent-message history, optionally waiting up to 30 seconds for a new matching message                            |
 | `comm.read`      | Fetch one or up to 500 inbound messages and mark them read; `body=false` returns only the prior acknowledgement shape                                         |
 | `comm.mark_read` | Named bulk mark-read for 1-500 inbound messages; `atomic=true` makes the cross-message mutation all-or-nothing                                                |
@@ -22,6 +23,19 @@ delivery confirmation, and channel polling observability.
 The internal `comm.ingest` handler is `Visibility::Subhandler` — it lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message
 directly, deduplicated by `external_id`, but it is not callable on the MCP wire.
+
+## `comm.transport_status` — sender transport state
+
+`comm.transport_status(id="<full-outbound-uuid>")` returns exactly `{id, status}`.
+The ID is canonical and prefixes are refused. Status is `pending`,
+`recipient_stored`, `recipient_quarantined`, `failed`, or `unknown`.
+Admission and holds remain `pending`. A verified recipient receipt supersedes
+a local permanent failure. An absent record in the caller's primary namespace
+is `unknown`; the read does not alter retry metadata.
+
+When re-encryption creates multiple envelopes, a receipt takes precedence;
+otherwise the highest local envelope sequence determines the status.
+`comm.delivered` continues to confirm the internal inbound sibling separately.
 
 ## `comm.inbox` — optional long poll
 

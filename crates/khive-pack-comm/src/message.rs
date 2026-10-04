@@ -53,6 +53,8 @@ pub(crate) const MESSAGE_PROJECTION_FIELDS: &[&str] = &[
     "outbound_ref",
     "sent_by_process",
     "idempotency_key",
+    "attachments",
+    "attachments_error",
 ];
 
 pub(crate) fn validate_message_projection_fields(
@@ -288,6 +290,7 @@ pub(crate) async fn dual_write_message(
         in_reply_to_message_id,
         references_chain,
         tags,
+        &[],
         None,
     )
     .await?;
@@ -316,6 +319,7 @@ pub(crate) async fn dual_write_message_with_identity(
     in_reply_to_message_id: Option<&str>,
     references_chain: Option<&str>,
     tags: Option<&[String]>,
+    attachments: &[khive_storage::NewAttachment],
     identity: Option<&crate::idempotency::MessageIdentity>,
 ) -> Result<MessageWrite, RuntimeError> {
     let recipient_ns_str = to.trim();
@@ -474,10 +478,11 @@ pub(crate) async fn dual_write_message_with_identity(
         },
     ];
     let (mut notes, embedding_truncation) = if let Some(identity) = identity {
-        match khive_runtime::keyed_message::create_keyed_message_pair(
+        match khive_runtime::keyed_message::create_keyed_message_pair_with_attachments(
             runtime,
             specs,
             &identity.physical_key(caller_token),
+            attachments,
         )
         .await
         .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
@@ -488,16 +493,22 @@ pub(crate) async fn dual_write_message_with_identity(
             } => (notes, embedding_truncation),
             khive_runtime::keyed_message::KeyedMessageWrite::Existing(holder) => {
                 return Ok(MessageWrite {
-                    outbound: identity.replay(runtime, caller_token, holder).await?,
+                    outbound: identity
+                        .replay(runtime, caller_token, holder, attachments)
+                        .await?,
                     embedding_truncation: Default::default(),
                     replayed: true,
                 });
             }
         }
     } else {
-        khive_runtime::create_notes_atomic_with_report(runtime, specs.into())
-            .await
-            .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
+        khive_runtime::atomic_message::create_notes_atomic_with_attachments(
+            runtime,
+            specs.into(),
+            attachments,
+        )
+        .await
+        .map_err(|error| attach_outbound_id_to_ambiguous_write(outbound_id, error))?
     };
     Ok(MessageWrite {
         outbound: notes.remove(0),
@@ -529,6 +540,10 @@ mod tests {
         let recipient_ns = format!("t460-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -549,6 +564,7 @@ mod tests {
             allowed_outbound_namespaces: vec![Namespace::parse(&recipient_ns).unwrap()],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
 
@@ -613,6 +629,10 @@ mod tests {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -633,6 +653,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         let token = runtime
@@ -762,6 +783,10 @@ mod tests {
         let recipient_ns = format!("vecfail-recipient-{}", Uuid::new_v4().simple());
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -782,6 +807,7 @@ mod tests {
             allowed_outbound_namespaces: vec![Namespace::parse(&recipient_ns).unwrap()],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         runtime.register_embedder(StubProvider);
@@ -930,6 +956,10 @@ mod tests {
         use khive_runtime::{AllowAllGate, BackendId, RuntimeConfig};
 
         let runtime = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -950,6 +980,7 @@ mod tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime");
         let caller_token = runtime

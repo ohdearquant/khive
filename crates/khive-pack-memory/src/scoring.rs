@@ -2,6 +2,7 @@
 //! See `crates/khive-pack-memory/docs/api/scoring.md` for the complete scoring model.
 use std::collections::{HashMap, HashSet};
 
+pub use khive_text::{contains_cjk_f32 as contains_cjk, is_cjk_char};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -67,14 +68,22 @@ pub struct CandidateContext<'a> {
 
 /// Match a pre-lowercased name at non-alphanumeric outer boundaries.
 /// All-CJK names use substring matching because equivalent word boundaries are absent.
-fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
+fn contains_at_word_boundary_cached(
+    haystack: &str,
+    cached_chars: &mut Option<Vec<char>>,
+    needle: &str,
+) -> bool {
     if needle.is_empty() {
         return false;
     }
     if needle.chars().all(is_cjk_char) {
         return haystack.contains(needle);
     }
-    let haystack_chars: Vec<char> = haystack.chars().collect();
+    let haystack_chars = cached_chars.get_or_insert_with(|| {
+        #[cfg(test)]
+        loop_3711_tests::body_materialized();
+        haystack.chars().collect()
+    });
     let needle_chars: Vec<char> = needle.chars().collect();
     let n = needle_chars.len();
     if n == 0 || haystack_chars.len() < n {
@@ -93,6 +102,19 @@ fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
         }
     }
     false
+}
+
+fn matches_any_entity(ctx: &CandidateContext<'_>) -> bool {
+    let lower = ctx.content.to_lowercase();
+    let mut chars = None;
+    ctx.entity_names
+        .iter()
+        .any(|name| contains_at_word_boundary_cached(&lower, &mut chars, name))
+}
+
+#[cfg(test)]
+fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
+    contains_at_word_boundary_cached(haystack, &mut None, needle)
 }
 
 impl AdjustmentCondition {
@@ -130,19 +152,13 @@ impl AdjustmentCondition {
                 if ctx.entity_names.is_empty() {
                     return false;
                 }
-                let lower = ctx.content.to_lowercase();
-                ctx.entity_names
-                    .iter()
-                    .any(|e| contains_at_word_boundary(&lower, e))
+                matches_any_entity(ctx)
             }
             Self::EntityMiss => {
                 if ctx.entity_names.is_empty() {
                     return false;
                 }
-                let lower = ctx.content.to_lowercase();
-                !ctx.entity_names
-                    .iter()
-                    .any(|e| contains_at_word_boundary(&lower, e))
+                !matches_any_entity(ctx)
             }
             Self::All { conditions } => conditions.iter().all(|c| c.matches(ctx)),
         }
@@ -564,31 +580,6 @@ impl ScoringConfig {
 
 // ── Utility functions ─────────────────────────────────────────────────────────
 
-/// Returns `true` if `c` is a CJK character (Unified, Extension A/B, Hiragana,
-/// Katakana, Hangul).
-#[inline]
-pub fn is_cjk_char(c: char) -> bool {
-    matches!(c,
-        '\u{4E00}'..='\u{9FFF}'       // CJK Unified Ideographs
-        | '\u{3400}'..='\u{4DBF}'     // CJK Extension A
-        | '\u{F900}'..='\u{FAFF}'     // CJK Compatibility Ideographs
-        | '\u{3040}'..='\u{309F}'     // Hiragana
-        | '\u{30A0}'..='\u{30FF}'     // Katakana
-        | '\u{20000}'..='\u{2A6DF}'   // CJK Extension B
-        | '\u{AC00}'..='\u{D7AF}'     // Hangul Syllables
-    )
-}
-
-/// Returns `true` when >15% of the query's characters are CJK.
-pub fn contains_cjk(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return false;
-    }
-    let cjk = chars.iter().filter(|&&c| is_cjk_char(c)).count();
-    (cjk as f32) / (chars.len() as f32) > 0.15
-}
-
 /// Normalize `min_score`: 0–1 passes through, 1–100 divides by 100, others return Err.
 pub fn normalize_min_score(score: f64) -> Result<f32, crate::config::MinScoreError> {
     if !score.is_finite() {
@@ -843,6 +834,10 @@ pub fn entity_posterior_term(entity_posterior_mean: Option<f64>, w_ent: f32) -> 
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "entity_loop_3711_tests.rs"]
+mod loop_3711_tests;
 
 #[cfg(test)]
 mod tests {

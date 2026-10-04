@@ -2,8 +2,8 @@
 //! seam (ADR-191 D3: "every write lands in the caller's namespace through
 //! the runtime's create seam").
 //!
-//! `KhiveRuntime::create_entity` (and every other `operations.rs` create
-//! helper) always assigns a fresh `Uuid::new_v4()` — there is no public,
+//! `KhiveRuntime::create_entity_with_embedding_report` assigns a fresh
+//! `Uuid::new_v4()` — there is no public,
 //! non-crate-private path that both accepts a caller-supplied id AND runs
 //! the full FTS+embedding indexing pipeline in one call (verified by reading
 //! `operations.rs::create_entity_with_embedding_report_inner`, whose
@@ -16,9 +16,9 @@
 //! The seam this module uses instead is two public runtime calls, both part
 //! of "the runtime" in the same sense `operations.rs`'s own internals are:
 //! `KhiveRuntime::entities()` (the `EntityStore` capability trait, ADR-005)
-//! for the id-carrying insert, then `KhiveRuntime::update_entity()` (the
-//! same method the `update` verb dispatches to) to route the real name and
-//! properties through the ordinary reindex path. `update_entity`'s reindex
+//! for the id-carrying insert, then
+//! `KhiveRuntime::update_entity_with_embedding_report()` to route the real name
+//! and properties through the ordinary reindex path. Its reindex
 //! only fires on a `name`/`description`/`entity_type` value change
 //! (`curation.rs::prepare_update_entity`), so the bare row is inserted with
 //! an empty name on purpose — the immediately following patch always
@@ -34,8 +34,8 @@ use uuid::Uuid;
 /// Refuse web writes that would reuse a differently attributed entity.
 ///
 /// Runtime by-ID reads remain namespace-agnostic under ADR-007 Rev 8. This
-/// is an interim web mutation safeguard while namespace-aware deterministic
-/// identity is pending; it does not change the UUID derivation or store policy.
+/// guards explicit IDs and insert races; deterministic web identities include
+/// the write namespace without changing the store policy.
 /// A refusal discloses only the requested ID, never the stored attribution.
 pub(crate) fn require_entity_namespace(
     token: &NamespaceToken,
@@ -86,6 +86,9 @@ pub(crate) async fn get_or_create(
     let mut bare = Entity::new(token.namespace().as_str(), entity_kind, "")
         .with_entity_type(Some(entity_type));
     bare.id = id;
+    // Check caller properties before the deterministic-ID placeholder insert;
+    // otherwise a refused later update would leave a bare entity behind.
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(&properties))?;
     let inserted = store
         .insert_entity_if_absent(bare)
         .await
@@ -95,8 +98,9 @@ pub(crate) async fn get_or_create(
         return Ok((winner, false));
     }
 
-    let entity = runtime
-        .update_entity(
+    // This shared helper has no single verb response in which to return an embedding warning.
+    let (entity, _embedding_report) = runtime
+        .update_entity_with_embedding_report(
             token,
             id,
             EntityPatch {
@@ -121,8 +125,9 @@ pub(crate) async fn patch(
     entity_type: Option<&str>,
     properties: Value,
 ) -> Result<Entity, RuntimeError> {
-    runtime
-        .update_entity(
+    // This shared helper has no single verb response in which to return an embedding warning.
+    let (entity, _embedding_report) = runtime
+        .update_entity_with_embedding_report(
             token,
             id,
             EntityPatch {
@@ -131,7 +136,8 @@ pub(crate) async fn patch(
                 ..Default::default()
             },
         )
-        .await
+        .await?;
+    Ok(entity)
 }
 
 #[cfg(test)]
@@ -139,6 +145,36 @@ mod tests {
     use super::*;
     use khive_runtime::{Namespace, RuntimeConfig};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn get_or_create_rejects_reserved_properties_before_placeholder_insert() {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let id = Uuid::new_v4();
+
+        let error = get_or_create(
+            &runtime,
+            &token,
+            id,
+            "document",
+            "resource",
+            "reserved web entity",
+            json!({"khive:secret_gate": "exempted:content-sha256-manifest-v1"}),
+        )
+        .await
+        .expect_err("reserved caller properties must be refused");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref message) if message.contains("khive:secret_gate")),
+            "unexpected error: {error:?}"
+        );
+        assert!(runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(id)
+            .await
+            .unwrap()
+            .is_none());
+    }
 
     #[tokio::test]
     async fn lost_insert_race_refuses_foreign_winner_without_mutating_it() {

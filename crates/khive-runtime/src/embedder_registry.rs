@@ -5,18 +5,94 @@
 //! during runtime construction and require no opt-in.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use lattice_embed::{
-    CachedEmbeddingService, EmbeddingModel, EmbeddingService, NativeEmbeddingService,
-    DEFAULT_MAX_BATCH_SIZE, MAX_TEXT_BYTES,
+    CachedEmbeddingService, EmbeddingModel, EmbeddingRole, EmbeddingService,
+    NativeEmbeddingService, DEFAULT_MAX_BATCH_SIZE, MAX_TEXT_BYTES,
 };
-use tokio::sync::OnceCell;
+use tokio::sync::{mpsc, Notify, OnceCell};
 
 use crate::error::{RuntimeError, RuntimeResult};
+
+const ADMISSION_WAITING: u8 = 1;
+const ADMISSION_ACCEPTED: u8 = 2;
+
+struct EmbeddingAdmission {
+    deadline: khive_storage::RequestReadDeadline,
+    request: khive_storage::RequestReadContext,
+    state: AtomicU8,
+    changed: Notify,
+}
+
+impl EmbeddingAdmission {
+    fn expired(&self) -> bool {
+        tokio::time::Instant::now() >= self.deadline.async_at()
+            || self.request.stop_reason().is_some()
+    }
+}
+
+tokio::task_local! {
+    static EMBEDDING_ADMISSION: Arc<EmbeddingAdmission>;
+}
+
+/// Bound only the built-in worker's pre-admission wait, above the lattice error
+/// boundary. Providers that never enter that wait retain their own semantics.
+pub(crate) async fn with_embedding_admission<T>(
+    future: impl std::future::Future<Output = lattice_embed::Result<T>>,
+) -> RuntimeResult<T> {
+    let deadline = khive_storage::effective_request_read_deadline(
+        khive_storage::RequestReadDeadline::after(khive_storage::request_read_timeout_from_env()),
+    );
+    let timeout = deadline
+        .async_at()
+        .saturating_duration_since(tokio::time::Instant::now());
+    let admission = Arc::new(EmbeddingAdmission {
+        deadline,
+        request: khive_storage::capture_request_read_context(),
+        state: AtomicU8::new(0),
+        changed: Notify::new(),
+    });
+    EMBEDDING_ADMISSION
+        .scope(Arc::clone(&admission), async move {
+            tokio::pin!(future);
+            let stopped = async {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline.async_at()) => {},
+                    _ = admission.request.clone().wait_for_stop() => {},
+                }
+            };
+            tokio::pin!(stopped);
+            let mut bound_expired = false;
+            loop {
+                tokio::select! {
+                    // A ready cache hit precedes admission, including an expired bound.
+                    biased;
+                    result = &mut future => return result.map_err(RuntimeError::from),
+                    _ = admission.changed.notified() => {},
+                    _ = &mut stopped, if !bound_expired => bound_expired = true,
+                }
+                match admission.state.load(Ordering::Acquire) {
+                    ADMISSION_ACCEPTED => return future.await.map_err(RuntimeError::from),
+                    ADMISSION_WAITING if bound_expired => {
+                        return Err(RuntimeError::Storage(
+                            khive_storage::StorageError::AdmissionTimeout {
+                                operation: "embedding admission".into(),
+                                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                                pool_identity: None,
+                            },
+                        ));
+                    }
+                    // A provider may enter the owned adapter later. Keep the
+                    // original expired bound without timing out its other work.
+                    _ => {}
+                }
+            }
+        })
+        .await
+}
 
 #[derive(Clone, Copy)]
 enum EmbeddingCall {
@@ -81,7 +157,7 @@ struct EmbeddingJob {
 /// Callers can detach safely because closed queued jobs are skipped before inference.
 pub(crate) struct BlockingEmbeddingService<S> {
     inner: Arc<S>,
-    worker: OnceLock<Result<SyncSender<EmbeddingJob>, String>>,
+    worker: OnceLock<Result<mpsc::Sender<EmbeddingJob>, String>>,
     in_flight_bytes: Arc<AtomicUsize>,
     byte_budget: usize,
 }
@@ -141,10 +217,10 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
         Ok(input_bytes)
     }
 
-    fn worker(&self) -> lattice_embed::Result<&SyncSender<EmbeddingJob>> {
+    fn worker(&self) -> lattice_embed::Result<&mpsc::Sender<EmbeddingJob>> {
         self.worker
             .get_or_init(|| {
-                let (sender, receiver) = mpsc::sync_channel(EMBEDDING_QUEUE_CAPACITY);
+                let (sender, receiver) = mpsc::channel(EMBEDDING_QUEUE_CAPACITY);
                 let inner = Arc::clone(&self.inner);
                 let runtime = tokio::runtime::Handle::current();
                 std::thread::Builder::new()
@@ -160,9 +236,9 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
     fn run_worker(
         inner: Arc<S>,
         runtime: tokio::runtime::Handle,
-        receiver: Receiver<EmbeddingJob>,
+        mut receiver: mpsc::Receiver<EmbeddingJob>,
     ) {
-        while let Ok(job) = receiver.recv() {
+        while let Some(job) = receiver.blocking_recv() {
             if job.reply.is_closed() {
                 continue;
             }
@@ -185,6 +261,38 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
     ) -> lattice_embed::Result<Vec<Vec<f32>>> {
         let input_bytes = Self::input_bytes(texts)?;
         let sender = self.worker()?;
+        let admission = EMBEDDING_ADMISSION.try_with(Arc::clone).ok();
+        let permit = if let Some(admission) = &admission {
+            admission.state.store(ADMISSION_WAITING, Ordering::Release);
+            admission.changed.notify_one();
+            if admission.expired() {
+                return std::future::pending().await;
+            }
+            sender.reserve().await.map_err(|_| {
+                lattice_embed::EmbedError::Internal(
+                    "embedding worker channel is disconnected".to_owned(),
+                )
+            })?
+        } else {
+            // Direct trait callers have no RuntimeResult boundary at which to
+            // report a typed admission timeout, so retain finite fail-fast admission.
+            sender.try_reserve().map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    lattice_embed::EmbedError::Internal("embedding worker queue is full".to_owned())
+                }
+                mpsc::error::TrySendError::Closed(_) => lattice_embed::EmbedError::Internal(
+                    "embedding worker channel is disconnected".to_owned(),
+                ),
+            })?
+        };
+        // Capacity and expiry can become ready in one poll. Do not publish a
+        // job after the original bound, even when reserve() returned a permit.
+        if admission
+            .as_ref()
+            .is_some_and(|admission| admission.expired())
+        {
+            return std::future::pending().await;
+        }
         let in_flight = InFlightBytes::reserve(
             Arc::clone(&self.in_flight_bytes),
             self.byte_budget,
@@ -198,14 +306,14 @@ impl<S: EmbeddingService + 'static> BlockingEmbeddingService<S> {
             reply,
             _in_flight: in_flight,
         };
-        sender.try_send(job).map_err(|error| match error {
-            TrySendError::Full(_) => {
-                lattice_embed::EmbedError::Internal("embedding worker queue is full".to_owned())
+        if let Some(admission) = &admission {
+            if admission.expired() {
+                return std::future::pending().await;
             }
-            TrySendError::Disconnected(_) => lattice_embed::EmbedError::Internal(
-                "embedding worker channel is disconnected".to_owned(),
-            ),
-        })?;
+            admission.state.store(ADMISSION_ACCEPTED, Ordering::Release);
+            admission.changed.notify_one();
+        }
+        permit.send(job);
         receiver
             .await
             .map_err(|error| lattice_embed::EmbedError::Internal(error.to_string()))?
@@ -220,6 +328,27 @@ impl<S: EmbeddingService + 'static> EmbeddingService for BlockingEmbeddingServic
         model: EmbeddingModel,
     ) -> lattice_embed::Result<Vec<Vec<f32>>> {
         self.run(texts, model, EmbeddingCall::Generic).await
+    }
+
+    async fn embed_with_role(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+        // The outer cache delegates raw caller text here; preparation belongs
+        // to the native service, after the caller-input admission checks.
+        let call = match role {
+            EmbeddingRole::Generic => EmbeddingCall::Generic,
+            EmbeddingRole::Query => EmbeddingCall::Query,
+            EmbeddingRole::Passage => EmbeddingCall::Passage,
+            _ => {
+                return Err(lattice_embed::EmbedError::InvalidInput(
+                    "unsupported embedding role".to_owned(),
+                ))
+            }
+        };
+        self.run(texts, model, call).await
     }
 
     async fn embed_query(
@@ -532,10 +661,21 @@ impl EmbedderProvider for LatticeEmbedderProvider {
     async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
         let native = Arc::new(NativeEmbeddingService::with_model(self.model));
         native.ensure_loaded().await?;
-        let cached = Arc::new(CachedEmbeddingService::with_default_cache(native));
-        Ok(Arc::new(BlockingEmbeddingService::new(cached)) as Arc<dyn EmbeddingService>)
+        Ok(cached_blocking_service(native))
     }
 }
+
+/// Keep result-cache lookup outside worker admission for every retrieval role.
+fn cached_blocking_service<S: EmbeddingService + 'static>(
+    inner: Arc<S>,
+) -> Arc<dyn EmbeddingService> {
+    let blocking = Arc::new(BlockingEmbeddingService::new(inner));
+    Arc::new(CachedEmbeddingService::with_default_cache(blocking))
+}
+
+#[cfg(test)]
+#[path = "embedding_cache_admission_tests.rs"]
+mod cache_admission_tests;
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
 
@@ -546,6 +686,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     struct ConstVecProvider {
         name: String,
@@ -566,8 +707,8 @@ mod tests {
     /// A trivial embedding service that returns a constant vector of `1.0`s.
     /// The `model` parameter is ignored — this service always returns the
     /// same synthetic vector regardless of which model is requested.
-    struct ConstVecService {
-        dims: usize,
+    pub(super) struct ConstVecService {
+        pub(super) dims: usize,
     }
 
     #[async_trait]
@@ -648,15 +789,15 @@ mod tests {
         }
     }
 
-    struct BlockingTestService {
-        calls: Mutex<Vec<String>>,
-        entered: AtomicUsize,
+    pub(super) struct BlockingTestService {
+        pub(super) calls: Mutex<Vec<String>>,
+        pub(super) entered: AtomicUsize,
         release: (Mutex<bool>, Condvar),
-        thread_ids: Mutex<HashSet<std::thread::ThreadId>>,
+        pub(super) thread_ids: Mutex<HashSet<std::thread::ThreadId>>,
     }
 
     impl BlockingTestService {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
                 entered: AtomicUsize::new(0),
@@ -665,7 +806,7 @@ mod tests {
             }
         }
 
-        fn release(&self) {
+        pub(super) fn release(&self) {
             *self
                 .release
                 .0
@@ -830,62 +971,340 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_adapter_rejects_call_when_queue_is_full() {
-        let inner = Arc::new(BlockingTestService::new());
-        let service = Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner)));
-        let first_service = Arc::clone(&service);
-        let first = tokio::spawn(async move {
-            first_service
-                .embed(&["first".to_owned()], EmbeddingModel::default())
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while inner.entered.load(Ordering::Acquire) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first embedding call must occupy the native worker");
+    pub(super) struct ReleaseWorkerOnDrop(pub(super) Arc<BlockingTestService>);
 
-        let sender = service.worker().expect("worker must be running");
-        let mut queued_receivers = Vec::with_capacity(EMBEDDING_QUEUE_CAPACITY);
-        for index in 0..EMBEDDING_QUEUE_CAPACITY {
-            let (reply, receiver) = tokio::sync::oneshot::channel();
-            let queued = sender.try_send(EmbeddingJob {
-                texts: vec![format!("queued-{index}")],
-                model: EmbeddingModel::default(),
-                call: EmbeddingCall::Generic,
-                reply,
-                _in_flight: InFlightBytes::reserve(
-                    Arc::clone(&service.in_flight_bytes),
-                    service.byte_budget,
-                    0,
-                )
-                .expect("zero-byte test job must fit the byte budget"),
-            });
-            assert!(queued.is_ok(), "bounded queue must accept its capacity");
-            queued_receivers.push(receiver);
+    impl Drop for ReleaseWorkerOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
         }
+    }
 
-        let overflow = tokio::time::timeout(
-            Duration::from_millis(100),
-            service.embed(&["overflow".to_owned()], EmbeddingModel::default()),
-        )
-        .await
-        .expect("a full embedding queue must fail without waiting")
-        .expect_err("a full embedding queue must return an embedding error");
+    struct ServiceProvider(Arc<dyn EmbeddingService>);
 
-        drop(queued_receivers);
-        inner.release();
-        first
+    #[async_trait]
+    impl EmbedderProvider for ServiceProvider {
+        fn name(&self) -> &str {
+            "queue-test"
+        }
+        fn dimensions(&self) -> usize {
+            1
+        }
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::clone(&self.0))
+        }
+    }
+
+    pub(super) fn queue_runtime(service: Arc<dyn EmbeddingService>) -> crate::KhiveRuntime {
+        let runtime = crate::KhiveRuntime::memory().expect("memory runtime");
+        runtime.register_embedder(ServiceProvider(service));
+        runtime
+    }
+
+    pub(super) async fn poll_once<F: std::future::Future + ?Sized>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    pub(super) async fn wait_for_entered(inner: &BlockingTestService, count: usize) {
+        let watchdog = std::time::Instant::now() + Duration::from_secs(2);
+        while inner.entered.load(Ordering::Acquire) < count {
+            assert!(
+                std::time::Instant::now() < watchdog,
+                "setup watchdog: native worker did not enter"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn drive_until_entered<F: std::future::Future + ?Sized>(
+        mut future: std::pin::Pin<&mut F>,
+        inner: &BlockingTestService,
+        count: usize,
+    ) {
+        let watchdog = std::time::Instant::now() + Duration::from_secs(2);
+        while inner.entered.load(Ordering::Acquire) < count {
+            assert!(
+                std::time::Instant::now() < watchdog,
+                "setup watchdog: driven runtime call did not reach the native worker"
+            );
+            assert!(
+                poll_once(future.as_mut()).await.is_pending(),
+                "held inference must remain pending while the runtime call is driven"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runtime_embedding_waits_for_capacity_and_drains_n_plus_one_calls() {
+        let inner = Arc::new(BlockingTestService::new());
+        let _release = ReleaseWorkerOnDrop(Arc::clone(&inner));
+        let service = Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner)));
+        let runtime = queue_runtime(service.clone());
+        runtime
+            .embedder("queue-test")
             .await
-            .expect("first embedding task must not panic")
-            .expect("first embedding call must succeed");
-        assert!(
-            overflow.to_string().contains("queue is full"),
-            "queue saturation must use the embedding failure path: {overflow}"
+            .expect("resolve provider before the admission fixture");
+        let first_text = vec!["first".to_owned()];
+        let mut first = Box::pin(runtime.embed_batch_with_model("queue-test", &first_text));
+        assert!(poll_once(first.as_mut()).await.is_pending());
+        drive_until_entered(first.as_mut(), &inner, 1).await;
+
+        let texts: Vec<_> = (0..EMBEDDING_QUEUE_CAPACITY)
+            .map(|index| vec![format!("queued-{index}")])
+            .collect();
+        let mut queued = Vec::new();
+        for text in &texts {
+            let mut call = Box::pin(runtime.embed_batch_with_model("queue-test", text));
+            assert!(
+                poll_once(call.as_mut()).await.is_pending(),
+                "the bounded queue must admit its N actual runtime calls"
+            );
+            queued.push(call);
+        }
+        assert_eq!(
+            service.in_flight_bytes.load(Ordering::Acquire),
+            first_text.iter().map(String::len).sum::<usize>()
+                + texts.iter().flatten().map(String::len).sum::<usize>(),
+            "the held worker and N queued runtime jobs must own their exact input bytes"
         );
+        let overflow_text = vec!["overflow".to_owned()];
+        let mut overflow = Box::pin(runtime.embed_batch_with_model("queue-test", &overflow_text));
+        let overflow_before_release = poll_once(overflow.as_mut()).await;
+        inner.release();
+        assert!(
+            overflow_before_release.is_pending(),
+            "request N+1 must wait for a slot instead of failing: {overflow_before_release:?}"
+        );
+        assert_eq!(first.await.unwrap(), vec![vec![1.0]]);
+        for call in queued {
+            assert_eq!(call.await.unwrap(), vec![vec![1.0]]);
+        }
+        assert_eq!(overflow.await.unwrap(), vec![vec![1.0]]);
+        assert_eq!(
+            inner.entered.load(Ordering::Acquire),
+            EMBEDDING_QUEUE_CAPACITY + 2
+        );
+        assert_eq!(inner.thread_ids.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_embedding_expired_admission_is_retryable_and_never_enqueued() {
+        let inner = Arc::new(BlockingTestService::new());
+        let _release = ReleaseWorkerOnDrop(Arc::clone(&inner));
+        let service = Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner)));
+        let runtime = queue_runtime(service.clone());
+        runtime
+            .embedder("queue-test")
+            .await
+            .expect("resolve provider before the admission fixture");
+        let first_text = vec!["first".to_owned()];
+        let mut first = Box::pin(runtime.embed_batch_with_model("queue-test", &first_text));
+        assert!(poll_once(first.as_mut()).await.is_pending());
+        drive_until_entered(first.as_mut(), &inner, 1).await;
+        let texts: Vec<_> = (0..EMBEDDING_QUEUE_CAPACITY)
+            .map(|index| vec![format!("queued-{index}")])
+            .collect();
+        let mut queued = Vec::new();
+        for text in &texts {
+            let mut call = Box::pin(runtime.embed_batch_with_model("queue-test", text));
+            assert!(poll_once(call.as_mut()).await.is_pending());
+            queued.push(call);
+        }
+        assert_eq!(
+            service.in_flight_bytes.load(Ordering::Acquire),
+            first_text.iter().map(String::len).sum::<usize>()
+                + texts.iter().flatten().map(String::len).sum::<usize>(),
+            "the held worker and N queued runtime jobs must own their exact input bytes"
+        );
+        let deadline = khive_storage::RequestReadDeadline::after(Duration::from_millis(100));
+        let mut expired = Box::pin(khive_storage::scope_request_read_deadline_at(
+            deadline,
+            runtime.embed_with_model("queue-test", "expired"),
+        ));
+        assert!(
+            poll_once(expired.as_mut()).await.is_pending(),
+            "an unexpired full-queue call must wait"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let result = poll_once(expired.as_mut()).await;
+        inner.release();
+        let error = match result {
+            std::task::Poll::Ready(Err(error)) => error,
+            other => panic!("expired admission must produce a typed runtime error: {other:?}"),
+        };
+        assert!(
+            matches!(&error, RuntimeError::Storage(khive_storage::StorageError::AdmissionTimeout {
+            operation, timeout_ms: 100, pool_identity: None,
+        }) if operation == "embedding admission"),
+            "{error:?}"
+        );
+        assert!(
+            error.retryable_failure_context().is_some(),
+            "pre-admission expiry must use the existing retryable classification"
+        );
+        let projected = crate::error_projection::runtime_error_value(
+            error,
+            crate::DomainDisposition::NotCommitted,
+        );
+        assert_eq!(projected["retryable"], true);
+        assert_eq!(projected["operation"], "embedding admission");
+        assert_eq!(first.await.unwrap(), vec![vec![1.0]]);
+        for call in queued {
+            assert_eq!(call.await.unwrap(), vec![vec![1.0]]);
+        }
+        assert!(
+            !inner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|text| text == "expired"),
+            "an expired waiter must never reach inference"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_embedding_earlier_absolute_bound_is_not_renewed_when_slot_is_ready() {
+        let inner = Arc::new(BlockingTestService::new());
+        let _release = ReleaseWorkerOnDrop(Arc::clone(&inner));
+        let runtime = queue_runtime(Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner))));
+        runtime
+            .embedder("queue-test")
+            .await
+            .expect("resolve provider before the admission deadline");
+        let deadline = khive_storage::RequestReadDeadline::after(Duration::from_millis(100));
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let mut call = Box::pin(khive_storage::scope_request_read_deadline_at(
+            deadline,
+            runtime.embed_with_model("queue-test", "expired-ready-slot"),
+        ));
+        let result = poll_once(call.as_mut()).await;
+        inner.release();
+        assert!(
+            matches!(
+                result,
+                std::task::Poll::Ready(Err(RuntimeError::Storage(
+                    khive_storage::StorageError::AdmissionTimeout { timeout_ms: 0, .. }
+                )))
+            ),
+            "an already-expired original bound must refuse even an available slot: {result:?}"
+        );
+        assert_eq!(
+            inner.entered.load(Ordering::Acquire),
+            0,
+            "capacity becoming ready must not bypass expiry"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_embedding_all_six_call_families_refuse_expired_admission() {
+        let inner = Arc::new(BlockingTestService::new());
+        let _release = ReleaseWorkerOnDrop(Arc::clone(&inner));
+        let runtime = queue_runtime(Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner))));
+        let texts = vec!["later".to_owned()];
+        for family in 0..6 {
+            let result = khive_storage::scope_request_read_deadline(Duration::ZERO, async {
+                match family {
+                    0 => runtime.embed_with_model("queue-test", "later").await,
+                    1 => runtime
+                        .embed_document_with_model_outcome("queue-test", "later")
+                        .await
+                        .map(|outcome| outcome.vector),
+                    2 => runtime.embed_query_with_model("queue-test", "later").await,
+                    3 => runtime
+                        .embed_batch_with_model("queue-test", &texts)
+                        .await
+                        .map(|vectors| vectors[0].clone()),
+                    4 => runtime
+                        .embed_document_batch_with_model("queue-test", &texts)
+                        .await
+                        .map(|vectors| vectors[0].clone()),
+                    _ => runtime
+                        .embed_query_batch_with_model("queue-test", &texts)
+                        .await
+                        .map(|vectors| vectors[0].clone()),
+                }
+            })
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Storage(
+                        khive_storage::StorageError::AdmissionTimeout { .. }
+                    ))
+                ),
+                "family {family} must reach the actual runtime admission boundary: {result:?}"
+            );
+        }
+        assert_eq!(inner.entered.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_embedding_admitted_inference_is_not_reported_as_admission_timeout() {
+        let inner = Arc::new(BlockingTestService::new());
+        let _release = ReleaseWorkerOnDrop(Arc::clone(&inner));
+        let runtime = queue_runtime(Arc::new(BlockingEmbeddingService::new(Arc::clone(&inner))));
+        runtime
+            .embedder("queue-test")
+            .await
+            .expect("resolve provider before the admission fixture");
+        let mut call = Box::pin(khive_storage::scope_request_read_deadline(
+            Duration::from_millis(100),
+            runtime.embed_with_model("queue-test", "first"),
+        ));
+        assert!(poll_once(call.as_mut()).await.is_pending());
+        drive_until_entered(call.as_mut(), &inner, 1).await;
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let after_deadline = poll_once(call.as_mut()).await;
+        inner.release();
+        assert!(after_deadline.is_pending(),
+            "already-running inference cannot be called a pre-admission refusal: {after_deadline:?}");
+        assert_eq!(call.await.unwrap(), vec![1.0]);
+    }
+
+    struct CustomWaitingService {
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for CustomWaitingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> lattice_embed::Result<Vec<Vec<f32>>> {
+            self.release.notified().await;
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "custom-waiting"
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn runtime_custom_inference_is_not_reported_as_builtin_admission_timeout() {
+        let inner = Arc::new(CustomWaitingService {
+            release: Notify::new(),
+        });
+        let runtime = queue_runtime(inner.clone());
+        let mut call = Box::pin(khive_storage::scope_request_read_deadline(
+            Duration::from_millis(100),
+            runtime.embed_with_model("queue-test", "custom"),
+        ));
+        assert!(poll_once(call.as_mut()).await.is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let after_deadline = poll_once(call.as_mut()).await;
+        inner.release.notify_one();
+        assert!(
+            after_deadline.is_pending(),
+            "custom inference did not enter the built-in pre-admission wait: {after_deadline:?}"
+        );
+        assert_eq!(call.await.unwrap(), vec![1.0]);
     }
 
     #[tokio::test]

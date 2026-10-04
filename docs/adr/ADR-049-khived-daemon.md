@@ -1584,12 +1584,26 @@ missing writable target, keep a Missing claim state, create/open the frozen
 path under the held lock, and bind its newly observed `(device, inode)`.
 Missing read-only targets refuse without creation. Re-stat each canonical path
 immediately after its SQLite backend opens and before schema preparation, then
-again before serving; observed identity drift fails boot. This post-open path
-check is not an atomic proof of SQLite's opened file
-descriptor: the SQLite binding used here does not expose that descriptor's
-identity (`crates/khive-mcp/src/serve.rs`, `reverify_reindex_target_identity`
-comment). Concurrent replace-and-restore within the gap remains a stated
-limitation.
+again before serving; observed identity drift fails boot. Pass the bound file
+identity into both implicit and declared-backend pool construction. On verified
+64-bit Linux and macOS, the binary installs an immutable forwarding observer for
+the bundled Unix VFS `fstat` syscall at process startup, before any SQLite file
+I/O. A claimed writer open must observe the actual descriptor identity and match
+every successful observation to the held claim before any SQL, identity-row
+initialization, or WAL setup. No observations or any mismatch refuse boot,
+including when the original pathname is restored after a foreign file opens.
+Claimed opens disable `SQLITE_OPEN_CREATE`; the bound file must already exist.
+Library hosts must call the unsafe startup initializer under its documented
+precondition; claimed opens never install it lazily. Other Unix ABIs and
+unverified VFS implementations refuse claimed opens. The forwarding callback
+neither closes nor denies SQLite's descriptors, preserving native POSIX lock
+handling. The final path checks remain additional startup guards.
+
+This check precedes pool SQL and WAL changes, not all native open-time I/O.
+SQLite's macOS msdos/exfat path can write to an empty file during native open;
+trusted nonmutating autoextensions must remain in place. The observer does not
+promise protection from that filesystem-specific raw write, mutating
+third-party autoextensions, or later replacement of the VFS syscall table.
 
 The guarantee is **per stable canonical pathname among participating daemon
 boots**, not per physical inode across distinct hardlink names. Symlink

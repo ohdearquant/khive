@@ -124,6 +124,187 @@ async fn refresh(
     .unwrap()
 }
 
+struct CapturingRefreshEmbedder(Arc<std::sync::Mutex<Vec<String>>>);
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for CapturingRefreshEmbedder {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        self.0.lock().unwrap().extend_from_slice(texts);
+        Ok(texts.iter().map(|_| vec![1.0; 4]).collect())
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "web-refresh-capture"
+    }
+}
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for CapturingRefreshEmbedder {
+    fn name(&self) -> &str {
+        "web-refresh-capture"
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    async fn build(
+        &self,
+    ) -> khive_runtime::RuntimeResult<Arc<dyn lattice_embed::EmbeddingService>> {
+        Ok(Arc::new(Self(Arc::clone(&self.0))))
+    }
+}
+
+// Controls: independently restore each legacy guarded update, or discard its
+// returned report; its metadata/body/redirect arm must fail. Removing only the
+// receipt's report field must fail even while the reply still discloses it.
+#[tokio::test]
+async fn refresh_discloses_bounded_embeddings_in_reply_and_receipt_for_each_update_path() {
+    for (arm, long) in [
+        ("metadata", true),
+        ("body", true),
+        ("redirect", true),
+        ("metadata", false),
+    ] {
+        let (runtime, token, _dir) = fixture();
+        let source = Url::parse("https://metadata.example/embedding-source").unwrap();
+        let terminal = Url::parse("https://metadata.example/embedding-terminal").unwrap();
+        let source_id = seed(&runtime, &token, &source, &[]).await;
+        let target_id = if arm == "redirect" {
+            seed(&runtime, &token, &terminal, &[]).await
+        } else {
+            source_id
+        };
+        let budget = khive_runtime::retrieval::document_embedding_budget("web-refresh-capture");
+        let name = if long {
+            "n".repeat(budget + 1)
+        } else {
+            "short refresh name".to_string()
+        };
+        runtime
+            .update_entity_with_embedding_report(
+                &token,
+                target_id,
+                khive_runtime::EntityPatch {
+                    name: Some(name.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime.register_embedder(CapturingRefreshEmbedder(Arc::clone(&captured)));
+        let before = entity(&runtime, &token, source_id)
+            .await
+            .properties
+            .unwrap();
+        let sent = refresh_request_headers(&before).unwrap();
+        let mut headers = response_headers();
+        headers.insert("content-type", "text/html".parse().unwrap());
+        let hops = if arm == "redirect" {
+            vec![crate::fetch::RedirectHop {
+                from: source.clone(),
+                to: terminal.clone(),
+                status: 302,
+            }]
+        } else {
+            vec![]
+        };
+        let reply = settle_refresh_with_request_headers(
+            &runtime,
+            &token,
+            source_id,
+            before["url"].as_str().unwrap(),
+            before["blob_ref"].as_str().unwrap(),
+            HopOutcome {
+                status: if arm == "metadata" { 304 } else { 200 },
+                final_url: if arm == "redirect" { terminal } else { source },
+                headers,
+                redirect_to: None,
+                body: if arm == "metadata" {
+                    None
+                } else {
+                    Some((b"changed representation bytes".to_vec(), false))
+                },
+            },
+            &hops,
+            &sent,
+        )
+        .await
+        .expect("refresh must retain its bounded embedding result");
+        let request = receipt(&runtime, &token, &reply).await;
+        if long {
+            let expected = json!({"truncated": 1, "discarded_bytes": 1});
+            assert_eq!(
+                reply["embedding_truncation_report"], expected,
+                "reply {arm}"
+            );
+            assert_eq!(
+                request["embedding_truncation_report"], expected,
+                "receipt {arm}"
+            );
+        } else {
+            assert!(reply.get("embedding_truncation_report").is_none());
+            assert!(request.get("embedding_truncation_report").is_none());
+        }
+        let embedded = if long {
+            "n".repeat(budget)
+        } else {
+            name.clone()
+        };
+        {
+            let seen = captured.lock().unwrap();
+            let entity_inputs: Vec<_> = seen
+                .iter()
+                .filter(|text| text.starts_with(if long { "nnn" } else { name.as_str() }))
+                .collect();
+            assert_eq!(entity_inputs, vec![&embedded], "exact provider input {arm}");
+            assert_eq!(
+                entity_inputs[0].len(),
+                if long { budget } else { name.len() }
+            );
+            if long {
+                let discarded = (name.len() - entity_inputs[0].len()) as u64;
+                assert_eq!(
+                    reply["embedding_truncation_report"]["discarded_bytes"],
+                    discarded
+                );
+                assert_eq!(
+                    request["embedding_truncation_report"]["discarded_bytes"],
+                    discarded
+                );
+            }
+        }
+        let stored = entity(&runtime, &token, target_id).await;
+        assert_eq!(stored.name, name);
+        assert_eq!(stored.entity_type.as_deref(), Some("page"));
+        assert_eq!(reply["lost_race"], false);
+        if arm != "metadata" {
+            let body_ref = stored.properties.as_ref().unwrap()["blob_ref"]
+                .as_str()
+                .unwrap();
+            let (capture_id, capture_request) =
+                crate::receipt::capture_for_body(&runtime, &token, &stored, body_ref)
+                    .await
+                    .unwrap()
+                    .expect("the receipt with an embedding report still owns this body");
+            assert_eq!(capture_id.to_string(), reply["receipt_id"]);
+            assert_eq!(
+                capture_request["embedding_truncation_report"],
+                request["embedding_truncation_report"]
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn first_fetch_then_refresh_keeps_negotiation_on_the_rooted_body() {
     let (runtime, token, _dir) = fixture();
@@ -138,7 +319,7 @@ async fn first_fetch_then_refresh_keeps_negotiation_on_the_rooted_body() {
     );
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr-CA"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["fr-CA"], "accept-encoding": ["identity"]})
     );
 
     let mut headers = response_headers();
@@ -152,7 +333,7 @@ async fn first_fetch_then_refresh_keeps_negotiation_on_the_rooted_body() {
     );
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr-CA"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["fr-CA"], "accept-encoding": ["identity"]})
     );
     assert_eq!(properties["etag"], "refreshed-etag");
     assert_eq!(reply["changed"], false);
@@ -397,7 +578,7 @@ async fn redirected_refresh_updates_terminal_metadata_and_negotiation() {
             );
             assert_eq!(
                 properties["request_headers"],
-                json!({"accept": ["application/json"], "accept-language": ["fr"], "accept-encoding": ["gzip"]}),
+                json!({"accept": ["application/json"], "accept-language": ["fr"], "accept-encoding": ["identity"]}),
                 "terminal refresh must retain the sent negotiation"
             );
             assert_eq!(properties["status"], 200);
@@ -429,7 +610,7 @@ async fn redirected_304_preserves_source_and_terminal_rows() {
             let source_before = entity(&runtime, &token, source).await;
             let final_canonical = crate::identity::canonicalize(final_url.clone());
             let final_id = crate::identity::document_id(
-                crate::identity::site_id(&final_canonical),
+                crate::identity::site_id(&khive_types::Namespace::local(), &final_canonical),
                 &crate::identity::path_and_query(&final_canonical),
             );
             if existing_terminal {
@@ -559,7 +740,6 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
-        .gzip(true)
         .build()
         .unwrap();
     let headers = effective_request_headers(
@@ -592,7 +772,7 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
     .await
     .unwrap();
     let id = Uuid::parse_str(fetched["id"].as_str().unwrap()).unwrap();
-    let expected = json!({"accept": ["application/json"], "accept-language": ["fr-CA,fr;q=0.8"], "accept-encoding": ["gzip"]});
+    let expected = json!({"accept": ["application/json"], "accept-language": ["fr-CA,fr;q=0.8"], "accept-encoding": ["identity"]});
     assert_eq!(
         receipt(&runtime, &token, &fetched).await["request_headers"],
         expected,
@@ -645,7 +825,7 @@ async fn refresh_reuses_negotiation_and_updated_validator_on_next_http_request()
         );
         assert_eq!(
             headers.get("accept-encoding"),
-            Some(&vec!["gzip".to_string()]),
+            Some(&vec!["identity".to_string()]),
             "the built client must send its fixed encoding on fetch and refresh"
         );
     }
@@ -709,7 +889,7 @@ async fn fetch_and_refresh_receipts_allowlist_metadata() {
         4,
         "only negotiation header values are durable"
     );
-    let expected = json!({"accept": ["application/json", "text/plain;q=0.5"], "accept-language": ["en"], "accept-encoding": ["gzip"]});
+    let expected = json!({"accept": ["application/json", "text/plain;q=0.5"], "accept-language": ["en"], "accept-encoding": ["identity"]});
     let mut conditional_sent = sent.clone();
     conditional_sent.push(("If-None-Match".into(), "old-etag".into()));
     let refreshed = settle_refresh_with_request_headers(
@@ -778,14 +958,14 @@ async fn head_preserves_cached_get_negotiation_and_unnegotiated_get_clears_it() 
     );
     assert_eq!(
         receipt(&runtime, &token, &reply).await["request_headers"],
-        json!({"accept": ["text/html"], "accept-encoding": ["gzip"]})
+        json!({"accept": ["text/html"], "accept-encoding": ["identity"]})
     );
     seed(&runtime, &token, &url, &[]).await;
     let properties = entity(&runtime, &token, id).await.properties.unwrap();
     assert_eq!(
         crate::fetch::stored_negotiation_headers(&properties).unwrap(),
-        vec![("accept-encoding".to_string(), "gzip".to_string())],
-        "a later unnegotiated GET clears caller fields but retains fixed gzip"
+        vec![("accept-encoding".to_string(), "identity".to_string())],
+        "a later unnegotiated GET clears caller fields but retains the fixed encoding"
     );
 }
 
@@ -897,7 +1077,8 @@ async fn overlapping_refresh_keeps_validators_with_the_settled_body() {
     let body_ref =
         khive_storage::ContentRef::from_hex(final_properties["blob_ref"].as_str().unwrap())
             .unwrap();
-    let stored_body = crate::blob_store(&runtime)
+    let stored_body = runtime
+        .require_blob_store()
         .unwrap()
         .get_bounded_verified(&body_ref, 64)
         .await
@@ -981,7 +1162,7 @@ async fn redirected_refresh_keeps_a_get_written_after_the_terminal_request() {
     assert_eq!(properties["content_language"], "fr");
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["fr"], "accept-encoding": ["identity"]})
     );
 }
 
@@ -1049,11 +1230,12 @@ async fn redirected_refresh_keeps_a_newer_get_body_after_the_terminal_request() 
     assert_eq!(properties["etag"], "newer-get-body");
     assert_eq!(
         properties["request_headers"],
-        json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["fr"], "accept-encoding": ["identity"]})
     );
     let body_ref =
         khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
-    let stored_body = crate::blob_store(&runtime)
+    let stored_body = runtime
+        .require_blob_store()
         .unwrap()
         .get_bounded_verified(&body_ref, 64)
         .await
@@ -1069,7 +1251,7 @@ async fn redirected_refresh_does_not_claim_a_terminal_row_created_during_its_req
     let source_url = Url::parse("https://metadata.example/new-target-source").unwrap();
     let terminal_url = Url::parse("https://metadata.example/new-target").unwrap();
     let source_id = seed(&runtime, &token, &source_url, &[]).await;
-    let terminal_id = document_id_for_url(&terminal_url);
+    let terminal_id = document_id_for_url(&token, &terminal_url);
     assert!(runtime
         .entities(&token)
         .unwrap()
@@ -1131,12 +1313,152 @@ async fn redirected_refresh_does_not_claim_a_terminal_row_created_during_its_req
     assert_eq!(properties["etag"], "newly-created-get");
     let body_ref =
         khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
-    let stored_body = crate::blob_store(&runtime)
+    let stored_body = runtime
+        .require_blob_store()
         .unwrap()
         .get_bounded_verified(&body_ref, 64)
         .await
         .unwrap();
     assert_eq!(stored_body, b"newly-created GET body");
+}
+
+#[tokio::test]
+async fn run_refresh_redirect_loses_to_get_after_terminal_request() {
+    use crate::egress::resolver_fixture::ScriptedResolver;
+
+    async fn request_line(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        while !bytes.ends_with(b"\r\n\r\n") {
+            let byte = socket.read_u8().await.expect("read HTTP request");
+            bytes.push(byte);
+            assert!(bytes.len() < 16_384, "request headers exceeded test bound");
+        }
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    let (runtime, token, _dir) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let source_url =
+        Url::parse(&format!("http://refresh-race.example.test:{port}/source")).unwrap();
+    let terminal_url =
+        Url::parse(&format!("http://refresh-race.example.test:{port}/terminal")).unwrap();
+    let source_id = seed(&runtime, &token, &source_url, &[]).await;
+    let terminal_id = seed(&runtime, &token, &terminal_url, &[]).await;
+    let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let server_terminal_url = terminal_url.clone();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        assert_eq!(request_line(&mut first).await, "GET /source HTTP/1.1");
+        first
+            .write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {server_terminal_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        first.shutdown().await.unwrap();
+        drop(first);
+
+        let (mut terminal, _) = listener.accept().await.unwrap();
+        assert_eq!(request_line(&mut terminal).await, "GET /terminal HTTP/1.1");
+        request_seen_tx.send(()).unwrap();
+        release_rx.await.expect("release older refresh response");
+        let body = b"older refresh body";
+        terminal
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nETag: older-refresh\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        terminal.write_all(body).await.unwrap();
+        terminal.shutdown().await.unwrap();
+    });
+
+    // Policy still validates a public DNS answer. Only this test's checked
+    // transport maps that host to the local paused HTTP server.
+    let resolver = ScriptedResolver::new(None);
+    let clients = crate::egress::PinnedClients::default();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(
+            "refresh-race.example.test",
+            std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), port),
+        )
+        .build()
+        .unwrap();
+    clients.insert_for_test(&source_url, resolver.address, client);
+    let run_runtime = runtime.clone();
+    let run_token = token.clone();
+    let run = tokio::spawn(async move {
+        let params = serde_json::from_value(json!({"id": source_id, "timeout_s": 5})).unwrap();
+        run_refresh(
+            &run_runtime,
+            &run_token,
+            &resolver,
+            &Default::default(),
+            params,
+            &clients,
+        )
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), request_seen_rx)
+        .await
+        .expect("production refresh did not reach the terminal request")
+        .unwrap();
+    let mut newer_headers = response_headers();
+    newer_headers.insert("etag", "newer-get".parse().unwrap());
+    let newer = settle_with_request_headers(
+        &runtime,
+        &token,
+        "GET",
+        &terminal_url,
+        200,
+        &newer_headers,
+        Some((b"newer GET body".to_vec(), false)),
+        &[],
+        true,
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(newer["id"], terminal_id.to_string());
+    release_tx.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("refresh did not settle")
+        .unwrap()
+        .unwrap();
+    server.await.unwrap();
+
+    assert_eq!(reply["lost_race"], true, "{reply}");
+    assert_eq!(reply["changed"], false, "{reply}");
+    let terminal = entity(&runtime, &token, terminal_id).await;
+    let properties = terminal.properties.as_ref().unwrap();
+    assert_eq!(properties["etag"], "newer-get");
+    let body_ref =
+        khive_storage::ContentRef::from_hex(properties["blob_ref"].as_str().unwrap()).unwrap();
+    let body = runtime
+        .require_blob_store()
+        .unwrap()
+        .get_bounded_verified(&body_ref, 64)
+        .await
+        .unwrap();
+    assert_eq!(body, b"newer GET body");
 }
 
 // Simulate a fetch paused between its body settlement and negotiation write.
@@ -1276,7 +1598,7 @@ fn vary_gate_requires_every_stored_selector_and_value() {
         "request_headers": {
             "accept": ["text/plain"],
             "accept-language": ["fr-CA"],
-            "accept-encoding": ["gzip"]
+            "accept-encoding": ["identity"]
         }
     });
     for (vary, replayable) in [
@@ -1328,7 +1650,7 @@ fn vary_gate_requires_every_stored_selector_and_value() {
     assert!(conditional_headers_for_hop(&missing_encoding, &url, &url, true).is_empty());
     let mut wrong_encoding = base.clone();
     wrong_encoding["vary"] = json!(["Accept-Encoding"]);
-    wrong_encoding["request_headers"]["accept-encoding"] = json!(["identity"]);
+    wrong_encoding["request_headers"]["accept-encoding"] = json!(["br"]);
     assert!(conditional_headers_for_hop(&wrong_encoding, &url, &url, true).is_empty());
     let mut missing = base;
     missing["vary"] = json!(["Accept-Language"]);
@@ -1344,14 +1666,119 @@ fn vary_accept_encoding_with_fixed_record_sends_validator() {
         "etag": "encoded-etag",
         "truncated": false,
         "vary": ["Accept-Encoding"],
-        "request_headers": {"accept-encoding": ["gzip"]}
+        "request_headers": {"accept-encoding": ["identity"]}
     });
     let sent = refresh_request_headers(&properties).unwrap();
-    assert!(sent
-        .iter()
-        .any(|(name, value)| { name.eq_ignore_ascii_case("accept-encoding") && value == "gzip" }));
+    assert!(sent.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("accept-encoding") && value == "identity"
+    }));
     assert!(sent.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("if-none-match") && value == "encoded-etag"
+    }));
+}
+
+#[test]
+fn stored_gzip_encoding_map_replays_identity_without_validators() {
+    let url = Url::parse("https://metadata.example/stored-gzip-map").unwrap();
+    let properties = json!({
+        "url": url.as_str(),
+        "etag": "stored-etag",
+        "truncated": false,
+        "vary": ["Accept, Accept-Encoding"],
+        "request_headers": {
+            "accept": ["text/plain"],
+            "accept-encoding": ["gzip"]
+        }
+    });
+    let sent = refresh_request_headers(&properties).unwrap();
+    assert_eq!(
+        crate::fetch::negotiation_headers(&sent),
+        crate::fetch::negotiation_headers(&[
+            ("accept".to_string(), "text/plain".to_string()),
+            ("accept-encoding".to_string(), "identity".to_string()),
+        ]),
+        "an earlier record keeps its replayed fields and never resends gzip"
+    );
+    assert!(sent.iter().all(|(name, _)| {
+        !name.eq_ignore_ascii_case("if-none-match")
+            && !name.eq_ignore_ascii_case("if-modified-since")
+    }));
+}
+
+#[tokio::test]
+async fn legacy_gzip_body_requires_identity_get_before_validation() {
+    let (runtime, token, _dir) = fixture();
+    let url = Url::parse("https://metadata.example/legacy-gzip-body").unwrap();
+    let id = seed(&runtime, &token, &url, &[]).await;
+    crate::entities::patch(
+        &runtime,
+        &token,
+        id,
+        None,
+        json!({
+            "vary": ["Accept-Encoding"],
+            "request_headers": {"accept-encoding": ["gzip"]}
+        }),
+    )
+    .await
+    .unwrap();
+    let before = entity(&runtime, &token, id).await;
+    let properties = before.properties.as_ref().unwrap();
+    let sent = refresh_request_headers(properties).unwrap();
+    assert_eq!(
+        crate::fetch::negotiation_headers(&sent)["accept-encoding"],
+        vec!["identity".to_string()]
+    );
+    assert!(sent.iter().all(|(name, _)| {
+        !name.eq_ignore_ascii_case("if-none-match")
+            && !name.eq_ignore_ascii_case("if-modified-since")
+    }));
+
+    let no_body = settle_refresh_with_request_headers(
+        &runtime,
+        &token,
+        id,
+        url.as_str(),
+        properties["blob_ref"].as_str().unwrap(),
+        HopOutcome {
+            status: 304,
+            final_url: url.clone(),
+            headers: HeaderMap::new(),
+            redirect_to: None,
+            body: Some((vec![], false)),
+        },
+        &[],
+        &sent,
+    )
+    .await;
+    assert!(
+        no_body
+            .unwrap_err()
+            .to_string()
+            .contains("unsolicited_not_modified"),
+        "an unsolicited 304 cannot bless the legacy body"
+    );
+    assert_eq!(
+        serde_json::to_value(entity(&runtime, &token, id).await).unwrap(),
+        serde_json::to_value(&before).unwrap(),
+        "a bodyless reply cannot change the legacy row"
+    );
+    assert_eq!(
+        entity(&runtime, &token, id).await.properties.unwrap()["request_headers"]
+            ["accept-encoding"],
+        json!(["gzip"])
+    );
+
+    refresh(&runtime, &token, id, &url, 200, response_headers(), &[]).await;
+    let after = entity(&runtime, &token, id).await;
+    let properties = after.properties.unwrap();
+    assert_eq!(
+        properties["request_headers"]["accept-encoding"],
+        json!(["identity"])
+    );
+    let next = refresh_request_headers(&properties).unwrap();
+    assert!(next.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("if-none-match") && value == "old-etag"
     }));
 }
 
@@ -1372,7 +1799,7 @@ async fn represented_accept_encoding_on_304_updates_vary() {
 }
 
 #[tokio::test]
-async fn legacy_map_304_represents_wire_gzip_but_next_refresh_is_unconditional() {
+async fn legacy_map_304_represents_wire_identity_but_next_refresh_is_unconditional() {
     let (runtime, token, _dir) = fixture();
     let url = Url::parse("https://metadata.example/legacy-encoding-304").unwrap();
     let id = seed(&runtime, &token, &url, &[]).await;
@@ -1619,7 +2046,7 @@ async fn concurrent_get_keeps_its_negotiation_after_same_body_refresh() {
     let after_get = entity(&runtime, &token, id).await;
     assert_eq!(
         after_get.properties.as_ref().unwrap()["request_headers"],
-        json!({"accept-language": ["en"], "accept-encoding": ["gzip"]})
+        json!({"accept-language": ["en"], "accept-encoding": ["identity"]})
     );
     assert_eq!(
         after_get.properties.as_ref().unwrap()["blob_ref"],
@@ -1632,7 +2059,7 @@ async fn concurrent_get_keeps_its_negotiation_after_same_body_refresh() {
     let final_entity = entity(&runtime, &token, id).await;
     assert_eq!(
         final_entity.properties.unwrap()["request_headers"],
-        json!({"accept-language": ["en"], "accept-encoding": ["gzip"]}),
+        json!({"accept-language": ["en"], "accept-encoding": ["identity"]}),
         "A5 allows only the caller's GET to replace stored negotiation"
     );
 }
@@ -1888,7 +2315,7 @@ mod refresh_revision_tests {
         assert_eq!(row.content_ref.as_deref(), Some(expected_ref));
         assert_eq!(
             properties["request_headers"],
-            json!({"accept-language": [language], "accept-encoding": ["gzip"]}),
+            json!({"accept-language": [language], "accept-encoding": ["identity"]}),
             "a refresh must not replace the later caller-issued GET negotiation"
         );
         assert_eq!(
@@ -2002,7 +2429,7 @@ mod refresh_revision_tests {
                 assert_eq!(audit["lost_race"], true);
                 assert_eq!(
                     audit["request_headers"],
-                    json!({"accept-language": ["fr"], "accept-encoding": ["gzip"]}),
+                    json!({"accept-language": ["fr"], "accept-encoding": ["identity"]}),
                     "receipt must report A's actual request, not B's saved context"
                 );
             }

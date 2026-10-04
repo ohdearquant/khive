@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    EmailMessageIdDomains, KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan,
-    VerbRegistry,
+    EmailMessageIdDomains, KhiveRuntime, KindHook, NamespaceToken, NoteEmbeddingPolicy,
+    NoteEmbeddingPolicySpec, RuntimeError, SchemaPlan, VerbRegistry,
 };
 use khive_types::{HandlerDef, Pack};
 
@@ -14,7 +14,7 @@ use crate::handlers;
 use crate::inbox_signal::InboxSignal;
 use crate::vocab::{COMM_HANDLERS, COMM_SCHEMA_PLAN_STMTS};
 
-/// Communication pack providing ten public `comm.*` verbs.
+/// Communication pack providing eleven public `comm.*` verbs.
 ///
 /// Stores and queries `message` notes in the standard notes table; message
 /// metadata lives in the `properties` JSON column.
@@ -41,6 +41,11 @@ impl Pack for CommPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &COMM_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
+    const NOTE_EMBEDDING_POLICIES: &'static [NoteEmbeddingPolicySpec] =
+        &[NoteEmbeddingPolicySpec {
+            kind: "message",
+            policy: NoteEmbeddingPolicy::DefaultModel,
+        }];
 }
 
 impl CommPack {
@@ -53,6 +58,7 @@ impl CommPack {
     /// [`Self::new_with_channel_ingest_capability`] or
     /// [`khive_runtime::PackRuntime::accept_channel_ingest_capability`]).
     pub fn new(runtime: KhiveRuntime) -> Self {
+        runtime.install_note_embedding_policies(<Self as Pack>::NOTE_EMBEDDING_POLICIES);
         Self {
             runtime,
             inbox_signal: InboxSignal::new(),
@@ -185,15 +191,6 @@ impl KindHook for MessageHook {
         Ok(())
     }
 
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: uuid::Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
-    }
-
     async fn validate_note_update(
         &self,
         _runtime: &KhiveRuntime,
@@ -249,15 +246,6 @@ impl KindHook for ChannelHealthHook {
              channel; use `comm.heartbeat` instead"
                 .into(),
         ))
-    }
-
-    async fn after_create(
-        &self,
-        _runtime: &KhiveRuntime,
-        _id: uuid::Uuid,
-        _args: &Value,
-    ) -> Result<(), RuntimeError> {
-        Ok(())
     }
 
     async fn validate_note_update(
@@ -366,6 +354,9 @@ impl PackRuntime for CommPack {
     fn handlers(&self) -> &'static [HandlerDef] {
         &COMM_HANDLERS
     }
+    fn note_embedding_policies(&self) -> &'static [NoteEmbeddingPolicySpec] {
+        <CommPack as Pack>::NOTE_EMBEDDING_POLICIES
+    }
     fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn KindHook>> {
         match kind {
             "message" => Some(std::sync::Arc::new(MessageHook)),
@@ -402,6 +393,9 @@ impl PackRuntime for CommPack {
                 handlers::handle_send(self.runtime(), &self.inbox_signal, token, params).await
             }
             "comm.delivered" => handlers::handle_delivered(self.runtime(), token, params).await,
+            "comm.transport_status" => {
+                handlers::handle_transport_status(self.runtime(), token, params).await
+            }
             "comm.inbox" => {
                 handlers::handle_inbox(self.runtime(), &self.inbox_signal, token, params).await
             }

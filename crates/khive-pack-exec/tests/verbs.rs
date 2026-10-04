@@ -200,7 +200,6 @@ impl Fixture {
         v["tree"].as_str().unwrap().to_string()
     }
 
-    // Read only by the kernel-denial test below, which is macOS-only.
     #[cfg(target_os = "macos")]
     async fn blob_text(&self, r: &Value) -> String {
         use base64::Engine;
@@ -235,6 +234,27 @@ impl Fixture {
         )
         .await;
         registered
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn register_perl(&self) {
+        self.call(
+            "tool.register",
+            json!({
+                "name": "perl",
+                "kind": "tool",
+                "description": "Perl network probe",
+                "source": "exec:/usr/bin/perl",
+                "side_effect": "write",
+                "trust": "first_party",
+            }),
+        )
+        .await;
+        self.call(
+            "tool.policy",
+            json!({ "actor": "*", "tool": "perl", "decision": "allow" }),
+        )
+        .await;
     }
 }
 
@@ -1782,6 +1802,118 @@ async fn run_denies_writes_through_escaping_symlinks_and_allows_inside_targets()
             "the inside write control succeeds while the outside target stays unchanged"
         );
     }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_generated_profile_refuses_outbound_tcp_connect() {
+    const PROBE: &str = r#"
+        use Socket qw(AF_INET SOCK_STREAM pack_sockaddr_in inet_aton);
+        use Errno qw(EPERM EACCES);
+        socket(my $socket, AF_INET, SOCK_STREAM, 0) or exit 43;
+        my $address = pack_sockaddr_in($ARGV[0], inet_aton("127.0.0.1"));
+        if (connect($socket, $address)) { exit 41; }
+        my $error = 0 + $!;
+        exit($error == EPERM || $error == EACCES ? 42 : 44);
+    "#;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let port = listener
+        .local_addr()
+        .expect("listener address")
+        .port()
+        .to_string();
+    let control = std::process::Command::new("/usr/bin/perl")
+        .args(["-e", PROBE, port.as_str()])
+        .output()
+        .expect("launch unsandboxed connect control");
+    assert_eq!(
+        control.status.code(),
+        Some(41),
+        "unsandboxed connect control failed: {control:?}"
+    );
+
+    let f = fixture();
+    f.register_perl().await;
+    let tree = f.tree(&[]).await;
+    let out = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "perl", "actor": "local",
+                "args": ["-e", PROBE, port],
+            }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["denied"], false, "{receipt}");
+    assert!(receipt["started_at"].is_string(), "{receipt}");
+    assert_eq!(
+        receipt["exit_code"], 42,
+        "connect must fail with EPERM/EACCES: {receipt}"
+    );
+    assert_eq!(receipt["success"], false, "{receipt}");
+    assert_eq!(receipt["sandbox"]["profile_digest"], receipt["profile_ref"]);
+    assert!(f
+        .blob_text(&receipt["profile_ref"])
+        .await
+        .contains("(deny default)"));
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn run_generated_profile_refuses_loopback_bind_and_listen() {
+    const PROBE: &str = r#"
+        use Socket qw(AF_INET SOCK_STREAM pack_sockaddr_in inet_aton);
+        use Errno qw(EPERM EACCES);
+        socket(my $socket, AF_INET, SOCK_STREAM, 0) or exit 53;
+        my $address = pack_sockaddr_in(0, inet_aton("127.0.0.1"));
+        if (!bind($socket, $address)) {
+            my $error = 0 + $!;
+            exit($error == EPERM || $error == EACCES ? 52 : 54);
+        }
+        if (!listen($socket, 1)) {
+            my $error = 0 + $!;
+            exit($error == EPERM || $error == EACCES ? 52 : 55);
+        }
+        exit 51;
+    "#;
+
+    let control = std::process::Command::new("/usr/bin/perl")
+        .args(["-e", PROBE])
+        .output()
+        .expect("launch unsandboxed bind/listen control");
+    assert_eq!(
+        control.status.code(),
+        Some(51),
+        "unsandboxed bind/listen control failed: {control:?}"
+    );
+
+    let f = fixture();
+    f.register_perl().await;
+    let tree = f.tree(&[]).await;
+    let out = f
+        .call(
+            "exec.run",
+            json!({
+                "tree": tree, "tool": "perl", "actor": "local",
+                "args": ["-e", PROBE],
+            }),
+        )
+        .await;
+    let receipt = &out["receipt"];
+    assert_eq!(receipt["denied"], false, "{receipt}");
+    assert!(receipt["started_at"].is_string(), "{receipt}");
+    assert_eq!(
+        receipt["exit_code"], 52,
+        "bind/listen must fail with EPERM/EACCES: {receipt}"
+    );
+    assert_eq!(receipt["success"], false, "{receipt}");
+    assert_eq!(receipt["sandbox"]["profile_digest"], receipt["profile_ref"]);
+    assert!(f
+        .blob_text(&receipt["profile_ref"])
+        .await
+        .contains("(deny default)"));
 }
 
 #[cfg(target_os = "macos")]

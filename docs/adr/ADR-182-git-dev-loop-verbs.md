@@ -179,8 +179,9 @@ item 1 is amended again in item 3.
    `result` and `reason`. `git.gates(repo)` lists the effective allow-list rows with those ids. No
    receipt, error or table row carries a credential value.
 8. **Trees and diffs.** `git.checkout(repo, ref)` returns `{commit, tree}` from `rev-parse`,
-   `ls-tree -r` and `cat-file blob`; symlink and submodule entries refuse. `git.diff(repo,
-   input_kind, base, head)` with `input_kind` `commits` or `trees` runs `git diff-tree -p
+   `ls-tree -r` and bounded `cat-file --batch` blob reads, falling back to `cat-file blob` for
+   exceptional object responses; symlink and submodule entries refuse. `git.diff(repo, input_kind,
+   base, head)` with `input_kind` `commits` or `trees` runs `git diff-tree -p
    --no-ext-diff --no-textconv --no-color --no-renames <base> <head>` and `--numstat` for
    `summary: {files, additions, deletions}`; tree inputs are written to a scratch repository with
    `mktree` first. The receipt's `inputs` are exactly `{input_kind, base, head}`.

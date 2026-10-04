@@ -210,9 +210,9 @@ impl PackRuntime for KgPack {
             }
             // Pure graph verbs: always use graph namespace.
             "link" => self.handle_link(graph_token, params, registry).await,
-            "neighbors" => self.handle_neighbors(graph_token, params).await,
+            "neighbors" => self.handle_neighbors(graph_token, params, registry).await,
             "traverse" => self.handle_traverse(graph_token, params).await,
-            "context" => self.handle_context(graph_token, params).await,
+            "context" => self.handle_context(graph_token, params, registry).await,
             "query" => self.handle_query(graph_token, params).await,
             "propose" => self.handle_propose(graph_token, params, registry).await,
             "review" => self.handle_review(graph_token, params, registry).await,
@@ -1244,7 +1244,7 @@ mod tests {
         let token = rt.authorize(Namespace::local()).unwrap();
 
         for i in 0..8 {
-            rt.create_entity(
+            rt.create_entity_with_embedding_report(
                 &token,
                 "concept",
                 None,
@@ -1254,6 +1254,7 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("create candidate entity");
         }
 
@@ -1321,8 +1322,17 @@ mod tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
         let entity = rt
-            .create_entity(&direct_tok, "concept", None, "RoPE", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &direct_tok,
+                "concept",
+                None,
+                "RoPE",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(record, _report)| record)
             .expect("direct entity create must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -1351,7 +1361,7 @@ mod tests {
     async fn resolve_search_result_sets_never_populate_the_ring() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &direct_tok,
             "concept",
             None,
@@ -1361,6 +1371,7 @@ mod tests {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("direct entity create must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -1527,8 +1538,17 @@ mod tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
         let entity = rt
-            .create_entity(&direct_tok, "concept", None, "RoLoRA", None, None, vec![])
+            .create_entity_with_embedding_report(
+                &direct_tok,
+                "concept",
+                None,
+                "RoLoRA",
+                None,
+                None,
+                vec![],
+            )
             .await
+            .map(|(record, _report)| record)
             .expect("direct entity create must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -1563,7 +1583,7 @@ mod tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
         let cjk = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &direct_tok,
                 "concept",
                 None,
@@ -1573,9 +1593,10 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("direct CJK entity create must succeed");
         let spaced = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &direct_tok,
                 "concept",
                 None,
@@ -1585,6 +1606,7 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("direct spaced-name entity create must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -1642,7 +1664,7 @@ mod tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
         let entity = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &direct_tok,
                 "concept",
                 None,
@@ -1652,6 +1674,7 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("direct entity create must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -1688,7 +1711,7 @@ mod tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
         for _ in 0..2 {
-            rt.create_entity(
+            rt.create_entity_with_embedding_report(
                 &direct_tok,
                 "concept",
                 None,
@@ -1698,6 +1721,7 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("direct entity create must succeed");
         }
 
@@ -1728,7 +1752,7 @@ mod tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
         let entity = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &direct_tok,
                 "concept",
                 None,
@@ -1738,6 +1762,7 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("direct entity create must succeed");
 
         let mut builder = VerbRegistryBuilder::new();
@@ -1778,7 +1803,7 @@ mod tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
         let entity = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &direct_tok,
                 "concept",
                 None,
@@ -1788,6 +1813,7 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("direct entity create must succeed");
         rt.delete_entity(&direct_tok, entity.id, false)
             .await
@@ -1816,7 +1842,7 @@ mod tests {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let direct_tok = rt.authorize(Namespace::local()).unwrap();
         let concept = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &direct_tok,
                 "concept",
                 None,
@@ -1826,8 +1852,9 @@ mod tests {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("direct entity create must succeed");
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &direct_tok,
             "document",
             None,
@@ -1837,6 +1864,7 @@ mod tests {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("direct entity create must succeed");
 
         let mut builder = VerbRegistryBuilder::new();

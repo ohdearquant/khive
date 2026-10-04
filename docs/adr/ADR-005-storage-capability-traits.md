@@ -764,3 +764,358 @@ rollback and connection state are proven, never merely attempted. An ambiguous o
 preserves this ADR's existing outcome-unknown and connection-retirement contract instead of
 guessing at settlement. No completed commit, and no earlier committed unit within a multi-commit
 request, may be described as retryable work that never ran.
+
+## Amendment: optional grouped entity counts (2026-09-30)
+
+**Status: Accepted (2026-09-30).**
+Existing accepted decisions remain in force.
+
+`EntityStore` adds the provided method
+`count_entities_by_type(&self, namespaces: &[String]) -> StorageResult<Option<Vec<(Option<String>, u64)>>>`.
+Its default is `Ok(None)`, meaning grouped reporting is unavailable, not that the store is empty.
+Like the documented `Unsupported` default for `EntityStore::upsert_entity_with_attachments`
+and other optional operations, this reporting default need not compose required primitives.
+`Ok(None)` denotes ordinary capability absence so callers can retain scalar counts while errors
+from an implemented report remain errors. It adds no policy or required implementation method;
+existing implementors retain their scalar count behavior.
+
+`Some(groups)` reports complete, disjoint counts of live entities in exactly the supplied namespace
+set, from one backend read snapshot. Duplicate namespaces do not multiply counts; an empty set has
+no groups. Each observed raw `entity_type` occurs once, with SQL NULL represented by `None` and
+strings preserved exactly, independent of registered vocabulary. `SqlEntityStore` obtains these
+groups with one grouped SELECT over the full namespace set, rather than separate type, namespace,
+or scalar reads. The sum of these groups is the entity total from that snapshot.
+
+Only `Ok(None)` denotes unavailable reporting. A storage error remains an error. The `stats`
+consumer's legacy scalar fallback and omitted breakdown are defined by
+[ADR-023's stats amendment](ADR-023-declarative-pack-format.md#amendment-optional-stats-entity-type-breakdown-2026-09-30).
+No capability category, vocabulary validation, namespace authority, or backend placement rule changes.
+
+## Amendment: input-aligned edge read outcomes (2026-10-01)
+
+**Status: Accepted (2026-10-02).** This additive capability amendment concerns
+[#3701](https://github.com/ohdearquant/khive/issues/3701), KG `neighbors` Record and
+Edge projections. It must be accepted before dependent implementation merges. The accepted text above remains in force; this proposal does
+not change [ADR-007 Rules 1 and 2](ADR-007-namespace.md#rule-1--storage-is-dumb),
+the Gate, or namespace attribution. Memory `include_source_id` is outside this amendment.
+
+### Capability and dependency boundary
+
+Runtime depends on `Arc<dyn GraphStore>`, not the concrete SQLite store. A method added
+only to `khive-db` cannot serve that abstract capability or alternate backends. Add this
+provided method to `GraphStore`; retain the existing `get_edges` signature, defaults,
+missing-row omission and batch-error behavior unchanged:
+
+```rust
+async fn get_edge_read_outcomes(
+    &self,
+    ids: &[LinkId],
+) -> StorageResult<Vec<StorageResult<Option<Edge>>>>;
+```
+
+On outer success, the vector has exactly `ids.len()` outcomes in input order. Each
+input ordinal has its own outcome, including repeated IDs. `Ok(Some(edge))` is a live
+edge; `Ok(None)` means absent or soft-deleted at that read observation. An inner error
+preserves the error for that ordinal rather than substituting `None`, dropping it,
+or aborting construction at an unrelated SQL row's position. An empty input succeeds
+with an empty vector and issues no edge read. Namespace is not a predicate on this
+by-ID read, and the trait adds no vocabulary or authorization policy.
+
+The provided implementation mechanically calls existing `get_edge` in input order and
+retains each primitive result as an inner outcome. It can read later IDs after a prior
+primitive error. This includes a primitive's admission or query error: a default
+point-read backend can attribute that failed call to its input. Existing implementors
+need no new required method and are not promised fewer I/O calls. The method introduces
+no outcome/error cloning requirement and no public error variant.
+
+An optimized backend distinguishes per-row conversion from batch infrastructure failure:
+
+| Outcome     | Meaning                                                                                                                                                                                                |
+| ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Inner `Err` | Conversion/type/UUID/relation/metadata failure for one requested row; retain its cause, storage error class and existing `get_edge` operation label.                                                   |
+| Outer `Err` | Batch admission, statement preparation/execution, cursor iteration, request-stop or invalid result-ordinal/cardinality failure. No per-ID cause is asserted and no partial-success vector is returned. |
+
+SQLite overrides the method with bounded chunks of at most 900 input ordinals, using a
+request-ordinal relation and a live-edge left join by ID. It preserves duplicate
+ordinals and missing rows, decodes a present row through the existing `read_edge`
+conversion, and records conversion failure inside that row's outcome. Statement and
+cursor failures remain outer errors and may use the additive
+`get_edge_read_outcomes` operation label. Ordinal/cardinality validation fails closed;
+`get_edges`, `batch_neighbors`, traversal and including-deleted reads do not change.
+Callers bound each batch; the provided method does not invent a total input ceiling.
+SQLite retains this ADR's pooled admission, request cancellation and statement-scoped
+reader lifetime, without standalone-open or point-read fallback after batch failure.
+
+### Runtime: validated stored-namespace groups and input-order errors
+
+Add the runtime adapter:
+
+```rust
+pub async fn get_edges_by_id(
+    &self,
+    token: &NamespaceToken,
+    ids: &[Uuid],
+) -> RuntimeResult<Vec<Option<Edge>>>;
+```
+
+The token remains caller context, not by-ID read authority. Process input in consecutive
+windows of at most 900 IDs; an empty input performs no read. Do not add a caller-visible
+namespace predicate, a returned-row namespace equality filter, or a total 1000-ID cap.
+Within each window:
+
+1. Read raw live `(id, namespace)` metadata by ID with no namespace predicate. A missing,
+   tombstoned or non-text namespace result retains the existing point-read `None` behavior.
+   Validate each text namespace with the existing `Namespace::parse` before observing
+   that same input's typed edge decode. Invalid text retains the runtime's
+   `edge namespace invalid` error. Metadata admission/query/iteration failure is fatal
+   for the window and retains the existing `get_edge_namespace` operation label;
+   malformed metadata result identity is likewise a fatal protocol failure, not a
+   fabricated per-ID error.
+2. Group inputs by their **validated stored namespace**, retaining every original input
+   index. Obtain each group's graph capability through that namespace, then call the
+   aligned-outcome method for that group's IDs. Do not route all inputs through the caller's
+   namespace or through the first valid row's namespace, even where current SQLite
+   capabilities share a pool. This is runtime capability selection; the store's ID query
+   remains unscoped under ADR-007.
+3. Retain namespace validation errors and every group's outcomes until original-order
+   folding. A group accessor error, outer batch error, or malformed outcome count is a
+   fatal error outcome **at that group's minimum original input index**. This is an
+   ordering convention for a group-wide failure, not a claim that the indexed ID caused
+   the statement error. Do not return immediately according to group traversal order;
+   collect the other group outcomes subject to existing request-stop admission.
+4. Fold the original input indices in order and return the earliest input error. A prior
+   row decode error therefore beats a later invalid namespace or a later group's accessor
+   failure; reversing the requested IDs reverses that precedence. On success, replay
+   every ordinal with `Some` or `None`, including duplicates. Missing or corrupt outcomes
+   must not shorten the vector or become successful empty rows. Stop before the next
+   input window when the current window fails; no partial result escapes the adapter.
+
+These groups are not namespace access-control partitions. ADR-007 Rule 1 still forbids
+implicit store scoping and Rule 2 still permits cross-namespace UUID reads. Vocabulary,
+namespace validation, capability selection and response policy stay in runtime/packs;
+SQLite owns SQL and row conversion. The existing serial live-anchor check and the one
+public dispatch Gate check remain unchanged. A missing/deleted KG anchor still fails
+before adjacency. A missing/deleted endpoint edge instead remains `None`; this adapter
+adds no batched anchor API or per-target Gate.
+
+### Observation, failure timing and bounded cost
+
+This is an explicit bounded batching decision, not a claim of identical serial
+interleavings. Metadata and typed hydration remain separate observations. A metadata
+miss is not rechecked if the row is restored later; a row that disappears after valid
+metadata can hydrate as `None`. The existing second read does not revalidate a changed
+namespace, and this adapter adds no such post-fetch check. No whole-request snapshot,
+writer lock or read transaction spans the windows.
+
+Within a window, several IDs may now share a metadata or hydration statement. SQLite
+reads a group's rows at a statement observation; the default backend can read them at
+separate instants. Duplicate inputs retain aligned positions, not a universal promise
+of separately timed duplicate reads. Capability acquisition occurs once per group
+rather than once per input. More group reads may occur before the earliest input error
+is returned. Ordinary group failures participate in the ordered fold; a fatal metadata
+statement cannot be retrospectively assigned to an individual row. Existing request
+cancellation/deadline settlement still governs whether further reads are admitted and
+must never be converted to missing rows, degraded success or retry fallback.
+
+Let `W` be the number of input windows and `G_w` the number of validated namespace
+groups in window `w`. The SQLite endpoint-hydration target is one metadata read per
+window plus bounded chunk reads for each group, giving work proportional to
+`W + sum(G_w)` for these 900-ID windows. It is not a universal constant: a window with
+900 different stored namespaces can require 900 group calls. Default backends can
+still issue one point read per group input. Capability construction/schema work and
+unchanged anchor/adjacency/enrichment reads are separate costs; no measured latency,
+reader-checkout total or speedup is asserted by this amendment.
+
+### KG adoption, acceptance and merge order
+
+KG selects/truncates the adjacency hits and computes its cursor before endpoint
+hydration. Record and Edge projections use this adapter only for retained hits; Summary
+performs no endpoint hydration. Preserve adjacency order, hit identity, stored
+source/target direction, null endpoints after deletion, existing limit/envelope/cursor
+shape and usage accounting. Do not fetch the extra pagination probe or change the
+best-effort entity/note enrichment path. By-ID hydration is not an extra graph hop;
+logical batching must not fabricate database-read counts.
+
+Acceptance requires storage, runtime and KG regression tests, each paired with a check that fails when the change is removed, proving:
+
+- input-aligned live/missing/tombstone/repeated/corrupt results and unchanged `get_edges`;
+- typed decode and namespace refusal order in both input orders, same-row namespace
+  validation before decode, and output parity when requested IDs differ from store order;
+- two failing namespace groups in reverse traversal order, plus a later second accessor
+  failure behind an earlier decode error: the minimum original input index wins;
+- cross-namespace edges route through each validated stored namespace while the real
+  public Gate deny and missing-anchor refusal remain intact;
+- real reader/work evidence at 1, 900, 901 and 1000 retained hits, with the namespace
+  group population stated, Summary zero hydration and no batch-error point-read fallback;
+- Out/In/Both stored endpoint direction, unchanged cursor/wire results, and existing
+  request-stop/error settlement. Any unexecuted race or fault fixture remains unproven.
+
+This Proposed amendment is a separately reviewable docs change. Acceptance binds the final amendment text before dependent #3701 trait, runtime and KG code merges; landing Proposed text alone is not adoption. Other Proposed amendments,
+accepted storage decisions and ADR-007 Rules 1/2 are not superseded. The separate
+memory provenance extension requires its own source/API and first-error decisions.
+
+## Amendment: shared streaming event cursor walk (2026-10-01)
+
+**Status: Proposed.** This additive runtime adapter concerns
+[#3709](https://github.com/ohdearquant/khive/issues/3709) and
+[#3729](https://github.com/ohdearquant/khive/issues/3729). It must be accepted before
+dependent implementation merges. Apart from the query_events ordering requirement
+below, the EventStore capability, namespace contract, dispatch Gate and event
+transport remain unchanged.
+
+### Runtime adapter over the existing capability
+
+Brain and moodboard currently implement the same timestamp cursor state machine.
+Move that mechanism into runtime, which already owns event-plane routing and the
+transport page cap. EventStore remains backend-neutral and receives no new
+required method. Packs continue to depend on runtime and storage traits, with no
+concrete SQLite dependency.
+
+Expose an event_walk module with this synchronous, infallible visitor adapter:
+
+```rust
+pub async fn walk_events_cursor(
+    store: &dyn EventStore,
+    filter: &EventFilter,
+    page_size: u32,
+    max_rows: u64,
+    visit: impl FnMut(Event) + Send,
+) -> Result<u64, EventWalkError>;
+```
+
+On success, the returned count equals the number of events passed to visit.
+A zero row budget issues no query and invokes no visitor. The helper adds no
+snapshot, total count, ordering key, authorization decision, hidden transaction
+or total-input ceiling. Each backend query retains existing reader admission,
+request cancellation and statement lifetime. The callback runs synchronously in
+delivery order; fallible or asynchronous callbacks require a separate contract.
+
+EventWalkError distinguishes the original storage error, a missing timestamp
+boundary during duplicate-page handling, a dense timestamp tie with its fetch
+limit, and an out-of-order fetched page. It does not choose a public RuntimeError
+or a pack-specific message. Brain retains its original storage-to-InvalidInput
+mapping and its brain messages; moodboard retains its original storage conversion
+and moodboard messages. Both callers map each mechanical variant explicitly,
+including the out-of-order-page variant.
+
+### Exact cursor behavior
+
+Every EventStore::query_events implementation must return rows ordered
+created_at DESC, id DESC. This is a trait requirement for every backend; the
+implementation change adds this same requirement to the trait's method doc.
+The cursor walk below is defined only under that order. A page in any other
+order is outside the contract, including a page returned through a forwarding
+or merged-store adapter.
+
+The adapter reproduces the existing collectors with one additional page-order
+check, including these edge cases:
+
+- Before any row of a fetched page is admitted, check that the complete page is
+  non-increasing by (created_at, id). If it is not, return the out-of-order-page
+  error and pass nothing from that page to the visitor. This check precedes
+  boundary deduplication and final-page budget clipping.
+- Clone the input filter for every query, replace only before, always use offset
+  zero and clamp the requested page size to 1 through the existing transport cap
+  of 4096. Keep all other namespace, actor, kind and time predicates.
+- Deliver fresh events in the backend's original order. Track UUIDs already
+  admitted at the current boundary timestamp; suppress only the same boundary
+  UUIDs when the timestamp is re-read.
+- Derive the boundary and UUID set from the complete fresh page before clipping
+  its final admitted prefix to the remaining row budget. Surplus rows are never
+  passed to the visitor. A short page ends the walk.
+- Advance the exclusive before bound to boundary + 1. At i64::MAX, keep the
+  previous cursor because no larger bound exists.
+- A full page containing only already-seen boundary rows doubles the fetch limit
+  with saturation, capped at 4096. A short duplicate page ends the walk.
+- At the cap, retain the original count query: clone the original filter and set
+  after to boundary.checked_sub(1).or(original_filter.after). If that count
+  equals the already-admitted count, advance before to the boundary and continue;
+  otherwise return the dense-tie error. A duplicate page before any boundary
+  returns the missing-boundary error. There is no point-read fallback.
+
+The walk consists of independent live reads. A count observed before or during
+the walk can differ from the delivered rows when concurrent writes occur.
+Preserve that behavior and each caller's current truncation/completeness handling;
+the returned admitted count does not certify a snapshot or an exhaustive result.
+
+### Pack adapters and ordered aggregation
+
+Moodboard remains a vector consumer through a collecting callback, retaining its
+existing judgment decoding and subsequent sorting. Bounded brain reads retain
+their audit/non-audit partition budgets and concatenation order. Exhaustive
+brain counts use a private accumulator directly and remove their Vec-returning
+production path; tests exercise the same streaming path that the handler uses.
+
+The accumulator preserves all response fields, marginal and optional cross maps,
+actor aliases, historical fallback fields, work-class precedence, omission of
+absent cost fields, empty requested cross maps, and page-scoped names on
+truncation. The 2,000,000-event exhaustive preflight limit is unchanged.
+
+Consume signed cost units in delivered order using the existing saturating_add.
+Signed saturating addition is not associative: MAX, 1, -1 in that order yields
+MAX - 1. Parallel page reductions, regrouping, or a SQL SUM are not substitutes
+for the ordered fold.
+
+Sharing actor-filter policy must preserve ADR-103's token-derived visibility,
+self identity, default aliases and fleet-reader allowlist. Telemetry continues to
+validate nonempty labels, its length bound and control characters before using
+the shared policy. Packs retain their existing error text and response labels;
+explicit scopes do not gain default-scope alias collapsing. This adapter grants
+no new actor or namespace access.
+
+### Retention boundary and acceptance
+
+For exhaustive brain aggregation, live handler memory comprises fetched pages,
+the current boundary UUID set and output accumulator maps, rather than all
+admitted Event payloads. Output-key cardinality and boundary UUID cardinality
+remain real costs. Backend and merged-store buffers are outside this handler
+claim; individual payload size is not bounded by this amendment. Moodboard's
+vector consumer does not gain a streaming memory claim.
+
+Acceptance requires regression tests for every cursor branch and caller-specific
+error mapping above, complete Event ID order for collectors, and complete
+response parity for aggregation. Include ties below, at and beyond 4096,
+i64 extrema, duplicate re-reads, final-page budget clipping, storage failures,
+count/walk divergence, and the signed saturation-order witness. Migrate all
+existing tests of the removed exhaustive Vec path onto the shipping visitor.
+
+Order conformance must cover differing timestamps, equal-timestamp UUID ties,
+and paginated output for every production EventStore implementation:
+
+- SqlEventStore has query_events_orders_by_created_at_then_id_desc in
+  crates/khive-db/src/stores/event_tests.rs. It currently checks the equal-timestamp
+  UUID tie; extend it to cover timestamp order and pagination.
+- AttributedEventStore delegates query_events unchanged to its inner store.
+  It needs attributed_query_events_preserves_created_at_then_id_desc to check
+  that delegation with an ordered backing store.
+- ForwardingEventStore returns the received page unchanged. It needs
+  forwarding_query_events_preserves_created_at_then_id_desc to check the
+  complete forwarded page order through the event transport.
+- SplitEventStore sorts its merged page by created_at DESC, id DESC before
+  applying the requested offset and limit. Its existing
+  split_store_routes_plain_to_legacy_idempotent_to_lane_and_merges_reads checks
+  membership, not order. It needs
+  split_query_events_orders_by_created_at_then_id_desc across both stores,
+  timestamp and UUID ties, and page boundaries.
+- The cursor walk's Store test double in
+  crates/khive-runtime/tests/event_cursor_walk.rs must return that order too.
+  It needs cursor_store_orders_by_created_at_then_id_desc to check its query
+  output.
+- AppendAfterCountStore in crates/khive-pack-brain/src/tests.rs delegates
+  query_events unchanged and must retain that order in the concurrent-boundary
+  fixture.
+- The implementation must include ascending_query_events_page_is_detected_or_refused
+  with a deliberately ascending page. The walk must return the out-of-order-page
+  error within a bounded number of queries and admit no row from that page; it
+  must never accept silent repeated delivery as successful traversal.
+
+A dedicated integration test binary must measure actual peak live allocation
+against increasing admitted populations with fixed output-key cardinality,
+separately accounting for boundary UUIDs and backend buffers. Without that
+executed evidence, no measured retention or speedup claim is accepted. Each
+load-bearing change has a compiling independent removal control whose named
+test fails when the corresponding behavior is removed.
+
+Acceptance applies to the final reviewed text and its conformant implementation.
+This proposal changes neither git.receipts pagination nor event-plane WAL
+configuration; those have separate contracts.

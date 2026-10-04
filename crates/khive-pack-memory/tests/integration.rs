@@ -7,7 +7,8 @@ use khive_runtime::{
     EmbedderProvider, FusionStrategy, KhiveRuntime, Namespace, NamespaceToken, PackRuntime,
     RuntimeConfig, RuntimeError, VerbRegistry, VerbRegistryBuilder,
 };
-use khive_storage::{SqlStatement, SqlValue};
+use khive_storage::types::{EdgeFilter, PageRequest};
+use khive_storage::{EdgeRelation, SqlStatement, SqlValue};
 use khive_types::Pack;
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
@@ -1085,6 +1086,79 @@ async fn test_recall_fuse_rrf_k1_uses_retrieval_adapter() {
         (score - expected).abs() < 1e-6,
         "RRF k=1, rank 1 → fused_score must be 0.5; got {score:.6} \
          (≈0.0164 means the adapter passed k=60 instead of k=1)"
+    );
+}
+
+/// A recall request that names `rrf` fuses with the configured constant instead of a literal 60.
+///
+/// Three memories that all match the query rank first, second and third in the text arm. RRF
+/// relevance is calibrated by position between the best and the worst fused score, so the
+/// middle hit's relevance depends on the constant while the other two do not.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn test_recall_request_naming_rrf_uses_the_configured_constant() {
+    const QUERY: &str = "rrf constant probe vector search";
+
+    async fn middle_rank_score(registry: &VerbRegistry, params: Value) -> f64 {
+        let result = registry
+            .dispatch("memory.recall", params)
+            .await
+            .expect("memory.recall succeeds");
+        let hit_list = result.as_array().expect("array of hits");
+        assert_eq!(
+            hit_list.len(),
+            3,
+            "all three memories must be recalled: {hit_list:?}"
+        );
+        let scores: Vec<f64> = hit_list
+            .iter()
+            .map(|h| h["rank_score"].as_f64().expect("rank_score"))
+            .collect();
+        let total: f64 = scores.iter().sum();
+        let lowest = scores.iter().copied().fold(f64::INFINITY, f64::min);
+        let highest = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        total - lowest - highest
+    }
+
+    let registry = make_registry(make_runtime());
+    for content in [
+        "rrf constant probe memory about vector search",
+        "rrf constant probe record about vector search",
+        "rrf constant probe entry about vector search",
+    ] {
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": content,
+                    "salience": 0.7,
+                    "decay": 0.01
+                }),
+            )
+            .await
+            .expect("memory.remember succeeds");
+    }
+
+    let unnamed_params = json!({ "query": QUERY });
+    let named_params = json!({ "query": QUERY, "fusion_strategy": "rrf" });
+    let named_at_sixty_params = json!({
+        "query": QUERY,
+        "fusion_strategy": "rrf",
+        "config": { "fuse_strategy": { "rrf": { "k": 60 } } }
+    });
+    let unnamed = middle_rank_score(&registry, unnamed_params).await;
+    let named = middle_rank_score(&registry, named_params).await;
+    let named_at_sixty = middle_rank_score(&registry, named_at_sixty_params).await;
+
+    assert!(
+        named_at_sixty > named + 1e-3,
+        "the middle hit must score higher at a configured constant of 60 than at 10: \
+         k=10 gave {named}, k=60 gave {named_at_sixty}"
+    );
+    assert!(
+        (named - unnamed).abs() < 1e-4,
+        "naming rrf under the default configuration must match omitting the strategy: \
+         named {named}, omitted {unnamed}"
     );
 }
 
@@ -3744,10 +3818,8 @@ async fn test_recall_rejects_degenerate_and_overflowing_token_budgets() {
     }
 }
 
-/// More matching supersedes edges than ranked candidates must not truncate the
-/// inbound-edge check. More than one storage page targets A and the following
-/// edge targets B, so both the page loop and the old candidate-count leak are
-/// exercised deterministically.
+/// High inbound fan-in on one candidate must not hide another target. The
+/// same suppression fixture also observes and plans the actual recall SQL.
 #[tokio::test]
 #[serial_test::serial(config_ledger)]
 async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
@@ -3842,7 +3914,7 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
     assert_eq!(inserted_b, 1, "fixture must add the page-two edge");
     drop(writer);
 
-    let registry = make_registry(rt);
+    let registry = make_registry(rt.clone());
     let baseline = registry
         .dispatch(
             "memory.recall",
@@ -3870,6 +3942,12 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
     assert!(baseline_ids.contains(&target_a_id.as_str()));
     assert!(baseline_ids.contains(&target_b_id.as_str()));
 
+    let observation = rt
+        .core()
+        .backend()
+        .pool()
+        .observe_test_statement_starts(1024)
+        .expect("observe actual recall statements");
     let suppressed = registry
         .dispatch(
             "memory.recall",
@@ -3889,7 +3967,331 @@ async fn test_recall_supersedes_suppression_exhausts_matching_edges() {
         .expect("suppressed recall");
     assert!(
         suppressed.as_array().is_some_and(Vec::is_empty),
-        "every targeted candidate must be suppressed after an exhaustive edge walk: {suppressed}"
+        "every targeted candidate must be suppressed after target lookups: {suppressed}"
+    );
+    let statements = observation
+        .started_statements()
+        .expect("complete statement observation");
+    drop(observation);
+    let edge_lookups: Vec<_> = statements
+        .iter()
+        .filter(|statement| {
+            statement
+                .sql
+                .contains("edges.target_id = requested.origin_id")
+                && statement.sql.contains("edges.relation IN (")
+        })
+        .collect();
+    assert_eq!(
+        edge_lookups.len(),
+        1,
+        "one batched lookup covers both candidates"
+    );
+    let mut reader = rt.sql().reader().await.expect("planner reader");
+    for statement in edge_lookups {
+        assert!(statement.readonly);
+        assert!(
+            !statement.sql.contains("graph_edges_seq"),
+            "SUPERSEDES_TARGET_LOOKUP: recall must not drive the global insertion ledger: {}",
+            statement.sql
+        );
+        let plan = reader
+            .explain(SqlStatement {
+                sql: statement.sql.clone(),
+                params: vec![
+                    SqlValue::Text("local".into()),
+                    SqlValue::Text(json!([target_a_id]).to_string()),
+                    SqlValue::Text("supersedes".into()),
+                    SqlValue::Integer(1),
+                ],
+                label: Some("supersedes-actual-lookup-plan".into()),
+            })
+            .await
+            .expect("plan the executed production statement");
+        assert!(
+            plan.iter().any(|row| matches!(row.get("detail"), Some(SqlValue::Text(detail))
+                if detail.starts_with("SEARCH ")
+                    && detail.contains("idx_graph_edges_ns_tgt_rel")
+                    && detail.contains("target_id=?"))),
+            "SUPERSEDES_TARGET_LOOKUP: actual recall SQL must seek the target/relation index: {plan:?}"
+        );
+    }
+}
+
+/// Create a semantic memory note whose content is `text` and return its id.
+async fn seed_memory_note(rt: &KhiveRuntime, token: &NamespaceToken, text: &str) -> Uuid {
+    rt.create_note(
+        token,
+        "memory",
+        None,
+        text,
+        Some(0.8),
+        Some(json!({ "memory_type": "semantic" })),
+        vec![],
+    )
+    .await
+    .expect("create memory note")
+    .id
+}
+
+/// Batched supersedes suppression must give the answer the per-candidate
+/// lookup gave, for every shape of incoming `supersedes` edge: a live edge
+/// suppresses its target; a soft-deleted edge and an edge stored under another
+/// namespace do not; an edge whose superseding note was soft-deleted still
+/// does, because a soft delete leaves edges in place and neither lookup reads
+/// the notes table. The per-candidate `query_edges` read is replayed here as the
+/// oracle, so the expectation is checked against the old path and not only
+/// against this test's own reading of it.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn test_recall_supersedes_batch_matches_per_candidate_lookup() {
+    let rt = make_runtime();
+    let token = rt
+        .authorize(Namespace::parse("local").expect("local namespace"))
+        .expect("authorize local");
+    let query = "issue thirty eight eighty one supersedes batch equivalence";
+
+    let live = seed_memory_note(&rt, &token, &format!("{query} n01")).await;
+    let newer = seed_memory_note(&rt, &token, &format!("{query} n02")).await;
+    let superseded = seed_memory_note(&rt, &token, &format!("{query} n03")).await;
+    let edge_deleted = seed_memory_note(&rt, &token, &format!("{query} n04")).await;
+    let source_deleted = seed_memory_note(&rt, &token, &format!("{query} n05")).await;
+    let other_namespace = seed_memory_note(&rt, &token, &format!("{query} n06")).await;
+    let removed_source = seed_memory_note(&rt, &token, &format!("{query} n07")).await;
+
+    // A live edge: `superseded` is suppressed.
+    rt.link(
+        &token,
+        newer,
+        superseded,
+        EdgeRelation::Supersedes,
+        1.0,
+        None,
+    )
+    .await
+    .expect("live supersedes edge");
+
+    // A soft-deleted edge: `edge_deleted` is not suppressed.
+    let dead_edge = rt
+        .link(
+            &token,
+            newer,
+            edge_deleted,
+            EdgeRelation::Supersedes,
+            1.0,
+            None,
+        )
+        .await
+        .expect("supersedes edge to soft-delete");
+    assert!(
+        rt.delete_edge(&token, Uuid::from(dead_edge.id), false)
+            .await
+            .expect("soft-delete edge"),
+        "the edge must exist to be soft-deleted"
+    );
+
+    // A live edge whose superseding note is then soft-deleted: `source_deleted`
+    // is still suppressed.
+    rt.link(
+        &token,
+        removed_source,
+        source_deleted,
+        EdgeRelation::Supersedes,
+        1.0,
+        None,
+    )
+    .await
+    .expect("edge from the note about to be deleted");
+    assert!(
+        rt.delete_note(&token, removed_source, false)
+            .await
+            .expect("soft-delete superseding note"),
+        "the superseding note must exist to be soft-deleted"
+    );
+
+    // A live edge under another namespace: `other_namespace` is not suppressed.
+    let mut writer = rt.sql().writer().await.expect("sql writer");
+    writer
+        .execute(SqlStatement {
+            sql: "INSERT INTO graph_edges \
+                  (namespace, id, source_id, target_id, relation, weight, created_at, updated_at) \
+                  VALUES ('other', ?1, ?2, ?3, 'supersedes', 1.0, 1, 1)"
+                .into(),
+            params: vec![
+                SqlValue::Text(Uuid::new_v4().to_string()),
+                SqlValue::Text(Uuid::new_v4().to_string()),
+                SqlValue::Text(other_namespace.to_string()),
+            ],
+            label: Some("test-3881-seed-other-namespace-supersedes".into()),
+        })
+        .await
+        .expect("seed an edge under another namespace");
+    drop(writer);
+
+    let candidates = [
+        live,
+        newer,
+        superseded,
+        edge_deleted,
+        source_deleted,
+        other_namespace,
+    ];
+    let graph = rt.graph(&token).expect("graph store");
+    let mut oracle_superseded = Vec::new();
+    for id in candidates {
+        let page = graph
+            .query_edges(
+                EdgeFilter {
+                    target_ids: vec![id],
+                    relations: vec![EdgeRelation::Supersedes],
+                    ..EdgeFilter::default()
+                },
+                vec![],
+                PageRequest {
+                    offset: 0,
+                    limit: 1,
+                },
+            )
+            .await
+            .expect("per-candidate lookup");
+        if !page.items.is_empty() {
+            oracle_superseded.push(id);
+        }
+    }
+    oracle_superseded.sort();
+    let mut expected_superseded = vec![superseded, source_deleted];
+    expected_superseded.sort();
+    assert_eq!(
+        oracle_superseded, expected_superseded,
+        "the per-candidate lookup must suppress exactly the live-edge targets"
+    );
+
+    let ids_of = |hits: &Value| -> Vec<Uuid> {
+        let mut ids: Vec<Uuid> = hits
+            .as_array()
+            .expect("recall returns an array")
+            .iter()
+            .filter_map(|hit| hit["id"].as_str())
+            .map(|id| Uuid::parse_str(id).expect("hit id is a uuid"))
+            .collect();
+        ids.sort();
+        ids
+    };
+    let recall_params = |suppress: bool| {
+        json!({
+            "query": query,
+            "limit": 20,
+            "fusion_strategy": "keyword_only",
+            "config": {
+                "scoring": {
+                    "enable_supersedes_suppression": suppress,
+                    "mmr_penalty": 0.0
+                }
+            }
+        })
+    };
+    let registry = make_registry(rt.clone());
+
+    let baseline = registry
+        .dispatch("memory.recall", recall_params(false))
+        .await
+        .expect("baseline recall");
+    let mut expected_candidates = candidates.to_vec();
+    expected_candidates.sort();
+    assert_eq!(
+        ids_of(&baseline),
+        expected_candidates,
+        "every seeded live note must be a candidate"
+    );
+
+    let suppressed = registry
+        .dispatch("memory.recall", recall_params(true))
+        .await
+        .expect("suppressed recall");
+    let mut expected_returned = vec![live, newer, edge_deleted, other_namespace];
+    expected_returned.sort();
+    assert_eq!(
+        ids_of(&suppressed),
+        expected_returned,
+        "recall must drop exactly the candidates the per-candidate lookup flagged"
+    );
+}
+
+/// Supersedes suppression asks for every candidate's incoming edge in one
+/// batched statement, not one statement per candidate (#3881).
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn test_recall_supersedes_lookup_is_one_batched_statement() {
+    const CANDIDATES: usize = 5;
+    // The batched read takes this many source ids per statement.
+    const BATCH_CHUNK: usize = 880;
+
+    let rt = make_runtime();
+    let token = rt
+        .authorize(Namespace::parse("local").expect("local namespace"))
+        .expect("authorize local");
+    let query = "issue thirty eight eighty one batched supersedes statement count";
+    for label in 0..CANDIDATES {
+        seed_memory_note(&rt, &token, &format!("{query} n{label:02}")).await;
+    }
+
+    let registry = make_registry(rt.clone());
+    let observation = rt
+        .core()
+        .backend()
+        .pool()
+        .observe_test_statement_starts(1024)
+        .expect("observe recall statements");
+    let hits = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": query,
+                "limit": 20,
+                "fusion_strategy": "keyword_only",
+                "config": {
+                    "scoring": {
+                        "enable_supersedes_suppression": true,
+                        "mmr_penalty": 0.0
+                    }
+                }
+            }),
+        )
+        .await
+        .expect("recall");
+    let statements = observation
+        .started_statements()
+        .expect("complete statement observation");
+    drop(observation);
+
+    assert_eq!(
+        hits.as_array().map(Vec::len),
+        Some(CANDIDATES),
+        "every seeded note must be a candidate, or the statement count proves nothing"
+    );
+    let batched = statements
+        .iter()
+        .filter(|statement| {
+            statement
+                .sql
+                .contains("edges.target_id = requested.origin_id")
+                && statement.sql.contains("edges.relation IN (")
+        })
+        .count();
+    assert_eq!(
+        batched,
+        CANDIDATES.div_ceil(BATCH_CHUNK),
+        "the candidates' supersedes edges must be read in ceil(N / 880) statements"
+    );
+    let per_candidate = statements
+        .iter()
+        .filter(|statement| {
+            statement.sql.contains("target_id IN (") && statement.sql.contains("relation IN (")
+        })
+        .count();
+    assert_eq!(
+        per_candidate, 0,
+        "no per-candidate edge lookup may remain on the recall path"
     );
 }
 
@@ -7148,4 +7550,207 @@ async fn bulk_create_refuses_a_memory_note_item_in_both_modes() {
         Some(1),
         "only the best-effort sibling may be stored: {observations}"
     );
+}
+
+/// A memory whose content exceeds the embedder input budget is stored, and the
+/// response discloses the truncation instead of failing after the commit.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn remember_over_embedding_budget_succeeds_and_discloses_truncation() {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new("truncation-enc", 4, 0.9));
+    let registry = make_registry(rt);
+
+    let content = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+    let result = registry
+        .dispatch("memory.remember", json!({ "content": content }))
+        .await
+        .expect("an over-budget memory must not fail after commit");
+
+    assert_eq!(
+        result["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "remember must disclose the truncated embedding input: {result}"
+    );
+    let note_id = result["id"].as_str().expect("note id present");
+    let stored = registry
+        .dispatch("get", json!({ "id": note_id }))
+        .await
+        .expect("the committed memory must be readable");
+    assert_eq!(stored["id"], json!(note_id));
+}
+
+/// A keyed memory over the embedder input budget discloses the truncation on
+/// the fresh write and its replay. Replay retains the stored identity and
+/// fences, reports its recomputed truncation, and adds no rows.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn keyed_remember_discloses_truncation_on_fresh_write_and_on_identical_replay() {
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        ..RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(ConstVecProvider::new("truncation-enc", 4, 0.9));
+    let registry = make_registry(rt);
+
+    let args = json!({
+        "content": "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1),
+        "key": "keyed-truncation",
+    });
+    let created = registry
+        .dispatch("memory.remember", args.clone())
+        .await
+        .expect("an over-budget keyed memory must not fail after commit");
+    assert!(
+        created.get("replayed").is_none(),
+        "first call is a fresh write: {created}"
+    );
+    assert_eq!(
+        created["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "a fresh keyed remember must disclose the truncated embedding input: {created}"
+    );
+
+    let replayed = registry
+        .dispatch("memory.remember", args)
+        .await
+        .expect("replay must succeed");
+    assert_eq!(
+        replayed["replayed"],
+        json!(true),
+        "second call replays: {replayed}"
+    );
+    assert_eq!(replayed["id"], created["id"]);
+    assert_eq!(
+        replayed["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "a replay must disclose its computed truncated embedding input: {replayed}"
+    );
+}
+
+/// Both remember branches retain a visibility fence while disclosing bounded
+/// embedding input. Keyed replay keeps that fence even after log compaction.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay() {
+    const MODEL: &str = "all-minilm-l6-v2";
+    for keyed in [false, true] {
+        let rt = make_runtime();
+        rt.register_embedder(ConstVecProvider::new(
+            MODEL,
+            EmbeddingModel::AllMiniLmL6V2.dimensions(),
+            0.9,
+        ));
+        let token = rt.authorize(Namespace::local()).expect("local token");
+        let registry = make_registry(rt.clone());
+        let content = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+        let mut args = json!({
+            "content": content,
+            "memory_type": "semantic",
+            "embedding_model": MODEL,
+        });
+        if keyed {
+            args["key"] = json!("joint-receipt-key");
+        }
+        let created = registry
+            .dispatch("memory.remember", args.clone())
+            .await
+            .expect("bounded embedding input must not fail after commit");
+        assert_eq!(
+            created["warnings"],
+            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+            "keyed={keyed}: truncation and its fence must be returned together"
+        );
+        let receipt = created["visibility_token"].clone();
+        assert_eq!(receipt["version"], json!(1));
+        assert_eq!(receipt["namespace"], json!("local"));
+        assert_eq!(receipt["fences"].as_array().map(Vec::len), Some(1));
+        assert_eq!(receipt["fences"][0]["model"], json!(MODEL));
+        let seq = receipt["fences"][0]["ann_write_log_seq"]
+            .as_u64()
+            .expect("positive committed vector fence");
+        assert!(seq > 0);
+        let id: Uuid = created["id"].as_str().expect("note id").parse().unwrap();
+        let stored = rt
+            .notes(&token)
+            .unwrap()
+            .get_note(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.content, content,
+            "full source text must remain stored"
+        );
+
+        let mut reader = rt.sql().reader().await.unwrap();
+        let high_sequence = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT seq FROM sqlite_sequence WHERE name = 'ann_write_log'".into(),
+                params: vec![],
+                label: Some("joint-remember-committed-sequence".into()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(high_sequence, Some(SqlValue::Integer(value)) if value == seq as i64));
+        drop(reader);
+
+        if keyed {
+            let durable = khive_runtime::keyed_memory::memory_visibility_receipt(&rt, &token, id)
+                .await
+                .unwrap()
+                .expect("keyed memory must retain its original receipt");
+            assert_eq!(durable, vec![(MODEL.to_owned(), seq)]);
+            let mut writer = rt.sql().writer().await.unwrap();
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM ann_write_log WHERE namespace = ?1 AND subject_id = ?2"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text("local".into()),
+                        SqlValue::Text(id.to_string()),
+                    ],
+                    label: Some("joint-remember-compact-original-log".into()),
+                })
+                .await
+                .unwrap();
+            drop(writer);
+            let replayed = registry.dispatch("memory.remember", args).await.unwrap();
+            assert_eq!(replayed["id"], created["id"]);
+            assert_eq!(replayed["replayed"], json!(true));
+            assert_eq!(replayed["visibility_token"], receipt);
+            assert_eq!(
+                replayed["warnings"], created["warnings"],
+                "replay must retain its computed truncation warning with the original fence"
+            );
+            let mut reader = rt.sql().reader().await.unwrap();
+            let replay_rows = reader
+                .query_scalar(SqlStatement {
+                    sql: "SELECT COUNT(*) FROM ann_write_log WHERE namespace = ?1 AND subject_id = ?2".into(),
+                    params: vec![SqlValue::Text("local".into()), SqlValue::Text(id.to_string())],
+                    label: Some("joint-remember-replay-no-new-log".into()),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(replay_rows, Some(SqlValue::Integer(0))));
+            drop(reader);
+            let holders = rt
+                .notes(&token)
+                .unwrap()
+                .get_live_notes_by_key("local", "joint-receipt-key", Some("memory"))
+                .await
+                .unwrap();
+            assert_eq!(holders.len(), 1);
+            assert_eq!(holders[0].id, id);
+        }
+    }
 }

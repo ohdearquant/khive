@@ -617,12 +617,30 @@ async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entit
                 continue;
             }
             let src = rt
-                .create_entity(&token, src_kind, None, "src", None, None, vec![])
+                .create_entity_with_embedding_report(
+                    &token,
+                    src_kind,
+                    None,
+                    "src",
+                    None,
+                    None,
+                    vec![],
+                )
                 .await
+                .map(|(record, _report)| record)
                 .expect("create source entity");
             let tgt = rt
-                .create_entity(&token, tgt_kind, None, "tgt", None, None, vec![])
+                .create_entity_with_embedding_report(
+                    &token,
+                    tgt_kind,
+                    None,
+                    "tgt",
+                    None,
+                    None,
+                    vec![],
+                )
                 .await
+                .map(|(record, _report)| record)
                 .expect("create target entity");
             let result = rt.link(&token, src.id, tgt.id, relation, 1.0, None).await;
             if result.is_ok() {
@@ -704,7 +722,7 @@ async fn valid_relations_hint_covers_formal_pack_entity_of_type_rules() {
             continue;
         }
         let src = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "concept",
                 Some("theorem"),
@@ -714,9 +732,10 @@ async fn valid_relations_hint_covers_formal_pack_entity_of_type_rules() {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("create typed source entity");
         let tgt = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "concept",
                 Some("definition"),
@@ -726,6 +745,7 @@ async fn valid_relations_hint_covers_formal_pack_entity_of_type_rules() {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .expect("create typed target entity");
         if rt
             .link(&token, src.id, tgt.id, relation, 1.0, None)
@@ -870,12 +890,30 @@ async fn link_invalid_relation_error_suggests_valid_relations() {
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
     let src_val = rt
-        .create_entity(&token, "concept", None, "ConceptA", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "ConceptA",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create source entity");
     let tgt_val = rt
-        .create_entity(&token, "concept", None, "ConceptB", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "ConceptB",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create target entity");
 
     let pack = KgPack::new(rt.clone());
@@ -921,12 +959,14 @@ async fn link_invalid_relation_error_attributes_each_resolved_kind_to_short_id()
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
     let source = rt
-        .create_entity(&token, "document", None, "Source", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "document", None, "Source", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create source document");
     let target = rt
-        .create_entity(&token, "concept", None, "Target", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Target", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create target concept");
     let source_short: String = source.id.to_string().chars().take(8).collect();
     let target_short: String = target.id.to_string().chars().take(8).collect();
@@ -970,7 +1010,7 @@ async fn link_invalid_relation_error_attributes_typed_entity_subtypes() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
     let source = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             Some("theorem"),
@@ -980,9 +1020,10 @@ async fn link_invalid_relation_error_attributes_typed_entity_subtypes() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create typed source");
     let target = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             Some("definition"),
@@ -992,6 +1033,7 @@ async fn link_invalid_relation_error_attributes_typed_entity_subtypes() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create typed target");
     let source_short: String = source.id.to_string().chars().take(8).collect();
     let target_short: String = target.id.to_string().chars().take(8).collect();
@@ -1043,16 +1085,19 @@ async fn bulk_link_errors_receive_endpoint_attribution_in_both_modes() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
     let concept_a = rt
-        .create_entity(&token, "concept", None, "A", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "A", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create concept a");
     let concept_b = rt
-        .create_entity(&token, "concept", None, "B", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "B", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create concept b");
     let document = rt
-        .create_entity(&token, "document", None, "Doc", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "document", None, "Doc", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create document");
     let doc_short: String = document.id.to_string().chars().take(8).collect();
 
@@ -1596,8 +1641,17 @@ async fn update_entity_with_note_field_content_returns_error() {
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
     let entity = rt
-        .create_entity(&token, "concept", None, "MyEntity", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "MyEntity",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
 
     let pack = KgPack::new(rt.clone());
@@ -1650,12 +1704,30 @@ async fn update_edge_with_non_edge_field_returns_error() {
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
     let src = rt
-        .create_entity(&token, "concept", None, "SrcConcept", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "SrcConcept",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create source entity");
     let tgt = rt
-        .create_entity(&token, "concept", None, "TgtConcept", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "TgtConcept",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create target entity");
     let edge = rt
         .link(&token, src.id, tgt.id, EdgeRelation::Extends, 0.8, None)
@@ -1715,12 +1787,14 @@ async fn update_edge_symmetric_conflict_returns_tombstoned_survivor_with_deleted
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
     let a = rt
-        .create_entity(&token, "concept", None, "A", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "A", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create a");
     let b = rt
-        .create_entity(&token, "concept", None, "B", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "B", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create b");
 
     let requested = rt
@@ -1983,15 +2057,6 @@ async fn update_note_tags_are_normalized_before_hook_and_hook_changes_are_preser
             Ok(())
         }
 
-        async fn after_create(
-            &self,
-            _: &KhiveRuntime,
-            _: uuid::Uuid,
-            _: &Value,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-
         async fn normalize_note_update(
             &self,
             _: &KhiveRuntime,
@@ -2091,7 +2156,7 @@ async fn update_entity_with_note_field_salience_returns_error() {
     let token = rt.authorize(khive_runtime::Namespace::local()).unwrap();
 
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -2101,6 +2166,7 @@ async fn update_entity_with_note_field_salience_returns_error() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
 
     let pack = KgPack::new(rt.clone());
@@ -2598,12 +2664,14 @@ async fn link_reports_replace_and_explicit_resurrection_with_edge_observations()
 
     let (rt, token, pack, registry) = configured_kg_pack().await;
     let source = rt
-        .create_entity(&token, "concept", None, "source", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "source", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create source");
     let target = rt
-        .create_entity(&token, "concept", None, "target", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "target", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create target");
 
     let created = pack
@@ -2871,12 +2939,14 @@ async fn link_entity_precedes_entity_unaffected_by_decision_note_rule() {
     let (rt, token, pack, registry) = configured_kg_pack().await;
 
     let src = rt
-        .create_entity(&token, "project", None, "step 1", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "project", None, "step 1", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create source entity");
     let tgt = rt
-        .create_entity(&token, "project", None, "step 2", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "project", None, "step 2", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create target entity");
 
     let params = serde_json::json!({
@@ -2912,12 +2982,14 @@ async fn merge_entity_reason_forwarded_through_registry_dispatch() {
     let token = rt.authorize(Namespace::local()).expect("authorize local");
 
     let into = rt
-        .create_entity(&token, "concept", None, "Into", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Into", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create into entity");
     let from = rt
-        .create_entity(&token, "concept", None, "From", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "From", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create from entity");
 
     registry
@@ -3041,12 +3113,22 @@ async fn get_and_resolve_follow_merged_entity_with_explicit_marker() {
     let registry = builder.build().expect("registry build");
 
     let into = rt
-        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Kept", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create into entity");
     let from = rt
-        .create_entity(&token, "concept", None, "Absorbed", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "Absorbed",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create from entity");
 
     registry
@@ -3122,16 +3204,19 @@ async fn get_and_resolve_follow_two_merges_to_final_entity() {
     let registry = builder.build().expect("registry build");
 
     let first = rt
-        .create_entity(&token, "concept", None, "First", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "First", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let middle = rt
-        .create_entity(&token, "concept", None, "Middle", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Middle", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let final_entity = rt
-        .create_entity(&token, "concept", None, "Final", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Final", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     for (from, into) in [(first.id, middle.id), (middle.id, final_entity.id)] {
         registry
@@ -3172,12 +3257,14 @@ async fn get_and_resolve_distinguish_redirect_cycle_from_long_chain() {
     let registry = builder.build().expect("registry build");
 
     let a = rt
-        .create_entity(&token, "concept", None, "Cycle A", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Cycle A", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let b = rt
-        .create_entity(&token, "concept", None, "Cycle B", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Cycle B", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let mut writer = rt.sql().writer().await.expect("sql writer");
     for (from, into) in [(a.id, b.id), (b.id, a.id)] {
@@ -3211,7 +3298,7 @@ async fn get_and_resolve_distinguish_redirect_cycle_from_long_chain() {
     let mut chain = Vec::new();
     for index in 0..34 {
         chain.push(
-            rt.create_entity(
+            rt.create_entity_with_embedding_report(
                 &token,
                 "concept",
                 None,
@@ -3221,6 +3308,7 @@ async fn get_and_resolve_distinguish_redirect_cycle_from_long_chain() {
                 vec![],
             )
             .await
+            .map(|(record, _report)| record)
             .unwrap()
             .id,
         );
@@ -3265,12 +3353,30 @@ async fn get_rejects_a_live_entity_with_a_redirect_pointer() {
     let registry = builder.build().expect("registry build");
 
     let live = rt
-        .create_entity(&token, "concept", None, "Corrupt live", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "Corrupt live",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let kept = rt
-        .create_entity(&token, "concept", None, "Other live", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "Other live",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let mut writer = rt.sql().writer().await.expect("sql writer");
     writer
@@ -3345,12 +3451,22 @@ async fn redirected_gate_recheck_preserves_implicit_and_explicit_namespace() {
 
     let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let kept = rt
-        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Kept", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let consumed = rt
-        .create_entity(&token, "concept", None, "Consumed", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "Consumed",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
@@ -3441,12 +3557,22 @@ async fn redirected_reads_recheck_the_effective_id_and_audit_the_denial() {
 
     let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let kept = rt
-        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Kept", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let consumed = rt
-        .create_entity(&token, "concept", None, "Consumed", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "Consumed",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
@@ -3540,12 +3666,22 @@ async fn redirected_reads_audit_both_allowed_gate_consultations() {
 
     let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let kept = rt
-        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Kept", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let consumed = rt
-        .create_entity(&token, "concept", None, "Consumed", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "Consumed",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
@@ -3652,12 +3788,22 @@ async fn redirected_gate_outage_audits_kept_id_with_request_id() {
 
     let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let kept = rt
-        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Kept", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let consumed = rt
-        .create_entity(&token, "concept", None, "Consumed", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "Consumed",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
@@ -3740,8 +3886,9 @@ async fn live_entity_read_has_one_gate_audit_and_no_redirect_marker() {
 
     let (rt, token, _pack, _registry) = configured_kg_pack().await;
     let live = rt
-        .create_entity(&token, "concept", None, "Live", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Live", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(crate::KgPack::new(rt.clone()));
@@ -3809,8 +3956,17 @@ async fn get_dispatch_short_prefix_with_include_deleted_returns_deleted_entity()
     let registry = builder.build().expect("registry build");
 
     let entity = rt
-        .create_entity(&token, "concept", None, "SoftDeleted", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "SoftDeleted",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     assert!(rt.delete_entity(&token, entity.id, false).await.unwrap());
 
@@ -4024,12 +4180,14 @@ async fn get_dispatch_include_deleted_returns_deleted_edge_full_uuid() {
     let registry = builder.build().expect("registry build");
 
     let src = rt
-        .create_entity(&token, "concept", None, "EdgeSrc", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "EdgeSrc", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create source entity");
     let tgt = rt
-        .create_entity(&token, "concept", None, "EdgeTgt", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "EdgeTgt", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create target entity");
     let edge = rt
         .link(&token, src.id, tgt.id, EdgeRelation::Extends, 0.8, None)
@@ -4064,12 +4222,30 @@ async fn get_dispatch_deleted_edge_without_include_deleted_is_not_found() {
     let registry = builder.build().expect("registry build");
 
     let src = rt
-        .create_entity(&token, "concept", None, "EdgeSrc2", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "EdgeSrc2",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create source entity");
     let tgt = rt
-        .create_entity(&token, "concept", None, "EdgeTgt2", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "EdgeTgt2",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create target entity");
     let edge = rt
         .link(&token, src.id, tgt.id, EdgeRelation::Extends, 0.8, None)
@@ -4097,8 +4273,9 @@ async fn get_dispatch_on_plain_deleted_and_absent_ids_unchanged() {
     let registry = builder.build().expect("registry build");
 
     let entity = rt
-        .create_entity(&token, "concept", None, "Deleted", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Deleted", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     assert!(rt.delete_entity(&token, entity.id, false).await.unwrap());
 
@@ -4224,7 +4401,7 @@ async fn include_deleted_and_restore_are_scoped_to_the_callers_namespace() {
     let registry = builder.build().expect("registry build");
 
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token_a,
             "concept",
             None,
@@ -4234,6 +4411,7 @@ async fn include_deleted_and_restore_are_scoped_to_the_callers_namespace() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     assert!(rt.delete_entity(&token_a, entity.id, false).await.unwrap());
 
@@ -4290,7 +4468,7 @@ async fn restore_kind_hint_does_not_disclose_a_foreign_tombstone() {
     let registry = builder.build().expect("registry build");
 
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token_a,
             "concept",
             None,
@@ -4300,6 +4478,7 @@ async fn restore_kind_hint_does_not_disclose_a_foreign_tombstone() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     assert!(rt.delete_entity(&token_a, entity.id, false).await.unwrap());
     let note = rt
@@ -4385,7 +4564,7 @@ async fn restoring_a_deleted_endpoint_restores_traversal_without_hiding_the_edge
 
     let (rt, token, pack, registry) = configured_kg_pack().await;
     let source = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -4395,9 +4574,10 @@ async fn restoring_a_deleted_endpoint_restores_traversal_without_hiding_the_edge
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create source");
     let target = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -4407,6 +4587,7 @@ async fn restoring_a_deleted_endpoint_restores_traversal_without_hiding_the_edge
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create target");
     let edge = rt
         .link(
@@ -4475,12 +4656,22 @@ async fn resolve_dispatch_on_merged_uuid_returns_redirect_marker() {
     let _ = token;
 
     let into = rt
-        .create_entity(&token, "concept", None, "Kept", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "Kept", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .expect("create into entity");
     let from = rt
-        .create_entity(&token, "concept", None, "Absorbed", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "Absorbed",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .expect("create from entity");
 
     registry
@@ -4641,7 +4832,7 @@ async fn context_returns_note_neighbours_and_names_their_substrate() {
     let (rt, token, pack, registry) = configured_kg_pack().await;
 
     let anchor = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -4651,9 +4842,10 @@ async fn context_returns_note_neighbours_and_names_their_substrate() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create anchor");
     let sibling = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -4663,6 +4855,7 @@ async fn context_returns_note_neighbours_and_names_their_substrate() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create sibling entity neighbour");
     let observation = rt
         .create_note(
@@ -4710,7 +4903,11 @@ async fn context_returns_note_neighbours_and_names_their_substrate() {
     // The control: the neighbour walk itself sees all three. Any shortfall in
     // `context` below is therefore hydration and not the edges.
     let neighbours = pack
-        .handle_neighbors(&token, json!({"node_id": anchor.id, "direction": "both"}))
+        .handle_neighbors(
+            &token,
+            json!({"node_id": anchor.id, "direction": "both"}),
+            &registry,
+        )
         .await
         .expect("neighbors");
     assert_eq!(
@@ -4726,6 +4923,7 @@ async fn context_returns_note_neighbours_and_names_their_substrate() {
         .handle_context(
             &token,
             json!({"entity_ids": [anchor.id.to_string()], "hops": 1}),
+            &registry,
         )
         .await
         .expect("context");
@@ -4790,7 +4988,7 @@ async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
 
     // Entity, deleted by a bare id: the caller named no kind at all.
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -4800,6 +4998,7 @@ async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     let out = registry
         .dispatch("delete", json!({"id": entity.id.to_string()}))
@@ -4834,7 +5033,7 @@ async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
     // Deleted with the generic spelling: the specific kind still comes back. This is
     // the arm the old code passed by accident, because it echoed "entity" verbatim.
     let generic = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "project",
             None,
@@ -4844,6 +5043,7 @@ async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     let out = registry
         .dispatch(
@@ -4861,7 +5061,7 @@ async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
     // The mismatch guard is unchanged: naming the wrong kind still refuses, and this
     // arm is what stops the fix from being read as "kind is now ignored".
     let guarded = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -4871,6 +5071,7 @@ async fn delete_reports_the_kind_it_resolved_not_the_one_it_was_given() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .expect("create entity");
     let err = registry
         .dispatch(

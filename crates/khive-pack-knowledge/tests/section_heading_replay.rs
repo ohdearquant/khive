@@ -100,6 +100,10 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -120,6 +124,7 @@ fn fixture() -> Fixture {
         allowed_outbound_namespaces: Vec::new(),
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("in-memory knowledge runtime");
     let control = Arc::new(Control::new());

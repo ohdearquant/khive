@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use khive_runtime::{EdgeListFilter, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError};
-use khive_storage::EdgeRelation;
+use khive_storage::{BlobStore, ContentRef, EdgeRelation, StorageCapability, StorageError};
 use regex::Regex;
 use serde_json::{json, Value};
 use url::Url;
@@ -104,6 +104,14 @@ async fn admit_derived_buffers(
     .map_err(|error| {
         RuntimeError::Internal(format!("web.extract: derived admission closed: {error}"))
     })
+}
+
+async fn source_blob_size(
+    store: &dyn BlobStore,
+    content_ref: &ContentRef,
+) -> khive_storage::StorageResult<Option<u64>> {
+    khive_storage::await_request_read_phase("web_extract_blob_size", store.size(content_ref))
+        .await?
 }
 
 fn decode_body(raw: &[u8], decoded_bytes: usize) -> String {
@@ -397,7 +405,7 @@ async fn resolve_target(
             let url = Url::parse(url_str)
                 .map_err(|error| RuntimeError::InvalidInput(format!("invalid url: {error}")))?;
             let canonical = identity::canonicalize(url);
-            let site = identity::site_id(&canonical);
+            let site = identity::site_id(token.namespace(), &canonical);
             identity::document_id(site, &identity::path_and_query(&canonical))
         }
         (Some(_), Some(_)) => {
@@ -624,7 +632,8 @@ struct ExistingLinks {
     legacy_claimed_targets: Vec<Uuid>,
     legacy_claimed: Vec<Value>,
     legacy_unclaimed: Vec<Value>,
-    retractions: Vec<Uuid>,
+    snapshots: HashMap<Uuid, khive_storage::Edge>,
+    retractions: Vec<khive_storage::Edge>,
 }
 
 fn is_legacy_extractor_write(edge: &khive_storage::Edge) -> bool {
@@ -662,6 +671,7 @@ async fn inspect_existing_links(
     let mut legacy_claimed = Vec::new();
     let mut legacy_unclaimed = Vec::new();
     let mut retractions = Vec::new();
+    let mut snapshots = HashMap::new();
     for edge in existing {
         if edge.namespace != token.namespace().as_str() {
             continue;
@@ -671,6 +681,7 @@ async fn inspect_existing_links(
             .as_ref()
             .and_then(|metadata| metadata.get("web_extract"))
             == Some(&Value::Bool(true));
+        snapshots.insert(edge.target_id, edge.clone());
         existing_edge_ids.insert(edge.target_id, Uuid::from(edge.id));
         if !marked {
             if present.contains(&edge.target_id) && is_legacy_extractor_write(&edge) {
@@ -691,7 +702,7 @@ async fn inspect_existing_links(
                 }));
             }
         } else if !present.contains(&edge.target_id) {
-            retractions.push(edge.id);
+            retractions.push(edge);
         }
     }
     // `list_edges` intentionally omits tombstones. An unmarked soft-deleted
@@ -713,6 +724,7 @@ async fn inspect_existing_links(
         else {
             continue;
         };
+        snapshots.insert(*target_id, edge.clone());
         existing_edge_ids.insert(*target_id, Uuid::from(edge.id));
         let marked = edge
             .metadata
@@ -745,7 +757,8 @@ async fn inspect_existing_links(
         legacy_claimed_targets,
         legacy_claimed,
         legacy_unclaimed,
-        retractions: retractions.into_iter().map(Uuid::from).collect(),
+        snapshots,
+        retractions,
     })
 }
 
@@ -783,7 +796,7 @@ async fn extract_links(
         if canonical.scheme() != "http" && canonical.scheme() != "https" {
             continue;
         }
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(token.namespace(), &canonical);
         let target_id = identity::document_id(site, &identity::path_and_query(&canonical));
         present.insert(target_id);
         let evidence = json!({
@@ -902,10 +915,36 @@ async fn extract_links(
             resurrect: false,
         });
     }
-    let edges = runtime.link_many(token, link_specs).await?;
-    for edge_id in &existing.retractions {
-        runtime.delete_edge(token, *edge_id, false).await?;
-    }
+    let guards = link_specs
+        .iter()
+        .filter(|spec| spec.relation == EdgeRelation::LinksTo)
+        .map(|spec| khive_db::stores::graph::GraphEdgeSnapshotGuard {
+            namespace: token.namespace().as_str().to_owned(),
+            source_id: document_id,
+            target_id: spec.target_id,
+            relation: EdgeRelation::LinksTo,
+            expected: existing.snapshots.get(&spec.target_id).cloned(),
+        })
+        .collect();
+    // Attachment concordance was checked on canonical main before preparation.
+    // This source-backend transaction fences the document body property and all
+    // selected edge snapshots, including absence, before any reconciliation DML.
+    let (rows, _) = runtime
+        .link_many_guarded_observed(
+            token,
+            link_specs,
+            khive_db::stores::graph::GraphMutationPreconditions {
+                document: Some(khive_db::stores::graph::GraphDocumentGuard {
+                    namespace: token.namespace().as_str().to_owned(),
+                    id: document_id,
+                    expected_blob_ref: source_content_ref.to_owned(),
+                }),
+                edges: guards,
+            },
+            existing.retractions.clone(),
+        )
+        .await?;
+    let edges: Vec<_> = rows.into_iter().map(|row| row.edge).collect();
     let collisions = targets
         .iter()
         .filter(|target| existing.unmarked_targets.contains(&target.id))
@@ -991,7 +1030,7 @@ async fn extract_entries(
         if !seen.insert(canonical.clone()) {
             continue;
         }
-        let entry_site = identity::site_id(&canonical);
+        let entry_site = identity::site_id(token.namespace(), &canonical);
         let target_id = identity::document_id(entry_site, &identity::path_and_query(&canonical));
         crate::entities::get_or_create(
             runtime,
@@ -1063,7 +1102,7 @@ async fn extract_text(
     let excerpt = text_excerpt(body);
     let excerpt_bytes = excerpt.len();
 
-    let store = crate::blob_store(runtime)?;
+    let store = runtime.require_blob_store()?;
     let content_ref = put_excerpt(store, excerpt, Arc::clone(derived_admission)).await?;
 
     let text_id = identity::derived_text_id(original_id, source_content_ref);
@@ -1216,16 +1255,27 @@ async fn run_extract_with_link_selection(
                 .collect()
         })
         .unwrap_or_default();
-    let hydrator = runtime.blob_hydrator().ok_or_else(|| {
-        RuntimeError::Unconfigured(
-            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or KHIVE_BLOB_ROOT)"
-                .to_string(),
-        )
-    })?;
+    let hydrator = runtime.require_blob_hydrator()?;
     verify_source_body(runtime, token, target_id, &source_content_ref).await?;
-    let verified = hydrator
-        .hydrate_verified(&content_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
-        .await?;
+    let blob_store = runtime.require_blob_store()?;
+    let size = match source_blob_size(blob_store.as_ref(), &content_ref).await {
+        Ok(Some(size)) => size,
+        Ok(None)
+        | Err(StorageError::Unsupported {
+            capability: StorageCapability::Blob,
+            ..
+        }) => khive_storage::MAX_BLOB_WHOLE_BYTES,
+        Err(error) => return Err(error.into()),
+    };
+    if size > khive_storage::MAX_BLOB_WHOLE_BYTES {
+        return Err(StorageError::BlobTooLarge {
+            content_ref,
+            max_bytes: khive_storage::MAX_BLOB_WHOLE_BYTES,
+            observed_at_least: size,
+        }
+        .into());
+    }
+    let verified = hydrator.hydrate_verified(&content_ref, size).await?;
     let url_str = properties
         .get("url")
         .and_then(Value::as_str)
@@ -1233,7 +1283,8 @@ async fn run_extract_with_link_selection(
         .to_string();
     let base_url = Url::parse(&url_str)
         .map_err(|error| RuntimeError::Internal(format!("stored url is invalid: {error}")))?;
-    let site_id = identity::site_id(&identity::canonicalize(base_url.clone()));
+    let canonical = identity::canonicalize(base_url.clone());
+    let site_id = crate::fetch::canonical_site(runtime, token, &canonical).await?;
     let entity_type = entity.entity_type.as_deref().unwrap_or("resource");
     let content_type = properties.get("content_type").and_then(Value::as_str);
 
@@ -1288,8 +1339,9 @@ async fn run_extract_with_link_selection(
         .any(|kind| kind == "links")
         .then(|| parse_link_occurrences(&body, &link_headers));
     // The second check closes the hydration and parse window before any
-    // derived row, link, or extraction note is written. Later interleavings
-    // still require an atomic graph replacement primitive to serialize fully.
+    // derived row, link, or extraction note is written. Link reconciliation
+    // also checks the source document property inside its graph transaction;
+    // canonical-main attachment concordance remains an outside precheck.
     verify_source_body(runtime, token, target_id, &source_content_ref).await?;
     let mut result = serde_json::Map::new();
     let mut targets_remaining = link_limit;
@@ -1792,7 +1844,7 @@ mod tests {
     ) -> Uuid {
         let url = Url::parse(url_str).unwrap();
         let canonical = identity::canonicalize(url);
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical);
         crate::entities::get_or_create(
             runtime,
             token,
@@ -1805,7 +1857,7 @@ mod tests {
         .await
         .unwrap();
         let id = identity::document_id(site, &identity::path_and_query(&canonical));
-        let store = crate::blob_store(runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         let entity_type = if content_type.starts_with("text/html") {
             "page"
@@ -1856,7 +1908,7 @@ mod tests {
         body: &[u8],
         link_headers: &[&str],
     ) -> (String, Uuid) {
-        let store = crate::blob_store(runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         let reference = content_ref.to_string();
         crate::entities::patch(
@@ -1996,6 +2048,7 @@ mod tests {
                 .await
                 .unwrap();
             let site = identity::site_id(
+                &khive_types::Namespace::local(),
                 &Url::parse("https://duplicate-kind.example.test/map.xml").unwrap(),
             );
             let neighbors = runtime
@@ -2057,8 +2110,10 @@ mod tests {
         assert_eq!(reply["result"]["feed"]["entries"], 0);
         assert_eq!(reply["result"]["feed"]["skipped"], 2);
 
-        let site =
-            identity::site_id(&Url::parse("https://publisher.example.test/map.xml").unwrap());
+        let site = identity::site_id(
+            &khive_types::Namespace::local(),
+            &Url::parse("https://publisher.example.test/map.xml").unwrap(),
+        );
         let neighbors = runtime
             .neighbors(
                 &token,
@@ -2076,7 +2131,7 @@ mod tests {
         );
         let fourth = Url::parse("https://entries.example.test/3").unwrap();
         let fourth_id = identity::document_id(
-            identity::site_id(&fourth),
+            identity::site_id(&khive_types::Namespace::local(), &fourth),
             &identity::path_and_query(&fourth),
         );
         assert!(runtime
@@ -2144,7 +2199,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = khive_storage::ContentRef::from_hex(
             entity.properties.unwrap()["blob_ref"].as_str().unwrap(),
         )
@@ -2369,8 +2424,10 @@ mod tests {
             .unwrap();
         assert_eq!(edges.len(), 3);
         let same = identity::canonicalize(Url::parse("https://links.example.test/same").unwrap());
-        let same_id =
-            identity::document_id(identity::site_id(&same), &identity::path_and_query(&same));
+        let same_id = identity::document_id(
+            identity::site_id(&khive_types::Namespace::local(), &same),
+            &identity::path_and_query(&same),
+        );
         let same_edge = edges.iter().find(|edge| edge.target_id == same_id).unwrap();
         let metadata = same_edge.metadata.as_ref().unwrap();
         assert_eq!(metadata["occurrence_count"], 2);
@@ -3033,6 +3090,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_unmarked_capture_extracts_without_receipt_or_header_links() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"<p>Legacy body without HTML links</p>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://legacy-capture.example.test/page",
+            "text/html",
+            body,
+        )
+        .await;
+        let page = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(page_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let reference = page.properties.as_ref().unwrap()["blob_ref"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let legacy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "pre-upgrade web receipt",
+                None,
+                Some(json!({
+                    "tags": [crate::receipt::RECEIPT_TAG],
+                    "request": {
+                        "verb": "web.fetch",
+                        "content_ref": reference.clone(),
+                        "body_entity_id": page_id.to_string(),
+                        "headers": {"link": ["<https://legacy-capture.example.test/header>; rel=next"]},
+                    },
+                })),
+                vec![page_id],
+            )
+            .await
+            .unwrap();
+        crate::entities::patch(
+            &runtime,
+            &token,
+            page_id,
+            None,
+            json!({ "capture_receipt_id": legacy.id.to_string() }),
+        )
+        .await
+        .unwrap();
+        let page = runtime
+            .entities(&token)
+            .unwrap()
+            .get_entity(page_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            crate::receipt::capture_for_body(&runtime, &token, &page, &reference)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["links".into()]),
+                link_limit: Some(10),
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply["result"]["links"]["edges_created"], 0);
+        let extraction_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(extraction_note.properties.unwrap()["request"]["capture_receipt_id"].is_null());
+        assert!(runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(legacy.id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn extraction_uses_genuine_capture_behind_newer_tagged_decoy() {
+        let (runtime, token, _dir) = test_runtime().await;
+        let body = b"<p>Captured body</p>";
+        let page_id = seed_page(
+            &runtime,
+            &token,
+            "https://owner.example.test/tagged-decoy",
+            "text/html",
+            body,
+        )
+        .await;
+        let (_reference, genuine) = capture_page(&runtime, &token, page_id, body, &[]).await;
+        let genuine_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(genuine)
+            .await
+            .unwrap()
+            .unwrap();
+        let decoy = runtime
+            .create_note(
+                &token,
+                "observation",
+                None,
+                "caller-written tagged decoy",
+                None,
+                Some(json!({"tags": [crate::receipt::RECEIPT_TAG]})),
+                vec![page_id],
+            )
+            .await
+            .unwrap();
+        let mut newer_decoy = decoy.clone();
+        newer_decoy.created_at = genuine_note.created_at + 1;
+        newer_decoy.updated_at = newer_decoy.created_at;
+        runtime
+            .backend()
+            .notes()
+            .unwrap()
+            .upsert_note(newer_decoy)
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .latest_annotating_note(&token, page_id, "observation", crate::receipt::RECEIPT_TAG)
+                .await
+                .unwrap(),
+            Some(decoy.id)
+        );
+        crate::entities::patch(
+            &runtime,
+            &token,
+            page_id,
+            None,
+            json!({ "capture_receipt_id": null }),
+        )
+        .await
+        .unwrap();
+
+        let reply = run_extract(
+            &runtime,
+            &token,
+            ExtractParams {
+                id: Some(page_id),
+                url: None,
+                kinds: Some(vec!["text".into()]),
+                link_limit: None,
+                namespace: None,
+            },
+        )
+        .await
+        .unwrap();
+        let extraction_note = runtime
+            .notes(&token)
+            .unwrap()
+            .get_note(Uuid::parse_str(reply["receipt_id"].as_str().unwrap()).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            extraction_note.properties.unwrap()["request"]["capture_receipt_id"],
+            genuine.to_string()
+        );
+    }
+
+    #[tokio::test]
     async fn extraction_refuses_property_and_content_attachment_mismatch_before_writes() {
         let (runtime, token, _dir) = test_runtime().await;
         let page_id = seed_page(
@@ -3043,7 +3282,7 @@ mod tests {
             b"<a href='/old'>Old</a>",
         )
         .await;
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let second = store.put(b"<a href='/new'>New</a>".to_vec()).await.unwrap();
         crate::entities::patch(
             &runtime,
@@ -3294,7 +3533,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = khive_storage::ContentRef::from_hex(
             entity.properties.unwrap()["blob_ref"].as_str().unwrap(),
         )
@@ -3326,7 +3565,7 @@ mod tests {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://origin.example.test/never-fetched").unwrap();
         let canonical = identity::canonicalize(url);
-        let site = identity::site_id(&canonical);
+        let site = identity::site_id(&khive_types::Namespace::local(), &canonical);
         let id = identity::document_id(site, &identity::path_and_query(&canonical));
         crate::entities::get_or_create(
             &runtime,

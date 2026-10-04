@@ -8,7 +8,7 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
-use khive_storage::entity::{Entity, EntityFilter};
+use khive_storage::entity::{Entity, EntityFilter, EntityTypeCounts};
 use khive_storage::error::{StorageError, WriterTaskRequestState};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
@@ -31,6 +31,8 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 }
 
 const NAMESPACE_COUNT_CHUNK_SIZE: usize = 500;
+
+const ENTITIES_COUNT_BY_TYPE_SQL: &str = include_str!("../../sql/entities-count-by-type.sql");
 
 const ENTITY_SELECT_COLUMNS: &str =
     "entities.id, entities.namespace, entities.kind, entities.entity_type, entities.name, \
@@ -66,13 +68,6 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
          version=entities.version+1",
     );
     statement
-}
-
-/// Insert a new entity without replacing an existing live or deleted row.
-/// A competing ID causes a constraint error, so a prepared create cannot
-/// overwrite a row committed after its absence check.
-pub fn entity_insert_statement(entity: &Entity) -> SqlStatement {
-    entity_write_statement(entity, "INSERT", "entity-insert")
 }
 
 fn entity_write_statement(entity: &Entity, insert: &str, label: &str) -> SqlStatement {
@@ -503,22 +498,6 @@ fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
     })
 }
 
-/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
-/// character itself (`\`) so a caller-supplied name is matched literally
-/// under `LIKE ... ESCAPE '\'` rather than as a pattern (#818: an
-/// entity named e.g. `a_b` must not also match `aXb`, and a name containing
-/// `%` must not silently widen into a broad substring scan).
-fn escape_like(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 fn build_entity_where(
     namespace: &str,
     filter: &EntityFilter,
@@ -633,7 +612,10 @@ fn build_entity_where(
     }
 
     if let Some(ref prefix) = filter.name_prefix {
-        params.push(Box::new(format!("{}%", escape_like(prefix))));
+        params.push(Box::new(format!(
+            "{}%",
+            khive_types::escape_like_literal(prefix)
+        )));
         conditions.push(format!("name LIKE ?{} ESCAPE '\\'", params.len()));
     }
 
@@ -1170,6 +1152,33 @@ impl EntityStore for SqlEntityStore {
         .await
     }
 
+    async fn count_entities_by_type(
+        &self,
+        namespaces: &[String],
+    ) -> Result<Option<EntityTypeCounts>, StorageError> {
+        let namespaces =
+            serde_json::to_string(namespaces).map_err(|error| StorageError::Serialization {
+                capability: StorageCapability::Entities,
+                message: error.to_string(),
+            })?;
+        self.with_reader("count_entities_by_type", move |conn| {
+            let mut statement = conn.prepare(ENTITIES_COUNT_BY_TYPE_SQL)?;
+            let rows = statement.query_map(rusqlite::params![namespaces], |row| {
+                let count: i64 = row.get(1)?;
+                let count = u64::try_from(count).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?;
+                Ok((row.get::<_, Option<String>>(0)?, count))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map(Some)
+        })
+        .await
+    }
+
     async fn count_entities(
         &self,
         namespace: &str,
@@ -1229,3 +1238,7 @@ pub(crate) fn ensure_entities_schema(conn: &rusqlite::Connection) -> Result<(), 
 #[cfg(test)]
 #[path = "entity_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "entity_type_counts_tests.rs"]
+mod entity_type_counts_tests;

@@ -166,6 +166,10 @@ impl EmbedderProvider for FixtureEmbedProvider {
 
 fn rt_with_fixture_embedder() -> KhiveRuntime {
     let rt = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -186,6 +190,7 @@ fn rt_with_fixture_embedder() -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("in-memory runtime");
     rt.register_embedder(FixtureEmbedProvider);

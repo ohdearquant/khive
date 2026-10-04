@@ -309,7 +309,23 @@ mod pending_hook_signal_tests {
 }
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::Internal(format!("brain persistence {context}: {e}"))
+    RuntimeError::internal_with_context(format!("brain persistence {context}"), e)
+}
+
+#[cfg(test)]
+mod sql_err_tests {
+    use super::sql_err;
+    use khive_runtime::RuntimeError;
+
+    #[test]
+    fn brain_persistence_sql_err_message_is_prefixed_context_and_error() {
+        match sql_err("insert", "boom") {
+            RuntimeError::Internal(message) => {
+                assert_eq!(message, "brain persistence insert: boom");
+            }
+            other => panic!("expected RuntimeError::Internal, got {other:?}"),
+        }
+    }
 }
 
 /// Append one `brain_event_log` row using an already-acquired writer (plain
@@ -1282,6 +1298,23 @@ async fn load_events_since_with_window(
     })
 }
 
+fn prepare_parked_state(mut state: BrainState, entity_capacity: usize) -> BrainState {
+    let effective_capacity = entity_capacity.max(1);
+    let normalize = |posterior: &mut khive_brain_core::BalancedRecallState| {
+        if posterior.entity_posteriors.capacity() != effective_capacity {
+            *posterior = khive_brain_core::BalancedRecallState::from_snapshot(
+                posterior.to_snapshot(),
+                entity_capacity,
+            );
+        }
+    };
+    normalize(&mut state.balanced_recall);
+    for posterior in state.profile_states.values_mut() {
+        normalize(posterior);
+    }
+    state
+}
+
 pub async fn ensure_loaded(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1396,75 +1429,22 @@ pub async fn ensure_loaded(
 
         let current_ns = t.active_namespace.clone();
 
-        // Clone the parts of the current shared state we need for save-restore,
-        // then immediately release the state lock so we can re-acquire it for
-        // the final write (Rust Mutexes are not reentrant).
-        let new_state = {
-            let current_state = state.lock().unwrap();
-
-            if let Some(ref from_ns) = current_ns {
-                let saved_current = BrainState {
-                    profiles: current_state.profiles.clone(),
-                    balanced_recall: khive_brain_core::BalancedRecallState::from_snapshot(
-                        current_state.balanced_recall.to_snapshot(),
-                        entity_capacity,
-                    ),
-                    profile_states: current_state
-                        .profile_states
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                k.clone(),
-                                khive_brain_core::BalancedRecallState::from_snapshot(
-                                    v.to_snapshot(),
-                                    entity_capacity,
-                                ),
-                            )
-                        })
-                        .collect(),
-                    bindings: current_state.bindings.clone(),
-                    section_states: current_state
-                        .section_states
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                k.clone(),
-                                khive_brain_core::SectionPosteriorState::from_snapshot(
-                                    v.to_snapshot(),
-                                ),
-                            )
-                        })
-                        .collect(),
-                    router_state: current_state.router_state.clone(),
-                    adapter_set: current_state.adapter_set.clone(),
-                    // A namespace swap parks this namespace's live state and
-                    // restores it later in the same process, so its counters
-                    // travel with it rather than restarting at zero.
-                    signals_applied: std::sync::atomic::AtomicU64::new(
-                        current_state
-                            .signals_applied
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    ),
-                    snapshot_serializations: std::sync::atomic::AtomicU64::new(
-                        current_state
-                            .snapshot_serializations
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    ),
-                };
-                // Release the state guard before mutating the tracker (save-restore
-                // path) so the re-acquire below cannot deadlock.
-                drop(current_state);
-
-                let restored = t.swap_namespace(from_ns, saved_current, namespace.clone());
-                fresh_brain_state
-                    .or(restored)
-                    .unwrap_or_else(|| BrainState::new(entity_capacity))
-            } else {
-                drop(current_state);
-                // No active namespace yet — first load.  active_namespace is set
-                // below together with the state write and loaded_namespaces mark.
-                fresh_brain_state.unwrap_or_else(|| BrainState::new(entity_capacity))
-            }
+        // Snapshot readers also take this guard. Keep it from the outgoing
+        // move through incoming publication so they never see the placeholder.
+        let mut current_state = state.lock().unwrap();
+        let new_state = if let Some(ref from_ns) = current_ns {
+            let saved_current = prepare_parked_state(
+                std::mem::replace(&mut *current_state, BrainState::new(entity_capacity)),
+                entity_capacity,
+            );
+            #[cfg(test)]
+            namespace_move_tests::pause_after_move(state);
+            let restored = t.swap_namespace(from_ns, saved_current, namespace.clone());
+            fresh_brain_state
+                .or(restored)
+                .unwrap_or_else(|| BrainState::new(entity_capacity))
+        } else {
+            fresh_brain_state.unwrap_or_else(|| BrainState::new(entity_capacity))
         };
 
         // Drain any hook signals that arrived before this load completed.
@@ -1481,7 +1461,7 @@ pub async fn ensure_loaded(
         // Write the new state while the tracker lock is still held.
         // After this line active_namespace, *state, and loaded_namespaces are
         // all consistent; no concurrent dispatch can observe a partial view.
-        *state.lock().unwrap() = final_state;
+        *current_state = final_state;
 
         t.mark_loaded_at(namespace, observed_version);
     }
@@ -3141,3 +3121,6 @@ mod persist_write_queue_routing {
             .expect("persist_brain_state_mutation must succeed once unblocked");
     }
 }
+
+#[cfg(test)]
+mod namespace_move_tests;

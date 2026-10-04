@@ -1,6 +1,6 @@
 //! CRUD handlers: upsert_atoms, upsert_domains, get, list, delete_atoms, stats.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -14,6 +14,7 @@ use super::schema::{
     AtomWrite, DeleteAtomsParams, GetParams, ListParams, StatsParams, UpsertAtomsParams,
     UpsertDomainsParams,
 };
+use super::search::HYDRATION_ID_CHUNK;
 use super::sections::{section_from_row, section_to_json};
 use super::util::{
     atom_from_row, atom_to_json, compute_embedding_coverage, deser, domain_from_row,
@@ -228,6 +229,34 @@ fn knowledge_get_prefix_statement(prefix: &str) -> Option<SqlStatement> {
             .into(),
         params: vec![SqlValue::Text(lower), SqlValue::Text(upper)],
         label: Some("knowledge.get.resolve_prefix".into()),
+    })
+}
+
+/// Match a chunk of ids-or-slugs against the live rows of one table, as one
+/// statement per key column. A single `id IN (..) OR slug IN (..)` predicate
+/// makes the planner scan the namespace, so each column gets its own
+/// statement: the primary key drives the id probe (`+namespace` keeps the
+/// namespace term out of index selection, as in `hydrate_atoms_statement`)
+/// and `(namespace, slug)` drives the slug probe. `+deleted_at` keeps the
+/// liveness term out of index selection too, so the count index on
+/// `(namespace, deleted_at, ..)` cannot win the slug probe and filter the
+/// whole live namespace. `head` is the statement up
+/// to `WHERE`; `lead` holds the binds before the keys, and its first entry is
+/// the namespace (`?1`).
+fn key_match_statements(head: &str, lead: Vec<SqlValue>, keys: &[String]) -> [SqlStatement; 2] {
+    let first_key = lead.len() + 1;
+    let placeholders = (first_key..first_key + keys.len())
+        .map(|n| format!("?{n}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut params = lead;
+    params.extend(keys.iter().cloned().map(SqlValue::Text));
+    [("id", "+namespace"), ("slug", "namespace")].map(|(column, namespace)| SqlStatement {
+        sql: format!(
+            "{head} WHERE {column} IN ({placeholders}) AND {namespace} = ?1 AND +deleted_at IS NULL"
+        ),
+        params: params.clone(),
+        label: None,
     })
 }
 
@@ -1226,7 +1255,9 @@ impl KnowledgeHandlers {
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
         let now = now_us();
-        let mut deleted = 0usize;
+        // Keys are matched a chunk at a time so the namespace bind plus the key
+        // binds stay below SQLite's portable variable ceiling.
+        let keys: Vec<String> = p.ids.iter().map(|id| id.trim().to_string()).collect();
 
         // Preflight the full request before mutating anything: knowledge.delete_atoms
         // is documented as atom-only. A domain's canonical row and its FTS mirror
@@ -1238,33 +1269,49 @@ impl KnowledgeHandlers {
             .reader()
             .await
             .map_err(|e| sql_err("delete_atoms reader", e))?;
-        for id_or_slug in &p.ids {
-            let key = id_or_slug.trim().to_string();
-            let domain = reader
-                .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_domains WHERE namespace = ?1 AND (id = ?2 OR slug = ?2) AND deleted_at IS NULL LIMIT 1".into(),
-                    params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(key.clone())],
-                    label: None,
-                })
-                .await
-                .map_err(|e| sql_err("delete_atoms domain preflight", e))?;
-            if domain.is_some() {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "knowledge.delete_atoms cannot delete domain {key:?}; use the generic delete verb by domain UUID"
-                )));
+        for chunk in keys.chunks(HYDRATION_ID_CHUNK) {
+            let mut domains: HashSet<String> = HashSet::new();
+            for statement in key_match_statements(
+                "SELECT id, slug FROM knowledge_domains",
+                vec![SqlValue::Text(ns.clone())],
+                chunk,
+            ) {
+                let rows = reader
+                    .query_all(statement)
+                    .await
+                    .map_err(|e| sql_err("delete_atoms domain preflight", e))?;
+                for row in &rows {
+                    domains.extend(row_str(row, "id"));
+                    domains.extend(row_str(row, "slug"));
+                }
             }
-
-            let mirror = reader
-                .query_row(SqlStatement {
-                    sql: "SELECT tags FROM knowledge_atoms WHERE namespace = ?1 AND (id = ?2 OR slug = ?2) AND deleted_at IS NULL LIMIT 1".into(),
-                    params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(key.clone())],
-                    label: None,
-                })
-                .await
-                .map_err(|e| sql_err("delete_atoms mirror preflight", e))?;
-            if let Some(row) = mirror {
-                let tags = row_str(&row, "tags").unwrap_or_default();
-                if tags.contains("type:domain") {
+            let mut mirrors: HashSet<String> = HashSet::new();
+            for statement in key_match_statements(
+                "SELECT id, slug, tags FROM knowledge_atoms",
+                vec![SqlValue::Text(ns.clone())],
+                chunk,
+            ) {
+                let rows = reader
+                    .query_all(statement)
+                    .await
+                    .map_err(|e| sql_err("delete_atoms mirror preflight", e))?;
+                for row in &rows {
+                    let tags = row_str(row, "tags").unwrap_or_default();
+                    if tags.contains("type:domain") {
+                        mirrors.extend(row_str(row, "id"));
+                        mirrors.extend(row_str(row, "slug"));
+                    }
+                }
+            }
+            // Keys keep request order, so the first refused key is the same one
+            // a per-key check would have stopped at.
+            for key in chunk {
+                if domains.contains(key) {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "knowledge.delete_atoms cannot delete domain {key:?}; use the generic delete verb by domain UUID"
+                    )));
+                }
+                if mirrors.contains(key) {
                     return Err(RuntimeError::InvalidInput(format!(
                         "knowledge.delete_atoms cannot delete domain mirror {key:?}; use the generic delete verb by domain UUID"
                     )));
@@ -1272,26 +1319,26 @@ impl KnowledgeHandlers {
             }
         }
 
+        let mut statements: Vec<SqlStatement> = Vec::new();
+        for chunk in keys.chunks(HYDRATION_ID_CHUNK) {
+            statements.extend(key_match_statements(
+                "UPDATE knowledge_atoms SET deleted_at = ?2",
+                vec![SqlValue::Text(ns.clone()), SqlValue::Integer(now)],
+                chunk,
+            ));
+        }
+        // One batch is one transaction and one writer round trip however many
+        // ids were sent. A storage error now rolls the whole request back;
+        // before, the ids ahead of the failing one stayed deleted. A repeated
+        // request converges either way, since deleted rows no longer match.
         let mut writer = sql
             .writer()
             .await
             .map_err(|e| sql_err("delete_atoms writer", e))?;
-        for id_or_slug in &p.ids {
-            let id_or_slug = id_or_slug.trim().to_string();
-            let affected = writer
-                .execute(SqlStatement {
-                    sql: "UPDATE knowledge_atoms SET deleted_at = ?1 WHERE namespace = ?2 AND (id = ?3 OR slug = ?3) AND deleted_at IS NULL".into(),
-                    params: vec![
-                        SqlValue::Integer(now),
-                        SqlValue::Text(ns.clone()),
-                        SqlValue::Text(id_or_slug),
-                    ],
-                    label: None,
-                })
-                .await
-                .map_err(|e| sql_err("delete_atoms update", e))?;
-            deleted += affected as usize;
-        }
+        let deleted = writer
+            .execute_batch(statements)
+            .await
+            .map_err(|e| sql_err("delete_atoms update", e))? as usize;
 
         Ok(json!({
             "deleted": deleted,
@@ -1541,6 +1588,50 @@ mod tests {
                 }),
             "knowledge.get short-id tables must use primary-key range seeks: {details:?}"
         );
+    }
+
+    /// `delete_atoms` matches ids and slugs with one statement per column. A
+    /// single `id IN (..) OR slug IN (..)` predicate makes the no-statistics
+    /// planner scan the namespace, so a full chunk must still seek an index.
+    #[tokio::test]
+    async fn delete_atoms_key_statements_seek_an_index_at_a_full_chunk() {
+        let runtime = KhiveRuntime::memory().expect("memory runtime");
+        let keys: Vec<String> = (0..super::HYDRATION_ID_CHUNK)
+            .map(|i| format!("key-{i}"))
+            .collect();
+        let mut reader = runtime.sql().reader().await.expect("plan reader");
+
+        for table in ["knowledge_atoms", "knowledge_domains"] {
+            let head = format!("SELECT id, slug FROM {table}");
+            let lead = vec![SqlValue::Text("local".into())];
+            let [by_id, by_slug] = super::key_match_statements(&head, lead, &keys);
+            assert_eq!(by_id.params.len(), super::HYDRATION_ID_CHUNK + 1);
+            assert_eq!(by_slug.params.len(), super::HYDRATION_ID_CHUNK + 1);
+
+            for (statement, index) in [
+                (by_id, format!("sqlite_autoindex_{table}_1")),
+                (by_slug, format!("idx_{table}_ns_slug")),
+            ] {
+                let rows = reader.explain(statement).await.expect("explain statement");
+                let details: Vec<String> = rows
+                    .iter()
+                    .filter_map(|row| match row.get("detail") {
+                        Some(SqlValue::Text(detail)) => Some(detail.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    details
+                        .iter()
+                        .any(|detail| detail.contains(&format!("USING INDEX {index}"))),
+                    "{table} key match must seek {index}: {details:?}"
+                );
+                assert!(
+                    !details.iter().any(|detail| detail.contains("SCAN")),
+                    "{table} key match must not scan: {details:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 /// Revision of the reviewed classification contract, included in policy identity.
 /// Bump whenever a classification or the allowed-read contract changes.
-pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v7";
+pub const OPERATION_CLASSIFIER_VERSION: &str = "domain-effects-v10";
 
 /// Strongest caller-requested effect of a reviewed operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +30,9 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("blob.abort", OperationAccess::Write),
     ("blob.begin", OperationAccess::Write),
     ("blob.commit", OperationAccess::Write),
+    ("blob.export", OperationAccess::Write),
     ("blob.get", OperationAccess::Read),
+    ("blob.import", OperationAccess::Write),
     ("blob.put", OperationAccess::Write),
     ("blob.put_part", OperationAccess::Write),
     ("blob.stat", OperationAccess::Read),
@@ -70,6 +72,7 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("comm.reply", OperationAccess::Write),
     ("comm.send", OperationAccess::Write),
     ("comm.thread", OperationAccess::Read),
+    ("comm.transport_status", OperationAccess::Read),
     ("comm.unread", OperationAccess::Read),
     ("context", OperationAccess::Read),
     ("create", OperationAccess::Write),
@@ -165,7 +168,9 @@ pub const CLASSIFIED_OPERATIONS: &[(&str, OperationAccess)] = &[
     ("session.list", OperationAccess::Read),
     ("session.resume", OperationAccess::Read),
     ("session.search", OperationAccess::Read),
+    ("session.stats", OperationAccess::Read),
     ("session.store", OperationAccess::Write),
+    ("session.vacuum", OperationAccess::Write),
     ("stats", OperationAccess::Read),
     ("stream.append", OperationAccess::Write),
     ("stream.batch", OperationAccess::Write),

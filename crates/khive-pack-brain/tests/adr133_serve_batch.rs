@@ -15,6 +15,10 @@ use serde_json::json;
 
 fn file_backed_runtime(db_path: std::path::PathBuf) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -35,6 +39,7 @@ fn file_backed_runtime(db_path: std::path::PathBuf) -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("file-backed runtime")
 }

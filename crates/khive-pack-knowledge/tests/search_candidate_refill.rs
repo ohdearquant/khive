@@ -142,6 +142,10 @@ impl EmbedderProvider for RefillVectorProvider {
 
 fn runtime_with_embedder() -> KhiveRuntime {
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -162,6 +166,7 @@ fn runtime_with_embedder() -> KhiveRuntime {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime");
     runtime.register_embedder(RefillVectorProvider);

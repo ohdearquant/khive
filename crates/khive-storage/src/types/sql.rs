@@ -20,6 +20,26 @@ pub enum SqlValue {
     Timestamp(DateTime<Utc>),
 }
 
+impl SqlValue {
+    /// Bind optional text: `Some` becomes [`SqlValue::Text`], including the empty
+    /// string, and `None` becomes [`SqlValue::Null`].
+    pub fn from_opt_text(value: Option<&str>) -> SqlValue {
+        match value {
+            Some(text) => SqlValue::Text(text.to_owned()),
+            None => SqlValue::Null,
+        }
+    }
+
+    /// Bind an optional integer: `Some` becomes [`SqlValue::Integer`], including
+    /// zero, and `None` becomes [`SqlValue::Null`].
+    pub fn from_opt_i64(value: Option<i64>) -> SqlValue {
+        match value {
+            Some(number) => SqlValue::Integer(number),
+            None => SqlValue::Null,
+        }
+    }
+}
+
 /// A parameterized SQL statement with optional diagnostic label.
 ///
 /// `sql` is one SQLite statement, not a script. Backends must reject trailing
@@ -47,6 +67,24 @@ pub struct SqlRow {
     pub columns: Vec<SqlColumn>,
 }
 
+/// A refused typed column read. `found` is the SQL variant name, or `None` for absence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlColumnError {
+    pub column: String,
+    pub found: Option<&'static str>,
+}
+
+impl std::fmt::Display for SqlColumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.found {
+            Some(found) => write!(f, "SQL column {} has value {found}", self.column),
+            None => write!(f, "SQL column {} is absent", self.column),
+        }
+    }
+}
+
+impl std::error::Error for SqlColumnError {}
+
 impl SqlRow {
     /// Look up a column value by name, returning `None` if absent.
     pub fn get(&self, name: &str) -> Option<&SqlValue> {
@@ -54,5 +92,72 @@ impl SqlRow {
             .iter()
             .find(|c| c.name == name)
             .map(|c| &c.value)
+    }
+
+    /// Read text, refusing NULL, absence, and other SQL variants.
+    pub fn text(&self, name: &str) -> Result<&str, SqlColumnError> {
+        match self.get(name) {
+            Some(SqlValue::Text(value)) => Ok(value),
+            found => Err(column_error(name, found)),
+        }
+    }
+
+    /// Read an integer, refusing NULL, absence, and other SQL variants, including Float.
+    pub fn i64(&self, name: &str) -> Result<i64, SqlColumnError> {
+        match self.get(name) {
+            Some(SqlValue::Integer(value)) => Ok(*value),
+            found => Err(column_error(name, found)),
+        }
+    }
+
+    /// Read nullable text, refusing an absent column or another SQL variant.
+    pub fn opt_text(&self, name: &str) -> Result<Option<&str>, SqlColumnError> {
+        match self.get(name) {
+            Some(SqlValue::Null) => Ok(None),
+            Some(SqlValue::Text(value)) => Ok(Some(value)),
+            found => Err(column_error(name, found)),
+        }
+    }
+
+    /// Read a nullable integer, refusing an absent column or another SQL variant.
+    pub fn opt_i64(&self, name: &str) -> Result<Option<i64>, SqlColumnError> {
+        match self.get(name) {
+            Some(SqlValue::Null) => Ok(None),
+            Some(SqlValue::Integer(value)) => Ok(Some(*value)),
+            found => Err(column_error(name, found)),
+        }
+    }
+
+    /// Read nullable text, treating absence as NULL while refusing other SQL variants.
+    pub fn opt_text_or_absent(&self, name: &str) -> Result<Option<&str>, SqlColumnError> {
+        match self.get(name) {
+            None => Ok(None),
+            _ => self.opt_text(name),
+        }
+    }
+
+    /// Read a nullable integer, treating absence as NULL while refusing other SQL variants.
+    pub fn opt_i64_or_absent(&self, name: &str) -> Result<Option<i64>, SqlColumnError> {
+        match self.get(name) {
+            None => Ok(None),
+            _ => self.opt_i64(name),
+        }
+    }
+}
+
+fn column_error(name: &str, found: Option<&SqlValue>) -> SqlColumnError {
+    SqlColumnError {
+        column: name.to_owned(),
+        found: found.map(|value| match value {
+            SqlValue::Null => "Null",
+            SqlValue::Bool(_) => "Bool",
+            SqlValue::Integer(_) => "Integer",
+            SqlValue::Float(_) => "Float",
+            SqlValue::Text(_) => "Text",
+            SqlValue::Blob(_) => "Blob",
+            SqlValue::Json(_) => "Json",
+            SqlValue::Uuid(_) => "Uuid",
+            SqlValue::Timestamp(_) => "Timestamp",
+        }),
     }
 }

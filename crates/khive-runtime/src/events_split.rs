@@ -45,7 +45,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use khive_db::StorageBackend;
+use khive_db::{StorageBackend, WalCeilingPolicy};
 use khive_storage::event::IdempotentEventBatchResult;
 use khive_storage::{
     BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageError,
@@ -382,11 +382,28 @@ pub fn direct_backend_read_only_for(
     direct_backend_with_max_readers(db_path, true, None)
 }
 
+/// Standalone opener: resolve its environment once before opening the event lane.
 pub(crate) fn direct_backend_with_max_readers(
     db_path: &Path,
     read_only: bool,
     max_readers: Option<usize>,
 ) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
+    let mut config = crate::RuntimeConfig {
+        db_path: Some(db_path.to_path_buf()),
+        ..crate::RuntimeConfig::no_embeddings()
+    };
+    let wal_ceiling = config.resolve_wal_ceiling_policy(read_only)?;
+    direct_backend_with_max_readers_and_wal_ceiling(db_path, read_only, max_readers, wal_ceiling)
+}
+
+/// Open the direct event lane with the policy already resolved for its main backend.
+pub(crate) fn direct_backend_with_max_readers_and_wal_ceiling(
+    db_path: &Path,
+    read_only: bool,
+    max_readers: Option<usize>,
+    wal_ceiling: WalCeilingPolicy,
+) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
+    wal_ceiling.validate_static(true, true, read_only)?;
     let mut registry = direct_backend_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -437,6 +454,16 @@ pub(crate) fn direct_backend_with_max_readers(
                 key.display()
             )));
         }
+        let existing_bytes = existing.pool().config().wal_ceiling.bytes;
+        if existing_bytes != wal_ceiling.bytes {
+            return Err(khive_db::SqliteError::InvalidConfig(format!(
+                "events database {} is already open with wal_ceiling_bytes={existing_bytes}; \
+                 requested {}; drain and restart before changing the WAL ceiling",
+                key.display(),
+                wal_ceiling.bytes
+            ))
+            .into());
+        }
         return Ok(Arc::clone(existing));
     }
     let db_path = key.as_path();
@@ -459,9 +486,13 @@ pub(crate) fn direct_backend_with_max_readers(
             .map_err(|e| crate::error::RuntimeError::Internal(e.to_string()))?;
     }
     let backend = Arc::new(if read_only {
-        StorageBackend::sqlite_read_only_with_max_readers(db_path, max_readers)?
+        StorageBackend::sqlite_read_only_with_max_readers_and_wal_ceiling(
+            db_path,
+            max_readers,
+            wal_ceiling,
+        )?
     } else {
-        StorageBackend::sqlite_with_max_readers(db_path, max_readers)?
+        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(db_path, max_readers, wal_ceiling)?
     });
     registry.insert(key, (read_only, Arc::clone(&backend)));
     Ok(backend)
@@ -639,48 +670,99 @@ pub struct EventsDaemonGuard {
     _file: std::fs::File,
 }
 
-/// Try to become the events daemon for `socket_path`. `None` = the lock
-/// could not be safely acquired — either another events daemon holds it, or
-/// a hardening step refused (symlinked lock entry, failed chmod). Both mean
-/// the caller must not serve; callers that need the socket directory
-/// validated must run `ensure_socket_dir_is_trusted` on the parent BEFORE
-/// calling this, so no lock-path operation happens in an untrusted
-/// directory.
+/// Try to become the events daemon for `socket_path`, returning `None` for
+/// contention or any refusal. Callers must validate the parent with
+/// `ensure_socket_dir_is_trusted` before lock-path operations in that directory.
 #[cfg(unix)]
 pub fn try_acquire_events_daemon_guard(socket_path: &Path) -> Option<EventsDaemonGuard> {
+    match acquire_events_daemon_guard_outcome(socket_path) {
+        EventsDaemonGuardAcquisition::Held(guard) => Some(guard),
+        _ => None,
+    }
+}
+
+/// Why a non-blocking daemon-lock acquisition did or did not succeed.
+/// Refusals retain the I/O error instead of treating every failure as contention.
+#[cfg(unix)]
+enum EventsDaemonGuardAcquisition {
+    Held(EventsDaemonGuard),
+    Contended,
+    OpenFailed(std::io::Error),
+    HardeningRefused(std::io::Error),
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for EventsDaemonGuardAcquisition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Held(_) => f.write_str("Held"),
+            Self::Contended => f.write_str("Contended"),
+            Self::OpenFailed(error) => f.debug_tuple("OpenFailed").field(error).finish(),
+            Self::HardeningRefused(error) => {
+                f.debug_tuple("HardeningRefused").field(error).finish()
+            }
+        }
+    }
+}
+
+/// Try to become the events daemon for `socket_path`. Every refusal means
+/// the caller must not serve; only `Contended` identifies a held lock.
+/// Callers that need the socket directory validated must run
+/// `ensure_socket_dir_is_trusted` on the parent BEFORE calling this, so no
+/// lock-path operation happens in an untrusted directory.
+#[cfg(unix)]
+fn acquire_events_daemon_guard_outcome(socket_path: &Path) -> EventsDaemonGuardAcquisition {
+    use EventsDaemonGuardAcquisition::{Contended, HardeningRefused, Held, OpenFailed};
+
     let lock_path = socket_path.with_extension("lock");
     if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent).ok()?;
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return OpenFailed(error);
+        }
     }
     use std::os::unix::fs::OpenOptionsExt;
     // `O_NOFOLLOW` pins the open to the final component: a symlink planted
     // at the lock name is refused instead of redirecting the open (and the
     // chmod below) to an attacker-selected target.
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&lock_path)
-        .ok()?;
+    {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return HardeningRefused(error);
+        }
+        Err(error) => return OpenFailed(error),
+    };
     // `mode` applies only at creation; tighten a pre-existing lock file too.
     // Descriptor-based (`fchmod` on the handle just opened), never a second
     // path lookup — and fail closed: with the inode pinned, a failed chmod
     // is abnormal, and serving behind a lock file another user can open is
     // exactly what the hardening exists to refuse.
-    file.set_permissions(
+    if let Err(error) = file.set_permissions(
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
-    )
-    .ok()?;
+    ) {
+        return HardeningRefused(error);
+    }
     use std::os::fd::AsRawFd;
     // SAFETY: `fd` is a live descriptor owned by `file` for the duration of
     // the call; `flock` reads nothing else.
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc == 0 {
-        Some(EventsDaemonGuard { _file: file })
+        Held(EventsDaemonGuard { _file: file })
     } else {
-        None
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || error.raw_os_error() == Some(libc::EAGAIN)
+        {
+            Contended
+        } else {
+            HardeningRefused(error)
+        }
     }
 }
 
@@ -928,9 +1010,10 @@ fn verify_events_db_owner_only_unopened(
 /// socket periodically and (re)spawn the daemon subcommand when unreachable.
 ///
 /// The spawned command contract is fixed here once: the current executable
-/// re-invoked as `events-daemon --db <db> --socket <socket>` — the subcommand
-/// the kernel binary registers for [`run_events_daemon`]. The child holds the
-/// per-socket advisory lock, so a probe/spawn race resolves to one survivor.
+/// re-invoked as `events-daemon --db <db> --socket <socket>` with the resolved
+/// WAL ceiling bytes and source — the subcommand the kernel binary registers
+/// for [`run_events_daemon`]. The child holds the per-socket advisory lock,
+/// so a probe/spawn race resolves to one survivor.
 ///
 /// Lifecycle: the loop observes the process-wide daemon shutdown token, so
 /// `drain()` never waits on it forever, and it retains the handle of the
@@ -944,8 +1027,37 @@ fn verify_events_db_owner_only_unopened(
 /// by a foreign-uid process is treated as UNREACHABLE (and logged loudly),
 /// so a pre-bound spoof socket triggers a real-daemon spawn instead of being
 /// reported healthy.
+///
+/// This standalone entry resolves its environment once before supervision.
+/// Hosts with an opened main backend pass its resolved policy through
+/// [`supervise_events_daemon_with_wal_ceiling`].
 #[cfg(unix)]
 pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
+    let mut config = crate::RuntimeConfig {
+        db_path: Some(db_path.clone()),
+        ..crate::RuntimeConfig::no_embeddings()
+    };
+    match config.resolve_wal_ceiling_policy(false) {
+        Ok(wal_ceiling) => {
+            supervise_events_daemon_with_wal_ceiling(db_path, socket_path, wal_ceiling).await;
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "invalid WAL ceiling; events supervisor not started");
+        }
+    }
+}
+
+/// Supervise every events-daemon child with the main backend's resolved policy.
+#[cfg(unix)]
+pub async fn supervise_events_daemon_with_wal_ceiling(
+    db_path: PathBuf,
+    socket_path: PathBuf,
+    wal_ceiling: WalCeilingPolicy,
+) {
+    if let Err(error) = wal_ceiling.validate_static(true, true, false) {
+        tracing::warn!(error = %error, "invalid WAL ceiling; events supervisor not started");
+        return;
+    }
     const PROBE_INTERVAL: Duration = Duration::from_secs(15);
     let shutdown = crate::daemon::daemon_shutdown_token();
     let mut child: Option<std::process::Child> = None;
@@ -983,16 +1095,8 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
         if !reachable && child.is_none() {
             match std::env::current_exe() {
                 Ok(exe) => {
-                    let spawned = std::process::Command::new(exe)
-                        .arg("events-daemon")
-                        .arg("--db")
-                        .arg(&db_path)
-                        .arg("--socket")
-                        .arg(&socket_path)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
+                    let spawned =
+                        events_daemon_command(&exe, &db_path, &socket_path, wal_ceiling).spawn();
                     match spawned {
                         Ok(spawned_child) => {
                             respawns += 1;
@@ -1029,6 +1133,35 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
     }
 }
 
+#[cfg(unix)]
+fn events_daemon_command(
+    executable: &Path,
+    db_path: &Path,
+    socket_path: &Path,
+    wal_ceiling: WalCeilingPolicy,
+) -> std::process::Command {
+    let source = match wal_ceiling.source {
+        khive_db::WalCeilingSource::BackendField => "backend_field",
+        khive_db::WalCeilingSource::Environment => "environment",
+        khive_db::WalCeilingSource::Default => "default",
+    };
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("events-daemon")
+        .arg("--db")
+        .arg(db_path)
+        .arg("--socket")
+        .arg(socket_path)
+        .arg("--wal-ceiling-bytes")
+        .arg(wal_ceiling.bytes.to_string())
+        .arg("--wal-ceiling-source")
+        .arg(source)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+
 /// Serve the events daemon loop on `socket_path`, owning `db_path`.
 ///
 /// Binds the socket (removing a stale path first), then accepts connections
@@ -1044,8 +1177,29 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
 /// identity — clients additionally verify the peer uid on every connect —
 /// but a hardened bind path is what keeps the *bind* itself out of another
 /// user's hands.
+///
+/// This standalone entry resolves its environment once before opening the
+/// daemon. Hosts with a resolved policy use [`run_events_daemon_with_wal_ceiling`].
 #[cfg(unix)]
 pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Result<()> {
+    let mut config = crate::RuntimeConfig {
+        db_path: Some(db_path.to_path_buf()),
+        ..crate::RuntimeConfig::no_embeddings()
+    };
+    let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
+    run_events_daemon_with_wal_ceiling(db_path, socket_path, wal_ceiling).await
+}
+
+/// Serve the events daemon with a policy already resolved by its host.
+#[cfg(unix)]
+pub async fn run_events_daemon_with_wal_ceiling(
+    db_path: &Path,
+    socket_path: &Path,
+    wal_ceiling: WalCeilingPolicy,
+) -> anyhow::Result<()> {
+    wal_ceiling
+        .validate_static(true, true, false)
+        .map_err(crate::error::RuntimeError::from)?;
     // The subcommand's `--db`/`--socket` arrive from argv and may be
     // relative; anchor them before anything derives a parent from them.
     let db_path = &absolutize(db_path);
@@ -1057,12 +1211,16 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
         std::fs::create_dir_all(parent)?;
         crate::daemon::ensure_socket_dir_is_trusted(parent)?;
     }
-    let Some(_guard) = try_acquire_events_daemon_guard(socket_path) else {
-        tracing::info!(
-            socket = %socket_path.display(),
-            "events daemon lock unavailable (held by another daemon, or hardening refused); exiting"
-        );
-        return Ok(());
+    let _guard = match acquire_events_daemon_guard_outcome(socket_path) {
+        EventsDaemonGuardAcquisition::Held(guard) => guard,
+        refusal => {
+            tracing::info!(
+                socket = %socket_path.display(),
+                reason = ?refusal,
+                "events daemon lock unavailable; exiting"
+            );
+            return Ok(());
+        }
     };
     ensure_events_db_owner_only(db_path)?;
     // Tighten a pre-existing database and any `-wal`/`-shm` an earlier
@@ -1078,7 +1236,10 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     // inodes. Sidecars SQLite creates from here on inherit the database
     // file's mode; the check after the open below opens nothing.
     let before_open = harden_events_db_sidecars(db_path)?;
-    let backend = Arc::new(StorageBackend::sqlite(db_path)?);
+    let backend = Arc::new(
+        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(db_path, None, wal_ceiling)
+            .map_err(crate::error::RuntimeError::from)?,
+    );
     // Ensure the schema once, loudly, before accepting traffic.
     backend.events()?;
     verify_events_db_owner_only_unopened(db_path, &before_open)?;
@@ -1116,6 +1277,9 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
     tracing::info!(
         socket = %socket_path.display(),
         db = %db_path.display(),
+        wal_ceiling_configured_bytes = wal_ceiling.bytes,
+        wal_ceiling_effective_bytes = wal_ceiling.effective_bytes(backend.is_read_only()),
+        wal_ceiling_source = ?wal_ceiling.source,
         "events daemon listening"
     );
 
@@ -1159,6 +1323,10 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
         });
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "events_wal_policy_tests.rs"]
+mod wal_policy_tests;
 
 /// Read one length-prefixed request frame, admitting the body buffer against
 /// the shared byte budget before allocating it. The returned permit holds
@@ -2652,15 +2820,21 @@ mod tests {
         let socket = dir.path().join("events.sock");
         std::os::unix::fs::symlink(&victim, socket.with_extension("lock")).unwrap();
         assert!(
-            try_acquire_events_daemon_guard(&socket).is_none(),
-            "a symlinked lock entry must refuse the guard"
+            matches!(
+                acquire_events_daemon_guard_outcome(&socket),
+                EventsDaemonGuardAcquisition::HardeningRefused(_)
+            ),
+            "a symlinked lock entry must report a hardening refusal"
         );
         let mode = victim.metadata().unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o644, "the symlink's target must keep its mode");
         assert_eq!(std::fs::read(&victim).unwrap(), b"v");
         let clean = dir.path().join("clean.sock");
         assert!(
-            try_acquire_events_daemon_guard(&clean).is_some(),
+            matches!(
+                acquire_events_daemon_guard_outcome(&clean),
+                EventsDaemonGuardAcquisition::Held(_)
+            ),
             "a plain lock path in the same directory must still acquire"
         );
     }
@@ -4129,15 +4303,67 @@ mod tests {
     fn events_daemon_guard_is_exclusive_then_reusable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("events.sock");
-        let first = try_acquire_events_daemon_guard(&socket).expect("first acquire");
+        let first = match acquire_events_daemon_guard_outcome(&socket) {
+            EventsDaemonGuardAcquisition::Held(guard) => guard,
+            other => panic!("first acquire must succeed: {other:?}"),
+        };
+        let second = acquire_events_daemon_guard_outcome(&socket);
         assert!(
-            try_acquire_events_daemon_guard(&socket).is_none(),
-            "second acquire must fail while the first guard is held"
+            matches!(second, EventsDaemonGuardAcquisition::Contended),
+            "second acquire must report contention while the first guard is held: {second:?}"
         );
         drop(first);
+        // Another test may fork while the first description is open. A child
+        // can retain that flock until exec or exit; retry only that diagnosed
+        // contention, never an open/hardening error, and never without a bound.
+        const MAX_ATTEMPTS: usize = 100;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match acquire_events_daemon_guard_outcome(&socket) {
+                EventsDaemonGuardAcquisition::Held(_) => return,
+                EventsDaemonGuardAcquisition::Contended if attempt < MAX_ATTEMPTS => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                other => panic!(
+                    "acquire must succeed after release within {MAX_ATTEMPTS} attempts; \
+                     attempt {attempt}: {other:?}"
+                ),
+            }
+        }
+        unreachable!("the final acquisition attempt returns or reports its refusal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn events_daemon_guard_open_failure_is_not_contention() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clean = dir.path().join("clean.sock");
+        assert!(matches!(
+            acquire_events_daemon_guard_outcome(&clean),
+            EventsDaemonGuardAcquisition::Held(_)
+        ));
+
         assert!(
-            try_acquire_events_daemon_guard(&socket).is_some(),
-            "acquire must succeed again after the guard is released"
+            try_acquire_events_daemon_guard(&clean).is_some(),
+            "the public Option entrance must preserve a successful acquisition"
+        );
+
+        // Opening a directory for writing must fail even when no process
+        // holds a daemon lock. Exercise the real open, not an injected result.
+        let socket = dir.path().join("blocked.sock");
+        let lock_path = socket.with_extension("lock");
+        std::fs::create_dir(&lock_path).expect("create directory at lock entry");
+        let outcome = acquire_events_daemon_guard_outcome(&socket);
+        assert!(
+            matches!(outcome, EventsDaemonGuardAcquisition::OpenFailed(_)),
+            "an actual lock-file open failure must not report contention: {outcome:?}"
+        );
+        assert!(
+            try_acquire_events_daemon_guard(&socket).is_none(),
+            "the public Option entrance must refuse an actual open failure"
+        );
+        assert!(
+            lock_path.is_dir(),
+            "the refused entry must remain a directory"
         );
     }
 

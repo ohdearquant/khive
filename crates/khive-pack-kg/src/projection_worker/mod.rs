@@ -136,21 +136,7 @@ impl ProposalsProjectionWorker {
             ],
             label: Some("projection_worker.applied_and_emit.cas".into()),
         };
-        let event_stmt = build_conditional_event_insert(&event);
-
-        let sql = self.runtime.sql();
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let total_rows = writer
-            .execute_batch(vec![projection_stmt, event_stmt])
-            .await
-            .map_err(RuntimeError::Storage)?;
-        let applied = total_rows == 2;
-        if applied {
-            // This atomic path deliberately bypasses EventStore::append_event,
-            // whose successful-append seam normally owns ADR-103 accounting.
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-        }
-        Ok(applied)
+        self.execute_guarded_event(projection_stmt, event).await
     }
 
     /// Atomically move status `approved` → `applying` before KG mutation.
@@ -278,20 +264,8 @@ impl ProposalsProjectionWorker {
         };
 
         let event_id = event.id;
-        let event_stmt = build_conditional_event_insert(&event);
-
-        let sql = self.runtime.sql();
-        let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let total_rows = writer
-            .execute_batch(vec![projection_stmt, event_stmt])
-            .await
-            .map_err(RuntimeError::Storage)?;
-
-        let cas_hit = if decision_changes_state {
-            total_rows == 2
-        } else {
-            true
-        };
+        let event_inserted = self.execute_guarded_event(projection_stmt, event).await?;
+        let cas_hit = !decision_changes_state || event_inserted;
 
         Ok((cas_hit, event_id))
     }
@@ -318,17 +292,29 @@ impl ProposalsProjectionWorker {
         };
 
         let event_id = event.id;
-        let event_stmt = build_conditional_event_insert(&event);
+        let event_inserted = self.execute_guarded_event(projection_stmt, event).await?;
+        Ok((event_inserted, event_id))
+    }
 
+    async fn execute_guarded_event(
+        &self,
+        projection_stmt: SqlStatement,
+        event: Event,
+    ) -> Result<bool, RuntimeError> {
+        let event_stmt = build_conditional_event_insert(&event);
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
-        let total_rows = writer
+        let result = writer
             .execute_batch(vec![projection_stmt, event_stmt])
-            .await
-            .map_err(RuntimeError::Storage)?;
-
-        let cas_hit = total_rows == 2;
-        Ok((cas_hit, event_id))
+            .await;
+        khive_storage::usage::account_event_write(
+            result
+                .as_ref()
+                .map(|total_rows| u64::from(*total_rows == 2)),
+        );
+        let total_rows = result.map_err(RuntimeError::Storage)?;
+        let event_inserted = total_rows == 2;
+        Ok(event_inserted)
     }
 
     /// Read the current row from `proposals_open` for a given proposal_id.

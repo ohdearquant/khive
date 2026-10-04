@@ -146,7 +146,9 @@ pub async fn resolve_cwd(
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect();
-    let store = blob_store(rt)?;
+    let hydrator = rt
+        .blob_hydrator()
+        .ok_or_else(|| RuntimeError::Unconfigured("exec blob hydrator is not installed".into()))?;
     let mut pending = VecDeque::new();
     let mut pending_bytes = 0;
     prepend_cwd_components(&mut pending, &mut pending_bytes, &cwd)?;
@@ -181,15 +183,25 @@ pub async fn resolve_cwd(
             }
             let reference = ContentRef::from_hex(&entry.content_ref)
                 .map_err(|e| RuntimeError::InvalidInput(format!("cwd entry {path:?}: {e}")))?;
-            let bytes = store
-                .get_bounded_verified(&reference, MAX_CWD_PATH_BYTES as u64)
+            let bytes = hydrator
+                .hydrate_verified(&reference, MAX_CWD_PATH_BYTES as u64)
                 .await
                 .map_err(|e| {
-                    RuntimeError::InvalidInput(format!(
-                        "cwd symlink target at {path:?} cannot be read within {MAX_CWD_PATH_BYTES} bytes: {e}"
-                    ))
+                    if matches!(
+                        &e,
+                        RuntimeError::Storage(
+                            khive_storage::StorageError::Timeout { .. }
+                                | khive_storage::StorageError::AdmissionTimeout { .. }
+                        ) | RuntimeError::Internal(_) | RuntimeError::Unconfigured(_)
+                    ) {
+                        e
+                    } else {
+                        RuntimeError::InvalidInput(format!(
+                            "cwd symlink target at {path:?} cannot be read within {MAX_CWD_PATH_BYTES} bytes: {e}"
+                        ))
+                    }
                 })?;
-            let target = std::str::from_utf8(&bytes).map_err(|_| {
+            let target = std::str::from_utf8(bytes.bytes()).map_err(|_| {
                 RuntimeError::InvalidInput(format!(
                     "cwd entry {path:?} target cannot name a UTF-8 manifest directory"
                 ))
@@ -306,9 +318,21 @@ struct PrefixWork {
     child_lookups: usize,
     #[cfg(test)]
     ordered_probes: usize,
+    #[cfg(test)]
+    copied_label_bytes: usize,
 }
 
 impl PrefixWork {
+    #[inline]
+    fn copied_label(&mut self, bytes: usize) {
+        #[cfg(test)]
+        {
+            self.copied_label_bytes += bytes;
+        }
+        #[cfg(not(test))]
+        let _ = (self, bytes);
+    }
+
     #[inline]
     fn comparison(&mut self, bytes: usize) {
         #[cfg(test)]
@@ -367,11 +391,22 @@ impl Default for PrefixIndex {
 
 impl PrefixIndex {
     fn first_parent<'a>(&self, path: &'a str, work: &mut PrefixWork) -> Option<&'a str> {
+        self.first_prefix(path, false, work)
+    }
+
+    fn first_prefix<'a>(
+        &self,
+        path: &'a str,
+        include_exact: bool,
+        work: &mut PrefixWork,
+    ) -> Option<&'a str> {
         let mut node = 0;
         let mut consumed = 0;
         loop {
             let remaining = &path[consumed..];
-            if self.nodes[node].entry && remaining.starts_with('/') {
+            if self.nodes[node].entry
+                && (remaining.starts_with('/') || (include_exact && remaining.is_empty()))
+            {
                 return Some(&path[..consumed]);
             }
             let first = remaining.chars().next()?;
@@ -397,6 +432,7 @@ impl PrefixIndex {
             };
             work.lookup();
             let Some(edge) = self.nodes[node].children.get(&first) else {
+                work.copied_label(remaining.len());
                 let child = self.nodes.len();
                 self.nodes.push(PrefixNode {
                     entry: true,
@@ -424,6 +460,7 @@ impl PrefixIndex {
                 .children
                 .remove(&first)
                 .expect("edge exists");
+            work.copied_label(edge.label.len() - common);
             let old_suffix = edge.label.split_off(common);
             let middle = self.nodes.len();
             let mut middle_node = PrefixNode::default();
@@ -441,6 +478,7 @@ impl PrefixIndex {
                 self.nodes[middle].entry = true;
             } else {
                 let suffix = &remaining[common..];
+                work.copied_label(suffix.len());
                 let child = self.nodes.len();
                 self.nodes.push(PrefixNode {
                     entry: true,
@@ -456,6 +494,56 @@ impl PrefixIndex {
             }
             return;
         }
+    }
+}
+
+/// Boolean output coverage over already validated declarations, independent of
+/// the manifest's file/directory collision policy.
+#[cfg(any(unix, test))]
+pub(crate) struct DeclaredCoverage {
+    prefixes: PrefixIndex,
+    #[cfg(test)]
+    work: crate::membership::MembershipWork,
+    #[cfg(test)]
+    pub(crate) declarations: Vec<String>,
+}
+
+#[cfg(any(unix, test))]
+impl DeclaredCoverage {
+    pub(crate) fn new(paths: &[String], work: crate::membership::MembershipWork) -> Self {
+        let mut ordered: Vec<&str> = paths.iter().map(String::as_str).collect();
+        // Insertion only affects representation, never the boolean predicate.
+        // A later split cannot copy an older suffix longer than its input.
+        ordered.sort_by_key(|path| path.len());
+        let mut prefixes = PrefixIndex::default();
+        let mut build = PrefixWork::default();
+        for path in ordered {
+            prefixes.insert(path, &mut build);
+        }
+        #[cfg(test)]
+        work.declared_build(
+            build.compared_bytes,
+            build.child_lookups,
+            build.copied_label_bytes,
+        );
+        #[cfg(not(test))]
+        let _ = work;
+        Self {
+            prefixes,
+            #[cfg(test)]
+            work,
+            #[cfg(test)]
+            declarations: paths.to_vec(),
+        }
+    }
+
+    pub(crate) fn covers(&self, path: &str) -> bool {
+        let mut query = PrefixWork::default();
+        let covered = self.prefixes.first_prefix(path, true, &mut query).is_some();
+        #[cfg(test)]
+        self.work
+            .declared_query(query.compared_bytes, query.child_lookups);
+        covered
     }
 }
 
@@ -584,12 +672,16 @@ pub async fn load(rt: &KhiveRuntime, tree_ref: &str) -> Result<Vec<TreeEntry>, R
             "tree {tree_ref} is not in the blob store"
         )));
     }
-    let bytes = store
-        .get_bounded_verified(&content_ref, MAX_MANIFEST_BYTES)
+    let hydrator = rt
+        .blob_hydrator()
+        .ok_or_else(|| RuntimeError::Unconfigured("exec blob hydrator is not installed".into()))?;
+    let bytes = hydrator
+        .hydrate_verified(&content_ref, MAX_MANIFEST_BYTES)
         .await?;
-    let manifest: Manifest = serde_json::from_slice(&bytes).map_err(|e| {
+    let manifest: Manifest = serde_json::from_slice(bytes.bytes()).map_err(|e| {
         RuntimeError::InvalidInput(format!("tree {tree_ref} is not a khive-tree manifest: {e}"))
     })?;
+    drop(bytes);
     if manifest.schema != TREE_SCHEMA {
         return Err(RuntimeError::InvalidInput(format!(
             "tree {tree_ref} has schema {:?}; expected {TREE_SCHEMA:?}",
@@ -690,6 +782,80 @@ pub fn digest_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn manifest_and_cwd_link_reads_wait_for_shared_hydration_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(dir.path().join("runtime.db")),
+            blob_hydration_bytes: khive_storage::MAX_BLOB_WHOLE_BYTES,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        let blob_store: std::sync::Arc<dyn BlobStore> = std::sync::Arc::new(
+            khive_db::stores::blob::FsBlobStore::new(dir.path().join("blobs"), 0).unwrap(),
+        );
+        rt.install_blob_store(blob_store.clone()).unwrap();
+        let held_ref = blob_store.put(b"held".to_vec()).await.unwrap();
+        let link_ref = blob_store.put(b"dir".to_vec()).await.unwrap();
+        let file_ref = blob_store.put(b"file".to_vec()).await.unwrap();
+        let entries = vec![
+            TreeEntry {
+                path: "dir/file".into(),
+                content_ref: file_ref.as_str().into(),
+                mode: 644,
+            },
+            TreeEntry {
+                path: "link".into(),
+                content_ref: link_ref.as_str().into(),
+                mode: 120000,
+            },
+        ];
+        let tree_ref = store(&rt, &entries).await.unwrap();
+        let held = rt
+            .blob_hydrator()
+            .unwrap()
+            .hydrate_verified(&held_ref, khive_storage::MAX_BLOB_WHOLE_BYTES)
+            .await
+            .unwrap();
+
+        let load_rt = rt.clone();
+        let mut load_task = tokio::spawn(async move { load(&load_rt, &tree_ref).await });
+        let cwd_rt = rt.clone();
+        let cwd_entries = entries.clone();
+        let mut cwd_task =
+            tokio::spawn(async move { resolve_cwd(&cwd_rt, &cwd_entries, "link").await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut load_task)
+                .await
+                .is_err(),
+            "manifest read must wait behind the held shared budget"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut cwd_task)
+                .await
+                .is_err(),
+            "cwd symlink read must wait behind the held shared budget"
+        );
+
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), load_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            entries
+        );
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), cwd_task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            "dir"
+        );
+    }
 
     #[test]
     fn rejects_unsafe_paths() {

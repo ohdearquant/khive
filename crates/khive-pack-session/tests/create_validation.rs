@@ -19,6 +19,10 @@ fn fixture() -> (TempDir, VerbRegistry) {
 fn fixture_with_runtime() -> (TempDir, KhiveRuntime, VerbRegistry) {
     let dir = TempDir::new().expect("tempdir");
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         telemetry: Default::default(),
         web: Default::default(),
         mounts: Vec::new(),
@@ -39,6 +43,7 @@ fn fixture_with_runtime() -> (TempDir, KhiveRuntime, VerbRegistry) {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("file-backed runtime");
     let mut builder = VerbRegistryBuilder::new();

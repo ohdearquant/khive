@@ -2,7 +2,9 @@
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
-/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent). See
+/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent).
+/// The builtins-only outbound-due index belongs to a numbered core migration.
+/// Supported writers maintain its strict stored deadline key. See
 /// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.
@@ -52,13 +54,18 @@ pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     PRIMARY KEY (channel_kind, channel_slug)\
 )";
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 16] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded. Returns the outbound message ID; the recipient receives a different inbound ID whose properties.outbound_ref links to the outbound ID. comm.read takes the inbound ID.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
+            ParamDef {
+                name: "attachments", param_type: "array", required: false,
+                description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "idempotency_key",
                 param_type: "string",
@@ -125,6 +132,23 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
             description: "Full UUID returned as full_id by comm.send or comm.reply, or surfaced \
                           as outbound_id in an ambiguous atomic-write error. A full UUID is \
                           required because it is the exact correlation key.",
+            resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
+        }],
+    },
+    HandlerDef {
+        name: "comm.transport_status",
+        description: "Read sender-local transport status for an outbound UUID: pending, \
+                      recipient_stored, recipient_quarantined, failed or unknown. Holds \
+                      remain pending; absence in the caller's namespace is unknown.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[ParamDef {
+            name: "id",
+            param_type: "uuid",
+            required: true,
+            description: "Full outbound UUID returned as full_id by comm.send or comm.reply, \
+                          or as outbound_id in an ambiguous atomic-write error. Prefixes \
+                          require scoped resolution and are refused.",
             resolution_mode: IdResolutionMode::FullUuidOnlyScopedToPrimary,
         }],
     },
@@ -326,6 +350,11 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 15] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[
+            ParamDef {
+                name: "attachments", param_type: "array", required: false,
+                description: "Up to 8 distinct existing blob content references, at most 64 MiB total. Local recipients and canonical main comm backend only; each message copy owns ordered metadata rows.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
             ParamDef {
                 name: "idempotency_key",
                 param_type: "string",

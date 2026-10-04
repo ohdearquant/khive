@@ -415,11 +415,16 @@ Optional, with defaults:
 - `KHIVE_EMAIL_QUARANTINE_STORE` (default `true`; when a message fails the
   sender-authentication or allowlist gate, store it as an unattributed
   quarantine record instead of dropping it)
+- `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED` (default `256`; the most live
+  quarantine records that may hold a stored copy of the original message.
+  Past that count a quarantined message is still recorded, without its
+  original bytes and with `quarantine_original_retained: "false"`; `0` stores
+  no originals)
 - `KHIVE_EMAIL_INGEST_NAMESPACE` (default `local`; target namespace for
   ingested messages)
-- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `local`; actor assigned to fresh,
-  uncorrelated email messages. Set it to `channel:email` to opt into a separate
-  mailbox.)
+- `KHIVE_EMAIL_DEFAULT_ACTOR` (default `channel:email`; actor assigned to fresh,
+  uncorrelated email messages. Set it to `local` only to retain the previous
+  shared inbox routing.)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
   falls back to the maintainer address when unset)
 

@@ -119,12 +119,22 @@ async fn edge_target_still_resolves_primary_namespace_prefix_and_name() {
     let (runtime, pack, registry) = fixture();
     let token = runtime.authorize(Namespace::local()).unwrap();
     let source = runtime
-        .create_entity(&token, "concept", None, "source", None, None, vec![])
+        .create_entity_with_embedding_report(&token, "concept", None, "source", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let target = runtime
-        .create_entity(&token, "concept", None, "target-name", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &token,
+            "concept",
+            None,
+            "target-name",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     pack.handle_link(
         &token,

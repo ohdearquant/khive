@@ -13,6 +13,10 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
     let previous_write_queue: Option<OsString> = std::env::var_os("KHIVE_WRITE_QUEUE");
     std::env::set_var("KHIVE_WRITE_QUEUE", "0");
     let runtime = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -33,6 +37,7 @@ async fn lock_contention_reports_failed_mark_read_statuses() {
         actor_id: None,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     });
     match previous_write_queue {
         Some(value) => std::env::set_var("KHIVE_WRITE_QUEUE", value),

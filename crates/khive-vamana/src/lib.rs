@@ -1,6 +1,9 @@
 //! Vamana ANN index: batch-built approximate nearest-neighbor search over unit-normalized vectors.
 
 #[cfg(feature = "mmap")]
+#[doc(hidden)]
+pub mod bridge;
+#[cfg(feature = "mmap")]
 mod checkpoint_io;
 pub mod config;
 pub mod distance;
@@ -10,6 +13,11 @@ pub mod external_ids;
 pub mod graph;
 pub mod index;
 
+#[cfg(feature = "mmap")]
+pub use checkpoint_io::{
+    remove_auxiliary_sidecar, remove_auxiliary_sidecars, write_auxiliary_sidecar_atomic,
+    AuxiliarySidecarCleaner, AuxiliarySidecarReader,
+};
 pub use config::VamanaConfig;
 pub use error::{Result, VamanaError};
 #[cfg(feature = "mmap")]

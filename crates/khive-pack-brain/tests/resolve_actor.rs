@@ -12,6 +12,10 @@ use serde_json::json;
 
 fn runtime_with_actor(actor_id: Option<&str>) -> KhiveRuntime {
     KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -32,6 +36,7 @@ fn runtime_with_actor(actor_id: Option<&str>) -> KhiveRuntime {
         visible_namespaces: vec![],
         allowed_outbound_namespaces: vec![],
         actor_id: actor_id.map(str::to_owned),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime")
 }

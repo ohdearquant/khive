@@ -9,6 +9,7 @@ use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
 use khive_storage::error::StorageError;
+use khive_storage::graph::{CommitAnnotationGuard, CommitAnnotationInsertOutcome};
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeEndpointBaseCounts,
     EdgeFilter, EdgeSeekPage, EdgeSortField, EdgeUpsertDisposition, EdgeUpsertRefusal,
@@ -18,9 +19,9 @@ use khive_storage::types::{
     PageRequest, PathNode, SeekCursor, SeekPage, SortDirection, SortOrder, SqlStatement, SqlValue,
     TraversalExecutionBudget, TraversalOptions, TraversalRequest,
 };
-use khive_storage::GraphStore;
 use khive_storage::LinkId;
 use khive_storage::StorageCapability;
+use khive_storage::{Event, GraphStore, StorageResult};
 use khive_types::EdgeRelation;
 
 use crate::error::SqliteError;
@@ -84,6 +85,47 @@ WHERE result.id = CASE WHEN (SELECT count(*) FROM incident) <= 2 THEN (
           WHEN json_type(n.properties, '$.tags') = 'array'
           THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag
           WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY)
+      AND EXISTS (SELECT 1 FROM graph_edges AS e INDEXED BY idx_graph_edges_unique_triple
+          WHERE e.namespace = ?1 AND e.source_id = n.id AND e.target_id = ?2
+            AND e.relation = 'annotates' AND e.deleted_at IS NULL)
+    ORDER BY n.created_at DESC, n.id ASC LIMIT 1
+) END"#;
+
+// The property predicate must run in both branches before ORDER BY/LIMIT;
+// filtering the single returned id in a caller lets a newer tagged decoy
+// conceal an older receipt with provenance.
+const LATEST_ANNOTATING_NOTE_WITH_PROPERTY_SQL: &str = r#"WITH incident AS MATERIALIZED (
+    SELECT source_id, deleted_at
+    FROM graph_edges INDEXED BY idx_graph_edges_ns_tgt_rel
+    WHERE namespace = ?1 AND target_id = ?2 AND relation = 'annotates'
+    LIMIT 3
+)
+SELECT result.id, result.created_at
+FROM notes AS result
+WHERE result.id = CASE WHEN (SELECT count(*) FROM incident) <= 2 THEN (
+    SELECT n.id
+    FROM incident AS e CROSS JOIN notes AS n
+    WHERE n.id = e.source_id AND e.deleted_at IS NULL
+      AND n.deleted_at IS NULL AND n.kind = ?3
+      AND EXISTS (SELECT 1 FROM json_each(CASE
+          WHEN json_type(n.properties, '$.tags') = 'array'
+          THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag
+          WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY)
+      AND EXISTS (SELECT 1 FROM json_each(n.properties) AS property
+          WHERE property.key = ?5 COLLATE BINARY AND property.type = 'text'
+            AND property.value = ?6 COLLATE BINARY)
+    ORDER BY n.created_at DESC, n.id ASC LIMIT 1
+) ELSE (
+    SELECT n.id
+    FROM notes AS n INDEXED BY idx_notes_created
+    WHERE n.deleted_at IS NULL AND n.kind = ?3
+      AND EXISTS (SELECT 1 FROM json_each(CASE
+          WHEN json_type(n.properties, '$.tags') = 'array'
+          THEN json_extract(n.properties, '$.tags') ELSE '[]' END) AS tag
+          WHERE tag.type = 'text' AND tag.value = ?4 COLLATE BINARY)
+      AND EXISTS (SELECT 1 FROM json_each(n.properties) AS property
+          WHERE property.key = ?5 COLLATE BINARY AND property.type = 'text'
+            AND property.value = ?6 COLLATE BINARY)
       AND EXISTS (SELECT 1 FROM graph_edges AS e INDEXED BY idx_graph_edges_unique_triple
           WHERE e.namespace = ?1 AND e.source_id = n.id AND e.target_id = ?2
             AND e.relation = 'annotates' AND e.deleted_at IS NULL)
@@ -835,9 +877,409 @@ pub fn edge_symmetric_absorb_or_update_inplace_statement(
     }
 }
 
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// A live source-document reference observed before pack preparation.
+#[doc(hidden)]
+pub struct GraphDocumentGuard {
+    pub namespace: String,
+    pub id: Uuid,
+    pub expected_blob_ref: String,
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// The complete row, or absence, observed for one canonical natural key.
+#[doc(hidden)]
+pub struct GraphEdgeSnapshotGuard {
+    pub namespace: String,
+    pub source_id: Uuid,
+    pub target_id: Uuid,
+    pub relation: EdgeRelation,
+    pub expected: Option<Edge>,
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Source-row expectations checked before any graph mutation.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct GraphMutationPreconditions {
+    pub document: Option<GraphDocumentGuard>,
+    pub edges: Vec<GraphEdgeSnapshotGuard>,
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Existing graph engines selected for a source-backend composition unit.
+#[doc(hidden)]
+pub enum GraphMutationRequest {
+    Single {
+        request: EdgeUpsertRequest,
+        guard_endpoints: bool,
+    },
+    Batch {
+        requests: Vec<EdgeUpsertRequest>,
+        guard_endpoints: bool,
+    },
+    CommitAnnotation {
+        edge: Edge,
+        guard: CommitAnnotationGuard,
+    },
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Transaction-observed outcomes retain the existing graph classifications.
+#[doc(hidden)]
+pub enum GraphMutationOutcome {
+    Single(GuardedEdgeUpsertOutcome),
+    Batch(GuardedEdgeBatchUpsertOutcome),
+    CommitAnnotation(CommitAnnotationInsertOutcome),
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Ordered upsert results and the separate preimages of retired live edges.
+#[doc(hidden)]
+pub struct GraphMutationEventOutcome {
+    pub mutation: GraphMutationOutcome,
+    pub retired: Vec<Edge>,
+}
+
+const GRAPH_MUTATION_EVENTS_OP: &str = "compose_graph_mutation_events";
+
+fn count_graph_mutation_events(outcome: &GraphMutationEventOutcome) {
+    let written = match &outcome.mutation {
+        GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
+        GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
+        GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
+        _ => 0,
+    };
+    khive_storage::usage::count(
+        khive_storage::usage::UsageUnit::EventRows,
+        (written + outcome.retired.len()) as u64,
+    );
+}
+
+/// Internal seam for khive-runtime; no compatibility promise.
+///
+/// Guarded composition seam for packs.
+#[doc(hidden)]
+pub async fn compose_graph_mutation_events<F>(
+    backend: &crate::StorageBackend,
+    mutation: GraphMutationRequest,
+    preconditions: GraphMutationPreconditions,
+    retirements: Vec<Edge>,
+    make_events: F,
+) -> StorageResult<GraphMutationEventOutcome>
+where
+    F: FnOnce(&GraphMutationEventOutcome) -> StorageResult<Vec<Event>> + Send + 'static,
+{
+    if backend.is_read_only() {
+        return Err(StorageError::Pool {
+            operation: GRAPH_MUTATION_EVENTS_OP.into(),
+            message: "backend is read-only".into(),
+        });
+    }
+    // Retain the normal accessors' store-readiness checks before admission;
+    // no schema work or asynchronous dispatch enters the enlisted engine.
+    backend
+        .graph()
+        .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+    backend
+        .events()
+        .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+    let pool = backend.pool_arc();
+    if let Some(writer_task) = pool.writer_task_for_write(None, GRAPH_MUTATION_EVENTS_OP)? {
+        return writer_task
+            .send_bounded(move |conn| {
+                graph_mutation_events_enlisted(
+                    conn,
+                    mutation,
+                    preconditions,
+                    retirements,
+                    make_events,
+                )
+            })
+            .await
+            .inspect(count_graph_mutation_events)
+            .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)));
+    }
+    pool.record_direct_route(crate::timeout_sink::Site::DirectRouteGraphGeneralWrite);
+    let is_file_backed = backend.is_file_backed();
+    tokio::task::spawn_blocking(move || {
+        if is_file_backed {
+            let conn = pool
+                .open_standalone_writer()
+                .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+            run_graph_mutation_transaction(&pool, &conn, false, move |conn| {
+                graph_mutation_events_enlisted(
+                    conn,
+                    mutation,
+                    preconditions,
+                    retirements,
+                    make_events,
+                )
+            })
+        } else {
+            let guard = pool
+                .try_writer()
+                .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+            run_graph_mutation_transaction(&pool, guard.conn(), true, move |conn| {
+                graph_mutation_events_enlisted(
+                    conn,
+                    mutation,
+                    preconditions,
+                    retirements,
+                    make_events,
+                )
+            })
+        }
+    })
+    .await
+    .map_err(|error| {
+        StorageError::driver(StorageCapability::Graph, GRAPH_MUTATION_EVENTS_OP, error)
+    })?
+    .inspect(count_graph_mutation_events)
+    .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)))
+}
+
+fn run_graph_mutation_transaction<R, F>(
+    pool: &ConnectionPool,
+    conn: &rusqlite::Connection,
+    pooled: bool,
+    operation: F,
+) -> StorageResult<R>
+where
+    F: FnOnce(&rusqlite::Connection) -> StorageResult<R>,
+{
+    if !conn.is_autocommit() {
+        if pooled {
+            pool.retire_pooled_writer(conn);
+        }
+        return Err(StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+        });
+    }
+    if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+        if !conn.is_autocommit() {
+            if pooled {
+                pool.retire_pooled_writer(conn);
+            }
+            return Err(StorageError::WriterTaskTerminated {
+                request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            });
+        }
+        crate::timeout_sink::maybe_emit_busy(
+            &crate::timeout_sink::db_label(pool),
+            crate::timeout_sink::Site::StandaloneGraph,
+            &error,
+        );
+        return Err(map_err(error, GRAPH_MUTATION_EVENTS_OP));
+    }
+    let _tx_handle = khive_storage::tx_registry::register_scoped(
+        Some(GRAPH_MUTATION_EVENTS_OP.to_string()),
+        pool.origin(),
+    );
+    let (result, terminal_state) = crate::writer_task::execute_wrapped_transaction(
+        conn,
+        "compose_graph_mutation_events.commit",
+        operation,
+    );
+    if pooled && terminal_state.is_some() {
+        pool.retire_pooled_writer(conn);
+    }
+    result
+}
+
+fn graph_mutation_conflict(message: &'static str) -> StorageError {
+    StorageError::Conflict {
+        capability: StorageCapability::Graph,
+        operation: GRAPH_MUTATION_EVENTS_OP.into(),
+        message: message.into(),
+    }
+}
+
+fn edge_snapshot_matches(actual: &Edge, expected: &Edge) -> bool {
+    actual.id == expected.id
+        && actual.namespace == expected.namespace
+        && actual.source_id == expected.source_id
+        && actual.target_id == expected.target_id
+        && actual.relation == expected.relation
+        && actual.weight.to_bits() == expected.weight.to_bits()
+        && actual.metadata == expected.metadata
+        && actual.target_backend == expected.target_backend
+        && actual.created_at == expected.created_at
+        && actual.updated_at == expected.updated_at
+        && actual.deleted_at == expected.deleted_at
+}
+
+fn check_graph_mutation_preconditions(
+    conn: &rusqlite::Connection,
+    preconditions: &GraphMutationPreconditions,
+    retirements: &[Edge],
+) -> StorageResult<()> {
+    if let Some(document) = &preconditions.document {
+        let matches: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM entities WHERE id=?1 AND namespace=?2 \
+                 AND deleted_at IS NULL AND json_type(properties, '$.blob_ref')='text' \
+                 AND json_extract(properties, '$.blob_ref')=?3 COLLATE BINARY)",
+                rusqlite::params![
+                    document.id.to_string(),
+                    &document.namespace,
+                    &document.expected_blob_ref,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        if !matches {
+            return Err(graph_mutation_conflict(
+                "source document body reference changed",
+            ));
+        }
+    }
+    for guard in &preconditions.edges {
+        let actual = edge_by_natural_key_parts_including_deleted(
+            conn,
+            &guard.namespace,
+            guard.source_id,
+            guard.target_id,
+            guard.relation,
+        )
+        .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        let matches = match (actual.as_ref(), guard.expected.as_ref()) {
+            (None, None) => true,
+            (Some(actual), Some(expected)) => edge_snapshot_matches(actual, expected),
+            _ => false,
+        };
+        if !matches {
+            return Err(graph_mutation_conflict("edge ownership snapshot changed"));
+        }
+    }
+    for expected in retirements {
+        let actual = edge_by_natural_key_including_deleted(conn, expected)
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        if expected.deleted_at.is_some()
+            || !actual
+                .as_ref()
+                .is_some_and(|actual| edge_snapshot_matches(actual, expected))
+        {
+            return Err(graph_mutation_conflict("edge retirement snapshot changed"));
+        }
+    }
+    Ok(())
+}
+
+/// Connection-enlisted graph/event engine: no transaction control or await.
+fn graph_mutation_events_enlisted<F>(
+    conn: &rusqlite::Connection,
+    mutation: GraphMutationRequest,
+    preconditions: GraphMutationPreconditions,
+    retirements: Vec<Edge>,
+    make_events: F,
+) -> StorageResult<GraphMutationEventOutcome>
+where
+    F: FnOnce(&GraphMutationEventOutcome) -> StorageResult<Vec<Event>>,
+{
+    if !retirements.is_empty() && !matches!(&mutation, GraphMutationRequest::Batch { .. }) {
+        return Err(StorageError::InvalidInput {
+            capability: StorageCapability::Graph,
+            operation: GRAPH_MUTATION_EVENTS_OP.into(),
+            message: "retirements require a batch mutation".into(),
+        });
+    }
+    check_graph_mutation_preconditions(conn, &preconditions, &retirements)?;
+    let mutation = match mutation {
+        GraphMutationRequest::Single {
+            request,
+            guard_endpoints,
+        } => GraphMutationOutcome::Single(
+            observed_edge_upsert(conn, &request, guard_endpoints)
+                .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?,
+        ),
+        GraphMutationRequest::Batch {
+            requests,
+            guard_endpoints,
+        } => {
+            let outcome = observed_edge_batch_upsert(conn, &requests, guard_endpoints)
+                .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+            if outcome.refusal.is_none() && outcome.rows.len() != requests.len() {
+                return Err(graph_mutation_conflict(
+                    "edge result count differs from request count",
+                ));
+            }
+            GraphMutationOutcome::Batch(outcome)
+        }
+        GraphMutationRequest::CommitAnnotation { edge, guard } => {
+            if edge.relation != EdgeRelation::Annotates || edge.deleted_at.is_some() {
+                return Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Graph,
+                    operation: GRAPH_MUTATION_EVENTS_OP.into(),
+                    message: "expected a live annotates edge".into(),
+                });
+            }
+            GraphMutationOutcome::CommitAnnotation(
+                conditional_commit_annotation_insert(conn, edge, &guard)
+                    .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?,
+            )
+        }
+    };
+    let written = match &mutation {
+        GraphMutationOutcome::Single(GuardedEdgeUpsertOutcome::Written(_)) => 1,
+        GraphMutationOutcome::Batch(outcome) if outcome.refusal.is_none() => outcome.rows.len(),
+        GraphMutationOutcome::CommitAnnotation(CommitAnnotationInsertOutcome::Created(_)) => 1,
+        _ => {
+            return Ok(GraphMutationEventOutcome {
+                mutation,
+                retired: Vec::new(),
+            })
+        }
+    };
+    let mut retired = Vec::with_capacity(retirements.len());
+    for edge in retirements {
+        let statement =
+            edge_soft_delete_statement(Uuid::from(edge.id), Utc::now().timestamp_micros());
+        let mut stmt = conn
+            .prepare(&statement.sql)
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        bind_params(&mut stmt, &statement.params)
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?;
+        if stmt
+            .raw_execute()
+            .map_err(|error| map_err(error, GRAPH_MUTATION_EVENTS_OP))?
+            != 1
+        {
+            return Err(graph_mutation_conflict(
+                "edge retirement changed during mutation",
+            ));
+        }
+        retired.push(edge);
+    }
+    let outcome = GraphMutationEventOutcome { mutation, retired };
+    let expected_events = written + outcome.retired.len();
+    if expected_events == 0 {
+        return Ok(outcome);
+    }
+    let events = make_events(&outcome)?;
+    if events.len() != expected_events {
+        return Err(graph_mutation_conflict(
+            "event result count differs from mutation count",
+        ));
+    }
+    for event in &events {
+        super::event::append_event_in_transaction(conn, event).map_err(|error| {
+            StorageError::driver(StorageCapability::Events, GRAPH_MUTATION_EVENTS_OP, error)
+        })?;
+    }
+    Ok(outcome)
+}
+
 /// A GraphStore backed by SQLite tables.
 pub struct SqlGraphStore {
     pool: Arc<ConnectionPool>,
+    index_repair: Option<super::index_repair::IndexRepairContext>,
     is_file_backed: bool,
     /// Default namespace for multi-record queries (ADR-007 PARAM-ONLY: used as a
     /// WHERE filter on `query_edges`/`neighbors`/`traverse`, never as an
@@ -868,10 +1310,34 @@ impl SqlGraphStore {
 
         Self {
             pool,
+            index_repair: None,
             is_file_backed,
             namespace: namespace.into(),
             writer_task,
         }
+    }
+
+    pub(crate) fn with_index_repair(
+        mut self,
+        repair: super::index_repair::IndexRepairContext,
+    ) -> Self {
+        self.index_repair = Some(repair);
+        self
+    }
+
+    async fn with_indexed_reader<F, R>(&self, op: &'static str, read: F) -> Result<R, StorageError>
+    where
+        F: FnMut(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        super::index_repair::run_indexed_read(
+            Arc::clone(&self.pool),
+            self.index_repair.clone(),
+            StorageCapability::Graph,
+            op,
+            read,
+        )
+        .await
     }
 
     fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
@@ -1475,11 +1941,7 @@ fn canonical_edge_endpoints(
     source_id: Uuid,
     target_id: Uuid,
 ) -> (Uuid, Uuid) {
-    if relation.is_symmetric() && target_id < source_id {
-        (target_id, source_id)
-    } else {
-        (source_id, target_id)
-    }
+    relation.canonical_endpoints(source_id, target_id)
 }
 
 /// Standalone existence probe for both endpoints of a would-be edge (#769),
@@ -1515,22 +1977,137 @@ fn edge_by_natural_key_including_deleted(
     conn: &rusqlite::Connection,
     edge: &Edge,
 ) -> Result<Option<Edge>, rusqlite::Error> {
-    let (source_id, target_id) =
-        canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+    edge_by_natural_key_parts_including_deleted(
+        conn,
+        &edge.namespace,
+        edge.source_id,
+        edge.target_id,
+        edge.relation,
+    )
+}
+
+fn edge_by_natural_key_parts_including_deleted(
+    conn: &rusqlite::Connection,
+    namespace: &str,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+) -> Result<Option<Edge>, rusqlite::Error> {
+    let (source_id, target_id) = canonical_edge_endpoints(relation, source_id, target_id);
     conn.query_row(
         "SELECT namespace, id, source_id, target_id, relation, weight, \
                 created_at, updated_at, deleted_at, metadata, target_backend \
          FROM graph_edges \
          WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 AND relation = ?4",
         rusqlite::params![
-            &edge.namespace,
+            namespace,
             source_id.to_string(),
             target_id.to_string(),
-            edge.relation.as_str(),
+            relation.as_str(),
         ],
         read_edge,
     )
     .optional()
+}
+
+/// The predicate and insert are one DML statement inside the caller's writer
+/// transaction. The follow-up probes classify an unsuccessful insert under
+/// that same transaction, so no racing curation can turn a tombstone into a
+/// repairable gap or change the note identity after its check.
+fn conditional_commit_annotation_insert(
+    conn: &rusqlite::Connection,
+    edge: Edge,
+    guard: &CommitAnnotationGuard,
+) -> Result<CommitAnnotationInsertOutcome, rusqlite::Error> {
+    // This connection is inside BEGIN IMMEDIATE on both writer paths. Check
+    // the pack-owned cursor rows here, then bind the result into the core-only
+    // INSERT: no other writer can change them between this probe and the DML.
+    let cursor_matches: bool = conn.query_row(
+        "SELECT (SELECT EXISTS(SELECT 1 FROM git_mirror_cursor \
+                 WHERE project_id=?1 AND kind='commits' \
+                 AND typeof(cursor_value)='text' \
+                 AND CAST(cursor_value AS BLOB)=?2 AND updated_at=?3)) \
+              AND (SELECT EXISTS(SELECT 1 FROM git_mirror_cursor \
+                 WHERE project_id=?1 AND kind='commits_checkpoint' \
+                 AND typeof(cursor_value)='text' \
+                 AND CAST(cursor_value AS BLOB)=?4 AND updated_at=?5))",
+        rusqlite::params![
+            edge.target_id.to_string(),
+            guard.commits.value,
+            guard.commits.updated_at,
+            guard.checkpoint.value,
+            guard.checkpoint.updated_at,
+        ],
+        |row| row.get(0),
+    )?;
+    let metadata = edge
+        .metadata
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let affected = conn.execute(
+        include_str!("../../sql/commit-annotation-insert.sql"),
+        rusqlite::params![
+            edge.namespace,
+            Uuid::from(edge.id).to_string(),
+            edge.source_id.to_string(),
+            edge.target_id.to_string(),
+            edge.weight,
+            edge.created_at.timestamp_micros(),
+            edge.updated_at.timestamp_micros(),
+            metadata,
+            guard.expected_sha,
+            guard.source_identity,
+            cursor_matches,
+        ],
+    )?;
+    if affected == 1 {
+        return Ok(CommitAnnotationInsertOutcome::Created(edge));
+    }
+    let source_live: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1 AND namespace=?2 \
+         AND kind='commit' AND deleted_at IS NULL \
+         AND json_type(properties, '$.sha')='text' \
+         AND json_extract(properties, '$.sha')=?3 COLLATE BINARY \
+         AND (SELECT COUNT(*) FROM notes WHERE namespace=?2 AND kind='commit' \
+              AND json_type(properties, '$.sha')='text' \
+              AND json_extract(properties, '$.sha')=?3 COLLATE BINARY)=1)",
+        rusqlite::params![
+            edge.source_id.to_string(),
+            edge.namespace,
+            guard.expected_sha
+        ],
+        |row| row.get(0),
+    )?;
+    if !source_live {
+        return Ok(CommitAnnotationInsertOutcome::SourceChanged);
+    }
+    let target_live: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM entities WHERE id=?1 AND namespace=?2 \
+         AND kind='project' AND deleted_at IS NULL \
+         AND json_type(properties, '$.repo_slug')='text' \
+         AND json_extract(properties, '$.repo_slug')=?3 COLLATE BINARY)",
+        rusqlite::params![
+            edge.target_id.to_string(),
+            edge.namespace,
+            guard.source_identity
+        ],
+        |row| row.get(0),
+    )?;
+    if !target_live {
+        return Ok(CommitAnnotationInsertOutcome::TargetChanged);
+    }
+    if !cursor_matches {
+        return Ok(CommitAnnotationInsertOutcome::CursorChanged);
+    }
+    match edge_by_natural_key_including_deleted(conn, &edge)? {
+        Some(existing) if existing.deleted_at.is_some() => {
+            Ok(CommitAnnotationInsertOutcome::Tombstoned)
+        }
+        Some(_) => Ok(CommitAnnotationInsertOutcome::ExistingLive),
+        None => Err(rusqlite::Error::QueryReturnedNoRows),
+    }
 }
 
 /// Apply one replacement-style upsert and derive its disposition/preimage on
@@ -1989,10 +2566,38 @@ impl GraphStore for SqlGraphStore {
         let node_id = node_id.to_string();
         let kind = kind.to_owned();
         let tag = tag.to_owned();
-        self.with_reader("latest_annotating_note", move |conn| {
+        self.with_indexed_reader("latest_annotating_note", move |conn| {
             conn.query_row(
                 LATEST_ANNOTATING_NOTE_SQL,
                 rusqlite::params![namespace, node_id, kind, tag],
+                |row| {
+                    let id: String = row.get(0)?;
+                    Ok((parse_uuid(&id)?, row.get(1)?))
+                },
+            )
+            .optional()
+        })
+        .await
+    }
+
+    async fn latest_annotating_note_with_property(
+        &self,
+        node_id: Uuid,
+        kind: &str,
+        tag: &str,
+        property_key: &str,
+        property_value: &str,
+    ) -> Result<Option<(Uuid, i64)>, StorageError> {
+        let namespace = self.namespace.clone();
+        let node_id = node_id.to_string();
+        let kind = kind.to_owned();
+        let tag = tag.to_owned();
+        let property_key = property_key.to_owned();
+        let property_value = property_value.to_owned();
+        self.with_indexed_reader("latest_annotating_note_with_property", move |conn| {
+            conn.query_row(
+                LATEST_ANNOTATING_NOTE_WITH_PROPERTY_SQL,
+                rusqlite::params![namespace, node_id, kind, tag, property_key, property_value],
                 |row| {
                     let id: String = row.get(0)?;
                     Ok((parse_uuid(&id)?, row.get(1)?))
@@ -2040,6 +2645,48 @@ impl GraphStore for SqlGraphStore {
             let mut stmt = conn.prepare(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             Ok(stmt.raw_execute()? > 0)
+        })
+        .await
+    }
+
+    async fn insert_commit_annotation_if_absent(
+        &self,
+        edge: Edge,
+        guard: CommitAnnotationGuard,
+    ) -> Result<CommitAnnotationInsertOutcome, StorageError> {
+        const OP: &str = "insert_commit_annotation_if_absent";
+        if edge.relation != EdgeRelation::Annotates || edge.deleted_at.is_some() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Graph,
+                operation: OP.into(),
+                message: "expected a live annotates edge".into(),
+            });
+        }
+        if let Some(writer_task) = self.current_writer_task(OP)? {
+            return writer_task
+                .send_bounded(move |conn| {
+                    conditional_commit_annotation_insert(conn, edge, &guard)
+                        .map_err(|error| map_err(error, OP))
+                })
+                .await;
+        }
+        let origin = self.pool.origin();
+        self.with_writer(OP, move |conn| {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register_scoped(Some(OP.to_string()), origin);
+            let outcome = match conditional_commit_annotation_insert(conn, edge, &guard) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            };
+            if let Err(error) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+            Ok(outcome)
         })
         .await
     }
@@ -2336,6 +2983,55 @@ impl GraphStore for SqlGraphStore {
             result.extend(edges);
         }
         Ok(result)
+    }
+
+    async fn get_edge_read_outcomes(
+        &self,
+        ids: &[LinkId],
+    ) -> Result<Vec<Result<Option<Edge>, StorageError>>, StorageError> {
+        const CHUNK: usize = 900;
+        let mut outcomes = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(CHUNK) {
+            let requested: Vec<String> =
+                chunk.iter().map(|id| Uuid::from(*id).to_string()).collect();
+            let expected = requested.len();
+            let rows = self
+                .with_reader("get_edge_read_outcomes", move |conn| {
+                    let requested_json = serde_json::to_string(&requested)
+                        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    let mut stmt = conn.prepare(
+                        "SELECT e.namespace, e.id, e.source_id, e.target_id, e.relation, e.weight, \
+                                e.created_at, e.updated_at, e.deleted_at, e.metadata, e.target_backend, \
+                                requested.key \
+                         FROM json_each(?1) AS requested \
+                         LEFT JOIN graph_edges AS e \
+                           ON e.id = requested.value AND e.deleted_at IS NULL \
+                         ORDER BY CAST(requested.key AS INTEGER) ASC",
+                    )?;
+                    let mut rows = stmt.query([requested_json])?;
+                    let mut outcomes = Vec::with_capacity(expected);
+                    while let Some(row) = rows.next()? {
+                        let ordinal: i64 = row.get(11)?;
+                        let ordinal =
+                            usize::try_from(ordinal).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                        if ordinal != outcomes.len() {
+                            return Err(rusqlite::Error::InvalidQuery);
+                        }
+                        let outcome = match row.get_ref(1)? {
+                            rusqlite::types::ValueRef::Null => Ok(None),
+                            _ => read_edge(row).map(Some).map_err(|e| map_err(e, "get_edge")),
+                        };
+                        outcomes.push(outcome);
+                    }
+                    if outcomes.len() != expected {
+                        return Err(rusqlite::Error::InvalidQuery);
+                    }
+                    Ok(outcomes)
+                })
+                .await?;
+            outcomes.extend(rows);
+        }
+        Ok(outcomes)
     }
 
     async fn batch_neighbors(
@@ -3147,62 +3843,141 @@ impl GraphStore for SqlGraphStore {
             return Ok(Vec::new());
         }
 
-        let mut distinct_roots = HashSet::with_capacity(request.roots.len());
-        let roots = request
-            .roots
-            .iter()
-            .copied()
-            .filter(|root| distinct_roots.insert(*root))
-            .collect::<Vec<_>>();
-        let opts = request.options;
-        let include_roots = request.include_roots;
-        let namespace = self.namespace.clone();
-        let origin = self.pool.origin();
         let budget = request.execution_budget;
-        // Shared with the blocking closure so the counts survive an error.
-        // `with_reader` runs the closure on a blocking thread where the
-        // task-local usage context is invisible, so it cannot call
-        // `usage::count` itself; returning the totals in the Ok value would
-        // lose every round trip already issued when a later statement fails.
-        let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let closure_rows = Arc::clone(&counted_rows);
-        let closure_queries = Arc::clone(&counted_queries);
-        let result = self
-            .with_reader("traverse", move |conn| {
-                Ok(run_bounded_traversal(
-                    conn,
-                    roots,
-                    opts,
-                    include_roots,
-                    namespace,
-                    origin,
-                    budget,
-                    closure_rows.as_ref(),
-                    closure_queries.as_ref(),
-                ))
-            })
-            .await
-            .and_then(|inner| inner);
+        let outer_context = khive_storage::capture_request_read_context();
+        let execution_deadline =
+            khive_storage::RequestReadDeadline::after(budget.remaining_duration());
+        khive_storage::scope_request_read_deadline_at(execution_deadline, async {
+            if outer_context.stop_reason().is_some() {
+                return Err(StorageError::Timeout {
+                    operation: "traverse".into(),
+                });
+            }
+            if budget.is_expired() {
+                return Err(traversal_timeout_error(&budget));
+            }
+            let mut distinct_roots = HashSet::with_capacity(request.roots.len());
+            let roots = request
+                .roots
+                .iter()
+                .copied()
+                .filter(|root| distinct_roots.insert(*root))
+                .collect::<Vec<_>>();
+            let opts = request.options;
+            if self
+                .index_repair
+                .as_ref()
+                .is_some_and(super::index_repair::IndexRepairContext::is_writable)
+            {
+                // Prepare and step the actual indexed adjacency statements with
+                // LIMIT 0 before BFS takes its long-lived reader. This checks the
+                // schema cookie without consuming walk rows or query counters.
+                // A schema change during the walk remains its original typed
+                // failure; we never restart BFS or renew its budget.
+                let directions = match opts.direction {
+                    Direction::Out => vec![Direction::Out],
+                    Direction::In => vec![Direction::In],
+                    Direction::Both => vec![Direction::Out, Direction::In],
+                };
+                let relation_count = opts.relations.as_ref().map_or(0, Vec::len);
+                let statements = directions
+                    .into_iter()
+                    .map(|direction| {
+                        traversal_neighbor_sql(direction, relation_count, opts.min_weight.is_some())
+                    })
+                    .collect::<Vec<_>>();
+                // Dropping preflight stops pending repair admission. Already admitted
+                // constructor DDL keeps its completion ownership outside this await.
+                let preflight = self.with_indexed_reader("traverse", move |conn| {
+                    for sql in &statements {
+                        let mut statement = conn.prepare(sql)?;
+                        statement.raw_bind_parameter(3, 0_i64)?;
+                        let _ = statement.raw_query().next()?;
+                    }
+                    Ok(())
+                });
+                let preflight_result = tokio::select! {
+                    biased;
+                    _ = outer_context.clone().wait_for_stop() => Err(StorageError::Timeout {
+                        operation: "traverse".into(),
+                    }),
+                    result = tokio::time::timeout_at(execution_deadline.async_at(), preflight) => {
+                        match result {
+                            Ok(result) => result,
+                            Err(_) => Err(traversal_timeout_error(&budget)),
+                        }
+                    },
+                };
+                preflight_result.map_err(|error| match error {
+                    StorageError::Timeout { .. }
+                        if budget.is_expired() && outer_context.stop_reason().is_none() =>
+                    {
+                        traversal_timeout_error(&budget)
+                    }
+                    error => error,
+                })?;
+                if budget.is_expired() {
+                    return Err(traversal_timeout_error(&budget));
+                }
+            }
+            let include_roots = request.include_roots;
+            let namespace = self.namespace.clone();
+            let origin = self.pool.origin();
+            let closure_budget = budget.clone();
+            // Shared with the blocking closure so the counts survive an error.
+            // `with_reader` runs the closure on a blocking thread where the
+            // task-local usage context is invisible, so it cannot call
+            // `usage::count` itself; returning the totals in the Ok value would
+            // lose every round trip already issued when a later statement fails.
+            let counted_rows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let counted_queries = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let closure_rows = Arc::clone(&counted_rows);
+            let closure_queries = Arc::clone(&counted_queries);
+            let result = self
+                .with_reader("traverse", move |conn| {
+                    Ok(run_bounded_traversal(
+                        conn,
+                        roots,
+                        opts,
+                        include_roots,
+                        namespace,
+                        origin,
+                        closure_budget,
+                        closure_rows.as_ref(),
+                        closure_queries.as_ref(),
+                    ))
+                })
+                .await
+                .and_then(|inner| inner)
+                .map_err(|error| match error {
+                    StorageError::Timeout { .. }
+                        if budget.is_expired() && outer_context.stop_reason().is_none() =>
+                    {
+                        traversal_timeout_error(&budget)
+                    }
+                    error => error,
+                });
 
-        // Accounted on BOTH outcomes. `db_round_trips` counts round trips
-        // *issued* and `graph_hops` counts adjacency rows storage *returned*,
-        // so work already done before a later statement errors is real work and
-        // must appear. Reading the shared counters here rather than off the
-        // Ok value is what makes that possible: the closure runs on a blocking
-        // thread where the task-local usage context is not visible, so it
-        // cannot count for itself, and a value returned only on success
-        // reports nothing at all when the traversal fails partway.
-        khive_storage::usage::count(
-            khive_storage::usage::UsageUnit::DbRoundTrips,
-            counted_queries.load(std::sync::atomic::Ordering::Relaxed),
-        );
-        khive_storage::usage::count(
-            khive_storage::usage::UsageUnit::GraphHops,
-            counted_rows.load(std::sync::atomic::Ordering::Relaxed),
-        );
+            // Accounted on BOTH outcomes. `db_round_trips` counts round trips
+            // *issued* and `graph_hops` counts adjacency rows storage *returned*,
+            // so work already done before a later statement errors is real work and
+            // must appear. Reading the shared counters here rather than off the
+            // Ok value is what makes that possible: the closure runs on a blocking
+            // thread where the task-local usage context is not visible, so it
+            // cannot count for itself, and a value returned only on success
+            // reports nothing at all when the traversal fails partway.
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::DbRoundTrips,
+                counted_queries.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            khive_storage::usage::count(
+                khive_storage::usage::UsageUnit::GraphHops,
+                counted_rows.load(std::sync::atomic::Ordering::Relaxed),
+            );
 
-        result
+            result
+        })
+        .await
     }
 
     async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {
@@ -3236,3 +4011,7 @@ mod annotation_tests;
 #[cfg(test)]
 #[path = "graph_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "graph_index_repair_tests.rs"]
+mod index_repair_tests;

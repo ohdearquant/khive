@@ -13,11 +13,12 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use serde_json::{json, Value};
+use tokio::io::AsyncRead;
 use tokio::process::Command as AsyncCommand;
 use uuid::Uuid;
 
+use khive_runtime::bounded_read::read_to_end_bounded_async;
 use khive_runtime::{
     secret_gate, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry,
 };
@@ -84,15 +85,10 @@ async fn read_command_pipe(
     limit: usize,
     overflow: IngestCommandError,
 ) -> std::result::Result<Vec<u8>, IngestCommandError> {
-    let mut bytes = Vec::new();
-    pipe.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
+    read_to_end_bounded_async(pipe, limit as u64)
         .await
-        .map_err(|_| IngestCommandError::Io)?;
-    if bytes.len() > limit {
-        return Err(overflow);
-    }
-    Ok(bytes)
+        .map_err(|_| IngestCommandError::Io)?
+        .ok_or(overflow)
 }
 
 async fn run_ingest_command(
@@ -1586,8 +1582,9 @@ mod gh_command_tests {
     }
 }
 
-/// Look up an existing `commit` note by its `properties.sha` (natural-key
-/// idempotence — dedupe before create).
+/// Look up an existing `commit` note by its `properties.sha`. New ingests use
+/// a note key to arbitrate concurrent creates, but older notes had no key.
+/// Detect legacy duplicates rather than selecting an arbitrary holder.
 async fn find_commit_by_sha(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1595,8 +1592,8 @@ async fn find_commit_by_sha(
 ) -> Result<Option<Uuid>> {
     let sql = runtime.sql();
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
-    let row = r
-        .query_row(SqlStatement {
+    let rows = r
+        .query_all(SqlStatement {
             sql: sql!("commits_by_sha_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
@@ -1606,7 +1603,43 @@ async fn find_commit_by_sha(
         })
         .await
         .map_err(anyhow::Error::new)?;
-    Ok(row.and_then(|r| row_uuid(&r)))
+    if rows.len() > 1 {
+        bail!("multiple live commit notes hold SHA {sha}; reconcile legacy duplicates before advancing an ingest checkpoint");
+    }
+    rows.first()
+        .map(|row| {
+            row_uuid(row)
+                .ok_or_else(|| anyhow!("stored commit note has an invalid ID for SHA {sha}"))
+        })
+        .transpose()
+}
+
+fn is_note_key_conflict(error: &RuntimeError) -> bool {
+    matches!(error.refusal_source(), RuntimeError::Khive(error)
+        if error.details().and_then(|details| details.get("reason")) == Some("key_conflict"))
+}
+
+async fn missing_commit_annotation_specs(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    commit_id: Uuid,
+    annotates: &BTreeSet<String>,
+) -> Result<Vec<LinkSpec>> {
+    let existing_targets = commit_annotation_targets(runtime, token, commit_id).await?;
+    Ok(annotates
+        .iter()
+        .map(|target| Uuid::parse_str(target).expect("annotation target is a UUID"))
+        .filter(|target| !existing_targets.contains(target))
+        .map(|target_id| LinkSpec {
+            namespace: None,
+            source_id: commit_id,
+            target_id,
+            relation: EdgeRelation::Annotates,
+            weight: 1.0,
+            metadata: None,
+            resurrect: false,
+        })
+        .collect())
 }
 
 /// Include tombstones: a deleted annotation is a deliberate curation choice,
@@ -1673,19 +1706,6 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
     }
 }
 
-/// Escape SQLite `LIKE` wildcards (`%`, `_`, `\`) so a caller-supplied path
-/// matches literally under `LIKE ... ESCAPE '\'`.
-fn escape_like(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        if matches!(c, '\\' | '%' | '_') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Find an existing `document` entity whose `properties.source_uri` or
 /// `name` matches `path` (ADR-086 keying convention); `None` when no match
 /// (v0 never creates documents on the ingester's behalf). See
@@ -1702,7 +1722,7 @@ async fn find_document_for_path(
         .unwrap_or(path);
     let sql = runtime.sql();
     let namespace = token.namespace().as_str().to_string();
-    let like_pattern = format!("%{}", escape_like(path));
+    let like_pattern = format!("%{}", khive_types::escape_like_literal(path));
 
     let mut r = sql.reader().await.map_err(anyhow::Error::new)?;
     let row = r
@@ -2105,7 +2125,7 @@ fn walk_commits(
         }
         let text = |field: &[u8]| String::from_utf8_lossy(field).into_owned();
         let sha = text(fields[0]);
-        if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !crate::object_id::is_40_hex(sha.as_bytes()) {
             bail!("git log returned a malformed commit id");
         }
         metadata.push((
@@ -3039,21 +3059,8 @@ async fn ingest_commits(
             // skips note creation, but still adds this project's missing
             // annotations before advancing its checkpoint. Existing live
             // edges may have curated fields; tombstones stay deleted.
-            let existing_targets = commit_annotation_targets(runtime, token, existing).await?;
-            let links = annotates
-                .iter()
-                .map(|target| Uuid::parse_str(target).expect("annotation target is a UUID"))
-                .filter(|target| !existing_targets.contains(target))
-                .map(|target_id| LinkSpec {
-                    namespace: None,
-                    source_id: existing,
-                    target_id,
-                    relation: EdgeRelation::Annotates,
-                    weight: 1.0,
-                    metadata: None,
-                    resurrect: false,
-                })
-                .collect();
+            let links =
+                missing_commit_annotation_specs(runtime, token, existing, &annotates).await?;
             if let Err(error) = runtime.link_many(token, links).await {
                 record_write_failure(report, "link", "commit", c.sha.clone(), error);
                 stall_cursor(&mut cursor_stalled, report);
@@ -3088,70 +3095,145 @@ async fn ingest_commits(
 
         let mut create_request = json!({
             "kind": "commit",
+            "key": format!("git.commit:{}", c.sha),
             "name": name,
             "content": content,
             "properties": properties,
-            "annotates": annotates.into_iter().collect::<Vec<_>>(),
+            "annotates": annotates.iter().cloned().collect::<Vec<_>>(),
         });
         if let Some(head) = embedding_head {
             create_request["embedding_content"] = json!(head);
         }
 
-        match crate::dispatch_from_token(registry, token, "create", create_request).await {
+        // The keyed note path finishes embedding and annotations before its
+        // single publication transaction. A competing pass may win the key
+        // after our initial SHA lookup; both exact replay and key conflict
+        // then reuse only the committed winner, including this project's
+        // missing annotations, before acknowledging the checkpoint.
+        let (id, created) = match crate::dispatch_from_token(
+            registry,
+            token,
+            "create",
+            create_request,
+        )
+        .await
+        {
             Ok(v) => {
-                report.commits_ingested += 1;
-                if embedding_head.is_some() {
-                    report.commit_embeddings_truncated += 1;
-                }
-                if let Some(id) = v
+                let Some(id) = v
                     .get("id")
-                    .and_then(|v| v.as_str())
+                    .and_then(Value::as_str)
                     .and_then(|s| Uuid::parse_str(s).ok())
-                {
-                    local_sha_to_id.insert(c.sha.clone(), id);
-                    new_records.push(NewRecordForRef {
-                        id,
-                        text: content.clone(),
-                    });
-                    // Parent -> child `precedes` edges (ADR-088 Amendment 1
-                    // ingest enrichment). Fail-open: an unresolved or
-                    // failing parent link is skipped/warned, never aborts
-                    // the pass.
-                    for parent_sha in &c.parents {
-                        let parent_id = match local_sha_to_id.get(parent_sha).copied() {
-                            Some(pid) => Some(pid),
-                            None => find_commit_by_sha(runtime, token, parent_sha).await?,
-                        };
-                        let Some(parent_id) = parent_id else {
-                            continue;
-                        };
-                        if parent_id == id {
-                            continue;
-                        }
-                        match crate::dispatch_from_token(
-                            registry,
-                            token,
-                            "link",
-                            json!({
-                                    "source_id": parent_id.to_string(),
-                                    "target_id": id.to_string(),
-                                    "relation": "precedes",
-                            }),
-                        )
-                        .await
-                        {
-                            Ok(_) => report.parent_edges_created += 1,
-                            Err(e) => report.warnings.push(format!(
-                                "linking parent {parent_sha} -> {} precedes: {e}",
-                                c.sha
-                            )),
-                        }
-                    }
-                }
+                else {
+                    record_write_failure(
+                        report,
+                        "create",
+                        "commit",
+                        c.sha.clone(),
+                        RuntimeError::Internal("create commit returned no valid id".into()),
+                    );
+                    stall_cursor(&mut cursor_stalled, report);
+                    continue;
+                };
+                let Some(created) = v.get("created").and_then(Value::as_bool) else {
+                    record_write_failure(
+                        report,
+                        "create",
+                        "commit",
+                        c.sha.clone(),
+                        RuntimeError::Internal(
+                            "keyed create commit returned no created flag".into(),
+                        ),
+                    );
+                    stall_cursor(&mut cursor_stalled, report);
+                    continue;
+                };
+                (id, created)
             }
-            Err(e) => {
-                record_write_failure(report, "create", "commit", c.sha.clone(), e);
+            Err(error) if is_note_key_conflict(&error) => {
+                let Some(id) = find_commit_by_sha(runtime, token, &c.sha).await? else {
+                    let key = format!("git.commit:{}", c.sha);
+                    let holder = runtime
+                        .get_note_by_key(token, &key, Some("commit"), false)
+                        .await;
+                    let failure = match holder {
+                            Ok(note) => {
+                                let holder_sha = note
+                                    .properties
+                                    .as_ref()
+                                    .and_then(|properties| properties.get("sha"))
+                                    .and_then(Value::as_str)
+                                    .filter(|sha| crate::object_id::is_40_hex(sha.as_bytes()))
+                                    .unwrap_or("<missing or malformed>");
+                                RuntimeError::Internal(format!(
+                                    "git commit key {key:?} is held by note {} kind {} properties.sha {holder_sha:?}; expected SHA {}",
+                                    note.id, note.kind, c.sha
+                                ))
+                            }
+                            Err(lookup_error) => RuntimeError::Internal(format!(
+                                "git commit key {key:?} conflicted but holder lookup failed: {lookup_error}; create error: {error}"
+                            )),
+                        };
+                    record_write_failure(report, "create", "commit", c.sha.clone(), failure);
+                    stall_cursor(&mut cursor_stalled, report);
+                    continue;
+                };
+                (id, false)
+            }
+            Err(error) => {
+                record_write_failure(report, "create", "commit", c.sha.clone(), error);
                 stall_cursor(&mut cursor_stalled, report);
+                continue;
+            }
+        };
+        if !created {
+            let links = missing_commit_annotation_specs(runtime, token, id, &annotates).await?;
+            if let Err(error) = runtime.link_many(token, links).await {
+                record_write_failure(report, "link", "commit", c.sha.clone(), error);
+                stall_cursor(&mut cursor_stalled, report);
+                continue;
+            }
+            local_sha_to_id.insert(c.sha.clone(), id);
+            report.commits_skipped_existing += 1;
+        } else {
+            report.commits_ingested += 1;
+            if embedding_head.is_some() {
+                report.commit_embeddings_truncated += 1;
+            }
+            local_sha_to_id.insert(c.sha.clone(), id);
+            new_records.push(NewRecordForRef {
+                id,
+                text: content.clone(),
+            });
+            // Parent -> child `precedes` edges are best-effort enrichment.
+            for parent_sha in &c.parents {
+                let parent_id = match local_sha_to_id.get(parent_sha).copied() {
+                    Some(pid) => Some(pid),
+                    None => find_commit_by_sha(runtime, token, parent_sha).await?,
+                };
+                let Some(parent_id) = parent_id else {
+                    continue;
+                };
+                if parent_id == id {
+                    continue;
+                }
+                match crate::dispatch_from_token(
+                    registry,
+                    token,
+                    "link",
+                    json!({
+                        "source_id": parent_id.to_string(),
+                        "target_id": id.to_string(),
+                        "relation": "precedes",
+                    }),
+                )
+                .await
+                {
+                    Ok(_) => report.parent_edges_created += 1,
+                    Err(e) => report.warnings.push(format!(
+                        "linking parent {parent_sha} -> {} precedes: {e}",
+                        c.sha
+                    )),
+                }
             }
         }
         if !cursor_stalled {
@@ -4526,7 +4608,7 @@ mod compact_prefix_resolver_tests {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
         let project = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "project",
                 None,
@@ -4536,6 +4618,7 @@ mod compact_prefix_resolver_tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let compact = project.id.simple().to_string();
         let wildcard_input = format!("{}%", &compact[..8]);
@@ -4552,7 +4635,7 @@ mod compact_prefix_resolver_tests {
         let rt = KhiveRuntime::memory().unwrap();
         let token = rt.authorize(Namespace::local()).unwrap();
         let project = rt
-            .create_entity(
+            .create_entity_with_embedding_report(
                 &token,
                 "project",
                 None,
@@ -4562,6 +4645,7 @@ mod compact_prefix_resolver_tests {
                 vec![],
             )
             .await
+            .map(|(row, _report)| row)
             .unwrap();
         let compact = project.id.simple().to_string();
 
@@ -4578,7 +4662,7 @@ mod find_document_for_path_tests {
     use khive_runtime::Namespace;
 
     async fn create_document(rt: &KhiveRuntime, token: &NamespaceToken, source_uri: &str) -> Uuid {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             token,
             "document",
             None,
@@ -4588,6 +4672,7 @@ mod find_document_for_path_tests {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .unwrap()
         .id
     }
@@ -4680,7 +4765,7 @@ mod module_index_loader_tests {
         name: &str,
         path: &str,
     ) -> Uuid {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             token,
             "concept",
             Some("module"),
@@ -4693,6 +4778,7 @@ mod module_index_loader_tests {
             vec![],
         )
         .await
+        .map(|(row, _report)| row)
         .unwrap()
         .id
     }
@@ -4821,3 +4907,7 @@ mod module_index_loader_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ingest/property_index_tests.rs"]
+mod property_index_tests;

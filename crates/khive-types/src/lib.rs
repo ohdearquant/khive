@@ -23,12 +23,15 @@ pub mod event;
 pub mod hash;
 pub mod header;
 pub mod id;
+#[cfg(feature = "serde")]
+pub mod json_type;
 pub mod khive_error;
 pub mod namespace;
 pub mod note;
 pub mod operation;
 pub mod pack;
 pub mod refusal;
+pub mod sql_like;
 pub mod substrate;
 pub mod timestamp;
 pub mod vector;
@@ -45,7 +48,7 @@ pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,
     ProposalAppliedPayload, ProposalDecision, ProposalReviewedPayload, ProposalWithdrawnPayload,
-    RerankExecutedPayload,
+    RerankExecutedPayload, ToolCheckDecidedPayload,
 };
 #[cfg(feature = "serde")]
 pub use event::{
@@ -54,6 +57,8 @@ pub use event::{
 pub use hash::Hash32;
 pub use header::Header;
 pub use id::{Id128, ParseIdError};
+#[cfg(feature = "serde")]
+pub use json_type::json_type_name;
 pub use khive_error::{Details, ErrorCode, ErrorDomain, ErrorKind, KhiveError, RetryHint};
 pub use namespace::Namespace;
 pub use note::{Note, NoteStatus};
@@ -63,11 +68,13 @@ pub use note::{Note, NoteStatus};
 #[allow(deprecated)]
 pub use pack::VerbDef;
 pub use pack::{
-    EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteKindSpec, NoteLifecycleSpec,
-    Pack, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
-    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
+    EdgeEndpointRule, EndpointKind, HandlerDef, IdResolutionMode, NoteEmbeddingPolicy,
+    NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec, Pack, PackColumnAddition,
+    PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    RESERVED_ENVELOPE_ARGS,
 };
 pub use refusal::RefusalReason;
+pub use sql_like::escape_like_literal;
 pub use substrate::{SubstrateKind, SUBSTRATE_COUNT};
 pub use timestamp::Timestamp;
 pub use vector::DistanceMetric;

@@ -427,10 +427,10 @@ phase_macos_pr_tests() {
     # OS, not from which crates sound platform-shaped. `cfg(unix)` is true on
     # Linux as well, so it selects nothing here; the discriminator is a
     # `target_os` arm, and every one of them in the workspace lives in
-    # khive-db (walpin, blob store), khive-runtime (daemon, engine config,
-    # resource), khive-pack-exec (sandbox and rlimits), khive-pack-moodboard
-    # (resolving an open file descriptor back to a path) or khive-pack-git
-    # (local remote handling).
+    # khive-fs (the thread errno accessor), khive-db (walpin, blob store),
+    # khive-runtime (daemon, engine config, resource), khive-pack-exec (sandbox
+    # and rlimits), khive-pack-moodboard (resolving an open file descriptor back
+    # to a path) or khive-pack-git (local remote handling).
     #
     # Everything dropped from this list still runs, on the Linux shards, which
     # partition `cargo nextest run --workspace`. What is given up is a second
@@ -457,7 +457,7 @@ phase_macos_pr_tests() {
     # compile everywhere, the result guards a symlink escape out of the model
     # directory, and only running the test decides whether the macOS one is
     # right.
-    cargo test -p khive-db -p khive-runtime -p khive-pack-exec -p khive-pack-moodboard
+    cargo test -p khive-fs -p khive-db -p khive-runtime -p khive-pack-exec -p khive-pack-moodboard
     # khive-pack-git's platform arms are in its unit tests; its integration
     # targets are git plumbing that behaves the same on both systems. khive-mcp
     # is `--lib` for the run-time reason given above.

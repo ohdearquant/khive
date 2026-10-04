@@ -3,9 +3,10 @@ use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::ops::{Deref, DerefMut};
@@ -16,11 +17,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+use crate::database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
 use crate::error::SqliteError;
+#[cfg(windows)]
+use crate::file_identity::sqlite_opened_file_identity;
+#[cfg(any(unix, windows))]
+use crate::file_identity::{database_file_identity, DatabaseFileIdentity};
 use crate::writer_task::WriterTaskHandle;
 use khive_storage::error::StorageError;
 use khive_storage::tx_registry::{DbIdentity, TxOrigin};
 use khive_storage::StorageCapability;
+
+mod claimed_file_identity;
+
+#[cfg(unix)]
+mod claimed_file_observer;
+
+#[cfg(unix)]
+pub use claimed_file_observer::initialize as initialize_claimed_file_observer;
+
+#[cfg(all(test, unix))]
+#[path = "pool/claimed_file_identity_tests.rs"]
+mod claimed_file_identity_tests;
 
 const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
@@ -30,10 +48,44 @@ const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 const DB_FREE_SPACE_FLOOR_ENV: &str = "KHIVE_DB_FREE_SPACE_FLOOR_BYTES";
 const DEFAULT_DB_FREE_SPACE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+const DATABASE_ID_TABLE: &str = "_khive_database_identity";
 static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentityOpenStage {
+    AfterMainOpenBeforeFirstStat,
+    AfterInitialIdentityWrite,
+    BeforeStandaloneOpen,
+    AfterStandaloneOpen,
+}
+
+#[cfg(test)]
+type IdentityOpenHook = Box<dyn Fn(&Path, IdentityOpenStage, Option<&Connection>)>;
+
+#[cfg(test)]
+thread_local! {
+    static IDENTITY_OPEN_HOOK: std::cell::RefCell<Option<IdentityOpenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_identity_open_hook(path: &Path, stage: IdentityOpenStage, conn: Option<&Connection>) {
+    IDENTITY_OPEN_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(path, stage, conn);
+        }
+    });
+}
+
+#[cfg(test)]
 type SpaceProbe = dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync;
+
+#[cfg(test)]
+thread_local! {
+    static STARTUP_SPACE_PROBE: std::cell::RefCell<Option<(u64, Arc<SpaceProbe>)>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 /// The SQLite write reserve is sampled at each operation admission. SQLite
 /// does not expose the size of an arbitrary upcoming transaction, so the
@@ -48,11 +100,19 @@ pub(crate) struct WriteAdmission {
 
 impl WriteAdmission {
     fn new(volume: Option<PathBuf>, floor_bytes: u64) -> Self {
+        #[cfg(test)]
+        let (floor_bytes, space_probe) = STARTUP_SPACE_PROBE.with(|probe| {
+            probe
+                .borrow()
+                .as_ref()
+                .map(|(floor, probe)| (*floor, Some(Arc::clone(probe))))
+                .unwrap_or((floor_bytes, None))
+        });
         Self {
             volume,
             floor_bytes,
             #[cfg(test)]
-            space_probe: Mutex::new(None),
+            space_probe: Mutex::new(space_probe),
         }
     }
 
@@ -398,11 +458,77 @@ fn deny_retired_writer(_context: AuthContext<'_>) -> Authorization {
 
 pub(crate) const TEST_HARNESS_ENV: &str = "KHIVE_TEST_HARNESS";
 
+/// Where the effective WAL ceiling byte value was configured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WalCeilingSource {
+    BackendField,
+    Environment,
+    #[default]
+    Default,
+}
+
+/// Resolved WAL-extent policy for one SQLite backend. A zero-byte policy is
+/// explicitly disabled; it remains visible in diagnostics and config identity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalCeilingPolicy {
+    pub bytes: u64,
+    pub source: WalCeilingSource,
+}
+
+impl WalCeilingPolicy {
+    /// Validate checks that do not need SQLite's page-size observation.
+    /// Read-only backends retain configured metadata but enforce no writer
+    /// policy. Invalid offset arithmetic is rejected in either mode.
+    pub fn validate_static(
+        self,
+        file_backed: bool,
+        wal_mode: bool,
+        read_only: bool,
+    ) -> Result<(), SqliteError> {
+        if self.bytes == 0 {
+            return Ok(());
+        }
+        if i64::try_from(self.bytes).is_err() {
+            return Err(SqliteError::WalCeilingOffsetOverflow { bytes: self.bytes });
+        }
+        if read_only {
+            return Ok(());
+        }
+        if !file_backed {
+            return Err(SqliteError::WalCeilingUnsupported {
+                bytes: self.bytes,
+                backend_kind: "in-memory backend",
+            });
+        }
+        if !wal_mode {
+            return Err(SqliteError::WalCeilingUnsupported {
+                bytes: self.bytes,
+                backend_kind: "non-WAL backend",
+            });
+        }
+        Ok(())
+    }
+
+    /// Bytes of writer policy that could be enforced on this backend.
+    pub fn effective_bytes(self, read_only: bool) -> u64 {
+        if read_only {
+            0
+        } else {
+            self.bytes
+        }
+    }
+}
+
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
     /// Database path. None = in-memory (pool degrades to single connection).
     pub path: Option<PathBuf>,
+    /// File identity pinned by the caller before this pool opens SQLite.
+    /// A mismatch is refused before identity initialization or WAL setup.
+    #[cfg(any(unix, windows))]
+    pub expected_file_identity: Option<DatabaseFileIdentity>,
     /// Number of reader connections (default: min(num_cpus, 8)).
     pub max_readers: usize,
     /// WAL mode (must be true for pooling to work; default: true).
@@ -429,6 +555,9 @@ pub struct PoolConfig {
     /// every connection that can execute SQL. Reader connections are already
     /// opened read-only regardless of this flag.
     pub read_only: bool,
+    /// ADR-194 WAL active-extent ceiling and its resolved configuration source.
+    /// Zero explicitly disables this independent policy.
+    pub wal_ceiling: WalCeilingPolicy,
     /// Route migrated store write paths through the single-writer
     /// `WriterTask` channel (ADR-067 Component A) instead of the legacy
     /// per-call pool-mutex/standalone-connection path. Enabled by default
@@ -507,6 +636,8 @@ impl Default for PoolConfig {
     fn default() -> Self {
         Self {
             path: None,
+            #[cfg(any(unix, windows))]
+            expected_file_identity: None,
             max_readers: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
@@ -529,6 +660,7 @@ impl Default for PoolConfig {
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
             read_only: false,
+            wal_ceiling: WalCeilingPolicy::default(),
             // `var_os`, not `var`: the documented contract is "any SET value
             // other than 1/true means Some(false)" — a set-but-non-Unicode
             // value must count as set (var() would return Err and silently
@@ -677,6 +809,19 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
     )))
 }
 
+/// Pool-scoped counters for ADR-166's search mechanism guards.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SearchMechanismSnapshot {
+    /// Coordinator calls actually issued to each registered backend, keyed by
+    /// the request's canonical kind. A backend skipped by served-kind routing
+    /// has no entry for that kind.
+    pub dispatches_by_backend_and_kind: BTreeMap<String, BTreeMap<String, u64>>,
+    /// Candidate note rows fetched after the text/vector fusion and fresh-tail
+    /// merge, including rows later filtered as deleted. Result metadata fetched
+    /// later by the KG handler is excluded.
+    pub note_candidate_hydration_rows: u64,
+}
+
 /// A read-write connection pool for SQLite.
 ///
 /// Architecture:
@@ -692,6 +837,8 @@ fn validate_write_admission_deadline(deadline_ms: u64) -> Result<(), SqliteError
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    #[cfg(any(test, feature = "test-support"))]
+    statement_observer: Arc<crate::statement_observer::StatementObserverHub>,
     main_pool_generation: OnceLock<u64>,
     /// Three-state gate for whether the ADR-091 scheduled task has claimed
     /// routine WAL reclamation for this pool. Until claimed, every
@@ -720,6 +867,10 @@ pub struct ConnectionPool {
     /// store and raw-SQL caller inherits it without per-verb bookkeeping
     /// (ADR-165 Slice 2 / ADR-166 G2).
     reader_acquisition_counters: ReaderAcquisitionCounters,
+    /// ADR-166 G4/G5 process-lifetime mechanism counters for this physical
+    /// backend. Backend IDs remain separate even when aliases share a pool.
+    search_dispatches: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
+    note_candidate_hydration_rows: AtomicU64,
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
@@ -763,6 +914,13 @@ pub struct ConnectionPool {
     /// derivation) use this, the same canonical value the identity was
     /// minted from, via [`Self::canonical_path`].
     identity_path: Option<PathBuf>,
+    /// The physical file SQLite opened, checked against the canonical path.
+    /// Later reader and standalone opens must retain this identity.
+    #[cfg(any(unix, windows))]
+    opened_file_identity: Option<DatabaseFileIdentity>,
+    /// A persistent nonce read through SQLite's opened main database, rather
+    /// than through the pathname that may have been replaced during open.
+    opened_database_id: Option<uuid::Uuid>,
     /// Registered only after every connection opens successfully. RAII removes
     /// the path when the last pool for it drops, including failed construction.
     identity_registration: Option<PoolIdentityRegistration>,
@@ -943,20 +1101,23 @@ impl<'pool> ReaderGuard<'pool> {
                 StorageError::driver(StorageCapability::Sql, "reader_guard.query_row", error)
             })
         })
-        .map_err(|error| match error {
-            StorageError::Driver {
-                capability,
-                operation,
-                source,
-            } => match source.downcast::<rusqlite::Error>() {
-                Ok(error) => SqliteError::Rusqlite(*error),
-                Err(source) => SqliteError::RequestReadStopped(StorageError::Driver {
+        .map_err(|error| {
+            self.pool.record_reader_query_error(&error);
+            match error {
+                StorageError::Driver {
                     capability,
                     operation,
                     source,
-                }),
-            },
-            other => SqliteError::RequestReadStopped(other),
+                } => match source.downcast::<rusqlite::Error>() {
+                    Ok(error) => SqliteError::Rusqlite(*error),
+                    Err(source) => SqliteError::RequestReadStopped(StorageError::Driver {
+                        capability,
+                        operation,
+                        source,
+                    }),
+                },
+                other => SqliteError::RequestReadStopped(other),
+            }
         })
     }
 
@@ -1225,6 +1386,14 @@ pub struct ReaderAcquisitionSnapshot {
     /// query began. Covers pooled checkout and the closed raw-SQL exception;
     /// cooperative request cancellation is intentionally excluded.
     pub checkout_timeouts: u64,
+    /// Queries on a checked-out pooled reader that SQLite refused with
+    /// `SQLITE_BUSY` after the connection's busy handler gave up (typed-store
+    /// reads, pooled raw-SQL reads, and [`ReaderGuard::query_row`]). Counted
+    /// after checkout succeeded, so it never overlaps `checkout_timeouts`;
+    /// `SQLITE_LOCKED` and cooperative cancellation are excluded. Writer
+    /// refusals are not counted here; the writer task's are in
+    /// [`WriterAcquisitionSnapshot::writer_task_begin_busy`].
+    pub busy_timeouts: u64,
     /// Pooled checkouts live at the instant this snapshot was taken.
     pub active_pooled_checkouts: u64,
     /// High-water mark of concurrent pooled checkouts.
@@ -1262,6 +1431,7 @@ struct ReaderAcquisitionCounters {
     standalone_opens: AtomicU64,
     infrastructure_standalone_opens: AtomicU64,
     checkout_timeouts: AtomicU64,
+    busy_timeouts: AtomicU64,
     active_pooled_checkouts: AtomicU64,
     peak_active_pooled_checkouts: AtomicU64,
     completed_pooled_checkouts: AtomicU64,
@@ -1282,6 +1452,10 @@ impl ReaderAcquisitionCounters {
 
     fn record_checkout_timeout(&self) {
         self.checkout_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_busy_timeout(&self) {
+        self.busy_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_reader_replacement_open_failure(&self) {
@@ -1332,6 +1506,7 @@ impl ReaderAcquisitionCounters {
                 .infrastructure_standalone_opens
                 .load(Ordering::Relaxed),
             checkout_timeouts: self.checkout_timeouts.load(Ordering::Relaxed),
+            busy_timeouts: self.busy_timeouts.load(Ordering::Relaxed),
             active_pooled_checkouts: self.active_pooled_checkouts.load(Ordering::Relaxed),
             peak_active_pooled_checkouts: self.peak_active_pooled_checkouts.load(Ordering::Relaxed),
             completed_pooled_checkouts: self.completed_pooled_checkouts.load(Ordering::Relaxed),
@@ -1352,6 +1527,59 @@ pub struct WriterGuard<'pool> {
     /// guard was checked out from, carried so `transaction` can register its
     /// span with the correct origin without holding a `&ConnectionPool`.
     origin: TxOrigin,
+}
+
+/// A zero-wait checkout that can run only the fixed checkpoint recovery
+/// pragmas. The connection remains private: exposing it would let a caller
+/// execute logical writes without disk-reserve admission (ADR-154 §5).
+///
+/// Ordinary SQL is deliberately unavailable through this capability:
+/// ```compile_fail
+/// use khive_db::{ConnectionPool, PoolConfig};
+/// let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+/// pool.try_checkpoint_nowait().unwrap().execute_batch("CREATE TABLE bypass (id INTEGER)");
+/// ```
+pub struct CheckpointGuard<'pool> {
+    guard: parking_lot::MutexGuard<'pool, Connection>,
+}
+
+/// SQLite's three-column result from a fixed WAL checkpoint pragma.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointResult {
+    /// Whether SQLite reported a busy checkpoint.
+    pub busy: i64,
+    /// WAL frames observed by SQLite (`-1` when there is no WAL).
+    pub log_frames: i64,
+    /// WAL frames copied back into the database.
+    pub checkpointed_frames: i64,
+}
+
+impl CheckpointGuard<'_> {
+    /// Run a PASSIVE checkpoint without disk-reserve admission.
+    pub fn passive(&self) -> Result<CheckpointResult, SqliteError> {
+        self.guard
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok(CheckpointResult {
+                    busy: row.get(0)?,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Run a TRUNCATE checkpoint without disk-reserve admission.
+    pub fn truncate(&self) -> Result<CheckpointResult, SqliteError> {
+        self.guard
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok(CheckpointResult {
+                    busy: row.get(0)?,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+            .map_err(Into::into)
+    }
 }
 
 /// Process-local monotonic counters for every instrumented writer acquisition
@@ -1555,6 +1783,11 @@ impl ConnectionPool {
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
         validate_write_admission_deadline(config.write_admission_deadline_ms)?;
+        config.wal_ceiling.validate_static(
+            config.path.is_some(),
+            config.wal_mode,
+            config.read_only,
+        )?;
 
         // Resolve "no preference" (`None`) now that `path` is known: on for
         // file-backed pools, off for in-memory ones. An explicit `Some(_)`
@@ -1595,20 +1828,113 @@ impl ConnectionPool {
             Arc::new(WriteAdmission::new(None, 0))
         };
         let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
-        let writer = open_writer_connection(&config, read_only_open_target.as_deref())?;
+        #[cfg(any(unix, windows))]
+        let identity_before_open = identity_path
+            .as_deref()
+            .map(database_file_identity_if_exists)
+            .transpose()?
+            .flatten();
+        #[cfg(any(unix, windows))]
+        claimed_file_identity::verify_before_open(&config, identity_before_open)?;
+        let mut writer = open_writer_connection(
+            &config,
+            read_only_open_target.as_deref(),
+            identity_path.as_deref(),
+        )?;
+        validate_wal_ceiling_at_open(&writer, &config)?;
+        // The identity bootstrap can take a write lock before the remaining
+        // connection pragmas are configured. Honor the caller's wait bound.
+        writer.busy_timeout(config.busy_timeout)?;
+        // A read of main.sqlite_master forces SQLite's main file open without
+        // changing either database. Reject an already-swapped target before
+        // installing a nonce into a legacy or initially empty database.
+        let initial_database_id = if identity_path.is_some() {
+            read_database_id(&writer)?
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(path) = identity_path.as_deref() {
+            run_identity_open_hook(
+                path,
+                IdentityOpenStage::AfterMainOpenBeforeFirstStat,
+                Some(&writer),
+            );
+        }
+        #[cfg(any(unix, windows))]
+        let identity_before_write = identity_path
+            .as_deref()
+            .map(database_file_identity)
+            .transpose()?;
+        #[cfg(any(unix, windows))]
+        if identity_before_open.is_some() && identity_before_open != identity_before_write {
+            return Err(SqliteError::InvalidData(
+                "database file identity changed while opening the pool".to_string(),
+            ));
+        }
+        #[cfg(any(unix, windows))]
+        if let Some(path) = identity_path.as_deref() {
+            let opened = opened_sqlite_file_identity(&writer, path)?;
+            if identity_before_write != Some(opened) {
+                return Err(SqliteError::InvalidData(
+                    "database file identity changed while opening the pool".to_string(),
+                ));
+            }
+        }
+        let opened_database_id =
+            if identity_path.is_some() && !config.read_only && initial_database_id.is_none() {
+                match write_admission.check() {
+                    Ok(()) => Some(initialize_database_id(&mut writer)?),
+                    // Recovery must be able to open this pool and its checkpoint
+                    // connection below the reserve. Physical file pinning still
+                    // applies; a later pool open can install the nonce.
+                    Err(SqliteError::CapacityFloor { .. }) => None,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                initial_database_id
+            };
+        #[cfg(test)]
+        if let Some(path) = identity_path.as_deref() {
+            run_identity_open_hook(
+                path,
+                IdentityOpenStage::AfterInitialIdentityWrite,
+                Some(&writer),
+            );
+        }
+        #[cfg(any(unix, windows))]
+        let opened_file_identity = identity_path
+            .as_deref()
+            .map(|path| opened_sqlite_file_identity(&writer, path))
+            .transpose()?;
+        #[cfg(any(unix, windows))]
+        if identity_before_write != opened_file_identity {
+            return Err(SqliteError::InvalidData(
+                "database file identity changed while opening the pool".to_string(),
+            ));
+        }
         let wal_enabled = configure_writer_connection(&writer, &config)?;
         let max_readers = effective_reader_count(&config, wal_enabled);
 
         let readers = ArrayQueue::new(max_readers.max(1));
 
+        #[cfg(any(test, feature = "test-support"))]
+        let statement_observer = crate::statement_observer::StatementObserverHub::new()?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&writer, &statement_observer)?;
+
         let mut pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            #[cfg(any(test, feature = "test-support"))]
+            statement_observer,
             main_pool_generation: OnceLock::new(),
             checkpoint_ownership: CheckpointOwnershipGate::new(),
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             write_admission,
             reader_acquisition_counters: ReaderAcquisitionCounters::default(),
+            search_dispatches: Mutex::new(BTreeMap::new()),
+            note_candidate_hydration_rows: AtomicU64::new(0),
             readers,
             max_readers,
             config,
@@ -1620,6 +1946,9 @@ impl ConnectionPool {
             writer_task_join_stored: AtomicBool::new(false),
             origin,
             identity_path,
+            #[cfg(any(unix, windows))]
+            opened_file_identity,
+            opened_database_id,
             identity_registration: None,
             #[cfg(test)]
             writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
@@ -1915,20 +2244,24 @@ impl ConnectionPool {
         }
     }
 
-    /// Zero-wait writer checkout for background tasks.
+    /// Zero-wait checkpoint checkout for recovery maintenance.
     ///
     /// Uses `try_lock()` (no timeout, no spin) — returns `Err` immediately when
-    /// any other caller holds the writer Mutex. Background tasks (e.g. the WAL
-    /// checkpoint task) MUST use this instead of `try_writer` so that a busy
-    /// writer causes the background task to skip its current tick rather than
-    /// stalling for up to `checkout_timeout` (default 5s) while write traffic
-    /// is in progress.
+    /// any other caller holds the writer Mutex. The scheduled checkpoint task
+    /// uses its own dedicated connection (ADR-091 Amendment 5); this optional
+    /// pooled capability remains available for zero-wait recovery callers.
     ///
-    /// This public checkout deliberately bypasses the disk-space admission
-    /// floor so checkpoint and recovery can run when the volume is low. It
-    /// returns a general writer guard; callers must reserve it for maintenance
-    /// and use `try_writer` for ordinary writes.
-    pub fn try_writer_nowait(&self) -> Result<WriterGuard<'_>, SqliteError> {
+    /// It bypasses the disk-reserve floor because checkpoints can recover WAL
+    /// space at or below that floor (ADR-154 §5). The returned guard exposes
+    /// only fixed PASSIVE and TRUNCATE checkpoint operations.
+    ///
+    /// The former unrestricted checkout must not return:
+    /// ```compile_fail
+    /// use khive_db::{ConnectionPool, PoolConfig};
+    /// let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
+    /// pool.try_writer_nowait().unwrap().execute_batch("CREATE TABLE bypass (id INTEGER)");
+    /// ```
+    pub fn try_checkpoint_nowait(&self) -> Result<CheckpointGuard<'_>, SqliteError> {
         self.ensure_pooled_writer_active()?;
         let guard = self.writer.try_lock().ok_or_else(|| {
             SqliteError::InvalidData(
@@ -1936,10 +2269,7 @@ impl ConnectionPool {
             )
         })?;
         self.ensure_pooled_writer_active()?;
-        Ok(WriterGuard {
-            guard,
-            origin: self.origin(),
-        })
+        Ok(CheckpointGuard { guard })
     }
 
     pub(crate) fn retire_pooled_writer(&self, conn: &Connection) {
@@ -1967,6 +2297,40 @@ impl ConnectionPool {
         self.writer_acquisition_counters.snapshot()
     }
 
+    /// Count a coordinator call only after served-kind filtering selects this
+    /// backend. The canonical requested kind is the granular kind when one was
+    /// supplied, or the entity/note substrate otherwise.
+    pub fn record_search_dispatch(&self, backend_id: &str, requested_kind: &str) {
+        let mut dispatches = self.search_dispatches.lock();
+        let count = dispatches
+            .entry(backend_id.to_owned())
+            .or_default()
+            .entry(requested_kind.to_owned())
+            .or_default();
+        *count = count.saturating_add(1);
+    }
+
+    /// Count one actual candidate note row returned at the post-fusion
+    /// hydration seam, including rows later filtered as deleted. Absent rows
+    /// and later result metadata are excluded.
+    pub fn record_note_candidate_hydration_row(&self) {
+        let _ = self.note_candidate_hydration_rows.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(1)),
+        );
+    }
+
+    /// Snapshot ADR-166 G4/G5 counters. Values reset only with this pool.
+    pub fn search_mechanism_snapshot(&self) -> SearchMechanismSnapshot {
+        SearchMechanismSnapshot {
+            dispatches_by_backend_and_kind: self.search_dispatches.lock().clone(),
+            note_candidate_hydration_rows: self
+                .note_candidate_hydration_rows
+                .load(Ordering::Relaxed),
+        }
+    }
+
     /// Snapshot reader acquisition, saturation, and hold lifecycle outcomes
     /// since this pool was constructed. Counters reset only with pool
     /// reconstruction.
@@ -1982,6 +2346,19 @@ impl ConnectionPool {
     /// raw-SQL read-transaction exception and reads on a standalone writer).
     pub(crate) fn record_reader_admission_timeout(&self) {
         self.reader_acquisition_counters.record_checkout_timeout();
+    }
+
+    /// Count a query error from an already checked-out pooled reader when it is
+    /// SQLite's `SQLITE_BUSY` surfacing after the busy handler gave up. Every
+    /// other error, including `SQLITE_LOCKED`, is ignored. Checkout exhaustion
+    /// is counted by [`Self::reader_until`] before any query runs, so the two
+    /// classes cannot overlap.
+    pub(crate) fn record_reader_query_error(&self, error: &StorageError) {
+        if crate::read_cancellation::storage_error_sqlite_code(error)
+            == Some(rusqlite::ErrorCode::DatabaseBusy)
+        {
+            self.reader_acquisition_counters.record_busy_timeout();
+        }
     }
 
     /// Clone the pool-scoped counter set for the lifetime-owned writer task.
@@ -2024,6 +2401,23 @@ impl ConnectionPool {
     /// Return the pool configuration.
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    /// Observe actual SQLite statement starts on this private test pool.
+    ///
+    /// The limit bounds retained SQL records. Failed steps count as attempts;
+    /// preparation alone does not count. The guard observes every pool-owned
+    /// connection, including the queued writer. Do not run unrelated background
+    /// work on the fixture pool; see the guard documentation for limitations.
+    /// Connection setup runs before observation begins on each connection and
+    /// is never recorded, including for opens during an active observation.
+    /// Reader connection opens use the existing reader acquisition counters instead.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_test_statement_starts(
+        &self,
+        limit: usize,
+    ) -> Result<crate::statement_observer::StatementStartObservation, SqliteError> {
+        self.statement_observer.observe(limit)
     }
 
     /// Identify this pool's counter window when it is designated as main.
@@ -2113,6 +2507,15 @@ impl ConnectionPool {
         Arc::clone(&self.sql_bridge_writer_slots)
     }
 
+    /// Current writer holds that prevent voluntary daemon retirement.
+    ///
+    /// The raw-SQL writer permit remains handle-scoped even in autocommit.
+    /// This read acquires no connection and changes no admission policy.
+    pub fn retirement_writer_holds(&self) -> usize {
+        usize::from(self.writer.is_locked())
+            + usize::from(self.sql_bridge_writer_slots.available_permits() == 0)
+    }
+
     /// This pool's ADR-091 backend-scoped attribution origin (ADR-091,
     /// backend-scoped WAL-pin attribution design note): `Database(_)` for a
     /// file-backed pool, `Memory` for an in-memory pool. Every
@@ -2129,6 +2532,57 @@ impl ConnectionPool {
     /// re-deriving a path from the raw configured one.
     pub fn canonical_path(&self) -> Option<&Path> {
         self.identity_path.as_deref()
+    }
+
+    /// Unix file identity retained for callers using the original tuple API.
+    #[cfg(unix)]
+    pub fn opened_file_identity(&self) -> Option<(u64, u64)> {
+        self.opened_file_identity
+            .map(DatabaseFileIdentity::unix_parts)
+    }
+
+    /// Physical file identity pinned to SQLite's opened main file. Construction
+    /// compares it with the path on both sides of the open before admission.
+    #[cfg(any(unix, windows))]
+    pub fn opened_file_identity_record(&self) -> Option<DatabaseFileIdentity> {
+        self.opened_file_identity
+    }
+
+    /// Ownership evidence captured through the database SQLite opened.
+    /// This does not select the topology's main backend or establish a root binding.
+    /// Legacy read-only and low-space opens without a stored UUID must reopen
+    /// after installation; this accessor never installs or re-mints an identity.
+    pub fn database_owner_identity(
+        &self,
+    ) -> Result<DatabaseOwnerIdentity, DatabaseOwnerIdentityError> {
+        if self.identity_path.is_none() {
+            return Err(DatabaseOwnerIdentityError::InMemory);
+        }
+        #[cfg(any(unix, windows))]
+        {
+            let durable_id = self
+                .opened_database_id
+                .ok_or(DatabaseOwnerIdentityError::DurableIdentityUnavailable)?;
+            let file_identity = self
+                .opened_file_identity
+                .ok_or(DatabaseOwnerIdentityError::PhysicalIdentityUnavailable)?;
+            Ok(DatabaseOwnerIdentity {
+                durable_id,
+                file_identity,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(DatabaseOwnerIdentityError::UnsupportedPlatform)
+        }
+    }
+
+    /// Require both this opened database's UUID and physical file to match.
+    pub fn verify_database_owner(
+        &self,
+        expected: &DatabaseOwnerIdentity,
+    ) -> Result<(), DatabaseOwnerIdentityError> {
+        self.database_owner_identity()?.verify_owner(expected)
     }
 
     /// Whether the write queue is effectively enabled for this pool: the
@@ -2362,13 +2816,25 @@ impl ConnectionPool {
 
     fn open_reader_connection(&self) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
-        open_reader_connection(path, &self.config)
+        #[cfg(any(unix, windows))]
+        if let Some(identity_path) = self.identity_path.as_deref() {
+            self.verify_opened_file_identity(identity_path)?;
+        }
+        let conn = open_reader_connection(path, &self.config)?;
+        #[cfg(any(unix, windows))]
+        if let Some(identity_path) = self.identity_path.as_deref() {
+            self.verify_connection_file_identity(&conn, identity_path)?;
+        }
+        self.verify_opened_database_id(&conn)?;
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
+        Ok(conn)
     }
 
     fn read_connection_path(&self) -> Result<&Path, SqliteError> {
         self.read_only_open_target
             .as_deref()
-            .or(self.config.path.as_deref())
+            .or(self.identity_path.as_deref())
             .ok_or_else(|| {
                 SqliteError::InvalidData(
                     "in-memory databases do not support standalone connections".to_string(),
@@ -2405,7 +2871,7 @@ impl ConnectionPool {
     /// write paths must call [`Self::open_standalone_writer`] so their
     /// acquisitions are observable.
     pub(crate) fn open_standalone_writer_untracked(&self) -> Result<Connection, SqliteError> {
-        let path = self.config.path.as_ref().ok_or_else(|| {
+        let path = self.identity_path.as_deref().ok_or_else(|| {
             SqliteError::InvalidData(
                 "in-memory databases do not support standalone connections".to_string(),
             )
@@ -2417,13 +2883,35 @@ impl ConnectionPool {
             ));
         }
 
-        let conn = Connection::open_with_flags(
+        // The configured spelling may be a symlink that changed since this
+        // pool opened. Use its pinned target, and refuse replacement of that
+        // target before SQLite can execute the diagnostics PASSIVE checkpoint.
+        #[cfg(any(unix, windows))]
+        self.verify_opened_file_identity(path)?;
+
+        #[cfg(test)]
+        run_identity_open_hook(path, IdentityOpenStage::BeforeStandaloneOpen, None);
+
+        let conn = claimed_file_identity::open_connection(
+            &self.config,
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
+            self.identity_path.as_deref(),
         )?;
+        #[cfg(test)]
+        run_identity_open_hook(path, IdentityOpenStage::AfterStandaloneOpen, Some(&conn));
+        #[cfg(any(unix, windows))]
+        self.verify_connection_file_identity(&conn, path)?;
+        self.verify_opened_database_id(&conn)?;
+        #[cfg(feature = "namespace-trigram-proto")]
+        register_namespace_trigram(&conn)?;
         register_writer_clock(&conn)?;
+        // Expression indexes over these keys are maintained by every writer
+        // (the write-queue task and per-store standalone writers included), so
+        // each of them needs the same functions the pooled writer registers.
+        register_rfc3339_key(&conn)?;
         conn.busy_timeout(self.config.busy_timeout)?;
         self.checkpoint_ownership
             .configure_wal_autocheckpoint(&conn)?;
@@ -2440,7 +2928,58 @@ impl ConnectionPool {
             )?;
         }
 
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
         Ok(conn)
+    }
+
+    #[cfg(any(unix, windows))]
+    fn verify_opened_file_identity(&self, path: &Path) -> Result<(), SqliteError> {
+        let Some(expected) = self.opened_file_identity else {
+            return Err(SqliteError::InvalidData(
+                "file-backed pool has no opened database file identity".to_string(),
+            ));
+        };
+        let current = database_file_identity(path).ok();
+        if current != Some(expected) {
+            return Err(SqliteError::InvalidData(
+                "pool database file identity changed since the first open; refusing standalone connection"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    fn verify_connection_file_identity(
+        &self,
+        conn: &Connection,
+        path: &Path,
+    ) -> Result<(), SqliteError> {
+        let opened = opened_sqlite_file_identity(conn, path)?;
+        if self.opened_file_identity != Some(opened) {
+            return Err(SqliteError::InvalidData(
+                "pool database file identity changed since the first open; refusing standalone connection"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_opened_database_id(&self, conn: &Connection) -> Result<(), SqliteError> {
+        // A read-only pool, or a writable pool opened below the space reserve,
+        // may precede installation of the nonce by another process. Without a
+        // nonce to pin, use the existing file identity checks where available.
+        let Some(expected) = self.opened_database_id else {
+            return Ok(());
+        };
+        if self.identity_path.is_some() && read_database_id(conn)? != Some(expected) {
+            return Err(SqliteError::InvalidData(
+                "pool database identity changed since the first open; refusing standalone connection"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Effective `PRAGMA wal_autocheckpoint` for a writer-capable connection
@@ -2524,16 +3063,30 @@ impl ConnectionPool {
     ) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
 
-        let conn = Connection::open_with_flags(
+        #[cfg(any(unix, windows))]
+        if let Some(identity_path) = self.identity_path.as_deref() {
+            self.verify_opened_file_identity(identity_path)?;
+        }
+
+        let conn = claimed_file_identity::open_connection(
+            &self.config,
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
+            self.identity_path.as_deref(),
         )?;
+        #[cfg(any(unix, windows))]
+        if let Some(identity_path) = self.identity_path.as_deref() {
+            self.verify_connection_file_identity(&conn, identity_path)?;
+        }
+        self.verify_opened_database_id(&conn)?;
         configure_reader_connection(&conn, &self.config)?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         self.reader_acquisition_counters
             .record_standalone_open(purpose);
+        #[cfg(any(test, feature = "test-support"))]
+        crate::statement_observer::install(&conn, &self.statement_observer)?;
         Ok(conn)
     }
 
@@ -2675,6 +3228,120 @@ fn mint_db_identity(configured_path: &Path) -> Result<(DbIdentity, PathBuf), Sql
     ))
 }
 
+#[cfg(any(unix, windows))]
+fn database_file_identity_if_exists(
+    path: &Path,
+) -> Result<Option<DatabaseFileIdentity>, SqliteError> {
+    match database_file_identity(path) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn opened_sqlite_file_identity(
+    conn: &Connection,
+    path: &Path,
+) -> Result<DatabaseFileIdentity, SqliteError> {
+    #[cfg(unix)]
+    {
+        verify_sqlite_opened_file_still_at_path(conn)?;
+        Ok(database_file_identity(path)?)
+    }
+    #[cfg(windows)]
+    {
+        let opened = sqlite_opened_file_identity(conn)?;
+        if database_file_identity(path).ok() != Some(opened) {
+            return Err(SqliteError::InvalidData(
+                "database file identity changed while SQLite held the opened file".to_string(),
+            ));
+        }
+        Ok(opened)
+    }
+}
+
+/// The nonce lives in the main database and is read through the connection
+/// SQLite actually opened. A pathname stat alone can observe a different file
+/// when another process renames entries during `sqlite3_open_v2`.
+fn read_database_id(conn: &Connection) -> Result<Option<uuid::Uuid>, SqliteError> {
+    let table_exists: bool = conn.query_row(
+        "SELECT count(*) != 0 FROM main.sqlite_master WHERE type = 'table' AND name = ?1",
+        [DATABASE_ID_TABLE],
+        |row| row.get(0),
+    )?;
+    if !table_exists {
+        // Older read-only snapshots cannot be initialized here. Their Unix
+        // file-control and inode checks still apply; writable opens backfill.
+        return Ok(None);
+    }
+    let id: String = conn.query_row(
+        &format!("SELECT id FROM main.{DATABASE_ID_TABLE} WHERE singleton = 1"),
+        [],
+        |row| row.get(0),
+    )?;
+    let id = uuid::Uuid::parse_str(&id).map_err(|error| {
+        SqliteError::InvalidData(format!("invalid stored database identity: {error}"))
+    })?;
+    Ok(Some(id))
+}
+
+fn initialize_database_id(conn: &mut Connection) -> Result<uuid::Uuid, SqliteError> {
+    if let Some(id) = read_database_id(conn)? {
+        return Ok(id);
+    }
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS main.{DATABASE_ID_TABLE} (\
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
+             id TEXT NOT NULL\
+         )"
+    ))?;
+    transaction.execute(
+        &format!("INSERT OR IGNORE INTO main.{DATABASE_ID_TABLE} (singleton, id) VALUES (1, ?1)"),
+        [uuid::Uuid::new_v4().to_string()],
+    )?;
+    let id: String = transaction.query_row(
+        &format!("SELECT id FROM main.{DATABASE_ID_TABLE} WHERE singleton = 1"),
+        [],
+        |row| row.get(0),
+    )?;
+    let id = uuid::Uuid::parse_str(&id).map_err(|error| {
+        SqliteError::InvalidData(format!("invalid stored database identity: {error}"))
+    })?;
+    transaction.commit()?;
+    Ok(id)
+}
+
+#[cfg(unix)]
+fn verify_sqlite_opened_file_still_at_path(conn: &Connection) -> Result<(), SqliteError> {
+    let mut moved: std::ffi::c_int = 0;
+    // SAFETY: `conn` remains alive and exclusively borrowed for this call;
+    // the `main` C string and writable integer out-parameter remain valid.
+    // SQLite documents SQLITE_FCNTL_HAS_MOVED as querying the opened file,
+    // and the bundled Unix VFS implements it using its retained inode.
+    // https://www.sqlite.org/c3ref/c_fcntl_begin_atomic_write.html
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+            (&mut moved as *mut std::ffi::c_int).cast(),
+        )
+    };
+    if result != rusqlite::ffi::SQLITE_OK {
+        return Err(SqliteError::InvalidData(format!(
+            "cannot verify opened database file identity (SQLite file control {result})"
+        )));
+    }
+    if moved != 0 {
+        return Err(SqliteError::InvalidData(
+            "database file identity changed while SQLite held the opened file".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Follow a (possibly dangling) final-component symlink chain to its
 /// ultimate target, bounded at [`MAX_SYMLINK_DEPTH`] hops. A path that is
 /// not itself a symlink — including one that does not exist at all —
@@ -2721,27 +3388,38 @@ fn effective_reader_count(config: &PoolConfig, wal_enabled: bool) -> usize {
 fn open_writer_connection(
     config: &PoolConfig,
     read_only_open_target: Option<&Path>,
+    identity_path: Option<&Path>,
 ) -> Result<Connection, SqliteError> {
-    match config.path.as_ref() {
-        Some(path) => {
-            let flags = if config.read_only {
-                writer_read_only_open_flags()
-            } else {
-                writer_open_flags()
-            };
-            let target = if config.read_only {
-                read_only_open_target.ok_or_else(|| {
-                    SqliteError::InvalidData(
-                        "file-backed read-only pool has no canonical open target".to_string(),
-                    )
-                })?
-            } else {
-                path
-            };
-            Connection::open_with_flags(target, flags).map_err(Into::into)
-        }
-        None => Connection::open_in_memory().map_err(Into::into),
+    claimed_file_identity::open_writer(config, read_only_open_target, identity_path)
+}
+
+/// Validate the one-frame reset floor using this backend connection's own
+/// page size. This runs before writer configuration changes journal mode or
+/// performs any schema work. The WAL I/O limiter arrives in a later slice, so
+/// a valid nonzero policy still refuses to open rather than running uncovered.
+fn validate_wal_ceiling_at_open(conn: &Connection, config: &PoolConfig) -> Result<(), SqliteError> {
+    let bytes = config.wal_ceiling.effective_bytes(config.read_only);
+    if bytes == 0 {
+        return Ok(());
     }
+    let page_size: i64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let page_size = u64::try_from(page_size).map_err(|_| {
+        SqliteError::InvalidData("SQLite reported a negative page size".to_string())
+    })?;
+    let minimum_bytes = page_size.checked_add(56).ok_or_else(|| {
+        SqliteError::InvalidData("SQLite page size overflowed the WAL frame floor".to_string())
+    })?;
+    if bytes < minimum_bytes {
+        return Err(SqliteError::WalCeilingBelowMinimum {
+            bytes,
+            page_size,
+            minimum_bytes,
+        });
+    }
+    Err(SqliteError::WalCapacityUnavailable {
+        bytes,
+        capability: "WAL I/O limiter",
+    })
 }
 
 /// Select the one case that may safely use SQLite's immutable URI contract: a
@@ -2836,7 +3514,10 @@ fn read_only_wal_open_target_for_path(path: &Path) -> Result<PathBuf, SqliteErro
 pub(crate) fn open_read_only_snapshot_connection(path: &Path) -> Result<Connection, SqliteError> {
     let (_, physical_path) = mint_db_identity(path)?;
     let target = read_only_wal_open_target_for_path(&physical_path)?;
-    Connection::open_with_flags(&target, reader_open_flags()).map_err(Into::into)
+    let conn = Connection::open_with_flags(&target, reader_open_flags())?;
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(&conn)?;
+    Ok(conn)
 }
 
 fn sqlite_header_uses_wal(path: &Path) -> Result<bool, SqliteError> {
@@ -2904,7 +3585,12 @@ fn push_sqlite_uri_path(uri: &mut String, bytes: &[u8]) {
 }
 
 fn open_reader_connection(path: &Path, config: &PoolConfig) -> Result<Connection, SqliteError> {
-    let conn = Connection::open_with_flags(path, reader_open_flags())?;
+    let conn = claimed_file_identity::open_connection(
+        config,
+        path,
+        reader_open_flags(),
+        config.path.as_deref(),
+    )?;
     configure_reader_connection(&conn, config)?;
     Ok(conn)
 }
@@ -2924,6 +3610,11 @@ fn writer_read_only_open_flags() -> OpenFlags {
 
 fn reader_open_flags() -> OpenFlags {
     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX
+}
+
+#[cfg(feature = "namespace-trigram-proto")]
+fn register_namespace_trigram(conn: &Connection) -> Result<(), SqliteError> {
+    crate::namespace_trigram_proto::register(conn).map_err(SqliteError::InvalidData)
 }
 
 fn register_writer_clock(conn: &Connection) -> Result<(), SqliteError> {
@@ -2947,7 +3638,17 @@ pub(crate) fn rfc3339_instant_key(instant: chrono::DateTime<chrono::Utc>) -> Vec
     key
 }
 
-fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
+/// The outbox deadline grammar is stricter than the general timestamp filter.
+/// This is shared by app-maintained stored keys, V44 backfill, and the read
+/// residual; no schema expression calls an application-defined function.
+pub(crate) fn strict_rfc3339_key(text: &str) -> Option<Vec<u8>> {
+    chrono::DateTime::parse_from_rfc3339(text)
+        .ok()
+        .map(|instant| rfc3339_instant_key(instant.with_timezone(&chrono::Utc)))
+}
+
+/// Register timestamp-key functions for read filters on pooled connections.
+pub(crate) fn register_rfc3339_key(conn: &Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     use rusqlite::types::ValueRef;
 
@@ -2968,6 +3669,25 @@ fn register_rfc3339_key(conn: &Connection) -> Result<(), SqliteError> {
             Ok(key)
         },
     )?;
+    // The outbox's legacy retry predicate used parse_from_rfc3339, while the
+    // general key above accepts Chrono's relaxed DateTime FromStr grammar.
+    // Keep the strict grammar separate so a relaxed-only future value still
+    // fails open as malformed, instead of postponing the message forever.
+    conn.create_scalar_function(
+        "khive_rfc3339_strict_key",
+        1,
+        FunctionFlags::SQLITE_UTF8
+            | FunctionFlags::SQLITE_DETERMINISTIC
+            | FunctionFlags::SQLITE_INNOCUOUS,
+        |ctx| {
+            let text = match ctx.get_raw(0) {
+                ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            let key = text.and_then(strict_rfc3339_key);
+            Ok(key)
+        },
+    )?;
     Ok(())
 }
 
@@ -2975,6 +3695,8 @@ fn configure_writer_connection(
     conn: &Connection,
     config: &PoolConfig,
 ) -> Result<bool, SqliteError> {
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(conn)?;
     register_writer_clock(conn)?;
     register_rfc3339_key(conn)?;
     if config.read_only {
@@ -3025,6 +3747,8 @@ fn configure_writer_connection(
 }
 
 fn configure_reader_connection(conn: &Connection, config: &PoolConfig) -> Result<(), SqliteError> {
+    #[cfg(feature = "namespace-trigram-proto")]
+    register_namespace_trigram(conn)?;
     register_rfc3339_key(conn)?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(config.busy_timeout)?;
@@ -3281,14 +4005,85 @@ fn pool_exhausted_error(timeout: Duration, max_readers: usize) -> SqliteError {
 mod runtime_write_routing_tests;
 
 #[cfg(test)]
+#[path = "database_owner_identity_pool_tests.rs"]
+mod database_owner_identity_pool_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    struct IdentityOpenHookReset;
+
+    impl Drop for IdentityOpenHookReset {
+        fn drop(&mut self) {
+            IDENTITY_OPEN_HOOK.with(|hook| *hook.borrow_mut() = None);
+        }
+    }
+
+    fn install_identity_open_hook(
+        hook: impl Fn(&Path, IdentityOpenStage, Option<&Connection>) + 'static,
+    ) -> IdentityOpenHookReset {
+        IDENTITY_OPEN_HOOK.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "identity open hook already installed"
+            );
+            *slot.borrow_mut() = Some(Box::new(hook));
+        });
+        IdentityOpenHookReset
+    }
+
+    struct StartupSpaceProbeReset;
+
+    impl Drop for StartupSpaceProbeReset {
+        fn drop(&mut self) {
+            STARTUP_SPACE_PROBE.with(|probe| *probe.borrow_mut() = None);
+        }
+    }
+
+    fn install_startup_space_probe(
+        floor_bytes: u64,
+        probe: impl Fn(&Path) -> std::io::Result<u64> + Send + Sync + 'static,
+    ) -> StartupSpaceProbeReset {
+        STARTUP_SPACE_PROBE.with(|slot| {
+            assert!(
+                slot.borrow().is_none(),
+                "startup space probe already installed"
+            );
+            *slot.borrow_mut() = Some((floor_bytes, Arc::new(probe)));
+        });
+        StartupSpaceProbeReset
+    }
+
+    #[cfg(unix)]
+    fn rename_pair_on_other_thread(from_a: &Path, to_a: &Path, from_b: &Path, to_b: &Path) {
+        let paths = (
+            from_a.to_path_buf(),
+            to_a.to_path_buf(),
+            from_b.to_path_buf(),
+            to_b.to_path_buf(),
+        );
+        std::thread::spawn(move || {
+            fs::rename(paths.0, paths.1).unwrap();
+            fs::rename(paths.2, paths.3).unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    mod timing {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_support/timing.rs"
+        ));
+    }
 
     #[test]
     fn constructor_writer_cancels_after_entering_the_wait_without_pool_timeout() {
         let pool = ConnectionPool::new(PoolConfig {
             path: None,
+            checkout_timeout: Duration::from_secs(1),
             ..PoolConfig::default()
         })
         .unwrap();
@@ -3330,10 +4125,12 @@ mod tests {
             .writer_until(|| context.blocking_stop_reason().is_some())
             .unwrap();
         assert!(stopped.is_none());
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "request deadline must beat pool timeout"
-        );
+        if let Some(bound) = timing::duration_bound(Duration::from_secs(1), None) {
+            assert!(
+                started.elapsed() < bound,
+                "request deadline must beat pool timeout within {bound:?}"
+            );
+        }
         assert_eq!(pool.writer_acquisition_snapshot(), before);
         drop(held);
     }
@@ -4742,6 +5539,333 @@ mod tests {
         assert!(pool.max_readers() > 0);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_only_legacy_reader_rejects_different_opened_file_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let replacement = dir.path().join("replacement.db");
+        for target in [&path, &replacement] {
+            let conn = Connection::open(target).unwrap();
+            conn.execute_batch("CREATE TABLE marker (value INTEGER)")
+                .unwrap();
+        }
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            read_only: true,
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open a legacy read-only pool without a stored database UUID");
+        assert_eq!(pool.opened_database_id, None);
+        assert_eq!(
+            pool.opened_file_identity,
+            Some(database_file_identity(&path).unwrap())
+        );
+        pool.open_reader_connection()
+            .expect("a later reader of the pinned file succeeds");
+
+        // SQLite's Windows VFS omits FILE_SHARE_DELETE, so a live pool bars
+        // pathname replacement. Exercise the same post-open gate with an
+        // actual connection to another file while the legacy pool stays live.
+        let other =
+            Connection::open_with_flags(&replacement, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let error = pool
+            .verify_connection_file_identity(&other, &path)
+            .expect_err("the opened handle differs from the requested path");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        let error = pool
+            .verify_connection_file_identity(&other, &replacement)
+            .expect_err("a different opened main handle cannot join this pool");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_and_new_reader_keep_the_first_opened_target_after_symlink_retarget() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.db");
+        let second = dir.path().join("second.db");
+        for (path, marker) in [(&first, 11), (&second, 22)] {
+            let conn = Connection::open(path).unwrap();
+            conn.execute("CREATE TABLE identity_marker (value INTEGER NOT NULL)", [])
+                .unwrap();
+            conn.execute("INSERT INTO identity_marker (value) VALUES (?1)", [marker])
+                .unwrap();
+        }
+        let alias = dir.path().join("current.db");
+        symlink(&first, &alias).unwrap();
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(alias.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open the first database through its alias");
+
+        fs::remove_file(&alias).unwrap();
+        symlink(&second, &alias).unwrap();
+
+        let standalone = pool
+            .open_standalone_writer_untracked()
+            .expect("standalone probe stays on the opened database");
+        let value: i64 = standalone
+            .query_row("SELECT value FROM identity_marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 11);
+
+        let reader = pool
+            .open_reader_connection()
+            .expect("a newly opened reader stays on the same database");
+        let value: i64 = reader
+            .query_row("SELECT value FROM identity_marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, 11);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_writer_refuses_replaced_pinned_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        let replacement = dir.path().join("replacement.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open the first database");
+        let replacement_conn = Connection::open(&replacement).unwrap();
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .unwrap();
+        drop(replacement_conn);
+        fs::rename(&replacement, &path).unwrap();
+
+        let error = pool
+            .open_standalone_writer_untracked()
+            .expect_err("a replaced file must not receive a standalone probe");
+        assert!(
+            error.to_string().contains("file identity changed"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn standalone_reader_refuses_replaced_pinned_database_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        let replacement = dir.path().join("replacement.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open the first database");
+        let replacement_conn = Connection::open(&replacement).unwrap();
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .unwrap();
+        drop(replacement_conn);
+        fs::rename(&replacement, &path).unwrap();
+
+        let error = pool
+            .open_standalone_reader(StandaloneReaderPurpose::ExplicitSqlReadTransaction)
+            .expect_err("a replaced file must not serve a standalone read");
+        assert!(
+            error.to_string().contains("file identity changed"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_path_replacement_after_sqlite_open_before_first_stat_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.db");
+        let replacement = dir.path().join("replacement.db");
+        let original = Connection::open(&path).unwrap();
+        original
+            .execute_batch("CREATE TABLE original_marker (id INTEGER)")
+            .unwrap();
+        drop(original);
+        let other = Connection::open(&replacement).unwrap();
+        other
+            .execute_batch("CREATE TABLE replacement_marker (id INTEGER)")
+            .unwrap();
+        drop(other);
+        let pinned_path = mint_db_identity(&path).unwrap().1;
+        let original_identity = database_file_identity(&path).unwrap();
+        let replacement_identity = database_file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+
+        let swapped = std::rc::Rc::new(Cell::new(false));
+        let _hook = install_identity_open_hook({
+            let path = path.clone();
+            let swapped = std::rc::Rc::clone(&swapped);
+            move |target, stage, conn| {
+                if target != pinned_path.as_path()
+                    || stage != IdentityOpenStage::AfterMainOpenBeforeFirstStat
+                {
+                    return;
+                }
+                let opened = conn.expect("SQLite main must already be open");
+                let marker: i64 = opened
+                    .query_row(
+                        "SELECT count(*) FROM main.sqlite_master WHERE name='original_marker'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(marker, 1, "the opened handle belongs to the original file");
+                let staged = path.with_extension("staged.db");
+                fs::hard_link(&replacement, &staged).unwrap();
+                fs::rename(&staged, &path).unwrap();
+                swapped.set(true);
+            }
+        });
+        let error = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            read_only: true,
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .err()
+        .expect("changed path must fail before pool admission");
+        assert!(
+            swapped.get(),
+            "swap must occur in the open-to-first-stat window"
+        );
+        assert_eq!(database_file_identity(&path).unwrap(), replacement_identity);
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initially_absent_path_replacement_cannot_pin_a_different_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.db");
+        let pinned_path = mint_db_identity(&path).unwrap().1;
+        let parked = dir.path().join("opened-writer.db");
+        let replacement = dir.path().join("replacement.db");
+        let replacement_conn = Connection::open(&replacement).unwrap();
+        replacement_conn
+            .execute_batch("CREATE TABLE replacement_marker (value INTEGER)")
+            .unwrap();
+        drop(replacement_conn);
+        assert!(!path.exists(), "exercise the absent first-open path");
+
+        let replacement_ran = std::rc::Rc::new(Cell::new(false));
+        let _hook = install_identity_open_hook({
+            let path = path.clone();
+            let replacement_ran = std::rc::Rc::clone(&replacement_ran);
+            move |target, stage, conn| {
+                if target != pinned_path.as_path()
+                    || stage != IdentityOpenStage::AfterInitialIdentityWrite
+                {
+                    return;
+                }
+                assert!(
+                    read_database_id(conn.expect("opened writer"))
+                        .unwrap()
+                        .is_some(),
+                    "the first writer's identity must be committed before replacement"
+                );
+                rename_pair_on_other_thread(&path, &parked, &replacement, &path);
+                replacement_ran.set(true);
+            }
+        });
+        let error = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .err()
+        .expect("an absent path must not pin a replacement after SQLite opened its writer");
+        assert!(replacement_ran.get(), "the replacement hook must execute");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        assert!(path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_swap_cannot_return_a_standalone_connection_to_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        let pinned_path = mint_db_identity(&path).unwrap().1;
+        let parked = dir.path().join("parked.db");
+        let replacement = dir.path().join("replacement.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.writer()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE identity_marker (value INTEGER); \
+                            INSERT INTO identity_marker (value) VALUES (11)",
+            )
+            .unwrap();
+        let mut replacement_conn = Connection::open(&replacement).unwrap();
+        replacement_conn
+            .execute_batch(
+                "CREATE TABLE identity_marker (value INTEGER); \
+                            INSERT INTO identity_marker (value) VALUES (22)",
+            )
+            .unwrap();
+        let replacement_id = initialize_database_id(&mut replacement_conn).unwrap();
+        assert_ne!(pool.opened_database_id, Some(replacement_id));
+        drop(replacement_conn);
+
+        let swap_ran = std::rc::Rc::new(Cell::new(false));
+        let restore_ran = std::rc::Rc::new(Cell::new(false));
+        let _hook = install_identity_open_hook({
+            let path = path.clone();
+            let swap_ran = std::rc::Rc::clone(&swap_ran);
+            let restore_ran = std::rc::Rc::clone(&restore_ran);
+            move |target, stage, conn| {
+                if target != pinned_path.as_path() {
+                    return;
+                }
+                match stage {
+                    IdentityOpenStage::AfterMainOpenBeforeFirstStat => {}
+                    IdentityOpenStage::BeforeStandaloneOpen => {
+                        rename_pair_on_other_thread(&path, &parked, &replacement, &path);
+                        swap_ran.set(true);
+                    }
+                    IdentityOpenStage::AfterStandaloneOpen => {
+                        let opened = conn.expect("SQLite opened the swapped path");
+                        let marker: i64 = opened
+                            .query_row("SELECT value FROM identity_marker", [], |row| row.get(0))
+                            .unwrap();
+                        assert_eq!(marker, 22, "the opened handle belongs to the replacement");
+                        rename_pair_on_other_thread(&path, &replacement, &parked, &path);
+                        restore_ran.set(true);
+                    }
+                    IdentityOpenStage::AfterInitialIdentityWrite => {}
+                }
+            }
+        });
+        let error = pool
+            .open_standalone_writer_untracked()
+            .expect_err("both pathname stats see the original, but SQLite opened replacement");
+        assert!(swap_ran.get(), "the swap hook must execute");
+        assert!(restore_ran.get(), "the restore hook must execute");
+        assert!(error.to_string().contains("identity changed"), "{error}");
+        assert_eq!(
+            database_file_identity(&path).unwrap(),
+            pool.opened_file_identity.unwrap()
+        );
+    }
+
     #[test]
     fn standalone_wal_writer_uses_configured_journal_size_limit() {
         let dir = tempfile::tempdir().unwrap();
@@ -4790,6 +5914,73 @@ mod tests {
             .expect("standalone rollback-journal writer open");
         assert_eq!(current_journal_mode(&standalone).unwrap(), "delete");
         assert_eq!(journal_size_limit_bytes(&standalone), sqlite_default);
+    }
+
+    #[test]
+    fn every_writer_capable_connection_maintains_rfc3339_expression_indexes() {
+        const INSERT: &str = "INSERT INTO deadlines(id, due) VALUES (?1, ?2)";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rfc3339_expression_index.db");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("file-backed pool open");
+        {
+            let writer = pool.writer().expect("pooled writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE deadlines(id INTEGER PRIMARY KEY, due TEXT);
+                     CREATE INDEX idx_deadlines_strict \
+                         ON deadlines(ifnull(khive_rfc3339_strict_key(due), x''));
+                     CREATE INDEX idx_deadlines_relaxed \
+                         ON deadlines(khive_rfc3339_key(due));",
+                )
+                .expect("pooled writer registers both key functions");
+        }
+
+        // Control: a connection that did not go through the pool's
+        // initialization cannot maintain these indexes. This is the
+        // failure every unregistered writer used to hit.
+        let bare = Connection::open(&path).expect("bare connection");
+        let refused = bare
+            .execute(INSERT, rusqlite::params![1, "2026-01-01T00:00:00Z"])
+            .expect_err("an unregistered connection cannot maintain the index");
+        assert!(
+            refused.to_string().contains("unknown function"),
+            "unexpected refusal: {refused}"
+        );
+        drop(bare);
+
+        let tracked = pool.open_standalone_writer().expect("tracked standalone");
+        let untracked = pool
+            .open_standalone_writer_untracked()
+            .expect("untracked standalone");
+        for (id, conn) in [(2, &tracked), (3, &untracked)] {
+            conn.execute(INSERT, rusqlite::params![id, "2026-01-01T00:00:00Z"])
+                .unwrap_or_else(|error| panic!("standalone writer {id}: {error}"));
+        }
+        {
+            let writer = pool.writer().expect("pooled writer");
+            writer
+                .conn()
+                .execute(INSERT, rusqlite::params![4, "2026-01-01T00:00:00Z"])
+                .expect("pooled writer");
+        }
+        let reader = pool
+            .open_standalone_reader(StandaloneReaderPurpose::DiagnosticsIndependentSnapshot)
+            .expect("standalone reader");
+        let indexed: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM deadlines \
+                 WHERE ifnull(khive_rfc3339_strict_key(due), x'') <= khive_rfc3339_strict_key(?1)",
+                ["2026-06-01T00:00:00Z"],
+                |row| row.get(0),
+            )
+            .expect("standalone reader registers the key functions");
+        assert_eq!(indexed, 3);
     }
 
     #[test]
@@ -5364,6 +6555,219 @@ mod tests {
     }
 
     #[test]
+    fn wal_ceiling_below_one_frame_reset_floor_is_typed_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-ceiling-floor.db");
+        let seed = Connection::open(&path).unwrap();
+        seed.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let page_size: i64 = seed
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let page_size = u64::try_from(page_size)
+            .map_err(|_| {
+                SqliteError::InvalidData("SQLite reported a negative page size".to_string())
+            })
+            .unwrap();
+        drop(seed);
+        let bytes = page_size + 55;
+
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            wal_ceiling: WalCeilingPolicy {
+                bytes,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("the one-frame reset floor must refuse this policy"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingBelowMinimum {
+                bytes: observed,
+                page_size: observed_page_size,
+                minimum_bytes,
+            } if observed == bytes
+                && observed_page_size == page_size
+                && minimum_bytes == page_size + 56
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_floor_reads_existing_backend_page_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-ceiling-8192.db");
+        let seed = Connection::open(&path).unwrap();
+        seed.pragma_update(None, "page_size", 8192).unwrap();
+        seed.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let page_size: i64 = seed
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let page_size = u64::try_from(page_size)
+            .map_err(|_| {
+                SqliteError::InvalidData("SQLite reported a negative page size".to_string())
+            })
+            .unwrap();
+        assert_eq!(page_size, 8192, "fixture must persist the larger page size");
+        drop(seed);
+
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_ceiling: WalCeilingPolicy {
+                bytes: 4096 + 56,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("an 8192-byte page cannot fit below its own one-frame floor"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingBelowMinimum {
+                bytes: 4152,
+                page_size: 8192,
+                minimum_bytes: 8248,
+            }
+        ));
+        let refused = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let identity_rows: i64 = refused
+            .query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE name = ?1",
+                [DATABASE_ID_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            identity_rows, 0,
+            "WAL policy refusal must precede identity nonce installation"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_at_one_frame_floor_fails_closed_without_io_limiter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-ceiling-unavailable.db");
+        let seed = Connection::open(&path).unwrap();
+        seed.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let page_size: i64 = seed
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let page_size = u64::try_from(page_size)
+            .map_err(|_| {
+                SqliteError::InvalidData("SQLite reported a negative page size".to_string())
+            })
+            .unwrap();
+        drop(seed);
+        let bytes = page_size + 56;
+
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            wal_ceiling: WalCeilingPolicy {
+                bytes,
+                source: WalCeilingSource::Environment,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("enabled ceiling must not open without the WAL I/O limiter"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.wal_capacity_stage(),
+            Some(crate::error::SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE)
+        );
+        assert!(matches!(
+            error,
+            SqliteError::WalCapacityUnavailable {
+                bytes: observed,
+                capability: "WAL I/O limiter",
+            } if observed == bytes
+        ));
+        let refused = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let identity_rows: i64 = refused
+            .query_row(
+                "SELECT COUNT(*) FROM main.sqlite_master WHERE name = ?1",
+                [DATABASE_ID_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            identity_rows, 0,
+            "WAL policy refusal must precede identity nonce installation"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_refuses_in_memory_backend_at_pool_open() {
+        let error = match ConnectionPool::new(PoolConfig {
+            wal_ceiling: WalCeilingPolicy {
+                bytes: 8192,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("an in-memory backend cannot enforce a WAL ceiling"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingUnsupported {
+                backend_kind: "in-memory backend",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_refuses_non_wal_backend_at_pool_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("non-wal-ceiling.db")),
+            wal_mode: false,
+            wal_ceiling: WalCeilingPolicy {
+                bytes: 8192,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("a rollback-journal backend cannot enforce a WAL ceiling"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingUnsupported {
+                backend_kind: "non-WAL backend",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn wal_ceiling_refuses_offset_overflow_at_pool_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = i64::MAX as u64 + 1;
+        let error = match ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("wal-ceiling-overflow.db")),
+            wal_ceiling: WalCeilingPolicy {
+                bytes,
+                source: WalCeilingSource::BackendField,
+            },
+            ..PoolConfig::for_test()
+        }) {
+            Ok(_) => panic!("ceiling cannot exceed signed SQLite file offsets"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SqliteError::WalCeilingOffsetOverflow { bytes: observed } if observed == bytes
+        ));
+    }
+
+    #[test]
     fn writer_checkout_and_release_works() {
         let cfg = PoolConfig {
             path: None,
@@ -5408,6 +6812,78 @@ mod tests {
             "the refusal must keep its typed capacity classification"
         );
         assert_eq!(pool.writer_acquisition_snapshot().pooled_acquisitions, 0);
+    }
+
+    #[test]
+    fn db_capacity_floor_keeps_legacy_pool_and_checkpoint_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-capacity.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE existing_data (value INTEGER)")
+            .unwrap();
+        drop(conn);
+
+        let _probe = install_startup_space_probe(100, |_| Ok(100));
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("pool startup must remain available below the reserve");
+
+        assert_eq!(pool.opened_database_id, None);
+        let reader = pool.reader().expect("pooled reads remain available");
+        let exists: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM main.sqlite_master WHERE name = ?1",
+                [DATABASE_ID_TABLE],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0, "low-space startup must not write a nonce");
+        drop(reader);
+        assert!(matches!(
+            pool.writer(),
+            Err(SqliteError::CapacityFloor { .. })
+        ));
+        pool.open_standalone_writer_untracked()
+            .expect("checkpoint infrastructure must still open");
+    }
+
+    #[test]
+    fn read_only_legacy_pool_accepts_later_nonce_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-read-only.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE existing_data (value INTEGER)")
+            .unwrap();
+        drop(conn);
+
+        let read_only = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            read_only: true,
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("open legacy database read-only");
+        assert_eq!(read_only.opened_database_id, None);
+
+        let _probe = install_startup_space_probe(0, |_| {
+            panic!("the disabled floor must not sample disk space")
+        });
+        let writable = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            wal_mode: false,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("writable pool installs the nonce");
+        assert!(writable.opened_database_id.is_some());
+
+        read_only
+            .open_reader_connection()
+            .expect("the preexisting read-only pool must keep replacing readers");
     }
 
     #[test]
@@ -5550,7 +7026,7 @@ mod tests {
         let before = pool.writer_acquisition_snapshot();
 
         assert!(
-            pool.try_writer_nowait().is_err(),
+            pool.try_checkpoint_nowait().is_err(),
             "zero-wait maintenance checkout must skip while held"
         );
 
@@ -5560,6 +7036,43 @@ mod tests {
             "a checkpoint-style zero-wait skip is not a finite-wait checkout timeout"
         );
         drop(held);
+    }
+
+    #[test]
+    fn checkpoint_capability_reclaims_wal_below_the_capacity_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint_floor.db");
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.set_test_write_admission(0, |_| Ok(0));
+        pool.writer()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE checkpoint_floor (id INTEGER); \
+                 INSERT INTO checkpoint_floor VALUES (1)",
+            )
+            .unwrap();
+
+        let wal_path = path.with_extension("db-wal");
+        assert!(std::fs::metadata(&wal_path).unwrap().len() > 0);
+        pool.set_test_write_admission(100, |_| Ok(99));
+        assert!(matches!(
+            pool.writer(),
+            Err(SqliteError::CapacityFloor { .. })
+        ));
+        let before = pool.writer_acquisition_snapshot();
+
+        let checkpoint = pool
+            .try_checkpoint_nowait()
+            .expect("checkpoint recovery must bypass the floor");
+        assert_eq!(checkpoint.passive().unwrap().busy, 0);
+        assert_eq!(checkpoint.truncate().unwrap().busy, 0);
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        assert_eq!(pool.writer_acquisition_snapshot(), before);
     }
 
     /// ADR-091 Plank 0: `WriterGuard::transaction` registers/deregisters a

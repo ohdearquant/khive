@@ -146,7 +146,7 @@ async fn entity_create_and_get_roundtrip() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -156,6 +156,7 @@ async fn entity_create_and_get_roundtrip() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     let fetched = rt.get_entity(&tok, entity.id).await.unwrap();
@@ -172,7 +173,7 @@ async fn entity_create_with_properties_and_tags() {
 
     let props = serde_json::json!({"domain": "fine-tuning", "type": "technique"});
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &research_tok,
             "concept",
             None,
@@ -182,6 +183,7 @@ async fn entity_create_with_properties_and_tags() {
             vec!["fine-tuning".to_string(), "quantization".to_string()],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     let fetched = rt.get_entity(&research_tok, entity.id).await.unwrap();
@@ -267,13 +269,23 @@ async fn entity_list_by_kind() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
 
-    rt.create_entity(&tok, "concept", None, "FlashAttention", None, None, vec![])
+    rt.create_entity_with_embedding_report(
+        &tok,
+        "concept",
+        None,
+        "FlashAttention",
+        None,
+        None,
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
+    rt.create_entity_with_embedding_report(&tok, "concept", None, "GQA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
-    rt.create_entity(&tok, "concept", None, "GQA", None, None, vec![])
-        .await
-        .unwrap();
-    rt.create_entity(
+    rt.create_entity_with_embedding_report(
         &tok,
         "document",
         None,
@@ -283,6 +295,7 @@ async fn entity_list_by_kind() {
         vec![],
     )
     .await
+    .map(|(record, _report)| record)
     .unwrap();
 
     let concepts = rt
@@ -310,8 +323,9 @@ async fn entity_delete_soft() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let entity = rt
-        .create_entity(&tok, "concept", None, "to-delete", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "to-delete", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     let deleted = rt.delete_entity(&tok, entity.id, false).await.unwrap();
@@ -328,13 +342,23 @@ async fn entity_count_by_kind() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     for _ in 0..3 {
-        rt.create_entity(&tok, "concept", None, "concept-X", None, None, vec![])
-            .await
-            .unwrap();
+        rt.create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "concept-X",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .map(|(record, _report)| record)
+        .unwrap();
     }
     for _ in 0..2 {
-        rt.create_entity(&tok, "document", None, "doc-Y", None, None, vec![])
+        rt.create_entity_with_embedding_report(&tok, "document", None, "doc-Y", None, None, vec![])
             .await
+            .map(|(record, _report)| record)
             .unwrap();
     }
 
@@ -357,12 +381,14 @@ async fn link_and_neighbors() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let lora = rt
-        .create_entity(&tok, "concept", None, "LoRA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "LoRA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let qlora = rt
-        .create_entity(&tok, "concept", None, "QLoRA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "QLoRA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     rt.link(&tok, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0, None)
@@ -384,16 +410,19 @@ async fn traverse_multi_hop() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let a = rt
-        .create_entity(&tok, "concept", None, "A", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "A", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let b = rt
-        .create_entity(&tok, "concept", None, "B", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "B", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let c = rt
-        .create_entity(&tok, "concept", None, "C", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "C", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
@@ -439,16 +468,19 @@ async fn traverse_total_weight_excludes_soft_deleted_nodes() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let a = rt
-        .create_entity(&tok, "concept", None, "A", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "A", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let light = rt
-        .create_entity(&tok, "concept", None, "light", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "light", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let heavy = rt
-        .create_entity(&tok, "concept", None, "heavy", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "heavy", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     rt.link(&tok, a.id, light.id, EdgeRelation::Extends, 0.25, None)
@@ -583,12 +615,14 @@ async fn query_via_gql() {
 
     // Set up entities and edges
     let lora = rt
-        .create_entity(&tok, "concept", None, "LoRA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "LoRA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let qlora = rt
-        .create_entity(&tok, "concept", None, "QLoRA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "QLoRA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(&tok, qlora.id, lora.id, EdgeRelation::VariantOf, 1.0, None)
         .await
@@ -626,9 +660,18 @@ async fn query_via_gql_inline_property_map_integer_literal_matches_json_number()
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let props = serde_json::json!({"number": 54});
-    rt.create_entity(&tok, "artifact", None, "PR #54", None, Some(props), vec![])
-        .await
-        .unwrap();
+    rt.create_entity_with_embedding_report(
+        &tok,
+        "artifact",
+        None,
+        "PR #54",
+        None,
+        Some(props),
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
 
     let rows = rt
         .query(&tok, "MATCH (n:artifact {number: 54}) RETURN n")
@@ -648,9 +691,18 @@ async fn query_via_gql_inline_property_map_quoted_number_does_not_match_json_num
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let props = serde_json::json!({"number": 54});
-    rt.create_entity(&tok, "artifact", None, "PR #54", None, Some(props), vec![])
-        .await
-        .unwrap();
+    rt.create_entity_with_embedding_report(
+        &tok,
+        "artifact",
+        None,
+        "PR #54",
+        None,
+        Some(props),
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
 
     let rows = rt
         .query(&tok, "MATCH (n:artifact {number: '54'}) RETURN n")
@@ -681,9 +733,18 @@ async fn query_via_gql_inline_property_map_large_integer_matches_exact_json_numb
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let props = serde_json::json!({"number": 9007199254740993i64});
-    rt.create_entity(&tok, "artifact", None, "big", None, Some(props), vec![])
-        .await
-        .unwrap();
+    rt.create_entity_with_embedding_report(
+        &tok,
+        "artifact",
+        None,
+        "big",
+        None,
+        Some(props),
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
 
     let rows = rt
         .query(
@@ -706,9 +767,18 @@ async fn query_via_gql_where_equality_large_integer_matches_exact_json_number() 
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let props = serde_json::json!({"number": 9007199254740993i64});
-    rt.create_entity(&tok, "artifact", None, "big", None, Some(props), vec![])
-        .await
-        .unwrap();
+    rt.create_entity_with_embedding_report(
+        &tok,
+        "artifact",
+        None,
+        "big",
+        None,
+        Some(props),
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
 
     let rows = rt
         .query(
@@ -728,9 +798,18 @@ async fn query_via_gql_inline_property_map_i64_bounds_match_exact_json_number() 
 
     for bound in [i64::MIN, i64::MAX] {
         let props = serde_json::json!({"number": bound});
-        rt.create_entity(&tok, "artifact", None, "bound", None, Some(props), vec![])
-            .await
-            .unwrap();
+        rt.create_entity_with_embedding_report(
+            &tok,
+            "artifact",
+            None,
+            "bound",
+            None,
+            Some(props),
+            vec![],
+        )
+        .await
+        .map(|(record, _report)| record)
+        .unwrap();
 
         let rows = rt
             .query(
@@ -755,9 +834,18 @@ async fn query_via_gql_where_equality_i64_bounds_match_exact_json_number() {
 
     for bound in [i64::MIN, i64::MAX] {
         let props = serde_json::json!({"number": bound});
-        rt.create_entity(&tok, "artifact", None, "bound", None, Some(props), vec![])
-            .await
-            .unwrap();
+        rt.create_entity_with_embedding_report(
+            &tok,
+            "artifact",
+            None,
+            "bound",
+            None,
+            Some(props),
+            vec![],
+        )
+        .await
+        .map(|(record, _report)| record)
+        .unwrap();
 
         let rows = rt
             .query(
@@ -788,7 +876,7 @@ async fn query_via_gql_where_equality_i64_bounds_match_exact_json_number() {
 async fn seed_concepts(rt: &KhiveRuntime, ns: &str, n: usize) -> khive_runtime::NamespaceToken {
     let tok = rt.authorize(Namespace::parse(ns).unwrap()).unwrap();
     for i in 0..n {
-        rt.create_entity(
+        rt.create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -798,6 +886,7 @@ async fn seed_concepts(rt: &KhiveRuntime, ns: &str, n: usize) -> khive_runtime::
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     }
     tok
@@ -1247,12 +1336,14 @@ async fn query_static_impossible_pattern_precedes_concept_concept_warns_and_retu
     // Real `precedes` edges exist — just never between two concepts (issue
     // #593's repro: 3445 `precedes` edges in the wild, all document/project/etc).
     let d1 = rt
-        .create_entity(&tok, "document", None, "Doc1", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "document", None, "Doc1", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let d2 = rt
-        .create_entity(&tok, "document", None, "Doc2", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "document", None, "Doc2", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(&tok, d1.id, d2.id, EdgeRelation::Precedes, 1.0, None)
         .await
@@ -1288,12 +1379,14 @@ async fn query_static_possible_pattern_extends_concept_concept_no_warning() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let a = rt
-        .create_entity(&tok, "concept", None, "LoRA2", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "LoRA2", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let b = rt
-        .create_entity(&tok, "concept", None, "QLoRA2", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "QLoRA2", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(&tok, b.id, a.id, EdgeRelation::Extends, 1.0, None)
         .await
@@ -1358,12 +1451,14 @@ async fn query_static_impossible_check_honors_pack_extended_endpoint_rules() {
     }]);
 
     let p = rt
-        .create_entity(&tok, "person", None, "Ada", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "person", None, "Ada", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let o = rt
-        .create_entity(&tok, "org", None, "Acme", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "org", None, "Acme", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(&tok, p.id, o.id, EdgeRelation::PartOf, 1.0, None)
         .await
@@ -1403,12 +1498,14 @@ async fn link_and_hint_agree_special_relation_pack_rules_never_enforced() {
     }]);
 
     let p1 = rt
-        .create_entity(&tok, "person", None, "Old Ada", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "person", None, "Old Ada", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let p2 = rt
-        .create_entity(&tok, "person", None, "New Ada", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "person", None, "New Ada", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     let link_result = rt
@@ -1443,12 +1540,14 @@ async fn query_static_possible_pattern_inbound_introduced_by_no_warning() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let doc = rt
-        .create_entity(&tok, "document", None, "Paper", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "document", None, "Paper", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let author = rt
-        .create_entity(&tok, "person", None, "Author", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "person", None, "Author", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(
         &tok,
@@ -1503,11 +1602,20 @@ async fn query_static_possible_pattern_entity_of_type_pack_rule_no_false_warning
     }]);
 
     let thm = rt
-        .create_entity(&tok, "concept", Some("theorem"), "T1", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            Some("theorem"),
+            "T1",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let def = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             Some("definition"),
@@ -1517,6 +1625,7 @@ async fn query_static_possible_pattern_entity_of_type_pack_rule_no_false_warning
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(&tok, thm.id, def.id, EdgeRelation::DependsOn, 1.0, None)
         .await
@@ -1566,11 +1675,20 @@ async fn query_static_possible_pattern_untyped_endpoints_with_entity_of_type_rul
     }]);
 
     let thm = rt
-        .create_entity(&tok, "concept", Some("theorem"), "T1", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            Some("theorem"),
+            "T1",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let def = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             Some("definition"),
@@ -1580,6 +1698,7 @@ async fn query_static_possible_pattern_untyped_endpoints_with_entity_of_type_rul
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(&tok, thm.id, def.id, EdgeRelation::DependsOn, 1.0, None)
         .await
@@ -1814,12 +1933,14 @@ async fn query_static_impossible_check_skips_sparql() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let d1 = rt
-        .create_entity(&tok, "document", None, "Doc1", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "document", None, "Doc1", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let d2 = rt
-        .create_entity(&tok, "document", None, "Doc2", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "document", None, "Doc2", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(&tok, d1.id, d2.id, EdgeRelation::Precedes, 1.0, None)
         .await
@@ -1853,12 +1974,30 @@ async fn namespace_isolation() {
     let ns_a_tok = rt.authorize(Namespace::parse("ns-a").unwrap()).unwrap();
     let ns_b_tok = rt.authorize(Namespace::parse("ns-b").unwrap()).unwrap();
 
-    rt.create_entity(&ns_a_tok, "concept", None, "EntityA", None, None, vec![])
-        .await
-        .unwrap();
-    rt.create_entity(&ns_b_tok, "concept", None, "EntityB", None, None, vec![])
-        .await
-        .unwrap();
+    rt.create_entity_with_embedding_report(
+        &ns_a_tok,
+        "concept",
+        None,
+        "EntityA",
+        None,
+        None,
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
+    rt.create_entity_with_embedding_report(
+        &ns_b_tok,
+        "concept",
+        None,
+        "EntityB",
+        None,
+        None,
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
 
     let a_entities = rt
         .list_entities(&ns_a_tok, None, None, 50, 0)
@@ -1884,7 +2023,7 @@ async fn create_entity_indexes_into_text_search() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let tok = rt.authorize(Namespace::local()).unwrap();
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -1894,6 +2033,7 @@ async fn create_entity_indexes_into_text_search() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let hits = rt
         .hybrid_search(&tok, "FlashAttention", None, 10, None, None, &[], None)
@@ -1911,7 +2051,7 @@ async fn create_entity_no_embedding_model_does_not_propagate_vector_error() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let tok = rt.authorize(Namespace::local()).unwrap();
     let result = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -1920,7 +2060,8 @@ async fn create_entity_no_embedding_model_does_not_propagate_vector_error() {
             None,
             vec![],
         )
-        .await;
+        .await
+        .map(|(record, _report)| record);
     assert!(
         result.is_ok(),
         "create_entity must not propagate Unconfigured from vector store"
@@ -1937,7 +2078,7 @@ async fn hybrid_search_excludes_soft_deleted_entities() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let tok = rt.authorize(Namespace::local()).unwrap();
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -1947,6 +2088,7 @@ async fn hybrid_search_excludes_soft_deleted_entities() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     // Confirm the entity is visible before deletion.
@@ -1977,7 +2119,7 @@ async fn hybrid_search_excludes_hard_deleted_entities() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let tok = rt.authorize(Namespace::local()).unwrap();
     let entity = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -1987,6 +2129,7 @@ async fn hybrid_search_excludes_hard_deleted_entities() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     let hits_before = rt
@@ -2062,6 +2205,10 @@ async fn file_backed_runtime_persists() {
 
     {
         let config = RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -2082,17 +2229,31 @@ async fn file_backed_runtime_persists() {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         };
         let rt = KhiveRuntime::new_for_test(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
-        rt.create_entity(&tok, "concept", None, "Persistent", None, None, vec![])
-            .await
-            .unwrap();
+        rt.create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Persistent",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .map(|(record, _report)| record)
+        .unwrap();
     }
 
     // Re-open the same file
     {
         let config = RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -2113,6 +2274,7 @@ async fn file_backed_runtime_persists() {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         };
         let rt = KhiveRuntime::new_for_test(config).unwrap();
         let tok = rt.authorize(Namespace::local()).unwrap();
@@ -2244,12 +2406,14 @@ async fn update_edge_returns_surviving_canonical_id_on_conflict() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let a = rt
-        .create_entity(&tok, "concept", None, "SurvA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "SurvA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let b = rt
-        .create_entity(&tok, "concept", None, "SurvB", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "SurvB", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     // E1: canonical competes_with between A and B (runtime canonicalises order).
@@ -2337,12 +2501,14 @@ async fn update_edge_canonical_orientation_conflict() {
     let tok = rt.authorize(Namespace::local()).unwrap();
 
     let a = rt
-        .create_entity(&tok, "concept", None, "CanOrA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "CanOrA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let b = rt
-        .create_entity(&tok, "concept", None, "CanOrB", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "CanOrB", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     // Determine canonical order: canon_lo < canon_hi.
@@ -2427,7 +2593,7 @@ async fn entity_create_blocks_secret_in_properties() {
     // A fake AWS key embedded in entity properties — must be blocked.
     let props = serde_json::json!({ "api_key": "AKIAFAKEKEY1234567890" });
     let result = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -2436,7 +2602,8 @@ async fn entity_create_blocks_secret_in_properties() {
             Some(props),
             vec![],
         )
-        .await;
+        .await
+        .map(|(record, _report)| record);
     assert!(
         result.is_err(),
         "entity create with secret in properties must be blocked"
@@ -2459,8 +2626,9 @@ async fn entity_create_blocks_secret_in_tags() {
         "AKIAFAKEKEY1234567890".to_string(),
     ];
     let result = rt
-        .create_entity(&tok, "concept", None, "TestEntity", None, None, tags)
-        .await;
+        .create_entity_with_embedding_report(&tok, "concept", None, "TestEntity", None, None, tags)
+        .await
+        .map(|(record, _report)| record);
     assert!(
         result.is_err(),
         "entity create with secret in tags must be blocked"
@@ -2706,7 +2874,7 @@ mod embedder_registry_tests {
             token: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             self.runtime
-                .create_entity(
+                .create_entity_with_embedding_report(
                     token,
                     "concept",
                     None,
@@ -2715,13 +2883,18 @@ mod embedder_registry_tests {
                     None,
                     vec![],
                 )
-                .await?;
+                .await
+                .map(|(record, _report)| record)?;
             Ok(Value::Null)
         }
     }
 
     fn memory_rt_no_model() -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -2742,6 +2915,7 @@ mod embedder_registry_tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("in-memory runtime")
     }
@@ -2882,6 +3056,10 @@ mod embedder_registry_tests {
     async fn dual_embedding_regression_both_models_registered() {
         use khive_runtime::RuntimeConfig;
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -2902,6 +3080,7 @@ mod embedder_registry_tests {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime with two models");
 
@@ -3070,12 +3249,14 @@ async fn link_concept_concept_supports_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let a = rt
-        .create_entity(&tok, "concept", None, "Finding A", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Finding A", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let b = rt
-        .create_entity(&tok, "concept", None, "Claim B", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Claim B", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok, a.id, b.id, EdgeRelation::Supports, 0.8, None)
@@ -3092,12 +3273,22 @@ async fn link_document_concept_supports_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let doc = rt
-        .create_entity(&tok, "document", None, "Paper X", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "document", None, "Paper X", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let claim = rt
-        .create_entity(&tok, "concept", None, "Hypothesis Y", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Hypothesis Y",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok, doc.id, claim.id, EdgeRelation::Supports, 0.9, None)
@@ -3112,7 +3303,7 @@ async fn link_concept_concept_refutes_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let a = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -3122,10 +3313,12 @@ async fn link_concept_concept_refutes_accepted() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let b = rt
-        .create_entity(&tok, "concept", None, "Claim B", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Claim B", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok, a.id, b.id, EdgeRelation::Refutes, 0.7, None)
@@ -3140,12 +3333,22 @@ async fn link_document_concept_refutes_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let doc = rt
-        .create_entity(&tok, "document", None, "Negative study", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "document",
+            None,
+            "Negative study",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let claim = rt
-        .create_entity(&tok, "concept", None, "Claim C", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Claim C", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok, doc.id, claim.id, EdgeRelation::Refutes, 0.85, None)
@@ -3264,8 +3467,17 @@ async fn link_note_entity_supports_rejected() {
         .await
         .unwrap();
     let entity = rt
-        .create_entity(&tok, "concept", None, "Some concept", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Some concept",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let result = rt
         .link(&tok, note.id, entity.id, EdgeRelation::Supports, 0.8, None)
@@ -3287,8 +3499,9 @@ async fn link_entity_note_refutes_rejected() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let entity = rt
-        .create_entity(&tok, "concept", None, "A concept", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "A concept", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let note = rt
         .create_note(
@@ -3324,12 +3537,30 @@ async fn link_person_concept_supports_rejected_with_relation_name() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let person = rt
-        .create_entity(&tok, "person", None, "Researcher A", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "person",
+            None,
+            "Researcher A",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let claim = rt
-        .create_entity(&tok, "concept", None, "Hypothesis Z", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Hypothesis Z",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let result = rt
         .link(&tok, person.id, claim.id, EdgeRelation::Supports, 0.5, None)
@@ -3353,12 +3584,22 @@ async fn link_dataset_concept_supports_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let ds = rt
-        .create_entity(&tok, "dataset", None, "Bench-X", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "dataset", None, "Bench-X", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let claim = rt
-        .create_entity(&tok, "concept", None, "Hypothesis Q", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Hypothesis Q",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok, ds.id, claim.id, EdgeRelation::Supports, 0.8, None)
@@ -3373,12 +3614,22 @@ async fn link_artifact_concept_refutes_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let art = rt
-        .create_entity(&tok, "artifact", None, "Checkpoint-v1", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "artifact",
+            None,
+            "Checkpoint-v1",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let claim = rt
-        .create_entity(&tok, "concept", None, "Claim R", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Claim R", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok, art.id, claim.id, EdgeRelation::Refutes, 0.7, None)
@@ -3393,12 +3644,22 @@ async fn link_artifact_concept_supports_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let art = rt
-        .create_entity(&tok, "artifact", None, "Checkpoint-v2", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "artifact",
+            None,
+            "Checkpoint-v2",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let claim = rt
-        .create_entity(&tok, "concept", None, "Claim T", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Claim T", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok, art.id, claim.id, EdgeRelation::Supports, 0.8, None)
@@ -3415,12 +3676,22 @@ async fn link_dataset_concept_refutes_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let ds = rt
-        .create_entity(&tok, "dataset", None, "Bench-Y", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "dataset", None, "Bench-Y", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let claim = rt
-        .create_entity(&tok, "concept", None, "Hypothesis W", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Hypothesis W",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok, ds.id, claim.id, EdgeRelation::Refutes, 0.75, None)
@@ -3442,7 +3713,7 @@ async fn update_edge_to_supports_on_legal_entity_pair_accepted() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let evidence = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok,
             "concept",
             None,
@@ -3452,10 +3723,20 @@ async fn update_edge_to_supports_on_legal_entity_pair_accepted() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let claim = rt
-        .create_entity(&tok, "concept", None, "Hypothesis H", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Hypothesis H",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     // Start with Extends (legal for concept→concept).
     let edge = rt
@@ -3492,12 +3773,22 @@ async fn update_edge_to_supports_on_disallowed_entity_pair_rejected() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let person = rt
-        .create_entity(&tok, "person", None, "Researcher B", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "person",
+            None,
+            "Researcher B",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let concept = rt
-        .create_entity(&tok, "concept", None, "Claim S", None, None, vec![])
+        .create_entity_with_embedding_report(&tok, "concept", None, "Claim S", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     // Person→Concept with a relation that IS legal to start (introduced_by is
     // illegal for person→concept too — use enables which IS legal for person
@@ -3551,8 +3842,17 @@ async fn update_edge_annotates_to_supports_rejected_cross_substrate() {
     let rt = rt();
     let tok = rt.authorize(Namespace::local()).unwrap();
     let entity = rt
-        .create_entity(&tok, "concept", None, "Target concept", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok,
+            "concept",
+            None,
+            "Target concept",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let note = rt
         .create_note(
@@ -3670,16 +3970,19 @@ async fn visible_set_reads_primary_and_extra_not_third() {
 
     // Write one entity and one note in each namespace.
     let entity_a = rt
-        .create_entity(&tok_a, "concept", None, "EntityA", None, None, vec![])
+        .create_entity_with_embedding_report(&tok_a, "concept", None, "EntityA", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let entity_b = rt
-        .create_entity(&tok_b, "concept", None, "EntityB", None, None, vec![])
+        .create_entity_with_embedding_report(&tok_b, "concept", None, "EntityB", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let entity_c = rt
-        .create_entity(&tok_c, "concept", None, "EntityC", None, None, vec![])
+        .create_entity_with_embedding_report(&tok_c, "concept", None, "EntityC", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     let note_a = rt
@@ -3770,7 +4073,7 @@ async fn visible_set_reads_primary_and_extra_not_third() {
 
     // --- WRITE via vis_tok lands in primary (vis-a) only, not in vis-b ---
     let written = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &vis_tok,
             "concept",
             None,
@@ -3780,6 +4083,7 @@ async fn visible_set_reads_primary_and_extra_not_third() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     assert_eq!(
         written.namespace.as_str(),
@@ -3811,12 +4115,30 @@ async fn namespace_isolation_backward_compat() {
     let ns_a_tok = rt.authorize(Namespace::parse("bc-a").unwrap()).unwrap();
     let ns_b_tok = rt.authorize(Namespace::parse("bc-b").unwrap()).unwrap();
 
-    rt.create_entity(&ns_a_tok, "concept", None, "EntityA", None, None, vec![])
-        .await
-        .unwrap();
-    rt.create_entity(&ns_b_tok, "concept", None, "EntityB", None, None, vec![])
-        .await
-        .unwrap();
+    rt.create_entity_with_embedding_report(
+        &ns_a_tok,
+        "concept",
+        None,
+        "EntityA",
+        None,
+        None,
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
+    rt.create_entity_with_embedding_report(
+        &ns_b_tok,
+        "concept",
+        None,
+        "EntityB",
+        None,
+        None,
+        vec![],
+    )
+    .await
+    .map(|(record, _report)| record)
+    .unwrap();
 
     let a_entities = rt
         .list_entities(&ns_a_tok, None, None, 50, 0)
@@ -3926,12 +4248,30 @@ async fn link_target_in_visible_but_not_primary_namespace_succeeds() {
         .unwrap();
 
     let entity_a = rt
-        .create_entity(&tok_a, "concept", None, "SrcEntity", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok_a,
+            "concept",
+            None,
+            "SrcEntity",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let entity_b = rt
-        .create_entity(&tok_b, "concept", None, "TgtEntity", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok_b,
+            "concept",
+            None,
+            "TgtEntity",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     // primary=link-mut-a, visible=[link-mut-a, link-mut-b].
@@ -3974,8 +4314,17 @@ async fn create_note_annotates_target_in_visible_only_namespace_succeeds() {
         .unwrap();
 
     let entity_b = rt
-        .create_entity(&tok_b, "concept", None, "AnnotTarget", None, None, vec![])
+        .create_entity_with_embedding_report(
+            &tok_b,
+            "concept",
+            None,
+            "AnnotTarget",
+            None,
+            None,
+            vec![],
+        )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     // primary=ann-mut-a, visible=[ann-mut-a, ann-mut-b].
@@ -4026,7 +4375,7 @@ async fn hybrid_search_surfaces_all_visible_namespaces() {
 
     // Create an entity in primary namespace with a distinctive term.
     let entity_in_primary = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_primary,
             "concept",
             None,
@@ -4036,11 +4385,12 @@ async fn hybrid_search_surfaces_all_visible_namespaces() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     // Create an entity in the extra namespace with the same distinctive term.
     let entity_in_extra = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_extra,
             "concept",
             None,
@@ -4050,6 +4400,7 @@ async fn hybrid_search_surfaces_all_visible_namespaces() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     // Visible-set token: primary = hs-primary-ns, also sees hs-extra-ns.
@@ -4128,7 +4479,10 @@ async fn update_note_cross_namespace_succeeds() {
 
     // Update from a different token — must succeed.
     let patch = NotePatch::new(None, Some("updated content".to_string()), None, None, None);
-    let updated = rt.update_note(&tok_b, note.id, patch).await;
+    let updated = rt
+        .update_note_with_embedding_report(&tok_b, note.id, patch)
+        .await
+        .map(|(record, _report)| record);
     assert!(
         updated.is_ok(),
         "update_note from foreign token must succeed; got {:?}",
@@ -4229,7 +4583,7 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_soft() {
 
     // Create two entities in ns-owner and link them.
     let src = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_owner,
             "concept",
             None,
@@ -4239,9 +4593,10 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_soft() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let tgt = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_owner,
             "concept",
             None,
@@ -4251,6 +4606,7 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_soft() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok_owner, src.id, tgt.id, EdgeRelation::Extends, 0.5, None)
@@ -4327,7 +4683,7 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_hard() {
 
     // Create two entities in ns-owner-hard and link them.
     let src = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_owner,
             "concept",
             None,
@@ -4337,9 +4693,10 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_hard() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let tgt = rt
-        .create_entity(
+        .create_entity_with_embedding_report(
             &tok_owner,
             "concept",
             None,
@@ -4349,6 +4706,7 @@ async fn delete_edge_cross_namespace_audit_uses_record_namespace_hard() {
             vec![],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let edge = rt
         .link(&tok_owner, src.id, tgt.id, EdgeRelation::Extends, 0.6, None)
@@ -4430,16 +4788,19 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
 
     // Entities: 2 in ns_a, 2 in ns_b (b2 created below, alongside the edges).
     let a1 = rt
-        .create_entity(&tok_a, "concept", None, "StatsA1", None, None, vec![])
+        .create_entity_with_embedding_report(&tok_a, "concept", None, "StatsA1", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let a2 = rt
-        .create_entity(&tok_a, "concept", None, "StatsA2", None, None, vec![])
+        .create_entity_with_embedding_report(&tok_a, "concept", None, "StatsA2", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     let b1 = rt
-        .create_entity(&tok_b, "concept", None, "StatsB1", None, None, vec![])
+        .create_entity_with_embedding_report(&tok_b, "concept", None, "StatsB1", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
 
     // Edges: two `extends` in ns_a, one `enables` in ns_b.
@@ -4450,8 +4811,9 @@ async fn stats_totals_match_list_walk_across_visible_namespaces() {
         .await
         .unwrap();
     let b2 = rt
-        .create_entity(&tok_b, "concept", None, "StatsB2", None, None, vec![])
+        .create_entity_with_embedding_report(&tok_b, "concept", None, "StatsB2", None, None, vec![])
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     rt.link(&tok_b, b1.id, b2.id, EdgeRelation::Enables, 1.0, None)
         .await

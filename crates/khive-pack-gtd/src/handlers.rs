@@ -305,10 +305,7 @@ pub struct TransitionParams {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+use khive_runtime::deser_params as deser;
 
 /// #2679: merge the shared `khive_storage::types::LimitReport`
 /// (`requested_limit`, `effective_limit`, `limit_clamped = requested >
@@ -1007,6 +1004,7 @@ pub fn gtd_transition_statement(
             snapshot.updated_at
         )));
     }
+    khive_runtime::secret_gate::reject_reserved_secret_gate_property(Some(new_props))?;
     let props_str = serde_json::to_string(new_props)
         .map_err(|e| RuntimeError::Internal(format!("serialize props: {e}")))?;
     Ok(SqlStatement {
@@ -1372,6 +1370,8 @@ impl GtdPack {
         let prepared =
             crate::task_create::prepare_task_create(self.runtime(), token, input).await?;
 
+        let mut embedding_truncation =
+            khive_runtime::retrieval::EmbeddingTruncationReport::default();
         let (note, replayed) = if let Some(key) = p.idempotency_key.as_deref() {
             khive_runtime::keyed_memory::validate_memory_key(key)?;
             let existing = self
@@ -1408,7 +1408,10 @@ impl GtdPack {
                     )
                     .await
                 {
-                    Ok((note, _)) => (note, false),
+                    Ok((note, truncation)) => {
+                        embedding_truncation = truncation;
+                        (note, false)
+                    }
                     Err(error) => {
                         let raced = self
                             .runtime()
@@ -1430,20 +1433,24 @@ impl GtdPack {
                 }
             }
         } else {
-            (
-                self.runtime()
-                    .create_note(
-                        token,
-                        "task",
-                        Some(prepared.title.as_str()),
-                        &prepared.content,
-                        Some(prepared.salience),
-                        Some(prepared.properties.clone()),
-                        prepared.annotates.clone(),
-                    )
-                    .await?,
-                false,
-            )
+            // The report-returning variant keeps a truncated embedding input
+            // from failing the call after the task is committed, which would
+            // skip the `depends_on` edges recorded below.
+            let (note, truncation) = self
+                .runtime()
+                .create_note_with_embedding_content_and_report(
+                    token,
+                    "task",
+                    Some(prepared.title.as_str()),
+                    &prepared.content,
+                    None,
+                    Some(prepared.salience),
+                    Some(prepared.properties.clone()),
+                    prepared.annotates.clone(),
+                )
+                .await?;
+            embedding_truncation = truncation;
+            (note, false)
         };
 
         // Record `depends_on` as graph edges (the GTD pack's `EDGE_RULES` extends
@@ -1467,6 +1474,20 @@ impl GtdPack {
         let mut response = render_task(&note);
         if replayed {
             response["replayed"] = json!(true);
+        }
+        // Replay skips embedding, but an identical retry still needs the
+        // disclosure if the stored content exceeds a selected model's budget.
+        let replayed_input_truncated = replayed
+            && self
+                .runtime()
+                .embedding_models_for_note_kind(&note.kind)
+                .iter()
+                .any(|model| {
+                    note.content.len() > khive_runtime::retrieval::document_embedding_budget(model)
+                });
+        if embedding_truncation.any_truncated() || replayed_input_truncated {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
         }
         Ok(response)
     }

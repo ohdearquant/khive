@@ -8,6 +8,7 @@ members = [
     "khive-fold",
     "khive-storage",
     "khive-text",
+    "khive-fs",
     "khive-db",
     "khive-query",
     "khive-gate",
@@ -48,6 +49,7 @@ members = [
     "khive-retrieval",
     "khive-repo-showcase",
     "khive-channel",
+    "khive-channel-node",
     "khive-channel-email",
     "khive-channel-telegram",
 ]

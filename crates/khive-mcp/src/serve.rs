@@ -3,6 +3,9 @@
 //! This is the bootstrap that the `kkernel mcp` subcommand drives. Logging is
 //! initialized by the binary, not here.
 
+#[path = "serve/claimed_backend.rs"]
+mod claimed_backend;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -139,6 +142,11 @@ pub fn db_override_refusal_envelope(error: &anyhow::Error) -> Option<serde_json:
 /// where a second concurrently-booting process could run schema DDL against
 /// the same database file at the same time — see
 /// [`khive_runtime::daemon::run_daemon_with_boot_guard`].
+/// Run the server using the supplied transport registry.
+///
+/// Library hosts enabling file-backed daemon boot on Unix must initialize
+/// `khive_db::pool::initialize_claimed_file_observer` before any SQLite I/O,
+/// following its unsafe startup contract. The stock `kkernel` binary does so.
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
     #[cfg(unix)]
     if !args.daemon && args.transport.as_deref().unwrap_or("stdio") == "stdio" {
@@ -205,9 +213,12 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
-            start_host_background_tasks(&args, server, schedule_rt)
-        })
+        khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
+            server,
+            boot_guard,
+            args.daemon_options(),
+            |server| start_host_background_tasks(&args, server, schedule_rt),
+        )
         .await?;
         return Ok(());
     }
@@ -227,16 +238,134 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     serve_with_session_sweep(server, &args, registry).await
 }
 
+fn daemon_startup_report(
+    args: &Args,
+    server: &KhiveMcpServer,
+    has_schedule: bool,
+) -> khive_runtime::daemon::DaemonStartupReport {
+    let mut report = khive_runtime::daemon::DaemonStartupReport::default();
+    if args.daemon
+        && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
+    {
+        #[cfg(feature = "channel-email")]
+        report.skipped_components.extend([
+            "email_channel_poll".to_owned(),
+            "email_channel_outbound".to_owned(),
+        ]);
+        #[cfg(feature = "channel-telegram")]
+        report.skipped_components.extend([
+            "telegram_channel_poll".to_owned(),
+            "telegram_channel_outbound".to_owned(),
+        ]);
+        if has_schedule {
+            report.skipped_components.push("schedule-tick".to_owned());
+        }
+        report.idle_ineligible_reasons = crate::components::idle_retirement_obligations(server);
+        #[cfg(unix)]
+        if !server.default_runtime_is_read_only()
+            && server
+                .events_split_config()
+                .is_some_and(|split| split.socket_path.is_some())
+        {
+            report
+                .idle_ineligible_reasons
+                .push("events_child_may_be_exclusively_owned".to_owned());
+        }
+    }
+    report
+}
+
 fn start_host_background_tasks(
     args: &Args,
     server: &KhiveMcpServer,
     schedule_rt: Option<KhiveRuntime>,
-) {
+) -> khive_runtime::daemon::DaemonStartupReport {
+    let report = daemon_startup_report(args, server, schedule_rt.is_some());
+    if args.daemon
+        && args.daemon_options().lifetime == khive_runtime::daemon::DaemonLifetime::Demand
+    {
+        for component in &report.skipped_components {
+            tracing::info!(component, "demand daemon: background component skipped");
+        }
+        start_daemon_components_if_daemon(args, server, None);
+        return report;
+    }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(server, args);
     #[cfg(feature = "channel-telegram")]
     spawn_telegram_channel_loops_if_daemon(server, args);
     start_daemon_components_if_daemon(args, server, schedule_rt);
+    report
+}
+
+#[cfg(all(test, unix))]
+mod demand_startup_tests {
+    use super::*;
+    use clap::Parser;
+
+    fn runtime_config() -> khive_runtime::RuntimeConfig {
+        khive_runtime::RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            actor_id: Some("test:demand-startup".to_owned()),
+            packs: vec!["kg".to_owned()],
+            events_split: None,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn configured_channels_and_schedule_are_skipped_by_real_startup() {
+        let runtime = KhiveRuntime::new(runtime_config()).unwrap();
+        let server = KhiveMcpServer::new(runtime.clone()).unwrap();
+        let demand = Args::parse_from(["mcp", "--daemon", "--lifetime", "demand"]);
+        let before = khive_runtime::daemon::background_task_count();
+        let report = start_host_background_tasks(&demand, &server, Some(runtime));
+        assert_eq!(
+            khive_runtime::daemon::background_task_count(),
+            before,
+            "a configured schedule must not create its supervised worker"
+        );
+        assert!(report
+            .skipped_components
+            .contains(&"schedule-tick".to_owned()));
+        #[cfg(feature = "channel-email")]
+        assert!(report
+            .skipped_components
+            .contains(&"email_channel_poll".to_owned()));
+        #[cfg(feature = "channel-telegram")]
+        assert!(report
+            .skipped_components
+            .contains(&"telegram_channel_poll".to_owned()));
+        let persistent = Args::parse_from(["mcp", "--daemon"]);
+        assert!(daemon_startup_report(&persistent, &server, true)
+            .skipped_components
+            .is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn events_supervision_configuration_is_idle_ineligible() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = runtime_config();
+        config.events_split = Some(khive_runtime::events_split::EventsSplitConfig {
+            db_path: dir.path().join("events.db"),
+            socket_path: Some(dir.path().join("events.sock")),
+        });
+        let server = KhiveMcpServer::new(KhiveRuntime::new(config).unwrap()).unwrap();
+        let demand = Args::parse_from(["mcp", "--daemon", "--lifetime", "demand"]);
+        let report = daemon_startup_report(&demand, &server, false);
+        assert!(report
+            .idle_ineligible_reasons
+            .contains(&"events_child_may_be_exclusively_owned".to_owned()));
+        assert!(
+            daemon_startup_report(&Args::parse_from(["mcp", "--daemon"]), &server, false)
+                .idle_ineligible_reasons
+                .is_empty()
+        );
+    }
 }
 
 /// Whether this process owns the email channel loops (#602).
@@ -267,6 +396,23 @@ fn channel_loop_plan(server: &KhiveMcpServer, args: &Args) -> crate::server::Cha
         server.channel_loop_admission()
     } else {
         crate::server::ChannelLoopAdmission::default()
+    }
+}
+
+/// Name the reason inbound polling was refused when the comm runtime is
+/// writable but the blob pack's runtime is not. Comm's own read-only refusal is
+/// reported by the callers' skip line; this is the blob counterpart.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+fn log_inbound_refused_for_read_only_blob(
+    channel_kind: &str,
+    admission: crate::server::ChannelLoopAdmission,
+) {
+    if admission.inbound_blocked_by_read_only_blob {
+        tracing::error!(
+            channel = channel_kind,
+            "{channel_kind} inbound polling not started: the blob pack runtime is read-only, so \
+             quarantined originals cannot be stored; assign the blob pack a writable backend"
+        );
     }
 }
 
@@ -415,6 +561,7 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
         tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
         return;
     }
+    log_inbound_refused_for_read_only_blob("email", admission);
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
             "email channel loops: skipped (assigned comm runtime does not admit writes)"
@@ -458,11 +605,18 @@ fn start_daemon_components_if_daemon(
     #[cfg(unix)]
     if server.default_runtime_is_read_only() {
         tracing::info!("read-only deployment: events daemon supervision skipped");
-    } else if let Some(split) = server.events_split_config() {
+    } else if let (Some(split), Some(wal_ceiling)) = (
+        server.events_split_config(),
+        server.events_wal_ceiling_policy(),
+    ) {
         if let Some(socket) = split.socket_path.clone() {
             khive_runtime::daemon::track_named_background_task(
                 "events_daemon_supervision",
-                khive_runtime::events_split::supervise_events_daemon(split.db_path.clone(), socket),
+                khive_runtime::events_split::supervise_events_daemon_with_wal_ceiling(
+                    split.db_path.clone(),
+                    socket,
+                    wal_ceiling,
+                ),
             );
         }
     }
@@ -478,12 +632,31 @@ fn writable_schedule_runtime(runtime: Option<KhiveRuntime>) -> Option<KhiveRunti
     runtime.filter(|runtime| !runtime.is_read_only())
 }
 
+#[cfg(all(test, feature = "channel-email"))]
+thread_local! {
+    static EMAIL_POLL_TEST_CHANNEL: std::cell::RefCell<Option<std::sync::Arc<dyn khive_channel::Channel>>> =
+        const { std::cell::RefCell::new(None) };
+    static EMAIL_POLL_TEST_SHUTDOWN: std::cell::RefCell<Option<tokio_util::sync::CancellationToken>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "channel-email")]
+fn email_poll_shutdown_token(
+    process_shutdown: tokio_util::sync::CancellationToken,
+) -> tokio_util::sync::CancellationToken {
+    #[cfg(test)]
+    let process_shutdown = EMAIL_POLL_TEST_SHUTDOWN
+        .with(|token| token.borrow_mut().take())
+        .unwrap_or(process_shutdown);
+    process_shutdown
+}
+
+#[cfg(feature = "channel-email")]
 /// Spawn the email channel polling + outbox loops if the `channel-email`
 /// feature is enabled and `KHIVE_EMAIL_*` config resolves. Non-fatal: logs a
 /// warning and returns on incomplete config. Only call this with the
 /// role-and-runtime admission returned by [`channel_loop_plan`] — use
 /// [`spawn_email_channel_loops_if_daemon`], which both serve entrypoints call.
-#[cfg(feature = "channel-email")]
 fn spawn_email_channel_loops(
     server: &KhiveMcpServer,
     admission: crate::server::ChannelLoopAdmission,
@@ -497,13 +670,16 @@ fn spawn_email_channel_loops(
             let email_ch = Arc::new(email_ch);
             let mut ch_registry = ChannelRegistry::new();
             let dyn_ch: Arc<dyn khive_channel::Channel> = email_ch.clone();
+            #[cfg(test)]
+            let dyn_ch = EMAIL_POLL_TEST_CHANNEL
+                .with(|channel| channel.borrow_mut().take())
+                .unwrap_or(dyn_ch);
             ch_registry.register(dyn_ch);
             let ch_registry = Arc::new(ch_registry);
             let verb_reg = server.verb_registry_clone();
             let runtime = server.channel_outbox_runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             let mut allowlist = allowed_recipients_from_env();
             if allowlist.is_empty() {
                 allowlist.push(email_ch.maintainer_address().to_string());
@@ -521,6 +697,8 @@ fn spawn_email_channel_loops(
 
             let spawned = run_if_authorized(&ingest_ns, &verb_reg, || {
                 if admission.inbound_poll {
+                    let poll_shutdown =
+                        email_poll_shutdown_token(khive_runtime::daemon_shutdown_token());
                     khive_runtime::track_named_background_task("email_channel_poll", async move {
                         if let Err(error) = ensure_channel_quarantine_storage(&verb_reg_poll).await
                         {
@@ -535,7 +713,7 @@ fn spawn_email_channel_loops(
                             verb_reg_poll,
                             ingest_ns_clone,
                             default_actor_clone,
-                            khive_runtime::daemon_shutdown_token(),
+                            poll_shutdown,
                         )
                         .await;
                     });
@@ -599,11 +777,17 @@ fn ingest_namespace_from_env() -> String {
         .unwrap_or_else(|| "local".to_string())
 }
 
+/// Resolve the default inbound actor for fresh (uncorrelated) email messages.
+#[cfg(feature = "channel-email")]
+fn email_default_inbound_actor_from_env() -> String {
+    default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email")
+}
+
 /// Resolve the default inbound actor for fresh (uncorrelated) channel messages.
 ///
-/// Reads the supplied environment variable; falls back to the channel's
-/// recipient when it is unset or blank. Email defaults to `local`; Telegram's
-/// fallback is isolated from the anonymous `local` mailbox.
+/// Reads the supplied environment variable; falls back to the supplied channel
+/// actor when it is unset or blank. Both channel defaults are isolated
+/// from the anonymous `local` mailbox.
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
 fn default_inbound_actor_from_env(actor_variable: &str, fallback: &str) -> String {
     std::env::var(actor_variable)
@@ -769,6 +953,7 @@ async fn ensure_channel_quarantine_storage(
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
 async fn quarantine_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -777,6 +962,7 @@ async fn quarantine_channel_ingest_failure(
     default_inbound_actor: Option<&str>,
     envelope: &khive_channel::ChannelEnvelope,
     classification: khive_runtime::ChannelIngestFailureClass,
+    retention_limit: Option<usize>,
 ) -> Result<(), khive_runtime::RuntimeError> {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
@@ -793,17 +979,39 @@ async fn quarantine_channel_ingest_failure(
         .map(|replay| (replay.bytes.as_slice(), replay.notification_to.as_str()))
         .unwrap_or_else(|| (envelope.content.as_bytes(), envelope.to.as_str()));
 
-    let put = registry
-        .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
-        .await?;
-    let content_ref = put
-        .get("content_ref")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            khive_runtime::RuntimeError::Internal(
-                "blob.put returned no string content_ref for channel quarantine".to_string(),
-            )
-        })?;
+    // The same retention bound as the poller's own quarantine path: past it
+    // the message is still recorded, without its original bytes. An error
+    // reading the count holds progress through the caller.
+    let content_ref = if quarantine_original_may_be_retained(
+        registry,
+        ingest_namespace,
+        retention_limit,
+    )
+    .await?
+    {
+        let put = registry
+            .dispatch("blob.put", json!({"bytes": BASE64.encode(replay_bytes)}))
+            .await?;
+        Some(
+            put.get("content_ref")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    khive_runtime::RuntimeError::Internal(
+                        "blob.put returned no string content_ref for channel quarantine"
+                            .to_string(),
+                    )
+                })?
+                .to_string(),
+        )
+    } else {
+        tracing::warn!(
+            channel = channel_kind,
+            external_id,
+            limit = retention_limit,
+            "quarantine retention limit reached; recording the refused message without its original bytes"
+        );
+        None
+    };
 
     // Quarantine sender prefix invariant: the sender retains the originating
     // channel prefix because prefix-keyed consumers depend on it for alert
@@ -814,21 +1022,33 @@ async fn quarantine_channel_ingest_failure(
         "quarantine sender prefix invariant: prefix-keyed consumers require the channel prefix"
     );
 
+    let mut metadata = json!({
+        "quarantined": "true",
+        "quarantine_classification": classification.name(),
+        "quarantine_reason": classification.reason(),
+        "quarantine_external_id": external_id,
+    });
+    let content = match &content_ref {
+        Some(content_ref) => {
+            metadata["quarantine_content_ref"] = json!(content_ref);
+            "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference."
+        }
+        None => {
+            metadata["quarantine_original_retained"] = json!("false");
+            metadata["quarantine_original_not_retained_reason"] = json!("retention-limit");
+            "Inbound channel message quarantined. Its original bytes were not stored because the quarantine retention limit was reached."
+        }
+    };
     let mut params = json!({
         "namespace": ingest_namespace,
         "from": quarantine_sender,
         "to": notification_to,
-        "content": "Inbound channel message quarantined. Original bytes are temporarily available through the attached content reference.",
+        "content": content,
         "channel_kind": channel_kind,
         "channel_slug": channel_slug,
         "external_id": external_id,
-        "metadata": {
-            "quarantined": "true",
-            "quarantine_classification": classification.name(),
-            "quarantine_reason": classification.reason(),
-            "quarantine_external_id": external_id,
-            "quarantine_content_ref": content_ref,
-        },
+        "correlation_external_id": envelope.correlation_external_id.clone(),
+        "metadata": metadata,
     });
     if let Some(actor) = default_inbound_actor {
         params["default_inbound_actor"] = json!(actor);
@@ -839,6 +1059,7 @@ async fn quarantine_channel_ingest_failure(
 }
 
 #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+#[allow(clippy::too_many_arguments)]
 async fn handle_channel_ingest_failure(
     registry: &khive_runtime::VerbRegistry,
     ingest_namespace: &str,
@@ -847,6 +1068,7 @@ async fn handle_channel_ingest_failure(
     envelope: &khive_channel::ChannelEnvelope,
     error: &khive_runtime::RuntimeError,
     unknown_attempts: &mut std::collections::HashMap<String, u8>,
+    retention_limit: Option<usize>,
 ) -> bool {
     let (channel_kind, channel_slug) = channel;
     let classification = error.channel_ingest_failure_class();
@@ -877,6 +1099,7 @@ async fn handle_channel_ingest_failure(
                 default_inbound_actor,
                 envelope,
                 classification,
+                retention_limit,
             )
             .await
             {
@@ -962,6 +1185,41 @@ async fn channel_cycle_wait(
     }
 }
 
+/// Whether one more quarantined original may be stored before it is published.
+///
+/// The bound is the number of live quarantine records in the ingest namespace
+/// (`comm.health`'s `quarantined_count`), so it survives restarts and shrinks
+/// as expired records are cleaned up. Records stored without an original count
+/// too, which keeps the bound conservative. `None` applies no bound.
+#[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+async fn quarantine_original_may_be_retained(
+    registry: &khive_runtime::VerbRegistry,
+    ingest_namespace: &str,
+    limit: Option<usize>,
+) -> Result<bool, khive_runtime::RuntimeError> {
+    let Some(limit) = limit else {
+        return Ok(true);
+    };
+    if limit == 0 {
+        return Ok(false);
+    }
+    let health = registry
+        .dispatch(
+            "comm.health",
+            serde_json::json!({"namespace": ingest_namespace}),
+        )
+        .await?;
+    let live = health
+        .get("quarantined_count")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            khive_runtime::RuntimeError::Internal(
+                "comm.health returned no numeric quarantined_count".to_string(),
+            )
+        })?;
+    Ok(live < limit as u64)
+}
+
 /// Background task that polls all registered channels every 5 seconds and
 /// ingests new inbound messages via `comm.ingest`.
 ///
@@ -985,6 +1243,7 @@ async fn channel_poll_loop(
     default_inbound_actor: String,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    use base64::Engine as _;
     use chrono::{DateTime, Utc};
     use khive_channel_email::{is_backoff_eligible, ImapBackoff};
     use serde_json::json;
@@ -1173,6 +1432,92 @@ async fn channel_poll_loop(
                         .collect();
                     let mut page_fully_ingested = true;
                     for env in page.envelopes {
+                        let mut metadata = env.metadata.clone();
+                        if kind == "email"
+                            && metadata.get("quarantined").map(String::as_str) == Some("true")
+                        {
+                            let Some(replay) = env.quarantine_replay.as_ref() else {
+                                tracing::warn!(
+                                    channel = kind,
+                                    external_id = env.external_id.as_deref(),
+                                    "quarantined email has no original-byte replay; holding channel progress"
+                                );
+                                page_fully_ingested = false;
+                                continue;
+                            };
+                            let retain_original = match quarantine_original_may_be_retained(
+                                &registry,
+                                &ingest_namespace,
+                                channel.quarantine_retention_limit(),
+                            )
+                            .await
+                            {
+                                Ok(retain) => retain,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        channel = kind,
+                                        external_id = env.external_id.as_deref(),
+                                        %error,
+                                        "could not read the retained quarantine count; holding channel progress"
+                                    );
+                                    page_fully_ingested = false;
+                                    continue;
+                                }
+                            };
+                            if !retain_original {
+                                tracing::warn!(
+                                    channel = kind,
+                                    external_id = env.external_id.as_deref(),
+                                    limit = channel.quarantine_retention_limit(),
+                                    "quarantine retention limit reached; recording the message without its original bytes"
+                                );
+                                metadata.insert(
+                                    "quarantine_original_retained".to_string(),
+                                    "false".to_string(),
+                                );
+                                metadata.insert(
+                                    "quarantine_original_not_retained_reason".to_string(),
+                                    "retention-limit".to_string(),
+                                );
+                            } else {
+                                let put = registry
+                                    .dispatch(
+                                        "blob.put",
+                                        json!({
+                                            "bytes": base64::engine::general_purpose::STANDARD
+                                                .encode(&replay.bytes)
+                                        }),
+                                    )
+                                    .await;
+                                let content_ref = match put {
+                                    Ok(result) => {
+                                        match result.get("content_ref").and_then(|v| v.as_str()) {
+                                            Some(content_ref) => content_ref.to_string(),
+                                            None => {
+                                                tracing::warn!(
+                                            channel = kind,
+                                            external_id = env.external_id.as_deref(),
+                                            "blob.put returned no quarantine content reference; holding channel progress"
+                                        );
+                                                page_fully_ingested = false;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            channel = kind,
+                                            external_id = env.external_id.as_deref(),
+                                            %error,
+                                            "failed to publish quarantined email original; holding channel progress"
+                                        );
+                                        page_fully_ingested = false;
+                                        continue;
+                                    }
+                                };
+                                metadata.insert("quarantine_content_ref".to_string(), content_ref);
+                            }
+                        }
                         let params = json!({
                             "namespace": ingest_namespace,
                             "from": env.from.clone(),
@@ -1188,7 +1533,7 @@ async fn channel_poll_loop(
                             "default_inbound_actor": default_inbound_actor,
                             "wire_message_id": env.wire_message_id.clone(),
                             "wire_references": env.wire_references.clone(),
-                            "metadata": env.metadata.clone(),
+                            "metadata": metadata,
                         });
                         if let Err(error) = registry.dispatch("comm.ingest", params).await {
                             let handled = handle_channel_ingest_failure(
@@ -1199,6 +1544,7 @@ async fn channel_poll_loop(
                                 &env,
                                 &error,
                                 &mut unknown_ingest_attempts,
+                                channel.quarantine_retention_limit(),
                             )
                             .await;
                             if !handled {
@@ -1775,6 +2121,7 @@ fn spawn_telegram_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) 
         tracing::info!("telegram channel loops: skipped (client role; daemon owns channel loops)");
         return;
     }
+    log_inbound_refused_for_read_only_blob("telegram", admission);
     if !admission.inbound_poll && !admission.outbound_delivery {
         tracing::info!(
             "telegram channel loops: skipped (assigned comm runtime does not admit writes)"
@@ -2011,6 +2358,8 @@ async fn telegram_poll_loop(
                             &env,
                             &error,
                             &mut unknown_ingest_attempts,
+                            // The Telegram adapter declares no retention bound.
+                            None,
                         )
                         .await;
                         if !handled {
@@ -2143,9 +2492,12 @@ pub async fn serve_server(
     tracing::info!(target: "khive.boot", "{}", resolved_actor_disclosure(server.actor_id()));
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon_with_boot_guard_and_start(server, boot_guard, |server| {
-            start_host_background_tasks(args, server, schedule_rt)
-        })
+        khive_runtime::daemon::run_daemon_with_options_and_boot_guard_and_start(
+            server,
+            boot_guard,
+            args.daemon_options(),
+            |server| start_host_background_tasks(args, server, schedule_rt),
+        )
         .await?;
         return Ok(());
     }
@@ -2243,6 +2595,10 @@ pub async fn build_registry_for_multi_backend_with_db_anchor_and_max_readers(
 
 /// Daemon boot variant: verify each claimed pathname immediately after its
 /// backend opens, before schema preparation can write to that backend.
+/// Unix hosts supplying claims must first initialize
+/// `khive_db::pool::initialize_claimed_file_observer` under its unsafe process
+/// startup contract, before any SQLite I/O. Claimed construction fails closed
+/// when the observer is uninitialized or its VFS/ABI is unsupported.
 pub async fn build_registry_for_multi_backend_with_db_anchor_and_max_readers_and_claims(
     base_config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -2295,6 +2651,7 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
                 BackendConfig {
                     kind: BackendKind::Memory,
                     path: None,
+                    wal_ceiling_bytes: None,
                     ..backend.clone()
                 }
             } else {
@@ -2304,14 +2661,242 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BackendAliasIdentity {
+    /// An existing file can have several distinct canonical hard-link paths.
+    #[cfg(any(unix, windows))]
+    File(FileIdentity),
+    /// A not-yet-created file has only a resolved path to compare.
+    Path(PathBuf),
+}
+
+fn backend_alias_identity(
+    backend_name: &str,
+    canonical: &std::path::Path,
+) -> anyhow::Result<BackendAliasIdentity> {
+    #[cfg(any(unix, windows))]
+    {
+        match khive_db::file_identity::database_file_identity(canonical) {
+            Ok(identity) => Ok(BackendAliasIdentity::File(identity)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+            }
+            Err(error) => anyhow::bail!(
+                "backend {backend_name}: cannot inspect database identity at {}: {error}",
+                canonical.display()
+            ),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = backend_name;
+        Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+    }
+}
+
+/// Read the identity that SQLite's pool pinned during open. A second pathname
+/// stat alone can agree with the pre-open stat after an A→B→A replacement,
+/// while SQLite actually holds B.
+fn opened_backend_alias_identity(
+    backend: &StorageBackend,
+    canonical: &std::path::Path,
+) -> anyhow::Result<BackendAliasIdentity> {
+    #[cfg(any(unix, windows))]
+    {
+        let identity = backend
+            .pool()
+            .opened_file_identity_record()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "file-backed backend {} has no opened SQLite file identity",
+                    canonical.display()
+                )
+            })?;
+        Ok(BackendAliasIdentity::File(identity))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = backend;
+        Ok(BackendAliasIdentity::Path(canonical.to_path_buf()))
+    }
+}
+
+fn snapshot_matches_opened_backend(
+    snapshot: &BackendAliasIdentity,
+    opened: &BackendAliasIdentity,
+) -> bool {
+    #[cfg(any(unix, windows))]
+    {
+        // An absent first-open path has no file identity to compare yet.
+        matches!(snapshot, BackendAliasIdentity::Path(_)) || snapshot == opened
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        snapshot == opened
+    }
+}
+
+/// Bind a configured file identity to the database actually opened by SQLite.
+/// The opener is injectable only so the path-replacement window can be tested
+/// deterministically; production passes `open_backend` unchanged.
+fn open_backend_bound_to_alias_identity_with<F>(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    snapshot: &BackendAliasIdentity,
+    canonical: &std::path::Path,
+    opener: F,
+) -> anyhow::Result<(StorageBackend, BackendAliasIdentity)>
+where
+    F: FnOnce(&BackendConfig, Option<usize>) -> anyhow::Result<StorageBackend>,
+{
+    let backend = opener(cfg, max_readers)?;
+    let opened = opened_backend_alias_identity(&backend, canonical)?;
+    let at_path = backend_alias_identity(&cfg.name, canonical)?;
+    let configured_now = canonical_backend_path(cfg)?
+        .map(|path| backend_alias_identity(&cfg.name, &path))
+        .transpose()?;
+    if opened != at_path
+        || configured_now.as_ref() != Some(&opened)
+        || !snapshot_matches_opened_backend(snapshot, &opened)
+    {
+        anyhow::bail!(
+            "backend {}: database identity changed between topology snapshot and SQLite open \
+             at {}: snapshot={snapshot:?}, opened={opened:?}, path_now={at_path:?}, \
+             configured_now={configured_now:?}",
+            cfg.name,
+            canonical.display()
+        );
+    }
+    Ok((backend, opened))
+}
+
+fn verify_reused_backend_alias_identity(
+    cfg: &BackendConfig,
+    snapshot: &BackendAliasIdentity,
+    canonical: &std::path::Path,
+    existing: &StorageBackend,
+) -> anyhow::Result<()> {
+    let opened = opened_backend_alias_identity(existing, canonical)?;
+    let at_path = backend_alias_identity(&cfg.name, canonical)?;
+    let configured_now = canonical_backend_path(cfg)?
+        .map(|path| backend_alias_identity(&cfg.name, &path))
+        .transpose()?;
+    if at_path != opened
+        || configured_now.as_ref() != Some(&opened)
+        || !snapshot_matches_opened_backend(snapshot, &at_path)
+    {
+        anyhow::bail!(
+            "backend {}: alias identity changed before cached backend reuse at {}: \
+             snapshot={snapshot:?}, opened={opened:?}, path_now={at_path:?}, \
+             configured_now={configured_now:?}",
+            cfg.name,
+            canonical.display()
+        );
+    }
+    Ok(())
+}
+
+/// Open the entire declared topology against one pre-open snapshot. The
+/// injectable opener makes the snapshot→SQLite-open race executable without a
+/// scheduler or global hook; production passes `open_backend_with_wal_ceiling`.
+fn open_effective_backends_with<F>(
+    config: &RuntimeConfig,
+    effective_backends: &[BackendConfig],
+    max_readers: Option<usize>,
+    mut opener: F,
+) -> anyhow::Result<HashMap<String, Arc<StorageBackend>>>
+where
+    F: FnMut(
+        &BackendConfig,
+        Option<usize>,
+        khive_db::WalCeilingPolicy,
+    ) -> anyhow::Result<StorageBackend>,
+{
+    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
+    let identities = effective_backends
+        .iter()
+        .map(|cfg| {
+            canonical_backend_path(cfg)?.map_or(Ok(None), |canonical| {
+                backend_alias_identity(&cfg.name, &canonical)
+                    .map(|identity| Some((identity, canonical)))
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut identity_to_backend: HashMap<BackendAliasIdentity, (Arc<StorageBackend>, String, u64)> =
+        HashMap::new();
+    for (backend_cfg, identity) in effective_backends.iter().zip(identities) {
+        let policy = wal_ceiling_policy_for_backend(config, backend_cfg)?;
+        let effective_bytes = policy.effective_bytes(backend_cfg.read_only);
+        if let Some((ref key, ref canon)) = identity {
+            if let Some((existing, first_name, first_bytes)) = identity_to_backend.get(key) {
+                verify_reused_backend_alias_identity(backend_cfg, key, canon, existing)?;
+                if existing.is_read_only() != backend_cfg.read_only {
+                    anyhow::bail!(
+                        "backend {} aliases {} but declares read_only={} while the same \
+                         physical database was already opened with read_only={}; every alias \
+                         of one database must use the same access mode",
+                        backend_cfg.name,
+                        canon.display(),
+                        backend_cfg.read_only,
+                        existing.is_read_only(),
+                    );
+                }
+                if *first_bytes != effective_bytes {
+                    return Err(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                        first_backend: first_name.clone(),
+                        second_backend: backend_cfg.name.clone(),
+                        path: canon.clone(),
+                        first_bytes: *first_bytes,
+                        second_bytes: effective_bytes,
+                    }
+                    .into());
+                }
+                backends.insert(backend_cfg.name.clone(), existing.clone());
+                continue;
+            }
+        }
+        let (backend, opened_key) = if let Some((ref key, ref canon)) = identity {
+            let (backend, opened) = open_backend_bound_to_alias_identity_with(
+                backend_cfg,
+                max_readers,
+                key,
+                canon,
+                |cfg, max_readers| opener(cfg, max_readers, policy),
+            )?;
+            (backend, Some(opened))
+        } else {
+            (opener(backend_cfg, max_readers, policy)?, None)
+        };
+        let arc = Arc::new(backend);
+        if let (Some((snapshot, _)), Some(opened)) = (identity, opened_key) {
+            if identity_to_backend.contains_key(&opened) {
+                anyhow::bail!(
+                    "backend {}: opened database identity was already cached under another \
+                     configured path; refusing duplicate pool after topology changed",
+                    backend_cfg.name
+                );
+            }
+            let cached = (arc.clone(), backend_cfg.name.clone(), effective_bytes);
+            identity_to_backend.insert(opened, cached.clone());
+            if matches!(&snapshot, BackendAliasIdentity::Path(_)) {
+                identity_to_backend.insert(snapshot, cached);
+            }
+        }
+        backends.insert(backend_cfg.name.clone(), arc);
+    }
+    Ok(backends)
+}
+
 /// Reject conflicting access modes without opening any configured database.
 pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> anyhow::Result<()> {
-    let mut physical_sqlite: HashMap<std::path::PathBuf, (&str, bool)> = HashMap::new();
+    let mut physical_sqlite: HashMap<BackendAliasIdentity, (&str, bool)> = HashMap::new();
     for backend in backends {
         let Some(canonical) = canonical_backend_path(backend)? else {
             continue;
         };
-        if let Some((first_name, first_read_only)) = physical_sqlite.get(&canonical) {
+        let identity = backend_alias_identity(&backend.name, &canonical)?;
+
+        if let Some((first_name, first_read_only)) = physical_sqlite.get(&identity) {
             if *first_read_only != backend.read_only {
                 anyhow::bail!(
                     "backend {} aliases {} (already declared by backend {}) but declares \
@@ -2325,7 +2910,64 @@ pub fn validate_effective_backend_alias_modes(backends: &[BackendConfig]) -> any
                 );
             }
         } else {
-            physical_sqlite.insert(canonical, (&backend.name, backend.read_only));
+            physical_sqlite.insert(identity, (&backend.name, backend.read_only));
+        }
+    }
+    Ok(())
+}
+
+fn wal_ceiling_policy_for_backend(
+    config: &RuntimeConfig,
+    backend: &BackendConfig,
+) -> anyhow::Result<khive_db::WalCeilingPolicy> {
+    let wal_mode = backend
+        .journal_mode
+        .as_deref()
+        .is_none_or(|mode| mode.eq_ignore_ascii_case("wal"));
+    let resolved = khive_runtime::resolve_wal_ceiling(
+        backend.wal_ceiling_bytes,
+        config.wal_ceiling_env_raw.as_deref(),
+        &backend.name,
+        backend.kind.clone(),
+        wal_mode,
+        backend.read_only,
+    )?;
+    Ok(khive_db::WalCeilingPolicy {
+        bytes: resolved.configured_bytes,
+        source: resolved.source,
+    })
+}
+
+/// Validate ceiling policy for every effective backend before daemon forwarding
+/// or opening any configured database. Aliases of one SQLite file must agree
+/// on the writer policy actually enforced by their shared pool.
+pub fn validate_wal_ceiling_topology(
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<()> {
+    let effective = effective_backend_configs(backends, force_memory);
+    let mut by_identity: HashMap<BackendAliasIdentity, (&str, u64)> = HashMap::new();
+    for backend in &effective {
+        let policy = wal_ceiling_policy_for_backend(config, backend)?;
+        let effective_bytes = policy.effective_bytes(backend.read_only);
+        let Some(path) = canonical_backend_path(backend)? else {
+            continue;
+        };
+        let identity = backend_alias_identity(&backend.name, &path)?;
+        if let Some((first_name, first_bytes)) = by_identity.get(&identity) {
+            if *first_bytes != effective_bytes {
+                return Err(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                    first_backend: (*first_name).to_string(),
+                    second_backend: backend.name.clone(),
+                    path,
+                    first_bytes: *first_bytes,
+                    second_bytes: effective_bytes,
+                }
+                .into());
+            }
+        } else {
+            by_identity.insert(identity, (&backend.name, effective_bytes));
         }
     }
     Ok(())
@@ -2363,7 +3005,12 @@ fn plan_configured_storage_targets(
                 canonical_backend_path(selected)?,
                 canonical_backend_path(main)?,
             ) {
-                (Some(selected), Some(main)) => selected == main,
+                (Some(selected), Some(main)) => same_database_target(
+                    &selected,
+                    &main,
+                    file_identity(&selected),
+                    file_identity(&main),
+                ),
                 // A force-memory override intentionally creates one distinct
                 // ephemeral backend per configured name; only the literal
                 // main name is the canonical-main target in that mode.
@@ -2377,6 +3024,25 @@ fn plan_configured_storage_targets(
         effective_backends,
         full_topology,
     })
+}
+
+/// Whether two backends resolve to one database file.
+///
+/// Equal canonical paths name the same file by construction, so a file
+/// identity read that disagrees (the file was replaced between the two reads)
+/// never separates them. A matching identity is an additional way to be equal,
+/// joining distinct paths such as hard links.
+fn same_database_target(
+    selected: &std::path::Path,
+    main: &std::path::Path,
+    selected_identity: Option<FileIdentity>,
+    main_identity: Option<FileIdentity>,
+) -> bool {
+    selected == main
+        || matches!(
+            (selected_identity, main_identity),
+            (Some(selected_id), Some(main_id)) if selected_id == main_id
+        )
 }
 
 /// Return the configured backend names a read-only schema check must inspect.
@@ -2415,10 +3081,15 @@ pub fn configured_storage_check_targets(
     }
 }
 
+#[path = "serve_targeted_migration.rs"]
+mod targeted_migration;
+
 /// Migrate storage without constructing pack runtimes or loading embedders.
 ///
 /// When `[[backends]]` is present this executes the same deduplicated,
 /// secondary-first inventory and main V21 cutover barrier as normal MCP boot.
+/// Independent targets open only that backend after whole-topology preflight.
+/// Newly collapsed identities refuse before core-schema migration.
 /// With no declared topology it uses the single-backend boot coordinator. No
 /// runtime is exposed and no pack DDL is applied.
 pub async fn migrate_configured_storage_topology(
@@ -2453,30 +3124,22 @@ pub async fn migrate_configured_storage_topology(
             cli_db_override,
             &khive_cfg.backends,
         )?;
+        validate_wal_ceiling_topology(&base_config, &plan.effective_backends, false)?;
         let selected = plan
             .effective_backends
             .iter()
             .find(|backend| backend.name == target)
             .expect("the planner validated the selected backend")
             .clone();
-        let backend = Arc::new(open_backend(&selected, None)?);
-        prepare_core_schema_for_boot(Arc::clone(&backend), format!("backend {}", selected.name))
-            .await?;
-        crate::attachment_cutover::require_secondary_attachment_empty(
-            Arc::clone(&backend),
-            &selected.name,
-        )
-        .await?;
-        crate::attachment_cutover::coordinate_empty_secondary_attachment_cutover(
-            Arc::clone(&backend),
-            &selected.name,
-        )
-        .await?;
-        return Ok(vec![BackendSchemaMigrationStatus {
-            backend: selected.name,
-            applied_version: read_applied_schema_version(backend.sql().as_ref()).await?,
-            prerequisite: false,
-        }]);
+        return Ok(vec![
+            targeted_migration::migrate_selected_storage_backend_with(
+                &base_config,
+                &plan.effective_backends,
+                &selected,
+                open_backend_with_wal_ceiling,
+            )
+            .await?,
+        ]);
     }
 
     let prepared = prepare_configured_storage_topology(
@@ -2622,29 +3285,20 @@ pub fn reject_conflicting_db_override_with_source(
 /// Filesystem identity of a reindex target, captured so a symlink retargeted
 /// or a file replaced in place between validation and open can be told apart
 /// from the declared file validation actually checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
-}
+#[cfg(any(unix, windows))]
+type FileIdentity = khive_db::file_identity::DatabaseFileIdentity;
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileIdentity;
 
 fn file_identity(path: &std::path::Path) -> Option<FileIdentity> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        use std::os::unix::fs::MetadataExt as _;
-        let meta = std::fs::metadata(path).ok()?;
-        Some(FileIdentity {
-            device: meta.dev(),
-            inode: meta.ino(),
-        })
+        khive_db::file_identity::database_file_identity(path).ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
-        // The standard library exposes no stable file-identity accessor off
-        // unix (the Windows volume-serial and file-index accessors are
-        // unstable), so the pre-open re-check degrades to path-level
-        // validation there. This crate's non-unix lane is compile-checked
-        // only.
         let _ = path;
         None
     }
@@ -2682,7 +3336,7 @@ pub fn capture_existing_database_target(
         path.display()
     );
     let identity = file_identity(&path);
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     anyhow::ensure!(
         identity.is_some(),
         "cannot capture database identity for {}",
@@ -2699,12 +3353,10 @@ pub fn capture_existing_database_target(
 /// to the same canonical (already symlink-free) path, so pinning the open to
 /// `target.path` defeats that redirect by construction; a declared file
 /// replaced in place (e.g. another database renamed over it) keeps the same
-/// path string but changes `(device, inode)`, which this call catches.
+/// path string but changes its physical file identity, which this call catches.
 ///
-/// The gap this does not close: a parent directory replaced in the sliver of
-/// time between this call returning and the underlying SQLite `open()`
-/// syscall. No API the sqlite binding used here exposes reaches an
-/// already-open file descriptor's identity, so that final window stays open.
+/// This pre-open check alone cannot close a replacement window between its
+/// return and the underlying SQLite `open()` syscall.
 pub fn reverify_reindex_target_identity(target: &ValidatedReindexTarget) -> anyhow::Result<()> {
     let observed = file_identity(&target.path);
     if observed != target.identity {
@@ -2828,7 +3480,12 @@ pub fn normalize_redundant_db_override_with_source(
         backends,
         config_source,
     )?;
-    if !force_memory {
+    if force_memory {
+        config.db_path = None;
+        config.wal_ceiling_bytes = 0;
+        config.wal_ceiling_configured_bytes = 0;
+        config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
+    } else {
         if let Some(main) = backends
             .iter()
             .find(|backend| backend.name == BackendId::MAIN)
@@ -2967,6 +3624,7 @@ async fn prepare_configured_storage_topology(
     // read-only/read-write alias topology without creating a partial set of
     // database files.
     validate_effective_backend_alias_modes(&effective_backends)?;
+    validate_wal_ceiling_topology(&base_config, &effective_backends, false)?;
 
     // ADR-170: the events split must anchor beside the store that actually
     // holds this deployment's data. The resolver derived it from
@@ -2995,40 +3653,20 @@ async fn prepare_configured_storage_topology(
         }
     }
 
-    // Open each declared backend, deduplicating SQLite backends by canonical
-    // path (ADR-028 §8). Schema preparation is deliberately deferred until
-    // after main is identified: every distinct secondary must be inventoried
-    // before main can atomically enable attachment-only GC at V21.
-    let mut backends: HashMap<String, Arc<StorageBackend>> = HashMap::new();
-    let mut path_to_backend: HashMap<std::path::PathBuf, Arc<StorageBackend>> = HashMap::new();
-    for backend_cfg in &effective_backends {
-        let canonical = canonical_backend_path(backend_cfg)?;
-        if let Some(ref canon) = canonical {
-            if let Some(existing) = path_to_backend.get(canon) {
-                if existing.is_read_only() != backend_cfg.read_only {
-                    anyhow::bail!(
-                        "backend {} aliases {} but declares read_only={} while the same \
-                         physical database was already opened with read_only={}; every alias \
-                         of one database must use the same access mode",
-                        backend_cfg.name,
-                        canon.display(),
-                        backend_cfg.read_only,
-                        existing.is_read_only(),
-                    );
-                }
-                backends.insert(backend_cfg.name.clone(), existing.clone());
-                continue;
-            }
-        }
-        let backend = open_backend(backend_cfg, max_readers)?;
-        if let Some(claims) = daemon_claims {
-            khive_runtime::daemon::assert_daemon_store_identities(claims)?;
-        }
-        let arc = Arc::new(backend);
-        if let Some(canon) = canonical {
-            path_to_backend.insert(canon, arc.clone());
-        }
-        backends.insert(backend_cfg.name.clone(), arc);
+    // Open each declared backend, deduplicating SQLite backends by physical
+    // file identity (or canonical path before creation; ADR-028 §8). Schema
+    // preparation is deferred until after main is identified: every distinct
+    // secondary must be inventoried before main can atomically enable
+    // attachment-only GC at V21.
+    let backends = open_effective_backends_with(
+        &base_config,
+        &effective_backends,
+        max_readers,
+        |cfg, readers, policy| claimed_backend::open_backend(cfg, readers, policy, daemon_claims),
+    )?;
+
+    if let Some(claims) = daemon_claims {
+        khive_runtime::daemon::assert_daemon_store_identities(claims)?;
     }
 
     let main_backend = backends
@@ -3352,6 +3990,10 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
     registry.call_register_note_mutation_hooks(&default_runtime);
+    registry.call_register_note_search_ann_providers(&default_runtime);
+    for rt in per_pack_runtimes_local.values() {
+        registry.call_register_note_search_ann_providers(rt);
+    }
     // Note-write identity: install the pack-owned kind set and the pack-owned
     // note-write validator so identity properties are derived at the write and
     // preserved through merge/update on every path, including the ones that
@@ -3366,8 +4008,11 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         .map(str::to_string)
         .collect();
     default_runtime.install_pack_owned_note_kinds(owned_note_kinds.clone());
+    let note_embedding_policies = registry.all_note_embedding_policies();
+    default_runtime.install_note_embedding_policies(&note_embedding_policies);
     for rt in per_pack_runtimes_local.values() {
         rt.install_pack_owned_note_kinds(owned_note_kinds.clone());
+        rt.install_note_embedding_policies(&note_embedding_policies);
     }
     // The validator is installed on every runtime the kind list reaches, not
     // just the default: each per-pack runtime is built independently, so none
@@ -3688,6 +4333,7 @@ async fn build_server_from_prepared(
     // backends slice keeps the line truthful in multi-backend mode, where the
     // config-declared backend paths — not `config.db_path` — receive writes.
     tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
+    tracing::info!(target: "khive.boot", "{}", resolved_wal_ceiling_disclosure(&config, &khive_cfg.backends, args.db.as_deref() == Some(":memory:")));
 
     if khive_cfg.backends.is_empty() {
         let runtime = build_single_backend_runtime_with_max_readers(
@@ -4074,6 +4720,7 @@ pub fn build_server_from_multi_backend_registry(
     #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
     let channel_loop_admission = crate::server::ChannelLoopAdmission::for_pack_runtimes(
         multi.per_pack_runtimes.get("comm").map(Arc::as_ref),
+        multi.per_pack_runtimes.get("blob").map(Arc::as_ref),
     );
     // The delivery loops scan, claim, and mark outbound `message` notes, so
     // they must hold the runtime that owns comm's rows — under a
@@ -4280,12 +4927,16 @@ pub async fn build_single_backend_runtime(
 }
 
 async fn build_single_backend_runtime_with_max_readers(
-    config: RuntimeConfig,
+    mut config: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<KhiveRuntime> {
-    let backend = Arc::new(open_single_backend(&config, max_readers)?);
+    let backend = Arc::new(claimed_backend::open_single_backend(
+        &mut config,
+        max_readers,
+        daemon_claims,
+    )?);
     if let Some(claims) = daemon_claims {
         khive_runtime::daemon::assert_daemon_store_identities(claims)?;
     }
@@ -4311,37 +4962,22 @@ async fn build_single_backend_runtime_with_max_readers(
 }
 
 fn open_single_backend(
-    config: &RuntimeConfig,
+    config: &mut RuntimeConfig,
     max_readers: Option<usize>,
 ) -> anyhow::Result<StorageBackend> {
-    let backend = match &config.db_path {
-        Some(path) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|error| {
-                    anyhow::anyhow!(
-                        "cannot create database parent directory {}: {error}",
-                        parent.display()
-                    )
-                })?;
-            }
-            StorageBackend::sqlite_with_max_readers(path, max_readers)
-                .map_err(|error| anyhow::anyhow!("open single SQLite backend: {error}"))?
-        }
-        None => StorageBackend::memory()
-            .map_err(|error| anyhow::anyhow!("open single in-memory backend: {error}"))?,
-    };
-    Ok(backend)
+    claimed_backend::open_single_backend(config, max_readers, None)
 }
 
 async fn prepare_single_backend_for_schema_admin(
     config: &RuntimeConfig,
     khive_cfg: &KhiveConfig,
 ) -> anyhow::Result<Arc<StorageBackend>> {
-    let backend = Arc::new(open_single_backend(config, None)?);
+    let mut config = config.clone();
+    let backend = Arc::new(open_single_backend(&mut config, None)?);
     prepare_core_schema_for_boot(Arc::clone(&backend), "single backend").await?;
 
     let hydrator = if schema_admin_requires_blob_hydrator(Arc::clone(&backend)).await? {
-        resolve_blob_hydrator_for_boot(config, khive_cfg, backend.as_ref(), backend.as_ref())?
+        resolve_blob_hydrator_for_boot(&config, khive_cfg, backend.as_ref(), backend.as_ref())?
     } else {
         None
     };
@@ -4456,6 +5092,7 @@ fn build_pack_runtime(
     let rt = KhiveRuntime::from_backend(backend, rt_config)
         .with_declared_backend_db_paths(declared_backend_db_paths)
         .with_diagnostic_backends(diagnostic_backends)
+        .with_diagnostic_observer_from(main_runtime)
         .with_core_embedders_from(main_runtime);
     if backend_name != BackendId::MAIN {
         rt.with_core_backend(main_backend.clone())
@@ -4465,49 +5102,17 @@ fn build_pack_runtime(
 }
 
 /// Open a `StorageBackend` from a `BackendConfig`.
+#[cfg(test)]
 fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Result<StorageBackend> {
-    match cfg.kind {
-        BackendKind::Memory => StorageBackend::memory()
-            .map_err(|e| anyhow::anyhow!("backend {}: memory open: {e}", cfg.name)),
-        BackendKind::Sqlite => {
-            let path = cfg.path.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "backend {}: sqlite backend requires a `path` field",
-                    cfg.name
-                )
-            })?;
-            let expanded = khive_runtime::expand_tilde(path);
-            if !cfg.read_only {
-                if let Some(parent) = expanded.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        anyhow::anyhow!(
-                            "backend {}: cannot create parent dir {}: {e}",
-                            cfg.name,
-                            parent.display()
-                        )
-                    })?;
-                }
-            }
-            if cfg.read_only {
-                StorageBackend::sqlite_read_only_with_max_readers(&expanded, max_readers).map_err(
-                    |e| anyhow::anyhow!("backend {}: sqlite read-only open: {e}", cfg.name),
-                )
-            } else {
-                let backend = StorageBackend::sqlite_with_max_readers(&expanded, max_readers)
-                    .map_err(|e| anyhow::anyhow!("backend {}: sqlite open: {e}", cfg.name))?;
-                if backend.is_read_only() {
-                    anyhow::bail!(
-                        "backend {}: path {} has no filesystem write bits; declare \
-                         `read_only = true` so backend topology and daemon config identity \
-                         describe the snapshot-inspection mode explicitly",
-                        cfg.name,
-                        expanded.display()
-                    );
-                }
-                Ok(backend)
-            }
-        }
-    }
+    open_backend_with_wal_ceiling(cfg, max_readers, khive_db::WalCeilingPolicy::default())
+}
+
+fn open_backend_with_wal_ceiling(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    wal_ceiling: khive_db::WalCeilingPolicy,
+) -> anyhow::Result<StorageBackend> {
+    claimed_backend::open_backend(cfg, max_readers, wal_ceiling, None)
 }
 
 /// Resolve the `--db`/`KHIVE_DB` value into the anchor used for tier-3
@@ -4577,6 +5182,93 @@ pub fn resolved_database_disclosure(
         }
         Some(path) => format!("database: {} (resolved)", path.display()),
     }
+}
+
+/// Report the resolved WAL policy for every storage target at startup. This
+/// uses the same configuration snapshot as daemon identity and backend open.
+pub fn resolved_wal_ceiling_disclosure(
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> String {
+    fn source_name(source: khive_runtime::WalCeilingSource) -> &'static str {
+        match source {
+            khive_runtime::WalCeilingSource::BackendField => "backend_field",
+            khive_runtime::WalCeilingSource::Environment => "environment",
+            khive_runtime::WalCeilingSource::Default => "default",
+        }
+    }
+
+    fn row(name: &str, configured: u64, effective: u64, source: &str, read_only: bool) -> String {
+        let status = if read_only && configured > 0 {
+            "read_only_not_enforced"
+        } else if effective > 0 {
+            "enforced"
+        } else {
+            "disabled"
+        };
+        // A backend name is operator-supplied text, so it takes the runtime's
+        // log-text path: credential shapes are masked, and control, format and
+        // line/paragraph separator characters (newline, escape sequences, bidi
+        // overrides) are escaped so a name cannot start a forged log line or
+        // drive the terminal.
+        let name = khive_runtime::secret_gate::bounded_masked_log_text(name);
+        format!(
+            "{name}: configured_bytes={configured} effective_bytes={effective} source={source} enabled={} status={status}",
+            effective > 0
+        )
+    }
+
+    if backends.is_empty() {
+        let read_only = config.db_path.as_deref().is_some_and(|path| {
+            std::fs::metadata(path).is_ok_and(|metadata| metadata.permissions().readonly())
+        });
+        let effective = if config.db_path.is_none() || read_only {
+            0
+        } else {
+            config.wal_ceiling_bytes
+        };
+        return format!(
+            "wal_ceiling: {}",
+            row(
+                BackendId::MAIN,
+                config.wal_ceiling_configured_bytes,
+                effective,
+                source_name(config.wal_ceiling_source),
+                read_only,
+            )
+        );
+    }
+
+    let mut rows = Vec::with_capacity(backends.len());
+    for backend in backends {
+        let (configured, source) = if force_memory {
+            (0, khive_runtime::WalCeilingSource::Default)
+        } else {
+            match backend.wal_ceiling_bytes {
+                Some(bytes) => (bytes, khive_runtime::WalCeilingSource::BackendField),
+                None if backend.kind == BackendKind::Memory => {
+                    (0, khive_runtime::WalCeilingSource::Default)
+                }
+                None => (
+                    config.wal_ceiling_configured_bytes,
+                    config.wal_ceiling_source,
+                ),
+            }
+        };
+        let memory = force_memory || backend.kind == BackendKind::Memory;
+        let read_only = backend.read_only;
+        let effective = if memory || read_only { 0 } else { configured };
+        rows.push(row(
+            &backend.name,
+            configured,
+            effective,
+            source_name(source),
+            read_only,
+        ));
+    }
+    rows.sort();
+    format!("wal_ceiling: {}", rows.join("; "))
 }
 
 /// One-line, stdout-safe disclosure of the actor selected by the resolved
@@ -4695,6 +5387,7 @@ pub fn resolve_runtime_config_with_db_anchor(
             no_embed_base,
             db_path_for_config.as_deref(),
             packs_overridden,
+            inputs.db == Some(":memory:"),
         )?
     } else {
         let base_config = RuntimeConfig {
@@ -4711,6 +5404,7 @@ pub fn resolve_runtime_config_with_db_anchor(
             base_config,
             db_path_for_config.as_deref(),
             packs_overridden,
+            inputs.db == Some(":memory:"),
         )?
     };
 
@@ -4890,6 +5584,7 @@ fn resolve_config(
     base: RuntimeConfig,
     db_path: Option<&std::path::Path>,
     packs_overridden: bool,
+    force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
@@ -4906,17 +5601,87 @@ fn resolve_config(
                 );
             }
 
-            Ok(runtime_config_from_khive_config(&khive_cfg, base))
+            let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
+            Ok(resolved)
         }
         None => {
             let env_cfg = config_from_env();
-            if env_cfg.engines.is_empty() {
-                Ok(base)
+            let mut resolved = if env_cfg.engines.is_empty() {
+                base
             } else {
-                Ok(runtime_config_from_khive_config(&env_cfg, base))
-            }
+                runtime_config_from_khive_config(&env_cfg, base)
+            };
+            resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
+            Ok(resolved)
         }
     }
+}
+
+/// Validate the captured policy snapshot before a forwarding client computes its daemon
+/// identity. Backend field overrides are resolved from this same snapshot at
+/// the named-backend opener, so a later environment change cannot split the
+/// client fingerprint from the opened pool.
+fn resolve_runtime_wal_ceiling(
+    config: &mut RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<()> {
+    if force_memory {
+        config.wal_ceiling_bytes = 0;
+        config.wal_ceiling_configured_bytes = 0;
+        config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
+        return validate_wal_ceiling_topology(config, backends, true);
+    }
+    let env_raw = config.wal_ceiling_env_raw.clone();
+    let needs_fallback = backends.is_empty()
+        || backends.iter().any(|backend| {
+            backend.kind == BackendKind::Sqlite && backend.wal_ceiling_bytes.is_none()
+        });
+    let fallback = if needs_fallback {
+        khive_runtime::resolve_wal_ceiling(
+            None,
+            env_raw.as_deref(),
+            BackendId::MAIN,
+            if backends.is_empty() && config.db_path.is_none() {
+                BackendKind::Memory
+            } else {
+                BackendKind::Sqlite
+            },
+            true,
+            false,
+        )?
+    } else {
+        khive_runtime::ResolvedWalCeiling {
+            configured_bytes: 0,
+            effective_bytes: 0,
+            source: khive_runtime::WalCeilingSource::Default,
+        }
+    };
+    config.wal_ceiling_env_raw = env_raw;
+    config.wal_ceiling_configured_bytes = fallback.configured_bytes;
+    config.wal_ceiling_bytes = fallback.effective_bytes;
+    config.wal_ceiling_source = fallback.source;
+
+    if backends.is_empty() {
+        let kind = if config.db_path.is_some() {
+            BackendKind::Sqlite
+        } else {
+            BackendKind::Memory
+        };
+        let main = khive_runtime::resolve_wal_ceiling(
+            None,
+            config.wal_ceiling_env_raw.as_deref(),
+            BackendId::MAIN,
+            kind,
+            true,
+            false,
+        )?;
+        config.wal_ceiling_bytes = main.effective_bytes;
+    } else {
+        validate_wal_ceiling_topology(config, backends, false)?;
+    }
+    Ok(())
 }
 
 /// Resolve configuration without enabling embedding engines (no-embed path).
@@ -4930,20 +5695,26 @@ fn resolve_actor_from_config(
     base: RuntimeConfig,
     db_path: Option<&std::path::Path>,
     packs_overridden: bool,
+    force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
     match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
-            let resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
+            resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
             Ok(RuntimeConfig {
                 embedding_model: None,
                 additional_embedding_models: vec![],
                 ..resolved
             })
         }
-        None => Ok(base),
+        None => {
+            let mut resolved = base;
+            resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
+            Ok(resolved)
+        }
     }
 }
 
@@ -4964,6 +5735,10 @@ fn apply_config_pack_selection(
     }
     base
 }
+
+#[cfg(all(test, unix))]
+#[path = "serve_targeted_alias_tests.rs"]
+mod targeted_alias_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5111,6 +5886,220 @@ mod tests {
     }
 
     #[test]
+    fn wal_ceiling_disclosure_names_disabled_default_and_read_only_policy() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        assert_eq!(
+            resolved_wal_ceiling_disclosure(&config, &[], false),
+            "wal_ceiling: main: configured_bytes=0 effective_bytes=0 source=default enabled=false status=disabled"
+        );
+
+        let backend = BackendConfig {
+            name: "archive".into(),
+            kind: BackendKind::Sqlite,
+            path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+            cache_mb: None,
+            journal_mode: None,
+            wal_ceiling_bytes: Some(8192),
+            served_kinds: None,
+            read_only: true,
+        };
+        assert_eq!(
+            resolved_wal_ceiling_disclosure(&config, &[backend], false),
+            "wal_ceiling: archive: configured_bytes=8192 effective_bytes=0 source=backend_field enabled=false status=read_only_not_enforced"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_disclosure_escapes_log_unsafe_characters_in_backend_names() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        let disclose = |name: &str| {
+            let backend = BackendConfig {
+                name: name.into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+                cache_mb: None,
+                journal_mode: None,
+                wal_ceiling_bytes: None,
+                served_kinds: None,
+                read_only: false,
+            };
+            resolved_wal_ceiling_disclosure(&config, &[backend], false)
+        };
+
+        // One arm per category: Cc newline and ESC, Cf bidi override, Zl, Zp.
+        for (raw, escaped) in [
+            ('\n', "\\u{000a}"),
+            ('\u{1b}', "\\u{001b}"),
+            ('\u{202e}', "\\u{202e}"),
+            ('\u{2028}', "\\u{2028}"),
+            ('\u{2029}', "\\u{2029}"),
+        ] {
+            let line = disclose(&format!("arch{raw}ive"));
+            assert!(
+                !line.contains(raw),
+                "U+{:04X} must not reach the startup line raw; got {line:?}",
+                raw as u32
+            );
+            assert!(
+                line.starts_with(&format!(
+                    "wal_ceiling: arch{escaped}ive: configured_bytes=0"
+                )),
+                "U+{:04X} is escaped and the rest of the name is kept; got {line:?}",
+                raw as u32
+            );
+        }
+
+        // Accented and CJK names are ordinary text and print unchanged.
+        assert!(
+            disclose("archivé字").starts_with("wal_ceiling: archivé字: configured_bytes=0"),
+            "non-ASCII letters must be kept"
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_disclosure_masks_credentials_in_backend_names() {
+        let config = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from("/tmp/khive-wal-disclosure.db")),
+            ..RuntimeConfig::default()
+        };
+        let disclose = |name: &str| {
+            let backend = BackendConfig {
+                name: name.into(),
+                kind: BackendKind::Sqlite,
+                path: Some(std::path::PathBuf::from("/tmp/khive-wal-archive.db")),
+                cache_mb: None,
+                journal_mode: None,
+                wal_ceiling_bytes: None,
+                served_kinds: None,
+                read_only: false,
+            };
+            resolved_wal_ceiling_disclosure(&config, &[backend], false)
+        };
+
+        // A credential pasted into a backend name is masked like any other log text.
+        let password = "S3cr3tP4ss";
+        let line = disclose(&format!(
+            "{}://dbuser:{password}@db.example.com:5432/archive",
+            "postgresql"
+        ));
+        assert!(
+            !line.contains(password),
+            "a credential in a backend name must not reach the startup line; got {line:?}"
+        );
+    }
+
+    #[test]
+    fn named_backend_ceiling_identity_agrees_with_the_opener_resolution() {
+        // The named-backend opener resolves from the backend field and the
+        // environment snapshot only, never from `wal_ceiling_bytes`. The
+        // fingerprint must therefore also encode a disabled ceiling here.
+        let dir = tempfile::tempdir().expect("named backend ceiling tempdir");
+        let config = RuntimeConfig {
+            db_path: Some(dir.path().join("main.db")),
+            packs: vec!["kg".to_string()],
+            wal_ceiling_bytes: 1 << 20,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_env_raw: None,
+            ..RuntimeConfig::no_embeddings()
+        };
+        let backend = |name: &str| BackendConfig {
+            name: name.into(),
+            kind: BackendKind::Sqlite,
+            path: Some(dir.path().join(format!("{name}.db"))),
+            cache_mb: None,
+            journal_mode: None,
+            wal_ceiling_bytes: None,
+            served_kinds: None,
+            read_only: false,
+        };
+        let topology = KhiveConfig {
+            backends: vec![backend("archive"), backend("main")],
+            ..KhiveConfig::default()
+        };
+
+        for declared in &topology.backends {
+            let policy = wal_ceiling_policy_for_backend(&config, declared)
+                .expect("resolve named backend ceiling");
+            assert_eq!(
+                policy.bytes, 0,
+                "the opener enables no ceiling for backend {}",
+                declared.name
+            );
+        }
+        let config_id = crate::server::compute_config_id(&config, Some(&topology));
+        let topology_part = &config_id[config_id.find(";backends=[").expect("topology present")..];
+        assert_eq!(
+            topology_part.matches(":wal_ceiling_bytes=0").count(),
+            topology.backends.len(),
+            "the fingerprint must agree with the opener for named backends; got {topology_part}"
+        );
+        assert_eq!(
+            topology_part.matches("wal_ceiling_bytes=").count(),
+            topology.backends.len(),
+            "no named backend may encode a ceiling its opener does not enable; got {topology_part}"
+        );
+    }
+
+    #[test]
+    fn single_backend_opener_uses_effective_ceiling_when_configured_value_is_zero() {
+        // An enabled ceiling that this build cannot yet enforce refuses to
+        // open, so a refusal naming the ceiling proves the opener applied it;
+        // a silently dropped ceiling would open successfully.
+        const CEILING: u64 = 1 << 20;
+        let dir = tempfile::tempdir().expect("single backend ceiling tempdir");
+        let mut config = RuntimeConfig {
+            db_path: Some(dir.path().join("single.db")),
+            wal_ceiling_bytes: CEILING,
+            wal_ceiling_configured_bytes: 0,
+            ..RuntimeConfig::no_embeddings()
+        };
+
+        let host_error = open_single_backend(&mut config, Some(2))
+            .err()
+            .expect("the host opener must not drop an enabled effective ceiling");
+        assert!(
+            matches!(
+                host_error.downcast_ref::<khive_db::SqliteError>(),
+                Some(khive_db::SqliteError::WalCapacityUnavailable { bytes, .. })
+                    if *bytes == CEILING
+            ),
+            "host opener refusal must name the effective ceiling; got {host_error:#}"
+        );
+
+        let runtime_dir = tempfile::tempdir().expect("runtime ceiling tempdir");
+        let runtime_error = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(runtime_dir.path().join("runtime.db")),
+            ..config.clone()
+        })
+        .err()
+        .expect("the runtime constructor must not drop an enabled effective ceiling");
+        assert!(
+            matches!(
+                &runtime_error,
+                khive_runtime::RuntimeError::Sqlite(
+                    khive_db::SqliteError::WalCapacityUnavailable { bytes, .. }
+                ) if *bytes == CEILING
+            ),
+            "runtime refusal must name the same ceiling; got {runtime_error:?}"
+        );
+
+        // A disabled ceiling still opens on the same path.
+        let mut disabled = RuntimeConfig {
+            db_path: Some(dir.path().join("disabled.db")),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            ..config
+        };
+        open_single_backend(&mut disabled, Some(2)).expect("a disabled ceiling opens");
+    }
+
+    #[test]
     fn resolved_actor_disclosure_names_attributed_actor() {
         let line = resolved_actor_disclosure(Some("lambda:worker"));
         assert_eq!(line, "actor: \"lambda:worker\" (resolved; attributed)");
@@ -5137,6 +6126,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("/data/main.db")),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             },
@@ -5148,6 +6138,7 @@ mod tests {
                 path: Some(std::path::PathBuf::from("/data/ignored-stray.db")),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             },
@@ -5179,6 +6170,7 @@ mod tests {
             path: Some(std::path::PathBuf::from("/data/main.db")),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         }];
@@ -6347,6 +7339,7 @@ id = "lambda:project-actor"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6356,6 +7349,7 @@ id = "lambda:project-actor"
                     path: Some(second_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6434,6 +7428,7 @@ id = "lambda:project-actor"
             path: Some(path.clone()),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         };
@@ -6540,6 +7535,7 @@ id = "lambda:project-actor"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6549,6 +7545,7 @@ id = "lambda:project-actor"
                     path: Some(secondary_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6599,6 +7596,7 @@ id = "lambda:project-actor"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6608,6 +7606,7 @@ id = "lambda:project-actor"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -6680,6 +7679,110 @@ id = "lambda:project-actor"
             Some(true),
             "comm.send must succeed; response: {comm_resp}"
         );
+
+        let list_resp = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"[
+                    list(kind="message", limit=3),
+                    list(kind="message", direction="outbound", limit=3, after=""),
+                    list(kind="note", note_kind="message", direction="outbound", limit=3),
+                    comm.inbox(box="sent", limit=3),
+                    list(kind="note", direction="outbound", limit=3)
+                ]"#
+                .to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("list and inbox dispatch");
+        let list_json: serde_json::Value =
+            serde_json::from_str(&list_resp).expect("list and inbox response is valid JSON");
+        let results = list_json["results"].as_array().expect("batch results");
+        let sent_id = results[3]["result"]["messages"][0]["id"]
+            .as_str()
+            .expect("sent message id");
+        for (index, field) in [(0, "items"), (1, "notes"), (2, "items")] {
+            assert_eq!(results[index]["ok"], true, "{list_json}");
+            let notes = results[index]["result"][field]
+                .as_array()
+                .expect("listed messages");
+            assert!(
+                notes.iter().any(|note| note["id"] == sent_id),
+                "list and comm.inbox must see the same message on the comm backend: {list_json}"
+            );
+        }
+        assert_eq!(results[3]["ok"], true, "{list_json}");
+        assert_eq!(results[4]["ok"], false, "{list_json}");
+        assert_eq!(results[4]["error"]["kind"], "invalid_input", "{list_json}");
+        assert!(
+            results[4]["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("secondary")),
+            "an unscoped note list with a message filter must name the comm backend: {list_json}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[serial(config_ledger)]
+    async fn message_filter_accepts_distinct_backend_names_for_one_open_store() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().expect("temporary database directory");
+        let db_path = dir.path().join("shared.db");
+        let khive_cfg = KhiveConfig {
+            backends: [BackendId::MAIN, "comm-alias"]
+                .into_iter()
+                .map(|name| BackendConfig {
+                    name: name.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(db_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    wal_ceiling_bytes: None,
+                    served_kinds: None,
+                    read_only: false,
+                })
+                .collect(),
+            packs: HashMap::from([(
+                "comm".to_string(),
+                PackConfig {
+                    backend: "comm-alias".to_string(),
+                    no_embed: false,
+                },
+            )]),
+            ..KhiveConfig::default()
+        };
+        let multi = build_registry_for_multi_backend_inner(
+            base_runtime_config_for_multi_backend(),
+            &khive_cfg,
+            None,
+        )
+        .await
+        .expect("aliased backend registry");
+        assert_ne!(
+            multi.default_runtime.backend_id(),
+            multi.per_pack_runtimes["comm"].backend_id()
+        );
+        assert!(multi
+            .default_runtime
+            .shares_backend_storage_with(&multi.per_pack_runtimes["comm"]));
+
+        let registry = multi.registry;
+        registry
+            .dispatch(
+                "comm.send",
+                serde_json::json!({"to": "email:recipient@example.com", "content": "alias witness"}),
+            )
+            .await
+            .expect("comm writes outbound row");
+        let listed = registry
+            .dispatch(
+                "list",
+                serde_json::json!({"kind": "note", "direction": "outbound", "limit": 1}),
+            )
+            .await
+            .expect("message filter accepts the shared physical store");
+        assert_eq!(listed["items"][0]["content"], "alias witness", "{listed}");
     }
 
     /// ADR-124 note-write identity guard: the pack-owned note kind set must
@@ -6710,6 +7813,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -6852,6 +7956,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -6968,6 +8073,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7051,6 +8157,7 @@ id = "lambda:project-actor"
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7085,6 +8192,7 @@ id = "lambda:project-actor"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7186,6 +8294,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7465,6 +8574,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7509,6 +8619,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7720,6 +8831,7 @@ region = "us-east-1"
                 path: Some(main_path.clone()),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: true,
             }],
@@ -7786,6 +8898,7 @@ region = "us-east-1"
                 path: Some(main_path),
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: true,
             }],
@@ -7842,6 +8955,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7851,6 +8965,7 @@ region = "us-east-1"
                     path: Some(archive_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -7907,6 +9022,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -7916,6 +9032,7 @@ region = "us-east-1"
                     path: Some(blob_db),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7974,6 +9091,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7983,6 +9101,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8059,6 +9178,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8068,6 +9188,7 @@ region = "us-east-1"
                     path: Some(real_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8077,6 +9198,7 @@ region = "us-east-1"
                     path: Some(alias_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8161,6 +9283,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8170,6 +9293,7 @@ region = "us-east-1"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8221,6 +9345,7 @@ region = "us-east-1"
                     path: Some(main_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8230,6 +9355,7 @@ region = "us-east-1"
                     path: Some(secondary_path),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8270,6 +9396,7 @@ region = "us-east-1"
             path: None,
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         });
@@ -9023,6 +10150,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9032,6 +10160,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9107,6 +10236,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9116,6 +10246,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9208,6 +10339,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9250,6 +10382,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9311,6 +10444,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9396,6 +10530,7 @@ region = "us-east-1"
             path: Some(db_path.clone()),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: true,
         };
@@ -9443,6 +10578,7 @@ region = "us-east-1"
             path: Some(db_path),
             cache_mb: None,
             journal_mode: None,
+            wal_ceiling_bytes: None,
             served_kinds: None,
             read_only: false,
         };
@@ -9472,6 +10608,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -9481,6 +10618,7 @@ region = "us-east-1"
                     path: Some(comm_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -9588,6 +10726,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: main_read_only,
                 },
@@ -9597,6 +10736,7 @@ region = "us-east-1"
                     path: Some(comm_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: comm_read_only,
                 },
@@ -9683,6 +10823,91 @@ region = "us-east-1"
         );
     }
 
+    /// The server built from a multi-backend registry reads admission from the
+    /// blob pack's own runtime: comm on a writable backend and blob on a
+    /// read-only one must not poll, and must still deliver outbound mail.
+    #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
+    #[tokio::test]
+    #[serial]
+    #[serial(config_ledger)]
+    async fn mixed_topology_refuses_inbound_polling_when_the_blob_backend_is_read_only() {
+        use clap::Parser;
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main-blob-admission.db");
+        let blob_path = dir.path().join("blob-admission.db");
+        let blob_root = dir.path().join("blob-objects");
+        let config_for = |blob_read_only: bool| KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: BackendId::MAIN.to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: false,
+                    wal_ceiling_bytes: None,
+                },
+                BackendConfig {
+                    name: "blob-store".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(blob_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    served_kinds: None,
+                    read_only: blob_read_only,
+                    wal_ceiling_bytes: None,
+                },
+            ],
+            packs: HashMap::from([(
+                "blob".to_string(),
+                PackConfig {
+                    backend: "blob-store".to_string(),
+                    no_embed: false,
+                },
+            )]),
+            storage: StorageSectionConfig {
+                blob: Some(BlobConfig::Fs {
+                    root: Some(blob_root.to_string_lossy().into_owned()),
+                    floor_bytes: Some(0),
+                }),
+            },
+            ..KhiveConfig::default()
+        };
+        let base_config = || {
+            let mut config = base_runtime_config_for_multi_backend();
+            config.packs = vec!["kg".to_string(), "comm".to_string(), "blob".to_string()];
+            config
+        };
+
+        let seeded =
+            build_registry_for_multi_backend_inner(base_config(), &config_for(false), None)
+                .await
+                .expect("seed exact-current snapshots");
+        drop(seeded);
+        #[cfg(unix)]
+        freeze_snapshot_sidecars(&blob_path);
+        let daemon = Args::parse_from(["mcp", "--daemon"]);
+
+        let snapshot =
+            build_registry_for_multi_backend_inner(base_config(), &config_for(true), None)
+                .await
+                .expect("writable comm plus read-only blob topology");
+        let server = build_server_from_multi_backend_registry(snapshot, &config_for(true), None);
+        let admission = channel_loop_plan(&server, &daemon);
+        assert!(
+            !admission.inbound_poll,
+            "quarantined originals are published through the read-only blob runtime"
+        );
+        assert!(admission.inbound_blocked_by_read_only_blob);
+        assert!(
+            admission.outbound_delivery,
+            "outbound delivery runs on the writable comm runtime and does not use blob"
+        );
+    }
+
     /// RAII guard: redirects `HOME` and restores the prior value on drop.
     struct HomeGuard {
         original: Option<std::ffi::OsString>,
@@ -9716,6 +10941,7 @@ region = "us-east-1"
                     path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9725,6 +10951,7 @@ region = "us-east-1"
                     path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9744,6 +10971,233 @@ region = "us-east-1"
         }
     }
 
+    #[test]
+    fn wal_disclosure_memory_main_does_not_disable_file_secondary() {
+        let config = RuntimeConfig {
+            db_path: None,
+            wal_ceiling_configured_bytes: 8192,
+            wal_ceiling_bytes: 8192,
+            wal_ceiling_source: khive_runtime::WalCeilingSource::Environment,
+            wal_ceiling_env_raw: Some("8192".into()),
+            ..RuntimeConfig::no_embeddings()
+        };
+        let mut topology =
+            duplicate_sqlite_path_config(std::path::Path::new("unused-secondary.db"));
+        topology.backends[0].kind = BackendKind::Memory;
+        topology.backends[0].path = None;
+        let line = resolved_wal_ceiling_disclosure(&config, &topology.backends, false);
+        assert!(line.contains("alias: configured_bytes=8192 effective_bytes=8192 source=environment enabled=true status=enforced"), "SECONDARY_FILE_POLICY_DISCLOSURE: {line}");
+        assert!(line.contains("main: configured_bytes=0 effective_bytes=0 source=default enabled=false status=disabled"));
+        let forced = resolved_wal_ceiling_disclosure(&config, &topology.backends, true);
+        assert_eq!(
+            forced
+                .matches("effective_bytes=0 source=default enabled=false")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn wal_ceiling_aliases_reject_unequal_effective_limits_before_open() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("not-created.db");
+        let mut topology = duplicate_sqlite_path_config(&path);
+        topology.backends[0].wal_ceiling_bytes = Some(8192);
+        topology.backends[1].wal_ceiling_bytes = Some(16384);
+        let runtime = RuntimeConfig::default();
+
+        let error = validate_wal_ceiling_topology(&runtime, &topology.backends, false)
+            .expect_err("one physical writer cannot have two limits");
+        assert!(matches!(
+            error.downcast_ref::<khive_runtime::ConfigError>(),
+            Some(khive_runtime::ConfigError::WalCeilingAliasConflict { .. })
+        ));
+        assert!(!path.exists(), "static validation must not open a database");
+
+        topology.backends[0].read_only = true;
+        topology.backends[1].read_only = true;
+        validate_wal_ceiling_topology(&runtime, &topology.backends, false)
+            .expect("read-only aliases both enforce zero");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_missing_paths_share_identity_through_symlink_parent() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("wal-alias-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let real = dir.path().join("real");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let database = real.join("not-created/deeper/database.db");
+        let relative = link
+            .strip_prefix(&cwd)
+            .unwrap()
+            .join("not-created/deeper/database.db");
+        for alias in [link.join("not-created/deeper/database.db"), relative] {
+            let mut topology = duplicate_sqlite_path_config(&database);
+            topology.backends[1].path = Some(alias);
+            topology.backends[0].wal_ceiling_bytes = Some(8192);
+            topology.backends[1].wal_ceiling_bytes = Some(16384);
+            let error = validate_wal_ceiling_topology(
+                &RuntimeConfig::no_embeddings(),
+                &topology.backends,
+                false,
+            )
+            .expect_err("MISSING_ALIAS_POLICY_CONFLICT");
+            assert!(matches!(
+                error.downcast_ref::<khive_runtime::ConfigError>(),
+                Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                    first_bytes: 8192,
+                    second_bytes: 16384,
+                    ..
+                })
+            ));
+            assert!(
+                !database.parent().unwrap().exists(),
+                "validation must not create missing path components"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_hard_link_aliases_reject_conflicting_policy_before_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        std::fs::write(&main, b"").unwrap();
+        std::fs::hard_link(&main, &alias).unwrap();
+        let mut topology = duplicate_sqlite_path_config(&main);
+        topology.backends[1].path = Some(alias);
+        topology.backends[0].wal_ceiling_bytes = Some(8192);
+        topology.backends[1].wal_ceiling_bytes = Some(16384);
+
+        let error =
+            validate_wal_ceiling_topology(&RuntimeConfig::default(), &topology.backends, false)
+                .expect_err("hard-linked aliases must enforce the same writer ceiling");
+        assert!(matches!(
+            error.downcast_ref::<khive_runtime::ConfigError>(),
+            Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                first_bytes: 8192,
+                second_bytes: 16384,
+                ..
+            })
+        ));
+        assert_eq!(std::fs::metadata(&main).unwrap().len(), 0);
+
+        for backend in &mut topology.backends {
+            backend.read_only = true;
+        }
+        validate_wal_ceiling_topology(&RuntimeConfig::default(), &topology.backends, false)
+            .expect("read-only hard-linked aliases enforce zero despite configured values");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_cached_hard_link_alias_rejects_conflicting_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        drop(rusqlite::Connection::open(&main).unwrap());
+        std::fs::hard_link(&main, &alias).unwrap();
+        let mut topology = duplicate_sqlite_path_config(&main);
+        topology.backends[1].path = Some(alias);
+        topology.backends[0].wal_ceiling_bytes = Some(0);
+        topology.backends[1].wal_ceiling_bytes = Some(8192);
+        let mut opened = Vec::new();
+
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &topology.backends,
+            None,
+            |cfg, max_readers, policy| {
+                opened.push(cfg.name.clone());
+                assert_eq!(policy.bytes, 0, "only the disabled main should be opened");
+                assert_eq!(policy.source, khive_db::WalCeilingSource::BackendField);
+                open_backend_with_wal_ceiling(cfg, max_readers, policy)
+            },
+        )
+        .err()
+        .expect("cached physical aliases must not silently inherit another writer policy");
+        assert_eq!(opened, ["main"]);
+        assert!(matches!(
+            error.downcast_ref::<khive_runtime::ConfigError>(),
+            Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
+                first_backend,
+                second_backend,
+                first_bytes: 0,
+                second_bytes: 8192,
+                ..
+            }) if first_backend == "main" && second_backend == "alias"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wal_ceiling_opener_forwards_each_backend_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let secondary = dir.path().join("secondary.db");
+        for path in [&main, &secondary] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let mut topology = duplicate_sqlite_path_config(&main);
+        topology.backends[0].wal_ceiling_bytes = Some(8192);
+        topology.backends[1].path = Some(alias);
+        topology.backends[1].wal_ceiling_bytes = Some(16384);
+        topology.backends.push(BackendConfig {
+            name: "secondary".to_string(),
+            path: Some(secondary),
+            wal_ceiling_bytes: None,
+            ..topology.backends[0].clone()
+        });
+        for backend in &mut topology.backends {
+            backend.read_only = true;
+        }
+        let runtime = RuntimeConfig {
+            wal_ceiling_env_raw: Some("32768".to_string()),
+            ..RuntimeConfig::default()
+        };
+        let mut opened = Vec::new();
+        let backends = open_effective_backends_with(
+            &runtime,
+            &topology.backends,
+            None,
+            |cfg, max_readers, policy| {
+                opened.push((cfg.name.clone(), policy));
+                open_backend_with_wal_ceiling(cfg, max_readers, policy)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            opened.len(),
+            2,
+            "the physical alias must reuse the main pool"
+        );
+        assert_eq!(opened[0].0, "main");
+        assert_eq!(opened[0].1.bytes, 8192);
+        assert_eq!(opened[0].1.source, khive_db::WalCeilingSource::BackendField);
+        assert_eq!(opened[1].0, "secondary");
+        assert_eq!(opened[1].1.bytes, 32768);
+        assert_eq!(opened[1].1.source, khive_db::WalCeilingSource::Environment);
+        assert!(Arc::ptr_eq(&backends["main"], &backends["alias"]));
+        assert!(!Arc::ptr_eq(&backends["main"], &backends["secondary"]));
+        for (name, policy) in opened {
+            let pool = backends[&name].pool_arc();
+            assert_eq!(pool.config().wal_ceiling, policy);
+            assert_eq!(policy.effective_bytes(pool.config().read_only), 0);
+        }
+    }
+
     #[tokio::test]
     async fn targeted_secondary_rejects_conflicting_physical_alias_modes_before_open() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -9756,6 +11210,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9765,6 +11220,7 @@ region = "us-east-1"
                     path: Some(aliased.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -9774,6 +11230,7 @@ region = "us-east-1"
                     path: Some(aliased.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9809,6 +11266,7 @@ region = "us-east-1"
                     path: Some(main.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9818,6 +11276,7 @@ region = "us-east-1"
                     path: Some(main),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9827,6 +11286,7 @@ region = "us-east-1"
                     path: Some(secondary),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9865,6 +11325,49 @@ region = "us-east-1"
         );
     }
 
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn equal_canonical_paths_stay_one_target_when_identity_reads_differ() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::fs::write(&a, b"").expect("first file");
+        std::fs::write(&b, b"").expect("second file");
+        let a_id = file_identity(&a).expect("first identity");
+        let b_id = file_identity(&b).expect("second identity");
+        assert_ne!(a_id, b_id);
+
+        // The file was replaced between the two identity reads: the paths are
+        // equal, so the identities must not separate them.
+        assert!(same_database_target(&a, &a, Some(a_id), Some(b_id)));
+        // One or both identity reads failed.
+        assert!(same_database_target(&a, &a, Some(a_id), None));
+        assert!(same_database_target(&a, &a, None, Some(a_id)));
+        assert!(same_database_target(&a, &a, None, None));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn matching_identity_joins_distinct_paths_but_a_missing_identity_does_not() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let a = dir.path().join("a.db");
+        let b = dir.path().join("b.db");
+        std::fs::write(&a, b"").expect("first file");
+        std::fs::write(&b, b"").expect("second file");
+        let a_id = file_identity(&a).expect("first identity");
+        let b_id = file_identity(&b).expect("second identity");
+        assert_ne!(a_id, b_id);
+
+        // Distinct paths with one physical identity (a hard link) are one database.
+        assert!(same_database_target(&a, &b, Some(a_id), Some(a_id)));
+        // Distinct paths with distinct identities are two databases.
+        assert!(!same_database_target(&a, &b, Some(a_id), Some(b_id)));
+        // Distinct paths cannot be joined without both identities.
+        assert!(!same_database_target(&a, &b, Some(a_id), None));
+        assert!(!same_database_target(&a, &b, None, Some(b_id)));
+        assert!(!same_database_target(&a, &b, None, None));
+    }
+
     fn memory_main_backend_config() -> KhiveConfig {
         KhiveConfig {
             backends: vec![BackendConfig {
@@ -9873,6 +11376,7 @@ region = "us-east-1"
                 path: None,
                 cache_mb: None,
                 journal_mode: None,
+                wal_ceiling_bytes: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -10012,6 +11516,412 @@ region = "us-east-1"
         assert!(message.contains("read_only"), "{message}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_backend_aliases_must_agree_on_access_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("main.db");
+        let hard_link = dir.path().join("archive.db");
+        std::fs::write(&database, b"").unwrap();
+        std::fs::hard_link(&database, &hard_link).unwrap();
+
+        let mut config = duplicate_sqlite_path_config(&database);
+        config.backends[1].path = Some(hard_link);
+        config.backends[1].read_only = true;
+        let error = validate_effective_backend_alias_modes(&config.backends)
+            .expect_err("hard links to one database cannot have conflicting modes");
+        let message = error.to_string();
+        assert!(message.contains("same physical database"), "{message}");
+        assert!(message.contains("read_only"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    #[serial_test::serial(config_ledger)]
+    async fn hard_linked_backend_aliases_share_one_open_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("main.db");
+        let hard_link = dir.path().join("archive.db");
+        rusqlite::Connection::open(&database).unwrap();
+        std::fs::hard_link(&database, &hard_link).unwrap();
+
+        let mut config = duplicate_sqlite_path_config(&database);
+        config.backends[1].path = Some(hard_link);
+        let topology = prepare_configured_storage_topology(
+            base_runtime_config_for_multi_backend(),
+            &config,
+            None,
+            StorageTopologyPurpose::Serving,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &topology.backends["main"],
+            &topology.backends["alias"]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_snapshot_to_open_aba_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for (path, marker) in [(&main, "original"), (&replacement, "replacement")] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch(&format!("CREATE TABLE {marker} (id INTEGER)"))
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let mut opened_alias = false;
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                if cfg.name == "main" {
+                    let staged_replacement = dir.path().join("staged-replacement.db");
+                    std::fs::hard_link(&replacement, &staged_replacement).unwrap();
+                    std::fs::rename(&staged_replacement, &main).unwrap();
+                    let backend = open_backend(cfg, max_readers)?;
+                    opened_main = true;
+                    assert_eq!(file_identity(&main), Some(replacement_identity));
+                    let staged_original = dir.path().join("staged-original.db");
+                    std::fs::hard_link(&alias, &staged_original).unwrap();
+                    std::fs::rename(&staged_original, &main).unwrap();
+                    Ok(backend)
+                } else {
+                    opened_alias = true;
+                    open_backend(cfg, max_readers)
+                }
+            },
+        )
+        .err()
+        .expect("the opened replacement must not be cached under the original inode");
+        assert!(opened_main);
+        assert!(
+            !opened_alias,
+            "reject before alias routing or schema preparation"
+        );
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        let message = error.to_string();
+        assert!(message.contains("identity changed"), "{message}");
+        assert!(message.contains("opened="), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_snapshot_to_open_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                if cfg.name == "main" {
+                    let staged = dir.path().join("staged-replacement.db");
+                    std::fs::hard_link(&replacement, &staged).unwrap();
+                    std::fs::rename(&staged, &main).unwrap();
+                    let backend = open_backend(cfg, max_readers)?;
+                    assert_eq!(
+                        backend.pool().opened_file_identity_record(),
+                        Some(replacement_identity)
+                    );
+                    opened_main = true;
+                    Ok(backend)
+                } else {
+                    panic!("reject before looking up or opening the hard-link alias")
+                }
+            },
+        )
+        .err()
+        .expect("the opened replacement must not inherit the old topology snapshot");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backend_alias_snapshot_rejects_same_path_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                if cfg.name == "main" {
+                    std::fs::remove_file(&main).unwrap();
+                    std::fs::hard_link(&replacement, &main).unwrap();
+                    let backend = open_backend(cfg, max_readers)?;
+                    assert_eq!(
+                        backend.pool().opened_file_identity_record(),
+                        Some(replacement_identity)
+                    );
+                    opened_main = true;
+                    Ok(backend)
+                } else {
+                    panic!("reject before cached alias reuse")
+                }
+            },
+        )
+        .err()
+        .expect("a read-only legacy database replacement must fail before alias routing");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_identity_rejects_path_swap_after_sqlite_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_main = false;
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                let backend = open_backend(cfg, max_readers)?;
+                if cfg.name == "main" {
+                    assert_eq!(file_identity(&main), Some(original_identity));
+                    assert_eq!(
+                        backend.pool().opened_file_identity_record(),
+                        Some(original_identity)
+                    );
+                    opened_main = true;
+                    let staged = dir.path().join("staged-replacement.db");
+                    std::fs::hard_link(&replacement, &staged).unwrap();
+                    std::fs::rename(&staged, &main).unwrap();
+                }
+                Ok(backend)
+            },
+        )
+        .err()
+        .expect("the path replacement after SQLite open must fail before alias reuse");
+        assert!(opened_main);
+        assert_eq!(file_identity(&main), Some(replacement_identity));
+        assert_eq!(file_identity(&alias), Some(original_identity));
+        assert!(error.to_string().contains("identity changed"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_hard_link_alias_rechecks_path_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        std::fs::hard_link(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                opened_count += 1;
+                let backend = open_backend(cfg, max_readers)?;
+                if cfg.name == "main" {
+                    let staged = dir.path().join("staged-alias.db");
+                    std::fs::hard_link(&replacement, &staged).unwrap();
+                    std::fs::rename(&staged, &alias).unwrap();
+                }
+                Ok(backend)
+            },
+        )
+        .err()
+        .expect("changed alias must not reuse the cached original backend");
+        assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        assert!(error.to_string().contains("before cached backend reuse"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_symlink_alias_rechecks_configured_target_before_reuse() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        symlink(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[1].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                opened_count += 1;
+                let backend = open_backend(cfg, max_readers)?;
+                if cfg.name == "main" {
+                    std::fs::remove_file(&alias).unwrap();
+                    symlink(&replacement, &alias).unwrap();
+                }
+                Ok(backend)
+            },
+        )
+        .err()
+        .expect("retargeted symlink must not reuse the cached original backend");
+        assert_eq!(opened_count, 1, "alias should reach the cache-reuse branch");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        let message = error.to_string();
+        assert!(message.contains("before cached backend reuse"), "{message}");
+        assert!(message.contains("configured_now="), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_backend_rechecks_configured_symlink_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main = dir.path().join("main.db");
+        let alias = dir.path().join("alias.db");
+        let replacement = dir.path().join("replacement.db");
+        for path in [&main, &replacement] {
+            let conn = rusqlite::Connection::open(path).unwrap();
+            conn.execute_batch("CREATE TABLE marker (id INTEGER)")
+                .unwrap();
+        }
+        symlink(&main, &alias).unwrap();
+        let original_identity = file_identity(&main).unwrap();
+        let replacement_identity = file_identity(&replacement).unwrap();
+        assert_ne!(original_identity, replacement_identity);
+        let mut config = duplicate_sqlite_path_config(&main);
+        config.backends[0].path = Some(alias.clone());
+        for backend in &mut config.backends {
+            backend.read_only = true;
+        }
+
+        let mut opened_count = 0;
+        let error = open_effective_backends_with(
+            &RuntimeConfig::default(),
+            &config.backends,
+            None,
+            |cfg, max_readers, _policy| {
+                opened_count += 1;
+                let backend = open_backend(cfg, max_readers)?;
+                if cfg.name == "main" {
+                    std::fs::remove_file(&alias).unwrap();
+                    symlink(&replacement, &alias).unwrap();
+                }
+                Ok(backend)
+            },
+        )
+        .err()
+        .expect("retargeted configured path must fail before caching the opened backend");
+        assert_eq!(opened_count, 1, "reject before opening the next backend");
+        assert_eq!(file_identity(&main), Some(original_identity));
+        assert_eq!(file_identity(&alias), Some(replacement_identity));
+        let message = error.to_string();
+        assert!(
+            message.contains("between topology snapshot and SQLite open"),
+            "{message}"
+        );
+        assert!(message.contains("configured_now="), "{message}");
+    }
+
     /// Regression for #720: changing `HOME` after runtime-config resolution but
     /// before multi-backend registry construction must not change the database
     /// anchor used by the consistency guard.
@@ -10090,6 +12000,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10099,6 +12010,7 @@ region = "us-east-1"
                     path: Some(secondary_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10159,6 +12071,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10168,6 +12081,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10268,6 +12182,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10277,6 +12192,7 @@ region = "us-east-1"
                     path: None,
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10339,6 +12255,7 @@ region = "us-east-1"
                     path: Some(main_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10348,6 +12265,7 @@ region = "us-east-1"
                     path: Some(second_path.clone()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10602,21 +12520,24 @@ region = "us-east-1"
 
         #[test]
         #[serial]
-        fn default_inbound_actor_defaults_to_local() {
+        fn default_inbound_actor_defaults_to_channel_email() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local"),
-                "local",
-                "an unset actor must resolve to the neutral namespace, not to any particular \
-                 deployment's identity"
-            );
+            let actor = email_default_inbound_actor_from_env();
+            assert_eq!(actor, "channel:email");
+            for caller in [None, Some("  ")] {
+                assert_ne!(
+                    actor,
+                    khive_runtime::resolve_actor(caller).id,
+                    "an unconfigured caller must never resolve to the email mailbox actor"
+                );
+            }
         }
 
         #[test]
         #[serial]
         fn default_inbound_actor_reads_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "lambda:mybot");
-            let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
             assert_eq!(actor, "lambda:mybot");
         }
@@ -10625,21 +12546,24 @@ region = "us-east-1"
         #[serial]
         fn default_inbound_actor_ignores_blank_env_var() {
             std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "  ");
-            let actor = default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            assert_eq!(actor, "local", "blank env var must fall back to default");
+            assert_eq!(
+                actor, "channel:email",
+                "blank env var must use the channel actor"
+            );
         }
 
         #[tokio::test]
         #[serial]
-        async fn fresh_uncorrelated_email_defaults_to_local_inbox() {
+        async fn explicit_local_override_routes_fresh_email_to_local_inbox() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
             assert_eq!(default_actor, "local");
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let registry = email_test_registry(runtime);
-            ingest_fresh_email(&registry, "email-default-local", &default_actor).await;
+            ingest_fresh_email(&registry, "email-explicit-local", &default_actor).await;
 
             let inbox = registry
                 .dispatch("comm.inbox", serde_json::json!({}))
@@ -10657,12 +12581,11 @@ region = "us-east-1"
 
         #[tokio::test]
         #[serial]
-        async fn opt_in_email_mailbox_is_visible_only_to_a_configured_reader() {
-            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "channel:email");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+        async fn fresh_uncorrelated_email_defaults_to_channel_mailbox() {
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
+            let default_actor = email_default_inbound_actor_from_env();
             assert_eq!(default_actor, "channel:email");
+            assert_ne!(default_actor, khive_runtime::resolve_actor(None).id);
 
             let config: KhiveConfig = toml::from_str(&format!(
                 "[actor]\nid = 'channel:email'\nmailbox_readers = ['{EMAIL_READER}']\n"
@@ -10680,7 +12603,7 @@ region = "us-east-1"
             );
             let runtime = KhiveRuntime::new(runtime_config).expect("configured runtime");
             let registry = email_test_registry(runtime);
-            ingest_fresh_email(&registry, "email-opt-in-reader", &default_actor).await;
+            ingest_fresh_email(&registry, "email-default-channel", &default_actor).await;
 
             let inbox = dispatch_as(
                 &registry,
@@ -10693,6 +12616,18 @@ region = "us-east-1"
             let messages = inbox["messages"].as_array().expect("inbox messages");
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0]["content"], "fresh email");
+            assert_eq!(messages[0]["properties"]["to_actor"], "channel:email");
+
+            let local = dispatch_as(&registry, None, "comm.inbox", serde_json::json!({}))
+                .await
+                .expect("the anonymous local caller can read its own inbox");
+            assert!(
+                local["messages"]
+                    .as_array()
+                    .expect("inbox messages")
+                    .is_empty(),
+                "fresh email must not appear in the anonymous local inbox"
+            );
 
             let denied = dispatch_as(
                 &registry,
@@ -10715,9 +12650,9 @@ region = "us-east-1"
         #[tokio::test]
         #[serial]
         async fn email_sender_prefix_filters_fresh_ingest_from_local_sends() {
+            std::env::set_var("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
+            let default_actor = email_default_inbound_actor_from_env();
             std::env::remove_var("KHIVE_EMAIL_DEFAULT_ACTOR");
-            let default_actor =
-                default_inbound_actor_from_env("KHIVE_EMAIL_DEFAULT_ACTOR", "local");
             let runtime = KhiveRuntime::memory().expect("in-memory runtime");
             let registry = email_test_registry(runtime);
             ingest_fresh_email(&registry, "email-prefix-filter", &default_actor).await;
@@ -13028,6 +14963,7 @@ backend = "kg-backend"
                         path: Some(main_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13037,6 +14973,7 @@ backend = "kg-backend"
                         path: Some(kg_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13169,6 +15106,7 @@ backend = "kg-backend"
                         path: Some(dir.path().join("main.db")),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13178,6 +15116,7 @@ backend = "kg-backend"
                         path: Some(dir.path().join("comm.db")),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13263,10 +15202,8 @@ backend = "kg-backend"
         }
 
         /// Two-backend regression for the comm split topology: comm assigned
-        /// its own backend while kg stays on main. The delivery loop's
-        /// non-wire scan/claim/mark must all land on the comm backend; the
-        /// generic wire `list` (kg/main-routed) cannot see the outbox at all,
-        /// which is exactly why the loop must not use it.
+        /// its own backend while kg stays on main. Explicit message lists and
+        /// the delivery loop's scan/claim/mark must use the comm backend.
         #[tokio::test]
         #[serial]
         #[serial(config_ledger)]
@@ -13282,6 +15219,7 @@ backend = "kg-backend"
                         path: Some(main_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13291,6 +15229,7 @@ backend = "kg-backend"
                         path: Some(comm_path.clone()),
                         cache_mb: None,
                         journal_mode: None,
+                        wal_ceiling_bytes: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -13335,8 +15274,6 @@ backend = "kg-backend"
                 .expect("comm.send returns full_id")
                 .to_string();
 
-            // The generic wire `list` runs on kg/main and must NOT see the
-            // outbox row — pinning the routing gap the non-wire scan closes.
             let wire_list = registry
                 .dispatch(
                     "list",
@@ -13348,15 +15285,17 @@ backend = "kg-backend"
                     }),
                 )
                 .await
-                .expect("generic list must succeed on main");
+                .expect("explicit message list must succeed on comm");
             let wire_items = wire_list
                 .get("items")
                 .and_then(serde_json::Value::as_array)
                 .cloned()
                 .unwrap_or_default();
             assert!(
-                wire_items.is_empty(),
-                "main-routed wire list must not see comm's outbox: {wire_list}"
+                wire_items
+                    .iter()
+                    .any(|item| item["id"].as_str() == Some(note_id.as_str())),
+                "explicit message list must see comm's outbox: {wire_list}"
             );
 
             let channel = RecordingChannel::default();
@@ -13417,17 +15356,30 @@ backend = "kg-backend"
     #[cfg(feature = "channel-email")]
     mod spawn_email_channel_loops_tests {
         use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+        use std::sync::{Arc, Mutex};
 
-        const EMAIL_ENV_VARS: [&str; 9] = [
+        const EMAIL_ENV_VARS: &[&str] = &[
             "KHIVE_EMAIL_SMTP_HOST",
+            "KHIVE_EMAIL_SMTP_PORT",
             "KHIVE_EMAIL_IMAP_HOST",
+            "KHIVE_EMAIL_IMAP_PORT",
+            "KHIVE_EMAIL_IMAP_MAX_MESSAGE_BYTES",
+            "KHIVE_EMAIL_IMAP_MAX_PAGE_BYTES",
             "KHIVE_EMAIL_USERNAME",
+            "KHIVE_EMAIL_MAILBOX",
             "KHIVE_EMAIL_MAINTAINER_ADDRESS",
             "KHIVE_EMAIL_AUTHSERV_ID",
             "KHIVE_EMAIL_PASSWORD",
             "KHIVE_EMAIL_OAUTH_TENANT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_ID",
             "KHIVE_EMAIL_OAUTH_CLIENT_SECRET",
+            "KHIVE_EMAIL_QUARANTINE_STORE",
+            "KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS",
+            "KHIVE_EMAIL_INGEST_NAMESPACE",
+            "KHIVE_EMAIL_DEFAULT_ACTOR",
         ];
 
         /// RAII guard: snapshots each `KHIVE_EMAIL_*` var's current value, clears it,
@@ -13459,6 +15411,158 @@ backend = "kg-backend"
                     }
                 }
             }
+        }
+
+        struct OneMessageEmailChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for OneMessageEmailChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                Ok(self.envelope.lock().unwrap().take().into_iter().collect())
+            }
+        }
+
+        #[test]
+        fn email_poll_shutdown_override_survives_cancelled_process_token() {
+            let cancelled_process = tokio_util::sync::CancellationToken::new();
+            cancelled_process.cancel();
+            let isolated = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(isolated.clone());
+            });
+
+            let selected = email_poll_shutdown_token(cancelled_process);
+            assert!(!selected.is_cancelled());
+            selected.cancel();
+            assert!(isolated.is_cancelled());
+        }
+
+        #[tokio::test(start_paused = true)]
+        #[serial]
+        async fn production_email_spawn_routes_unset_default_actor_to_channel_mailbox() {
+            let _env_guard = EmailEnvGuard::clear();
+            std::env::set_var("KHIVE_EMAIL_SMTP_HOST", "smtp.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_IMAP_HOST", "imap.example.invalid");
+            std::env::set_var("KHIVE_EMAIL_USERNAME", "mailbox@example.com");
+            std::env::set_var("KHIVE_EMAIL_MAINTAINER_ADDRESS", "maintainer@example.com");
+            std::env::set_var("KHIVE_EMAIL_AUTHSERV_ID", "mx.example.com");
+            std::env::set_var("KHIVE_EMAIL_PASSWORD", "test-password");
+            assert!(std::env::var_os("KHIVE_EMAIL_DEFAULT_ACTOR").is_none());
+            khive_channel_email::EmailChannel::from_env().expect("email config takes the Ok arm");
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let blob_dir = tempfile::tempdir().expect("blob directory");
+            runtime
+                .install_blob_store(Arc::new(
+                    khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                        .expect("blob store"),
+                ))
+                .expect("install quarantine blob store");
+            let server = KhiveMcpServer::with_packs(
+                runtime,
+                &["kg".to_string(), "comm".to_string(), "blob".to_string()],
+            )
+            .expect("server builds with comm and blob storage");
+            let registry = server.verb_registry_clone();
+            let mut admission = server.channel_loop_admission();
+            assert!(
+                admission.inbound_poll,
+                "writable comm runtime admits polling"
+            );
+            admission.outbound_delivery = false;
+
+            // Replace the transport and process-global shutdown token. The
+            // real spawn path still resolves the actor, starts
+            // channel_poll_loop, and dispatches comm.ingest.
+            let test_shutdown = tokio_util::sync::CancellationToken::new();
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(test_shutdown.clone());
+            });
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(slot.borrow().is_none());
+                *slot.borrow_mut() = Some(Arc::new(OneMessageEmailChannel {
+                    envelope: Mutex::new(Some(
+                        ChannelEnvelope::new(
+                            "email:sender@example.com",
+                            "email:mailbox@example.com",
+                            "production actor wiring",
+                        )
+                        .with_external_id("email-production-default-actor"),
+                    )),
+                }));
+            });
+            spawn_email_channel_loops(&server, admission);
+            EMAIL_POLL_TEST_CHANNEL.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed fake transport"
+                );
+            });
+            EMAIL_POLL_TEST_SHUTDOWN.with(|slot| {
+                assert!(
+                    slot.borrow_mut().take().is_none(),
+                    "spawn consumed test-scoped shutdown token"
+                );
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let message = loop {
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                tokio::task::yield_now().await;
+                let channel_inbox = registry
+                    .dispatch_with_identity(
+                        "comm.inbox",
+                        serde_json::json!({"status": "all"}),
+                        Some(khive_runtime::RequestIdentity {
+                            namespace: "local".to_string(),
+                            actor_id: Some("channel:email".to_string()),
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .expect("channel actor reads its own inbox");
+                if let Some(message) = channel_inbox["messages"]
+                    .as_array()
+                    .expect("channel inbox messages")
+                    .iter()
+                    .find(|message| message["content"] == "production actor wiring")
+                {
+                    break message.clone();
+                }
+                let local_inbox = registry
+                    .dispatch("comm.inbox", serde_json::json!({"status": "all"}))
+                    .await
+                    .expect("local actor reads its own inbox");
+                assert!(
+                    !local_inbox["messages"]
+                        .as_array()
+                        .expect("local inbox messages")
+                        .iter()
+                        .any(|message| message["content"] == "production actor wiring"),
+                    "the production poll must not pass local as comm.ingest's default actor"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "production polling did not ingest its test message within 30s"
+                );
+            };
+            assert_eq!(message["properties"]["to_actor"], "channel:email");
+            test_shutdown.cancel();
         }
 
         #[tokio::test]
@@ -13561,6 +15665,89 @@ backend = "kg-backend"
             let admitted = channel_loop_plan(&server, &client);
             assert!(!admitted.inbound_poll);
             assert!(!admitted.outbound_delivery);
+        }
+
+        /// Inbound polling publishes quarantined originals through `blob.put`, so
+        /// a writable comm runtime beside a read-only blob runtime must not poll:
+        /// every publish would fail, the cursor would hold, and the same message
+        /// would be retried forever.
+        #[test]
+        #[serial_test::serial(config_ledger)]
+        fn email_admission_refuses_inbound_polling_when_the_blob_runtime_is_read_only() {
+            use crate::server::ChannelLoopAdmission;
+            use std::sync::{Arc, Mutex};
+
+            #[derive(Clone, Default)]
+            struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+            impl std::io::Write for CapturedLog {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+                type Writer = CapturedLog;
+                fn make_writer(&'a self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("blob-read-only.db");
+            let config = RuntimeConfig {
+                db_path: Some(path),
+                packs: vec!["kg".to_string(), "blob".to_string()],
+                ..RuntimeConfig::no_embeddings()
+            };
+            KhiveRuntime::new(config.clone()).expect("seed exact-current snapshot");
+            #[cfg(unix)]
+            freeze_snapshot_sidecars(config.db_path.as_ref().expect("db path"));
+            let read_only_blob =
+                KhiveRuntime::new_readonly(config).expect("read-only blob runtime");
+            assert!(read_only_blob.is_read_only());
+            let writable = KhiveRuntime::memory().expect("writable runtime");
+
+            let refused =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&writable), Some(&read_only_blob));
+            assert!(
+                !refused.inbound_poll,
+                "polling must not start against a read-only blob runtime"
+            );
+            assert!(refused.inbound_blocked_by_read_only_blob);
+            assert!(
+                refused.outbound_delivery,
+                "outbound delivery does not touch blob and stays admitted"
+            );
+
+            let captured = CapturedLog::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .without_time()
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                log_inbound_refused_for_read_only_blob("email", refused);
+            });
+            let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logged.contains("blob pack runtime is read-only"),
+                "the refusal must name the blob runtime: {logged}"
+            );
+
+            // Controls: a writable blob runtime, or no blob pack at all, leaves
+            // admission exactly as comm's own writability decides it.
+            let admitted =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&writable), Some(&writable));
+            assert!(admitted.inbound_poll && admitted.outbound_delivery);
+            assert!(!admitted.inbound_blocked_by_read_only_blob);
+            let no_blob = ChannelLoopAdmission::for_pack_runtimes(Some(&writable), None);
+            assert!(no_blob.inbound_poll && !no_blob.inbound_blocked_by_read_only_blob);
+            let comm_read_only =
+                ChannelLoopAdmission::for_pack_runtimes(Some(&read_only_blob), Some(&writable));
+            assert!(!comm_read_only.inbound_poll && !comm_read_only.outbound_delivery);
         }
 
         #[tokio::test]
@@ -13997,6 +16184,43 @@ backend = "kg-backend"
 
         const SOURCE: &str = "imap+tls:h:993:m:INBOX";
 
+        /// The poller stores every quarantined email's original as one blob
+        /// before it commits the cursor, so the channel's accepted message
+        /// ceiling must fit one blob object. A larger ceiling admits a message
+        /// whose quarantine `blob.put` refuses on every poll.
+        #[test]
+        fn email_message_ceiling_fits_one_blob_object() {
+            assert_eq!(
+                khive_channel_email::config::MAX_IMAP_MESSAGE_BYTES as u64,
+                khive_storage::blob::MAX_BLOB_WHOLE_BYTES
+            );
+        }
+
+        /// The poll loop stores inbound rows under its landing actor, so the
+        /// stored mailbox is read through that owner. `None` reads as the
+        /// anonymous caller.
+        async fn list_messages_as(
+            registry: &khive_runtime::VerbRegistry,
+            namespace: &str,
+            actor_id: Option<&str>,
+        ) -> Vec<serde_json::Value> {
+            registry
+                .dispatch_with_identity(
+                    "list",
+                    json!({"namespace": namespace, "kind": "message", "limit": 50}),
+                    Some(khive_runtime::RequestIdentity {
+                        namespace: namespace.to_string(),
+                        actor_id: actor_id.map(str::to_string),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .expect("list must succeed")["items"]
+                .as_array()
+                .expect("list returns an items envelope")
+                .clone()
+        }
+
         /// First `poll_page` call returns one message that ingests cleanly
         /// and one that permanently fails `comm.ingest` validation (empty
         /// content) -- simulating a partial-page ingest failure. Every
@@ -14167,17 +16391,13 @@ backend = "kg-backend"
                  {calls:?}"
             );
 
-            let inbox = registry
-                .dispatch(
-                    "list",
-                    json!({"namespace": "local", "kind": "message", "limit": 50}),
-                )
-                .await
-                .expect("list must succeed");
-            let notes = inbox["items"]
-                .as_array()
-                .expect("list returns an items envelope")
-                .clone();
+            let notes = list_messages_as(&registry, "local", Some("actor:test")).await;
+            for other in [None, Some("actor:other")] {
+                assert!(
+                    list_messages_as(&registry, "local", other).await.is_empty(),
+                    "a caller other than the landing actor must not list its mailbox: {other:?}"
+                );
+            }
             let matching: Vec<_> = notes
                 .iter()
                 .filter(|n| {
@@ -14313,12 +16533,12 @@ backend = "kg-backend"
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
-        struct ContentRefusalOnceChannel {
+        struct EmailOnceChannel {
             envelope: Mutex<Option<ChannelEnvelope>>,
         }
 
         #[async_trait]
-        impl Channel for ContentRefusalOnceChannel {
+        impl Channel for EmailOnceChannel {
             fn kind(&self) -> &'static str {
                 "email"
             }
@@ -14465,17 +16685,7 @@ backend = "kg-backend"
                 );
             assert_eq!(restored.checkpoint.high_water, Some(1));
 
-            let inbox = registry
-                .dispatch(
-                    "list",
-                    json!({"namespace": "local", "kind": "message", "limit": 50}),
-                )
-                .await
-                .expect("list must succeed");
-            let notes = inbox["items"]
-                .as_array()
-                .expect("list returns an items envelope")
-                .clone();
+            let notes = list_messages_as(&registry, "local", Some("actor:test")).await;
             let quarantined = notes
                 .iter()
                 .find(|n| {
@@ -14525,6 +16735,425 @@ backend = "kg-backend"
         }
 
         #[tokio::test(start_paused = true)]
+        async fn first_time_email_quarantine_roots_exact_original_before_cursor_commit() {
+            const ORIGINAL_BYTES: &[u8] = b"From: forged@example.com\r\n\
+                To: maintainer@example.com\r\n\
+                X-Original: \xff\x00\r\n\
+                \r\n\
+                untrusted body\r\n";
+            const EXTERNAL_ID: &str = "imap:h:account:11:8";
+            let mut envelope = ChannelEnvelope::new(
+                "email:quarantine",
+                "email:maintainer@example.com",
+                "untrusted body",
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_legacy_external_id("imap:h:11:8")
+            .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
+            envelope
+                .metadata
+                .insert("quarantined".to_string(), "true".to_string());
+            envelope
+                .metadata
+                .insert("quarantine_reason".to_string(), "off-allowlist".to_string());
+            envelope.metadata.insert(
+                "quarantine_claimed_from".to_string(),
+                "forged@example.com".to_string(),
+            );
+
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(EmailOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first-time quarantine must attach its original and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let notes = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
+            assert_eq!(notes.len(), 1, "one first-time quarantine note");
+            let quarantined = &notes[0];
+            let props = &quarantined["properties"];
+            assert_eq!(props["external_id"], EXTERNAL_ID);
+            assert_eq!(props["from_actor"], "email:quarantine");
+            assert_eq!(props["quarantined"], "true");
+            assert_eq!(props["quarantine_reason"], "off-allowlist");
+            assert_eq!(props["quarantine_claimed_from"], "forged@example.com");
+            assert!(props.get("quarantine_classification").is_none());
+            let content_ref = props["quarantine_content_ref"]
+                .as_str()
+                .expect("first-time quarantine original reference");
+            let note_id = quarantined["id"]
+                .as_str()
+                .expect("quarantine note id")
+                .parse::<uuid::Uuid>()
+                .expect("quarantine note UUID");
+            let owner = runtime
+                .attachments()
+                .expect("main attachment store")
+                .get_attachment(note_id, "quarantine-original")
+                .await
+                .expect("attachment lookup")
+                .expect("original must be rooted before cursor commit");
+            assert_eq!(owner.substrate, khive_storage::AttachmentSubstrate::Note);
+            assert_eq!(owner.content_ref.as_str(), content_ref);
+            let fetched = registry
+                .dispatch("blob.get", json!({"content_ref": content_ref}))
+                .await
+                .expect("quarantine original must be retrievable");
+            let original = BASE64
+                .decode(fetched["bytes"].as_str().expect("base64 original bytes"))
+                .expect("valid base64 original bytes");
+            assert_eq!(original, ORIGINAL_BYTES);
+        }
+
+        /// One page of pre-built envelopes, delivered once, from a channel that
+        /// declares a quarantine retention limit.
+        struct EmailBatchChannel {
+            envelopes: Mutex<Vec<ChannelEnvelope>>,
+            limit: Option<usize>,
+        }
+
+        #[async_trait]
+        impl Channel for EmailBatchChannel {
+            fn kind(&self) -> &'static str {
+                "email"
+            }
+
+            fn quarantine_retention_limit(&self) -> Option<usize> {
+                self.limit
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                _since: DateTime<Utc>,
+                _checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                let envelopes = std::mem::take(&mut *self.envelopes.lock().unwrap());
+                let next_checkpoint = (!envelopes.is_empty()).then(|| ChannelCheckpoint {
+                    source: SOURCE.to_string(),
+                    generation: 11,
+                    high_water: Some(7),
+                });
+                Ok(ChannelPollPage {
+                    envelopes,
+                    next_checkpoint,
+                })
+            }
+        }
+
+        /// Published blob objects under `dir`: files named by a 64-hex digest.
+        fn count_files(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir)
+                .expect("read blob directory")
+                .map(|entry| entry.expect("directory entry").path())
+                .map(|path| {
+                    if path.is_dir() {
+                        return count_files(&path);
+                    }
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    usize::from(name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()))
+                })
+                .sum()
+        }
+
+        /// Poll three distinct quarantined emails through the real poll loop
+        /// under `limit`. Returns each stored note's properties in external-id
+        /// order, plus the number of objects the blob store ended up holding.
+        async fn poll_three_quarantined_emails(
+            limit: Option<usize>,
+        ) -> (Vec<serde_json::Value>, usize) {
+            let envelopes = (1..=3)
+                .map(|n| {
+                    let mut envelope = ChannelEnvelope::new(
+                        "email:quarantine",
+                        "email:maintainer@example.com",
+                        format!("untrusted body {n}"),
+                    )
+                    .with_external_id(format!("imap:h:account:11:{n}"))
+                    .with_quarantine_replay(
+                        format!("raw original number {n}").into_bytes(),
+                        "email:maintainer@example.com",
+                    );
+                    envelope
+                        .metadata
+                        .insert("quarantined".to_string(), "true".to_string());
+                    envelope
+                        .metadata
+                        .insert("quarantine_reason".to_string(), "off-allowlist".to_string());
+                    envelope
+                })
+                .collect();
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(EmailBatchChannel {
+                envelopes: Mutex::new(envelopes),
+                limit,
+            }));
+
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "every quarantined message must be recorded and the cursor must advance"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let inbox = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
+            let mut properties: Vec<serde_json::Value> = inbox
+                .iter()
+                .map(|note| note["properties"].clone())
+                .collect();
+            properties.sort_by_key(|props| props["external_id"].as_str().map(str::to_string));
+            (properties, count_files(blob_dir.path()))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn quarantine_originals_stop_at_the_retention_limit_but_every_record_is_kept() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(2)).await;
+            assert_eq!(notes.len(), 3, "every quarantined message is recorded");
+            for retained in &notes[..2] {
+                assert!(
+                    retained["quarantine_content_ref"].is_string(),
+                    "below the limit the original is retained: {retained}"
+                );
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            let omitted = &notes[2];
+            assert_eq!(omitted["quarantined"], "true");
+            assert_eq!(omitted["external_id"], "imap:h:account:11:3");
+            assert!(
+                omitted.get("quarantine_content_ref").is_none(),
+                "past the limit no original is published: {omitted}"
+            );
+            assert_eq!(omitted["quarantine_original_retained"], "false");
+            assert_eq!(
+                omitted["quarantine_original_not_retained_reason"],
+                "retention-limit"
+            );
+            assert_eq!(
+                stored_objects, 2,
+                "blob.put ran only for the two originals under the limit"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn quarantine_originals_are_all_retained_below_the_retention_limit() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(10)).await;
+            assert_eq!(notes.len(), 3);
+            for retained in &notes {
+                assert!(retained["quarantine_content_ref"].is_string());
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            assert_eq!(stored_objects, 3);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_zero_retention_limit_stores_no_originals() {
+            let (notes, stored_objects) = poll_three_quarantined_emails(Some(0)).await;
+            assert_eq!(notes.len(), 3);
+            for omitted in &notes {
+                assert!(omitted.get("quarantine_content_ref").is_none());
+                assert_eq!(omitted["quarantine_original_retained"], "false");
+            }
+            assert_eq!(stored_objects, 0);
+        }
+
+        /// Quarantine three messages that `comm.ingest` refused, through the
+        /// ingest-failure path, under `limit`. Returns the stored message
+        /// properties sorted by external id and the number of blob objects.
+        async fn quarantine_three_refused_messages(
+            limit: Option<usize>,
+        ) -> (Vec<serde_json::Value>, usize) {
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            for index in 1..=3u32 {
+                let envelope = ChannelEnvelope::new(
+                    "email:maintainer@example.com",
+                    "email:mailbox@example.com",
+                    "refused body",
+                )
+                .with_external_id(format!("imap:h:refused:11:{index}"))
+                .with_quarantine_replay(
+                    format!("original message {index}").into_bytes(),
+                    "email:maintainer@example.com",
+                );
+                quarantine_channel_ingest_failure(
+                    &registry,
+                    "test-ns",
+                    "email",
+                    "email",
+                    Some("actor:test"),
+                    &envelope,
+                    khive_runtime::ChannelIngestFailureClass::Permanent {
+                        reason: "SecretDetected",
+                    },
+                    limit,
+                )
+                .await
+                .expect("a refused message is always recorded");
+            }
+
+            let inbox = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
+            let mut properties: Vec<serde_json::Value> = inbox
+                .iter()
+                .map(|note| note["properties"].clone())
+                .collect();
+            properties.sort_by_key(|props| props["external_id"].as_str().map(str::to_string));
+            (properties, count_files(blob_dir.path()))
+        }
+
+        #[tokio::test]
+        async fn refused_message_originals_stop_at_the_retention_limit_but_every_record_is_kept() {
+            let (notes, stored_objects) = quarantine_three_refused_messages(Some(2)).await;
+            assert_eq!(notes.len(), 3, "every refused message is recorded");
+            for retained in &notes[..2] {
+                assert!(
+                    retained["quarantine_content_ref"].is_string(),
+                    "below the limit the original is retained: {retained}"
+                );
+                assert!(retained.get("quarantine_original_retained").is_none());
+            }
+            let omitted = &notes[2];
+            assert_eq!(omitted["quarantined"], "true");
+            assert_eq!(omitted["external_id"], "imap:h:refused:11:3");
+            assert!(
+                omitted.get("quarantine_content_ref").is_none(),
+                "past the limit no original is published: {omitted}"
+            );
+            assert_eq!(omitted["quarantine_original_retained"], "false");
+            assert_eq!(
+                omitted["quarantine_original_not_retained_reason"],
+                "retention-limit"
+            );
+            assert_eq!(
+                stored_objects, 2,
+                "blob.put ran only for the two originals under the limit"
+            );
+        }
+
+        #[tokio::test]
+        async fn refused_message_originals_are_unbounded_without_a_limit() {
+            let (notes, stored_objects) = quarantine_three_refused_messages(None).await;
+            assert_eq!(notes.len(), 3);
+            for retained in &notes {
+                assert!(retained["quarantine_content_ref"].is_string());
+            }
+            assert_eq!(stored_objects, 3);
+        }
+
+        #[tokio::test(start_paused = true)]
         async fn content_refusal_stores_exact_replay_and_ingests_body_free_quarantine() {
             const EXTERNAL_ID: &str = "imap:h:11:7";
             const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
@@ -14543,7 +17172,7 @@ backend = "kg-backend"
             .with_quarantine_replay(ORIGINAL_BYTES.to_vec(), "email:maintainer@example.com");
 
             let mut ch_registry = ChannelRegistry::new();
-            ch_registry.register(Arc::new(ContentRefusalOnceChannel {
+            ch_registry.register(Arc::new(EmailOnceChannel {
                 envelope: Mutex::new(Some(envelope)),
             }));
 
@@ -14619,16 +17248,7 @@ backend = "kg-backend"
             }
             task.abort();
 
-            let inbox = registry
-                .dispatch(
-                    "list",
-                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
-                )
-                .await
-                .expect("list must succeed");
-            let notes = inbox["items"]
-                .as_array()
-                .expect("list returns an items envelope");
+            let notes = list_messages_as(&registry, "test-ns", Some("actor:test")).await;
             assert_eq!(notes.len(), 1, "only the quarantine notification is stored");
             let quarantined = &notes[0];
             assert_eq!(
@@ -14712,6 +17332,7 @@ backend = "kg-backend"
                 khive_runtime::ChannelIngestFailureClass::Permanent {
                     reason: "SecretDetected",
                 },
+                None,
             )
             .await
             .expect("duplicate quarantine repairs its missing blob owner");
@@ -14723,6 +17344,139 @@ backend = "kg-backend"
                 .unwrap()
                 .expect("retry restores the GC root");
             assert_eq!(repaired.content_ref.as_str(), content_ref);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn correlated_content_refusal_routes_quarantine_to_original_sender() {
+            const EXTERNAL_ID: &str = "imap:correlated-quarantine:11:7";
+            const REFUSED_BODY: &str = "AKIAFAKEKEY1234567890"; // gitleaks:allow
+
+            let config = RuntimeConfig {
+                db_path: None,
+                actor_id: Some("lambda:original-sender".to_string()),
+                ..RuntimeConfig::no_embeddings()
+            };
+            let runtime = KhiveRuntime::new(config).expect("in-memory sender runtime");
+            let blob_dir = tempfile::tempdir().expect("blob tempdir");
+            let blob_store =
+                khive_db::stores::blob::FsBlobStore::new(blob_dir.path().to_path_buf(), 0)
+                    .expect("fs blob store");
+            runtime
+                .install_blob_store(Arc::new(blob_store))
+                .expect("install blob store");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(
+                khive_pack_comm::CommPack::new_with_channel_ingest_capability(
+                    runtime.clone(),
+                    khive_runtime::ChannelIngestCapability::grant_for_direct_composition(),
+                ),
+            );
+            builder.register(khive_pack_blob::BlobPack::new(runtime.clone()));
+            builder.with_actor_id(runtime.config().actor_id.clone());
+            let registry = builder.build().expect("registry builds");
+            ensure_channel_quarantine_storage(&registry)
+                .await
+                .expect("quarantine storage preflight");
+
+            let sent = registry
+                .dispatch(
+                    "comm.send",
+                    json!({"to": "email:recipient@example.com", "content": "original outbound"}),
+                )
+                .await
+                .expect("original sender's outbound message");
+            assert_eq!(sent["from"], "lambda:original-sender");
+            let thread_id = sent["thread_id"]
+                .as_str()
+                .expect("outbound thread ID")
+                .to_string();
+            let envelope = ChannelEnvelope::new(
+                "email:recipient@example.com",
+                "email:mailbox@example.com",
+                REFUSED_BODY,
+            )
+            .with_external_id(EXTERNAL_ID)
+            .with_correlation(thread_id.clone())
+            .with_quarantine_replay(
+                REFUSED_BODY.as_bytes().to_vec(),
+                "email:recipient@example.com",
+            );
+
+            let refused = registry
+                .dispatch(
+                    "comm.ingest",
+                    json!({
+                        "namespace": "local",
+                        "from": envelope.from.clone(),
+                        "to": envelope.to.clone(),
+                        "content": envelope.content.clone(),
+                        "channel_kind": "email",
+                        "external_id": EXTERNAL_ID,
+                        "correlation_external_id": thread_id.clone(),
+                        "default_inbound_actor": "channel:email",
+                    }),
+                )
+                .await
+                .expect_err("the real content gate must refuse the reply");
+            assert!(matches!(
+                refused,
+                khive_runtime::RuntimeError::SecretDetected(_)
+            ));
+
+            let mut channels = ChannelRegistry::new();
+            channels.register(Arc::new(EmailOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(channels),
+                registry.clone(),
+                "local".to_string(),
+                "channel:email".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            ));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let restored = load_channel_cursor(&registry, "email", "email")
+                    .await
+                    .expect("cursor lookup");
+                if restored
+                    .as_ref()
+                    .is_some_and(|stored| stored.checkpoint.high_water == Some(7))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a refused correlated message must quarantine and advance the cursor"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let listed = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "local", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list messages");
+            let quarantined: Vec<_> = listed["items"]
+                .as_array()
+                .expect("message items")
+                .iter()
+                .filter(|note| note["properties"]["external_id"] == EXTERNAL_ID)
+                .collect();
+            assert_eq!(quarantined.len(), 1, "one quarantine for the refused reply");
+            let props = &quarantined[0]["properties"];
+            assert_eq!(props["from_actor"], "email:quarantine");
+            assert_eq!(props["to_actor"], "lambda:original-sender");
+            assert_ne!(props["to_actor"], "channel:email");
+            assert_eq!(props["thread_id"], sent["thread_id"]);
+            assert_eq!(props["quarantine_reason"], "SecretDetected");
         }
 
         /// A real quarantine note plus GC-rooted original in one isolated
@@ -14790,6 +17544,37 @@ backend = "kg-backend"
                 .authorize(Namespace::parse("retention-ns").unwrap())
                 .unwrap();
             let notes = runtime.notes(&token).unwrap();
+            let annotator = runtime
+                .create_note(
+                    &token,
+                    "observation",
+                    None,
+                    "quarantine cleanup edge fixture",
+                    None,
+                    None,
+                    vec![note_id],
+                )
+                .await
+                .unwrap();
+            let incident_edge_query = || SqlStatement {
+                sql: "SELECT id FROM graph_edges \
+                      WHERE source_id = ?1 AND target_id = ?2 AND relation = 'annotates'"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(annotator.id.to_string()),
+                    SqlValue::Text(note_id.to_string()),
+                ],
+                label: Some("quarantine_retention_incident_edges".into()),
+            };
+            let edges_before = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(incident_edge_query())
+                .await
+                .unwrap();
+            assert_eq!(edges_before.len(), 1);
             let note = notes.get_note(note_id).await.unwrap().unwrap();
             let expires_at = note
                 .expires_at
@@ -14836,6 +17621,15 @@ backend = "kg-backend"
                 .expect("expired cleanup");
             assert_eq!(after["deleted"], 1);
             assert!(notes.get_note(note_id).await.unwrap().is_none());
+            let edges_after = runtime
+                .sql()
+                .reader()
+                .await
+                .unwrap()
+                .query_all(incident_edge_query())
+                .await
+                .unwrap();
+            assert!(edges_after.is_empty());
             assert!(runtime
                 .attachments()
                 .unwrap()
@@ -16120,6 +18914,7 @@ backend = "kg-backend"
                     path: Some(main_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -16129,6 +18924,7 @@ backend = "kg-backend"
                     path: Some(tool_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
+                    wal_ceiling_bytes: None,
                     served_kinds: None,
                     read_only: tool_read_only,
                 },

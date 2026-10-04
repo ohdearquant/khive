@@ -2,7 +2,7 @@
 //! See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::recall_feedback::{on_recall_hit, on_recall_miss};
 
@@ -15,8 +15,9 @@ use khive_runtime::{
     micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RequestIdentity, RuntimeError,
     SearchSource, VerbRegistry,
 };
-use khive_storage::types::{Direction, EdgeFilter, NeighborQuery};
+use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
+use khive_types::{Details, KhiveError};
 
 use crate::config::{RecallConfig, ScoreBreakdown};
 use crate::rerank::{weighted_rerank, RerankFeatures};
@@ -33,11 +34,6 @@ use super::common::{
     DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC, PROF_CID,
     RECALL_CALL_ID, RECALL_SLOW_THRESHOLD_MS,
 };
-
-/// Bounded storage page for inbound supersession checks. This is deliberately
-/// independent of recall candidate cardinality: one candidate may have any
-/// number of superseding edges.
-const SUPERSEDES_EDGE_PAGE_SIZE: u32 = 256;
 
 fn compare_rank_scores_desc(left: f32, right: f32) -> std::cmp::Ordering {
     match (left.is_nan(), right.is_nan()) {
@@ -130,12 +126,103 @@ fn reject_archived_brain_profile(response: &Value, profile_id: &str) -> Result<(
     Ok(())
 }
 
+fn freshness_unmet(models: &[String]) -> RuntimeError {
+    let mut failed = models.to_vec();
+    failed.sort();
+    failed.dedup();
+    KhiveError::unavailable(format!(
+        "freshness_unmet: memory.recall could not prove visibility for models {}",
+        failed.join(", ")
+    ))
+    .with_details(Details::new_owned([
+        ("reason", "freshness_unmet".to_string()),
+        ("failed_models", failed.join(",")),
+    ]))
+    .into()
+}
+
+fn session_attempt_deadline(
+    first_attempt: bool,
+    wait_end: Instant,
+    attempt_deadline: Instant,
+) -> Instant {
+    if first_attempt {
+        attempt_deadline
+    } else {
+        attempt_deadline.min(wait_end)
+    }
+}
+
 impl MemoryPack {
+    async fn collect_recall_candidates_with_session(
+        &self,
+        query: &str,
+        token: &NamespaceToken,
+        opts: RecallCandidateParams<'_>,
+        wait_end: Instant,
+        attempt_deadline: Instant,
+    ) -> Result<super::common::RecallCandidateSet, RuntimeError> {
+        if opts
+            .session_fence
+            .is_none_or(|fence| fence.fences.is_empty())
+        {
+            return self.collect_recall_candidates(query, token, opts).await;
+        }
+        let required_models: Vec<String> = opts
+            .session_fence
+            .expect("nonempty session fence checked")
+            .fences
+            .iter()
+            .map(|fence| fence.model.clone())
+            .collect();
+        let fence = opts.session_fence.expect("nonempty session fence checked");
+        let mut first_attempt = true;
+        loop {
+            // A zero wait still gets one immediate attempt. Only retries are
+            // bounded by the caller's wait window as well as the request cap.
+            let deadline = session_attempt_deadline(first_attempt, wait_end, attempt_deadline);
+            if Instant::now() >= deadline {
+                return Err(freshness_unmet(&required_models));
+            }
+            first_attempt = false;
+
+            // Poll the inexpensive fence without embedding, FTS or KNN. The
+            // candidate-producing read proves it again in its own snapshot.
+            let probe = Box::pin(crate::ann::session_unmet_fences(&self.runtime, fence));
+            let unmet = tokio::time::timeout_at(deadline.into(), probe)
+                .await
+                .map_err(|_| freshness_unmet(&required_models))?;
+            let failed_models = if unmet.is_empty() {
+                let candidate_future = Box::pin(self.collect_recall_candidates(query, token, opts));
+                let candidates = tokio::time::timeout_at(deadline.into(), candidate_future)
+                    .await
+                    .map_err(|_| freshness_unmet(&required_models))??;
+                if candidates.session_unmet_models.is_empty() {
+                    return Ok(candidates);
+                }
+                candidates.session_unmet_models
+            } else {
+                unmet
+            };
+            khive_storage::ensure_request_read_active("memory.recall")?;
+            let now = Instant::now();
+            if now >= wait_end {
+                return Err(freshness_unmet(&failed_models));
+            }
+            let pause = wait_end
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(40));
+            tokio::time::sleep(pause).await;
+            khive_storage::ensure_request_read_active("memory.recall")?;
+        }
+    }
+
     pub(crate) async fn handle_recall(
         &self,
         token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
+        hard_deadline: Option<Instant>,
     ) -> Result<Value, RuntimeError> {
         use std::sync::atomic::Ordering;
 
@@ -162,6 +249,28 @@ impl MemoryPack {
             None => token.clone(),
         };
         let token = &effective_token;
+        let requested_models = p
+            .embedding_model
+            .as_ref()
+            .map(|model| vec![model.clone()])
+            .unwrap_or_else(|| self.runtime.registered_embedding_model_names());
+        let visible_namespaces = token.visible_namespace_strs();
+        let session_fence = crate::visibility::parse_recall_visibility(
+            p.consistency.as_ref(),
+            p.visibility_token.as_ref(),
+            &visible_namespaces,
+            &requested_models,
+        )?;
+        let timeout_ms = crate::visibility::parse_timeout_ms(p.timeout_ms.as_ref())?;
+        let wait_started = Instant::now();
+        let wait_by_caller = wait_started + Duration::from_millis(timeout_ms);
+        let request_deadline = hard_deadline.or_else(|| {
+            wait_started.checked_add(Duration::from_millis(crate::pack::recall_deadline_ms()))
+        });
+        let wait_by_request = request_deadline
+            .and_then(|deadline| deadline.checked_sub(Duration::from_secs(2)))
+            .unwrap_or(wait_started);
+        let session_wait_end = wait_by_caller.min(wait_by_request);
 
         let created_after_us = p
             .created_after
@@ -216,21 +325,7 @@ impl MemoryPack {
         }
 
         let mut cfg = p.effective_config(self.active_config());
-        if let Some(ref fs) = p.fusion_strategy {
-            let mut new_strategy = super::common::parse_fusion_strategy_str(fs)?;
-            if let (
-                FusionStrategy::Weighted {
-                    weights: ref mut new_w,
-                },
-                FusionStrategy::Weighted {
-                    weights: ref existing_w,
-                },
-            ) = (&mut new_strategy, &cfg.fuse_strategy)
-            {
-                *new_w = existing_w.clone();
-            }
-            cfg.fuse_strategy = new_strategy;
-        }
+        super::common::apply_requested_fusion_strategy(&mut cfg, p.fusion_strategy.as_deref())?;
         cfg.validate()?;
 
         let effective_min_score: f32 = {
@@ -359,18 +454,21 @@ impl MemoryPack {
         // already-large pipeline and then into the MCP dispatch poll stack.
         let mut current_candidate_limit = candidate_limit;
         let mut recall_stage_timings = RecallStageTimings::default();
-        let mut candidates = Box::pin(self.collect_recall_candidates(
+        let mut candidates = Box::pin(self.collect_recall_candidates_with_session(
             query_trimmed,
             token,
             RecallCandidateParams {
                 candidate_limit: current_candidate_limit,
                 embedding_model: p.embedding_model.as_deref(),
+                session_fence: session_fence.as_ref(),
                 cjk_fts_bypass,
                 snippet_policy: TextSnippetPolicy::Omit,
                 fts_gather: &effective_fts_gather,
                 ann_overfetch_max_rounds,
                 ann_ready_timeout_ms,
             },
+            session_wait_end,
+            wait_by_request,
         ))
         .await?;
         recall_stage_timings.add_retrieval_round(candidates.timings);
@@ -438,18 +536,21 @@ impl MemoryPack {
                 break;
             }
             current_candidate_limit = widened;
-            candidates = Box::pin(self.collect_recall_candidates(
+            candidates = Box::pin(self.collect_recall_candidates_with_session(
                 query_trimmed,
                 token,
                 RecallCandidateParams {
                     candidate_limit: current_candidate_limit,
                     embedding_model: p.embedding_model.as_deref(),
+                    session_fence: session_fence.as_ref(),
                     cjk_fts_bypass,
                     snippet_policy: TextSnippetPolicy::Omit,
                     fts_gather: &effective_fts_gather,
                     ann_overfetch_max_rounds,
                     ann_ready_timeout_ms,
                 },
+                session_wait_end,
+                wait_by_request,
             ))
             .await?;
             recall_stage_timings.add_retrieval_round(candidates.timings);
@@ -811,13 +912,10 @@ impl MemoryPack {
                 .map(|sn| sn.note.content.chars().take(prefix_len).collect::<String>())
                 .collect();
 
-            for i in 1..ranked.len() {
-                for j in 0..i {
-                    if prefixes[i] == prefixes[j] {
-                        ranked[i].rank_score =
-                            (ranked[i].rank_score - scoring_cfg.mmr_penalty).max(0.0);
-                        break;
-                    }
+            for (candidate, duplicate) in ranked.iter_mut().zip(duplicate_prefix_flags(&prefixes)) {
+                if duplicate {
+                    candidate.rank_score =
+                        (candidate.rank_score - scoring_cfg.mmr_penalty).max(0.0);
                 }
             }
         }
@@ -857,33 +955,24 @@ impl MemoryPack {
             let mut superseded_by_edge: HashSet<Uuid> = HashSet::new();
             if !candidate_ids.is_empty() {
                 let graph = self.runtime.graph(token)?;
-                let filter = EdgeFilter {
-                    target_ids: candidate_ids,
-                    relations: vec![EdgeRelation::Supersedes],
-                    ..EdgeFilter::default()
-                };
-                let mut after = None;
-                loop {
-                    // Walk the immutable insertion sequence to exhaustion.
-                    // A single fixed-size query tied to candidate count can
-                    // omit targets when another candidate has many inbound
-                    // supersedes edges (#1749).
-                    let edges = graph
-                        .query_edges_sequence_after(
-                            filter.clone(),
-                            after,
-                            SUPERSEDES_EDGE_PAGE_SIZE,
-                        )
-                        .await?;
-                    khive_storage::ensure_request_read_active("memory.recall")?;
-                    for edge in &edges.items {
-                        superseded_by_edge.insert(edge.target_id);
-                    }
-                    let Some(next_after) = edges.next_after else {
-                        break;
-                    };
-                    after = Some(next_after);
-                }
+                // One batched read for every candidate; the first element of each
+                // returned pair is the requested candidate that has an incoming
+                // `supersedes` edge.
+                superseded_by_edge = graph
+                    .batch_neighbors(
+                        &candidate_ids,
+                        NeighborQuery {
+                            direction: Direction::In,
+                            relations: Some(vec![EdgeRelation::Supersedes]),
+                            limit: Some(1),
+                            min_weight: None,
+                        },
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|(candidate_id, _)| candidate_id)
+                    .collect();
+                khive_storage::ensure_request_read_active("memory.recall")?;
             }
 
             let superseded_ids: HashSet<Uuid> = superseded_by_prop
@@ -1353,6 +1442,20 @@ async fn emit_recall_executed_event(
     }
 }
 
+/// One set insertion per prefix; the first occurrence keeps its original score.
+fn duplicate_prefix_flags(prefixes: &[String]) -> impl Iterator<Item = bool> + '_ {
+    let mut seen = HashSet::with_capacity(prefixes.len());
+    prefixes.iter().map(move |prefix| {
+        #[cfg(test)]
+        loop_3711_tests::visit();
+        !seen.insert(prefix.as_str())
+    })
+}
+
+#[cfg(test)]
+#[path = "recall_loop_3711_tests.rs"]
+mod loop_3711_tests;
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -1372,6 +1475,35 @@ mod tests {
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    mod timing {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../test_support/timing.rs"
+        ));
+    }
+
+    #[test]
+    fn session_retry_deadline_obeys_caller_window_but_first_attempt_does_not() {
+        let now = std::time::Instant::now();
+        let request_cap = now + std::time::Duration::from_secs(2);
+        let caller_cap = now + std::time::Duration::from_millis(25);
+        assert_eq!(
+            super::session_attempt_deadline(true, caller_cap, request_cap),
+            request_cap,
+            "timeout_ms=0 still permits one immediate proof and candidate attempt"
+        );
+        assert_eq!(
+            super::session_attempt_deadline(false, caller_cap, request_cap),
+            caller_cap,
+            "a retry already in flight must end at the caller's wait deadline"
+        );
+        assert_eq!(
+            super::session_attempt_deadline(false, request_cap, caller_cap),
+            caller_cap,
+            "the request cap can end a retry sooner than the caller window"
+        );
+    }
 
     #[test]
     fn rank_sort_keeps_nan_last_and_breaks_equal_scores_by_id() {
@@ -1711,8 +1843,8 @@ mod tests {
 
         // Coverage retains the watchdog and result assertions without making
         // instrumented scheduling part of the caller-latency contract.
-        if std::env::var_os("LLVM_PROFILE_FILE").is_none() {
-            let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 2;
+        let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 2;
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
             assert!(
                 elapsed < caller_bound,
                 "#836 recall exceeded its caller-derived completion bound \
@@ -2495,6 +2627,7 @@ mod tests {
             40,
             2,
             1_000,
+            None,
         )
         .await
         .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
@@ -2530,6 +2663,7 @@ mod tests {
                 40,
                 2,
                 0,
+                None,
             ),
         )
         .await
@@ -2694,6 +2828,145 @@ mod tests {
             runtime,
             _temp_dir: Some(tmp),
         }
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn hot_path_guard_g1_recall_batches_served_targets_into_one_writer_acquisition() {
+        use khive_runtime::audit_batch::AuditBatchConfig;
+
+        async fn await_tracked_background_idle() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while khive_runtime::background_task_count() != 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("tracked recall and audit tasks must drain");
+        }
+
+        const QUERY: &str = "violet orchard writer acquisition witness";
+        let rt = build_full_rt_with_brain();
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for _ in 0..8 {
+            rt.create_note(&token, "memory", None, QUERY, Some(0.8), None, vec![])
+                .await
+                .expect("seed a distinct matching memory");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        builder
+            .with_runtime_event_store(&rt)
+            .expect("use the runtime's real audit batch");
+        // One audit row per generation keeps the miss/hit fixed-cost control stable.
+        builder.with_audit_batch_config(AuditBatchConfig {
+            max_rows_per_generation: std::num::NonZeroUsize::new(1).unwrap(),
+            ..AuditBatchConfig::default()
+        });
+        let registry = builder.build().expect("registry");
+        assert!(registry.audit_batch_handle().is_some());
+        assert!(
+            rt.backend()
+                .pool()
+                .writer_task_handle()
+                .expect("writer task lookup")
+                .is_some(),
+            "this guard requires the file-backed writer task"
+        );
+
+        await_tracked_background_idle().await;
+        let warm = registry
+            .dispatch("memory.recall", json!({"query": QUERY, "limit": 8}))
+            .await
+            .expect("warm recall");
+        assert_eq!(warm.as_array().expect("warm hits").len(), 8);
+        await_tracked_background_idle().await;
+
+        let before = rt
+            .db_diagnostics()
+            .await
+            .expect("before diagnostics")
+            .writer_contention
+            .writer_task_acquisitions;
+        let miss = registry
+            .dispatch(
+                "memory.recall",
+                json!({"query": "unseeded hazelnut zephyr", "limit": 8}),
+            )
+            .await
+            .expect("no-hit fixed-cost control");
+        assert!(miss.as_array().expect("no-hit results").is_empty());
+        await_tracked_background_idle().await;
+        let after_miss = rt
+            .db_diagnostics()
+            .await
+            .expect("control diagnostics")
+            .writer_contention
+            .writer_task_acquisitions;
+
+        let hit = registry
+            .dispatch("memory.recall", json!({"query": QUERY, "limit": 8}))
+            .await
+            .expect("measured recall");
+        assert_eq!(hit.as_array().expect("measured hits").len(), 8);
+        await_tracked_background_idle().await;
+        let after_hit = rt
+            .db_diagnostics()
+            .await
+            .expect("after diagnostics")
+            .writer_contention
+            .writer_task_acquisitions;
+
+        let event_page = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![khive_types::EventKind::RecallExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("recall telemetry");
+        assert_eq!(event_page.items.len(), 3, "each recall emitted telemetry");
+        let mut reader = rt.sql().reader().await.expect("serve ledger reader");
+        let ledger_row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT COUNT(*) AS count FROM brain_serve_ledger WHERE query_raw = ?1".into(),
+                params: vec![khive_storage::types::SqlValue::Text(QUERY.into())],
+                label: None,
+            })
+            .await
+            .expect("serve ledger query")
+            .expect("count row");
+        assert!(
+            matches!(
+                ledger_row.get("count"),
+                Some(khive_storage::types::SqlValue::Integer(16))
+            ),
+            "warm and measured recalls each persisted eight served targets: {ledger_row:?}"
+        );
+
+        let miss_acquisitions = after_miss - before;
+        let hit_acquisitions = after_hit - after_miss;
+        assert_eq!(
+            hit_acquisitions,
+            miss_acquisitions + 1,
+            "eight served targets may add only one writer-task acquisition beyond the fixed audit and telemetry work"
+        );
+        drop(reader);
+        registry
+            .shutdown_audit_batch()
+            .await
+            .expect("audit batch drains before fixture teardown");
     }
 
     // `#[serial(background_tasks)]`: see the note on
@@ -3205,17 +3478,50 @@ mod tests {
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns.clone()).expect("authorize local");
 
-        rt.create_note(
-            &token,
+        // Seed the real note and FTS legs without create_note's NoteCreated
+        // append: the tested backend's event accessor must remain cold.
+        let note = khive_storage::Note::new(
+            ns.as_str(),
             "memory",
-            None,
             "event acquisition failure recall note",
-            Some(0.7),
-            None,
-            vec![],
         )
-        .await
-        .expect("create note");
+        .with_salience(0.7);
+        rt.notes(&token)
+            .expect("note store")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed real memory row");
+        rt.text_for_notes(&token)
+            .expect("note FTS store")
+            .upsert_document(khive_storage::types::TextDocument {
+                subject_id: note.id,
+                kind: khive_types::SubstrateKind::Note,
+                record_kind: Some("memory".into()),
+                namespace: ns.as_str().to_owned(),
+                title: None,
+                body: note.content,
+                tags: vec![],
+                metadata: None,
+                updated_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("seed real lexical leg");
+        let event_rows = rt
+            .sql()
+            .reader()
+            .await
+            .expect("premise reader")
+            .query_scalar(khive_storage::types::SqlStatement {
+                sql: "SELECT COUNT(*) FROM events".into(),
+                params: vec![],
+                label: Some("recall_acquisition_cold_premise".into()),
+            })
+            .await
+            .expect("inspect migrated event table without acquiring EventStore");
+        assert!(
+            matches!(event_rows, Some(khive_storage::types::SqlValue::Integer(0))),
+            "fixture must not emit create/other events before cold acquisition"
+        );
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
@@ -3275,6 +3581,57 @@ mod tests {
             .fields
             .get("error")
             .is_some_and(|error| !error.is_empty()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(background_tasks)]
+    #[serial_test::serial(config_ledger)]
+    async fn warm_recall_event_store_acquisition_finishes_while_writer_is_held() {
+        use std::time::Duration;
+
+        let rt = KhiveRuntime::memory().expect("runtime");
+        let token = rt.authorize(Namespace::local()).expect("local");
+        rt.events(&token)
+            .expect("first real event accessor initializes its schema");
+        let pool = rt.backend().pool();
+        let bound = Duration::from_secs(1).min(pool.config().checkout_timeout / 2);
+        assert!(bound >= Duration::from_millis(100));
+        let writer = pool
+            .writer()
+            .expect("hold writer after event initialization");
+        let before = pool.writer_acquisition_snapshot();
+        let acquiring_rt = rt.clone();
+        // This is emit_recall_executed_event's actual accessor. Appending the
+        // event remains writer work; the companion isolates acquisition only.
+        let mut acquiring = tokio::task::spawn_blocking(move || acquiring_rt.events(&token));
+        let while_held = tokio::time::timeout(bound, &mut acquiring).await;
+        drop(writer);
+        let store = match while_held {
+            Ok(joined) => joined
+                .expect("event acquisition worker joins")
+                .expect("warm event accessor"),
+            Err(_) => {
+                let _ = tokio::time::timeout(bound, acquiring).await;
+                panic!("warm recall event accessor must return before writer release");
+            }
+        };
+        let after = pool.writer_acquisition_snapshot();
+        assert_eq!(after.timeouts, before.timeouts);
+        assert_eq!(
+            after.pooled_acquisitions, before.pooled_acquisitions,
+            "warm event acquisition must not request the writer"
+        );
+        let page = store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::types::PageRequest {
+                    limit: 1,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("the acquired handle reads the real event table after release");
+        assert!(page.items.is_empty());
     }
 
     // `#[serial(background_tasks)]`: see the note on
@@ -3966,10 +4323,16 @@ mod tests {
             "[ADR-081 §5 latency] recall without brain pack: {without_brain:?}; \
              recall with brain pack (profile resolution + async ledger dispatch): {with_brain:?}"
         );
-        assert!(
-            with_brain < Duration::from_secs(2),
-            "profile resolution must not introduce unbounded latency, got {with_brain:?}"
-        );
+        // Dispatch uses this same cached deadline when the request has no override.
+        let caller_bound =
+            Duration::from_millis(crate::pack::recall_deadline_ms()).saturating_mul(2);
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
+            assert!(
+                with_brain < caller_bound,
+                "profile resolution exceeded its configured caller-derived completion bound \
+                 {caller_bound:?}, got {with_brain:?}"
+            );
+        }
     }
 
     // ── ADR-104 Stage A: serve-time profile projection ─────────────────────
@@ -5599,6 +5962,7 @@ mod tests {
                     "query": "direct mismatch regression",
                 }),
                 &registry,
+                None,
             )
             .await
             .expect_err("a local token must not elevate into a measurement arm");
@@ -6663,10 +7027,9 @@ mod tests {
         }
     }
 
-    /// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
-    #[tokio::test]
-    #[serial_test::serial(config_ledger)]
-    async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+    async fn held_embed_deadline_result_with_caller_delay(
+        caller_delay: Option<std::time::Duration>,
+    ) {
         const MODEL: &str = "recall-889-slow-model";
         const CALLER_DEADLINE_MS: u64 = 50;
         let hold = Arc::new(Notify::new());
@@ -6712,6 +7075,10 @@ mod tests {
             ),
         )
         .await;
+        // Simulate an instrumented caller resuming after the real recall outcome.
+        if let Some(delay) = caller_delay {
+            tokio::time::sleep(delay).await;
+        }
         let elapsed = start.elapsed();
 
         // Release the timed-out worker so it does not occupy a blocking-pool slot.
@@ -6735,14 +7102,68 @@ mod tests {
             }
         }
 
-        if std::env::var_os("LLVM_PROFILE_FILE").is_none() {
-            let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 10;
+        let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 10;
+        if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
             assert!(
                 elapsed < caller_bound,
                 "#889 recall exceeded its caller-derived completion bound \
                  {caller_bound:?}, took {elapsed:?}"
             );
         }
+    }
+
+    /// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+        held_embed_deadline_result_with_caller_delay(None).await;
+    }
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn recall_889_coverage_delay_retains_typed_deadline_outcome() {
+        const CHILD: &str = "KHIVE_RECALL_TIMING_COVERAGE_CHILD";
+        const NAME: &str =
+            "handlers::recall::tests::recall_889_coverage_delay_retains_typed_deadline_outcome";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(std::env::var_os("LLVM_PROFILE_FILE").is_some());
+            tokio::runtime::Runtime::new().unwrap().block_on(
+                held_embed_deadline_result_with_caller_delay(Some(
+                    std::time::Duration::from_millis(750),
+                )),
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let output_path = dir.path().join("child-output.txt");
+        let output = std::fs::File::create(&output_path).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("LLVM_PROFILE_FILE", dir.path().join("recall-%p.profraw"))
+            .stdout(std::process::Stdio::from(output.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(output))
+            .spawn()
+            .unwrap();
+        let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= watchdog {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("coverage fixture watchdog expired; no semantic outcome");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let output = std::fs::read_to_string(output_path).unwrap();
+        assert!(status.success(), "coverage recall child failed:\n{output}");
+        assert!(
+            output.contains("1 passed; 0 failed"),
+            "coverage recall requires nonzero exact child selection: {output}"
+        );
     }
 
     // ── #30/#889: tracing-capture harness for the deadline-exceeded WARN ──────

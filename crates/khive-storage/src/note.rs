@@ -34,6 +34,15 @@ pub struct Note {
     pub version: i64,
 }
 
+/// The columns needed to decide whether a note may appear in an ID-based result.
+/// Includes soft-deleted rows so the caller can apply its visibility policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoteVisibility {
+    pub id: Uuid,
+    pub namespace: String,
+    pub deleted_at: Option<i64>,
+}
+
 const fn initial_note_version() -> i64 {
     1
 }
@@ -547,12 +556,21 @@ pub enum FilterOp {
     /// numeric field never matches. `PropertyFilter.value` is the prefix and
     /// must be `SqlValue::Text`; an empty prefix matches every text value.
     TextStartsWithIndexed,
+    /// Match a recipient's first colon-terminated channel prefix by equality
+    /// on its indexed bucket. The value must be a nonempty `SqlValue::Text`
+    /// prefix with exactly one trailing colon, such as `email:`. Arbitrary
+    /// partial prefixes use `TextStartsWithIndexed` instead.
+    TextColonPrefixBucketIndexed,
     /// Keep only RFC 3339 text values that parse as UTC instants.
     Rfc3339Valid,
     /// Compare parsed UTC instants, including subsecond precision and offsets.
     /// The value is a `Timestamp` or RFC 3339 `Text`.
     Rfc3339Gte,
     Rfc3339Lte,
+    /// Matches an RFC 3339 instant at or before the supplied timestamp, or a
+    /// missing, null, non-text, or malformed value. The outbox uses this to
+    /// fail open on legacy retry deadlines without filtering after LIMIT.
+    Rfc3339LteOrInvalid,
 }
 
 /// A single `json_extract(properties, '$.field') op value` predicate.
@@ -664,6 +682,22 @@ pub struct NoteFilter {
     /// by `query_notes_filtered_count_free` with `offset: 0`.
     #[serde(default)]
     pub after_instant: Option<NoteInstantSeekAfter>,
+    /// Restrict `message` rows to the ones this mailbox reader may see, in
+    /// the query itself. Rows of every other kind are unaffected. Applying the
+    /// partition here means a scan window, and any cursor derived from it,
+    /// only ever contains rows the reader is allowed to see.
+    #[serde(default)]
+    pub mailbox: Option<NoteMailboxScope>,
+}
+
+/// The actor partition a mailbox reader may see, as evaluated by the store.
+/// It mirrors the row-level mailbox rule: an inbound message belongs to its
+/// `to_actor`, an outbound message to its `from_actor`, and `legacy_local`
+/// additionally admits the unattributed pre-routing rows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteMailboxScope {
+    pub actor_id: String,
+    pub legacy_local: bool,
 }
 
 /// Temporal-referential note CRUD over the notes substrate table.
@@ -1040,6 +1074,34 @@ pub trait NoteStore: Send + Sync + 'static {
         for &id in ids {
             if let Some(n) = self.get_note(id).await? {
                 out.push(n);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch multiple notes, including soft-deleted rows, for mutation policy checks.
+    /// Missing IDs are omitted; callers correlate rows by ID rather than result order.
+    async fn get_notes_batch_including_deleted(&self, ids: &[Uuid]) -> StorageResult<Vec<Note>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(note) = self.get_note_including_deleted(id).await? {
+                out.push(note);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Fetch only the columns needed for note visibility checks by UUID.
+    /// Missing IDs are omitted; soft-deleted rows retain their deletion time.
+    async fn get_note_visibility_batch(&self, ids: &[Uuid]) -> StorageResult<Vec<NoteVisibility>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(note) = self.get_note_including_deleted(id).await? {
+                out.push(NoteVisibility {
+                    id: note.id,
+                    namespace: note.namespace,
+                    deleted_at: note.deleted_at,
+                });
             }
         }
         Ok(out)

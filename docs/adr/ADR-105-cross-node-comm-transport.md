@@ -331,6 +331,11 @@ This appendix fixes the bytes that the node adapter (item 5 of the amendment, `k
 and the hosted service's node ingress exchange. It exists so that both can be built against one
 contract at the same time, and so that neither side's first implementation becomes the definition.
 
+**Amended 2026-10-02 (v2 text).** A.2 gains a timestamp profile; A.3 states which signing keys and
+which signatures are acceptable; A.5 says that a duplicated member is invalid at any depth; A.6.3
+says what a client does with a poll item it cannot parse. The text of A.4, A.6.1 and A.8 is not
+changed, but A.3's key and signature rule applies wherever they pin or verify a signing key.
+
 ### A.1 Scope and versioning
 
 In scope: device request authentication, contact key lookup, envelope submission, delivery polling,
@@ -365,6 +370,13 @@ with `unsupported_version`.
   A.4 step 2 and answers `401`; only the body-size check of step 1 comes before it.
 - **Integers** in JSON: numbers from 0 to 2^53 - 1. In binary inputs: `u32` and `u64`, big-endian.
   Key epochs and contact generations are further bounded by A.10.
+- **Timestamps** in JSON are RFC 3339 date-times in one profile: `YYYY-MM-DDThh:mm:ss`, an optional
+  fraction of 1 to 9 digits, then `Z` or a numeric offset `+hh:mm` / `-hh:mm`. `T` and `Z` are
+  uppercase. A space separator, lowercase `t` or `z`, the offset `-00:00`, a seconds value of 60 and a
+  fraction longer than 9 digits are refused, never normalized. A timestamp the service writes
+  (`admitted_at`, `recorded_at`, `server_time`) may carry any offset, and a reader normalises it to UTC.
+  `sent_at` (A.5) is UTC: a reader accepts `Z` or `+00:00` and refuses any other offset, and a writer
+  writes `Z`.
 - **Request bodies** are JSON objects with exactly the members A.6 names for them. An unknown, a
   duplicated or a missing member is `invalid_request`.
 - `lp(x)` is a `u16` big-endian length followed by the bytes of `x`.
@@ -403,7 +415,13 @@ The **enrolment bundle** the client hands to the owner's enrolment operation is:
 over `ctx("enrol") || lp(realm) || kem_public_key || signing_public_key`. The service refuses a
 bundle whose keys are not 32 bytes, whose KEM key is one of the X25519 small-order points (checked as
 RFC 7748 section 6.1 describes: a shared secret of all zeros is rejected), whose signing key is not a
-valid Ed25519 point, or whose proof does not verify. It also refuses a bundle whose KEM key or
+canonical encoding of an Ed25519 point (RFC 8032 section 5.1.3: `y` below p, and no negative zero)
+or is a point of small order, or whose proof does not verify. Every party that pins or verifies with
+a signing key applies the same rule, so a degenerate key is refused where it is pinned and not only
+where it is enrolled. A verifier refuses a signature whose `S` is not below the group order L or whose
+`R` is not a canonical point encoding, and accepts it only when `[S]B = R + [k]A` holds without
+multiplying by the cofactor (the cofactorless check of RFC 8032 section 5.1.7), so two verifiers built
+from this text agree on every signature. It also refuses a bundle whose KEM key or
 signing key is already enrolled for any device in the realm, so no two devices share a fingerprint.
 A device enrolled with a KEM key and no signing key cannot authenticate under A.4; its owner enrols
 it again with a new pair of keys, because its old KEM key is already enrolled in the realm and would
@@ -500,10 +518,11 @@ it on every send (A.6.2), and binding it into the ciphertext would force a re-en
 two agents re-accept each other.
 
 The plaintext is a UTF-8 JSON object: `v` (1), `subject` (string or null), `body` (string),
-`sent_at` (RFC 3339, UTC), `thread_id` (a UUID or null), `in_reply_to` (a logical message
+`sent_at` (RFC 3339, UTC, in the A.2 timestamp profile), `thread_id` (a UUID or null), `in_reply_to` (a logical message
 identifier or null) and, optionally, `kind` (`announce`, `report` or `ask`: the sender's declared
 purpose under runtime ADR-195 D4). A sender writes `kind` only with one of those three values and
 otherwise omits it; absent means unspecified. A recipient ignores members it does not know, except that a plaintext with a duplicated member,
+at the top level or inside any nested object including the value of a member it ignores,
 or with any of the reserved identity members `from`, `sender`, `to`, `recipient`, `tenant`,
 `namespace`, `actor`, `project`, `device` or `delegation`, is invalid and is quarantined (A.8): identity comes from the
 authenticated envelope, never from the plaintext. A `kind` with any other value, `null`,
@@ -702,6 +721,13 @@ last receipt in the page, or `receipts_after` when the page carries none. A clie
 `receipts_after` past a receipt once it has either verified it and durably recorded the outcome, or
 rejected it and reported it (A.8), so one receipt that fails verification cannot hold back the ones
 after it.
+
+A client parses each item of `deliveries` and of `receipts` on its own. An item that is not the shape
+this section gives, for example a malformed identifier or a signature of the wrong length, is
+reported and skipped. It does not make the page, the items beside it or `receipts_cursor`
+unreadable, and for a receipt it counts as rejected for the cursor rule above. A skipped delivery
+gets no receipt. A page whose own members (`receipts_cursor`, `server_time`, the two arrays) do not
+parse is refused whole.
 
 #### A.6.4 `POST /node/v1/receipts`
 
@@ -1180,6 +1206,14 @@ implementation.
 | a step 9 record that commits but whose outcome the service cannot confirm | `503 capacity_exhausted`, nothing forwarded, A.6.5 answers `unknown`; the client's resubmission of the same bytes is not charged again, and is admitted whenever a first submit of the same body would be, except that no credit is needed |
 | a re-encryption after `recipient_key_changed` and the owner's confirmation, to a replacement device whose key epoch number equals the old device's, no receipt having been recorded for the first admission; the re-encryption being one that, as a first submit, would be admitted, credit aside | admitted, not charged again |
 | a poll page whose first receipt fails verification | that message stays `pending`, the receipts after it are processed, and `receipts_after` advances past all of them |
+| a plaintext whose `sent_at` is `2026-09-23T20:00:00+01:00` | `quarantined` receipt, no message note |
+| a plaintext whose `sent_at` is `2026-09-23 20:00:00Z` | `quarantined` receipt, no message note |
+| a plaintext whose `sent_at` is `2026-09-23T20:00:00-00:00` | `quarantined` receipt, no message note |
+| a server timestamp `2026-09-24T01:30:00+05:30` | accepted and normalized to `2026-09-23T20:00:00Z` |
+| an identity-point signing key `01` followed by 31 zero bytes | refused at enrolment and at pin |
+| a non-canonical signing key encoding: identity with the sign bit set, or `y = p + 1` | refused at enrolment and at pin |
+| a plaintext with duplicate `x` members inside an ignored `extension` object | `quarantined` receipt, no message note |
+| a poll page whose first delivery has `delivery_attempt_id` `not-a-uuid`, beside a valid delivery and receipt | malformed delivery reported and skipped with no receipt; valid items and cursor remain readable |
 
 The seeds above are `SHA-256` of the ASCII labels `khive-node-v1 vector sender kem`,
 `khive-node-v1 vector recipient kem`, `khive-node-v1 vector sender sig`,
@@ -1194,3 +1228,310 @@ Everything under "What stands" and "Compatibility obligation" above. In particul
 and every existing channel adapter stays byte-identical.
 
 <!-- deno-fmt-ignore-end -->
+
+## Amendment 2026-10-03 -- Sender receipts from the poll page
+
+**Status.** Accepted; ratified by the maintainer, 2026-10-03.
+
+**Why.** Item 5 of the 2026-09-14 amendment gives the `Channel` trait three receipt methods.
+`send_with_receipt` answers when a submit is answered, and `poll_deliveries` returns inbound
+envelopes with their receipt tickets. Neither carries the receipts that A.6.3 returns to a sender on
+its own poll. A.6.3 allows one outstanding poll per device, so the poll that receives a device's
+deliveries is also the poll that brings its agent's receipts. Without a route for them, a sender
+learns of a delivery only by resubmitting (A.6.2 step 2) or by a status read for each pending
+message (A.6.5), and the receipts on every poll page go unread. This amendment adds the route.
+
+### What changes
+
+1. **The poll page carries the sender's receipts and their cursor.** `DeliveryPage` gains a list of
+   receipt results, one for each receipt item on the page, in page order, and the page's
+   `receipts_cursor`. Both are separate from the page's envelope checkpoint (`next_checkpoint`),
+   which keeps its present meaning for the channel kinds that have one. The default
+   `poll_deliveries` and `DeliveryPage::legacy` carry no receipt results and no receipt cursor, and
+   pass the legacy page, its checkpoint included, through unchanged.
+2. **A receipt is verified in one place, by one constructor.** Every receipt, whether it arrives in
+   a submit answer, a poll page or a status read, is verified by the node adapter under the sender
+   rule of A.8: its binding against the outbox record for that message, and its signature with the
+   recipient signing key the owner pinned for that message's recipient device at
+   `recipient_key_epoch`. The adapter reads the outbox record and the pinned key through the source
+   and pin interfaces the deployment supplies, never through a database of its own, and never takes
+   a key from the service. This is the same boundary at which the adapter already authenticates
+   inbound envelopes with the owner's pinned keys before it issues an `InboundReceiptTicket`, and
+   the place A.9 and the `SendOutcome` documentation in `khive-channel` already assign the check for
+   a receipt in a submit answer.
+
+   The verified result is a sealed type in `khive-channel`, beside `DeliveryReceipt`, the receipt
+   signing input and the receipt signing public key. Its payload is private and its only constructor
+   is the verification: given a receipt and a pinned signing public key, it returns the sealed value
+   or an error. The runtime's present verified-receipt type and its verifying constructor move down
+   to `khive-channel` with the same meaning. The adapter is the only caller of the constructor. The
+   runtime accepts only the sealed type and has no constructor of its own, so no code path, an
+   adapter defect included, records a receipt whose signature was not checked. Unlike
+   `InboundReceiptTicket`, whose constructor performs no verification, this value cannot exist
+   without a signature check. What the type does not prove is which key was used; supplying the
+   pinned key, and never one the service offered, is the adapter's duty and arm 1 tests it. Inside
+   the writer transaction that records the receipt, the runtime still requires the receipt's binding
+   and disposition to match the outbox row, which keeps a row changed after the adapter's read from
+   being receipted on stale data.
+
+   The pin source answers for the key epoch and fingerprint an outbox row recorded for as long as
+   that row exists, a later rotation of that device's key included. A.8 keeps an outbox row past
+   `failed` for the receipt retention, and the pin for the row's recorded epoch is retained for the
+   same time. A pin source that forgot a rotated-out epoch would reject a legitimate receipt for a
+   message sent before the rotation, on the poll and again on every resubmit answer, and the message
+   would never leave `pending`.
+3. **Two kinds of failure, handled differently.** A **rejection** is a failure the receipt itself
+   causes: an item that does not parse, a binding that does not match the outbox record, a receipt
+   for a message with no outbox record, a recipient key the owner has not confirmed or whose
+   fingerprint does not match, or a signature that does not verify. A rejection never counts as
+   delivered and changes no message's state: a `pending` message stays `pending` and a `failed` one
+   stays `failed`, because only a verified receipt ends either (A.8). When it names an outbox row
+   that holds no verified receipt, the runtime records on that row the reason A.9 gives for an
+   unverified receipt. When the row already holds a verified receipt, the rejection is reported and
+   nothing is written on that row: the recorded receipt and the row's state stand. When it names no
+   row, it is reported. A rejection is handled, so the cursor passes it (A.6.3). A failure to **read
+   local state** while verifying (the outbox record or the pin source cannot be read) is not a
+   rejection. The receipt is unhandled, the page's receipt cursor is not committed, and the next
+   poll returns the receipt again.
+4. **The cursor commits once the page's receipts are handled, and never decreases.** A poll page of
+   the `khive` channel kind carries no envelope checkpoint: the A.6.3 page holds deliveries,
+   receipts, `receipts_cursor` and `server_time`, and its deliveries need no cursor.
+   `next_checkpoint` is therefore absent on every page of this kind, and the slug's channel
+   checkpoint row holds one value with one meaning. For this kind the runtime stores
+   `receipts_after` durably per slug, in that slug's channel checkpoint: `source` names the slug's
+   realm, agent and device, `generation` is fixed because a sender's `seq` values are never reset
+   (A.6.3), and `high_water` holds the value. The poll coordinator commits a page's
+   `receipts_cursor` once every receipt result on the page has been recorded or reported, whatever
+   happened to the page's deliveries. Deliveries need no cursor: one that is not handled gets no
+   receipt and the service hands it out again (A.6.3). A page with an unhandled receipt commits no
+   cursor. A page whose `receipts_cursor` is below the `receipts_after` it was requested with is
+   refused whole, and the stored value stands.
+5. **Recording is idempotent per message.** Receipts recorded before a crash, but above the
+   committed cursor, come back on the first poll after restart. Accepting a verified receipt for a
+   message that already holds one with the same disposition changes nothing, under any
+   `delivery_attempt_id`: a resubmitted message can be receipted again under a new attempt (A.8,
+   replay identity). A verified receipt whose disposition differs from the recorded one changes
+   nothing and is reported; the first recorded disposition stands, as it does on the service
+   (A.6.4). Recording the same rejection reason again changes nothing, and a verified receipt that
+   arrives after a rejection is recorded as any verified receipt is. This changes the runtime's
+   present acceptance, which refuses every second receipt that is not byte-identical to the first.
+   Under that rule a second receipt with the same disposition under a new attempt is refused as a
+   conflict, and a coordinator that treated the refusal as unhandled would never advance the cursor
+   past it. After this amendment, only a different disposition is a conflict, and a reported
+   conflict is handled.
+
+### Acceptance
+
+Each arm names the change that must turn it red.
+
+1. **One verification site, one constructor.** With the recipient's pin confirmed and the binding
+   matching the outbox record, a poll page carries a receipt signed with a key other than the pinned
+   one, and the service's answer offers that other key. The result is a rejection, the message stays
+   `pending`, and its row carries the unverified-receipt reason. Verifying with the key the service
+   supplied instead of the pinned one turns the arm red: the message becomes `recipient_stored`. A
+   receipt whose signature verifies under no key is a rejection in the same way. The seal has its
+   own control at compile time: code outside `khive-channel` that builds the sealed value without
+   calling its constructor does not compile, and the runtime exposes no constructor for it.
+2. **A rejection is recorded and passed; a read failure is not.** A page holds a rejected receipt
+   for one message, then a verified receipt for a second. The first row carries the reason and keeps
+   its state, the second becomes `recipient_stored`, and the cursor commits past both. Not recording
+   the reason turns the arm red, and so do treating the rejection as unhandled (the cursor stays)
+   and recording it as delivered. In a second case the pin source fails while the page is verified:
+   no cursor commits, and once the pin source answers again the next poll records the receipt.
+   Treating the read failure as a rejection turns this case red, because the cursor moves past a
+   receipt that is then never recorded. In a third case a rejected receipt names a message that
+   already holds a verified receipt: that row is identical before and after, and the rejection is
+   reported. Writing the rejection reason on that row turns the case red.
+3. **Replay after a crash.** The process stops after a receipt is recorded and before the cursor
+   commits. After restart, the next poll returns the receipt again, and the message ends up recorded
+   once, holding the first receipt. Committing the cursor before recording turns the arm red (the
+   receipt is lost), and so does removing the already-recorded check (the second accept replaces the
+   stored receipt). A second verified receipt for the same message under a new
+   `delivery_attempt_id`, with the same disposition, changes nothing and the cursor moves past it.
+   Refusing it as a conflict that leaves the page unhandled turns the arm red.
+4. **The cursor rule.** A page holding one delivery whose ingest fails and one verified receipt
+   commits the cursor past the receipt. A page whose `receipts_cursor` is below the requested
+   `receipts_after` is refused and the stored value is unchanged. Committing before the receipts are
+   handled turns the arm red, and so do tying the commit to the page's deliveries (the cursor stays)
+   and accepting the lower cursor (the stored value decreases).
+5. **Legacy adapters are unchanged.** An existing adapter's page carries no receipt results and no
+   receipt cursor, and its stored envelope checkpoint and ingested notes are identical to what they
+   were before this amendment, a checkpoint-aware adapter included. Making the default
+   `poll_deliveries` return a receipt result or a receipt cursor turns the arm red.
+6. **Rotation after the send.** A message is sent to a device at key epoch N. The owner then
+   confirms epoch N+1 for that device, and a receipt for the message, signed with the epoch N key,
+   arrives on a poll. It verifies and the message becomes `recipient_stored`. Dropping the epoch N
+   pin at rotation turns the arm red: the receipt is rejected and the message stays `pending`. The
+   pages in this test are of the `khive` kind: none carries an envelope checkpoint, and the slug's
+   checkpoint row holds only the receipt cursor.
+
+### What stands
+
+Item 5's three methods and their defaults; A.8 and A.9, except as items 2 to 5 above refine them;
+and the status read (A.6.5), which a client may still use but which the receipt path does not need.
+
+## Amendment 2026-10-03 -- Recipient receipt signing site
+
+**Status.** Proposed (2026-10-03).
+
+**Why.** A.8 (Receiving, step 4) has the recipient commit a delivery and then sign a receipt, and
+item 5 of the 2026-09-14 amendment has `acknowledge_receipt` take a signed receipt. Neither says
+who signs, or when. At khive-oss 7d77b30a the journal stores a binding and a disposition and no
+signature (`crates/khive-db/sql/045-recipient-transport.sql:14-23`,
+`crates/khive-db/src/stores/note/recipient/mod.rs:282-287`), and no code in `khive-runtime` or
+`khive-db` produces a signed `DeliveryReceipt` (`crates/khive-channel/src/lib.rs:297-301`). The
+only signer is `WireReceipt::sign` in `khive-channel-node`
+(`crates/khive-channel-node/src/receipt.rs:72-84`), a crate that `khive-runtime` does not depend on
+(`crates/khive-runtime/Cargo.toml:20` names `khive-channel` only). A.3 keeps private keys in the
+client's key facility and out of every khive store. This amendment signs where the key already is:
+the node adapter signs when it acknowledges, and the runtime holds no key. It also carries one
+clarification to the sender-receipts amendment of 2026-10-03, in item 6.
+
+This amendment refines A.8 (Receiving, step 4). The commit stays there, with the journal entry in
+one transaction. The phrases "and the client then signs a `stored` receipt" and "the client signs a
+`quarantined` receipt" now mean that the adapter signs when it acknowledges the committed entry,
+and not at ingest.
+
+### What changes
+
+1. **The adapter signs only a committed entry.** The recipient's receipt for a stored or
+   quarantined delivery is signed by the node adapter when it acknowledges a journal entry. The
+   runtime MUST NOT hold a signing key or store a signature, and nothing is signed at ingest. The
+   acknowledgement method of the `Channel` trait is replaced. The new method takes a typed value
+   that only the runtime can construct, where `acknowledge_receipt` took a signed receipt. The
+   trait keeps three defaulted receipt methods, which keeps the fence of the 2026-09-14 amendment
+   true: "MAY add the three defaulted `Channel` methods and their companion types". The runtime
+   MUST construct the typed value only from an acknowledgement-journal entry that has been
+   committed. A.8 (Receiving, step 4) commits the note or the quarantine record and the entry in
+   one transaction, and a replayed attempt adds its own entry (A.8, Replay identity). The value
+   carries the binding and the disposition of that one entry and no signature. The adapter MUST
+   NOT sign any input that did not arrive in that value, and MUST NOT take a binding or a
+   disposition from anywhere else.
+2. **The same bytes on a retry.** A.8 (Receipts) retries a receipt with the same bytes. Because
+   the adapter signs at each attempt, a key facility MUST return identical signature bytes for
+   identical input, so one binding and one disposition signed twice give identical receipt bytes.
+   A facility that can return different bytes for the same input MUST NOT sign receipts. The
+   signature is Ed25519 in the pure form of RFC 8032 (A.3), which takes no random input, and the
+   signing input is a pure function of the binding and the disposition (`receipt_signing_input`,
+   `crates/khive-channel/src/lib.rs:320-338`). The two implementors of `KeyFacility` at 7d77b30a
+   meet the identical-bytes requirement. `InMemoryKeyFacility::sign`
+   (`crates/khive-channel-node/src/keys.rs:252-254`) calls `SigningKey::sign` (`keys.rs:153-156`)
+   of `ed25519-dalek` 2.2.0, pinned at `crates/khive-channel-node/Cargo.toml:27`, which derives its
+   nonce from a hash of a secret prefix of the expanded key and the message and draws no random
+   bytes (`raw_sign_byupdate` in its `src/signing.rs`). The test facility `SpyFacility`
+   (`crates/khive-channel-node/src/client_tests.rs:166-172`) delegates `sign` to it.
+3. **The key of the named epoch.** The key facility cannot say which epoch its key belongs to:
+   `KeyFacility::sign` takes only the input and `public_keys` returns one key pair
+   (`keys.rs:121-123`). The adapter's binding names that epoch (`NodeClientBinding.key_epoch`,
+   `crates/khive-channel-node/src/source.rs:8-16`), and this amendment fixes it as the epoch of
+   the one key the adapter's facility holds. Before any signing call (`WireReceipt::sign`,
+   `crates/khive-channel-node/src/receipt.rs:72-84`), the adapter MUST compare the entry's
+   `recipient_key_epoch` with its binding's key epoch. When they are unequal, the adapter MUST NOT
+   make a signing call and MUST NOT post, and the entry is retired and reported, as A.9 uses those
+   words (item 4, the `PermanentTransport` answer). It is never signed under another epoch. When
+   they are equal, the adapter signs with its facility's key. A.8 (Own key rotation) waits only for
+   the device's pending messages, so an entry can outlive the key it names. If a facility ever
+   holds keys of several epochs, the path is an epoch-aware facility interface, which this
+   amendment does not define.
+4. **The answers of `acknowledge_receipt` carry over.** A.9 names `acknowledge_receipt`, and its
+   list applies to the new method. For each journal entry the new method answers exactly as the
+   list in A.9 that begins "On the receipt path `acknowledge_receipt` answers" (lines 1008-1017
+   at 7d77b30a):
+   - `Ok(())` for `200 {"recorded": true}`, and the entry is done;
+   - `Ok(())` for `not_found`, and the entry is dropped (A.8);
+   - `ChannelError::PermanentTransport` for `receipt_conflict`, `receipt_invalid`, and any other
+     refusal whose A.7 outcome is `failed`, and the entry is retired and reported, never retried
+     with the same bytes, and the local message note and receipt record are kept;
+   - `ChannelError::Transport` for a refusal whose outcome is to retry, a 5xx or a network
+     failure, and the entry is retried with the same bytes;
+   - `ChannelError::Auth` for `401`, handled as A.9 handles `401` on a submit (the channel pauses
+     for credential repair), and the entry is kept.
+
+   The new method MUST NOT change any of these answers or the handling of the entry.
+5. **The default is unsupported.** The default of the new method MUST be the unsupported
+   configuration error that the default of `acknowledge_receipt` returns at 7d77b30a,
+   `ChannelError::Config` with the text "receipts unsupported by" and the adapter's kind
+   (`crates/khive-channel/src/lib.rs:647-657`), which is classed permanent (`lib.rs:533-537`). An
+   adapter that does not override the method keeps its present behavior.
+6. **A record that belongs to another binding is a rejection.** Item 3 of the sender-receipts
+   amendment lists the failures a receipt itself causes. That list also includes a receipt whose
+   message has an outbox record that was read and does not belong to this adapter's binding. The
+   node client makes that check in `PersistedSubmission::matches`
+   (`crates/khive-channel-node/src/source.rs:40-51`), called at
+   `crates/khive-channel-node/src/client.rs:377`, and reports a failure as
+   `ReceiptRejection::SourceMismatch` (`client.rs:378`, `response.rs:120`). It is a fact about
+   stored state and the binding that no retry changes, so a receipt that fails it MUST be handled
+   as a rejection: the page's receipt cursor passes it (A.6.3), and it is recorded or reported as
+   item 3 of that amendment says for a rejection. A failure to read the record or the pin source
+   stays unhandled, as that item says. The text of that item is not edited.
+
+### Consequences
+
+Replacing the method is a breaking change to the public `Channel` trait of `khive-channel`, which is
+on the publish list (`scripts/publish.sh:65`), for any adapter that overrides `acknowledge_receipt`:
+its override no longer compiles. At 7d77b30a no adapter in the tree overrides it: a search of the
+whole tree finds `fn acknowledge_receipt` only at its definition
+(`crates/khive-channel/src/lib.rs:652`), and the only other use is one test that calls the default
+(line 833). An adapter that does not override it is unaffected, because the default of the new
+method is the same unsupported error. The change log entry that lands with the code MUST name the
+replaced method and its replacement.
+
+### Acceptance
+
+Each arm names the change that must turn it red.
+
+1. **Only a committed entry is signed.** (a) Code outside the runtime that builds the typed value
+   does not compile. The test is a compile-fail doctest of the form the runtime's recipient path
+   already uses (`crates/khive-runtime/src/comm_recipient.rs:6-18`), which fails when its snippet
+   compiles. Making the value constructible outside the runtime therefore turns it red. (b) A
+   delivery whose commit fails, for example on a refusal by the secret gate
+   (`comm_recipient.rs:173`), leaves no journal entry, and the new method is never called. Calling
+   it at ingest, before the commit, turns it red. (c) For a committed entry, the bytes the facility
+   is asked to sign are exactly the signing input of that entry's binding and disposition, and the
+   posted receipt carries that binding and disposition. Signing any other input turns it red.
+   (d) After the acknowledgement, no column of the entry's journal row and no other row holds the
+   signature the adapter produced. Storing the signature turns it red.
+2. **Same bytes.** Each implementor of `KeyFacility` in the tree (`InMemoryKeyFacility`,
+   `keys.rs:244`, and `SpyFacility`, `client_tests.rs:166`) signs one binding and disposition twice
+   and returns identical bytes that verify under its public key. The adapter acknowledges one
+   entry twice, the first attempt answered with a 5xx, and posts byte-identical bodies with fresh
+   request authentication (A.4), as `retry_body_is_identical_and_authentication_is_fresh`
+   (`client_tests.rs:1258`) asserts for a submit. A facility that mixes a random or
+   counter-derived component into its signature turns both parts red.
+3. **The key of the named epoch.** The test facility counts its `sign` calls, which `SpyFacility`
+   does not yet do (`client_tests.rs:152-156`). An entry whose `recipient_key_epoch` equals the
+   binding's key epoch posts a receipt that verifies under the facility's public key. An entry
+   whose epoch differs from the binding's, in either direction, makes zero signing calls and zero
+   posts, and is retired and reported. Only the two counts discriminate. A receipt signed under
+   the wrong epoch is refused by the service as `receipt_invalid` (A.6.4), and A.9 retires the
+   entry on that answer too, so the entry's end state is the same either way. Signing before the
+   comparison turns the signing count red, and posting an entry whose epoch differs turns the post
+   count red.
+4. **The answers of A.9.** A scripted service answers, one case each, `200 {"recorded": true}`,
+   `not_found`, `receipt_conflict`, `receipt_invalid`, another refusal whose A.7 outcome is
+   `failed` (an edge `400` or `413`), a refusal whose outcome is to retry, a 5xx, a network failure
+   and `401`. The new method returns, and the entry ends, as A.9 says for each. Answering any one
+   differently turns that case red, for example `receipt_invalid` answered as a retry, which sends
+   refused bytes again.
+5. **Legacy adapters are unchanged.** A new test calls the new method on an adapter that does not
+   override it and asserts the unsupported `ChannelError::Config` answer and that nothing was sent.
+   Making the default return `Ok(())` turns that test red. No existing test calls the new method:
+   the test of the old default (`lib.rs:790-843`, call at line 833) calls `acknowledge_receipt`,
+   goes away with it, and is what the new test replaces.
+6. **Another binding's record is a rejection.** A receipt arrives for a message whose stored
+   record belongs to another binding. The result is a rejection with the reason `SourceMismatch`,
+   the page's receipt cursor is committable, and the message's state is unchanged. Classifying the
+   case as unhandled turns the arm red: the cursor stays uncommitted and the receipt returns on
+   every poll.
+7. **The change log names the replacement.** The change that lands the code has an entry under
+   Unreleased in `CHANGELOG.md` that names `acknowledge_receipt` and the new method. A check that
+   reads the entry turns red when the entry is removed.
+
+### What stands
+
+The receipt, its signing input and `POST /node/v1/receipts` are as A.6.4 defines them, so no wire
+behavior changes. Item 5 of the 2026-09-14 amendment stands for `send_with_receipt` and
+`poll_deliveries`, and for acknowledgement as item 1 refines it. A.8 and A.9 stand except as items
+1 to 5 above refine them, and so does A.3: the private key stays in the key facility. The
+sender-receipts amendment stands as written: item 6 adds a case to the list in its item 3 and
+leaves the text of that item unchanged.

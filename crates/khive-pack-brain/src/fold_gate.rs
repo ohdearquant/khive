@@ -26,7 +26,7 @@ pub const IMPLICIT_MASS_CAP: f64 = 1.5;
 pub const IMPLICIT_MASS_HALF_LIFE_US: f64 = 7.0 * 24.0 * 3600.0 * 1_000_000.0;
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::Internal(format!("fold gate {context}: {e}"))
+    RuntimeError::internal_with_context(format!("fold gate {context}"), e)
 }
 
 /// Decay `old_mass` forward by `delta_us` microseconds under the shared half-life.
@@ -455,6 +455,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fold_gate_sql_err_message_is_prefixed_context_and_error() {
+        match sql_err("insert", "boom") {
+            RuntimeError::Internal(message) => {
+                assert_eq!(message, "fold gate insert: boom");
+            }
+            other => panic!("expected RuntimeError::Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn decayed_mass_zero_delta_is_unchanged() {
         assert!((decayed_mass(1.0, 0) - 1.0).abs() < 1e-12);
     }
@@ -530,6 +540,10 @@ mod tests {
         let db_path = dir.path().join("fold-gate-concurrency.db");
 
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -550,6 +564,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("file-backed runtime");
 
@@ -644,6 +659,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join(db_name);
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -664,6 +683,7 @@ mod tests {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id: None,
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("file-backed runtime");
         (rt, dir)

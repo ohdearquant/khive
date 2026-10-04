@@ -26,6 +26,7 @@ khive-fold = { version = "0.9.0", path = "../khive-fold" }
 khive-db = { version = "0.9.0", path = "../khive-db", features = ["vectors"] }
 khive-query = { version = "0.9.0", path = "../khive-query" }
 khive-gate = { version = "0.9.0", path = "../khive-gate" }
+khive-retrieval = { version = "0.9.0", path = "../khive-retrieval" }
 inventory = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -68,7 +69,7 @@ tracing-subscriber = { workspace = true }
 serial_test = { workspace = true }
 syn = { workspace = true }
 quote = { workspace = true }
-proc-macro2 = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [build-dependencies]
 chrono = { workspace = true }

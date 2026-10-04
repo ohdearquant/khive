@@ -144,6 +144,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-116](ADR-116-memory-ann-generation-coherence.md)                   | Durable Per-Model Generation Coherence for the Memory ANN Warm Path                                        |
 | [ADR-117](ADR-117-session-continuity-search.md)                         | Session Continuity — Cross-Session Search and Remote Ingestion                                             |
 | [ADR-117a](ADR-117a-session-identity-tenant-isolation.md)               | Session Identity and Tenant Isolation                                                                      |
+| [ADR-117b](ADR-117b-session-deletion-retention.md)                      | Session Mirror Deletion and Storage-Cap Retention                                                          |
 | [ADR-118](ADR-118-fresh-tail-recall-visibility.md)                      | Fresh-Tail Exact Leg — Read-Your-Writes Visibility for Vector Recall                                       |
 | [ADR-119](ADR-119-daemon-component-supervision.md)                      | Host-Supervised Daemon Components Beside the Verb Plane                                                    |
 | [ADR-120](ADR-120-khive-flow-control-flow-envelope.md)                  | Khive Flow — A Bounded Control-Flow Envelope in the Request DSL                                            |
@@ -222,6 +223,7 @@ The same head-binding governs review: a verdict authorizes only the exact commit
 | [ADR-193](ADR-193-charter-runs.md)                                      | Charter Runs — Procedural Actions Admitted Only on Recorded Evidence                                       |
 | [ADR-194](ADR-194-sqlite-wal-extent-ceiling.md)                         | Bounded SQLite WAL Extent Ceiling Under a Pinned Reader                                                    |
 | [ADR-195](ADR-195-comm-actor-trust-classes.md)                          | Actor Trust Classes and Per-Pair Message Policy for comm                                                   |
+| [ADR-196](ADR-196-located-in-relation.md)                               | The `located_in` Relation                                                                                  |
 
 <!-- END GENERATED ADR CATALOG -->
 
@@ -239,8 +241,8 @@ Supporting documents are exhibits cited by an ADR. They are not ADRs, carry no A
 ## Closed Taxonomies — Quick Reference
 
 - **Entity kinds**: 8 shared base kinds in `khive_types` (`concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`) plus KG pack-side `resource` governance for actionable knowledge resources (ADR-001, ADR-048)
-- **Edge relations (17 in 9 categories)** (ADR-002, extended by ADR-055):
-  - Structure: `contains`, `part_of`, `instance_of`
+- **Edge relations (19 in 9 categories)** (ADR-002, extended by ADR-055, ADR-191 and ADR-196):
+  - Structure: `contains`, `part_of`, `instance_of`, `links_to`, `located_in`
   - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
   - Provenance: `derived_from`
   - Temporal: `precedes`
@@ -264,6 +266,8 @@ Amendments whose own status reads Proposed. Each needs the sign-off described un
 
 Amendments to accepted records:
 
+- [ADR-005 amendment: shared streaming event cursor walk](ADR-005-storage-capability-traits.md#amendment-shared-streaming-event-cursor-walk-2026-10-01) (2026-10-01): proposed runtime cursor walk over the existing EventStore capability, shared by brain and moodboard (#3709, #3729).
+- [ADR-031 Amendment 4](ADR-031-multi-engine-retrieval.md#amendment-4-2026-09-30-disclose-bounded-document-embedding-input-at-the-rust-runtime-boundary) (2026-09-30): document-embedding truncation disclosure and Rust runtime API migration.
 - [ADR-017](ADR-017-pack-standard.md#amendment-2026-09-12-a-runtime-owned-adapter-because-static-declarations-are-not-an-install-format) (2026-09-12): a runtime-owned adapter, because static declarations are not an install format.
 - [ADR-019 Amendment 3](ADR-019-gtd-pack.md#amendment-3-proposed-2026-09-14-additive-task-query-filters-2678) (2026-09-14): additive task-query filters (#2678).
 - [ADR-023](ADR-023-declarative-pack-format.md#amendment-an-independently-installed-distribution-is-a-pack-2026-09-12) (2026-09-12): an independently installed distribution is a pack.
@@ -272,19 +276,31 @@ Amendments to accepted records:
 - [ADR-027 Amendment 4](ADR-027-dynamic-pack-loading.md#amendment-4-2026-09-12-installable-pack-distributions-and-what-stays-rejected) (2026-09-12): installable pack distributions, and what stays rejected.
 - [ADR-028 Amendment A3](ADR-028-pack-scoped-backends.md#amendment-a3-backend-route-validation-and-search-runtime-selection-2026-09-14) (2026-09-14): backend route validation and search runtime selection.
 - [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-inbox-and-thread-limit-disclosure-2026-09-14) (2026-09-14): inbox and thread limit disclosure.
+- [ADR-040](ADR-040-communication-and-schedule-packs.md#amendment-proposed-comm-message-file-attachments-2026-10-02) (2026-10-02): comm message file attachments, with confined `blob.import` and `blob.export`.
 - [ADR-051 Amendment 1](ADR-051-section-embeddings-hybrid-compose.md#amendment-1-blend-kg-entities-into-the-compose-candidate-pool): blend KG entities into the compose candidate pool.
 - [ADR-061 Amendment 1](ADR-061-pack-extensible-by-id-resolution.md#amendment-1-unsupported-generic-mutation-of-pack-private-records) (2026-09-14): unsupported generic mutation of pack-private records.
+- [ADR-079 Amendment 4](ADR-079-ann-persistence-warm-path-integration.md#amendment-4-2026-10-03-contract-for-a-shared-ann-lifecycle-host) (2026-10-03): contract for a shared ANN lifecycle host: the recovery fence, two generation counters, one tail reader, equal-score order and segment-key disjointness (#3921, #3922).
+- [ADR-085 Amendment 13](ADR-085-code-pack.md#amendment-13-2026-09-30-native-routing-for-in-process-code-map-clients) (2026-09-30): proposed code-map ownership boundary, five core opener classes and bidirectional lock acceptance, including the [Proposed Amendment 12 lifetime clarification](ADR-085-code-pack.md#proposed-clarification-guarded-identity-lifetime); architecture fork unchosen. PR #3674 is held, as a merge-sequencing statement that applies when this text lands. The hold releases only when the executed acceptance of this amendment has passed for the full census population under the selected architecture, the `code.ingest` native constructor included, and the amendment is ratified on that executed evidence; a status change without that executed evidence does not release the hold.
+- [ADR-085 Amendment 14](ADR-085-code-pack.md#amendment-14-2026-10-02-sequential-recovery-of-interrupted-l2-sweeps) (2026-10-02): accepted 2026-10-03; sequential recovery markers for interrupted L2 sweeps (#3736), with the multi-root owner limitation tracked as #3752.
+- [ADR-085 Amendment 15](ADR-085-code-pack.md#amendment-15-2026-10-03-fallback-owners-neither-grant-nor-use-l2-reuse-authority) (2026-10-03): accepted 2026-10-03; an owner resolved by the basename fallback has no project root, so an invocation neither writes its completion nor uses an earlier one (#3736).
+- [ADR-085 Amendment 16](ADR-085-code-pack.md#amendment-16-2026-10-03-retained-declaration-and-edge-observations-gate-l2-reuse) (2026-10-03): proposed retained declaration and outgoing derived-edge observation prerequisites for unchanged L2 reuse, including shared manifest owners and historical-edge reparse costs (#3752).
 - [ADR-087 Amendment 1](ADR-087-workspace-mirror.md#amendment-1-2026-07-15-self-standing-content-convention-blob-backed-binaries-durability-separation) (2026-07-15): self-standing content convention, blob-backed binaries, durability separation.
 - [ADR-088 Amendment 1, operational rider](ADR-088-amendment-1-git-digest.md#proposed-operational-rider-persisted-cursor-inspection-2026-09-10) (2026-09-10): persisted cursor inspection. Its heading marks it Proposed; it has no separate status line.
 - [ADR-104 Amendment 1](ADR-104-posterior-serving-recall.md#amendment-1-2026-07-12-prior-preserving-evidence-decay-for-per-entity-posteriors) (2026-07-12): prior-preserving evidence decay for per-entity posteriors.
 - [ADR-105 Appendix A](ADR-105-cross-node-comm-transport.md#appendix-a-2026-09-23----node-wire-protocol-version-1) (2026-09-23): node wire protocol, version 1, proposed as part of the 2026-09-14 amendment.
+- [ADR-105 Amendment 2026-10-03](ADR-105-cross-node-comm-transport.md#amendment-2026-10-03----sender-receipts-from-the-poll-page) (2026-10-03): accepted 2026-10-03; the poll page carries the sender's receipts, verified in the node adapter through a sealed constructor, with a receipt cursor that commits once the page's receipts are handled.
+- [ADR-105 Amendment 2026-10-03, recipient receipt signing site](ADR-105-cross-node-comm-transport.md#amendment-2026-10-03----recipient-receipt-signing-site) (2026-10-03): proposed; the node adapter signs the recipient's receipt when it acknowledges a committed journal entry, from a typed value only the runtime can construct, with identical bytes on a retry and the key of the epoch the binding names. The new method replaces `acknowledge_receipt`. It also adds a stored record that belongs to another binding to the sender-side rejection cases.
+- [ADR-115 Amendment 6](ADR-115-secret-gate-content-manifest-exemption.md#amendment-6-2026-09-30-fixed-sets-of-literal-property-paths) (2026-09-30): fixed sets of literal property paths.
 - [ADR-119 Amendment 6](ADR-119-daemon-component-supervision.md#amendment-6-cancellation-during-inbound-transport-reads-2026-09-14) (2026-09-14): cancellation during inbound transport reads.
 - [ADR-130 Amendment 5](ADR-130-search-response-completeness-and-ranking-evidence.md#amendment-5-proposed-search-limit-disclosure-at-the-mcp-operation-boundary-2026-09-14) (2026-09-14): search limit disclosure at the MCP operation boundary.
+- [ADR-144 Amendment 3](ADR-144-memory-write-visibility-fence.md#amendment-3-2026-10-04-partitioned-moves-carry-memory-vectors-with-receipts) (2026-10-04): partitioned memory vector carry with receipts and exact destination fences (#3696).
 - [ADR-180 Amendment 2](ADR-180-tool-pack.md#amendment-2-2026-09-11-the-grant-digest-and-the-exec-receipt-canonicalize-by-the-same-function) (2026-09-11): the grant digest and the exec receipt canonicalize by the same function.
+- [ADR-181 Amendment 11](ADR-181-exec-verb-sandboxed-run.md#amendment-11-2026-09-29-timeout-residual-for-detached-descendants) (2026-09-29): timeout residual for detached descendants.
 - [ADR-182 Amendment 2, item 10](ADR-182-git-dev-loop-verbs.md#amendment-2-2026-09-08-exact-compares-actor-only-credentials-dispositions-receipts) (2026-09-08): operator read, a policy-gated `git.receipts.all`.
 
 Amendments inside records whose own status is Proposed:
 
 - [ADR-133 Amendment 3](ADR-133-incidental-writes-off-the-request-hot-path.md#amendment-3-2026-09-08-the-obligation-error-carries-the-domain-disposition-and-a-post-dispatch-obligation-error-is-never-retry-permission) (2026-09-08).
 - [ADR-137 Amendment 1](ADR-137-tailnet-wire-transport.md#amendment-1-wire-contract-closure-before-the-first-consumer): wire-contract closure before the first consumer.
+- [ADR-189 Amendment 2](ADR-189-namespace-move.md#amendment-2-2026-10-04-logical-domain-routes-and-partitioned-vector-destinations) (2026-10-04): canonical Domain mirror ownership and unique source-vector destinations per backend (#3696).
 - [ADR-172 Amendment 2](ADR-172-versioned-notes-compare-and-set.md#amendment-2-2026-09-08-a-head-note-kind-for-keyed-documents-the-document-kind-as-a-tag-embed-and-the-in-transaction-arm) (2026-09-08), [Amendment 3](ADR-172-versioned-notes-compare-and-set.md#amendment-3-2026-09-09-ordered-fence-lists) (2026-09-09), [Amendment 4](ADR-172-versioned-notes-compare-and-set.md#amendment-4-2026-09-11-absence-as-a-fence-predicate) (2026-09-11) and [Amendment 5](ADR-172-versioned-notes-compare-and-set.md#amendment-5-2026-09-14-an-accepted-fenced-write-always-mints-a-version-the-no-op-answer-is-for-unfenced-updates-only) (2026-09-14).

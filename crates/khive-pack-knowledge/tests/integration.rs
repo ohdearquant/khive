@@ -114,6 +114,67 @@ async fn pack_registers_cleanly_with_verb_registry() {
     );
 }
 
+struct LearnWarningEmbeddingService;
+
+#[async_trait::async_trait]
+impl lattice_embed::EmbeddingService for LearnWarningEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: lattice_embed::EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+        Ok(vec![vec![1.0]; texts.len()])
+    }
+
+    fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "learn-warning-test"
+    }
+}
+
+struct LearnWarningEmbedderProvider;
+
+#[async_trait::async_trait]
+impl khive_runtime::EmbedderProvider for LearnWarningEmbedderProvider {
+    fn name(&self) -> &str {
+        "learn-warning-test"
+    }
+
+    fn dimensions(&self) -> usize {
+        1
+    }
+
+    async fn build(&self) -> Result<Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+        Ok(Arc::new(LearnWarningEmbeddingService))
+    }
+}
+
+#[tokio::test]
+async fn learn_reports_embedding_truncation() {
+    let runtime = rt();
+    runtime.register_embedder(LearnWarningEmbedderProvider);
+    let f = pack(runtime);
+    let description = "x".repeat(lattice_embed::MAX_TEXT_BYTES + 1);
+
+    let response = f
+        .dispatch(
+            "knowledge.learn",
+            json!({"name": "long description", "description": description}),
+        )
+        .await
+        .expect("learn with an over-limit description");
+
+    assert_eq!(
+        response["warnings"],
+        json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        "learn must disclose a truncated embedding input: {response}"
+    );
+    assert_eq!(response["description"].as_str(), Some(description.as_str()));
+}
+
 // ── learn verb ────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -595,7 +656,7 @@ async fn issue2732_topic_query_count_distinguishes_corpus_window_and_output() {
         .unwrap();
     const QUERY: &str = "orchardwindowprobe";
     for slot in 0..17 {
-        core.create_entity(
+        core.create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -605,6 +666,7 @@ async fn issue2732_topic_query_count_distinguishes_corpus_window_and_output() {
             vec!["count-domain".into()],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     }
     // An independent, fixed-bound core search supplies exact candidate IDs and scores.
@@ -708,7 +770,7 @@ async fn issue2824_empty_and_whitespace_topic_queries_stay_on_the_query_branch()
         .unwrap();
     const QUERY: &str = "orchardwindowprobe";
     for slot in 0..17 {
-        core.create_entity(
+        core.create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -718,6 +780,7 @@ async fn issue2824_empty_and_whitespace_topic_queries_stay_on_the_query_branch()
             vec!["count-domain".into()],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     }
 
@@ -770,7 +833,7 @@ async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
         .unwrap();
     const QUERY: &str = "orchardwindowprobe";
     for slot in 0..13 {
-        core.create_entity(
+        core.create_entity_with_embedding_report(
             &token,
             "concept",
             None,
@@ -780,6 +843,7 @@ async fn issue2732_topic_query_count_applies_domain_filter_without_refill() {
             vec!["other".into()],
         )
         .await
+        .map(|(record, _report)| record)
         .unwrap();
     }
     let ranked = core
@@ -2554,6 +2618,10 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
 
     let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
     let rt = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -2574,6 +2642,7 @@ async fn index_reembed_paging_sweep_covers_equal_created_at_in_order() {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime");
     rt.register_embedder(RecordingEmbedProvider {
@@ -2775,6 +2844,10 @@ async fn knowledge_index_persists_audited_bounded_prefixed_fingerprint() {
 
     let recorded = Arc::new(Mutex::new(Vec::<String>::new()));
     let rt = KhiveRuntime::new(RuntimeConfig {
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: Default::default(),
+        wal_ceiling_env_raw: None,
         web: Default::default(),
         telemetry: Default::default(),
         mounts: Vec::new(),
@@ -2795,6 +2868,7 @@ async fn knowledge_index_persists_audited_bounded_prefixed_fingerprint() {
         allowed_outbound_namespaces: vec![],
         actor_id: None,
         exec: Default::default(),
+        ..khive_runtime::RuntimeConfig::no_embeddings()
     })
     .expect("runtime");
     rt.register_test_audited_embedder(MODEL, RecordingProvider(Arc::clone(&recorded)));
@@ -3158,6 +3232,166 @@ async fn delete_atoms_mixed_request_with_domain_mirror_leaves_normal_atom_live()
         .await
         .expect("normal atom must remain live after the rejected mixed request");
     assert_eq!(atom["kind"], "atom");
+}
+
+/// Insert live atoms straight into storage so a delete test can seed many
+/// rows without upsert validation. Returns each atom's id, in slug order.
+async fn seed_raw_atoms(runtime: &KhiveRuntime, slugs: &[String]) -> Vec<String> {
+    let ids: Vec<String> = (0..slugs.len())
+        .map(|i| format!("d1e1e700-0000-4000-8000-{i:012}"))
+        .collect();
+    let statements: Vec<SqlStatement> = slugs
+        .iter()
+        .zip(&ids)
+        .map(|(slug, id)| SqlStatement {
+            sql: "INSERT INTO knowledge_atoms \
+                  (id, namespace, slug, name, content, created_at, updated_at) \
+                  VALUES (?1, 'local', ?2, ?2, 'delete control content', 1, 1)"
+                .into(),
+            params: vec![SqlValue::Text(id.clone()), SqlValue::Text(slug.clone())],
+            label: Some("test.knowledge_delete_atoms.seed".into()),
+        })
+        .collect();
+    let mut writer = runtime.sql().writer().await.expect("knowledge writer");
+    writer.execute_batch(statements).await.expect("seed atoms");
+    ids
+}
+
+async fn live_atom_slugs(runtime: &KhiveRuntime) -> Vec<String> {
+    let mut reader = runtime.sql().reader().await.expect("knowledge reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT slug FROM knowledge_atoms WHERE deleted_at IS NULL ORDER BY slug".into(),
+            params: vec![],
+            label: None,
+        })
+        .await
+        .expect("live slugs");
+    rows.iter()
+        .filter_map(|row| match row.get("slug") {
+            Some(SqlValue::Text(slug)) => Some(slug.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn delete_atoms_counts_ids_slugs_duplicates_and_deleted_across_chunks() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let slugs: Vec<String> = (0..6).map(|i| format!("del-{i}")).collect();
+    let ids = seed_raw_atoms(&runtime, &slugs).await;
+
+    // del-5 is already deleted before the request below.
+    f.dispatch("knowledge.delete_atoms", json!({ "ids": ["del-5"] }))
+        .await
+        .expect("pre-delete");
+
+    // 2,000 references span three chunks; real atoms sit on both sides of the
+    // chunk boundary, one is named twice (slug and id), one is already deleted
+    // and one is written with surrounding whitespace.
+    let mut request: Vec<String> = (0..2000).map(|i| format!("no-such-atom-{i}")).collect();
+    request[0] = slugs[0].clone();
+    request[899] = ids[1].clone();
+    request[900] = format!("  {}  ", slugs[2]);
+    request[1799] = ids[2].clone();
+    request[1800] = slugs[5].clone();
+    request[1999] = ids[3].clone();
+    let resp = f
+        .dispatch("knowledge.delete_atoms", json!({ "ids": request }))
+        .await
+        .expect("delete");
+
+    assert_eq!(resp["deleted"], 4, "del-0..del-3 are deleted once each");
+    assert_eq!(resp["requested"], 2000, "requested is the submitted length");
+    assert_eq!(live_atom_slugs(&runtime).await, vec!["del-4".to_string()]);
+}
+
+#[tokio::test]
+async fn delete_atoms_refuses_a_domain_in_a_later_chunk_before_deleting_anything() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    seed_raw_atoms(&runtime, &["first-chunk-atom".to_string()]).await;
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({ "domains": [{ "slug": "late-domain", "name": "Late Domain", "description": "Late domain techniques — covering concepts techniques algorithms implementations applications use cases and design patterns in detail — covering concepts techniques" }] }),
+    )
+    .await
+    .expect("seed domain");
+
+    let mut request: Vec<String> = (0..1500).map(|i| format!("no-such-atom-{i}")).collect();
+    request[0] = "first-chunk-atom".to_string();
+    request[1400] = "late-domain".to_string();
+    let err = f
+        .dispatch("knowledge.delete_atoms", json!({ "ids": request }))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "expected InvalidInput, got: {err:?}"
+    );
+    let text = err.to_string();
+    assert!(
+        text.contains("cannot delete domain \"late-domain\""),
+        "{text}"
+    );
+    assert!(
+        text.contains("use the generic delete verb by domain UUID"),
+        "{text}"
+    );
+    let live = live_atom_slugs(&runtime).await;
+    assert!(
+        live.contains(&"first-chunk-atom".to_string()),
+        "a refused request must not delete the atoms listed before the domain"
+    );
+}
+
+#[tokio::test]
+async fn delete_atoms_storage_error_rolls_back_the_whole_request() {
+    let runtime = rt();
+    let f = pack(runtime.clone());
+    let slugs: Vec<String> = ["rb-alpha", "rb-beta", "rb-poison", "rb-gamma"]
+        .iter()
+        .map(|slug| slug.to_string())
+        .collect();
+    seed_raw_atoms(&runtime, &slugs).await;
+    {
+        let sql = runtime.sql();
+        let mut writer = sql.writer().await.expect("fixture trigger writer");
+        writer
+            .execute(SqlStatement {
+                sql: "CREATE TRIGGER reject_one_delete BEFORE UPDATE OF deleted_at \
+                      ON knowledge_atoms WHEN OLD.slug = 'rb-poison' \
+                      BEGIN SELECT RAISE(ABORT, 'injected delete failure'); END"
+                    .into(),
+                params: vec![],
+                label: Some("test.knowledge_delete_atoms.reject_one_delete".into()),
+            })
+            .await
+            .expect("install trigger in the private in-memory fixture");
+    }
+
+    let err = f
+        .dispatch("knowledge.delete_atoms", json!({ "ids": slugs }))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("delete_atoms"),
+        "the storage error must surface: {err}"
+    );
+
+    // The request is one transaction: the atoms listed before the failing one
+    // are not left deleted.
+    assert_eq!(
+        live_atom_slugs(&runtime).await,
+        vec![
+            "rb-alpha".to_string(),
+            "rb-beta".to_string(),
+            "rb-gamma".to_string(),
+            "rb-poison".to_string(),
+        ]
+    );
 }
 
 // ── stats ──────────────────────────────────────────────────────────────────────
@@ -5430,6 +5664,10 @@ mod kg_blend {
         pause: Option<Arc<EmbedPause>>,
     ) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -5450,6 +5688,7 @@ mod kg_blend {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(MarkerEmbedProvider { recorded, pause });
@@ -5921,8 +6160,8 @@ mod kg_blend {
         );
     }
 
-    /// #2232: auto-compose crosses suggest ANN/rerank, atom rerank, and two
-    /// KG kind searches. Every stage must reuse the first successful query
+    /// #2232: auto-compose crosses suggest ANN/rerank, atom rerank, and the
+    /// KG blend search. Every stage must reuse the first successful query
     /// vector instead of independently embedding the same request text.
     #[tokio::test]
     async fn auto_compose_embeds_request_query_exactly_once() {
@@ -6165,6 +6404,10 @@ mod kg_blend {
 
         let calls = Arc::new(Mutex::new(0usize));
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -6185,6 +6428,7 @@ mod kg_blend {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(CountingEmbedProvider {
@@ -6452,6 +6696,164 @@ mod kg_blend {
         );
     }
 
+    /// Runs an explicit-domain compose with a dispatch-accounting context armed and
+    /// returns the response with the counters that dispatch recorded. Explicit domains
+    /// skip the suggest phase, so the KG blend is the only vector search in the call.
+    async fn compose_counting_usage(f: &Fixture, domain_id: &str) -> (Value, Value) {
+        let usage = khive_runtime::usage::UsageContext::new();
+        let resp = khive_runtime::usage::scope(
+            usage.clone(),
+            f.dispatch(
+                "knowledge.compose",
+                json!({ "domain_ids": [domain_id], "query": QUERY }),
+            ),
+        )
+        .await
+        .expect("explicit domain_ids compose ok");
+        (resp, usage.snapshot())
+    }
+
+    /// The blend finds `concept` and `document` entities with one vector query shared
+    /// by both kinds, so the vector store is queried once for the call rather than once
+    /// per kind, and both kinds still come back.
+    #[tokio::test]
+    async fn kg_blend_searches_both_kinds_in_one_vector_pass() {
+        let f = pack(rt_with_marker_embedder());
+        let domain_id = seed_domain_and_atom(&f).await;
+        let concept_id = seed_kg_concept(&f).await;
+        let document_id = seed_kg_document(&f).await;
+
+        let (resp, usage) = compose_counting_usage(&f, &domain_id).await;
+
+        assert_eq!(
+            usage["vector_passes"], 1,
+            "one blend search over both kinds must run one vector pass, got: {usage}"
+        );
+        let entities = resp["data"]["entities"]
+            .as_array()
+            .expect("entities array must be present when both kinds blend");
+        let ids: HashSet<&str> = entities.iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(
+            ids,
+            HashSet::from([concept_id.as_str(), document_id.as_str()]),
+            "both seeded kinds must be blended, got: {entities:?}"
+        );
+    }
+
+    /// With only one blend kind present, the shared vector query returns that kind's
+    /// entity and the call still runs one vector pass.
+    #[tokio::test]
+    async fn kg_blend_with_one_kind_present_returns_it_in_one_vector_pass() {
+        for kind in ["concept", "document"] {
+            let f = pack(rt_with_marker_embedder());
+            let domain_id = seed_domain_and_atom(&f).await;
+            let seeded = if kind == "concept" {
+                seed_kg_concept(&f).await
+            } else {
+                seed_kg_document(&f).await
+            };
+
+            let (resp, usage) = compose_counting_usage(&f, &domain_id).await;
+
+            assert_eq!(
+                usage["vector_passes"], 1,
+                "a {kind}-only blend must run one vector pass, got: {usage}"
+            );
+            let entities = resp["data"]["entities"]
+                .as_array()
+                .expect("entities array must be present when one kind blends");
+            let ids: Vec<&str> = entities.iter().filter_map(|e| e["id"].as_str()).collect();
+            assert_eq!(
+                ids,
+                [seeded.as_str()],
+                "a {kind}-only blend must return exactly the seeded entity, got: {entities:?}"
+            );
+        }
+    }
+
+    /// The shared vector query leaves each kind with the list a per-kind search returns,
+    /// also when one kind has more matches than its budget.
+    ///
+    /// Scenario: with a limit of 2, six concepts match both the text query and the vector,
+    /// so the concept list is cut to its budget. Two documents match only by vector. The
+    /// oracle is the per-kind `hybrid_search` call the blend made before it shared the
+    /// vector query.
+    #[tokio::test]
+    async fn kg_blend_each_kind_matches_the_per_kind_search_when_a_kind_is_over_budget() {
+        const LIMIT: u32 = 2;
+        let rt = rt_with_marker_embedder();
+        let f = pack(rt.clone());
+        for i in 0..6 {
+            f.dispatch(
+                "create",
+                json!({
+                    "kind": "concept",
+                    "name": format!("Concept{i}"),
+                    "description": format!("{MARKER} paged cache variant {i}"),
+                }),
+            )
+            .await
+            .expect("create kg concept");
+        }
+        for i in 0..2 {
+            f.dispatch(
+                "create",
+                json!({
+                    "kind": "document",
+                    "name": format!("Document{i}"),
+                    "description": format!("{MARKER} decode attention paper {i}"),
+                }),
+            )
+            .await
+            .expect("create kg document");
+        }
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let mut marker_vector = vec![0.0f32; DIM];
+        marker_vector[0] = 1.0;
+        let kinds = ["concept", "document"];
+
+        let mut expected: Vec<Vec<String>> = Vec::new();
+        for kind in kinds {
+            let hits = rt
+                .hybrid_search(
+                    &token,
+                    "paged",
+                    Some(marker_vector.clone()),
+                    LIMIT,
+                    Some(kind),
+                    None,
+                    &[],
+                    None,
+                )
+                .await
+                .expect("per-kind search");
+            expected.push(hits.iter().map(|hit| hit.entity_id.to_string()).collect());
+        }
+        assert_eq!(
+            expected[0].len(),
+            LIMIT as usize,
+            "premise: the concept list is cut to its budget"
+        );
+        assert_eq!(
+            expected[1].len(),
+            2,
+            "premise: the document list is not empty"
+        );
+
+        let per_kind = rt
+            .hybrid_search_each_kind(&token, "paged", Some(marker_vector), LIMIT, &kinds)
+            .await
+            .expect("shared-vector search");
+        let mut actual: Vec<Vec<String>> = Vec::new();
+        for hits in &per_kind {
+            actual.push(hits.iter().map(|hit| hit.entity_id.to_string()).collect());
+        }
+        assert_eq!(
+            actual, expected,
+            "each kind must get the ids and order its own per-kind search returns"
+        );
+    }
+
     /// Test 8: zero-atom edge case (ADR-051 Amendment 1 Decision) — when the
     /// final compose body ends up with zero atoms (everything trimmed by
     /// `max_tokens`), the entity inclusion floor is undefined, so no
@@ -6589,6 +6991,10 @@ mod kg_blend {
 
     fn rt_with_failing_blend_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: Default::default(),
+            wal_ceiling_env_raw: None,
             web: Default::default(),
             telemetry: Default::default(),
             mounts: Vec::new(),
@@ -6609,6 +7015,7 @@ mod kg_blend {
             allowed_outbound_namespaces: vec![],
             actor_id: None,
             exec: Default::default(),
+            ..khive_runtime::RuntimeConfig::no_embeddings()
         })
         .expect("runtime");
         rt.register_embedder(FailingBlendEmbedProvider);

@@ -25,7 +25,9 @@ pub mod usage;
 pub mod vectors;
 
 pub use agent::AgentStore;
-pub use attachment::{Attachment, AttachmentStore, AttachmentSubstrate, NewAttachment};
+pub use attachment::{
+    Attachment, AttachmentReadReport, AttachmentStore, AttachmentSubstrate, NewAttachment,
+};
 pub use blob::{
     BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, UploadId,
     MAX_BLOB_WHOLE_BYTES,
@@ -38,7 +40,7 @@ pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
 };
 pub use graph::GraphStore;
-pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
+pub use note::{FilterOp, Note, NoteFilter, NoteStore, NoteVisibility, SortDir};
 pub use request_context::{
     await_request_read_phase, capture_request_read_context, effective_request_read_deadline,
     ensure_request_read_active, inherit_request_read_cancellation, inherit_request_read_context,
@@ -83,3 +85,9 @@ pub use khive_types::{
     AgentRecord, AgentState, EdgeCategory, EdgeRelation, EventOutcome, SubstrateKind,
     TerminalReason,
 };
+
+/// The current time as microseconds since the Unix epoch, the unit stored
+/// rows use for their timestamps.
+pub fn now_micros() -> i64 {
+    chrono::Utc::now().timestamp_micros()
+}

@@ -16,7 +16,9 @@ use khive_storage::{
 use khive_types::pack::pack_registry_tag;
 use khive_types::{EdgeRelation, VerbCategory, Visibility};
 
-use crate::policy::{self, actor_label, now_micros, Decision};
+use crate::policy::{
+    self, actor_label, now_micros, opt_u32, Decision, DecisionCaller, DecisionInvocation,
+};
 use crate::vocab::{
     CAPABILITY_TAG, DECISIONS, KINDS, REGISTRY_ENTITY_KIND, REGISTRY_TAG, SIDE_EFFECTS,
     TRUST_ORIGINS,
@@ -52,18 +54,6 @@ fn opt_str(params: &Value, key: &str) -> Result<Option<String>, RuntimeError> {
 
 fn req_str(params: &Value, key: &str) -> Result<String, RuntimeError> {
     opt_str(params, key)?.ok_or_else(|| RuntimeError::InvalidInput(format!("{key} is required")))
-}
-
-fn opt_u32(params: &Value, key: &str, default: u32, max: u32) -> Result<u32, RuntimeError> {
-    match params.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(v) => v
-            .as_u64()
-            .map(|n| u32::try_from(n).unwrap_or(u32::MAX).clamp(1, max))
-            .ok_or_else(|| {
-                RuntimeError::InvalidInput(format!("{key} must be a non-negative integer"))
-            }),
-    }
 }
 
 fn opt_i64(params: &Value, key: &str) -> Result<Option<i64>, RuntimeError> {
@@ -831,29 +821,70 @@ pub(crate) async fn list(
 
 // ── policy and grants ────────────────────────────────────────────────────────
 
+/// Whether a decision is persisted as an event or only computed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Receipt {
+    Record,
+    Skip,
+}
+
 async fn decision_for(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     reference: &str,
     actor: &str,
+    receipt: Receipt,
 ) -> Result<(String, bool, Decision), RuntimeError> {
     let ns = token.namespace().as_str().to_string();
     match resolve_tool(rt, token, reference).await {
         Ok(entity) => {
             let registration = RegistryPin::from_entity(&entity)?;
-            let d = policy::decide(
-                rt,
-                &ns,
-                actor,
-                &entity.name,
-                side_effect_of(&entity).as_deref(),
-                Some(&registration),
-            )
-            .await?;
+            let side_effect = side_effect_of(&entity);
+            let d = if receipt == Receipt::Record {
+                policy::decide_with_receipt(
+                    rt,
+                    DecisionInvocation {
+                        token,
+                        actor,
+                        tool: &entity.name,
+                        registered: true,
+                        caller: DecisionCaller::ToolCheck,
+                    },
+                    side_effect.as_deref(),
+                    Some(&registration),
+                )
+                .await?
+            } else {
+                policy::decide(
+                    rt,
+                    &ns,
+                    actor,
+                    &entity.name,
+                    side_effect.as_deref(),
+                    Some(&registration),
+                )
+                .await?
+            };
             Ok((entity.name.clone(), true, d))
         }
         Err(RuntimeError::NotFound(_)) => {
-            let d = policy::decide(rt, &ns, actor, reference, None, None).await?;
+            let d = if receipt == Receipt::Record {
+                policy::decide_with_receipt(
+                    rt,
+                    DecisionInvocation {
+                        token,
+                        actor,
+                        tool: reference,
+                        registered: false,
+                        caller: DecisionCaller::ToolCheck,
+                    },
+                    None,
+                    None,
+                )
+                .await?
+            } else {
+                policy::decide(rt, &ns, actor, reference, None, None).await?
+            };
             Ok((reference.to_string(), false, d))
         }
         Err(e) => Err(e),
@@ -867,7 +898,8 @@ pub(crate) async fn check(
 ) -> Result<Value, RuntimeError> {
     let reference = req_str(&params, "tool")?;
     let actor = opt_str(&params, "actor")?.unwrap_or_else(|| actor_label(token));
-    let (name, registered, decision) = decision_for(rt, token, &reference, &actor).await?;
+    let (name, registered, decision) =
+        decision_for(rt, token, &reference, &actor, Receipt::Record).await?;
     let mut v = decision.to_json();
     v["ok"] = json!(true);
     v["tool"] = json!(name);
@@ -889,7 +921,8 @@ pub(crate) async fn request(
     let notify = opt_str(&params, "notify")?;
     let ns = token.namespace().as_str().to_string();
 
-    let (name, registered, decision) = decision_for(rt, token, &reference, &actor).await?;
+    let (name, registered, decision) =
+        decision_for(rt, token, &reference, &actor, Receipt::Skip).await?;
     if decision.decision == "allow" {
         let mut v = decision.to_json();
         v["ok"] = json!(true);
@@ -1072,8 +1105,15 @@ pub(crate) async fn policies(
 }
 
 #[cfg(test)]
+#[path = "parameter_helpers_tests.rs"]
+mod parameter_helpers_tests;
+
+#[cfg(test)]
 #[path = "claim_tests.rs"]
 mod claim_tests;
+#[cfg(test)]
+#[path = "decision_receipt_tests.rs"]
+mod decision_receipt_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -21,6 +21,8 @@ pub(crate) mod util;
 pub(crate) struct KnowledgeHandlers;
 
 #[cfg(test)]
+mod a5_rerank_tests;
+#[cfg(test)]
 mod ann_degrade_tests;
 #[cfg(test)]
 mod namespace_move_consumer_tests;

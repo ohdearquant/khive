@@ -24,9 +24,10 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode, NoteKindSpec,
-    NoteLifecycleSpec, PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef,
-    VerbCategory, VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
+    json_type_name, EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, IdResolutionMode,
+    NoteEmbeddingPolicy, NoteEmbeddingPolicySpec, NoteKindSpec, NoteLifecycleSpec,
+    PackColumnAddition, PackColumnAffinity, PackSchemaPlan, ParamDef, VerbCategory,
+    VerbPresentationPolicy, Visibility, RESERVED_ENVELOPE_ARGS,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -316,6 +317,11 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
+    /// Per-kind write-time embedding policy; unlisted kinds use every model.
+    fn note_embedding_policies(&self) -> &'static [NoteEmbeddingPolicySpec] {
+        &[]
+    }
+
     /// Optional per-kind hook for shared CRUD specialization.
     ///
     /// When a kind is owned by this pack (declared in `note_kinds()` or
@@ -416,6 +422,11 @@ pub trait PackRuntime: Send + Sync {
     /// `KhiveRuntime::install_note_mutation_hook`. Default no-op leaves the hook absent.
     /// See `docs/api/pack.md#register_note_mutation_hook` for cross-pack notification rationale.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {}
+
+    /// Install a backend-matched note-search ANN candidate source. The
+    /// memory pack supplies it after registration; packs without a matching
+    /// graph leave the runtime's exact vector-store route in place.
+    fn register_note_search_ann_provider(&self, _runtime: &KhiveRuntime) {}
 
     /// Install a note-write validator on the runtime, called at pack
     /// initialisation with the same timing as `register_note_mutation_hook`.
@@ -614,13 +625,15 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// Errors here are **logged but not propagated** — the storage write has
     /// already succeeded; failing the call would mislead the caller.
     /// Implementations should `tracing::warn!` and return `Ok(())` for
-    /// best-effort side effects.
+    /// best-effort side effects. The default does nothing.
     async fn after_create(
         &self,
-        runtime: &KhiveRuntime,
-        id: uuid::Uuid,
-        args: &Value,
-    ) -> Result<(), RuntimeError>;
+        _runtime: &KhiveRuntime,
+        _id: uuid::Uuid,
+        _args: &Value,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 
     /// Validate an approved AddEntity draft before preparing domain writes.
     /// The draft kind is canonical.
@@ -1260,6 +1273,16 @@ impl VerbRegistryBuilder {
             .map(|h| h.name)
             .collect();
 
+        // Keep the first declaration for duplicate subhandler names, matching
+        // the registry's existing pack-order metadata lookup behavior. Public
+        // verb names have already been checked for uniqueness above.
+        let mut handler_by_name: HashMap<&'static str, &'static HandlerDef> = HashMap::new();
+        for pack in &ordered_packs {
+            for handler in pack.handlers() {
+                handler_by_name.entry(handler.name).or_insert(handler);
+            }
+        }
+
         // Admission-degrade eligibility (#2147/#2217, khive-oss#2311): decided
         // once here, from the trust bit the composition root recorded at
         // registration time (never from `pack.name()`'s self-report) plus
@@ -1352,6 +1375,7 @@ impl VerbRegistryBuilder {
             audit_store_read_only: self.audit_store_read_only,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
+            handler_by_name: Arc::new(handler_by_name),
             degrade_safe_verbs: Arc::new(degrade_safe_verbs),
             read_replay_safe_verbs: Arc::new(read_replay_safe_verbs),
             reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
@@ -1645,6 +1669,9 @@ pub struct VerbRegistry {
     /// message — the pack set is fixed after construction, so there is no
     /// need to re-scan every pack's handlers on every miss.
     available_verbs: Arc<Vec<&'static str>>,
+    /// Static handler metadata indexed once at build time. Duplicate internal
+    /// subhandler names retain the first pack's declaration, as before.
+    handler_by_name: Arc<HashMap<&'static str, &'static HandlerDef>>,
     /// Verbs eligible for admission-pressure audit degradation, precomputed
     /// once at `build()` time from registration-time pack trust plus each
     /// handler's declared category and
@@ -2028,6 +2055,26 @@ fn edge_endpoint_table(packs: &[Box<dyn PackRuntime>]) -> Vec<Value> {
 }
 
 impl VerbRegistry {
+    /// Select the owning pack's backend for a note-kind KG read. The caller
+    /// keeps its already-authorized token; this only selects storage.
+    pub fn kg_note_read_runtime_for_kind<'a>(
+        &'a self,
+        runtime: &'a KhiveRuntime,
+        kind: &str,
+    ) -> &'a KhiveRuntime {
+        let Some(resolver) = &self.kg_read_resolver else {
+            return runtime;
+        };
+        let Some(owner) = self
+            .packs
+            .iter()
+            .find(|pack| pack.note_kinds().contains(&kind))
+        else {
+            return runtime;
+        };
+        resolver.runtime_for_pack(owner.name())
+    }
+
     /// Resolve a KG entity/note handle across the configured backend inventory.
     ///
     /// The caller must supply its dispatch-authorized token. By-ID reads do not
@@ -2379,6 +2426,7 @@ impl VerbRegistry {
         ("brain", "brain.bindings"),
         // comm
         ("comm", "comm.delivered"),
+        ("comm", "comm.transport_status"),
         ("comm", "comm.inbox"),
         ("comm", "comm.unread"),
         ("comm", "comm.thread"),
@@ -2422,6 +2470,8 @@ impl VerbRegistry {
         ("session", "session.resume"),
         ("session", "session.export"),
         ("session", "session.search"),
+        // Fixed SQL reads and file metadata only; no domain or maintenance write.
+        ("session", "session.stats"),
         // tool (registry, grant and policy reads; tool.suggest runs the same
         // hybrid search as the kg search and context verbs above)
         ("tool", "tool.suggest"),
@@ -2746,6 +2796,26 @@ impl VerbRegistry {
         F: FnOnce(Namespace) -> Fut,
         Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
     {
+        self.dispatch_intercepted_with_token_and_disposition(verb, params, identity, |token| {
+            dispatch(token.gate_namespace().clone())
+        })
+        .await
+    }
+
+    /// Intercept an operation with the sealed caller token minted after the
+    /// gate decision. Coordinated reads retain the resolved actor and their
+    /// existing namespace selection without reconstructing identity from args.
+    pub async fn dispatch_intercepted_with_token_and_disposition<M, F, Fut>(
+        &self,
+        verb: &str,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+        dispatch: F,
+    ) -> Result<InterceptedDispatchResult<M>, DispatchError>
+    where
+        F: FnOnce(NamespaceToken) -> Fut,
+        Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
+    {
         let request_id = identity.and_then(|id| id.request_id);
         let gate_req = self
             .gate_request_with_identity(verb, params, identity)
@@ -2797,7 +2867,8 @@ impl VerbRegistry {
         };
 
         let started = Instant::now();
-        let mut result = dispatch(gate_req.namespace.clone()).await;
+        let token = self.mint_intercepted_read_token(&gate_req, params, identity);
+        let mut result = dispatch(token).await;
         let domain_succeeded = result.is_ok();
         let duration_us = started.elapsed().as_micros() as i64;
         let receipt_outcome = if verb == "git.digest" && result.is_ok() {
@@ -2961,6 +3032,47 @@ impl VerbRegistry {
         self.gate
             .check(&request)
             .is_ok_and(|decision| decision.is_allow())
+    }
+
+    fn mint_intercepted_read_token(
+        &self,
+        gate_req: &GateRequest,
+        params: &Value,
+        identity: Option<&RequestIdentity>,
+    ) -> NamespaceToken {
+        // Preserve the coordinator's existing namespace selection: the gate
+        // namespace is primary, and explicit namespace input stays narrow.
+        let visible = if params.get("namespace").is_some() {
+            Vec::new()
+        } else {
+            let mut visible = match identity {
+                Some(identity) => identity
+                    .visible_namespaces
+                    .iter()
+                    .filter_map(|namespace| Namespace::parse(namespace).ok())
+                    .collect(),
+                None => self.visible_namespaces.clone(),
+            };
+            visible.push(Namespace::local());
+            visible
+        };
+        NamespaceToken::mint_with_visibility(
+            gate_req.namespace.clone(),
+            visible,
+            gate_req.actor.clone(),
+        )
+        .with_gate_namespace(gate_req.namespace.clone())
+        .with_gate_explicit_namespace(
+            params
+                .get("namespace")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+        .with_request_id(identity.and_then(|identity| identity.request_id))
+        .with_process_ref(match identity {
+            Some(identity) => identity.process_ref.clone(),
+            None => crate::config::process_ref_from_env(),
+        })
     }
 
     fn gate_request_with_identity(
@@ -3937,10 +4049,7 @@ impl VerbRegistry {
     /// guaranteed-failed `dispatch` (and its audit write) when an optional
     /// pack is absent can probe first and skip the call entirely.
     pub fn has_verb(&self, verb: &str) -> bool {
-        self.packs
-            .iter()
-            .flat_map(|p| p.handlers().iter())
-            .any(|h| h.name == verb)
+        self.handler_by_name.contains_key(verb)
     }
 
     /// Advisory metadata for synchronous planning and MCP initialization.
@@ -4180,6 +4289,14 @@ impl VerbRegistry {
             .collect()
     }
 
+    /// Collect pack-declared embedding policies for registered note kinds.
+    pub fn all_note_embedding_policies(&self) -> Vec<NoteEmbeddingPolicySpec> {
+        self.packs
+            .iter()
+            .flat_map(|pack| pack.note_embedding_policies().iter().copied())
+            .collect()
+    }
+
     /// All pack-contributed validation rules across registered packs.
     ///
     /// Returns references into the pack-owned `'static` slices — no allocation
@@ -4267,6 +4384,14 @@ impl VerbRegistry {
         }
     }
 
+    /// Install pack-owned note-search candidate sources before warm-up or
+    /// dispatch, following the same registration timing as mutation hooks.
+    pub fn call_register_note_search_ann_providers(&self, runtime: &KhiveRuntime) {
+        for pack in self.packs.iter() {
+            pack.register_note_search_ann_provider(runtime);
+        }
+    }
+
     /// Invoke `PackRuntime::register_note_write_validator` on every registered pack.
     ///
     /// Called by the transport during startup with the same timing as
@@ -4291,30 +4416,28 @@ impl VerbRegistry {
 
     /// Resolve the presentation policy for a verb name.
     ///
-    /// Walks all registered handlers (including subhandlers) for the first
-    /// matching name and returns its declared [`VerbPresentationPolicy`].
+    /// Uses the first registered handler (including subhandlers) with this name
+    /// and returns its declared [`VerbPresentationPolicy`].
     /// Returns `Standard` for unknown verbs — unknown verbs will fail at
     /// dispatch anyway, so the fallback here is safe.
     pub fn presentation_policy_for(&self, verb: &str) -> khive_types::VerbPresentationPolicy {
-        for pack in self.packs.iter() {
-            if let Some(handler) = pack.handlers().iter().find(|h| h.name == verb) {
-                return handler.presentation_policy();
-            }
-        }
-        khive_types::VerbPresentationPolicy::Standard
+        self.handler_by_name
+            .get(verb)
+            .map_or(khive_types::VerbPresentationPolicy::Standard, |handler| {
+                handler.presentation_policy()
+            })
     }
 
     /// Resolve the declared [`VerbCategory`] for a verb name.
     ///
-    /// Walks all registered handlers (including subhandlers) for the first
-    /// matching name and returns its speech-act category. Returns `None` for
+    /// Uses the first registered handler (including subhandlers) with this name
+    /// and returns its speech-act category. Returns `None` for
     /// an unregistered verb name, so a caller deciding transport-level
     /// behavior (e.g. whether a post-dispatch condition is safe to retry)
     /// can fail closed on an unknown verb instead of guessing a category.
     pub fn verb_category(&self, verb: &str) -> Option<VerbCategory> {
-        self.packs
-            .iter()
-            .find_map(|pack| pack.handlers().iter().find(|h| h.name == verb))
+        self.handler_by_name
+            .get(verb)
             .map(|handler| handler.category)
     }
 
@@ -4330,6 +4453,8 @@ impl VerbRegistry {
     ///   event with a freshly generated id and no natural key at all.
     /// - `telemetry.emit` can append a durable stream record with a fresh
     ///   identity and sequence, depending on the configured channel policy.
+    /// - `tool.check` appends a `tool_check_decided` receipt with a fresh
+    ///   event id for every evaluated decision (ADR-180 Amendment 6).
     ///
     /// The speech-act category alone cannot rule this out — it describes
     /// what the verb tells the *caller*, not what it schedules against
@@ -4337,7 +4462,7 @@ impl VerbRegistry {
     /// was made idempotent) is a correctness decision requiring the same
     /// scrutiny as the categorization itself.
     pub const SIDE_EFFECTING_ASSERTIVE_VERBS: &'static [&'static str] =
-        &["memory.recall", "search", "telemetry.emit"];
+        &["memory.recall", "search", "telemetry.emit", "tool.check"];
 
     /// Whether a response lost to the daemon frame budget may be truthfully
     /// advertised as safe to re-issue: the verb is [`VerbCategory::Assertive`]
@@ -4360,12 +4485,9 @@ impl VerbRegistry {
     /// boundary without blocking internal callers that invoke the same verbs
     /// through the runtime directly.
     pub fn is_subhandler_verb(&self, verb: &str) -> bool {
-        for pack in self.packs.iter() {
-            if let Some(handler) = pack.handlers().iter().find(|h| h.name == verb) {
-                return matches!(handler.visibility, Visibility::Subhandler);
-            }
-        }
-        false
+        self.handler_by_name
+            .get(verb)
+            .is_some_and(|handler| matches!(handler.visibility, Visibility::Subhandler))
     }
 
     /// Apply all non-empty pack-auxiliary schema plans to the given backend.
@@ -5676,19 +5798,6 @@ pub fn resolve_explicit_namespace(
     }
 }
 
-/// JSON type name for error messages: describes a present-but-malformed
-/// `namespace` value without echoing its contents.
-pub fn json_type_name(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
 // INLINE TEST JUSTIFICATION: tests here exercise VerbRegistry collision detection,
 // gate enforcement, and dispatch ordering that depend on direct access to the
 // registry's private `packs` Vec and gate field. Moving them to tests/ would
@@ -6357,6 +6466,135 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn session_stats_admission_degrade_requires_trusted_session_owner() {
+        static HANDLERS: [HandlerDef; 2] = [
+            HandlerDef {
+                name: "session.stats",
+                description: "read session store statistics",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "session.vacuum",
+                description: "compact session store",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            },
+        ];
+
+        let pack = || CountingHandlersPack {
+            name: "session",
+            handlers: &HANDLERS,
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let mut trusted = VerbRegistryBuilder::new();
+        trusted.register_trusted(pack());
+        let trusted = trusted.build().expect("trusted session registry");
+        assert!(trusted.admission_degrade_safe_probe("session.stats"));
+        assert!(!trusted.admission_degrade_safe_probe("session.vacuum"));
+
+        let mut untrusted = VerbRegistryBuilder::new();
+        untrusted.register(pack());
+        let untrusted = untrusted.build().expect("untrusted session registry");
+        assert!(!untrusted.admission_degrade_safe_probe("session.stats"));
+    }
+
+    #[test]
+    fn verb_metadata_uses_build_time_index_across_packs() {
+        static FIRST_HANDLERS: [HandlerDef; 2] = [
+            HandlerDef {
+                name: "get",
+                description: "first public handler",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "internal.shared",
+                description: "first internal handler",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Assertive,
+                params: &[],
+            },
+        ];
+        static SECOND_HANDLERS: [HandlerDef; 2] = [
+            HandlerDef {
+                name: "comm.send",
+                description: "second public handler",
+                visibility: Visibility::Verb,
+                category: VerbCategory::Commissive,
+                params: &[],
+            },
+            HandlerDef {
+                name: "internal.shared",
+                description: "second internal handler",
+                visibility: Visibility::Subhandler,
+                category: VerbCategory::Directive,
+                params: &[],
+            },
+        ];
+
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(CountingHandlersPack {
+            name: "kg",
+            handlers: &FIRST_HANDLERS,
+            calls: first_calls.clone(),
+        });
+        builder.register(CountingHandlersPack {
+            name: "comm",
+            handlers: &SECOND_HANDLERS,
+            calls: second_calls.clone(),
+        });
+        let registry = builder.build().expect("registry builds");
+        let after_build = (
+            first_calls.load(Ordering::SeqCst),
+            second_calls.load(Ordering::SeqCst),
+        );
+        assert!(after_build.0 > 0 && after_build.1 > 0);
+
+        assert_eq!(
+            registry.presentation_policy_for("get"),
+            VerbPresentationPolicy::AlwaysVerbose
+        );
+        assert_eq!(
+            registry.presentation_policy_for("comm.send"),
+            VerbPresentationPolicy::Standard
+        );
+        assert_eq!(
+            registry.presentation_policy_for("missing"),
+            VerbPresentationPolicy::Standard
+        );
+        assert_eq!(registry.verb_category("get"), Some(VerbCategory::Assertive));
+        assert_eq!(
+            registry.verb_category("comm.send"),
+            Some(VerbCategory::Commissive)
+        );
+        assert_eq!(registry.verb_category("missing"), None);
+        // Duplicate internal names retain the first pack's metadata.
+        assert_eq!(
+            registry.verb_category("internal.shared"),
+            Some(VerbCategory::Assertive)
+        );
+        assert!(registry.is_subhandler_verb("internal.shared"));
+        assert!(!registry.is_subhandler_verb("comm.send"));
+        assert!(!registry.is_subhandler_verb("missing"));
+        assert!(registry.has_verb("comm.send"));
+        assert!(!registry.has_verb("missing"));
+        assert_eq!(
+            (
+                first_calls.load(Ordering::SeqCst),
+                second_calls.load(Ordering::SeqCst)
+            ),
+            after_build,
+            "metadata lookups must not re-read either pack's handler slice"
+        );
+    }
+
+    #[test]
     fn read_replay_requires_trusted_owning_pack_for_every_opted_in_verb() {
         static HANDLERS: [HandlerDef; 5] = [
             HandlerDef {
@@ -6500,6 +6738,7 @@ pub(crate) mod tests {
             ("search", "/../khive-pack-kg/src/handler_defs.rs"),
             ("memory.recall", "/../khive-pack-memory/src/pack.rs"),
             ("telemetry.emit", "/../khive-pack-telemetry/src/pack.rs"),
+            ("tool.check", "/../khive-pack-tool/src/vocab.rs"),
         ];
         assert_eq!(
             sources.len(),
@@ -14589,15 +14828,6 @@ mod note_update_sequencing_tests {
             &self,
             _runtime: &KhiveRuntime,
             _args: &mut Value,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-
-        async fn after_create(
-            &self,
-            _runtime: &KhiveRuntime,
-            _id: uuid::Uuid,
-            _args: &Value,
         ) -> Result<(), RuntimeError> {
             Ok(())
         }

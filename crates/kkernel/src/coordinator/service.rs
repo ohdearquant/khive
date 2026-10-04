@@ -13,8 +13,8 @@ use khive_mcp::coordinator::{
     CoordError, CoordLinkResult, CoordSearchResult, CoordinatorService,
 };
 use khive_pack_kg::handlers::ValidatedSearchRequest;
-use khive_runtime::BackendId;
 use khive_runtime::Namespace;
+use khive_runtime::{BackendId, NamespaceToken, NoteSearchHit, RuntimeError, SearchHit};
 use khive_storage::EdgeRelation;
 
 use super::dispatch::{BackendSearchFailureKind, SubstrateCoordinator};
@@ -38,6 +38,129 @@ impl SubstrateCoordinatorService {
     /// The primary backend id, if any.
     pub fn primary_backend_id_inner(&self) -> Option<BackendId> {
         self.inner.primary_runtime().map(|_| BackendId::main())
+    }
+
+    async fn hydrate_search_result(
+        &self,
+        namespace: &Namespace,
+        entity_hits: Vec<SearchHit>,
+        mut note_hits: Vec<NoteSearchHit>,
+        per_backend: Vec<super::dispatch::BackendSearchResult>,
+        caller: Option<&NamespaceToken>,
+        mailbox: Option<khive_runtime::MailboxView>,
+    ) -> CoordSearchResult {
+        let partial = per_backend.iter().any(|r| r.error.is_some());
+
+        // Batch-fetch entity kind + created_at for each merged entity hit.
+        // We locate each hit's owning backend and call get_entity on it.
+        // By-ID (locate/get_entity) is namespace-agnostic (ADR-007 Rev 6), so
+        // `extra_visible` does not apply here — only the fan-out search above
+        // is namespace-filtered.
+        let mut entity_kinds: HashMap<Uuid, String> = HashMap::new();
+        let mut entity_created_at: HashMap<Uuid, i64> = HashMap::new();
+        let mut entity_updated_at: HashMap<Uuid, i64> = HashMap::new();
+        let mut entity_versions: HashMap<Uuid, i64> = HashMap::new();
+        for hit in &entity_hits {
+            if khive_storage::request_read_is_cancelled() {
+                break;
+            }
+            let backend_id = self.inner.locate(hit.entity_id, namespace).await;
+            if let Some(bid) = backend_id {
+                if let Some(entry) = self.inner.registry().get(&bid) {
+                    let rt = &entry.runtime;
+                    if let Ok(authorized) = rt.authorize(namespace.clone()) {
+                        let token = caller.cloned().unwrap_or(authorized);
+                        if let Ok(entity) = rt.get_entity(&token, hit.entity_id).await {
+                            entity_created_at.insert(hit.entity_id, entity.created_at);
+                            entity_updated_at.insert(hit.entity_id, entity.updated_at);
+                            entity_versions.insert(hit.entity_id, entity.version);
+                            entity_kinds.insert(hit.entity_id, entity.kind);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Batch-fetch note kind + name + created_at for each merged note hit.
+        let mut note_kinds: HashMap<Uuid, String> = HashMap::new();
+        let mut note_created_at: HashMap<Uuid, i64> = HashMap::new();
+        let mut note_updated_at: HashMap<Uuid, i64> = HashMap::new();
+        let mut note_versions: HashMap<Uuid, i64> = HashMap::new();
+        let mut note_names: HashMap<Uuid, Option<String>> = HashMap::new();
+        for hit in &note_hits {
+            if khive_storage::request_read_is_cancelled() {
+                break;
+            }
+            let backend_id = self.inner.locate(hit.note_id, namespace).await;
+            if let Some(bid) = backend_id {
+                if let Some(entry) = self.inner.registry().get(&bid) {
+                    let rt = &entry.runtime;
+                    if let Ok(authorized) = rt.authorize(namespace.clone()) {
+                        let token = caller.cloned().unwrap_or(authorized);
+                        if let Ok(store) = rt.notes(&token) {
+                            if let Ok(Some(note)) = store.get_note(hit.note_id).await {
+                                if let Some(view) = mailbox.as_ref() {
+                                    if !view.permits_message_note(&token, &note) {
+                                        continue;
+                                    }
+                                }
+                                note_versions.insert(hit.note_id, note.version);
+                                note_created_at.insert(hit.note_id, note.created_at);
+                                note_updated_at.insert(hit.note_id, note.updated_at);
+                                note_names.insert(hit.note_id, note.name.clone());
+                                note_kinds.insert(hit.note_id, note.kind);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if mailbox.is_some() {
+            note_hits.retain(|hit| note_versions.contains_key(&hit.note_id));
+        }
+        let coord_per_backend: Vec<CoordBackendResult> = per_backend
+            .into_iter()
+            .map(|r| {
+                let vector_selected = self
+                    .inner
+                    .registry()
+                    .get(&r.backend_id)
+                    .is_some_and(|entry| entry.runtime.vector_arm_selected());
+                CoordBackendResult {
+                    backend_id: r.backend_id,
+                    entity_hits: r.hits,
+                    note_hits: r.note_hits,
+                    vector_selected,
+                    error: r.error.map(|failure| CoordBackendFailure {
+                        kind: match failure.kind {
+                            BackendSearchFailureKind::BackendError => {
+                                CoordBackendFailureKind::BackendError
+                            }
+                            BackendSearchFailureKind::Timeout => CoordBackendFailureKind::Timeout,
+                        },
+                        message: failure.message,
+                    }),
+                    vector_error: r.vector_error,
+                }
+            })
+            .collect();
+
+        CoordSearchResult {
+            entity_hits,
+            note_hits,
+            per_backend: coord_per_backend,
+            partial,
+            entity_kinds,
+            note_kinds,
+            entity_created_at,
+            entity_updated_at,
+            entity_versions,
+            note_created_at,
+            note_updated_at,
+            note_versions,
+            note_names,
+        }
     }
 }
 
@@ -116,108 +239,44 @@ impl CoordinatorService for SubstrateCoordinatorService {
             .fan_out_search_with_visibility(request, namespace, extra_visible)
             .await;
 
-        let partial = per_backend.iter().any(|r| r.error.is_some());
+        self.hydrate_search_result(namespace, entity_hits, note_hits, per_backend, None, None)
+            .await
+    }
 
-        // Batch-fetch entity kind + created_at for each merged entity hit.
-        // We locate each hit's owning backend and call get_entity on it.
-        // By-ID (locate/get_entity) is namespace-agnostic (ADR-007 Rev 6), so
-        // `extra_visible` does not apply here — only the fan-out search above
-        // is namespace-filtered.
-        let mut entity_kinds: HashMap<Uuid, String> = HashMap::new();
-        let mut entity_created_at: HashMap<Uuid, i64> = HashMap::new();
-        let mut entity_updated_at: HashMap<Uuid, i64> = HashMap::new();
-        let mut entity_versions: HashMap<Uuid, i64> = HashMap::new();
-        for hit in &entity_hits {
-            if khive_storage::request_read_is_cancelled() {
-                break;
-            }
-            let backend_id = self.inner.locate(hit.entity_id, namespace).await;
-            if let Some(bid) = backend_id {
-                if let Some(entry) = self.inner.registry().get(&bid) {
-                    let rt = &entry.runtime;
-                    if let Ok(token) = rt.authorize(namespace.clone()) {
-                        if let Ok(entity) = rt.get_entity(&token, hit.entity_id).await {
-                            entity_created_at.insert(hit.entity_id, entity.created_at);
-                            entity_updated_at.insert(hit.entity_id, entity.updated_at);
-                            entity_versions.insert(hit.entity_id, entity.version);
-                            entity_kinds.insert(hit.entity_id, entity.kind);
-                        }
-                    }
-                }
-            }
+    async fn fan_out_search_scoped(
+        &self,
+        request: &ValidatedSearchRequest,
+        token: &NamespaceToken,
+        args: &serde_json::Value,
+        extra_visible: &[Namespace],
+    ) -> Result<CoordSearchResult, RuntimeError> {
+        if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Entity {
+            return Ok(self
+                .fan_out_search(request, token.gate_namespace(), extra_visible)
+                .await);
         }
-
-        // Batch-fetch note kind + name + created_at for each merged note hit.
-        let mut note_kinds: HashMap<Uuid, String> = HashMap::new();
-        let mut note_created_at: HashMap<Uuid, i64> = HashMap::new();
-        let mut note_updated_at: HashMap<Uuid, i64> = HashMap::new();
-        let mut note_versions: HashMap<Uuid, i64> = HashMap::new();
-        let mut note_names: HashMap<Uuid, Option<String>> = HashMap::new();
-        for hit in &note_hits {
-            if khive_storage::request_read_is_cancelled() {
-                break;
-            }
-            let backend_id = self.inner.locate(hit.note_id, namespace).await;
-            if let Some(bid) = backend_id {
-                if let Some(entry) = self.inner.registry().get(&bid) {
-                    let rt = &entry.runtime;
-                    if let Ok(token) = rt.authorize(namespace.clone()) {
-                        if let Ok(store) = rt.notes(&token) {
-                            if let Ok(Some(note)) = store.get_note(hit.note_id).await {
-                                note_versions.insert(hit.note_id, note.version);
-                                note_created_at.insert(hit.note_id, note.created_at);
-                                note_updated_at.insert(hit.note_id, note.updated_at);
-                                note_names.insert(hit.note_id, note.name.clone());
-                                note_kinds.insert(hit.note_id, note.kind);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let coord_per_backend: Vec<CoordBackendResult> = per_backend
-            .into_iter()
-            .map(|r| {
-                let vector_selected = self
-                    .inner
-                    .registry()
-                    .get(&r.backend_id)
-                    .is_some_and(|entry| entry.runtime.vector_arm_selected());
-                CoordBackendResult {
-                    backend_id: r.backend_id,
-                    entity_hits: r.hits,
-                    note_hits: r.note_hits,
-                    vector_selected,
-                    error: r.error.map(|failure| CoordBackendFailure {
-                        kind: match failure.kind {
-                            BackendSearchFailureKind::BackendError => {
-                                CoordBackendFailureKind::BackendError
-                            }
-                            BackendSearchFailureKind::Timeout => CoordBackendFailureKind::Timeout,
-                        },
-                        message: failure.message,
-                    }),
-                    vector_error: r.vector_error,
-                }
-            })
-            .collect();
-
-        CoordSearchResult {
-            entity_hits,
-            note_hits,
-            per_backend: coord_per_backend,
-            partial,
-            entity_kinds,
-            note_kinds,
-            entity_created_at,
-            entity_updated_at,
-            entity_versions,
-            note_created_at,
-            note_updated_at,
-            note_versions,
-            note_names,
-        }
+        let mailbox = if request.substrate() == khive_pack_kg::handlers::SearchSubstrate::Note {
+            self.inner
+                .primary_runtime()
+                .map(|runtime| runtime.authorize_mailbox_view(token, "search", None, args))
+                .transpose()?
+        } else {
+            None
+        };
+        let (entity_hits, note_hits, per_backend) = self
+            .inner
+            .fan_out_search_with_token(request, token, args, extra_visible)
+            .await;
+        Ok(self
+            .hydrate_search_result(
+                token.namespace(),
+                entity_hits,
+                note_hits,
+                per_backend,
+                Some(token),
+                mailbox,
+            )
+            .await)
     }
 
     fn is_single_backend(&self) -> bool {

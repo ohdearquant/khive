@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
-    micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
-    NamespaceToken, RuntimeError, VerbRegistry, RUNTIME_STAMPED_ACTOR_KINDS,
+    micros_to_iso, split_stamped_label, DispatchHook, EventAttribution, EventView, KhiveRuntime,
+    Namespace, NamespaceToken, RuntimeError, VerbRegistry,
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
@@ -955,25 +955,8 @@ impl BrainPack {
         }
     }
 
-    fn caller_actor_label(token: &NamespaceToken) -> String {
-        let actor = token.actor();
-        if actor.kind == "actor" {
-            actor.id.clone()
-        } else {
-            format!("{}:{}", actor.kind, actor.id)
-        }
-    }
-
-    fn split_stamped_actor_label(label: &str) -> Option<(&str, &str)> {
-        label
-            .split_once(':')
-            .filter(|(kind, _)| RUNTIME_STAMPED_ACTOR_KINDS.contains(kind))
-    }
-
     fn check_read_actor(token: &NamespaceToken, actor: &str) -> Result<(), RuntimeError> {
-        if actor != Self::caller_actor_label(token)
-            && !token.visible_namespace_strs().contains(&actor)
-        {
+        if actor != token.actor().label() && !token.visible_namespace_strs().contains(&actor) {
             return Err(RuntimeError::InvalidInput(format!(
                 "actor {actor:?} is not visible to this caller"
             )));
@@ -1028,9 +1011,9 @@ impl BrainPack {
                 token.actor().id
             )));
         }
-        let caller = Self::caller_actor_label(token);
+        let caller = token.actor().label();
         if let Some(actor) = p.actor.as_deref() {
-            let (identity, is_self) = match Self::split_stamped_actor_label(actor) {
+            let (identity, is_self) = match split_stamped_label(actor) {
                 Some((kind, id)) => (
                     if kind == "actor" { id } else { actor },
                     token.actor().kind == kind && token.actor().id == id,
@@ -1070,12 +1053,10 @@ impl BrainPack {
         // A prefixed id has no bare alias: that spelling belongs to another
         // principal's canonical events. Only default scope coalesces actor keys.
         let actor_filters: Vec<String> = match p.actor.as_deref() {
-            Some(a) if Self::split_stamped_actor_label(a).is_some() => vec![a.to_string()],
+            Some(a) if split_stamped_label(a).is_some() => vec![a.to_string()],
             Some(a) => vec![a.to_string(), format!("actor:{a}")],
             None if all_actors => Vec::new(),
-            None if token.actor().kind == "actor"
-                && Self::split_stamped_actor_label(&caller).is_some() =>
-            {
+            None if token.actor().kind == "actor" && split_stamped_label(&caller).is_some() => {
                 vec![format!("actor:{caller}")]
             }
             None if token.actor().kind == "actor" => {
@@ -1397,7 +1378,7 @@ impl BrainPack {
         let p: ResolveParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        let caller = Self::caller_actor_label(token);
+        let caller = token.actor().label();
         // Anonymous omission must retain the serve path's wildcard-only resolution.
         let actor = match p.actor.as_deref() {
             Some(a) => {
@@ -2108,7 +2089,6 @@ impl BrainPack {
                     "serve_attribution": serve_attribution,
                 }));
             };
-            khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
 
             // lattice-router: build the context vector from the now-published live
             // state and forward through the fann network. This is a best-effort
@@ -2228,10 +2208,7 @@ impl BrainPack {
                         "serve_attribution": serve_attribution,
                     }));
                 }
-                crate::fold_gate::GateAndAppendOutcome::Applied(result) => {
-                    khive_storage::usage::count(khive_storage::usage::UsageUnit::EventRows, 1);
-                    result.event
-                }
+                crate::fold_gate::GateAndAppendOutcome::Applied(result) => result.event,
             }
         };
 
@@ -2812,7 +2789,7 @@ impl BrainPack {
         let p: BindingsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        let caller = Self::caller_actor_label(token);
+        let caller = token.actor().label();
         let actor = p.actor.as_deref().unwrap_or(&caller);
         Self::check_read_actor(token, actor)?;
 
@@ -3066,8 +3043,9 @@ impl BrainPack {
             }
         }
 
-        self.runtime
-            .create_entity(
+        let (_, embedding_report) = self
+            .runtime
+            .create_entity_with_embedding_report(
                 token,
                 "artifact",
                 Some("adapter"),
@@ -3078,12 +3056,17 @@ impl BrainPack {
             )
             .await?;
 
-        Ok(json!({
+        let mut response = json!({
             "registered": true,
             "adapter_id": p.adapter_id,
             "content_hash": p.content_hash,
             "base_model_revision": p.base_model_revision,
-        }))
+        });
+        if embedding_report.any_truncated() {
+            response["warnings"] =
+                json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]);
+        }
+        Ok(response)
     }
 }
 

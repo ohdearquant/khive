@@ -1,6 +1,5 @@
 //! Shared SQL helpers and row-to-type converters for knowledge handlers.
 
-use chrono::Utc;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -93,13 +92,10 @@ pub(super) fn validate_atom_content(content: &str) -> Result<(), RuntimeError> {
 // ─── error helpers ───────────────────────────────────────────────────────────
 
 pub(super) fn sql_err(ctx: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::Internal(format!("{ctx}: {e}"))
+    RuntimeError::internal_with_context(ctx, e)
 }
 
-pub(super) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+pub(super) use khive_runtime::deser_params as deser;
 
 // ─── token estimation ────────────────────────────────────────────────────────
 
@@ -118,9 +114,7 @@ pub(super) fn estimate_compose_item_tokens(title: &str, content: &str) -> usize 
 
 // ─── SQL helpers ─────────────────────────────────────────────────────────────
 
-pub(super) fn now_us() -> i64 {
-    Utc::now().timestamp_micros()
-}
+pub(super) use khive_storage::now_micros as now_us;
 
 pub(super) fn new_id() -> String {
     Uuid::new_v4().to_string()
@@ -311,14 +305,19 @@ pub(super) fn status_multiplier(status: Option<&str>) -> f32 {
 // ─── embed text helper ────────────────────────────────────────────────────────
 
 pub(super) fn atom_embed_text(atom: &Atom) -> String {
+    atom_embed_text_fields(&atom.name, &atom.content, &atom.tags)
+}
+
+/// Render search fallbacks from the same stored fields as index-time atoms.
+pub(super) fn atom_embed_text_fields(name: &str, content: &str, tags: &str) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(3);
-    if !atom.name.is_empty() {
-        parts.push(atom.name.clone());
+    if !name.is_empty() {
+        parts.push(name.to_owned());
     }
-    if !atom.content.is_empty() {
-        parts.push(atom.content.clone());
+    if !content.is_empty() {
+        parts.push(content.to_owned());
     }
-    if let Ok(tags) = serde_json::from_str::<Vec<String>>(&atom.tags) {
+    if let Ok(tags) = serde_json::from_str::<Vec<String>>(tags) {
         let meaningful: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
         if !meaningful.is_empty() {
             parts.push(format!("Tags: {}", meaningful.join(", ")));
@@ -340,11 +339,16 @@ pub(super) async fn resolve_atom_id(
         .await
         .map_err(|e| sql_err("resolve_atom_id reader", e))?;
     let id = id_or_slug.trim().to_string();
-    let row = if id.parse::<Uuid>().is_ok() {
+    let row = if let Ok(uuid) = id.parse::<Uuid>() {
+        // Atom ids are stored as lowercase hyphenated text, so bind the parsed
+        // value's canonical form, not the spelling the caller used.
         reader
             .query_row(SqlStatement {
                 sql: "SELECT id FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
-                params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
+                params: vec![
+                    SqlValue::Text(uuid.as_hyphenated().to_string()),
+                    SqlValue::Text(ns.to_owned()),
+                ],
                 label: None,
             })
             .await
@@ -421,4 +425,19 @@ pub(super) async fn compute_embedding_coverage(
     };
 
     Ok(atoms_with_vector as f64 / total_atoms as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knowledge_sql_err_message_is_context_and_error() {
+        match sql_err("insert atom", "boom") {
+            RuntimeError::Internal(message) => {
+                assert_eq!(message, "insert atom: boom");
+            }
+            other => panic!("expected RuntimeError::Internal, got {other:?}"),
+        }
+    }
 }

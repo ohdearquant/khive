@@ -74,23 +74,30 @@ impl MemoryPack {
         let sql = self.runtime.sql();
         let mut reader = sql.reader().await?;
 
-        // Build candidate query: kind='memory', not deleted, in namespace.
-        // We'll apply Rust-side salience, effective-salience, and expires_at
-        // filters below. For large datasets a dedicated SQL WHERE is better,
-        // but the note set is bounded by namespace and kind, so row-level
-        // filtering is safe.
+        // Effective selection needs age, decay and memory_type properties.
+        // Raw/expiry selection keeps the same rows and Rust predicates while
+        // avoiding those unused values. Namespace/kind do not bound row count.
+        let projection = if p.min_effective_salience.is_some() {
+            "id, salience, decay_factor, created_at, expires_at, properties"
+        } else {
+            "id, salience, expires_at"
+        };
         let rows = reader
             .query_all(SqlStatement {
-                sql: "SELECT id, salience, decay_factor, created_at, expires_at, properties \
-                      FROM notes \
-                      WHERE kind = 'memory' \
-                        AND namespace = ? \
-                        AND deleted_at IS NULL"
-                    .to_string(),
+                sql: format!(
+                    "SELECT {projection} \
+                     FROM notes \
+                     WHERE kind = 'memory' \
+                       AND namespace = ? \
+                       AND deleted_at IS NULL"
+                ),
                 params: vec![SqlValue::Text(namespace.clone())],
                 label: Some("memory.prune.candidates".to_string()),
             })
             .await?;
+
+        #[cfg(test)]
+        observe_prune_selection(&rows);
 
         let mut to_delete: Vec<uuid::Uuid> = Vec::new();
 
@@ -259,6 +266,56 @@ impl MemoryPack {
         Ok(json!({ "ok": true }))
     }
 }
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct PruneSelectionWork {
+    queries: usize,
+    rows: usize,
+    columns: usize,
+    owned_text_bytes: usize,
+    owned_blob_bytes: usize,
+    properties_bytes: usize,
+    column_names: std::collections::BTreeSet<String>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PRUNE_SELECTION_WORK: std::cell::RefCell<PruneSelectionWork>;
+}
+
+#[cfg(test)]
+fn observe_prune_selection(rows: &[khive_storage::types::SqlRow]) {
+    let _ = PRUNE_SELECTION_WORK.try_with(|work| {
+        let mut work = work.borrow_mut();
+        work.queries += 1;
+        work.rows += rows.len();
+        for row in rows {
+            work.columns += row.columns.len();
+            for column in &row.columns {
+                work.column_names.insert(column.name.clone());
+                let bytes = match &column.value {
+                    SqlValue::Text(value) => {
+                        work.owned_text_bytes += value.len();
+                        value.len()
+                    }
+                    SqlValue::Blob(value) => {
+                        work.owned_blob_bytes += value.len();
+                        value.len()
+                    }
+                    _ => 0,
+                };
+                if column.name == "properties" {
+                    work.properties_bytes += bytes;
+                }
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+#[path = "prune_materialization_tests.rs"]
+mod prune_materialization_tests;
 
 // ── #533: memory.prune must not surface stale rows via any recall retrieval
 // path (FTS lexical, sqlite-vec/ANN vector, or the default hybrid fusion) ────
@@ -475,8 +532,8 @@ mod prune_recall_visibility_tests {
 
     /// #533 follow-up: `RecallConfig::default()` fuses via `FusionStrategy::Rrf
     /// { k: 10 }` (`config.rs`) — the shipped default is reached by omitting
-    /// `fusion_strategy` from the recall params entirely (an explicit `"rrf"`
-    /// string selects k=60). This test exercises that exact omitted-param path: seed a
+    /// `fusion_strategy` from the recall params entirely. This test exercises that exact
+    /// omitted-param path: seed a
     /// low-salience note, confirm it is recallable pre-prune via the FTS, vector, and
     /// default (fusion_strategy omitted) legs — proving each leg actually sees the
     /// note, not just vacuously agreeing on absence — then prune and confirm all

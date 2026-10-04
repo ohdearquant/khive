@@ -538,7 +538,7 @@ fn compile_fixed_length(
                     ));
                     // Enforce the ADR-041 role/substrate matrix.
                     where_parts.push(format!(
-                        "(({e_alias}.role IN ('candidate', 'selected') AND {e_alias}.referent_kind = 'note') \
+                        "(({e_alias}.role IN ('candidate', 'selected') AND {e_alias}.referent_kind IN ('entity', 'note')) \
                           OR ({e_alias}.role = 'target' AND {e_alias}.referent_kind IN ('entity', 'note')) \
                           OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind IN ('entity', 'note')))"
                     ));
@@ -784,17 +784,6 @@ fn bind_condition_value(
     Ok(params.len())
 }
 
-fn escape_like_literal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if matches!(ch, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(ch);
-    }
-    escaped
-}
-
 fn compile_condition_predicate(
     col_expr: &str,
     cond: &Condition,
@@ -807,7 +796,7 @@ fn compile_condition_predicate(
                     "CONTAINS and STARTS WITH require a string literal".into(),
                 ));
             };
-            let escaped = escape_like_literal(value);
+            let escaped = khive_types::escape_like_literal(value);
             let pattern = if cond.op == CompareOp::Contains {
                 format!("%{escaped}%")
             } else {
@@ -2831,17 +2820,17 @@ mod tests {
         );
     }
 
-    /// `observed_as_selected` remains note-only.
+    /// Search observations may select entities; recall and rerank still emit note referents.
     #[test]
-    fn synthetic_edge_observed_as_selected_still_compiles_note_referents() {
-        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:memory) RETURN m.id LIMIT 10")
+    fn synthetic_edge_candidate_and_selected_admit_entity_and_note_referents() {
+        let q = gql::parse("MATCH (ev)-[:observed_as_selected]->(m:entity) RETURN m.id LIMIT 10")
             .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
-            compiled
-                .sql
-                .contains("e0.role IN ('candidate', 'selected') AND e0.referent_kind = 'note'"),
-            "selected/candidate roles must still be guarded to note referents only; sql: {}",
+            compiled.sql.contains(
+                "e0.role IN ('candidate', 'selected') AND e0.referent_kind IN ('entity', 'note')"
+            ),
+            "selected/candidate roles must follow the stored entity/note referent kind; sql: {}",
             compiled.sql
         );
     }

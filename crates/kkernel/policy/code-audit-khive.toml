@@ -32,6 +32,7 @@ denied_pairs = []
 
 [crate_ranks]
 khive-channel = 0
+khive-fs = 0
 khive-quant = 0
 khive-text = 0
 khive-types = 0
@@ -52,27 +53,27 @@ khive-storage = 2
 khive-db = 3
 khive-hnsw = 3
 khive-retrieval = 4
-khive-runtime = 4
-khive-brain-core = 5
-khive-merge = 5
-khive-pack-blob = 5
-khive-pack-code = 5
-khive-pack-comm = 5
-khive-pack-formal = 5
-khive-pack-git = 5
-khive-pack-gtd = 5
-khive-pack-kg = 5
-khive-pack-moodboard = 5
-khive-pack-schedule = 5
-khive-pack-session = 5
-khive-pack-template = 5
-khive-pack-workspace = 5
-khive-vcs = 5
-khive-pack-brain = 6
-khive-pack-knowledge = 6
-khive-pack-memory = 6
-khive-mcp = 7
-kkernel = 8
+khive-runtime = 5
+khive-brain-core = 6
+khive-merge = 6
+khive-pack-blob = 6
+khive-pack-code = 6
+khive-pack-comm = 6
+khive-pack-formal = 6
+khive-pack-git = 6
+khive-pack-gtd = 6
+khive-pack-kg = 6
+khive-pack-moodboard = 6
+khive-pack-schedule = 6
+khive-pack-session = 6
+khive-pack-template = 6
+khive-pack-workspace = 6
+khive-vcs = 7
+khive-pack-brain = 7
+khive-pack-knowledge = 7
+khive-pack-memory = 7
+khive-mcp = 8
+kkernel = 9
 
 # Non-crate projects the workspace also ships and `code.ingest` resolves. The
 # npm distribution graph is a real DAG evaluated in isolation: the six
