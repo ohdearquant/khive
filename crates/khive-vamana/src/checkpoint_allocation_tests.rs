@@ -329,6 +329,58 @@ fn inverse_validation_preserves_missing_and_balanced_phantom_diagnostics() {
 }
 
 #[test]
+fn inverse_validation_accepts_unsorted_medoid_and_rejects_medoid_phantom() {
+    let mut graph = VamanaGraph::new(6, 0).unwrap();
+    *graph.adjacency_mut_for_load() = vec![vec![5, 2], vec![3], vec![0], vec![0], vec![1], vec![4]];
+    let mut reverse_adj = vec![vec![]; 6];
+    for (parent, neighbors) in graph.adjacency().iter().enumerate() {
+        for &target in neighbors {
+            reverse_adj[target as usize].push(parent as u32);
+        }
+    }
+    let graph = parse_graph(&encode_graph_lossless(&graph).unwrap(), 5, 6).unwrap();
+    let mut lifecycle =
+        parse_lifecycle(&encode_lifecycle(&[0], &[], &reverse_adj, 0), 6, 5).unwrap();
+    assert_eq!(graph.adjacency()[0], [5, 2]);
+    assert_eq!(
+        validate_v2_structural(&graph, &lifecycle, 6).unwrap(),
+        0,
+        "a parsed valid inverse accepts a distance-ordered medoid list"
+    );
+
+    // Node 3 has one real parent (1), so the replacement keeps its cardinality.
+    // Medoid 0 does not point to 3: only medoid membership rejects this phantom.
+    lifecycle.reverse_adj[3] = vec![0];
+    let lifecycle = parse_lifecycle(
+        &encode_lifecycle(&[0], &[], &lifecycle.reverse_adj, 0),
+        6,
+        5,
+    )
+    .unwrap();
+    let error = validate_v2_structural(&graph, &lifecycle, 6)
+        .expect_err("a balanced phantom whose parent is the medoid must be refused");
+    assert!(
+        matches!(&error, VamanaError::InvalidFormat { reason }
+            if Some(reason.clone()) == legacy_inverse_error(&graph, &lifecycle)),
+        "medoid phantom retains the first-vertex inverse diagnostic: {error}"
+    );
+}
+
+#[test]
+fn real_v2_load_preserves_unsorted_medoid_adjacency() {
+    let (dir, mut index, _) = dense_checkpoint();
+    let medoid = index.graph.medoid() as usize;
+    index.graph.adjacency_mut_for_load()[medoid].reverse();
+    let stored = index.graph.adjacency()[medoid].clone();
+    assert!(stored.windows(2).all(|pair| pair[0] > pair[1]));
+    index.save_atomic(dir.path()).unwrap();
+    let loaded = VamanaIndex::load(dir.path())
+        .expect("real checkpoint load accepts an unsorted medoid forward list");
+    assert_eq!(loaded.graph.adjacency()[medoid], stored);
+    assert_eq!(loaded.to_bytes(&[]).unwrap(), index.to_bytes(&[]).unwrap());
+}
+
+#[test]
 fn mapped_empty_and_missing_segments_retain_hash_and_format_semantics() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("graph.bin");

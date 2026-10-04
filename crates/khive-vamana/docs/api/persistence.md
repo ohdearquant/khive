@@ -158,8 +158,9 @@ is the entry point that decides whether to fall back to a rebuild; `VamanaIndex:
 surfaces the error directly to callers that don't hold a corpus to rebuild from.
 
 File-backed v2 reads hash `vectors.bin` through a fixed 64 KiB buffer. Graph and
-lifecycle checksum reads and parsing use temporary read-only mappings; the
-save-time sequence guard also maps the codes segment. Empty temporary segments
+lifecycle checksum reads and parsing use temporary read-only mappings; v1 graph
+loads use the same mapped reader, and the save-time sequence guard also maps the
+codes segment. Empty temporary segments
 reach the same checksum and format checks as empty byte buffers. Temporary views
 close before a recovery rebuild publishes replacements. Segment files must not
 be modified or truncated outside the publication-lock protocol, as already
@@ -169,7 +170,12 @@ A checksum-valid empty `codes.bin` maps as an empty slice and reaches the codes
 parser, which returns `InvalidFormat`. Strict `load` refuses it;
 `load_or_build` rebuilds it from the corpus, and the sequence guard treats the
 malformed incumbent as repairable. Ordinary file or mapping I/O errors retain
-their existing error path.
+their existing error path. After a mapping succeeds, a page read fault is
+outside the Rust `Result` path: on Linux, filesystem or device I/O failure can
+raise `SIGBUS` during hashing or parsing and terminate the process. Load-time
+codes mappings already had this exposure; mapped graph and lifecycle reads,
+including v1 graph loads, and the sequence guard's codes read now share it. There
+is no signal recovery in these paths.
 
 The parsed graph and lifecycle retain their owned adjacency lists. Structural
 validation checks the inverse through per-node incoming counts and membership in
@@ -211,7 +217,9 @@ happens in the validation step rather than in `restore_reverse_adj` itself.
 
 ## Safety note (mmap)
 
-The single `unsafe` block in `mmap_vectors` maps `vectors.bin` read-only.
+Read-only mappings cover retained vector and code segments and temporary graph,
+lifecycle and sequence-guard code segments. Each unsafe mapping requires the
+publication protocol to preserve the mapped inode and bytes during access.
 The contract: callers must not mutate or truncate the file while the index
 is live. Legacy `save` writes fresh temporary inodes and renames them over
 canonical names, so an existing reader's mapped inode is not truncated.
