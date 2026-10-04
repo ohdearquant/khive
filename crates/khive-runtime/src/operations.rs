@@ -1265,11 +1265,7 @@ pub(crate) fn canonical_edge_endpoints(
     source_id: Uuid,
     target_id: Uuid,
 ) -> (Uuid, Uuid) {
-    if relation.is_symmetric() && target_id < source_id {
-        (target_id, source_id)
-    } else {
-        (source_id, target_id)
-    }
+    relation.canonical_endpoints(source_id, target_id)
 }
 
 /// Keep endpoint substrates paired with their IDs when a symmetric link swaps direction.
