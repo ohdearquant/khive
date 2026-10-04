@@ -19,6 +19,7 @@
 pub mod adapters;
 pub mod error;
 pub mod eval;
+pub mod hit;
 pub mod hybrid;
 pub mod metrics;
 #[cfg(feature = "persist")]
@@ -38,6 +39,7 @@ pub use adapters::{StorageKeywordSearch, StorageVectorSearch};
 
 // Re-export core types
 pub use error::{ErrorKind, Result, RetrievalError};
+pub use hit::{HybridSearchOutcome, RankScoreKind, SearchHit, SearchSignals, SearchSource};
 
 #[cfg(feature = "bm25")]
 pub use khive_bm25::{Bm25Config, Bm25Index, Bm25Stats, DocumentId, SearchContext};

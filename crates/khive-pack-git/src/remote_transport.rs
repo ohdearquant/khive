@@ -12,6 +12,8 @@ use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::process::Command;
 use zeroize::Zeroizing;
 
+use crate::git_env;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteError {
     Refused,
@@ -62,19 +64,8 @@ pub struct GhTransport {
 
 fn isolated(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    command.env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
+    git_env::apply_shared_env(command.as_std_mut());
     command
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -82,23 +73,20 @@ fn isolated(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// Settings only the remote transport carries, passed after `git_env::SHARED_SETTINGS`.
+const TRANSPORT_SETTINGS: &[&str] = &[
+    "protocol.https.allow=always",
+    "http.sslVerify=true",
+    "http.followRedirects=false",
+    "http.extraHeader=",
+    "push.followTags=false",
+    "push.recurseSubmodules=no",
+];
+
 fn git_command(program: &Path, repo: &Path, token: Option<&str>) -> Command {
     let mut command = isolated(program.as_os_str());
-    for setting in [
-        "core.hooksPath=/dev/null",
-        "core.fsmonitor=false",
-        "commit.gpgsign=false",
-        "credential.helper=",
-        "core.sshCommand=/usr/bin/false",
-        "protocol.allow=never",
-        "protocol.https.allow=always",
-        "http.sslVerify=true",
-        "http.followRedirects=false",
-        "http.extraHeader=",
-        "push.followTags=false",
-        "push.recurseSubmodules=no",
-    ] {
-        command.args(["-c", setting]);
+    for setting in git_env::SHARED_SETTINGS.iter().chain(TRANSPORT_SETTINGS) {
+        command.arg("-c").arg(setting);
     }
     if let Some(token) = token {
         let clear = Zeroizing::new(format!("x-access-token:{token}"));
@@ -585,5 +573,58 @@ mod tests {
             ),
             Err(RemoteError::InvalidResponse)
         );
+    }
+
+    #[test]
+    fn git_and_gh_commands_keep_their_argv_and_environment() {
+        // The environment carries PATH, which other cases rewrite while holding this guard.
+        let _guard = crate::cache::ENV_MUTEX.blocking_lock();
+        let git = git_command(Path::new("git"), Path::new("/fixture/repo"), None);
+        let (args, envs) = git_env::describe(git.as_std());
+        assert_eq!(git.as_std().get_program(), "git");
+        let settings = [
+            "core.hooksPath=/dev/null",
+            "core.fsmonitor=false",
+            "commit.gpgsign=false",
+            "credential.helper=",
+            "core.sshCommand=/usr/bin/false",
+            "protocol.allow=never",
+            "protocol.https.allow=always",
+            "http.sslVerify=true",
+            "http.followRedirects=false",
+            "http.extraHeader=",
+            "push.followTags=false",
+            "push.recurseSubmodules=no",
+        ];
+        let mut expected_args = Vec::new();
+        for setting in settings {
+            expected_args.extend(["-c", setting]);
+        }
+        expected_args.extend(["-C", "/fixture/repo"]);
+        assert_eq!(args, expected_args);
+        let mut expected_envs = std::collections::BTreeMap::new();
+        for (key, value) in [
+            ("GIT_ATTR_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("LC_ALL", "C"),
+        ] {
+            expected_envs.insert(key.to_owned(), Some(value.to_owned()));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            let path = path.to_string_lossy().into_owned();
+            expected_envs.insert("PATH".to_owned(), Some(path));
+        }
+        assert_eq!(envs, expected_envs);
+
+        let gh = isolated("gh");
+        let (gh_args, gh_envs) = git_env::describe(gh.as_std());
+        assert_eq!(gh.as_std().get_program(), "gh");
+        assert!(gh_args.is_empty());
+        assert_eq!(gh_envs, expected_envs);
     }
 }

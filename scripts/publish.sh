@@ -57,6 +57,7 @@ CRATES=(
     khive-text          # khive-bm25 depends on it (normal dep); the old dev-dep cycle is gone
     khive-bm25
     khive-fusion
+    khive-fs             # no khive-* dependencies; dep of khive-db, so publish first
     khive-db
     khive-hnsw
     khive-query
@@ -64,8 +65,8 @@ CRATES=(
     khive-gate-rego
     khive-channel          # no khive-* deps; transport abstraction; dep of khive-runtime
     khive-request        # needs khive-types only; versioned dev-dep of khive-runtime, so publish first
+    khive-retrieval      # needs khive-fusion/score/types (all above); dep of khive-runtime, so publish first
     khive-runtime
-    khive-retrieval
     khive-vcs-adapters
     khive-changeset      # needs khive-types (above)
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)

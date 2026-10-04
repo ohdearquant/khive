@@ -14,6 +14,7 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 | `src/adapters/`        | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
 | `src/error.rs`         | `RetrievalError` enum and `Result` alias                                      |
 | `src/eval/`            | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
+| `src/hit.rs`           | Search result types: `SearchHit`, `SearchSource`, `HybridSearchOutcome`       |
 | `src/hybrid/`          | `HybridSearcher`, `DualIndexRouter`, `HybridConfig`, `Query`                  |
 | `src/metrics/`         | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
 | `src/persist/`         | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |

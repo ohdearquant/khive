@@ -1231,6 +1231,7 @@ dependencies = [
  "crossbeam-queue",
  "fs4",
  "futures",
+ "khive-fs",
  "khive-score",
  "khive-storage",
  "khive-types",
@@ -1262,6 +1263,13 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "khive-fs"
+version = "0.9.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -1308,6 +1316,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "khive-retrieval"
+version = "0.9.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "khive-fusion",
+ "khive-score",
+ "khive-types",
+ "lattice-embed",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "khive-runtime"
 version = "0.9.0"
 dependencies = [
@@ -1323,6 +1350,7 @@ dependencies = [
  "khive-fusion",
  "khive-gate",
  "khive-query",
+ "khive-retrieval",
  "khive-score",
  "khive-storage",
  "khive-types",

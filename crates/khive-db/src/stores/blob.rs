@@ -23,6 +23,8 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 
+#[cfg(unix)]
+use khive_fs::fd_relative::{clear_errno, current_errno};
 use khive_storage::blob::{
     BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, UploadId,
     MAX_BLOB_WHOLE_BYTES,
@@ -1289,37 +1291,6 @@ fn acquire_database_gc_lock(database_path: Option<&Path>) -> StorageResult<Optio
         .map_err(|e| map_io_err(e, "database_gc_lock_open"))?;
     fs4::FileExt::lock(&lock_file).map_err(|e| map_io_err(e, "database_gc_lock_acquire"))?;
     Ok(Some(lock_file))
-}
-
-#[cfg(all(unix, target_os = "macos"))]
-fn errno_location() -> *mut libc::c_int {
-    // SAFETY: `__error` returns this thread's errno cell; obtaining the
-    // pointer has no preconditions beyond running on a thread, which every
-    // caller here does.
-    unsafe { libc::__error() }
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn errno_location() -> *mut libc::c_int {
-    // SAFETY: see the macOS arm above; `__errno_location` is the Linux/glibc
-    // equivalent thread-local errno accessor.
-    unsafe { libc::__errno_location() }
-}
-
-/// Zero `errno` on the current thread. `readdir` never clears `errno` itself
-/// on success, so this must run immediately before each call for the
-/// NULL-return ambiguity below to be resolvable afterward.
-#[cfg(unix)]
-fn clear_errno() {
-    // SAFETY: `errno_location` returns a valid, live thread-local `c_int`
-    // cell for the duration of this call.
-    unsafe { *errno_location() = 0 };
-}
-
-#[cfg(unix)]
-fn current_errno() -> libc::c_int {
-    // SAFETY: see `clear_errno`.
-    unsafe { *errno_location() }
 }
 
 /// List non-dot entry names of an open directory descriptor via `fdopendir`
