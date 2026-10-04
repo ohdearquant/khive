@@ -1212,6 +1212,12 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
         counts.subjects.insert(route.class.render(), moved);
     }
 
+    // Single-target vectors carry every source section's vector, including
+    // historical sections with a missing or differently attributed parent.
+    if let Some(target) = request.single_target() {
+        move_whole_table(conn, "knowledge_sections", source, target, &mut counts.rows)?;
+    }
+
     // Vectors are enumerated from the live store, never from a constant list: a
     // store using a model this build was never compiled against still has its
     // `vec_*` table found here.
@@ -2189,3 +2195,7 @@ fn issue2673_namespace_move_advances_entity_version_without_changing_timestamp()
 #[cfg(all(test, feature = "vectors"))]
 #[path = "namespace_move_partition_tests.rs"]
 mod partition_tests;
+
+#[cfg(all(test, feature = "vectors"))]
+#[path = "namespace_move_orphan_section_tests.rs"]
+mod orphan_section_tests;
