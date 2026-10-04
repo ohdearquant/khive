@@ -692,7 +692,7 @@ async fn settle_refresh_from_snapshot(
     if outcome.status != 304 {
         if let Some((buffer, truncated)) = outcome.body.take() {
             was_truncated = Some(truncated);
-            let store = crate::blob_store(runtime)?;
+            let store = runtime.require_blob_store()?;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             let content_ref_str = content_ref.to_string();
             response_content_ref = content_ref_str.clone();
@@ -1117,7 +1117,7 @@ mod tests {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://legacy-capture.example.test/body").unwrap();
         let prefix = b"synthetic prefix only";
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(prefix.to_vec()).await.unwrap();
         let reference = content_ref.to_string();
         let (_, id) = crate::fetch::mint_bare(&runtime, &token, &url)
@@ -1185,7 +1185,7 @@ mod tests {
         let (runtime, token, _dir) = test_runtime().await;
         let url = Url::parse("https://legacy-capture.example.test/complete").unwrap();
         let body = b"synthetic complete body";
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         let reference = content_ref.to_string();
         let (_, id) = crate::fetch::mint_bare(&runtime, &token, &url)
@@ -1406,7 +1406,7 @@ mod tests {
         .await
         .unwrap();
         let id = identity::document_id(site, &identity::path_and_query(&canonical));
-        let store = crate::blob_store(runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         crate::entities::get_or_create(
             runtime,
@@ -1558,7 +1558,7 @@ mod tests {
         let after2_props = after2.properties.unwrap();
         assert_eq!(after2_props["content_type"], "text/plain");
         let new_ref = after2_props["blob_ref"].as_str().unwrap();
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let stored = store
             .get_bounded_verified(
                 &khive_storage::ContentRef::from_hex(new_ref).unwrap(),
