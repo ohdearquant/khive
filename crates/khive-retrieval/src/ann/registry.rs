@@ -496,7 +496,13 @@ async fn compact_write_log_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::KhiveRuntime;
+    use khive_db::StorageBackend;
+
+    fn memory_backend() -> StorageBackend {
+        let backend = StorageBackend::memory().expect("memory backend");
+        backend.prepare_core_schema().expect("core schema");
+        backend
+    }
 
     async fn execute(sql: &dyn SqlAccess, sql_text: &str, params: Vec<SqlValue>) {
         sql.writer()
@@ -523,8 +529,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_pending_consumer_retires_without_weakening_active_minimum() {
-        let rt = KhiveRuntime::memory().expect("runtime");
-        let sql = rt.sql();
+        let backend = memory_backend();
+        let sql = backend.sql();
         let model = "ann-registry-expiry";
         register_pending_at(sql.as_ref(), "dormant", "local", model, 1)
             .await
@@ -591,8 +597,8 @@ mod tests {
 
     #[tokio::test]
     async fn retirement_wins_before_delayed_checkpoint_publication() {
-        let rt = KhiveRuntime::memory().expect("runtime");
-        let sql = rt.sql();
+        let backend = memory_backend();
+        let sql = backend.sql();
         let model = "ann-registry-retire-race";
         register_pending_at(sql.as_ref(), "dormant", "local", model, 1)
             .await
@@ -620,8 +626,8 @@ mod tests {
 
     #[tokio::test]
     async fn pending_row_just_inside_grace_survives_and_still_pins_the_log() {
-        let rt = KhiveRuntime::memory().expect("runtime");
-        let sql = rt.sql();
+        let backend = memory_backend();
+        let sql = backend.sql();
         let model = "ann-registry-grace-inside";
         // cutoff = now - PENDING_GRACE_US = 2; registered_at 3 is one
         // microsecond inside the grace window.
@@ -683,8 +689,8 @@ mod tests {
 
     #[tokio::test]
     async fn pending_row_at_exact_grace_boundary_retires() {
-        let rt = KhiveRuntime::memory().expect("runtime");
-        let sql = rt.sql();
+        let backend = memory_backend();
+        let sql = backend.sql();
         let model = "ann-registry-grace-boundary";
         // cutoff = now - PENDING_GRACE_US = 2; registered_at 2 sits exactly
         // on the boundary, which the <= comparator retires.
@@ -722,8 +728,8 @@ mod tests {
         // publication`; this is the raise-first ordering: an activation that
         // commits before compaction must protect the row from age
         // retirement, however far past its grace the registration is.
-        let rt = KhiveRuntime::memory().expect("runtime");
-        let sql = rt.sql();
+        let backend = memory_backend();
+        let sql = backend.sql();
         let model = "ann-registry-activate-race";
         register_pending_at(sql.as_ref(), "late-build", "local", model, 1)
             .await
@@ -765,8 +771,8 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_pending_registration_does_not_refresh_grace() {
-        let rt = KhiveRuntime::memory().expect("runtime");
-        let sql = rt.sql();
+        let backend = memory_backend();
+        let sql = backend.sql();
         let model = "ann-registry-stable-grace";
         register_pending_at(sql.as_ref(), "pending", "local", model, 11)
             .await
@@ -788,8 +794,8 @@ mod tests {
 
     #[tokio::test]
     async fn recovering_and_active_zero_consumers_never_age_retire() {
-        let rt = KhiveRuntime::memory().expect("runtime");
-        let sql = rt.sql();
+        let backend = memory_backend();
+        let sql = backend.sql();
         let model = "ann-registry-protected-states";
         register_pending_at(sql.as_ref(), "active-zero", "local", model, 1)
             .await

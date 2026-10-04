@@ -9,7 +9,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority, PENDING_WATERMARK};
+use khive_retrieval::ann::registry::{
+    self as ann_registry, CompactionScope, WatermarkAuthority, PENDING_WATERMARK,
+};
 use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{
     is_benign_shutdown_cancellation, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,

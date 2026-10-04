@@ -7,7 +7,8 @@ mod test_process;
 
 pub mod actor_identity;
 pub mod agent_lifecycle;
-pub mod ann_registry;
+#[doc(hidden)]
+pub use khive_retrieval::ann::registry as ann_registry;
 pub mod atomic_message;
 pub mod atomic_plan;
 pub mod atomic_prepare;
