@@ -943,28 +943,45 @@ impl KhiveRuntime {
         // sanitize_fts5_query strips known-unsafe FTS5 metacharacters up front, but if
         // the lexical leg still errors at runtime on residual punctuation the sanitizer
         // doesn't strip, this fails loud instead of degrading to vector-only fusion.
-        let text_search_result = self
-            .text(token)?
-            .search(TextSearchRequest {
-                query: query_text.to_string(),
-                mode: text_mode,
-                filter: Some(TextFilter {
-                    namespaces: visible_ns.clone(),
-                    // Push the entity-kind filter into the FTS query. Without it the
-                    // text arm returns the top `candidates` rows across EVERY entity
-                    // kind in the namespace and the kind is applied only afterwards,
-                    // so when one kind dominates the lexical ranking a search for a
-                    // rarer kind gets back fewer rows than exist, or none. The
-                    // `EntityFilter.kinds` check below stays as the backstop.
-                    record_kinds: entity_kind
-                        .map(|kind| vec![kind.to_string()])
-                        .unwrap_or_default(),
-                    ..TextFilter::default()
-                }),
-                top_k: candidates,
-                snippet_chars: 200,
-            })
-            .await;
+        let text_store = self.text(token)?;
+        let text_fut = text_store.search(TextSearchRequest {
+            query: query_text.to_string(),
+            mode: text_mode,
+            filter: Some(TextFilter {
+                namespaces: visible_ns.clone(),
+                // Push the entity-kind filter into the FTS query. Without it the
+                // text arm returns the top `candidates` rows across EVERY entity
+                // kind in the namespace and the kind is applied only afterwards,
+                // so when one kind dominates the lexical ranking a search for a
+                // rarer kind gets back fewer rows than exist, or none. The
+                // `EntityFilter.kinds` check below stays as the backstop.
+                record_kinds: entity_kind
+                    .map(|kind| vec![kind.to_string()])
+                    .unwrap_or_default(),
+                ..TextFilter::default()
+            }),
+            top_k: candidates,
+            snippet_chars: 200,
+        });
+        let text_fut = crate::stage_seam::text_stage(text_fut);
+        // The stages read nothing from each other, so they run together; a text error wins.
+        let vector_fut = async {
+            match vector_pool {
+                Some(pool) => Ok((pool, None)),
+                None => {
+                    self.hybrid_vector_stage(
+                        token,
+                        query_text,
+                        query_vector,
+                        candidates,
+                        vector_similarity_floor,
+                        tolerate_vector_error,
+                    )
+                    .await
+                }
+            }
+        };
+        let (text_search_result, vector_result) = tokio::join!(text_fut, vector_fut);
         // FtsPasses is counted inside the store's `search()` (khive-db
         // stores/text.rs), only once a real FTS5 statement is prepared —
         // an empty/fully-sanitized query short-circuits there before any
@@ -974,21 +991,7 @@ impl KhiveRuntime {
             "hybrid_search",
             query_text,
         )?;
-
-        let (vector_hits, vector_error) = match vector_pool {
-            Some(pool) => (pool, None),
-            None => {
-                self.hybrid_vector_stage(
-                    token,
-                    query_text,
-                    query_vector,
-                    candidates,
-                    vector_similarity_floor,
-                    tolerate_vector_error,
-                )
-                .await?
-            }
-        };
+        let (vector_hits, vector_error) = vector_result?;
 
         // Each arm fetched `candidates` independently, so their union can contain
         // twice that many distinct IDs. Keep the complete fetched pool through

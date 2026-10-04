@@ -71,6 +71,9 @@ pub mod runtime;
 pub mod secret_gate;
 pub(crate) mod secret_gate_finalizer;
 mod sql_include;
+#[cfg(test)]
+mod stage_overlap_tests;
+mod stage_seam;
 mod streams;
 pub mod telemetry_config;
 pub use streams::{
