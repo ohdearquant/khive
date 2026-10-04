@@ -589,6 +589,10 @@ impl EmbeddingService for TestAuditedService {
 }
 
 impl EmbedderEntry {
+    pub(crate) fn cached_service(&self) -> Option<Arc<dyn EmbeddingService>> {
+        self.cell.get().map(Arc::clone)
+    }
+
     pub(crate) fn has_audited_document_preparation(&self) -> bool {
         self.audited_document_preparation
     }

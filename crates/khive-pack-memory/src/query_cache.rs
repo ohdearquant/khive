@@ -1,7 +1,7 @@
 //! Bounded query-embedding LRU cache local to khive-pack-memory.
 //!
-//! Keyed by `(model_name, query_text) -> Arc<[f32]>`.  Cache hits bypass
-//! `spawn_blocking` and return in microseconds.  No invalidation is needed:
+//! Keyed by `(model_name, query_text) -> Arc<[f32]>`. Cache hits bypass
+//! embedding work. No invalidation is needed:
 //! query embedding is pure for a fixed model and text.
 
 use std::num::NonZeroUsize;
