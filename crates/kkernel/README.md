@@ -95,6 +95,12 @@ Two feature flags gate optional functionality, both pass-through to `khive-mcp`:
 `bench-embedder` (deterministic hash embedder for benchmarking, never enabled in release
 builds) and `channel-email` (SMTP/IMAP polling loop, inert without `KHIVE_EMAIL_*` env vars).
 
+The agent, telemetry and web packs are the optional features `pack-agent`, `pack-telemetry` and
+`pack-web`. All three are on by default, so a default build links the packs it always has. A build
+without one (`--no-default-features`, adding back only the packs you want) does not link that pack:
+it is absent from the pack list the server reports, and naming it in `--pack` or `KHIVE_PACKS` is
+refused as an unknown pack.
+
 ## Where this sits
 
 `kkernel` sits at the top of the storage dependency chain — it depends on every pack crate

@@ -11192,9 +11192,8 @@ mod tests {
             .split(", ")
             .collect();
 
-        // `web` is linked into every build of this binary and contributes no
-        // verb under this selection. Naming it as loaded is the whole defect.
-        assert!(selectable.contains(&"web"), "selectable was {selectable:?}");
+        // `web` is linked only with `pack-web`; naming it as loaded is the whole defect.
+        assert_eq!(selectable.contains(&"web"), cfg!(feature = "pack-web"));
         assert!(!loaded.contains(&"web"));
         // The two sets partition the linked inventory: nothing is in both.
         for pack in &loaded {
@@ -11218,6 +11217,7 @@ mod tests {
         assert_eq!(names, vec!["assign", "list", "search"]);
     }
 
+    #[cfg(feature = "pack-telemetry")]
     #[tokio::test]
     #[serial(config_ledger)]
     async fn telemetry_inventory_dispatch_preserves_configured_carriers() {

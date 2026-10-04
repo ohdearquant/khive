@@ -42,10 +42,13 @@ pub mod vector;
 //
 // To add a new first-party pack: (1) add its crate as a `[dependency]` in
 // `kkernel/Cargo.toml`, (2) add a `use` line below referencing any public type
-// — this is the force-link anchor that prevents linker dead-stripping.
+// — this is the force-link anchor that prevents linker dead-stripping. A pack
+// that is an optional feature (agent, telemetry, web, formal, moodboard) takes a
+// `#[cfg(feature = ...)]` on its line, matching its `optional = true` dependency.
 #[doc(hidden)]
 #[allow(unused_imports)]
 mod _pack_links {
+    #[cfg(feature = "pack-agent")]
     use khive_pack_agent::AgentPack as _;
     use khive_pack_blob::BlobPack as _;
     use khive_pack_brain::BrainPack as _;
@@ -63,8 +66,10 @@ mod _pack_links {
     use khive_pack_moodboard::MoodboardPack as _;
     use khive_pack_schedule::SchedulePack as _;
     use khive_pack_session::SessionPack as _;
+    #[cfg(feature = "pack-telemetry")]
     use khive_pack_telemetry::TelemetryPack as _;
     use khive_pack_tool::ToolPack as _;
+    #[cfg(feature = "pack-web")]
     use khive_pack_web::WebPack as _;
     use khive_pack_workspace::WorkspacePack as _;
 }

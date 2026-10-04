@@ -1690,6 +1690,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "pack-telemetry")]
     #[test]
     fn atomic_preparation_keeps_discovered_hooks_without_activating_unrequested_telemetry() {
         let runtime = KhiveRuntime::new(RuntimeConfig {
@@ -1733,6 +1734,7 @@ mod tests {
         assert!(preflight.has_verb("telemetry.emit"));
     }
 
+    #[cfg(feature = "pack-telemetry")]
     #[test]
     fn telemetry_atomic_exemption_has_no_vocabulary_hooks_or_admissible_verbs() {
         use khive_types::Pack;

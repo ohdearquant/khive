@@ -380,6 +380,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "pack-telemetry")]
     #[test]
     fn telemetry_metadata_requires_no_declared_carrier() {
         let (registry, runtime) = build_registry().expect("metadata does not activate telemetry");
