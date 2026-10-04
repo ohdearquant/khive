@@ -2736,6 +2736,7 @@ dependencies = [
  "chrono",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-pack-kg",
  "khive-runtime",
  "khive-score",
