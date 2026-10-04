@@ -14,10 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 use tokio::process::Command as AsyncCommand;
 use uuid::Uuid;
 
+use khive_runtime::bounded_read::read_to_end_bounded_async;
 use khive_runtime::{
     secret_gate, KhiveRuntime, LinkSpec, NamespaceToken, RuntimeError, VerbRegistry,
 };
@@ -84,15 +85,10 @@ async fn read_command_pipe(
     limit: usize,
     overflow: IngestCommandError,
 ) -> std::result::Result<Vec<u8>, IngestCommandError> {
-    let mut bytes = Vec::new();
-    pipe.take(limit as u64 + 1)
-        .read_to_end(&mut bytes)
+    read_to_end_bounded_async(pipe, limit as u64)
         .await
-        .map_err(|_| IngestCommandError::Io)?;
-    if bytes.len() > limit {
-        return Err(overflow);
-    }
-    Ok(bytes)
+        .map_err(|_| IngestCommandError::Io)?
+        .ok_or(overflow)
 }
 
 async fn run_ingest_command(

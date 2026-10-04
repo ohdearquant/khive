@@ -14,6 +14,7 @@ pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod audit_batch;
 pub mod blob;
+pub mod bounded_read;
 pub mod build_info;
 pub mod comm_recipient;
 pub mod comm_transport;
