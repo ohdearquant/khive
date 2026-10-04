@@ -599,6 +599,17 @@ writers must not keep writing after that point. An interrupted migration either
 rolls back or resumes from its durable provenance without substituting the
 database's now-current version for the captured historical population.
 
+The cutover reports what it classified, per database, in its own output. The
+migration runner returns only the schema version it reached, so the cutover
+change adds that output: for each database it upgrades, the number of keyed
+memory notes classified `legacy`, `modern`, and `unknown`, and the `unknown`
+count for each namespace that has one. The counts are read from the persisted
+markers after classification, inside the cutover transaction, so a resumed
+cutover reports its final population once rather than adding to an earlier
+partial count. The report goes to the operator log of the process that applied
+the migration and is never part of an error returned to a caller; no verb
+exposes it.
+
 The marker follows its note across namespace moves in the same transaction,
 survives soft delete and restore, and is removed with hard deletion. Reusing a
 key for another note ID cannot inherit the deleted note's epoch. Missing or
@@ -619,6 +630,29 @@ An unreadable provenance store is an availability failure, not proof of an
 unknown epoch: return a retryable unavailable error without a token and without
 changing the persisted classification. A legacy marker paired with a receipt
 is contradictory evidence and takes `receipt_epoch_unknown`.
+
+**What the caller holds after a refusal.** Every refusal in the table is
+raised on the exact-replay path: the key claim found a live holder whose
+content is identical, and the attempt's atomic unit rolled back without
+writing. Each refusal therefore carries the holder's ID as `memory_id` in its
+details, as the version 1 missing-receipt refusal in `keyed_memory.rs` already
+does, and carries `domain_disposition: "not_committed"`. That is the
+pack-raised class ADR-133 Amendment 3 (A3.1) opens with `key_conflict`: the
+attempt wrote nothing and the error names the existing record. Today the
+refusal has no named disposition, so it surfaces as `unknown`, and ADR-179 D5
+resolves an `unknown` replay by replaying again; for a terminal reason that
+loop never ends. In ADR-179's terms the replay has reconciled: the caller holds
+the ID of the one memory it intended, and that memory's write committed
+earlier. What it does not hold is a freshness token for that write. After
+`legacy_receipt_absent` or `receipt_epoch_unknown` the caller reads `memory_id`
+and is done, as after `key_conflict`; resending returns the same refusal and
+the same ID, because replay never changes the marker. Such a caller has no
+token to present for that memory and relies on eventual recall. After
+`receipt_temporarily_unavailable` the same ID is returned, and the caller may
+retry for a token knowing the write exists. A receipt found missing right after
+the same attempt's own write committed is outside this rule: that attempt did
+write, so its error keeps the `unknown` disposition and the caller reconciles
+it by replay.
 
 The terminal unknown refusal means repeating the same call or waiting cannot
 establish the original fence. It does not authorize deletion, re-embedding,
@@ -675,6 +709,59 @@ clarify sentences of Amendment 2 without changing its security properties.
   sound only if every old writer stays stopped across all later version steps,
   and it adds a preparation journal with its own lifecycle.
 
+### Production callers of the routes that write no marker
+
+The routes that write no marker are the storage constructors `upsert_note`,
+`insert_note_if_absent`, `try_insert_note`, `try_insert_note_with_attachments`,
+`upsert_notes` and `batch_upsert_notes` in `crates/khive-db/src/stores/note.rs`
+(also reached through the policy wrapper that `runtime.notes(token)` returns,
+in `crates/khive-runtime/src/note_store_guard.rs`), the exported statement
+builders in the same file, and `RecipientTransportStore::commit` in
+`crates/khive-db/src/stores/note/recipient/mod.rs`. Every production caller of
+these at `e59b98b99bbafc09f6590b442ec165eff7b0d925`, outside test modules, is
+listed below with its disposition.
+
+| Caller (path, function)                                                                                                                                         | What it writes                                               | Disposition                                                          |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `crates/khive-runtime/src/operations.rs`, `create_note_inner` (generic note creation)                                                                           | A new note built with `Note::new`; the function takes no key | Cannot create keyed memory                                           |
+| `crates/khive-runtime/src/operations.rs`, `try_create_note_impl` (trusted channel ingest)                                                                       | A new note built with `Note::new`, no key                    | Cannot create keyed memory                                           |
+| `crates/khive-pack-comm/src/handlers.rs`, `handle_heartbeat`                                                                                                    | Kind `channel_health`, no key                                | Cannot create keyed memory                                           |
+| `crates/kkernel/src/code_ingest.rs`, `persist_ingest_note` (code findings ingest)                                                                               | Kind `finding`, no key                                       | Cannot create keyed memory                                           |
+| `crates/khive-runtime/src/atomic_prepare.rs`, `prepare_add_note` (proposal apply)                                                                               | A new note built with `Note::new`, no key                    | Cannot create keyed memory                                           |
+| `crates/khive-runtime/src/keyed_message.rs`, `create_keyed_message_pair_with_attachments`                                                                       | Kind restricted to `message`                                 | Cannot create keyed memory                                           |
+| `crates/khive-runtime/src/atomic_message.rs`, `prepare_atomic_note_requests`, and `crates/khive-runtime/src/note_create.rs`, `prepare_note_create`              | The statement builders, inside the runtime unit              | This is the runtime unit; a keyed memory note it creates is `modern` |
+| `crates/khive-runtime/src/comm_recipient.rs`, `ingest_verified_recipient` (recipient transport commit; called only from tests and a doc example at this commit) | Kind `message`, no key                                       | Cannot create keyed memory                                           |
+
+The routes that move or revive an existing note create no identity and keep
+its marker: `move_kinded_subject` in `crates/khive-db/src/namespace_move.rs`
+(namespace move target), `restore_note` in
+`crates/khive-runtime/src/operations.rs` (undelete), and `merge_note_sql` in
+`crates/khive-runtime/src/curation.rs`, which writes onto a destination ID that
+`read_merge_note` has already read and does not transfer the source's marker.
+Import does not reach these routes for memory: `import_kg` in
+`crates/khive-runtime/src/portability.rs` reads archives of entities and edges
+only. The tree has no database restore-from-backup operation; a copy of the
+database file carries the marker table with its notes, so every note keeps its
+class.
+
+So at this commit no production caller creates a keyed memory note through a
+route that writes no marker. The disposition for the routes themselves is
+unknown forever, by intent: they have no model or fence context, and a library
+caller that hands them a `Note` with kind `memory` and a key gets a note that
+refuses as `receipt_epoch_unknown` on exact replay. A production route that
+needs to create keyed memory, including a hosted ingest service that embeds
+this runtime outside this repository, goes through the runtime unit.
+
+Two runtime-unit routes create keyed notes today without the receipt flag:
+`create_note_with_options` and `create_note_with_options_resolving_annotations`
+in `crates/khive-runtime/src/note_write.rs` (called from the shared `create`
+handler, the gtd handlers and curation) and new keyed members of `stream.batch`
+in `crates/khive-runtime/src/streams.rs`. When the memory pack is registered,
+its creation hook in `crates/khive-pack-memory/src/hook.rs` refuses kind
+`memory` on both, so in a served daemon only `memory.remember` creates keyed
+memory. A runtime without that hook can reach them, and they are among the
+writers that must write `modern`, as the settled point above says.
+
 ### Acceptance before implementation merge
 
 - Upgrade actual pre-V46 data and actual already-V46 data through the migration
@@ -707,6 +794,23 @@ clarify sentences of Amendment 2 without changing its security properties.
 - A keyed memory note created through a lower-level storage constructor has
   no marker and refuses as `receipt_epoch_unknown` on exact replay. The same
   note created through the runtime keyed writer is `modern` and reseals.
+- Exact replay through the request envelope of an `unknown` keyed memory, and
+  separately of a `legacy` one without a receipt, returns its refusal with the
+  holder's ID as `memory_id` and `domain_disposition: "not_committed"`. A
+  second identical replay returns the same refusal and ID, and note, vector,
+  ANN log, edge, receipt and marker rows are unchanged across both. Removing
+  the named disposition, so that the refusal surfaces as `unknown`, must fail
+  this test.
+- Upgrading a database seeded with a known mix of `legacy`, `modern` and
+  `unknown` keyed memories across two namespaces reports exactly those three
+  counts and the per-namespace `unknown` counts. An interrupted and resumed
+  cutover reports the same values once. No replay refusal carries any of them.
+- A source census of production callers of the routes that write no marker
+  reproduces the caller table above, and a new production caller fails it
+  until the table and that caller's disposition are updated. The census
+  asserts a non-empty caller set, so a pattern that silently matches nothing
+  fails instead of passing. It extends an existing source census in the tree
+  rather than adding a new mechanism.
 - A default recall accepts a token whose namespace is in its visible set and
   refuses one outside it; an explicit one-namespace request refuses a token
   from another visible namespace. A byte appended to a valid envelope fails
