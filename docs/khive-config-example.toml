@@ -13,8 +13,9 @@
 #   3. ./.khive/config.toml                           (project-local hidden dir)
 #   4. ~/.khive/config.toml                           (user-global)
 #
-# Unknown keys are ignored (forward-compatible), except inside the security-sensitive
-# [gate] and [brain] tables: their schemas are closed, so unknown keys fail startup.
+# Unknown top-level keys are ignored (forward-compatible). These tables are closed, so
+# an unknown key in them fails startup: [actor], [gate], [brain], [blob], [telemetry],
+# [storage], [exec] (not its [exec.limits] subtable), [web], and each [[backends]] entry.
 #
 # Sections in this file:
 #   [actor]         default identity + namespace read/write scope
