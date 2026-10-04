@@ -50,6 +50,7 @@ CRATES=(
     khive-types
     khive-score
     khive-quant
+    khive-fs             # no khive-* dependencies; dep of khive-vamana and khive-db, publish first
     khive-vamana
     khive-fold
     khive-wire-protocol # no khive-* dependencies; shared native frame contract
@@ -57,7 +58,6 @@ CRATES=(
     khive-text          # khive-bm25 depends on it (normal dep); the old dev-dep cycle is gone
     khive-bm25
     khive-fusion
-    khive-fs             # no khive-* dependencies; dep of khive-db, so publish first
     khive-db
     khive-hnsw
     khive-query

@@ -3026,6 +3026,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "criterion",
+ "khive-fs",
  "khive-quant",
  "libc",
  "memmap2",
