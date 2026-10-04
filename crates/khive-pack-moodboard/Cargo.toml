@@ -12,6 +12,9 @@ categories.workspace = true
 description = "Experimental Khive-native visual retrieval and pairwise preference learning"
 
 [dependencies]
+khive-retrieval = { version = "0.9.0", path = "../khive-retrieval" }
+khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
+khive-score = { version = "0.9.0", path = "../khive-score" }
 khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
 khive-storage = { version = "0.9.0", path = "../khive-storage" }
