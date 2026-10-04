@@ -162,7 +162,8 @@ handle: constructing or retaining it opens no SQLite connection. Its ordinary
 the operation and return it only after statement finalization, callback cleanup,
 and connection reset/replacement. Ordinary reads through a queue-backed
 `SqlWriter` use the same route. There is no standalone fallback after pool
-saturation.
+saturation. A raw-SQL read waits for its permit the same way, so raw-SQL and
+typed reads are admitted in arrival order.
 
 The pool-wide reader admission budget is the effective `max_readers` (minimum
 one in degraded in-memory mode). Pooled guards and the explicit raw-SQL
