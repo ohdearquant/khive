@@ -38,6 +38,7 @@ mod sql;
 mod backend_policy_tests;
 pub mod cache;
 mod credentials;
+mod git_env;
 pub mod handlers;
 pub mod hook;
 pub mod ingest;
