@@ -11,16 +11,12 @@ use khive_runtime::{KhiveRuntime, RuntimeError, VerifiedBlob};
 use khive_storage::{ContentRef, MAX_BLOB_WHOLE_BYTES};
 use serde::Serialize;
 
+use crate::git_env;
 use crate::write_argv::{validate_message, validate_ref_name};
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+/// Settings only local invocations carry, passed after `git_env::SHARED_SETTINGS`.
 const HARDENING: &[&str] = &[
-    "core.hooksPath=/dev/null",
-    "core.fsmonitor=false",
-    "commit.gpgsign=false",
-    "credential.helper=",
-    "core.sshCommand=/usr/bin/false",
-    "protocol.allow=never",
     // Signature display and verification run a program the REPOSITORY names. `log` reads
     // `log.showSignature`, and every verifier path resolves through one of the `gpg*.program`
     // keys, so a repository whose config points them at a script executes that script the moment
@@ -184,25 +180,11 @@ pub(crate) struct DiffResult {
 /// the operation it is hardening, without recursing into the enumeration it exists to feed.
 fn base_command(program: &Path) -> Command {
     let mut command = Command::new(program);
-    // Inherited GIT_DIR, index/object paths, config injection, and identities
-    // must not redirect an operation away from the caller's authorized repo.
-    command.env_clear();
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
-    command
-        .env("LC_ALL", "C")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        // Empty is a portable graft-file override that does not emit Git's deprecation hint.
-        .env("GIT_GRAFT_FILE", "")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0");
-    for setting in HARDENING {
+    git_env::apply_shared_env(&mut command);
+    // Empty is a portable graft-file override that does not emit Git's deprecation hint.
+    command.env("GIT_GRAFT_FILE", "");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    for setting in git_env::SHARED_SETTINGS.iter().chain(HARDENING) {
         command.arg("-c").arg(setting);
     }
     command
@@ -2159,5 +2141,53 @@ mod tests {
             assert!(validate_oid(invalid, "expected_head").is_err());
         }
         assert!(validate_oid(ZERO_OID, "expected_head").is_ok());
+    }
+
+    #[test]
+    fn base_command_argv_and_environment_are_pinned() {
+        // The environment carries PATH, which other cases rewrite while holding this guard.
+        let _guard = crate::cache::ENV_MUTEX.blocking_lock();
+        let command = base_command(Path::new("git"));
+        let (args, envs) = git_env::describe(&command);
+        assert_eq!(command.get_program(), "git");
+        let settings = [
+            "core.hooksPath=/dev/null",
+            "core.fsmonitor=false",
+            "commit.gpgsign=false",
+            "credential.helper=",
+            "core.sshCommand=/usr/bin/false",
+            "protocol.allow=never",
+            "log.showSignature=false",
+            "merge.verifySignatures=false",
+            "gpg.program=/usr/bin/false",
+            "gpg.openpgp.program=/usr/bin/false",
+            "gpg.x509.program=/usr/bin/false",
+            "gpg.ssh.program=/usr/bin/false",
+        ];
+        let mut expected_args = Vec::new();
+        for setting in settings {
+            expected_args.extend(["-c", setting]);
+        }
+        assert_eq!(args, expected_args);
+        let mut expected_envs = BTreeMap::new();
+        for (key, value) in [
+            ("GIT_ATTR_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+            ("GIT_GRAFT_FILE", ""),
+            ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("LC_ALL", "C"),
+        ] {
+            expected_envs.insert(key.to_owned(), Some(value.to_owned()));
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            let path = path.to_string_lossy().into_owned();
+            expected_envs.insert("PATH".to_owned(), Some(path));
+        }
+        assert_eq!(envs, expected_envs);
     }
 }
