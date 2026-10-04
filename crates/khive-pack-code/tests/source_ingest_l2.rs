@@ -2653,18 +2653,18 @@ async fn unchanged_l2_file_refreshes_only_edges_current_at_previous_project_swee
 
     let third = run_code_ingest(&rt, &token, ingest(third_sweep))
         .await
-        .expect("T3 reuses the unchanged file");
+        .expect("T3 re-observes the unchanged file");
     assert_eq!(
         l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "caller", "helper").await
             ["last_seen_at"],
         first_sweep.to_rfc3339(),
-        "unchanged-file refresh must not revive the removed call"
+        "unchanged source must not revive the removed call"
     );
     assert_eq!(
         l2_edge_metadata(&rt, "pkg_edge_history", "depends_on", "stable", "helper").await
             ["last_seen_at"],
         third_sweep.to_rfc3339(),
-        "a still-current call must advance using the pre-L1 project clock"
+        "a still-observed call advances with this invocation"
     );
     assert_eq!(third.l2.expect("T3 L2 report").symbol_edges_stamped, 1);
 }
