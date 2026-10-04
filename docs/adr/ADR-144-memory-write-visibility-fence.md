@@ -734,18 +734,35 @@ listed below with its disposition.
 | `crates/khive-runtime/src/atomic_message.rs`, `prepare_atomic_note_requests`, and `crates/khive-runtime/src/note_create.rs`, `prepare_note_create`              | New notes of any kind, keyed or not, prepared inside the runtime unit | The runtime unit. No marker exists anywhere at this commit; after the cutover change a keyed memory note created here records `modern` |
 | `crates/khive-runtime/src/comm_recipient.rs`, `ingest_verified_recipient` (recipient transport commit; called only from tests and a doc example at this commit) | Kind `message`, no key                                                | Cannot create keyed memory                                                                                                             |
 
-The other exported note builders change or remove an existing row and create
-no identity: `note_replace_if_unchanged_statement` and
-`note_metadata_replace_if_unchanged_statement` (called from
-`prepare_versioned_note_update` in `crates/khive-runtime/src/note_write.rs`),
-and `note_soft_delete_statement` and `note_hard_delete_statement` (called from
-`prepare_delete` in `crates/khive-runtime/src/atomic_prepare.rs` and
-`delete_note_with_post_commit_report` in
-`crates/khive-runtime/src/operations.rs`). Hard deletion removes the marker
-with its note. The replace statement and the upsert statement's conflict branch
-both set `kind`, so a route could turn an existing keyed row into kind
-`memory`. Such a row is not an original memory write: it carries no marker and
-takes the unknown refusal on exact replay.
+The six other exported statement builders in the same file change or remove an
+existing row and create no identity. Each is listed with every function that
+issues it at that commit:
+
+- `note_replace_if_unchanged_statement`: `prepare_versioned_note_update` in
+  `crates/khive-runtime/src/note_write.rs`, and the store method
+  `replace_note_if_unchanged`, which packs and runtime code reach through the
+  policy wrapper (for example the comm handlers and curation).
+- `note_metadata_replace_if_unchanged_statement`:
+  `prepare_versioned_note_update`. It starts from the replace statement's
+  parameters and replaces its SQL with one that holds `kind` as a predicate and
+  does not set it.
+- `note_update_properties_statement` and `note_set_property_statement`: the
+  store methods `update_note_properties` and `set_note_property`. Both write
+  `properties`, `updated_at` and the due columns derived from the properties;
+  neither sets `kind`.
+- `note_soft_delete_statement`: `prepare_delete` in
+  `crates/khive-runtime/src/atomic_prepare.rs` and the store method
+  `delete_note`, which `delete_note_with_post_commit_report` in
+  `crates/khive-runtime/src/operations.rs` calls for a soft delete.
+- `note_hard_delete_statement`: `prepare_delete`,
+  `delete_note_with_post_commit_report`, and `delete_note`.
+
+Hard deletion removes the marker with its note. The replace statement and the
+upsert statement's conflict branch both set `kind`, so a route could turn an
+existing keyed row into kind `memory`. Such a row is not an original memory
+write: it carries no marker and takes the unknown refusal on exact replay. That
+disposition holds for every caller of these builders, so it does not depend on
+the caller list above being complete.
 
 The routes that move or revive an existing note create no identity and keep
 its marker: `move_kinded_subject` in `crates/khive-db/src/namespace_move.rs`
