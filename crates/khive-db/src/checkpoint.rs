@@ -2494,14 +2494,12 @@ pub async fn run_checkpoint_task(
                     note_checkpoint_skipped();
                     CheckpointTick::Skipped
                 }
-                Err(join_err) => {
-                    // The checkpoint cycle panicked on the blocking thread. The
-                    // connection and escalation state moved into it are gone;
-                    // `ensure_open` reopens the connection next tick and the
-                    // escalation state restarts from its initial value.
-                    truncate_state = TruncateState::default();
+                Err(panicked) => {
+                    // The cycle panicked: its connection is gone (reopened next tick) and the
+                    // escalation state is the one it was handed, counted as a TRUNCATE attempt.
+                    truncate_state = panicked.truncate_state;
                     tracing::warn!(
-                        error = %join_err,
+                        error = %panicked.join_error,
                         "WAL checkpoint cycle panicked on its blocking thread; \
                          dropping the connection for a fresh reopen next tick"
                     );
@@ -3097,6 +3095,8 @@ fn maybe_truncate(
     // and interval gates passed, and the busy_timeout override is in effect
     // immediately before the TRUNCATE pragma itself.
     truncate_state.last_attempt = Some(Instant::now());
+    #[cfg(test)]
+    off_worker::cycle_panic_seam::after_attempt_decided(pool.canonical_path());
 
     let start = Instant::now();
     let outcome = query_truncate_observation(conn);
@@ -8318,6 +8318,7 @@ mod tests {
     /// 2's opening (reflecting its state at emission time), then episode 2's
     /// recovery.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn dropped_recovery_handoff_does_not_merge_pressure_episodes() {
         let config = CheckpointConfig {
             warn_pages: 1_000,
@@ -8389,6 +8390,7 @@ mod tests {
     /// queue frees. The loss itself is counted and logged at the discard
     /// site; this test pins the delivered-history shape.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn episode_elapsed_entirely_behind_barrier_is_discarded_not_reordered() {
         let config = CheckpointConfig {
             warn_pages: 1_000,
