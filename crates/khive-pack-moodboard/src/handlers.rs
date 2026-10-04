@@ -1,6 +1,6 @@
 //! Moodboard verb handlers.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -19,6 +19,9 @@ use khive_storage::{
 };
 use khive_types::SubstrateKind;
 
+#[cfg(test)]
+use crate::materialization::{is_stale_candidate_error, validated_cosine_score};
+use crate::materialization::{materialize_hits, merge_visible_hits};
 use crate::model::{validate_embedding, DescriptorIdentity, LoadedVisionModel, VisionModelState};
 use crate::preprocess::{prepare_raster, PreparedRaster};
 use crate::MoodboardPack;
@@ -26,7 +29,7 @@ use crate::MoodboardPack;
 const MAX_OBJECT_BYTES: usize = 64 * 1024 * 1024;
 const VISUAL_FIELD: &str = "visual.descriptor";
 const DEFAULT_TOP_K: u32 = 20;
-const MAX_TOP_K: u32 = 100;
+pub(crate) const MAX_TOP_K: u32 = 100;
 const MAX_CANDIDATE_MULTIPLIER: u32 = 4;
 static INGEST_CONTENT_LOCKS: [Mutex<()>; 256] = [const { Mutex::const_new(()) }; 256];
 
@@ -139,17 +142,17 @@ pub(crate) async fn handle_search(
         &descriptor,
     )
     .await?;
-    let raw_hits = search_embedding(
+    let hits = search_materialized_hits(
         pack.runtime(),
+        &core,
         token,
+        blob_store.as_ref(),
+        asset_id,
         &descriptor,
         &embedding,
-        candidate_limit(top_k),
+        top_k,
     )
     .await?;
-
-    let hits =
-        materialize_hits(&core, token, blob_store.as_ref(), asset_id, raw_hits, top_k).await?;
 
     Ok(json!({
         "query_asset_id": asset_id.to_string(),
@@ -159,75 +162,31 @@ pub(crate) async fn handle_search(
     }))
 }
 
-async fn materialize_hits(
-    runtime: &KhiveRuntime,
+// Keep the one-shot vector window and materialization together so an
+// underfilled page never silently triggers another backend request.
+#[allow(clippy::too_many_arguments)]
+async fn search_materialized_hits(
+    vector_runtime: &KhiveRuntime,
+    core: &KhiveRuntime,
     token: &NamespaceToken,
     blob_store: &dyn BlobStore,
-    query_asset_id: Uuid,
-    raw_hits: Vec<VectorSearchHit>,
+    asset_id: Uuid,
+    descriptor: &DescriptorIdentity,
+    embedding: &[f32],
     top_k: u32,
 ) -> Result<Vec<Value>, RuntimeError> {
-    let mut hits = Vec::with_capacity(top_k as usize);
-    let authorized_namespaces: BTreeSet<&str> = token
-        .visible_namespaces()
-        .iter()
-        .map(|namespace| namespace.as_str())
-        .collect();
-    for hit in raw_hits {
-        let score = validated_cosine_score(&hit)?;
-        if hit.subject_id == query_asset_id || hits.len() == top_k as usize {
-            continue;
-        }
-        let candidate = match runtime.get_entity(token, hit.subject_id).await {
-            Ok(candidate) => candidate,
-            Err(error) if is_stale_candidate_error(&error) => continue,
-            Err(error) => return Err(error),
-        };
-        if !authorized_namespaces.contains(candidate.namespace.as_str())
-            || candidate.kind != "artifact"
-            || candidate.entity_type.as_deref() != Some("visual_asset")
-        {
-            continue;
-        }
-        let Some(candidate_ref) = candidate.content_ref else {
-            continue;
-        };
-        let Ok(candidate_ref) = ContentRef::from_hex(candidate_ref) else {
-            continue;
-        };
-        if !blob_store.exists(&candidate_ref).await? {
-            continue;
-        }
-        hits.push(json!({
-            "asset_id": candidate.id.to_string(),
-            "score": score,
-            "rank": hits.len() + 1,
-            "name": candidate.name,
-            "content_ref": candidate_ref.to_string(),
-        }));
-    }
-    Ok(hits)
-}
-
-fn validated_cosine_score(hit: &VectorSearchHit) -> Result<f64, RuntimeError> {
-    let score = hit.score.to_f64();
-    if !score.is_finite() || !(-1.0..=1.0).contains(&score) {
-        return Err(RuntimeError::Internal(format!(
-            "moodboard vector backend returned invalid cosine score {score} for {} (expected finite [-1,1])",
-            hit.subject_id
-        )));
-    }
-    Ok(score)
-}
-
-fn is_stale_candidate_error(error: &RuntimeError) -> bool {
-    matches!(
-        error,
-        RuntimeError::NotFound(_) | RuntimeError::NamespaceMismatch { .. }
+    let raw_hits = search_embedding(
+        vector_runtime,
+        token,
+        descriptor,
+        embedding,
+        candidate_limit(top_k),
     )
+    .await?;
+    materialize_hits(core, token, blob_store, asset_id, raw_hits, top_k).await
 }
 
-fn candidate_limit(top_k: u32) -> u32 {
+pub(crate) fn candidate_limit(top_k: u32) -> u32 {
     top_k
         .saturating_mul(MAX_CANDIDATE_MULTIPLIER)
         .saturating_add(1)
@@ -643,7 +602,7 @@ async fn search_embedding(
         .iter()
         .map(|namespace| namespace.as_str().to_string())
         .collect();
-    let mut merged = BTreeMap::<Uuid, VectorSearchHit>::new();
+    let mut sources = Vec::with_capacity(namespaces.len());
     for namespace in namespaces {
         let request = VectorSearchRequest {
             query_vectors: vec![embedding.to_vec()],
@@ -657,33 +616,9 @@ async fn search_embedding(
         request
             .validate()
             .map_err(|error| RuntimeError::Internal(format!("moodboard vector query: {error}")))?;
-        for hit in store.search(request).await? {
-            match merged.entry(hit.subject_id) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert(hit);
-                }
-                std::collections::btree_map::Entry::Occupied(mut entry)
-                    if hit.score > entry.get().score =>
-                {
-                    entry.insert(hit);
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-        }
+        sources.push(store.search(request).await?);
     }
-
-    let mut hits: Vec<_> = merged.into_values().collect();
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.subject_id.cmp(&right.subject_id))
-    });
-    hits.truncate(top_k as usize);
-    for (index, hit) in hits.iter_mut().enumerate() {
-        hit.rank = u32::try_from(index + 1).expect("top_k is bounded to u32");
-    }
-    Ok(hits)
+    Ok(merge_visible_hits(sources, top_k))
 }
 
 #[cfg(test)]
@@ -1705,3 +1640,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "materialization_search_tests.rs"]
+mod materialization_search_tests;
