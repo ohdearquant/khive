@@ -2179,19 +2179,12 @@ async fn register_consumer_identity(
         // durable consumer to age-retire, so that's sufficient here.
         let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: "INSERT OR IGNORE INTO ann_consumer_watermark \
-                      (consumer, namespace, embedding_model, watermark) \
-                      VALUES (?1, ?2, ?3, ?4)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(consumer.into()),
-                    SqlValue::Text(ANN_WILDCARD_NS.into()),
-                    SqlValue::Text(model.to_owned()),
-                    SqlValue::Integer(PENDING_WATERMARK),
-                ],
-                label: Some("memory_ann_register_pathless_consumer".into()),
-            })
+            .execute(ann_registry::pathless_register_pending(
+                "memory_",
+                consumer,
+                ANN_WILDCARD_NS,
+                model,
+            ))
             .await
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -2268,28 +2261,9 @@ async fn read_consumer_watermark(
     consumer: &str,
 ) -> Result<Option<i64>, String> {
     let sql = rt.sql();
-    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT watermark FROM ann_consumer_watermark \
-                  WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
-                .into(),
-            params: vec![
-                SqlValue::Text(consumer.into()),
-                SqlValue::Text(ANN_WILDCARD_NS.into()),
-                SqlValue::Text(model.to_owned()),
-            ],
-            label: Some("memory_ann_read_own_watermark".into()),
-        })
+    ann_registry::read_watermark(sql.as_ref(), "memory_", consumer, ANN_WILDCARD_NS, model)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(rows
-        .into_iter()
-        .next()
-        .and_then(|row| match row.get("watermark") {
-            Some(SqlValue::Integer(n)) => Some(*n),
-            _ => None,
-        }))
+        .map_err(|e| e.to_string())
 }
 
 /// Conditionally raise this consumer's registered watermark after a durable
@@ -2315,29 +2289,16 @@ async fn raise_consumer_watermark_with_authority(
     let raised = if ann_segment_dir(rt, model).is_none() {
         let watermark = i64::try_from(s)
             .map_err(|_| format!("memory ANN watermark {s} exceeds SQLite INTEGER range"))?;
-        let predicate = match authority {
-            WatermarkAuthority::PendingOrActive => {
-                "(watermark = -2 OR (watermark >= 0 AND watermark <= ?4))"
-            }
-            WatermarkAuthority::Active => "watermark >= 0 AND watermark <= ?4",
-            WatermarkAuthority::Recovering => "watermark = -1",
-        };
         let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE ann_consumer_watermark SET watermark = ?4 \
-                     WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
-                       AND {predicate}"
-                ),
-                params: vec![
-                    SqlValue::Text(consumer.into()),
-                    SqlValue::Text(ANN_WILDCARD_NS.into()),
-                    SqlValue::Text(model.to_owned()),
-                    SqlValue::Integer(watermark),
-                ],
-                label: Some("memory_ann_raise_pathless_watermark".into()),
-            })
+            .execute(ann_registry::pathless_raise_watermark(
+                "memory_",
+                consumer,
+                ANN_WILDCARD_NS,
+                model,
+                watermark,
+                authority,
+            ))
             .await
             .map_err(|e| e.to_string())?
             == 1
@@ -2372,18 +2333,11 @@ async fn compact_log(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
         // multi-statement transaction between pooled writer operations.
         let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: "DELETE FROM ann_write_log \
-                      WHERE embedding_model = ?1 \
-                        AND seq <= (SELECT MIN(watermark.watermark) \
-                                    FROM ann_consumer_watermark watermark \
-                                    WHERE (watermark.namespace = ann_write_log.namespace \
-                                           OR watermark.namespace = '*') \
-                                      AND watermark.embedding_model = ?1)"
-                    .into(),
-                params: vec![SqlValue::Text(model.to_owned())],
-                label: Some("memory_ann_compact_pathless_log".into()),
-            })
+            .execute(ann_registry::pathless_compact_log(
+                "memory_",
+                CompactionScope::Model,
+                model,
+            ))
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())?;

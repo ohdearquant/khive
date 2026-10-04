@@ -1163,19 +1163,12 @@ async fn register_consumer(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(
         // pending lifecycle to retire, so one closed-fence statement is enough.
         let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: "INSERT OR IGNORE INTO ann_consumer_watermark \
-                      (consumer, namespace, embedding_model, watermark) \
-                      VALUES (?1, ?2, ?3, ?4)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ANN_CONSUMER.into()),
-                    SqlValue::Text(ns.to_owned()),
-                    SqlValue::Text(model.to_owned()),
-                    SqlValue::Integer(ann_registry::PENDING_WATERMARK),
-                ],
-                label: Some("knowledge_ann_register_pathless_consumer".into()),
-            })
+            .execute(ann_registry::pathless_register_pending(
+                "knowledge_",
+                ANN_CONSUMER,
+                ns,
+                model,
+            ))
             .await
             .map_err(|error| error.to_string())?;
         return Ok(());
@@ -1194,21 +1187,12 @@ async fn write_force_rebuild_sentinel_row(rt: &KhiveRuntime, key: &AnnKey) -> Re
     if ann_segment_dir(rt, &key.namespace, &key.model).is_none() {
         let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: "INSERT INTO ann_consumer_watermark \
-                      (consumer, namespace, embedding_model, watermark) \
-                      VALUES (?1, ?2, ?3, ?4) \
-                      ON CONFLICT(consumer, namespace, embedding_model) \
-                      DO UPDATE SET watermark = excluded.watermark"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ANN_CONSUMER.into()),
-                    SqlValue::Text(key.namespace.clone()),
-                    SqlValue::Text(key.model.clone()),
-                    SqlValue::Integer(ann_registry::RECOVERING_WATERMARK),
-                ],
-                label: Some("knowledge_ann_mark_pathless_recovering".into()),
-            })
+            .execute(ann_registry::pathless_mark_recovering(
+                "knowledge_",
+                ANN_CONSUMER,
+                &key.namespace,
+                &key.model,
+            ))
             .await
             .map_err(|error| error.to_string())?;
         return Ok(());
@@ -1263,28 +1247,10 @@ async fn read_own_watermark(
     model: &str,
 ) -> Result<Option<i64>, String> {
     let sql = rt.sql();
-    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT watermark FROM ann_consumer_watermark \
-                  WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
-                .into(),
-            params: vec![
-                SqlValue::Text(ANN_CONSUMER.into()),
-                SqlValue::Text(ns.to_owned()),
-                SqlValue::Text(model.to_owned()),
-            ],
-            label: Some("ann_read_own_watermark".into()),
-        })
+    // This statement has always been labelled without a pack prefix.
+    ann_registry::read_watermark(sql.as_ref(), "", ANN_CONSUMER, ns, model)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(rows
-        .into_iter()
-        .next()
-        .and_then(|row| match row.get("watermark") {
-            Some(SqlValue::Integer(n)) => Some(*n),
-            _ => None,
-        }))
+        .map_err(|e| e.to_string())
 }
 
 /// Raise this consumer's registered watermark monotonically after a durable
@@ -1340,29 +1306,16 @@ async fn raise_watermark(
     let raised = if ann_segment_dir(rt, ns, model).is_none() {
         let watermark = i64::try_from(s)
             .map_err(|_| format!("knowledge ANN watermark {s} exceeds SQLite INTEGER range"))?;
-        let predicate = match shared_authority {
-            WatermarkAuthority::PendingOrActive => {
-                "(watermark = -2 OR (watermark >= 0 AND watermark <= ?4))"
-            }
-            WatermarkAuthority::Active => "watermark >= 0 AND watermark <= ?4",
-            WatermarkAuthority::Recovering => "watermark = -1",
-        };
         let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE ann_consumer_watermark SET watermark = ?4 \
-                     WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
-                       AND {predicate}"
-                ),
-                params: vec![
-                    SqlValue::Text(ANN_CONSUMER.into()),
-                    SqlValue::Text(ns.to_owned()),
-                    SqlValue::Text(model.to_owned()),
-                    SqlValue::Integer(watermark),
-                ],
-                label: Some("knowledge_ann_raise_pathless_watermark".into()),
-            })
+            .execute(ann_registry::pathless_raise_watermark(
+                "knowledge_",
+                ANN_CONSUMER,
+                ns,
+                model,
+                watermark,
+                shared_authority,
+            ))
             .await
             .map_err(|error| error.to_string())?
             == 1
@@ -1390,21 +1343,11 @@ async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), Str
     if ann_segment_dir(rt, ns, model).is_none() {
         let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: "DELETE FROM ann_write_log \
-                      WHERE namespace = ?1 AND embedding_model = ?2 \
-                        AND seq <= (SELECT MIN(watermark.watermark) \
-                                    FROM ann_consumer_watermark watermark \
-                                    WHERE (watermark.namespace = ?1 \
-                                           OR watermark.namespace = '*') \
-                                      AND watermark.embedding_model = ?2)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ns.to_owned()),
-                    SqlValue::Text(model.to_owned()),
-                ],
-                label: Some("knowledge_ann_compact_pathless_log".into()),
-            })
+            .execute(ann_registry::pathless_compact_log(
+                "knowledge_",
+                CompactionScope::Namespace(ns.to_owned()),
+                model,
+            ))
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())?;

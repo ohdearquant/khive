@@ -86,6 +86,181 @@ fn integer_range_error(value: u64) -> StorageError {
     ))
 }
 
+// Statement text which both a transactional registry operation and its
+// single-statement (`pathless_*`) form run.  Each lives here once, so a change
+// to the registry rule reaches every runtime.
+const REGISTER_PENDING_SQL: &str = "INSERT OR IGNORE INTO ann_consumer_watermark \
+     (consumer, namespace, embedding_model, watermark) \
+     VALUES (?1, ?2, ?3, ?4)";
+
+const MARK_RECOVERING_SQL: &str = "INSERT INTO ann_consumer_watermark \
+     (consumer, namespace, embedding_model, watermark) \
+     VALUES (?1, ?2, ?3, ?4) \
+     ON CONFLICT(consumer, namespace, embedding_model) \
+     DO UPDATE SET watermark = excluded.watermark";
+
+/// The `UPDATE` which publishes watermark `?4` for the registry row named by
+/// `?1`, `?2` and `?3`, guarded by the predicate `authority` grants.
+fn raise_sql(authority: WatermarkAuthority) -> String {
+    let predicate = match authority {
+        WatermarkAuthority::PendingOrActive => {
+            "(watermark = -2 OR (watermark >= 0 AND watermark <= ?4))"
+        }
+        WatermarkAuthority::Active => "watermark >= 0 AND watermark <= ?4",
+        WatermarkAuthority::Recovering => "watermark = -1",
+    };
+    format!(
+        "UPDATE ann_consumer_watermark SET watermark = ?4 \
+         WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
+           AND {predicate}"
+    )
+}
+
+/// Statement form of [`register_pending`] for a runtime with no durable
+/// consumer lifecycle: one closed-fence insert, with no pending-age metadata.
+///
+/// `label_prefix` is prepended to the statement label, so each pack keeps its
+/// own operator-visible statement names.
+pub fn pathless_register_pending(
+    label_prefix: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+) -> SqlStatement {
+    stmt(
+        REGISTER_PENDING_SQL,
+        vec![
+            SqlValue::Text(consumer.to_owned()),
+            SqlValue::Text(namespace.to_owned()),
+            SqlValue::Text(model.to_owned()),
+            SqlValue::Integer(PENDING_WATERMARK),
+        ],
+        &format!("{label_prefix}ann_register_pathless_consumer"),
+    )
+}
+
+/// Statement form of [`mark_recovering`] for a runtime with no durable
+/// consumer lifecycle: the recovery-fence upsert alone, with no pending
+/// metadata to clear.
+pub fn pathless_mark_recovering(
+    label_prefix: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+) -> SqlStatement {
+    stmt(
+        MARK_RECOVERING_SQL,
+        vec![
+            SqlValue::Text(consumer.to_owned()),
+            SqlValue::Text(namespace.to_owned()),
+            SqlValue::Text(model.to_owned()),
+            SqlValue::Integer(RECOVERING_WATERMARK),
+        ],
+        &format!("{label_prefix}ann_mark_pathless_recovering"),
+    )
+}
+
+/// Statement form of [`raise_watermark`] for a runtime with no durable
+/// consumer lifecycle: the guarded `UPDATE` alone, with no pending metadata to
+/// clear.  `watermark` is already a SQLite integer; the caller owns the range
+/// check and its error text.  A run which affects no row means the fence
+/// rejected `authority`.
+pub fn pathless_raise_watermark(
+    label_prefix: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+    watermark: i64,
+    authority: WatermarkAuthority,
+) -> SqlStatement {
+    stmt(
+        raise_sql(authority),
+        vec![
+            SqlValue::Text(consumer.to_owned()),
+            SqlValue::Text(namespace.to_owned()),
+            SqlValue::Text(model.to_owned()),
+            SqlValue::Integer(watermark),
+        ],
+        &format!("{label_prefix}ann_raise_pathless_watermark"),
+    )
+}
+
+/// Statement form of [`compact_write_log`] for a runtime with no durable
+/// consumer lifecycle: the log delete bounded by the registry minimum, with no
+/// dormant registrations to retire.
+pub fn pathless_compact_log(
+    label_prefix: &str,
+    scope: CompactionScope,
+    model: &str,
+) -> SqlStatement {
+    let label = format!("{label_prefix}ann_compact_pathless_log");
+    let model = model.to_owned();
+    match scope {
+        CompactionScope::Namespace(namespace) => stmt(
+            "DELETE FROM ann_write_log \
+             WHERE namespace = ?1 AND embedding_model = ?2 \
+               AND seq <= (SELECT MIN(watermark.watermark) \
+                           FROM ann_consumer_watermark watermark \
+                           WHERE (watermark.namespace = ?1 \
+                                  OR watermark.namespace = '*') \
+                             AND watermark.embedding_model = ?2)",
+            vec![SqlValue::Text(namespace), SqlValue::Text(model)],
+            &label,
+        ),
+        CompactionScope::Model => stmt(
+            "DELETE FROM ann_write_log \
+             WHERE embedding_model = ?1 \
+               AND seq <= (SELECT MIN(watermark.watermark) \
+                           FROM ann_consumer_watermark watermark \
+                           WHERE (watermark.namespace = ann_write_log.namespace \
+                                  OR watermark.namespace = '*') \
+                             AND watermark.embedding_model = ?1)",
+            vec![SqlValue::Text(model)],
+            &label,
+        ),
+    }
+}
+
+/// Statement which reads one consumer's registered watermark.
+pub fn read_watermark_statement(
+    label_prefix: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+) -> SqlStatement {
+    stmt(
+        "SELECT watermark FROM ann_consumer_watermark \
+         WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3",
+        vec![
+            SqlValue::Text(consumer.to_owned()),
+            SqlValue::Text(namespace.to_owned()),
+            SqlValue::Text(model.to_owned()),
+        ],
+        &format!("{label_prefix}ann_read_own_watermark"),
+    )
+}
+
+/// Read one consumer's registered watermark.  `None` means the registry holds
+/// no row for that consumer, namespace and model.
+pub async fn read_watermark(
+    sql: &dyn SqlAccess,
+    label_prefix: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+) -> StorageResult<Option<i64>> {
+    let statement = read_watermark_statement(label_prefix, consumer, namespace, model);
+    let mut reader = sql.reader().await?;
+    let rows = reader.query_all(statement).await?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| match row.get("watermark") {
+            Some(SqlValue::Integer(n)) => Some(*n),
+            _ => None,
+        }))
+}
+
 /// Register a consumer in the pending state without changing an existing
 /// active or recovering registration.
 pub async fn register_pending(
@@ -118,9 +293,7 @@ async fn register_pending_at(
         Box::pin(async move {
             let inserted = writer
                 .execute(stmt(
-                    "INSERT OR IGNORE INTO ann_consumer_watermark \
-                     (consumer, namespace, embedding_model, watermark) \
-                     VALUES (?1, ?2, ?3, ?4)",
+                    REGISTER_PENDING_SQL,
                     vec![
                         SqlValue::Text(consumer.clone()),
                         SqlValue::Text(namespace.clone()),
@@ -190,11 +363,7 @@ pub async fn mark_recovering(
         Box::pin(async move {
             writer
                 .execute(stmt(
-                    "INSERT INTO ann_consumer_watermark \
-                     (consumer, namespace, embedding_model, watermark) \
-                     VALUES (?1, ?2, ?3, ?4) \
-                     ON CONFLICT(consumer, namespace, embedding_model) \
-                     DO UPDATE SET watermark = excluded.watermark",
+                    MARK_RECOVERING_SQL,
                     vec![
                         SqlValue::Text(consumer.clone()),
                         SqlValue::Text(namespace.clone()),
@@ -245,13 +414,6 @@ pub async fn raise_watermark(
     authority: WatermarkAuthority,
 ) -> StorageResult<bool> {
     let watermark = i64::try_from(watermark).map_err(|_| integer_range_error(watermark))?;
-    let predicate = match authority {
-        WatermarkAuthority::PendingOrActive => {
-            "(watermark = -2 OR (watermark >= 0 AND watermark <= ?4))"
-        }
-        WatermarkAuthority::Active => "watermark >= 0 AND watermark <= ?4",
-        WatermarkAuthority::Recovering => "watermark = -1",
-    };
     let consumer = consumer.to_owned();
     let namespace = namespace.to_owned();
     let model = model.to_owned();
@@ -259,11 +421,7 @@ pub async fn raise_watermark(
         Box::pin(async move {
             let affected = writer
                 .execute(stmt(
-                    format!(
-                        "UPDATE ann_consumer_watermark SET watermark = ?4 \
-                         WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
-                           AND {predicate}"
-                    ),
+                    raise_sql(authority),
                     vec![
                         SqlValue::Text(consumer.clone()),
                         SqlValue::Text(namespace.clone()),
@@ -833,5 +991,278 @@ mod tests {
             .await,
             2
         );
+    }
+
+    // The statement tests below keep a copy of each literal the packs used to
+    // inline as the oracle: the builder must reproduce its text, its parameter
+    // order and its label exactly.
+
+    fn assert_statement(got: &SqlStatement, sql: &str, params: Vec<SqlValue>, label: &str) {
+        assert_eq!(got.sql, sql, "statement text");
+        assert_eq!(
+            format!("{:?}", got.params),
+            format!("{params:?}"),
+            "parameter order"
+        );
+        assert_eq!(got.label.as_deref(), Some(label), "statement label");
+    }
+
+    fn text(value: &str) -> SqlValue {
+        SqlValue::Text(value.to_owned())
+    }
+
+    #[test]
+    fn pathless_register_pending_matches_the_inlined_literal() {
+        assert_statement(
+            &pathless_register_pending("memory_", "memory:ann", "*", "model"),
+            "INSERT OR IGNORE INTO ann_consumer_watermark \
+             (consumer, namespace, embedding_model, watermark) \
+             VALUES (?1, ?2, ?3, ?4)",
+            vec![
+                text("memory:ann"),
+                text("*"),
+                text("model"),
+                SqlValue::Integer(-2),
+            ],
+            "memory_ann_register_pathless_consumer",
+        );
+        assert_statement(
+            &pathless_register_pending("knowledge_", "knowledge:atom", "local", "model"),
+            "INSERT OR IGNORE INTO ann_consumer_watermark \
+             (consumer, namespace, embedding_model, watermark) \
+             VALUES (?1, ?2, ?3, ?4)",
+            vec![
+                text("knowledge:atom"),
+                text("local"),
+                text("model"),
+                SqlValue::Integer(-2),
+            ],
+            "knowledge_ann_register_pathless_consumer",
+        );
+    }
+
+    #[test]
+    fn pathless_mark_recovering_matches_the_inlined_literal() {
+        assert_statement(
+            &pathless_mark_recovering("knowledge_", "knowledge:atom", "local", "model"),
+            "INSERT INTO ann_consumer_watermark \
+             (consumer, namespace, embedding_model, watermark) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(consumer, namespace, embedding_model) \
+             DO UPDATE SET watermark = excluded.watermark",
+            vec![
+                text("knowledge:atom"),
+                text("local"),
+                text("model"),
+                SqlValue::Integer(-1),
+            ],
+            "knowledge_ann_mark_pathless_recovering",
+        );
+    }
+
+    #[test]
+    fn pathless_raise_watermark_matches_the_inlined_literal_for_every_authority() {
+        let cases = [
+            (
+                WatermarkAuthority::PendingOrActive,
+                "(watermark = -2 OR (watermark >= 0 AND watermark <= ?4))",
+            ),
+            (
+                WatermarkAuthority::Active,
+                "watermark >= 0 AND watermark <= ?4",
+            ),
+            (WatermarkAuthority::Recovering, "watermark = -1"),
+        ];
+        for (authority, predicate) in cases {
+            let oracle = format!(
+                "UPDATE ann_consumer_watermark SET watermark = ?4 \
+                 WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
+                   AND {predicate}"
+            );
+            assert_statement(
+                &pathless_raise_watermark("memory_", "memory:ann", "*", "model", 7, authority),
+                &oracle,
+                vec![
+                    text("memory:ann"),
+                    text("*"),
+                    text("model"),
+                    SqlValue::Integer(7),
+                ],
+                "memory_ann_raise_pathless_watermark",
+            );
+        }
+        let knowledge = pathless_raise_watermark(
+            "knowledge_",
+            "knowledge:atom",
+            "local",
+            "model",
+            0,
+            WatermarkAuthority::Active,
+        );
+        assert_eq!(
+            knowledge.label.as_deref(),
+            Some("knowledge_ann_raise_pathless_watermark")
+        );
+    }
+
+    #[test]
+    fn pathless_compact_log_matches_the_inlined_literal_for_a_namespace() {
+        assert_statement(
+            &pathless_compact_log(
+                "knowledge_",
+                CompactionScope::Namespace("local".into()),
+                "model",
+            ),
+            "DELETE FROM ann_write_log \
+             WHERE namespace = ?1 AND embedding_model = ?2 \
+               AND seq <= (SELECT MIN(watermark.watermark) \
+                           FROM ann_consumer_watermark watermark \
+                           WHERE (watermark.namespace = ?1 \
+                                  OR watermark.namespace = '*') \
+                             AND watermark.embedding_model = ?2)",
+            vec![text("local"), text("model")],
+            "knowledge_ann_compact_pathless_log",
+        );
+    }
+
+    #[test]
+    fn pathless_compact_log_matches_the_inlined_literal_for_a_model() {
+        assert_statement(
+            &pathless_compact_log("memory_", CompactionScope::Model, "model"),
+            "DELETE FROM ann_write_log \
+             WHERE embedding_model = ?1 \
+               AND seq <= (SELECT MIN(watermark.watermark) \
+                           FROM ann_consumer_watermark watermark \
+                           WHERE (watermark.namespace = ann_write_log.namespace \
+                                  OR watermark.namespace = '*') \
+                             AND watermark.embedding_model = ?1)",
+            vec![text("model")],
+            "memory_ann_compact_pathless_log",
+        );
+    }
+
+    #[test]
+    fn read_watermark_statement_matches_the_inlined_literal() {
+        let sql = "SELECT watermark FROM ann_consumer_watermark \
+                   WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3";
+        assert_statement(
+            &read_watermark_statement("memory_", "memory:ann", "*", "model"),
+            sql,
+            vec![text("memory:ann"), text("*"), text("model")],
+            "memory_ann_read_own_watermark",
+        );
+        // The knowledge pack has always labelled this statement without a pack
+        // prefix; an empty prefix keeps that operator-visible name.
+        assert_statement(
+            &read_watermark_statement("", "knowledge:atom", "local", "model"),
+            sql,
+            vec![text("knowledge:atom"), text("local"), text("model")],
+            "ann_read_own_watermark",
+        );
+    }
+
+    async fn watermark_of(sql: &dyn SqlAccess, model: &str) -> Option<i64> {
+        read_watermark(sql, "test_", "reader", "local", model)
+            .await
+            .expect("read watermark")
+    }
+
+    #[tokio::test]
+    async fn read_watermark_reports_each_registry_state_and_none_when_absent() {
+        let backend = memory_backend();
+        let sql = backend.sql();
+        let model = "ann-registry-read-watermark";
+        assert_eq!(watermark_of(sql.as_ref(), model).await, None);
+        register_pending_at(sql.as_ref(), "reader", "local", model, 1)
+            .await
+            .expect("register");
+        assert_eq!(watermark_of(sql.as_ref(), model).await, Some(-2));
+        assert!(raise_watermark(
+            sql.as_ref(),
+            "reader",
+            "local",
+            model,
+            5,
+            WatermarkAuthority::PendingOrActive,
+        )
+        .await
+        .expect("activate"));
+        assert_eq!(watermark_of(sql.as_ref(), model).await, Some(5));
+        mark_recovering(sql.as_ref(), "reader", "local", model)
+            .await
+            .expect("recovering");
+        assert_eq!(watermark_of(sql.as_ref(), model).await, Some(-1));
+        let other = read_watermark(sql.as_ref(), "test_", "reader", "elsewhere", model)
+            .await
+            .expect("read other namespace");
+        assert_eq!(other, None, "the namespace is part of the row identity");
+    }
+
+    async fn run(sql: &dyn SqlAccess, statement: SqlStatement) -> u64 {
+        sql.writer()
+            .await
+            .expect("writer")
+            .execute(statement)
+            .await
+            .expect("execute")
+    }
+
+    #[tokio::test]
+    async fn pathless_statements_drive_the_registry_rows() {
+        let backend = memory_backend();
+        let sql = backend.sql();
+        let model = "ann-registry-pathless-run";
+        let register = pathless_register_pending("test_", "reader", "local", model);
+        assert_eq!(run(sql.as_ref(), register.clone()).await, 1);
+        assert_eq!(run(sql.as_ref(), register).await, 0, "insert ignored");
+        assert_eq!(watermark_of(sql.as_ref(), model).await, Some(-2));
+
+        let raise = |watermark, authority| {
+            pathless_raise_watermark("test_", "reader", "local", model, watermark, authority)
+        };
+        let recovering = WatermarkAuthority::Recovering;
+        assert_eq!(run(sql.as_ref(), raise(3, recovering)).await, 0);
+        let first = raise(5, WatermarkAuthority::PendingOrActive);
+        assert_eq!(run(sql.as_ref(), first).await, 1);
+        assert_eq!(watermark_of(sql.as_ref(), model).await, Some(5));
+        let behind = raise(4, WatermarkAuthority::Active);
+        assert_eq!(run(sql.as_ref(), behind).await, 0, "no step back");
+        let ahead = raise(9, WatermarkAuthority::Active);
+        assert_eq!(run(sql.as_ref(), ahead).await, 1);
+        assert_eq!(watermark_of(sql.as_ref(), model).await, Some(9));
+
+        let fence = pathless_mark_recovering("test_", "reader", "local", model);
+        assert_eq!(run(sql.as_ref(), fence).await, 1);
+        assert_eq!(watermark_of(sql.as_ref(), model).await, Some(-1));
+        assert_eq!(run(sql.as_ref(), raise(11, recovering)).await, 1);
+        assert_eq!(watermark_of(sql.as_ref(), model).await, Some(11));
+
+        for seq in 1..=6 {
+            execute(
+                sql.as_ref(),
+                "INSERT INTO ann_write_log \
+                 (seq, namespace, embedding_model, kind, field, subject_id, op) \
+                 VALUES (?1, 'local', ?2, 'note', 'note.content', ?3, 'upsert')",
+                vec![
+                    SqlValue::Integer(seq),
+                    text(model),
+                    SqlValue::Text(format!("subject-{seq}")),
+                ],
+            )
+            .await;
+        }
+        let by_namespace =
+            pathless_compact_log("test_", CompactionScope::Namespace("local".into()), model);
+        assert_eq!(run(sql.as_ref(), by_namespace).await, 6);
+        execute(
+            sql.as_ref(),
+            "INSERT INTO ann_write_log \
+             (seq, namespace, embedding_model, kind, field, subject_id, op) \
+             VALUES (7, 'local', ?1, 'note', 'note.content', 'subject-7', 'upsert')",
+            vec![text(model)],
+        )
+        .await;
+        let by_model = pathless_compact_log("test_", CompactionScope::Model, model);
+        assert_eq!(run(sql.as_ref(), by_model).await, 1);
     }
 }
