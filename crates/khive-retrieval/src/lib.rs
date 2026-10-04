@@ -17,6 +17,9 @@
 
 #[cfg(feature = "storage-adapters")]
 pub mod adapters;
+#[cfg(feature = "ann")]
+#[doc(hidden)]
+pub mod ann;
 pub mod error;
 pub mod eval;
 pub mod hit;

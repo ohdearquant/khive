@@ -12,6 +12,7 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 | Module                 | Purpose                                                                       |
 | ---------------------- | ----------------------------------------------------------------------------- |
 | `src/adapters/`        | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
+| `src/ann.rs`           | Hidden checkpoint-lock and rotation-watcher helpers (feature `ann`)           |
 | `src/error.rs`         | `RetrievalError` enum and `Result` alias                                      |
 | `src/eval/`            | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
 | `src/hit.rs`           | Search result types: `SearchHit`, `SearchSource`, `HybridSearchOutcome`       |

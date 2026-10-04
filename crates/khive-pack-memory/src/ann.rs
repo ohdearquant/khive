@@ -1394,23 +1394,20 @@ fn start_rotation_watcher_with_shutdown(
     }
 
     let ann = Arc::downgrade(ann);
+    let tick = move || {
+        let ann = ann.upgrade();
+        let ann_root = ann_root.clone();
+        async move {
+            let Some(ann) = ann else {
+                return std::ops::ControlFlow::Break(());
+            };
+            refresh_rotated_segments_in_root(&ann_root, &ann).await;
+            std::ops::ControlFlow::Continue(())
+        }
+    };
     Some(khive_runtime::spawn_named_tracked_task(
         "memory_ann_rotation_watch",
-        async move {
-            let start = tokio::time::Instant::now() + ROTATION_WATCH_INTERVAL;
-            let mut ticks = tokio::time::interval_at(start, ROTATION_WATCH_INTERVAL);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = ticks.tick() => {}
-                }
-                let Some(ann) = ann.upgrade() else {
-                    break;
-                };
-                refresh_rotated_segments_in_root(&ann_root, &ann).await;
-            }
-        },
+        khive_retrieval::ann::rotation_watch_loop(ROTATION_WATCH_INTERVAL, shutdown, tick),
     ))
 }
 
@@ -2163,32 +2160,10 @@ fn ann_segment_dir_from_root(ann_root: &std::path::Path, model: &str) -> std::pa
     ann_root.join(hex)
 }
 
-fn acquire_bridge_checkpoint_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
-    std::fs::create_dir_all(dir).map_err(|error| {
-        format!(
-            "create memory ANN checkpoint directory {}: {error}",
-            dir.display()
-        )
-    })?;
-    let lock_path = dir.join(".bridge-checkpoint.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| format!("open memory ANN lock {}: {error}", lock_path.display()))?;
-    lock.lock()
-        .map_err(|error| format!("acquire memory ANN lock {}: {error}", lock_path.display()))?;
-    Ok(lock)
-}
-
 async fn acquire_bridge_checkpoint_lock_async(
     dir: std::path::PathBuf,
 ) -> Result<std::fs::File, String> {
-    tokio::task::spawn_blocking(move || acquire_bridge_checkpoint_lock(&dir))
-        .await
-        .map_err(|error| format!("memory ANN lock task failed: {error}"))?
+    khive_retrieval::ann::acquire_checkpoint_lock_async(dir, "memory ANN").await
 }
 
 /// Install `candidate`, replacing an equal-or-newer-generation incumbent but
