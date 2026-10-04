@@ -66,6 +66,8 @@ uuid = { workspace = true }
 criterion = { workspace = true }
 rand = { workspace = true }
 serial_test = { workspace = true }
+syn = { workspace = true }
+proc-macro2 = "1"
 
 [[bench]]
 name = "db_hot_path"

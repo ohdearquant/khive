@@ -7100,43 +7100,7 @@ mod tests {
         assert!(!store.exists(&orphan).await.unwrap());
     }
 
-    #[test]
-    fn resolve_blob_root_prefers_env_var() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("KHIVE_BLOB_ROOT", "/tmp/env-override-root");
-        let resolved = resolve_blob_root(Some(Path::new("/db/dir")), Some(Path::new("/cfg/root")));
-        std::env::remove_var("KHIVE_BLOB_ROOT");
-        assert_eq!(resolved.unwrap(), PathBuf::from("/tmp/env-override-root"));
-    }
-
-    #[test]
-    fn resolve_blob_root_prefers_config_over_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("KHIVE_BLOB_ROOT");
-        let resolved = resolve_blob_root(Some(Path::new("/db/dir")), Some(Path::new("/cfg/root")));
-        assert_eq!(resolved.unwrap(), PathBuf::from("/cfg/root"));
-    }
-
-    #[test]
-    fn resolve_blob_root_defaults_beside_db_dir() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("KHIVE_BLOB_ROOT");
-        let resolved = resolve_blob_root(Some(Path::new("/db/dir")), None);
-        assert_eq!(resolved.unwrap(), PathBuf::from("/db/dir/blobs"));
-    }
-
-    #[test]
-    fn resolve_blob_root_errors_with_no_env_config_or_db_dir() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("KHIVE_BLOB_ROOT");
-        let resolved = resolve_blob_root(None, None);
-        assert!(resolved.is_err());
-    }
-
-    // `std::env::set_var`/`remove_var` mutate real process-global state, so the
-    // four `resolve_blob_root` env-precedence tests must not interleave under
-    // the crate's default parallel test runner.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    include!("blob/environment_tests.rs");
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

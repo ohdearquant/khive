@@ -1270,16 +1270,23 @@ mod tests {
 
     #[test]
     fn resolve_log_dir_prefers_explicit_override() {
+        if crate::test_process::run_in_child(|_| {}) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var(SINK_DIR_OVERRIDE_ENV, dir.path());
+        crate::test_process::set_var(SINK_DIR_OVERRIDE_ENV, dir.path());
         let resolved = resolve_log_dir(None);
-        std::env::remove_var(SINK_DIR_OVERRIDE_ENV);
+        crate::test_process::remove_var(SINK_DIR_OVERRIDE_ENV);
         assert_eq!(resolved, Some(dir.path().to_path_buf()));
     }
 
     #[test]
     fn resolve_log_dir_falls_back_to_db_parent_under_test_harness() {
-        std::env::remove_var(SINK_DIR_OVERRIDE_ENV);
+        if crate::test_process::run_in_child(|command| {
+            command.env_remove(SINK_DIR_OVERRIDE_ENV);
+        }) {
+            return;
+        }
         // KHIVE_TEST_HARNESS=1 is force-set by .cargo/config.toml for every
         // cargo test/binary in this workspace — assert the behavior this
         // module relies on to keep tests off the real ~/.khive/logs.
@@ -1291,27 +1298,34 @@ mod tests {
 
     #[test]
     fn resolve_log_dir_none_without_db_parent_under_test_harness() {
-        std::env::remove_var(SINK_DIR_OVERRIDE_ENV);
+        if crate::test_process::run_in_child(|command| {
+            command.env_remove(SINK_DIR_OVERRIDE_ENV);
+        }) {
+            return;
+        }
         assert_eq!(resolve_log_dir(None), None);
     }
 
     #[test]
     fn slow_write_threshold_env_override_and_zero_disable() {
-        std::env::remove_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV);
+        if crate::test_process::run_in_child(|_| {}) {
+            return;
+        }
+        crate::test_process::remove_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV);
         assert_eq!(slow_write_threshold(), Some(SLOW_WRITE_THRESHOLD));
 
-        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "250");
+        crate::test_process::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "250");
         assert_eq!(slow_write_threshold(), Some(Duration::from_millis(250)));
 
         // 0 = disabled entirely, never "emit every write".
-        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "0");
+        crate::test_process::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "0");
         assert_eq!(slow_write_threshold(), None);
 
         // Unparseable falls back to the default, never to disabled — a typo
         // in the override must not silently turn the instrument off.
-        std::env::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "not-a-number");
+        crate::test_process::set_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV, "not-a-number");
         assert_eq!(slow_write_threshold(), Some(SLOW_WRITE_THRESHOLD));
-        std::env::remove_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV);
+        crate::test_process::remove_var(SLOW_WRITE_THRESHOLD_MS_OVERRIDE_ENV);
     }
 
     #[test]

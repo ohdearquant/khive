@@ -54,6 +54,9 @@ pub mod writer_task;
 #[cfg(test)]
 mod writer_busy_fixture;
 
+#[cfg(test)]
+mod test_process;
+
 pub use backend::StorageBackend;
 pub use checkpoint::{
     checkpoint_once, run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner,
