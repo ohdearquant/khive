@@ -2332,3 +2332,177 @@ The multiple-root limitation (#3752) remains outside the whole-owner guarantee.
 Ratifying this amendment, with Amendment 14, releases the dependent recovery
 change (#3736) to its normal review. No implementation or native acceptance is
 asserted by this amendment.
+
+## Amendment 16 (2026-10-03): retained declaration and edge observations gate L2 reuse
+
+**Status: Proposed.**
+
+This amendment addresses the remaining manifest-governed case of #3752.
+
+**Amends:** Amendment 14's unchanged-file reuse prerequisite and its deferred
+multiple-root and restored-file strands; Amendment 15's retained multiple-root
+exclusion and its unconditional whole-invocation fast-path acceptance. **Retains:**
+B5 observation semantics, deterministic owner/module/symbol
+identities, marker shape, opaque time comparison, sequential-only recovery,
+fallback refusal of reuse authority, pending-write ordering, the existing secret
+gate and every other rule of Amendments 14 and 15. No stored root provenance,
+property, schema, lease, serialization or clock ordering is introduced.
+
+### Superseded deferrals and acceptance
+
+The following accepted text remains recorded above. This amendment replaces the
+listed deferrals, narrows Amendment 14's completed-predecessor fast path with the
+declaration and edge prerequisite, and replaces the quoted Amendment 15 acceptance
+below:
+
+- Amendment 14: “Their existing stale-edge strand after an otherwise completed
+  invocation remains a known limitation outside this amendment.” A restored file
+  whose retained declaration observations fail the new prerequisite must now
+  re-observe its actual source.
+- Amendment 14's multiple-root paragraph: “This is a known limitation, tracked as
+  #3752.” Manifest-governed roots sharing an owner now obey the same per-file
+  observation prerequisite; completion still describes the invocation's observed
+  coverage and grants no observation of an unvisited root.
+- Amendment 14's acceptance: “A skipped-file fixture must retain, rather than
+  conceal, the known stale-edge limitation.” Retain the actual read refusal and
+  durable completion assertions, then prove real re-observation of a restored
+  file when the prerequisite fails instead of retaining the final stale strand.
+- Amendment 15: “The multiple-root limitation (#3752) remains outside the
+  whole-owner guarantee.” The prerequisite now governs that remaining case.
+
+Amendment 15 also contains this acceptance requirement:
+
+```text
+- A manifest-governed whole invocation followed by an unchanged whole invocation
+  still writes its completed marker and takes the unchanged-file fast path.
+```
+
+Replace that acceptance with: A manifest-governed whole invocation followed by an
+unchanged whole invocation still writes its completed marker. Each unchanged file
+takes the unchanged-file fast path only when its retained declaration and outgoing
+derived-edge observations satisfy this amendment's prerequisites; otherwise it
+re-observes actual source through the existing read, parse and re-resolution path.
+
+### Decision and current-coverage proof
+
+An unchanged file may refresh retained declarations only when every retained row
+has a canonical code declaration kind, belongs to the file's existing owner and
+language, and carries `last_seen_at` exactly equal to that owner/language's
+captured completed predecessor stamp. Check all retained rows before refreshing
+any of them. Also require every live outgoing `depends_on` or `implements` edge
+from those retained IDs with `l2_derived: true` to carry that exact predecessor
+observation. This includes an edge whose target was not visited by another root:
+partially shared declaration identities alone cannot prove prior edge coverage.
+Other relations, soft-deleted edges and edges without boolean `l2_derived: true`
+do not block reuse. A caller-authored edge marked derived follows that same rule;
+an ordinary manual edge does not. No target history is made current by the audit.
+Compare the existing serialized observations as opaque text; do not
+parse, normalize or order timestamps. Recheck declaration kind, owner/language and
+observation against the fresh row inside each guarded declaration mutation. After
+those mutations, repeat the live edge audit with fresh graph reads before
+returning reusable authority. These are separate observations, not a transaction
+across entity and edge rows or a guarantee against concurrent owner writers.
+A missing declaration or audited edge, invalid predicate or refused refresh
+selects the existing actual source
+parse/persist/re-resolution path for that file. A storage error retains its
+existing error and committed-prefix behavior.
+
+Successful reuse stamps every retained declaration with this invocation's
+observation before marking its declarations current and unchanged. Successful
+parse stamps each allowed observed declaration and records only those retained
+declaration IDs before marking them current. Thus, after one completed invocation,
+every retained declaration marked current for its owner/language has this
+invocation's stamp, including declarations of reused files. No second repair
+ingest is required to establish that coverage. This remains a sequential
+guarantee, not authority over overlapping writers.
+
+Filtered, missing, outside-root, unreadable and parse-refused files supply no
+current declarations. Their unobserved history remains historical; a later
+encounter retries ordinary read/parse checks, and a successful read follows the
+new prerequisite or existing missing-coverage reparse rule. A persistent refusal
+never becomes observation. Gate-refused declarations and descendants of a
+gate-refused inline module remain outside retained current coverage. When a
+successful parse records only an allowed subset, an unchanged later invocation
+can reuse that subset; clearing the gate refusal alone does not force discovery
+of an excluded declaration. A subsequent real parse retries it under existing
+gate rules. Gate-refused scaffolding or ownership writes can leave unusable
+coverage and force repeated parsing on later invocations. Another unvisited root
+does not gain current declarations; its next successful encounter must satisfy
+the prerequisite or reparse. Files with successful empty declaration sets remain
+valid observed empty coverage.
+
+Natural unchanged-edge refresh keeps **both** existing exact predecessor-stamp
+checks, the `l2_derived` checks and current same-owner endpoint authority. A
+reparsed file republishes only references the scanner actually observes and
+resolves. Removed references, unobserved deleted rows and manually authored edges
+remain historical. Inbound `contains` refresh retains its existing predicates.
+No historical timestamp range is made eligible.
+
+### Cost and boundaries
+
+Reuse checking applies to every unchanged project file encountered by the
+invocation, so refresh work scales with all those files. Successful reuse of a
+nonempty retained declaration set performs two outgoing-edge audits, before and
+after the guarded declaration writes. Each audit calls `GraphStore::batch_neighbors`
+and `GraphStore::get_edges`: four graph capability calls in total. Physical SQLite
+SELECT counts depend on the declaration and edge-hydration chunks; an audit with no
+matching outgoing edges has no edge-hydration SELECT. Empty declaration sets issue
+no graph read, and an earlier declaration refusal or failed first audit prevents
+later audits. A successful warm same-root repeat still writes every retained
+declaration with that invocation's observation.
+
+With different non-empty retained declaration identities and different sweep-time
+strings, each alternating manifest-governed A/B invocation sharing an owner finds
+the visited root's declarations different from the completed predecessor and
+reparses its encountered files. That cost persists for every such alternation;
+the first return alone is insufficient acceptance evidence. One immediately
+repeated same-root invocation can reuse the now-current retained declarations.
+No measurement of how often shared owners occur in practice is claimed.
+
+Root alternation alone is not an unconditional prohibition on reuse. Empty sets
+satisfy the all-declaration predicate vacuously. Identical module/declaration
+identities with unchanged bytes can share refreshed declaration and edge rows.
+Repeated identical
+opaque sweep-time strings can satisfy equality even for different declarations.
+These cases retain the accepted identity, empty-coverage and opaque-time rules;
+they do not introduce root provenance. Partially aliased declarations must still
+pass both edge audits. A file that retains a removed live derived natural edge
+whose historical observation differs from the captured predecessor reparses on every unchanged
+ingest that sees that mismatch. This cost is permanent while successive
+predecessor stamps keep differing from that historical observation, for every
+owner, shared or not. No stored complete reference list exists to distinguish that
+history from an unobserved still-present reference. Missing or wrong-type edge
+observations likewise refuse reuse. Audit read errors retain the existing storage
+error type.
+
+### Acceptance
+
+Use real file-backed WAL and rollback DELETE runtimes and observe actual parser
+calls.
+
+- Manifest-governed A/proj/alpha.rs → B/proj/beta.rs → unchanged A/proj/alpha.rs
+  must reparse actual references and stamp its natural call and positive impl at
+  the new owner stamp without changing identity or evidence. Repeat alternation
+  at least twice more; each visited file parses once. Assert every retained
+  current declaration after one completed ingest and after warm same-root reuse.
+  Removing only the declaration observation prerequisite must fail the old-row
+  refusal assertion; removing the complete observation prerequisite must fail the
+  natural-edge timestamp assertion. Removing its guarded rebase recheck must fail a separate
+  real changed-row witness.
+- With identical common.rs callers in both roots but an exclusive alpha.rs target
+  in A, A T10/B T20/A T30 must really re-observe the shared caller's cross-file
+  reference. Removing both edge audits must fail that natural-call timestamp.
+  Change an audited edge after the declaration read pause and before its guarded
+  write resumes: the final fresh audit must force real parsing. Removing only
+  that final audit must fail the edge timestamp assertion.
+- Distinct manifest owners and completed same-root invocations keep reuse.
+  Pin empty/aliased/repeated-stamp cost boundaries with actual source files.
+  Preserve Amendment 15's real fallback reparse arms.
+- Restore a file after an actual read refusal and completed sweep with a
+  different stamp: parse actual source and refresh only observed references.
+  A removed call, an unobserved deleted edge and a manual edge must remain
+  unchanged. Pin the permanent repeated-parse cost of retained removed live
+  natural history. Independent direct edge-refresh predecessor-filter and derived-filter controls must
+  each fail their corresponding historical-row assertion.
+- Preserve Amendment 14's committed-fault/cancellation recovery, mixed-stamp
+  re-observation, strict marker and completion/FTS durability acceptance.
