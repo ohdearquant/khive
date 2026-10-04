@@ -271,7 +271,7 @@ def main():
             + "\n".join(f"  - {error}" for error in documented_count_errors)
         )
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 14 production packs and exposes 144 MCP-callable verbs
+        # unset) loads 14 production packs and exposes 145 MCP-callable verbs
         # (count what verbs() returns, not internal dispatch arms). The session
         # pack contributes seven verbs: 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -310,8 +310,8 @@ def main():
         # exec nine (the tool registry with use policy and sandboxed runs over trees).
         # Update this number when the pack set or verb surface changes; a
         # silent drift here is the bug this assertion exists to catch.
-        assert verbs_result["total"] == 144, (
-            f"expected 144 user-facing verbs from the 14 default packs "
+        assert verbs_result["total"] == 145, (
+            f"expected 145 user-facing verbs from the 14 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083 plus dependency-gated transcript search, stats and vacuum; "
             f"context is the 17th kg-substrate bare verb per ADR-089; "
@@ -354,6 +354,9 @@ def main():
         )
         assert "comm.delivered" in verb_names, (
             f"'comm.delivered' (#1447) must appear in verbs listing: {verb_names}"
+        )
+        assert "comm.transport_status" in verb_names, (
+            f"comm.transport_status must appear in verbs listing: {verb_names}"
         )
         assert "comm.mark_read" in verb_names, (
             f"'comm.mark_read' (#1387) must appear in verbs listing: {verb_names}"

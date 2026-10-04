@@ -125,11 +125,12 @@ async fn pack_registered_message_notes_are_queryable_through_gql() {
 }
 
 #[test]
-fn comm_pack_declares_fifteen_handlers() {
+fn comm_pack_declares_sixteen_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        15,
-        "comm pack must declare 15 handlers: send, delivered, inbox, read, mark_read, unread, reply, \
+        16,
+        "comm pack must declare 16 handlers: send, delivered, transport_status, inbox, read, \
+         mark_read, unread, reply, \
          thread, ingest, cleanup_expired_quarantine, heartbeat, health, probe, cursor_get, cursor_commit \
          (khive #1387, #1447, #449, #66)"
     );
@@ -139,6 +140,7 @@ fn comm_pack_declares_fifteen_handlers() {
         names.contains(&"comm.delivered"),
         "comm.delivered verb must be registered (khive #1447)"
     );
+    assert!(names.contains(&"comm.transport_status"));
     assert!(names.contains(&"comm.inbox"));
     assert!(names.contains(&"comm.read"));
     assert!(
@@ -16739,5 +16741,190 @@ async fn wire_ingest_cannot_select_verified_recipient_commit() {
             })
             .unwrap();
         assert_eq!(count, 0, "wire parameters must not select verified ingest");
+    }
+}
+
+mod transport_status_tests {
+    use super::*;
+    use khive_runtime::comm_transport::{
+        FailureClass, SenderAssurance, SenderEnvelope, TransportState,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn envelope(outbound_note_id: Uuid) -> SenderEnvelope {
+        SenderEnvelope {
+            namespace: "local".into(),
+            logical_message_id: Uuid::new_v4(),
+            outbound_note_id,
+            kind: "khive".into(),
+            slug: "device".into(),
+            credential_ref: "keys/device".into(),
+            recipient_address: format!("khive1:example/{}", Uuid::nil()),
+            protocol_version: 1,
+            sender_agent_id: Uuid::new_v4().to_string(),
+            sender_assurance: SenderAssurance::Claimed,
+            recipient_agent_id: Uuid::nil().to_string(),
+            recipient_device_id: Uuid::new_v4(),
+            recipient_key_epoch: 1,
+            contact_generation: 1,
+            sender_key_epoch: 1,
+            recipient_key_fingerprint: "ab".repeat(32),
+            enc: vec![1; 32],
+            ciphertext: vec![2, 0, 255],
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dispatch_returns_exact_status_object_and_full_uuid_in_agent_mode() {
+        let (registry, runtime) = build_registry();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let e = envelope(Uuid::new_v4());
+        runtime
+            .create_sender_transport(&token, e.clone())
+            .await
+            .unwrap();
+        let response = registry
+            .dispatch("comm.transport_status", json!({"id": e.outbound_note_id}))
+            .await
+            .unwrap();
+        let expected = json!({"id": e.outbound_note_id, "status": "pending"});
+        assert_eq!(
+            response, expected,
+            "the real dispatch returns exactly two fields"
+        );
+        let handler = CommPack::HANDLERS
+            .iter()
+            .find(|h| h.name == "comm.transport_status")
+            .unwrap();
+        assert_eq!(handler.visibility, Visibility::Verb);
+        assert_eq!(handler.category, khive_types::VerbCategory::Assertive);
+        assert_eq!(
+            khive_runtime::presentation::present_with_policy(
+                response,
+                khive_runtime::presentation::PresentationMode::Agent,
+                0,
+                handler.presentation_policy(),
+            ),
+            expected,
+            "Agent presentation preserves the canonical outbound UUID"
+        );
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            registry
+                .dispatch("comm.transport_status", json!({"id": unknown}))
+                .await
+                .unwrap(),
+            json!({"id": unknown, "status": "unknown"})
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn dispatch_refuses_short_uuid_and_normalizes_complete_spellings() {
+        let (registry, _) = build_registry();
+        let id = Uuid::new_v4();
+        let error = registry
+            .dispatch("comm.transport_status", json!({"id": &id.to_string()[..8]}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            khive_runtime::RuntimeError::InvalidInput(_)
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("short prefix")
+                && message.contains("scoped resolution")
+                && message.contains("full outbound UUID"),
+            "{message}"
+        );
+        assert_eq!(
+            registry
+                .dispatch(
+                    "comm.transport_status",
+                    json!({"id": format!("  {}  ", id.simple().to_string().to_uppercase())})
+                )
+                .await
+                .unwrap(),
+            json!({"id": id, "status": "unknown"})
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
+    async fn delivered_ignores_failed_and_recipient_stored_transport_rows() {
+        let (registry, runtime) = build_registry();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        // One real dual-write and one UUID with no internal sibling pin both outcomes.
+        let sent = registry
+            .dispatch(
+                "comm.send",
+                json!({"to": "agent:recipient", "content": "transport independence"}),
+            )
+            .await
+            .unwrap();
+        let sent_id = Uuid::parse_str(sent["full_id"].as_str().unwrap()).unwrap();
+        for (id, count) in [(sent_id, 1), (Uuid::new_v4(), 0)] {
+            let expected = json!({
+                "id": id,
+                "status": if count > 0 { "delivered" } else { "undelivered" },
+                "delivered": count > 0,
+                "inbound_count": count,
+            });
+            let before = registry
+                .dispatch("comm.delivered", json!({"id": id}))
+                .await
+                .unwrap();
+            assert_eq!(before, expected, "the internal sibling fixture is real");
+            let e = envelope(id);
+            runtime
+                .create_sender_transport(&token, e.clone())
+                .await
+                .unwrap();
+            runtime
+                .record_sender_transport_failure(e.key(), FailureClass::Permanent, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.delivered", json!({"id": id}))
+                    .await
+                    .unwrap(),
+                before,
+                "a failed transport row cannot alter dual-write confirmation"
+            );
+            // The trusted store boundary is sufficient here: signature verification is
+            // exercised by the runtime status matrix, not by this independent read.
+            let receipt = json!({
+                "binding": {
+                    "protocol_version": e.protocol_version,
+                    "logical_message_id": e.logical_message_id,
+                    "sender_agent_id": e.sender_agent_id,
+                    "recipient_agent_id": e.recipient_agent_id,
+                    "recipient_device_id": e.recipient_device_id,
+                    "recipient_key_epoch": e.recipient_key_epoch,
+                    "contact_generation": e.contact_generation,
+                    "delivery_attempt_id": Uuid::new_v4(),
+                },
+                "disposition": "stored",
+                "signature": [1],
+            });
+            khive_db::stores::note::transport::SenderTransportStore::new(
+                runtime.backend().pool_arc(),
+            )
+            .accept_receipt(e.key(), TransportState::RecipientStored, receipt)
+            .await
+            .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.delivered", json!({"id": id}))
+                    .await
+                    .unwrap(),
+                before,
+                "a recipient-stored transport row cannot alter dual-write confirmation"
+            );
+        }
     }
 }
