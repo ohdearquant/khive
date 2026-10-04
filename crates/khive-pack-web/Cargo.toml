@@ -16,6 +16,7 @@ khive-types = { version = "0.9.0", path = "../khive-types", features = ["serde"]
 khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
 khive-storage = { version = "0.9.0", path = "../khive-storage" }
 khive-db = { version = "0.9.0", path = "../khive-db" }
+khive-fs = { version = "0.9.0", path = "../khive-fs" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

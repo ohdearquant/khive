@@ -2828,6 +2828,7 @@ dependencies = [
  "flate2",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",

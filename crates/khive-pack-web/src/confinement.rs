@@ -76,12 +76,12 @@ mod platform {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod platform {
     use super::*;
-    use std::ffi::{CStr, CString, OsStr, OsString};
+    use std::ffi::{OsStr, OsString};
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Component;
+
+    use khive_fs::fd_relative::{list_names, open_at, stat_at, stat_fd};
 
     enum AdmissionError {
         DescriptorExhausted { path: PathBuf, error: io::Error },
@@ -138,40 +138,6 @@ mod platform {
         ancestry: Vec<(PathBuf, Identity)>,
     }
 
-    fn c_name(name: &OsStr) -> io::Result<CString> {
-        CString::new(name.as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))
-    }
-
-    fn stat_fd(file: &File) -> io::Result<libc::stat> {
-        let mut stat = std::mem::MaybeUninit::uninit();
-        // SAFETY: file owns a live descriptor and stat is a writable out-parameter.
-        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful fstat initialized the entire structure.
-        Ok(unsafe { stat.assume_init() })
-    }
-
-    fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
-        let name = c_name(name)?;
-        let mut stat = std::mem::MaybeUninit::uninit();
-        // SAFETY: parent is live, name is terminated, and stat is writable.
-        if unsafe {
-            libc::fstatat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: successful fstatat initialized the structure.
-        Ok(unsafe { stat.assume_init() })
-    }
-
     fn check_type(stat: &libc::stat, path: &Path) -> Result<bool, AdmissionError> {
         match stat.st_mode & libc::S_IFMT {
             libc::S_IFDIR => Ok(true),
@@ -197,26 +163,11 @@ mod platform {
         before_open: &mut dyn FnMut(&Path),
     ) -> Result<File, AdmissionError> {
         let directory = check_type(checked, path)?;
-        let name =
-            c_name(name).map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?;
         before_open(path);
-        // O_NONBLOCK prevents a raced-in FIFO from blocking before fstat rejects it.
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if directory { libc::O_DIRECTORY } else { 0 };
-        // SAFETY: parent is live and name contains exactly one terminated component.
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(io_refusal(
-                "ingest_path_changed",
-                path,
-                io::Error::last_os_error(),
-            ));
-        }
-        // SAFETY: successful openat returned a uniquely owned descriptor.
-        let opened = unsafe { File::from_raw_fd(fd) };
+        // open_at sets O_NONBLOCK, which prevents a raced-in FIFO from blocking before
+        // fstat rejects it.
+        let opened = open_at(parent, name, directory)
+            .map_err(|error| io_refusal("ingest_path_changed", path, error))?;
         let actual = stat_fd(&opened)
             .map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?;
         if Identity::from(checked) != Identity::from(&actual)
@@ -298,62 +249,12 @@ mod platform {
         })
     }
 
-    struct DirStream(*mut libc::DIR);
-
-    impl Drop for DirStream {
-        fn drop(&mut self) {
-            // SAFETY: this wrapper uniquely owns the successful fdopendir result.
-            unsafe { libc::closedir(self.0) };
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    fn errno_location() -> *mut libc::c_int {
-        // SAFETY: the accessor returns the current thread's live errno cell.
-        unsafe { libc::__error() }
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    fn errno_location() -> *mut libc::c_int {
-        // SAFETY: the accessor returns the current thread's live errno cell.
-        unsafe { libc::__errno_location() }
-    }
-
     fn names(directory: &File, path: &Path) -> Result<Vec<OsString>, AdmissionError> {
         let checked = stat_fd(directory)
             .map_err(|error| io_refusal("ingest_path_unresolvable", path, error))?;
         // Reopen '.' for an independent directory position; dup would share its offset.
         let reopened = open_checked(directory, OsStr::new("."), path, &checked, &mut |_| {})?;
-        let fd = reopened.into_raw_fd();
-        // SAFETY: fd is uniquely owned and fdopendir takes ownership on success.
-        let stream = unsafe { libc::fdopendir(fd) };
-        if stream.is_null() {
-            let error = io::Error::last_os_error();
-            // SAFETY: fdopendir failed, so ownership of fd remains here.
-            unsafe { libc::close(fd) };
-            return Err(io_refusal("ingest_read_failed", path, error));
-        }
-        let stream = DirStream(stream);
-        let mut result = Vec::new();
-        loop {
-            // SAFETY: errno is thread-local; stream remains live until this function returns.
-            unsafe { *errno_location() = 0 };
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(0) {
-                    return Err(io_refusal("ingest_read_failed", path, error));
-                }
-                break;
-            }
-            // SAFETY: d_name is terminated and copied before the next readdir call.
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
-                result.push(OsString::from_vec(name.to_vec()));
-            }
-        }
-        result.sort();
-        Ok(result)
+        list_names(&reopened).map_err(|error| io_refusal("ingest_read_failed", path, error))
     }
 
     fn walk(
