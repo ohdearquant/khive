@@ -811,6 +811,8 @@ async fn index_entity(
         .map_err(|e| CodeSourceIngestError::Storage(format!("entity FTS indexing: {e}")))?;
     #[cfg(test)]
     l2_batch_tests::observe_fts_write(entity.id);
+    #[cfg(test)]
+    l2_recovery_tests::observe_fts_write();
     report.fts_indexed += 1;
     Ok(())
 }
@@ -904,6 +906,8 @@ where
         if let Some(outcome) = outcome {
             #[cfg(test)]
             l2_batch_tests::observe_row_write(id);
+            #[cfg(test)]
+            l2_recovery_tests::after_entity_commit(&replacement);
             index_entity(rt, token, &replacement, report).await?;
             return Ok(outcome);
         }
@@ -959,6 +963,8 @@ where
                 .then_some(RowMutationOutcome::Created)
         };
         if let Some(outcome) = outcome {
+            #[cfg(test)]
+            l2_recovery_tests::after_edge_commit(id).await;
             return Ok(outcome);
         }
     }
@@ -1012,9 +1018,8 @@ fn ts(dt: DateTime<Utc>) -> i64 {
     dt.timestamp_micros()
 }
 
-/// Capture the old project/language clock before any tier in this invocation
-/// advances it. A missing or malformed clock cannot authorize refreshing
-/// historical L2 edges.
+/// Capture completed predecessor authority before any selected tier advances
+/// the visible project clock (ADR-085 Amendments 14 and 15).
 async fn capture_previous_l2_sweep_stamp(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1026,23 +1031,17 @@ async fn capture_previous_l2_sweep_stamp(
         source_project: name.to_string(),
         language: language.to_string(),
     };
-    if previous_stamps.contains_key(&owner) {
+    if previous_stamps.stamps.contains_key(&owner) {
         return Ok(());
     }
     let stamp = get_entity_opt(rt, token, project_uuid(name))
         .await?
         .and_then(|project| {
-            project
-                .properties
-                .and_then(|properties| properties.get("sweep_clock").cloned())
-                .and_then(|clock| {
-                    clock
-                        .get(language)
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
+            project.properties.as_ref().and_then(|properties| {
+                completed_l2_sweep_stamp(properties, language).map(str::to_string)
+            })
         });
-    previous_stamps.insert(owner, stamp);
+    previous_stamps.stamps.insert(owner, stamp);
     Ok(())
 }
 
@@ -1091,6 +1090,31 @@ async fn upsert_project(
         props.insert("source_project".into(), json!(name));
         props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
         props.insert("sweep_clock".into(), Value::Object(sweep_clock));
+        if capture_previous_l2_sweep {
+            let mut runs = props
+                .get("l2_sweep_runs")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let completed = runs
+                .get(language)
+                .filter(|entry| valid_l2_sweep_entry(entry))
+                .and_then(|entry| entry.get("completed"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            runs.insert(
+                language.to_string(),
+                json!({
+                    "version": 1,
+                    "attempted": {
+                        "run_id": previous_l2_sweep_stamps.run_id.to_string(),
+                        "sweep_time": sweep_time.to_rfc3339(),
+                    },
+                    "completed": completed,
+                }),
+            );
+            props.insert("l2_sweep_runs".into(), Value::Object(runs));
+        }
         entity.id = id;
         entity.namespace = token.namespace().as_str().to_string();
         entity.kind = "project".to_string();
@@ -1146,7 +1170,7 @@ async fn ensure_project_id(
         file_label,
         language,
         sweep_time,
-        per_language_project_stamps,
+        per_language_project_stamps && language == "rust",
         previous_l2_sweep_stamps,
         report,
     )
@@ -2350,7 +2374,7 @@ pub async fn run_code_ingest(
                 &file_label,
                 m.language,
                 opts.sweep_time,
-                opts.enable_l2,
+                opts.enable_l2 && m.language == "rust",
                 &mut previous_l2_sweep_stamps,
                 &mut report,
             )
@@ -2480,6 +2504,17 @@ pub async fn run_code_ingest(
             opts.sweep_time,
             &previous_l2_sweep_stamps,
             &mut state,
+            &mut report,
+        )
+        .await?;
+        #[cfg(test)]
+        l2_recovery_tests::before_completion().await;
+        complete_l2_sweeps(
+            rt,
+            token,
+            opts.sweep_time,
+            &previous_l2_sweep_stamps,
+            &state,
             &mut report,
         )
         .await?;
@@ -2736,10 +2771,76 @@ struct L2OwnerKey {
     language: String,
 }
 
-type PreviousL2SweepStamps = HashMap<L2OwnerKey, Option<String>>;
+struct PreviousL2SweepStamps {
+    run_id: Uuid,
+    stamps: HashMap<L2OwnerKey, Option<String>>,
+}
+
+impl PreviousL2SweepStamps {
+    fn new() -> Self {
+        Self {
+            run_id: Uuid::new_v4(),
+            stamps: HashMap::new(),
+        }
+    }
+
+    fn get(&self, owner: &L2OwnerKey) -> Option<&Option<String>> {
+        self.stamps.get(owner)
+    }
+}
+
+fn valid_l2_run_marker(marker: &Value) -> bool {
+    let Some(fields) = marker.as_object() else {
+        return false;
+    };
+    if fields.len() != 2 || fields.get("sweep_time").and_then(Value::as_str).is_none() {
+        return false;
+    }
+    fields
+        .get("run_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| {
+            Uuid::parse_str(id).is_ok_and(|uuid| {
+                uuid.get_version() == Some(uuid::Version::Random)
+                    && uuid.get_variant() == uuid::Variant::RFC4122
+                    && uuid.to_string() == id
+            })
+        })
+}
+
+fn valid_l2_sweep_entry(entry: &Value) -> bool {
+    entry.as_object().is_some_and(|fields| {
+        fields.len() == 3
+            && fields.get("version").and_then(Value::as_u64) == Some(1)
+            && fields.get("attempted").is_some_and(valid_l2_run_marker)
+            && fields
+                .get("completed")
+                .is_some_and(|marker| marker.is_null() || valid_l2_run_marker(marker))
+    })
+}
+
+fn completed_l2_sweep_stamp<'a>(properties: &'a Value, language: &str) -> Option<&'a str> {
+    let entry = properties
+        .get("l2_sweep_runs")?
+        .as_object()?
+        .get(language)?;
+    if !valid_l2_sweep_entry(entry) || entry.get("completed")? != entry.get("attempted")? {
+        return None;
+    }
+    let stamp = entry.get("completed")?.get("sweep_time")?.as_str()?;
+    (properties.get("sweep_clock")?.get(language)?.as_str()? == stamp).then_some(stamp)
+}
+
+#[derive(Debug)]
+struct L2OwnerCoverage {
+    whole: bool,
+    fallback: bool,
+    file_label: String,
+}
 
 #[derive(Debug, Default)]
 struct L2SweepState {
+    owners: HashMap<L2OwnerKey, L2OwnerCoverage>,
     /// Declarations proven current by this L2 invocation, never ambient
     /// ownership left by a prior sweep or an earlier tier in this call.
     current_declarations: HashMap<Uuid, L2OwnerKey>,
@@ -2751,6 +2852,51 @@ struct L2SweepState {
     /// Natural L2 dependency/implementation edges successfully stamped this
     /// sweep; this set is the authority for `symbol_edges_stamped`.
     stamped_edge_ids: BTreeSet<Uuid>,
+}
+
+async fn complete_l2_sweeps(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    sweep_time: DateTime<Utc>,
+    previous_stamps: &PreviousL2SweepStamps,
+    state: &L2SweepState,
+    report: &mut CodeSourceIngestReport,
+) -> Result<(), CodeSourceIngestError> {
+    let run_id = previous_stamps.run_id.to_string();
+    for (owner, coverage) in &state.owners {
+        if !coverage.whole || coverage.fallback {
+            continue;
+        }
+        let outcome = mutate_entity(
+            rt,
+            token,
+            project_uuid(&owner.source_project),
+            &coverage.file_label,
+            report,
+            |current| {
+                let mut entity = current?.clone();
+                let props = entity.properties.as_mut()?.as_object_mut()?;
+                let runs = props.get_mut("l2_sweep_runs")?.as_object_mut()?;
+                let entry = runs.get_mut(&owner.language)?;
+                if !valid_l2_sweep_entry(entry)
+                    || entry["attempted"]["run_id"].as_str() != Some(run_id.as_str())
+                {
+                    return None;
+                }
+                entry["completed"] = json!({
+                    "run_id": run_id,
+                    "sweep_time": sweep_time.to_rfc3339(),
+                });
+                entity.updated_at = ts(sweep_time);
+                Some(entity)
+            },
+        )
+        .await?;
+        if outcome.wrote() {
+            report.projects_updated += 1;
+        }
+    }
+    Ok(())
 }
 
 impl L2SweepState {
@@ -4092,17 +4238,48 @@ async fn run_l2_sweep(
     record_manifest_failures(report, failures);
     let manifest_index = manifest::ManifestIndex::new(&manifests);
 
-    for file in files {
-        let Some(file_dir) = file.parent() else {
-            continue;
-        };
-        let governing = manifest_index.governing(file_dir, &canonical_ingest_root, LANGUAGE);
-        let (proj_root, proj_name) = governing.unwrap_or_else(|| {
-            (
-                canonical_ingest_root.clone(),
-                basename_project_name(ingest_root),
-            )
-        });
+    // Resolve every encountered owner before any unchanged-file decision.
+    // A later fallback file disqualifies the owner for the whole invocation,
+    // including files encountered earlier through a governing manifest.
+    let files: Vec<_> = files
+        .into_iter()
+        .filter_map(|file| {
+            let governing =
+                manifest_index.governing(file.parent()?, &canonical_ingest_root, LANGUAGE);
+            let fallback = governing.is_none();
+            let (proj_root, proj_name) = governing.unwrap_or_else(|| {
+                (
+                    canonical_ingest_root.clone(),
+                    basename_project_name(ingest_root),
+                )
+            });
+            let owner = L2OwnerKey {
+                source_project: proj_name.clone(),
+                language: LANGUAGE.to_string(),
+            };
+            let whole = proj_root.starts_with(&canonical_ingest_root);
+            state
+                .owners
+                .entry(owner.clone())
+                .and_modify(|coverage| {
+                    coverage.whole &= whole;
+                    coverage.fallback |= fallback;
+                })
+                .or_insert_with(|| L2OwnerCoverage {
+                    whole,
+                    fallback,
+                    file_label: file.display().to_string(),
+                });
+            if fallback {
+                // This also discards authority captured by an earlier L1 or
+                // L1.5 upsert. Completion retention is a separate decision.
+                previous_l2_sweep_stamps.stamps.insert(owner, None);
+            }
+            Some((file, proj_root, proj_name))
+        })
+        .collect();
+
+    for (file, proj_root, proj_name) in files {
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, LANGUAGE) else {
             report.files_skipped_without_module_path += 1;
             continue;
@@ -4135,6 +4312,8 @@ async fn run_l2_sweep(
 
         let file_for_read = file.clone();
         let root_for_read = canonical_ingest_root.clone();
+        #[cfg(test)]
+        l2_recovery_tests::before_source_read(&file).await;
         let source =
             match blocking_io(move || read_l2_source(&root_for_read, &file_for_read)).await? {
                 Ok(source) => source,
@@ -4148,7 +4327,16 @@ async fn run_l2_sweep(
 
         let precomputed_module_id = module_uuid(&proj_name, LANGUAGE, &module_path);
         let existing_module = get_entity_opt(rt, token, precomputed_module_id).await?;
-        let needs_reparse = refused
+        let owner = L2OwnerKey {
+            source_project: proj_name.clone(),
+            language: LANGUAGE.to_string(),
+        };
+        let recovering = previous_l2_sweep_stamps
+            .get(&owner)
+            .and_then(Option::as_ref)
+            .is_none();
+        let needs_reparse = recovering
+            || refused
             || l2_needs_reparse(
                 existing_module
                     .as_ref()
@@ -4232,7 +4420,12 @@ async fn run_l2_sweep(
 
         clear_l2_ownership(rt, token, module_id, &file_label, report).await?;
         let parse_result = match source {
-            L2Source::Ready { content, .. } => parse_rust_file_on_worker(content).await,
+            L2Source::Ready { content, .. } => {
+                let result = parse_rust_file_on_worker(content).await;
+                #[cfg(test)]
+                l2_recovery_tests::observe_parse(&file);
+                result
+            }
             L2Source::Refused { reason, .. } => Err(reason),
         };
         if let Some(declaration_ids) = persist_l2_file(
@@ -4740,6 +4933,9 @@ mod reresolve_projection_tests;
 
 #[cfg(test)]
 mod l2_batch_tests;
+
+#[cfg(test)]
+mod l2_recovery_tests;
 
 #[cfg(test)]
 mod tests {

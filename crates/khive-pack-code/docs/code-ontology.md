@@ -126,6 +126,27 @@ success for an unsearchable map. Point a normal `kkernel` process at the map thr
 `neighbors`, `traverse`, and `context`. `kkernel code-audit` remains the separate policy-driven,
 read-only report surface for the same database.
 
+L2 recovery records versioned `l2_sweep_runs` entries on each participating project, keyed by
+language. A fresh UUID v4 identifies an invocation independently of its caller-supplied time.
+The attempted marker shares the project mutation that advances `sweep_clock`. Without a valid,
+matching completed predecessor and visible clock, encountered files execute the real parsing,
+persistence and resolution path even when their hashes match. A completed predecessor retains
+the unchanged-file fast path and the exact predecessor-stamp guard for natural edges; recovery
+does not promote removed references, manual edges or unvisited files.
+
+Completion follows all file, pending-write, resolution and edge-refresh work. Only a whole
+manifest-governed owner may complete. Reaching an owner through the directory-name fallback
+disqualifies that owner for the entire invocation: it neither reuses a predecessor nor publishes
+completion, and therefore pays the real re-observation cost on each call. No-L2 calls write no
+L2 markers. A successful completion adds one guarded project mutation, one `projects_updated`
+and one successful `fts_indexed` write, with the corresponding entity revision/version advance.
+
+These guarantees cover sequential invocations, not overlapping writers. A completion row can
+commit before its following FTS write fails: the caller receives the existing error while graph
+completion remains durable. Completion describes observed coverage, including existing read,
+parse and gate skips; skipped files' historical-edge strand and multiple project roots sharing
+one owner (#3752) remain outside the recovery guarantee. See ADR-085 Amendments 14 and 15.
+
 Before each guarded entity insert or replacement, source ingest rejects the runtime-owned
 top-level `khive:secret_gate` property using the shared reservation validator. This includes a
 property retained from an existing map row; reingestion cannot carry an unverified stamp into a
