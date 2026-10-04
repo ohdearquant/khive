@@ -229,6 +229,9 @@ fn assignments_rule_out_version(sql: &str) -> bool {
 fn test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         a.path().is_ident("test")
+            || (a.path().segments.len() == 2
+                && a.path().segments[0].ident == "tokio"
+                && a.path().segments[1].ident == "test")
             || (a.path().is_ident("cfg")
                 && a.parse_args::<syn::Path>()
                     .is_ok_and(|p| p.is_ident("test")))
@@ -722,6 +725,45 @@ fn note_version_scanner_controls() {
             "scanner must reject {source}"
         );
     }
+}
+
+#[test]
+fn note_version_scanner_skips_tokio_tests_but_keeps_async_writers() {
+    let mut scanner = Scanner::default();
+    scanner.visit_file(
+        &syn::parse_file(
+            r#"
+        #[tokio::test]
+        async fn fixture() { call("UPDATE notes SET content='fixture'"); }
+        #[tokio::test(flavor = "current_thread")]
+        async fn configured_fixture() { call("UPDATE notes SET content='fixture'"); }
+        #[::tokio::test]
+        async fn absolute_fixture() { call("UPDATE notes SET content='fixture'"); }
+        async fn live() { call("UPDATE notes SET content='live'"); }
+        #[other::test]
+        async fn unknown_attribute() { call("UPDATE notes SET content='live'"); }
+        #[tokio::instrument]
+        async fn another_tokio_attribute() { call("UPDATE notes SET content='live'"); }
+        #[cfg(any(test, feature = "fault-injection"))]
+        async fn feature() { call("UPDATE notes SET content='live' WHERE 1=0"); }
+    "#,
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        scanner
+            .statements
+            .iter()
+            .map(|(owner, _)| owner.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "live",
+            "unknown_attribute",
+            "another_tokio_attribute",
+            "feature"
+        ],
+        "skip only the known Tokio test harness; retain every production-capable async writer"
+    );
 }
 
 #[test]
