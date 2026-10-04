@@ -85,8 +85,8 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
         1,
     ),
     (
-        "khive-runtime/src/curation.rs",
-        "reindex_note_with_plan",
+        "khive-runtime/src/curation/note_reindex.rs",
+        "reindex_note_outcome",
         "DELETE",
         "{table}",
         1,

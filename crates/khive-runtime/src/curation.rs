@@ -27,6 +27,9 @@ use crate::event_store_guard::EventAttribution;
 use crate::operations::{base_entity_rule_allows, canonical_edge_endpoints, endpoint_matches};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+#[path = "curation/note_reindex.rs"]
+mod note_reindex;
+
 /// Restrict an outbox scan before its SQL page bound is applied. A held row
 /// for another or unconfigured channel must not consume a channel's page.
 enum OutboxSlugFilter<'a> {
@@ -2081,170 +2084,6 @@ impl KhiveRuntime {
         Ok(report)
     }
 
-    /// Re-upsert FTS5 and kind-eligible vectors, removing excluded-model rows.
-    ///
-    /// Excluded-model cleanup is revision-guarded and fail-closed. Embedding
-    /// eligible models remains best-effort like entity reindexing.
-    pub(crate) async fn reindex_note(
-        &self,
-        token: &NamespaceToken,
-        note: &khive_storage::note::Note,
-    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
-        let embedding_plan = EmbeddingModelPlan::capture(self);
-        self.reindex_note_with_plan(token, note, &embedding_plan)
-            .await
-    }
-
-    async fn reindex_note_with_plan(
-        &self,
-        token: &NamespaceToken,
-        note: &khive_storage::note::Note,
-        embedding_plan: &EmbeddingModelPlan,
-    ) -> RuntimeResult<crate::retrieval::EmbeddingTruncationReport> {
-        let statements = khive_db::stores::text::delete_document_statements(
-            "fts_notes",
-            &note.namespace,
-            note.id,
-        )
-        .into_iter()
-        .chain(khive_db::stores::text::insert_document_statements(
-            "fts_notes",
-            &note_fts_document(note),
-        ))
-        .collect();
-        if !self.apply_note_index_revision(note, statements).await? {
-            return Ok(crate::retrieval::EmbeddingTruncationReport::default());
-        }
-        let mut report = crate::retrieval::EmbeddingTruncationReport::default();
-        let selected_models = self.embedding_models_for_note_kind(&note.kind);
-        // A kind policy can narrow after an earlier revision wrote vectors to
-        // every model. Remove those stale rows from every excluded table in
-        // the captured plan, under the same note-revision fence as FTS writes.
-        for model_name in embedding_plan
-            .model_names()
-            .iter()
-            .filter(|name| !selected_models.contains(*name))
-        {
-            // The vector table is created lazily. A missing table has no old
-            // row to remove, but preparing it also makes the guarded DML safe.
-            self.vectors_for_model(token, model_name)?;
-            let table = format!("vec_{}", crate::config::sanitize_key(model_name));
-            let model_key = table
-                .strip_prefix("vec_")
-                .expect("runtime vector tables use the vec_ prefix");
-            let subject = note.id.to_string();
-            // A selected and an excluded model may sanitize to the same table
-            // key. Check the stored model before touching either row or sidecar.
-            let statements = vec![
-                SqlStatement {
-                    sql: format!(
-                        "INSERT INTO ann_write_log \
-                     (namespace, embedding_model, kind, field, subject_id, op) \
-                     SELECT namespace, embedding_model, kind, field, subject_id, 'delete' \
-                     FROM {table} WHERE subject_id=?1 AND namespace=?2 AND embedding_model=?3"
-                    ),
-                    params: vec![
-                        SqlValue::Text(subject.clone()),
-                        SqlValue::Text(note.namespace.clone()),
-                        SqlValue::Text(model_name.clone()),
-                    ],
-                    label: Some("note-reindex-excluded-log-delete".into()),
-                },
-                SqlStatement {
-                    sql: format!(
-                        "DELETE FROM vector_provenance \
-                         WHERE model_key=?1 AND subject_id=?2 \
-                         AND EXISTS (SELECT 1 FROM {table} \
-                                     WHERE subject_id=?2 AND namespace=?3 AND embedding_model=?4)"
-                    ),
-                    params: vec![
-                        SqlValue::Text(model_key.to_string()),
-                        SqlValue::Text(subject.clone()),
-                        SqlValue::Text(note.namespace.clone()),
-                        SqlValue::Text(model_name.clone()),
-                    ],
-                    label: Some("note-reindex-excluded-provenance-delete".into()),
-                },
-                SqlStatement {
-                    sql: format!(
-                        "DELETE FROM {table} \
-                         WHERE subject_id=?1 AND namespace=?2 AND embedding_model=?3"
-                    ),
-                    params: vec![
-                        SqlValue::Text(subject),
-                        SqlValue::Text(note.namespace.clone()),
-                        SqlValue::Text(model_name.clone()),
-                    ],
-                    label: Some("note-reindex-excluded-vector-delete".into()),
-                },
-            ];
-            if !self.apply_note_index_revision(note, statements).await? {
-                return Ok(report);
-            }
-        }
-        for model_name in embedding_plan
-            .model_names()
-            .iter()
-            .filter(|name| selected_models.contains(*name))
-        {
-            match self
-                .embed_document_with_model_outcome_for_token(
-                    token,
-                    model_name,
-                    note_embedding_text_ref(note),
-                )
-                .await
-            {
-                Ok(outcome) => {
-                    report.observe(&outcome);
-                    match self.vectors_for_model(token, model_name) {
-                        Ok(_) => {
-                            if outcome.vector.iter().any(|value| !value.is_finite()) {
-                                tracing::warn!(model = model_name, id = %note.id, "reindex_note: non-finite vector, skipping model");
-                                continue;
-                            }
-                            let table = format!("vec_{}", crate::config::sanitize_key(model_name));
-                            let statements = crate::atomic_message::vector_insert_statements(
-                                &table,
-                                &note.namespace,
-                                note.id,
-                                "note.content",
-                                model_name,
-                                &outcome.vector,
-                                "note-reindex",
-                            )
-                            .into_iter()
-                            .map(|planned| planned.statement)
-                            .collect();
-                            if let Err(e) = self.apply_note_index_revision(note, statements).await {
-                                tracing::warn!(
-                                    model = model_name,
-                                    id = %note.id,
-                                    "reindex_note: vector insert failed, skipping model: {e}"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                model = model_name,
-                                id = %note.id,
-                                "reindex_note: could not access vector store for model, skipping: {e}"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        model = model_name,
-                        id = %note.id,
-                        "reindex_note: embed failed for model, skipping: {e}"
-                    );
-                }
-            }
-        }
-        Ok(report)
-    }
-
     /// Apply a note patch to exactly the supplied read snapshot without
     /// fetching the row again. The caller must persist it through
     /// [`Self::update_note_from_snapshot_with_embedding_report`] or a write
@@ -3636,16 +3475,21 @@ impl KhiveRuntime {
                     if crate::operations::consume_fts_fail_fault(&updated_note.namespace) {
                         Err(RuntimeError::Internal("injected FTS failure".to_string()))
                     } else {
-                        self.reindex_note_with_plan(token, &updated_note, &embedding_plan)
+                        self.reindex_note_outcome(token, &updated_note, &embedding_plan)
                             .await
                     };
                 #[cfg(not(any(test, feature = "fault-injection")))]
                 let reindex_result = self
-                    .reindex_note_with_plan(token, &updated_note, &embedding_plan)
+                    .reindex_note_outcome(token, &updated_note, &embedding_plan)
                     .await;
 
                 match reindex_result {
-                    Ok(report) => summary.embedding_truncation = report,
+                    Ok(outcome) => {
+                        summary.post_commit_reindex_error = outcome
+                            .error(updated_note.id)
+                            .map(|error| error.to_string());
+                        summary.embedding_truncation = outcome.truncation;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             into_id = %summary.kept_id,
@@ -14158,16 +14002,40 @@ mod tests {
             policy: NoteEmbeddingPolicy::DefaultModel,
         }]);
 
-        rt.update_note(
-            &tok,
-            note.id,
-            NotePatch {
-                content: Some("message after policy narrowing".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("best-effort default embed failure does not fail note update");
+        let error = rt
+            .update_note(
+                &tok,
+                note.id,
+                NotePatch {
+                    content: Some("message after policy narrowing".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("committed note update must disclose eligible default model failure")
+            .to_string();
+        assert!(
+            error.contains(&format!("model {primary_name} embedding")),
+            "{error}"
+        );
+        let changed = rt
+            .notes(&tok)
+            .unwrap()
+            .get_note(note.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.content, "message after policy narrowing");
+        assert_eq!(
+            rt.text_for_notes(&tok)
+                .unwrap()
+                .get_document("local", note.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .body,
+            changed.content
+        );
         assert!(attempts.load(Ordering::SeqCst) > 0);
 
         let table = format!("vec_{model_key}");

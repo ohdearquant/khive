@@ -292,8 +292,9 @@ read verbs are rejected at parse time.**
   seam exists.
 - **`update` and `merge` caveat (verified at source) — applies to BOTH substrates.** Under the
   current handlers, an entity `update` triggers a reindex when name or description change, and a
-  **note** `update` triggers a reindex when note name or content change (`reindex_entity` /
-  `reindex_note` in `crates/khive-runtime/src/curation.rs`); both reindex paths await embedding.
+  **note** `update` triggers a reindex when note name or content change (`reindex_entity` in
+  `crates/khive-runtime/src/curation.rs` / `reindex_note` in
+  `crates/khive-runtime/src/curation/note_reindex.rs`); both reindex paths await embedding.
   Property-only updates on either substrate skip reindex entirely (covered by existing
   regression tests). `merge` already performs its vector re-insert **after** its transaction,
   precisely because embedding is async — the handler's own documentation states this. So the
