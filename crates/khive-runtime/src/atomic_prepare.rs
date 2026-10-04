@@ -57,6 +57,8 @@ use khive_db::stores::note::{
 };
 use khive_db::stores::text::{delete_document_statements, insert_document_statements};
 
+mod note_reindex_effect;
+
 // ---------------------------------------------------------------------------
 // arg extraction helpers
 // ---------------------------------------------------------------------------
@@ -2227,28 +2229,7 @@ async fn apply_one_post_commit_effect(
             }))
         }
         PostCommitEffect::ReindexNote { note_id, version } => {
-            let Some(note) = runtime.notes(token)?.get_note(note_id).await? else {
-                return Ok(None);
-            };
-            if note.version != version {
-                return Ok(None);
-            }
-            let truncation = runtime.reindex_note(token, &note).await?;
-            if runtime
-                .notes(token)?
-                .get_note(note_id)
-                .await?
-                .is_none_or(|current| current.version != version)
-            {
-                return Ok(None);
-            }
-            // Atomic note updates bypass the regular update_note hook. Notify
-            // in-process consumers only after the current version was indexed.
-            runtime.fire_note_mutation_hook(&note.kind, note.id).await;
-            Ok(Some(PostCommitEmbeddingOutcome {
-                effect: PostCommitEffect::ReindexNote { note_id, version },
-                truncation,
-            }))
+            note_reindex_effect::apply(runtime, token, note_id, version).await
         }
         PostCommitEffect::NoteDeleted { note_id, kind } => {
             // The committed row may already be gone; use the captured kind.
@@ -3147,7 +3128,7 @@ mod tests {
         );
 
         // The already-committed note rows remain intact, but both deferred
-        // reindexes now fail. The following deletion hook must still fire.
+        // reindexes now fail. Both current-note hooks and the later delete fire.
         let mut writer = runtime.sql().writer().await.expect("writer");
         writer
             .execute(SqlStatement {
@@ -3165,10 +3146,11 @@ mod tests {
             .to_string();
         assert!(error.contains("effect[0]"), "{error}");
         assert!(error.contains("effect[1]"), "{error}");
-        for id in failed_ids {
+        for id in &failed_ids {
             assert!(error.contains(&id.to_string()), "{error}");
         }
-        assert_eq!(*fired.lock().expect("lock"), vec![deleted_id]);
+        failed_ids.push(deleted_id);
+        assert_eq!(*fired.lock().expect("lock"), failed_ids);
     }
 
     /// Atomic delete must purge the note's FTS row and vector row for both
