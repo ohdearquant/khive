@@ -444,6 +444,7 @@ pub fn resolve_wal_ceiling(
 /// read_only = false
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     /// Unique backend name. Referenced by `[packs.<name>].backend`.
     pub name: String,
@@ -568,8 +569,10 @@ pub struct BlobSectionConfig {
 }
 
 /// `[storage]` section in `khive.toml`. Holds storage-layer config not
-/// already covered by `[[backends]]` (ADR-028).
+/// already covered by `[[backends]]` (ADR-028). Unknown fields are rejected
+/// so an unsupported database selector cannot silently select the default store.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StorageSectionConfig {
     /// Blob store backend selector (ADR-111 Amendment 2). Absent means
     /// `FsBlobStore` at the existing root-resolution precedence, unchanged
@@ -912,6 +915,7 @@ pub struct ExecLimitsConfig {
 /// file_size = 104857600
 /// ```
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExecSectionConfig {
     #[serde(default)]
     pub root: Option<String>,
@@ -1269,6 +1273,8 @@ impl WebSectionConfig {
 /// Unknown top-level keys are silently ignored by serde for forward
 /// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
+/// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
+/// destination keys cannot be silently dropped.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
     #[serde(default)]
@@ -4692,6 +4698,105 @@ merge_refusal = ["opener"]"#
     }
 
     // ── [storage.blob] section (ADR-111 Amendment 2) ─────────────────────────
+
+    fn assert_unknown_destination_key(content: &str, key: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(&dir, content);
+        let diagnostic_path = std::fs::canonicalize(&path).unwrap();
+        let err = KhiveConfig::load(Some(&path)).expect_err("unknown destination must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("unknown field `{key}`")),
+            "{message}"
+        );
+        assert!(
+            message.contains(&diagnostic_path.display().to_string()),
+            "{message}"
+        );
+        match err {
+            ConfigError::Parse { path, .. } => assert_eq!(path, diagnostic_path),
+            other => panic!("expected a file-attributed parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_write_destination_storage_keys_are_refused() {
+        for content in [
+            "[storage]\nmain = '.khive/scratch.db'\n",
+            "[storage]\nmain = '.khive/scratch.db'\nblob = { backend = 'fs' }\n",
+        ] {
+            assert_unknown_destination_key(content, "main");
+        }
+        assert_unknown_destination_key(
+            "[storage]\nblbo = { backend = 'fs', root = '/scratch/blobs' }\n",
+            "blbo",
+        );
+    }
+
+    #[test]
+    fn test_unknown_write_destination_backend_keys_are_refused() {
+        assert_unknown_destination_key(
+            "[[backends]]\nname = 'main'\npaht = '/scratch/store.db'\n",
+            "paht",
+        );
+    }
+
+    #[test]
+    fn test_unknown_write_destination_exec_keys_are_refused() {
+        assert_unknown_destination_key("[exec]\nrooot = '/scratch/exec'\n", "rooot");
+    }
+
+    #[test]
+    fn test_valid_write_destinations_load_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_storage = write_toml(&dir, "[storage]\n");
+        assert!(KhiveConfig::load(Some(&empty_storage))
+            .unwrap()
+            .unwrap()
+            .storage
+            .blob
+            .is_none());
+
+        let path = write_toml(
+            &dir,
+            r#"
+future_top_level_key = true
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "/scratch/store.db"
+read_only = false
+[storage]
+blob = { backend = "fs", root = "/scratch/blobs", floor_bytes = 4096 }
+[exec]
+root = "/scratch/exec"
+read_roots = ["/scratch/tools"]
+keep = true
+[exec.limits]
+cpu_seconds = 60
+file_size = 1048576
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path)).unwrap().unwrap();
+        assert_eq!(cfg.backends.len(), 1);
+        assert_eq!(
+            cfg.backends[0].path.as_deref(),
+            Some(Path::new("/scratch/store.db"))
+        );
+        assert!(!cfg.backends[0].read_only);
+        match cfg.storage.blob {
+            Some(BlobConfig::Fs { root, floor_bytes }) => {
+                assert_eq!(root.as_deref(), Some("/scratch/blobs"));
+                assert_eq!(floor_bytes, Some(4096));
+            }
+            other => panic!("expected the configured filesystem store, got {other:?}"),
+        }
+        assert_eq!(cfg.exec.root.as_deref(), Some("/scratch/exec"));
+        assert_eq!(cfg.exec.read_roots, ["/scratch/tools"]);
+        assert!(cfg.exec.keep);
+        assert_eq!(cfg.exec.limits.cpu_seconds, Some(60));
+        assert_eq!(cfg.exec.limits.file_size, Some(1048576));
+    }
 
     // No [storage] section at all -> fs default, existing configurations
     // keep behaving exactly as they did before this section existed.
