@@ -73,10 +73,12 @@ the two verbs no longer diverge.
    `direction`/`relations` filters and a per-call result cap of `fanout`. Per-hop
    neighbor ordering is edge-weight descending (see Amendment below for the ordering
    contract). `hops=2` expands each first-hop node once more with the same filters and
-   the same `fanout` cap; visited-set dedup prevents cycles. Work done is therefore
-   bounded independently of `budget`: at most `anchors × (fanout + fanout²)` neighbor
-   records are fetched (defaults: 5 × 110 = 550). `budget` governs output size; `fanout`
-   and `hops` govern expansion work.
+   the same `fanout` cap per visible namespace; visited-set dedup prevents cycles. Work
+   is bounded independently of `budget`, with the visible-namespace and mailbox-refill
+   multipliers described in the mailbox-read amendment below. The original
+   `anchors × (fanout + fanout²)` estimate (defaults: 5 × 110 = 550) describes one visible
+   namespace without refill. `budget` governs output size; `fanout`, `hops`, visible
+   namespaces and bounded refill govern expansion work.
 3. **Hop-2 representation.** Second-hop records are flattened into their anchor's single
    `neighbors` list, marked `hop: 2`, carrying the `relation`/`direction`/`weight` of the
    edge that discovered them and `via` set to the id of their hop-1 parent (hop-1 records
@@ -212,3 +214,32 @@ This amendment makes the shipped behavior the contract, not a documented gap:
   row) before expansion begins; a non-entity or unresolvable id is a request error, not a
   silently absent anchor. This was implicit in "honored in full" (§1) but not stated as a
   validation requirement; this amendment makes it explicit.
+
+## Amendment: mailbox-scoped graph reads and candidate work (#3764)
+
+`context` applies the same caller mailbox view as generic `get`, `search` and `neighbors`
+when a graph reference or neighbor is a `message` note. Explicit anchors retain their live,
+visible entity requirement. The handler keeps the original caller token while resolving
+origins across the registry's configured KG backends and expanding adjacency on the graph
+backend. A separate read of the owning message-note backend checks endpoints, including
+tombstones that can outlive adjacency. These reads do not form an atomic snapshot of origin,
+edge and record metadata; concurrent deletion or replacement can change what is hydrated.
+The [generic message-read contract](../../crates/khive-pack-kg/docs/api/message-read-scope.md)
+records the library preconditions and prefix rules.
+
+Each expanded node queries every visible namespace separately. A namespace's candidate
+window starts at `fanout`, then doubles when mailbox filtering under-fills it, up to a
+10,000-candidate window. Successful namespace windows contribute at most `fanout` admitted
+neighbors each, which are merged and deduplicated before the next hop. For `V` visible
+namespaces and `F = fanout`, the admitted-neighbor bound for two hops is therefore
+`anchors × (V × F + (V × F)²)`. Raw candidate work can be larger: the geometric refill reads
+repeat prefixes, and each expanded node can inspect windows from all `V` namespaces. The
+10,000 cap bounds each window, not the combined request's reads. Output truncation at
+`budget` occurs after expansion and does not limit those reads.
+
+If a namespace reaches the scan cap while still under-filled and its raw window may have
+more candidates, `context` adds `scan_incomplete: true`. This marks a bounded partial graph
+view, independently of the assembly's `truncated` flag. `context` supplies no continuation
+cursor, so repeating the same request does not promise progress beyond the cap. The limited
+`neighbors` surface separately supplies its normal `next_after` only when an additional
+admitted result proves another page exists; `scan_incomplete` alone is not such a proof.
