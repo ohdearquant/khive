@@ -50,6 +50,16 @@ use crate::safe_source::{self, SourceReadError};
 
 mod file_pending;
 use file_pending::{stamp_l2_declarations, FileReference};
+#[path = "source_ingest/l2_edge_refresh.rs"]
+mod l2_edge_refresh;
+use l2_edge_refresh::refresh_unchanged_l2_edges;
+mod l2_declaration_refresh;
+use l2_declaration_refresh::refresh_l2_declarations;
+mod l2_observation;
+use l2_observation::{
+    completed_l2_observation, observation_matches, upsert_l2_depends_on, upsert_l2_implements,
+    valid_l2_sweep_entry, L2Observation, PreviousL2SweepStamps,
+};
 
 const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
 const RUST_L2_MAX_SOURCE_BYTES: usize = safe_source::MAX_INGEST_FILE_BYTES as usize;
@@ -866,6 +876,8 @@ where
         l2_batch_tests::observe_row_read(id);
         #[cfg(test)]
         race_seam::pause_after_row_read().await;
+        #[cfg(test)]
+        l2_recovery_tests::after_entity_read(id).await;
         let Some(mut replacement) = apply(current.as_ref()) else {
             return Ok(RowMutationOutcome::Unchanged);
         };
@@ -1040,9 +1052,10 @@ async fn capture_previous_l2_sweep_stamp(
     let stamp = get_entity_opt(rt, token, project_uuid(name))
         .await?
         .and_then(|project| {
-            project.properties.as_ref().and_then(|properties| {
-                completed_l2_sweep_stamp(properties, language).map(str::to_string)
-            })
+            project
+                .properties
+                .as_ref()
+                .and_then(|properties| completed_l2_observation(properties, language))
         });
     previous_stamps.stamps.insert(owner, stamp);
     Ok(())
@@ -2774,66 +2787,6 @@ struct L2OwnerKey {
     language: String,
 }
 
-struct PreviousL2SweepStamps {
-    run_id: Uuid,
-    stamps: HashMap<L2OwnerKey, Option<String>>,
-}
-
-impl PreviousL2SweepStamps {
-    fn new() -> Self {
-        Self {
-            run_id: Uuid::new_v4(),
-            stamps: HashMap::new(),
-        }
-    }
-
-    fn get(&self, owner: &L2OwnerKey) -> Option<&Option<String>> {
-        self.stamps.get(owner)
-    }
-}
-
-fn valid_l2_run_marker(marker: &Value) -> bool {
-    let Some(fields) = marker.as_object() else {
-        return false;
-    };
-    if fields.len() != 2 || fields.get("sweep_time").and_then(Value::as_str).is_none() {
-        return false;
-    }
-    fields
-        .get("run_id")
-        .and_then(Value::as_str)
-        .is_some_and(|id| {
-            Uuid::parse_str(id).is_ok_and(|uuid| {
-                uuid.get_version() == Some(uuid::Version::Random)
-                    && uuid.get_variant() == uuid::Variant::RFC4122
-                    && uuid.to_string() == id
-            })
-        })
-}
-
-fn valid_l2_sweep_entry(entry: &Value) -> bool {
-    entry.as_object().is_some_and(|fields| {
-        fields.len() == 3
-            && fields.get("version").and_then(Value::as_u64) == Some(1)
-            && fields.get("attempted").is_some_and(valid_l2_run_marker)
-            && fields
-                .get("completed")
-                .is_some_and(|marker| marker.is_null() || valid_l2_run_marker(marker))
-    })
-}
-
-fn completed_l2_sweep_stamp<'a>(properties: &'a Value, language: &str) -> Option<&'a str> {
-    let entry = properties
-        .get("l2_sweep_runs")?
-        .as_object()?
-        .get(language)?;
-    if !valid_l2_sweep_entry(entry) || entry.get("completed")? != entry.get("attempted")? {
-        return None;
-    }
-    let stamp = entry.get("completed")?.get("sweep_time")?.as_str()?;
-    (properties.get("sweep_clock")?.get(language)?.as_str()? == stamp).then_some(stamp)
-}
-
 #[derive(Debug)]
 struct L2OwnerCoverage {
     whole: bool,
@@ -2841,8 +2794,9 @@ struct L2OwnerCoverage {
     file_label: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct L2SweepState {
+    run_id: Uuid,
     owners: HashMap<L2OwnerKey, L2OwnerCoverage>,
     /// Declarations proven current by this L2 invocation, never ambient
     /// ownership left by a prior sweep or an earlier tier in this call.
@@ -2856,6 +2810,33 @@ struct L2SweepState {
     /// Natural L2 dependency/implementation edges successfully stamped this
     /// sweep; this set is the authority for `symbol_edges_stamped`.
     stamped_edge_ids: BTreeSet<Uuid>,
+    /// Successful natural writer observations, including repeated shared IDs.
+    observed_natural_edge_ids: Vec<Uuid>,
+    /// Accepted natural relations belonging to reused physical producers.
+    current_natural_edge_ids: BTreeSet<Uuid>,
+}
+
+impl L2SweepState {
+    fn new(run_id: Uuid) -> Self {
+        Self {
+            run_id,
+            owners: HashMap::new(),
+            current_declarations: HashMap::new(),
+            current_modules: HashMap::new(),
+            current_files: BTreeMap::new(),
+            unchanged_declarations: BTreeSet::new(),
+            stamped_edge_ids: BTreeSet::new(),
+            observed_natural_edge_ids: Vec::new(),
+            current_natural_edge_ids: BTreeSet::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for L2SweepState {
+    fn default() -> Self {
+        Self::new(Uuid::new_v4())
+    }
 }
 
 async fn complete_l2_sweeps(
@@ -3272,123 +3253,6 @@ async fn resolve_l2_reference(
     Ok(None)
 }
 
-/// Sorted-set-union evidence merge for one L2 `depends_on` edge — repeated
-/// evidence (e.g. the same call observed on re-ingest) folds onto the
-/// existing array rather than duplicating it, mirroring
-/// `merge_dependency_metadata`'s established pattern for L1 edges.
-fn merge_l2_evidence(
-    existing_metadata: Option<&Value>,
-    new_evidence: &str,
-    language: &str,
-    now: DateTime<Utc>,
-) -> Value {
-    let mut evidence: BTreeSet<String> = existing_metadata
-        .and_then(|m| m.get("l2_evidence"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    evidence.insert(new_evidence.to_string());
-    json!({
-        "l2_derived": true,
-        "l2_evidence": evidence.into_iter().collect::<Vec<_>>(),
-        "language": language,
-        "last_seen_at": now.to_rfc3339(),
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn upsert_l2_depends_on(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    source_id: Uuid,
-    target_id: Uuid,
-    evidence: &str,
-    language: &str,
-    now: DateTime<Utc>,
-    state: &mut L2SweepState,
-    report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
-    let edge_id = edge_uuid(EdgeRelation::DependsOn, source_id, target_id);
-    let outcome = mutate_edge(rt, token, edge_id, |current| {
-        let metadata = merge_l2_evidence(
-            current.and_then(|edge| edge.metadata.as_ref()),
-            evidence,
-            language,
-            now,
-        );
-        Some(Edge {
-            id: LinkId::from(edge_id),
-            namespace: token.namespace().as_str().to_string(),
-            source_id,
-            target_id,
-            relation: EdgeRelation::DependsOn,
-            weight: 1.0,
-            created_at: current.map(|edge| edge.created_at).unwrap_or(now),
-            updated_at: now,
-            deleted_at: None,
-            metadata: Some(metadata),
-            target_backend: current.and_then(|edge| edge.target_backend.clone()),
-        })
-    })
-    .await?;
-    state.stamped_edge_ids.insert(edge_id);
-    match outcome {
-        RowMutationOutcome::Created => report.edges_created += 1,
-        RowMutationOutcome::Updated => report.edges_updated += 1,
-        RowMutationOutcome::Unchanged | RowMutationOutcome::Blocked => {}
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn upsert_l2_implements(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    type_id: Uuid,
-    trait_id: Uuid,
-    language: &str,
-    now: DateTime<Utc>,
-    state: &mut L2SweepState,
-    report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
-    let edge_id = edge_uuid(EdgeRelation::Implements, type_id, trait_id);
-    let outcome = mutate_edge(rt, token, edge_id, |current| {
-        let mut metadata = current
-            .and_then(|edge| edge.metadata.as_ref())
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        metadata.insert("l2_derived".into(), json!(true));
-        metadata.insert("language".into(), json!(language));
-        metadata.insert("last_seen_at".into(), json!(now.to_rfc3339()));
-        Some(Edge {
-            id: LinkId::from(edge_id),
-            namespace: token.namespace().as_str().to_string(),
-            source_id: type_id,
-            target_id: trait_id,
-            relation: EdgeRelation::Implements,
-            weight: 1.0,
-            created_at: current.map(|edge| edge.created_at).unwrap_or(now),
-            updated_at: now,
-            deleted_at: None,
-            metadata: Some(Value::Object(metadata)),
-            target_backend: current.and_then(|edge| edge.target_backend.clone()),
-        })
-    })
-    .await?;
-    state.stamped_edge_ids.insert(edge_id);
-    match outcome {
-        RowMutationOutcome::Created => report.edges_created += 1,
-        RowMutationOutcome::Updated => report.edges_updated += 1,
-        RowMutationOutcome::Unchanged | RowMutationOutcome::Blocked => {}
-    }
-    Ok(())
-}
-
 /// Attempt immediate same-project resolution of one positive `impl Trait for
 /// Type`. Unlike a call/type reference, an impl has no declaring storage
 /// entity of its own, so a failed
@@ -3652,6 +3516,7 @@ where
 struct L2ContainmentStamp<'a> {
     language: &'a str,
     sweep_time: DateTime<Utc>,
+    run_id: Uuid,
 }
 
 async fn stamp_containment_edge(
@@ -3679,6 +3544,7 @@ async fn stamp_containment_edge(
                 "l2_derived": true,
                 "language": stamp.language,
                 "last_seen_at": stamp.sweep_time.to_rfc3339(),
+                "l2_observed_run_id": stamp.run_id.to_string(),
             }),
         };
         Some(Edge {
@@ -3723,6 +3589,7 @@ async fn upsert_declaration(
     source_path: &str,
     source_revision: &str,
     sweep_time: DateTime<Utc>,
+    run_id: Uuid,
     file_label: &str,
     report: &mut CodeSourceIngestReport,
 ) -> Result<Option<(Uuid, String)>, CodeSourceIngestError> {
@@ -3760,6 +3627,7 @@ async fn upsert_declaration(
         props.insert("source_revision".into(), json!(source_revision));
         props.insert("content_hash".into(), json!(decl.content_hash));
         props.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
+        props.insert("l2_observed_run_id".into(), json!(run_id.to_string()));
         entity.id = id;
         entity.namespace = token.namespace().as_str().to_string();
         entity.kind = "concept".to_string();
@@ -3817,93 +3685,6 @@ async fn clear_l2_ownership(
     })
     .await?;
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn refresh_l2_declarations(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    source_project: &str,
-    language: &str,
-    source_path: &str,
-    source_revision: &str,
-    sweep_time: DateTime<Utc>,
-    file_label: &str,
-    declaration_ids: &[Uuid],
-    report: &mut CodeSourceIngestReport,
-) -> Result<bool, CodeSourceIngestError> {
-    let mut declarations = Vec::with_capacity(declaration_ids.len());
-    for id in declaration_ids {
-        let Some(entity) = get_entity_opt(rt, token, *id).await? else {
-            return Ok(false);
-        };
-        let canonical_kind = entity
-            .entity_type
-            .as_deref()
-            .and_then(DeclKind::from_code_token);
-        let properties = entity.properties.as_ref();
-        let matches_owner = properties
-            .and_then(|value| value.get("source_project"))
-            .and_then(Value::as_str)
-            == Some(source_project)
-            && properties
-                .and_then(|value| value.get("language"))
-                .and_then(Value::as_str)
-                == Some(language);
-        if canonical_kind.is_none() || !matches_owner {
-            return Ok(false);
-        }
-        declarations.push(entity);
-    }
-
-    for declaration in declarations {
-        let id = declaration.id;
-        let mut current_valid = true;
-        let outcome = mutate_entity(rt, token, id, file_label, report, |current| {
-            let Some(mut declaration) = current.cloned() else {
-                current_valid = false;
-                return None;
-            };
-            let properties = declaration.properties.as_ref();
-            current_valid = declaration
-                .entity_type
-                .as_deref()
-                .and_then(DeclKind::from_code_token)
-                .is_some()
-                && properties
-                    .and_then(|value| value.get("source_project"))
-                    .and_then(Value::as_str)
-                    == Some(source_project)
-                && properties
-                    .and_then(|value| value.get("language"))
-                    .and_then(Value::as_str)
-                    == Some(language);
-            if !current_valid {
-                return None;
-            }
-            let mut properties = declaration
-                .properties
-                .clone()
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default();
-            properties.insert("source_path".into(), json!(source_path));
-            properties.insert("source_revision".into(), json!(source_revision));
-            properties.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-            declaration.properties = Some(Value::Object(properties));
-            declaration.updated_at = ts(sweep_time);
-            Some(declaration)
-        })
-        .await?;
-        if !current_valid || outcome == RowMutationOutcome::Blocked {
-            return Ok(false);
-        }
-        if outcome.wrote() {
-            if let Some(l2) = report.l2.as_mut() {
-                l2.symbols_updated += 1;
-            }
-        }
-    }
-    Ok(true)
 }
 
 /// Persist one L2-selected Rust file's parse outcome. On failure, invalidate
@@ -3965,6 +3746,7 @@ async fn persist_l2_file(
             source_path,
             source_revision,
             sweep_time,
+            state.run_id,
             file_label,
             report,
         )
@@ -3980,7 +3762,9 @@ async fn persist_l2_file(
     }
     let current_file_ids: BTreeSet<Uuid> = declaration_ids.iter().copied().collect();
 
+    let observation_start = state.observed_natural_edge_ids.len();
     let mut file_references = Vec::new();
+    let mut file_implementations = Vec::new();
     // Phase B: containment + same-project call/type-reference resolution.
     for (id, containing_module_path, decl) in &declared {
         let owner_id = declaration_owner_id(
@@ -3998,6 +3782,7 @@ async fn persist_l2_file(
             L2ContainmentStamp {
                 language,
                 sweep_time,
+                run_id: state.run_id,
             },
             false,
             report,
@@ -4072,6 +3857,15 @@ async fn persist_l2_file(
     let mut pending_impls = Vec::new();
     for imp in &parsed.impls {
         let containing_module_path = resolve_module_path(module_path, &imp.module_segments);
+        if !imp.type_path.is_empty() && !imp.trait_path.is_empty() {
+            file_implementations.push(file_pending::FileImplementation {
+                module_path: containing_module_path.clone(),
+                implementation: L2PendingImpl {
+                    type_path: imp.type_path.clone(),
+                    trait_path: imp.trait_path.clone(),
+                },
+            });
+        }
         if let Some(entry) = resolve_l2_implements(
             rt,
             token,
@@ -4111,6 +3905,8 @@ async fn persist_l2_file(
         module_id,
         &declaration_ids,
         &file_references,
+        &state.observed_natural_edge_ids[observation_start..],
+        &file_implementations,
         content_hash,
         file_label,
         report,
@@ -4147,7 +3943,7 @@ async fn run_l2_sweep(
         sweep_time,
     } = inputs;
     const LANGUAGE: &str = "rust";
-    let mut state = L2SweepState::default();
+    let mut state = L2SweepState::new(previous_l2_sweep_stamps.run_id);
     let Some(ext) = imports::extension_for_language(LANGUAGE) else {
         return Ok(state);
     };
@@ -4305,7 +4101,7 @@ async fn run_l2_sweep(
                 .as_ref()
                 .and_then(|entity| entity.properties.as_ref())
                 .and_then(|properties| file_pending::read_file(properties, &file_label))
-                .filter(|entry| entry.content_hash == hash)
+                .filter(|entry| entry.content_hash == hash && entry.natural_edge_ids.is_some())
                 .is_none()
             || l2_needs_reparse(
                 existing_module
@@ -4352,6 +4148,7 @@ async fn run_l2_sweep(
             L2ContainmentStamp {
                 language: LANGUAGE,
                 sweep_time,
+                run_id: state.run_id,
             },
             true,
             report,
@@ -4359,12 +4156,13 @@ async fn run_l2_sweep(
         .await?;
 
         if !needs_reparse {
-            let declaration_ids = existing_module
+            let accepted = existing_module
                 .as_ref()
                 .and_then(|entity| entity.properties.as_ref())
                 .and_then(|properties| file_pending::read_file(properties, &file_label))
-                .map(|entry| entry.declaration_ids)
-                .unwrap_or_default();
+                .expect("reuse requires accepted producer coverage");
+            let declaration_ids = accepted.declaration_ids;
+            let natural_edge_ids = accepted.natural_edge_ids.expect("checked inventory");
             if refresh_l2_declarations(
                 rt,
                 token,
@@ -4373,8 +4171,13 @@ async fn run_l2_sweep(
                 &source_path,
                 &snapshot.revision,
                 sweep_time,
+                state.run_id,
                 &file_label,
                 &declaration_ids,
+                &natural_edge_ids,
+                previous_l2_sweep_stamps
+                    .get(&owner)
+                    .and_then(Option::as_ref),
                 report,
             )
             .await?
@@ -4387,6 +4190,7 @@ async fn run_l2_sweep(
                 state
                     .unchanged_declarations
                     .extend(declaration_ids.iter().copied());
+                state.current_natural_edge_ids.extend(natural_edge_ids);
                 continue;
             }
         }
@@ -4429,169 +4233,6 @@ async fn run_l2_sweep(
     Ok(state)
 }
 
-/// Refresh outgoing dependency/implementation edges for declarations whose
-/// files were reused without parsing. This runs only after the complete L2
-/// walk and re-resolution, so a target is refreshed only when this invocation
-/// proved both endpoints current. An edge must also have been current at its
-/// source project's previous language sweep; changed sources restamp only
-/// references observed by their new parse, leaving removed edges historical.
-async fn refresh_unchanged_l2_edges(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    sweep_time: DateTime<Utc>,
-    previous_l2_sweep_stamps: &PreviousL2SweepStamps,
-    state: &mut L2SweepState,
-    report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
-    if state.unchanged_declarations.is_empty() {
-        return Ok(());
-    }
-    let graph = rt.graph(token)?;
-    let sources: Vec<Uuid> = state.unchanged_declarations.iter().copied().collect();
-    let hits = graph
-        .batch_neighbors(
-            &sources,
-            NeighborQuery {
-                direction: Direction::Out,
-                relations: Some(vec![EdgeRelation::DependsOn, EdgeRelation::Implements]),
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    let edge_ids: BTreeSet<Uuid> = hits.into_iter().map(|(_, hit)| hit.edge_id).collect();
-    let edges = graph
-        .get_edges(&edge_ids.into_iter().map(LinkId::from).collect::<Vec<_>>())
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    for edge in edges {
-        let Some(source_owner) = state.current_declarations.get(&edge.source_id).cloned() else {
-            continue;
-        };
-        if !state.unchanged_declarations.contains(&edge.source_id)
-            || state.current_declarations.get(&edge.target_id) != Some(&source_owner)
-        {
-            continue;
-        }
-        let Some(previous_stamp) = previous_l2_sweep_stamps
-            .get(&source_owner)
-            .and_then(Option::as_deref)
-        else {
-            continue;
-        };
-        if !edge
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("l2_derived"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-            || edge
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("last_seen_at"))
-                .and_then(Value::as_str)
-                != Some(previous_stamp)
-        {
-            continue;
-        }
-        let edge_id = Uuid::from(edge.id);
-        let outcome = mutate_edge(rt, token, edge_id, |current| {
-            let mut edge = current?.clone();
-            let mut metadata = edge
-                .metadata
-                .clone()
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default();
-            if !metadata
-                .get("l2_derived")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                || metadata.get("last_seen_at").and_then(Value::as_str) != Some(previous_stamp)
-            {
-                return None;
-            }
-            metadata.insert("language".into(), json!(source_owner.language));
-            metadata.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-            edge.updated_at = sweep_time;
-            edge.metadata = Some(Value::Object(metadata));
-            Some(edge)
-        })
-        .await?;
-        if outcome.wrote() {
-            state.stamped_edge_ids.insert(edge_id);
-            report.edges_updated += 1;
-        }
-    }
-
-    let hits = graph
-        .batch_neighbors(
-            &sources,
-            NeighborQuery {
-                direction: Direction::In,
-                relations: Some(vec![EdgeRelation::Contains]),
-                limit: None,
-                min_weight: None,
-            },
-        )
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    let edge_ids: BTreeSet<Uuid> = hits.into_iter().map(|(_, hit)| hit.edge_id).collect();
-    let edges = graph
-        .get_edges(&edge_ids.into_iter().map(LinkId::from).collect::<Vec<_>>())
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    for edge in edges {
-        let Some(target_owner) = state.current_declarations.get(&edge.target_id).cloned() else {
-            continue;
-        };
-        let source_owner = state
-            .current_declarations
-            .get(&edge.source_id)
-            .or_else(|| state.current_modules.get(&edge.source_id));
-        if !state.unchanged_declarations.contains(&edge.target_id)
-            || source_owner != Some(&target_owner)
-        {
-            continue;
-        }
-        if !edge
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("l2_derived"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let edge_id = Uuid::from(edge.id);
-        let outcome = mutate_edge(rt, token, edge_id, |current| {
-            let mut edge = current?.clone();
-            let mut metadata = edge
-                .metadata
-                .clone()
-                .and_then(|value| value.as_object().cloned())
-                .unwrap_or_default();
-            if !metadata
-                .get("l2_derived")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
-                return None;
-            }
-            metadata.insert("language".into(), json!(target_owner.language));
-            metadata.insert("last_seen_at".into(), json!(sweep_time.to_rfc3339()));
-            edge.updated_at = sweep_time;
-            edge.metadata = Some(Value::Object(metadata));
-            Some(edge)
-        })
-        .await?;
-        if outcome.wrote() {
-            report.edges_updated += 1;
-        }
-    }
-    Ok(())
-}
-
 /// L2 synchronous re-resolve pass, run once after the whole L2 file walk
 /// completes (mirrors L1.5's `reresolve_pass`): revisits every symbol
 /// carrying accepted per-file call/type references and every module carrying pending
@@ -4628,6 +4269,7 @@ async fn l2_reresolve_pass(
         })
         .await
         .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
+    let mut resolved = HashMap::new();
     for row in rows {
         let Some(module_id) = row_uuid(&row) else {
             continue;
@@ -4710,6 +4352,10 @@ async fn l2_reresolve_pass(
                     )
                     .await?;
                     resolved_any = true;
+                    resolved.insert(
+                        (module_id, entry),
+                        edge_uuid(EdgeRelation::Implements, type_id, trait_id),
+                    );
                 }
                 _ => still_pending.push(entry),
             }
@@ -4749,6 +4395,7 @@ async fn l2_reresolve_pass(
         }
     }
 
+    file_pending::record_resolved_implementations(rt, token, state, &resolved, report).await?;
     Ok(())
 }
 
@@ -5153,6 +4800,7 @@ mod tests {
             "src/lib.rs",
             "unversioned",
             Utc::now(),
+            Uuid::new_v4(),
             "src/lib.rs",
             &mut report,
         )
