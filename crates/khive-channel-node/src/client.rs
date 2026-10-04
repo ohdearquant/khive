@@ -12,7 +12,10 @@ use crate::wire::{
     AcknowledgeResponse, AdmissionResponse, BoundedList, ContactResponse, Delivery, MessageState,
     ReceiptItem, RefusalCode, RefusalResponse, ServerTimestamp, StatusResponse,
 };
-use khive_channel::{ChannelError, HoldReason, PendingDetail, ReceiptDisposition, SendOutcome};
+use khive_channel::{
+    ChannelError, HoldReason, PendingDetail, ReceiptDisposition, SendOutcome,
+    VerifiedRecipientReceipt,
+};
 use reqwest::{Client, Method, Url};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::value::RawValue;
@@ -320,11 +323,9 @@ impl NodeClient {
             };
             return Ok(match self.verify_sender_receipt(&receipt, Some(&p)).await {
                 ReceiptVerification::Verified(v) => match v.receipt.disposition {
-                    ReceiptDisposition::Stored => {
-                        SendOutcome::RecipientStored(v.receipt.to_channel())
-                    }
+                    ReceiptDisposition::Stored => SendOutcome::RecipientStored(v.into_verified()),
                     ReceiptDisposition::Quarantined => {
-                        SendOutcome::RecipientQuarantined(v.receipt.to_channel())
+                        SendOutcome::RecipientQuarantined(v.into_verified())
                     }
                 },
                 ReceiptVerification::Rejected(reason) => unverified(reason),
@@ -405,11 +406,16 @@ impl NodeClient {
         if pin.identity() != &identity || pin.fingerprint() != &p.recipient_fingerprint {
             return rejected(ReceiptRejection::FingerprintMismatch);
         }
-        if receipt.verify(&pin.keys().signing).is_err() {
-            return rejected(ReceiptRejection::InvalidSignature);
-        }
+        let verified = match VerifiedRecipientReceipt::verify(
+            receipt.to_channel(),
+            pin.keys().signing.as_bytes(),
+        ) {
+            Ok(verified) => verified,
+            Err(_) => return rejected(ReceiptRejection::InvalidSignature),
+        };
         ReceiptVerification::Verified(VerifiedSenderReceipt {
             receipt: receipt.clone(),
+            verified,
         })
     }
 

@@ -582,7 +582,10 @@ async fn submit_accepts_a_new_canonical_service_attempt_but_refuses_noncanonical
         .unwrap()
     {
         SendOutcome::RecipientStored(accepted) => {
-            assert_eq!(accepted.binding.delivery_attempt_id, other_id().into_uuid());
+            assert_eq!(
+                accepted.receipt().binding.delivery_attempt_id,
+                other_id().into_uuid()
+            );
         }
         other => panic!("canonical service attempt must be accepted, got {other:?}"),
     }
