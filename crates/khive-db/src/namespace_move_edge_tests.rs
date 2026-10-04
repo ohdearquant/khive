@@ -232,6 +232,7 @@ fn duplicate_relation_routes_and_same_namespace_targets_refuse() {
 fn bare_edge_route_preserves_legacy_rows_and_counts() {
     let mut conn = prepared();
     edge(&conn, 5, "source", "legacy_relation");
+    edge(&conn, 102, "target", "supports");
     let before = content(&conn);
     let request = MoveRequest::new("source", vec![route("edge", "target")]);
     let tx = conn.transaction().unwrap();
@@ -250,9 +251,62 @@ fn bare_edge_route_preserves_legacy_rows_and_counts() {
     }
     assert_eq!(after[&id(100)], "target-a");
     assert_eq!(after[&id(101)], "foreign");
+    assert_eq!(after[&id(102)], "target");
     assert_eq!(content(&tx), before);
     assert_eq!(move_namespace(&tx, &request).unwrap().subjects["edge"], 0);
     tx.commit().unwrap();
+}
+
+fn snapshots_in(conn: &Connection, namespace: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM brain_profile_snapshots WHERE namespace = ?1",
+        [namespace],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn exhaustive_relation_routes_move_aggregates_only_to_a_single_target() {
+    for with_fallback in [false, true] {
+        for split in [false, true] {
+            let conn = prepared();
+            conn.execute(
+                "INSERT INTO brain_profile_snapshots \
+                 (profile_id, namespace, snapshot_json, updated_at) \
+                 VALUES ('p', 'source', '{}', 1)",
+                [],
+            )
+            .unwrap();
+            let mut routes: Vec<MoveRoute> = RELATIONS
+                .iter()
+                .map(|relation| {
+                    let target = if split && *relation == "supports" {
+                        "target-b"
+                    } else {
+                        "target"
+                    };
+                    route(&format!("edge:{relation}"), target)
+                })
+                .collect();
+            if with_fallback {
+                routes.push(route("edge", "target"));
+            }
+            let request = MoveRequest::new("source", routes);
+            let counts = move_namespace(&conn, &request).unwrap();
+            assert_eq!(counts.rows.get("graph_edges"), Some(&5));
+            if split {
+                assert_eq!(counts.left_behind.get("brain_profile_snapshots"), Some(&1));
+                assert_eq!(snapshots_in(&conn, "source"), 1);
+                assert_eq!(snapshots_in(&conn, "target"), 0);
+            } else {
+                assert!(counts.left_behind.is_empty(), "{:?}", counts.left_behind);
+                assert_eq!(counts.rows.get("brain_profile_snapshots"), Some(&1));
+                assert_eq!(snapshots_in(&conn, "source"), 0);
+                assert_eq!(snapshots_in(&conn, "target"), 1);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "vectors")]

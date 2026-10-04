@@ -162,9 +162,10 @@ impl MoveRequest {
             })
     }
 
-    /// Every route names the same target, and every class present in the source
-    /// is routed. Only then can a per-namespace aggregate with no subject be
-    /// carried anywhere.
+    /// Every route names the same target. That every class and relation present
+    /// in the source is routed is not checked here: `validate` refuses any other
+    /// request before this is consulted. Only then can a per-namespace aggregate
+    /// with no subject be carried anywhere.
     fn single_target(&self) -> Option<&str> {
         let mut targets = self.routes.iter().map(|r| r.target.as_str());
         let first = targets.next()?;
