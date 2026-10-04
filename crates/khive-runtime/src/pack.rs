@@ -625,13 +625,15 @@ pub trait KindHook: Send + Sync + std::fmt::Debug {
     /// Errors here are **logged but not propagated** — the storage write has
     /// already succeeded; failing the call would mislead the caller.
     /// Implementations should `tracing::warn!` and return `Ok(())` for
-    /// best-effort side effects.
+    /// best-effort side effects. The default does nothing.
     async fn after_create(
         &self,
-        runtime: &KhiveRuntime,
-        id: uuid::Uuid,
-        args: &Value,
-    ) -> Result<(), RuntimeError>;
+        _runtime: &KhiveRuntime,
+        _id: uuid::Uuid,
+        _args: &Value,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 
     /// Validate an approved AddEntity draft before preparing domain writes.
     /// The draft kind is canonical.
@@ -14825,15 +14827,6 @@ mod note_update_sequencing_tests {
             &self,
             _runtime: &KhiveRuntime,
             _args: &mut Value,
-        ) -> Result<(), RuntimeError> {
-            Ok(())
-        }
-
-        async fn after_create(
-            &self,
-            _runtime: &KhiveRuntime,
-            _id: uuid::Uuid,
-            _args: &Value,
         ) -> Result<(), RuntimeError> {
             Ok(())
         }
