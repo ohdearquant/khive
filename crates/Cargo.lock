@@ -2623,6 +2623,7 @@ dependencies = [
  "khive-fusion",
  "khive-pack-brain",
  "khive-pack-kg",
+ "khive-retrieval",
  "khive-runtime",
  "khive-score",
  "khive-storage",

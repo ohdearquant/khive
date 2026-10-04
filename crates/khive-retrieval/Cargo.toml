@@ -62,6 +62,9 @@ storage-adapters = ["khive-storage"]
 native-rerank = []
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
 embed = []
+# Hidden helpers shared by the packs that keep file-backed ANN checkpoints: the checkpoint
+# directory lock and the rotation watcher loop. Uses only std, tokio and tokio-util.
+ann = []
 
 [dev-dependencies]
 criterion = { workspace = true }
