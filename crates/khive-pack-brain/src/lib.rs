@@ -106,3 +106,6 @@ mod tests;
 
 #[cfg(test)]
 mod event_counts_group_tests;
+
+#[cfg(test)]
+mod unknown_event_usage_tests;
