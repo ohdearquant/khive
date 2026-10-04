@@ -1239,6 +1239,7 @@ jobs:
       available: ${{ steps.compute_coverage.outcome == 'success' }}
       current: ${{ steps.compute_coverage.outputs.current }}
     env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # See the model cache steps below: with this set the cache is load-bearing.
       LATTICE_OFFLINE: "1"
     steps:
