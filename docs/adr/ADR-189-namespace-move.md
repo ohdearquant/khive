@@ -646,9 +646,13 @@ They stay in the source and the move neither deletes nor rewrites them.
 Rows that stay are reported so that a caller can raise them with an operator:
 
 - `left_behind` names both tables with the number of rows that stayed;
-- the move result carries two counts, the policy rows that are not soft-deleted and the grant
-  rows that are not expired at the instant the move ran;
-- a move that leaves a policy row that is not soft-deleted or a grant that is not expired logs
+- the move result carries two counts, the policy rows that are not soft-deleted and the grants
+  in force at the instant the move ran: granted, not invalidated and not expired. These are the
+  row conditions the tool pack itself reads. The pack also matches a grant's registration pin
+  against the tool's current registration when it decides a call, which a move does not
+  evaluate, so the count can include a pinned grant that no longer matches and never omits a
+  grant the pack would honour;
+- a move that leaves a policy row that is not soft-deleted or a grant in force logs
   one line at warn level naming the source namespace and the two counts, with no row contents.
 
 **Residual.** Authorization rows left under the old namespace name will meet any data later
@@ -668,7 +672,7 @@ excluded list. Its failure message names the tables without a rule.
   row, the source's snapshot rows are gone and the target has none, authorization rows are
   byte-identical in the source, `left_behind` names both authorization tables, and the two
   operator counts equal the seeded live rows where the fixture also seeds one soft-deleted policy
-  row and one expired grant.
+  row, one expired grant, one grant request that was never decided and one revoked grant.
 - A partitioning move of the same source succeeds. Audit rows follow their notes, the four
   receipt tables and both authorization tables stay and are counted in `left_behind`, and the
   operator counts are as above.
