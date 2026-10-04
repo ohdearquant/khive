@@ -16,13 +16,15 @@ use khive_runtime::{
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::StorageError;
+use khive_vamana::bridge::AnnBridgeCore;
 use khive_vamana::distance::l2_normalize;
-use khive_vamana::{
-    read_commit_fingerprint, read_commit_info, read_external_ids_sidecar, segment_commit_digest,
-    write_external_ids_sidecar, CorpusFingerprint, VamanaConfig, VamanaIndex,
-};
+use khive_vamana::{read_commit_info, segment_commit_digest, CorpusFingerprint};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
+
+// Reached by the test modules through `use super::*`.
+#[cfg(test)]
+use khive_vamana::write_external_ids_sidecar;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -79,11 +81,12 @@ impl AnnKey {
 }
 
 pub(crate) struct AnnBridge {
-    index: VamanaIndex,
+    /// The index, its id map and its commit digest; they read as fields of the
+    /// bridge through `Deref`.
+    core: AnnBridgeCore,
     incarnation: Arc<()>,
     #[cfg(test)]
     reverse_map_scan_hook: Option<Arc<dyn Fn() + Send + Sync>>,
-    id_map: Vec<Uuid>,
     /// Built on first replay; subsequent batches update only changed subjects.
     reverse_map: Option<HashMap<Uuid, u32>>,
     #[cfg(test)]
@@ -91,11 +94,6 @@ pub(crate) struct AnnBridge {
     dirty_ops: u64,
     published_seq: u64,
     last_checkpoint: std::time::Instant,
-    /// Digest of the v2 commit record this mmap bridge loaded. Every
-    /// file-backed publication carries a fresh nonce, so equality means the
-    /// mapped file generation is still current (#2081). Owned builds have no
-    /// publication identity until they are persisted and reopened.
-    commit_digest: Option<[u8; 32]>,
     /// The stable v2 commit remains unchanged while memory-owned delta
     /// publications advance their own nonce and watermark beside it.
     base_commit_digest: Option<[u8; 32]>,
@@ -115,6 +113,20 @@ pub(crate) struct AnnBridge {
     /// predecessor mmaps, rather than merely changing the cache metadata.
     #[cfg(test)]
     drop_probe: Option<Arc<()>>,
+}
+
+impl std::ops::Deref for AnnBridge {
+    type Target = AnnBridgeCore;
+
+    fn deref(&self) -> &AnnBridgeCore {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for AnnBridge {
+    fn deref_mut(&mut self) -> &mut AnnBridgeCore {
+        &mut self.core
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -618,46 +630,25 @@ impl AnnState {
 
 impl AnnBridge {
     pub(crate) fn build(
-        mut vectors: Vec<f32>,
+        vectors: Vec<f32>,
         dim: usize,
         id_map: Vec<Uuid>,
         namespace_set: HashSet<String>,
     ) -> Result<Self, RuntimeError> {
-        if dim == 0 {
-            return Err(RuntimeError::Internal("dimension must be > 0".into()));
-        }
-        if vectors.is_empty() || id_map.is_empty() {
-            return Err(RuntimeError::Internal(
-                "no vectors to build ANN index from".into(),
-            ));
-        }
-        let n = vectors.len() / dim;
-        if n != id_map.len() {
-            return Err(RuntimeError::Internal(format!(
-                "id_map length {} != vector count {}",
-                id_map.len(),
-                n
-            )));
-        }
-        for row in vectors.chunks_exact_mut(dim) {
-            l2_normalize(row);
-        }
-        let cfg = VamanaConfig::with_dimensions(dim);
-        let index = VamanaIndex::build_owned(vectors, cfg)
-            .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+        let core = AnnBridgeCore::build(vectors, dim, id_map).map_err(RuntimeError::Internal)?;
+        // The core accepted the build only when the vector count equals the id-map length.
+        let n = core.id_map.len();
         Ok(Self {
-            index,
+            core,
             incarnation: Arc::new(()),
             #[cfg(test)]
             reverse_map_scan_hook: None,
-            id_map,
             reverse_map: None,
             #[cfg(test)]
             reverse_map_builds: 0,
             dirty_ops: 0,
             published_seq: 0,
             last_checkpoint: std::time::Instant::now(),
-            commit_digest: None,
             base_commit_digest: None,
             base_applied_seq: 0,
             base_ops: n,
@@ -691,20 +682,16 @@ impl AnnBridge {
         k: usize,
         route: AnnScoreRoute,
     ) -> Result<Vec<(Uuid, f64)>, RuntimeError> {
-        let mut q = query.to_vec();
-        l2_normalize(&mut q);
         let raw = self
-            .index
-            .search(&q, k)
+            .core
+            .search_hits(query, k)
             .map_err(|e| RuntimeError::Internal(format!("memory ANN search: {e}")))?;
         let mut hits = Vec::with_capacity(raw.len());
-        for (idx, dist) in raw {
-            if let Some(uuid) = self.id_map.get(idx as usize) {
-                // The graph emits normalized-vector L2². For note search,
-                // L2²/2 is cosine distance and uses the same converter as the
-                // exact sqlite-vec route; memory recall retains its prior floor.
-                hits.push((*uuid, route.graph_score(dist)?));
-            }
+        for (uuid, dist) in raw {
+            // The graph emits normalized-vector L2². For note search,
+            // L2²/2 is cosine distance and uses the same converter as the
+            // exact sqlite-vec route; memory recall retains its prior floor.
+            hits.push((uuid, route.graph_score(dist)?));
         }
         Ok(hits)
     }
@@ -778,18 +765,20 @@ impl AnnBridge {
 
     fn fork_for_maintenance(&self) -> Self {
         Self {
-            index: self.index.fork_for_maintenance(),
+            core: AnnBridgeCore {
+                index: self.index.fork_for_maintenance(),
+                id_map: self.id_map.clone(),
+                commit_digest: self.commit_digest,
+            },
             incarnation: Arc::new(()),
             #[cfg(test)]
             reverse_map_scan_hook: self.reverse_map_scan_hook.clone(),
-            id_map: self.id_map.clone(),
             reverse_map: self.reverse_map.clone(),
             #[cfg(test)]
             reverse_map_builds: self.reverse_map_builds,
             dirty_ops: self.dirty_ops,
             published_seq: self.published_seq,
             last_checkpoint: self.last_checkpoint,
-            commit_digest: self.commit_digest,
             base_commit_digest: self.base_commit_digest,
             base_applied_seq: self.base_applied_seq,
             base_ops: self.base_ops,
@@ -841,6 +830,8 @@ impl AnnBridge {
         if self.reverse_map.is_none() {
             self.rebuild_reverse_map();
         }
+        // Disjoint field borrows: `Deref` would borrow the whole bridge while `reverse` is live.
+        let core = &mut self.core;
         let reverse = self.reverse_map.as_mut().expect("initialized reverse map");
 
         for (uuid, op) in ops {
@@ -850,7 +841,7 @@ impl AnnBridge {
                         // Fail closed: if a same-batch upsert already reused
                         // this slot, skip the tombstone instead of deleting
                         // someone else's live vector.
-                        if self.id_map.get(ordinal as usize) != Some(&uuid) {
+                        if core.id_map.get(ordinal as usize) != Some(&uuid) {
                             tracing::warn!(
                                 subject = %uuid,
                                 ordinal,
@@ -859,7 +850,7 @@ impl AnnBridge {
                             reverse.remove(&uuid);
                             continue;
                         }
-                        self.index
+                        core.index
                             .tombstone(ordinal)
                             .map_err(|e| format!("replay tombstone({ordinal}): {e}"))?;
                         reverse.remove(&uuid);
@@ -868,34 +859,34 @@ impl AnnBridge {
                 Some(mut embedding) => {
                     l2_normalize(&mut embedding);
                     if let Some(&old) = reverse.get(&uuid) {
-                        if self.id_map.get(old as usize) != Some(&uuid) {
+                        if core.id_map.get(old as usize) != Some(&uuid) {
                             return Err(format!(
                                 "replay upsert: ordinal {old} is no longer owned by {uuid}"
                             ));
                         }
-                        self.index
+                        core.index
                             .tombstone(old)
                             .map_err(|e| format!("replay tombstone({old}): {e}"))?;
                         reverse.remove(&uuid);
                     }
-                    let ordinal = self
+                    let ordinal = core
                         .index
                         .insert(&embedding)
                         .map_err(|e| format!("replay insert: {e}"))?;
                     let slot = ordinal as usize;
-                    match slot.cmp(&self.id_map.len()) {
+                    match slot.cmp(&core.id_map.len()) {
                         std::cmp::Ordering::Less => {
-                            let previous_owner = self.id_map[slot];
+                            let previous_owner = core.id_map[slot];
                             if reverse.get(&previous_owner) == Some(&ordinal) {
                                 reverse.remove(&previous_owner);
                             }
-                            self.id_map[slot] = uuid;
+                            core.id_map[slot] = uuid;
                         }
-                        std::cmp::Ordering::Equal => self.id_map.push(uuid),
+                        std::cmp::Ordering::Equal => core.id_map.push(uuid),
                         std::cmp::Ordering::Greater => {
                             return Err(format!(
                                 "replay insert returned ordinal {ordinal} beyond id_map len {}",
-                                self.id_map.len()
+                                core.id_map.len()
                             ));
                         }
                     }
@@ -903,26 +894,27 @@ impl AnnBridge {
                 }
             }
         }
-        self.index.set_last_applied_seq(Some(new_s));
+        core.index.set_last_applied_seq(Some(new_s));
         Ok(())
     }
 
     pub(crate) fn consolidate_if_needed(&mut self, tau: usize) -> Result<bool, String> {
-        if !self.index.needs_consolidation() && self.index.ops_since_consolidation() < tau {
+        let core = &mut self.core;
+        if !core.index.needs_consolidation() && core.index.ops_since_consolidation() < tau {
             return Ok(false);
         }
-        if self.id_map.len() != self.index.num_vectors() {
+        if core.id_map.len() != core.index.num_vectors() {
             return Err("consolidation: id_map length differs from vector count".to_string());
         }
-        let new_to_old = self
+        let new_to_old = core
             .index
             .consolidate()
             .map_err(|e| format!("memory ANN consolidation: {e}"))?;
         if !new_to_old.is_empty() {
-            self.id_map = new_to_old
+            core.id_map = new_to_old
                 .into_iter()
                 .map(|old| {
-                    self.id_map.get(old as usize).copied().ok_or_else(|| {
+                    core.id_map.get(old as usize).copied().ok_or_else(|| {
                         format!("consolidation: old ordinal {old} is outside id_map")
                     })
                 })
@@ -942,22 +934,7 @@ impl AnnBridge {
     /// there is logged rather than returned, because readers already ignore a
     /// HEAD whose watermark the new base covers.
     pub(crate) fn save_atomic(&self, dir: &std::path::Path) -> Result<[u8; 32], String> {
-        let count = self.id_map.len();
-        if count != self.index.num_vectors() {
-            return Err(format!(
-                "id_map length {count} != index.num_vectors() {}",
-                self.index.num_vectors()
-            ));
-        }
-        self.index
-            .save_atomic(dir)
-            .map_err(|e| format!("VamanaIndex::save_atomic: {e}"))?;
-        let digest = segment_commit_digest(dir)
-            .map_err(|e| format!("segment_commit_digest after save: {e}"))?
-            .ok_or_else(|| {
-                "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
-            })?;
-        write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())?;
+        let digest = self.core.save_atomic(dir)?;
         if let Err(error) = delta::clear(dir) {
             tracing::warn!(%error, "memory delta cleanup failed after full checkpoint commit");
         }
@@ -970,44 +947,20 @@ impl AnnBridge {
     /// (conservative — recall assumes non-visible namespaces may exist) until
     /// the caller populates it.
     pub(crate) fn load(dir: &std::path::Path) -> Result<Self, String> {
-        read_commit_fingerprint(dir)
-            .map_err(|e| format!("read_commit_fingerprint: {e}"))?
-            .ok_or_else(|| {
-                "no v2 commit fingerprint: segment dir is absent, v1, or has a torn commit"
-                    .to_string()
-            })?;
-        let index = VamanaIndex::load(dir).map_err(|e| format!("VamanaIndex::load: {e}"))?;
-        let (sidecar_digest, id_map) = read_external_ids_sidecar(dir)?;
-        let commit_digest = segment_commit_digest(dir)
-            .map_err(|e| format!("segment_commit_digest: {e}"))?
-            .ok_or_else(|| "metadata.bin vanished between fingerprint and digest".to_string())?;
-        if sidecar_digest != commit_digest {
-            return Err(
-                "external_ids.bin commit-digest mismatch: torn segment/sidecar pair".to_string(),
-            );
-        }
-        if id_map.len() != index.num_vectors() {
-            return Err(format!(
-                "external_ids.bin count {} != index.num_vectors() {}",
-                id_map.len(),
-                index.num_vectors()
-            ));
-        }
-        let base_applied_seq = index.last_applied_seq().unwrap_or(0);
-        let base_ops = index.num_vectors();
+        let (core, commit_digest) = AnnBridgeCore::load(dir)?;
+        let base_applied_seq = core.index.last_applied_seq().unwrap_or(0);
+        let base_ops = core.index.num_vectors();
         let mut bridge = Self {
-            index,
+            core,
             incarnation: Arc::new(()),
             #[cfg(test)]
             reverse_map_scan_hook: None,
-            id_map,
             reverse_map: None,
             #[cfg(test)]
             reverse_map_builds: 0,
             dirty_ops: 0,
             published_seq: base_applied_seq,
             last_checkpoint: std::time::Instant::now(),
-            commit_digest: Some(commit_digest),
             base_commit_digest: Some(commit_digest),
             base_applied_seq,
             base_ops,
