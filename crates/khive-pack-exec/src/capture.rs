@@ -139,13 +139,12 @@ fn read_regular_bounded(
 mod platform {
     use super::{read_regular_bounded, CaptureRead, CapturedContent};
     use khive_fs::fd_relative::{c_name, list_names, open_at, stat_at, stat_fd};
+    use khive_fs::opened_file::opened_file_path;
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
     use std::fs::{File, OpenOptions};
     use std::io;
     use std::os::fd::AsRawFd;
-    #[cfg(target_vendor = "apple")]
-    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::Arc;
@@ -191,7 +190,7 @@ mod platform {
         pub fn missing_root(&self) -> io::Result<Option<String>> {
             use std::os::unix::fs::MetadataExt as _;
 
-            let path = match descriptor_path(&self.directory) {
+            let path = match opened_file_path(&self.directory).map_err(capture_path_error) {
                 Ok(path) => path,
                 Err(error) if error.kind() == io::ErrorKind::Unsupported => return Err(error),
                 Err(error) => {
@@ -228,35 +227,22 @@ mod platform {
     #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
     const DESCRIPTOR_PATH_QUERY: &str = "descriptor path query";
 
-    #[cfg(target_vendor = "apple")]
-    fn descriptor_path(file: &File) -> io::Result<std::path::PathBuf> {
-        let mut buffer = vec![0u8; libc::PATH_MAX as usize + 1];
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buffer.as_mut_ptr()) } == -1 {
-            return Err(io::Error::last_os_error());
+    fn capture_path_error(error: io::Error) -> io::Error {
+        if error.raw_os_error().is_some() {
+            return error;
         }
-        let len = buffer.iter().position(|&byte| byte == 0).ok_or_else(|| {
-            io::Error::new(
+        match error.kind() {
+            io::ErrorKind::Unsupported => io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no descriptor-to-path query on this platform",
+            ),
+            #[cfg(target_vendor = "apple")]
+            io::ErrorKind::InvalidData => io::Error::new(
                 io::ErrorKind::InvalidData,
                 "F_GETPATH result is not terminated",
-            )
-        })?;
-        buffer.truncate(len);
-        Ok(std::path::PathBuf::from(OsString::from_vec(buffer)))
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn descriptor_path(file: &File) -> io::Result<std::path::PathBuf> {
-        // A removed directory reads back as "<path> (deleted)", which the
-        // lstat comparison then reports as missing or as a different file.
-        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-    }
-
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-    fn descriptor_path(_file: &File) -> io::Result<std::path::PathBuf> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "no descriptor-to-path query on this platform",
-        ))
+            ),
+            _ => error,
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -477,6 +463,56 @@ mod platform {
         use super::*;
         #[cfg(target_vendor = "apple")]
         use std::os::fd::FromRawFd;
+
+        #[test]
+        fn capture_path_error_keeps_the_unsupported_platform_message() {
+            let error = capture_path_error(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "secure opened-file path resolution is unsupported on this Unix target",
+            ));
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+            assert_eq!(
+                error.to_string(),
+                "no descriptor-to-path query on this platform"
+            );
+
+            for errno in [libc::EBADF, libc::ENOTSUP, libc::EILSEQ] {
+                let os_error = capture_path_error(io::Error::from_raw_os_error(errno));
+                assert_eq!(os_error.raw_os_error(), Some(errno));
+            }
+        }
+
+        #[cfg(target_vendor = "apple")]
+        #[test]
+        fn capture_path_error_keeps_the_unterminated_apple_query_message() {
+            let error = capture_path_error(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "F_GETPATH returned no NUL terminator",
+            ));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "F_GETPATH result is not terminated");
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn shared_opened_file_path_keeps_the_removed_directory_suffix() {
+            let parent = tempfile::tempdir().unwrap();
+            let removed = parent.path().canonicalize().unwrap().join("removed");
+            std::fs::create_dir(&removed).unwrap();
+            let root = CaptureRoot::open(&removed).unwrap();
+            std::fs::remove_dir(&removed).unwrap();
+
+            let mut expected = removed.into_os_string();
+            expected.push(" (deleted)");
+            assert_eq!(
+                opened_file_path(&root.directory).unwrap(),
+                std::path::PathBuf::from(expected)
+            );
+            assert_eq!(
+                root.missing_root().unwrap().as_deref(),
+                Some("root_missing: /proc/self/fd path of the run directory no longer exists")
+            );
+        }
 
         #[test]
         fn capture_open_does_not_follow_symlink_in_run_directory() {

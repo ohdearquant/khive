@@ -239,6 +239,8 @@ const V45_UP: &str = include_str!("../sql/045-recipient-transport.sql");
 const V46_UP: &str = include_str!("../sql/046-memory-visibility-receipts.sql");
 const V47_UP: &str = include_str!("../sql/047-attachment-role-quarantine.sql");
 const V49_UP: &str = include_str!("../sql/049-git-note-property-indexes.sql");
+
+const V50_UP: &str = include_str!("../sql/050-entity-list-plans.sql");
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -564,6 +566,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 49,
         name: "git_note_property_indexes",
         up: V49_UP,
+    },
+    VersionedMigration {
+        version: 50,
+        name: "entity_list_plans",
+        up: V50_UP,
     },
 ];
 
@@ -1811,3 +1818,7 @@ mod tests;
 #[cfg(test)]
 #[path = "git_note_index_migration_tests.rs"]
 mod git_note_indexes;
+
+#[cfg(test)]
+#[path = "entity_list_index_migration_tests.rs"]
+mod entity_list_indexes;

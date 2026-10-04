@@ -11,6 +11,7 @@ pub(super) fn routed_subjects(request: &MoveRequest) -> (String, Vec<rusqlite::t
             SubjectClass::Note(kind) => ("note", Some(kind)),
             SubjectClass::Entity(kind) => ("entity", Some(kind)),
             SubjectClass::Edge => ("edge", None),
+            SubjectClass::EdgeRelation(relation) => ("edge", Some(relation)),
             SubjectClass::Atom => ("atom", None),
             SubjectClass::Domain => ("domain", None),
         };
@@ -37,7 +38,11 @@ pub(super) fn routed_subjects(request: &MoveRequest) -> (String, Vec<rusqlite::t
          JOIN route_data AS route ON route.class = 'entity' AND subject.kind = route.kind \
          WHERE subject.namespace = ?1 \
          UNION ALL SELECT subject.id, route.target FROM graph_edges AS subject \
-         JOIN route_data AS route ON route.class = 'edge' WHERE subject.namespace = ?1 \
+         JOIN route_data AS route ON route.class = 'edge' \
+           AND (route.kind = subject.relation OR (route.kind IS NULL AND NOT EXISTS (\
+             SELECT 1 FROM route_data AS specific \
+             WHERE specific.class = 'edge' AND specific.kind = subject.relation))) \
+         WHERE subject.namespace = ?1 \
          UNION ALL SELECT atom.id, route.target FROM knowledge_atoms AS atom \
          JOIN route_data AS route ON route.class = 'atom' \
          WHERE atom.namespace = ?1 AND NOT {MIRROR_EXISTS} \
