@@ -559,13 +559,23 @@ async fn receipt_pin_unavailable_and_source_mismatch_are_reported() {
             SpyFacility::new(true),
         );
         let result = c.status(logical()).await.unwrap();
-        let expected = if source_mismatch {
-            ReceiptRejection::SourceMismatch
+        let reported = if source_mismatch {
+            matches!(
+                &result.receipt,
+                Some(ReceiptVerification::Rejected(
+                    ReceiptRejection::SourceMismatch
+                ))
+            )
         } else {
-            ReceiptRejection::PinUnavailable
+            matches!(
+                &result.receipt,
+                Some(ReceiptVerification::Unhandled(
+                    khive_channel::ReceiptReadFailure::PinUnavailable
+                ))
+            )
         };
         assert!(
-            matches!(result.receipt, Some(ReceiptVerification::Rejected(reason)) if reason == expected),
+            reported,
             "the source/pin failure must be reported distinctly"
         );
         assert_eq!(server.requests().await.len(), 2);

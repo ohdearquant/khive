@@ -13,7 +13,7 @@ use crate::wire::{
     ReceiptItem, RefusalCode, RefusalResponse, ServerTimestamp, StatusResponse,
 };
 use khive_channel::{
-    ChannelError, HoldReason, PendingDetail, ReceiptDisposition, SendOutcome,
+    ChannelError, HoldReason, PendingDetail, ReceiptDisposition, ReceiptReadFailure, SendOutcome,
     VerifiedRecipientReceipt,
 };
 use reqwest::{Client, Method, Url};
@@ -62,6 +62,9 @@ struct RawPollPage {
 }
 
 impl NodeClient {
+    pub fn binding(&self) -> &NodeClientBinding {
+        &self.state.binding
+    }
     pub fn new(
         binding: NodeClientBinding,
         service_url: &str,
@@ -329,6 +332,11 @@ impl NodeClient {
                     }
                 },
                 ReceiptVerification::Rejected(reason) => unverified(reason),
+                ReceiptVerification::Unhandled(reason) => {
+                    return Err(NodeError::transport(&format!(
+                        "receipt local state unavailable: {reason:?}"
+                    )));
+                }
             });
         }
         let refusal = serde_json::from_slice::<RefusalResponse>(&r.body).ok();
@@ -370,7 +378,11 @@ impl NodeClient {
                 {
                     Ok(Some(p)) => p,
                     Ok(None) => return rejected(ReceiptRejection::SourceMissing),
-                    Err(_) => return rejected(ReceiptRejection::SourceUnavailable),
+                    Err(_) => {
+                        return ReceiptVerification::Unhandled(
+                            ReceiptReadFailure::SourceUnavailable,
+                        )
+                    }
                 };
                 &fetched
             }
@@ -401,7 +413,7 @@ impl NodeClient {
                 return rejected(ReceiptRejection::FingerprintMismatch)
             }
             Ok(_) => return rejected(ReceiptRejection::PinUnconfirmed),
-            Err(_) => return rejected(ReceiptRejection::PinUnavailable),
+            Err(_) => return ReceiptVerification::Unhandled(ReceiptReadFailure::PinUnavailable),
         };
         if pin.identity() != &identity || pin.fingerprint() != &p.recipient_fingerprint {
             return rejected(ReceiptRejection::FingerprintMismatch);
@@ -630,7 +642,7 @@ impl NodeClient {
 
 fn unverified(reason: ReceiptRejection) -> SendOutcome {
     SendOutcome::Pending(PendingDetail::ReceiptUnverified {
-        reason: format!("{reason:?}"),
+        reason: reason.as_str().to_owned(),
     })
 }
 fn rejected(reason: ReceiptRejection) -> ReceiptVerification {

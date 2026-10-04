@@ -62,6 +62,9 @@ pub enum PinState {
 pub struct PinSourceError(pub String);
 
 #[async_trait]
+/// Resolve an owner's confirmed key for an exact device epoch.
+/// Retain the epoch and fingerprint recorded by an outbound row for as long as
+/// that row exists, including receipt retention after failure and later rotation.
 pub trait PinSource: Send + Sync {
     async fn resolve(&self, identity: &PinIdentity) -> Result<PinState, PinSourceError>;
 }

@@ -6,7 +6,8 @@ use crate::wire::{
     WireDecodeError,
 };
 use crate::ProtocolError;
-use khive_channel::{ChannelError, VerifiedRecipientReceipt};
+pub use khive_channel::ReceiptRejectionReason as ReceiptRejection;
+use khive_channel::{ChannelError, ReceiptReadFailure, VerifiedRecipientReceipt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
@@ -113,17 +114,6 @@ impl NodeDelivery {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReceiptRejection {
-    SourceMissing,
-    SourceUnavailable,
-    SourceMismatch,
-    BindingMismatch,
-    PinUnavailable,
-    PinUnconfirmed,
-    FingerprintMismatch,
-    InvalidSignature,
-}
 #[derive(Debug)]
 pub struct VerifiedSenderReceipt {
     pub(crate) receipt: WireReceipt,
@@ -144,6 +134,7 @@ impl VerifiedSenderReceipt {
 pub enum ReceiptVerification {
     Verified(VerifiedSenderReceipt),
     Rejected(ReceiptRejection),
+    Unhandled(ReceiptReadFailure),
 }
 #[derive(Debug)]
 pub struct NodeReceiptResult {
