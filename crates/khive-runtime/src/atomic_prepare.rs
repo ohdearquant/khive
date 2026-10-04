@@ -2152,18 +2152,11 @@ async fn prepare_merge(
 // post-commit effects
 // ---------------------------------------------------------------------------
 
-/// Embedding metadata produced by one successfully applied reindex effect.
-///
-/// The effect identity is retained so response builders can attach an advisory
-/// to the exact atomic op that scheduled the reindex. Effects whose target is
-/// no longer present are omitted from the returned outcome list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PostCommitEmbeddingOutcome {
-    /// The committed reindex effect that produced this outcome.
-    pub effect: PostCommitEffect,
-    /// Actual input bounding observed while executing the effect.
-    pub truncation: crate::retrieval::EmbeddingTruncationReport,
-}
+mod embedding_outcome;
+pub use embedding_outcome::{
+    apply_post_commit_effects_with_failures, PostCommitEffectsReport, PostCommitEmbeddingOutcome,
+    ReindexModelFailure, ReindexModelStage,
+};
 
 /// Run every deferred [`PostCommitEffect`] after a committed atomic unit.
 pub async fn apply_post_commit_effects(
@@ -2176,34 +2169,24 @@ pub async fn apply_post_commit_effects(
         .map(|_| ())
 }
 
-/// Truncation-reporting form of [`apply_post_commit_effects`]. Re-fetches each
+/// Embedding-reporting form of [`apply_post_commit_effects`]. Re-fetches each
 /// target's now-committed row outside any transaction and reuses the existing
 /// `reindex_entity`/`reindex_note` (FTS + embedding, same as the non-atomic
 /// path) for exact parity. Returns the typed embedding outcome for each reindex
-/// effect so callers can preserve write-response advisories instead of
-/// discarding them after commit.
+/// effect so callers can preserve truncation advisories and partial model
+/// failures instead of discarding them after commit. Model failures remain
+/// best-effort; lexical indexing and excluded-model cleanup errors propagate.
+/// When any effect fails, the other effects' outcomes are dropped with the
+/// returned error; [`apply_post_commit_effects_with_failures`] keeps both.
 pub async fn apply_post_commit_effects_with_report(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     effects: CommittedPostCommitEffects,
 ) -> RuntimeResult<Vec<PostCommitEmbeddingOutcome>> {
-    let mut embedding_outcomes = Vec::new();
-    let mut failures = Vec::new();
-    for (index, effect) in effects.into_effects().into_iter().enumerate() {
-        let identity = format!("{effect:?}");
-        match apply_one_post_commit_effect(runtime, token, effect).await {
-            Ok(Some(outcome)) => embedding_outcomes.push(outcome),
-            Ok(None) => {}
-            Err(error) => failures.push(format!("effect[{index}] {identity}: {error}")),
-        }
-    }
-    if failures.is_empty() {
-        Ok(embedding_outcomes)
-    } else {
-        Err(RuntimeError::Internal(format!(
-            "post-commit effects failed after commit: {}",
-            failures.join("; ")
-        )))
+    let report = apply_post_commit_effects_with_failures(runtime, token, effects).await;
+    match report.failure_error() {
+        Some(error) => Err(error),
+        None => Ok(report.outcomes),
     }
 }
 
@@ -2226,6 +2209,7 @@ async fn apply_one_post_commit_effect(
             Ok(Some(PostCommitEmbeddingOutcome {
                 effect: PostCommitEffect::ReindexEntity { entity_id },
                 truncation,
+                failures: Vec::new(),
             }))
         }
         PostCommitEffect::ReindexNote { note_id, version } => {

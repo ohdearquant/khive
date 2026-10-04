@@ -49,6 +49,8 @@ pub struct SqlEventStore {
     is_file_backed: bool,
     namespace: String,
     writer_task: Option<WriterTaskHandle>,
+    #[cfg(test)]
+    lose_next_fallback_reply: std::sync::atomic::AtomicBool,
 }
 
 impl SqlEventStore {
@@ -69,7 +71,27 @@ impl SqlEventStore {
             is_file_backed,
             namespace: namespace.into(),
             writer_task,
+            #[cfg(test)]
+            lose_next_fallback_reply: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    fn after_fallback_write_for_test<T>(
+        &self,
+        result: Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        // Lose only the reply: the real fallback transaction already committed.
+        if result.is_ok()
+            && self
+                .lose_next_fallback_reply
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StorageError::WriterTaskTerminated {
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+            });
+        }
+        result
     }
 
     fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
@@ -1314,6 +1336,8 @@ impl EventStore for SqlEventStore {
                 Ok(())
             })
             .await;
+        #[cfg(test)]
+        let result = self.after_fallback_write_for_test(result);
         khive_storage::usage::account_event_write(result.as_ref().map(|()| 1));
         result
     }
@@ -1362,6 +1386,8 @@ impl EventStore for SqlEventStore {
                 Ok(summary)
             })
             .await;
+        #[cfg(test)]
+        let result = self.after_fallback_write_for_test(result);
         khive_storage::usage::account_event_write(result.as_ref().map(|summary| summary.affected));
         result
     }
@@ -1522,3 +1548,7 @@ mod tests;
 #[cfg(test)]
 #[path = "event_busy_tests.rs"]
 mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "event_fallback_usage_tests.rs"]
+mod fallback_usage_tests;

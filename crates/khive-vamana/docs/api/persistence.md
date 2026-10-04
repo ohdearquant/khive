@@ -183,6 +183,15 @@ the forward lists, with one sorted medoid forward-list copy for its potentially
 larger degree. Successful validation does not build another full reverse
 adjacency or clone each reverse list, and it preserves their stored order.
 
+Checkpoint regression tests measure live requested heap bytes in a separate
+process running one exact test. Allocation, deallocation and successful resize
+deltas are counted from process start; each operation reports its high-water
+increase above the live baseline, including a loaded index retained by the
+caller. This is neither RSS nor allocator-internal transient memory. Fixtures
+exercise public `load` and `save_atomic` with the same graph and four times the
+vector payload, allowing owned graph/codec state and save-time SQ8 serialization
+while refusing an additional incumbent vector-sized heap copy.
+
 ## lifecycle.bin format
 
 Written by `write_lifecycle` (`index.rs`) as part of the v2 segmented save. All

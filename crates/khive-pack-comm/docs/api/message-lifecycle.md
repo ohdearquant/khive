@@ -40,8 +40,9 @@ reclaim on message deletion.
 
 `comm.inbox` and `comm.thread` return `attachments: [{content_ref, size,
 media_type}]` on each message, using `[]` when none exist; `attachments` is
-also an accepted projection field. Only the exact indexed roles above are
-read, sorted by index. Other roles and malformed suffixes are ignored.
+also an accepted projection field. Only the exact indexed roles above populate
+that array, sorted by index. Other roles and malformed suffixes are not file
+entries.
 `comm.read` returns the same metadata when `body=true` (the default), while
 `body=false` preserves the acknowledgement-only response. No comm response
 contains file bytes. Media type is nullable because references carry no MIME
@@ -61,6 +62,13 @@ including after deletion of their original record; this preserves the bytes
 until the quarantined metadata can be repaired. GC admission still requires
 the exact completed V21 epoch: migrated V47 stores remain refused until
 later epoch ownership has been reviewed.
+
+The count is owner-wide, before the positional display-role filter: an
+unreadable row with a non-message role such as `quarantine-original` can
+contribute even though that role is not displayed. Readable non-message
+rows contribute neither displayed files nor errors. This counts metadata
+rows, not missing object bytes; explicitly projecting an absent marker
+returns null.
 
 A failure of the attachment lookup itself still returns an error. Bulk
 `comm.read(body=true)` reads every target's fields before marking the first

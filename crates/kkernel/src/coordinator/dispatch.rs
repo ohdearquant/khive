@@ -1,6 +1,7 @@
 //! SubstrateCoordinator — cross-backend dispatch (D2-D4).
 
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,11 +10,12 @@ use tokio::task::JoinError;
 use uuid::Uuid;
 
 use khive_pack_kg::handlers::{SearchSubstrate, ValidatedSearchRequest};
+use khive_retrieval::hybrid::{combine_best_ranked_evidence, fuse_labelled, HitLabel};
 use khive_runtime::{
     BackendId, EdgeEndpointKind, KhiveRuntime, NamespaceToken, NoteSearchHit, Resolved,
     RuntimeError, SearchHit, SearchSource,
 };
-use khive_score::{rrf_score, DeterministicScore};
+use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
 use khive_types::{namespace::Namespace, SubstrateKind};
 
@@ -1325,15 +1327,23 @@ fn rrf_fanout_search_limit(request: &ValidatedSearchRequest) -> u32 {
 
 // ---- RRF merge ----
 
-#[derive(Default)]
-struct RrfMergeBucket {
-    score: DeterministicScore,
-    // Ranked lists follow backend ID order; equal ranks retain the earlier backend.
-    evidence_rank: Option<usize>,
-    signals: khive_runtime::SearchSignals,
-    source: Option<SearchSource>,
-    title: Option<String>,
-    snippet: Option<String>,
+/// Fuse ranked lists with reciprocal rank fusion (k=60), keep the hits whose fused source passes
+/// `source_filter`, then cut the filtered order to `limit`.
+///
+/// Each list is one arm and each hit carries its position in its own list. Later copies of an id
+/// widen the source and fill a missing title or snippet, and the signals come from the
+/// best-ranked appearance, with the earlier list winning a tie.
+fn merge_labelled(
+    arms: Vec<Vec<(Uuid, HitLabel)>>,
+    limit: usize,
+    source_filter: Option<SearchSource>,
+) -> Vec<(Uuid, DeterministicScore, HitLabel)> {
+    const K: usize = 60;
+
+    let mut fused = fuse_labelled(arms, K, combine_best_ranked_evidence);
+    fused.retain(|(_, _, label)| source_filter.is_none_or(|want| label.source == want));
+    fused.truncate(limit);
+    fused
 }
 
 /// Merge multiple ranked entity hit lists via Reciprocal Rank Fusion (k=60).
@@ -1342,63 +1352,40 @@ pub(super) fn rrf_merge_entity_hits(lists: Vec<Vec<SearchHit>>, limit: usize) ->
     rrf_merge_entity_hits_filtered(lists, limit, None)
 }
 
-fn rrf_merge_entity_hits_filtered(
+pub(super) fn rrf_merge_entity_hits_filtered(
     lists: Vec<Vec<SearchHit>>,
     limit: usize,
     source_filter: Option<SearchSource>,
 ) -> Vec<SearchHit> {
-    const K: usize = 60;
-
-    let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
-
-    for list in &lists {
-        // A list votes once per id: a repeated id scores only at the position of its
-        // first occurrence, as in `khive_fusion::reciprocal_rank_fusion`. Its later
-        // copies still contribute source, title and snippet.
-        let mut seen = HashSet::with_capacity(list.len());
-        for (i, hit) in list.iter().enumerate() {
-            let entry = scores.entry(hit.entity_id).or_default();
-            if seen.insert(hit.entity_id) {
-                entry.score = entry.score + rrf_score(i + 1, K);
-            }
-            if entry.evidence_rank.is_none_or(|best_rank| i < best_rank) {
-                entry.evidence_rank = Some(i);
-                entry.signals = hit.signals;
-            }
-            entry.source = Some(match entry.source {
-                Some(source) => source.union(hit.source),
-                None => hit.source,
-            });
-            if entry.title.is_none() {
-                entry.title = hit.title.clone();
-            }
-            if entry.snippet.is_none() {
-                entry.snippet = hit.snippet.clone();
-            }
+    let mut arms = Vec::with_capacity(lists.len());
+    for list in lists {
+        let mut arm = Vec::with_capacity(list.len());
+        for (rank, hit) in list.into_iter().enumerate() {
+            let label = HitLabel {
+                rank,
+                signals: hit.signals,
+                source: hit.source,
+                title: hit.title,
+                snippet: hit.snippet,
+            };
+            arm.push((hit.entity_id, label));
         }
+        arms.push(arm);
     }
 
-    let mut merged: Vec<SearchHit> = scores
-        .into_iter()
-        .filter_map(|(id, bucket)| {
-            let source = bucket.source.expect("each bucket gets a source");
-            if source_filter.is_some_and(|expected| source != expected) {
-                return None;
-            }
-            Some(SearchHit {
-                entity_id: id,
-                score: bucket.score,
-                rank_score_kind: khive_runtime::RankScoreKind::Rrf,
-                signals: bucket.signals,
-                source,
-                title: bucket.title,
-                snippet: bucket.snippet,
-            })
-        })
-        .collect();
-
-    merged.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
-    merged.truncate(limit);
+    let fused = merge_labelled(arms, limit, source_filter);
+    let mut merged = Vec::with_capacity(fused.len());
+    for (entity_id, score, label) in fused {
+        merged.push(SearchHit {
+            entity_id,
+            score,
+            rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+            signals: label.signals,
+            source: label.source,
+            title: label.title,
+            snippet: label.snippet,
+        });
+    }
     merged
 }
 
@@ -1411,63 +1398,40 @@ pub(super) fn rrf_merge_note_hits(
     rrf_merge_note_hits_filtered(lists, limit, None)
 }
 
-fn rrf_merge_note_hits_filtered(
+pub(super) fn rrf_merge_note_hits_filtered(
     lists: Vec<Vec<NoteSearchHit>>,
     limit: usize,
     source_filter: Option<SearchSource>,
 ) -> Vec<NoteSearchHit> {
-    const K: usize = 60;
-
-    let mut scores: HashMap<Uuid, RrfMergeBucket> = HashMap::new();
-
-    for list in &lists {
-        // A list votes once per id: a repeated id scores only at the position of its
-        // first occurrence, as in `khive_fusion::reciprocal_rank_fusion`. Its later
-        // copies still contribute source, title and snippet.
-        let mut seen = HashSet::with_capacity(list.len());
-        for (i, hit) in list.iter().enumerate() {
-            let entry = scores.entry(hit.note_id).or_default();
-            if seen.insert(hit.note_id) {
-                entry.score = entry.score + rrf_score(i + 1, K);
-            }
-            if entry.evidence_rank.is_none_or(|best_rank| i < best_rank) {
-                entry.evidence_rank = Some(i);
-                entry.signals = hit.signals;
-            }
-            entry.source = Some(match entry.source {
-                Some(source) => source.union(hit.source),
-                None => hit.source,
-            });
-            if entry.title.is_none() {
-                entry.title = hit.title.clone();
-            }
-            if entry.snippet.is_none() {
-                entry.snippet = hit.snippet.clone();
-            }
+    let mut arms = Vec::with_capacity(lists.len());
+    for list in lists {
+        let mut arm = Vec::with_capacity(list.len());
+        for (rank, hit) in list.into_iter().enumerate() {
+            let label = HitLabel {
+                rank,
+                signals: hit.signals,
+                source: hit.source,
+                title: hit.title,
+                snippet: hit.snippet,
+            };
+            arm.push((hit.note_id, label));
         }
+        arms.push(arm);
     }
 
-    let mut merged: Vec<NoteSearchHit> = scores
-        .into_iter()
-        .filter_map(|(id, bucket)| {
-            let source = bucket.source.expect("each bucket gets a source");
-            if source_filter.is_some_and(|expected| source != expected) {
-                return None;
-            }
-            Some(NoteSearchHit {
-                note_id: id,
-                score: bucket.score,
-                rank_score_kind: khive_runtime::RankScoreKind::Rrf,
-                signals: bucket.signals,
-                source,
-                title: bucket.title,
-                snippet: bucket.snippet,
-            })
-        })
-        .collect();
-
-    merged.sort_by(|a, b| b.score.cmp(&a.score).then(a.note_id.cmp(&b.note_id)));
-    merged.truncate(limit);
+    let fused = merge_labelled(arms, limit, source_filter);
+    let mut merged = Vec::with_capacity(fused.len());
+    for (note_id, score, label) in fused {
+        merged.push(NoteSearchHit {
+            note_id,
+            score,
+            rank_score_kind: khive_runtime::RankScoreKind::Rrf,
+            signals: label.signals,
+            source: label.source,
+            title: label.title,
+            snippet: label.snippet,
+        });
+    }
     merged
 }
 

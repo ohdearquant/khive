@@ -9,22 +9,23 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 
 ## Module layout
 
-| Module                 | Purpose                                                                       |
-| ---------------------- | ----------------------------------------------------------------------------- |
-| `src/adapters/`        | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
-| `src/ann.rs`           | Hidden checkpoint-lock and rotation-watcher helpers (feature `ann`)           |
-| `src/error.rs`         | `RetrievalError` enum and `Result` alias                                      |
-| `src/eval/`            | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
-| `src/hit.rs`           | Search result types: `SearchHit`, `SearchSource`, `HybridSearchOutcome`       |
-| `src/hybrid/`          | `HybridSearcher`, `HybridConfig`, `Query`                  |
-| `src/metrics/`         | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
-| `src/persist/`         | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |
-| `src/policy/`          | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
-| `src/query_ir.rs`      | `QueryNode` IR tree; composable, serialisable query plans                     |
-| `src/replay/`          | Temporal replay and drift metrics (feature `persist`)                         |
-| `src/search_config.rs` | Per-call `SearchConfig` for recall/compose search phase                       |
-| `src/timeout.rs`       | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
-| `src/weights/`         | Per-atom weight loading for replay (feature `persist`)                        |
+| Module                   | Purpose                                                                       |
+| ------------------------ | ----------------------------------------------------------------------------- |
+| `src/adapters/`          | `StorageVectorSearch` and `StorageKeywordSearch` (feature `storage-adapters`) |
+| `src/ann.rs`             | Hidden checkpoint-lock and rotation-watcher helpers (feature `ann`)           |
+| `src/error.rs`           | `RetrievalError` enum and `Result` alias                                      |
+| `src/eval/`              | Precision/recall/nDCG/Jaccard retrieval evaluation metrics                    |
+| `src/hit.rs`             | Search result types: `SearchHit`, `SearchSource`, `HybridSearchOutcome`       |
+| `src/hybrid/`            | `HybridSearcher`, `HybridConfig`, `Query`                                     |
+| `src/materialization.rs` | Bounded policy-free ranked-prefix materialization and typed drop diagnostics  |
+| `src/metrics/`           | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
+| `src/persist/`           | SQLite persistence for HNSW/BM25 indexes (feature `persist`)                  |
+| `src/policy/`            | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
+| `src/query_ir.rs`        | `QueryNode` IR tree; composable, serialisable query plans                     |
+| `src/replay/`            | Temporal replay and drift metrics (feature `persist`)                         |
+| `src/search_config.rs`   | Per-call `SearchConfig` for recall/compose search phase                       |
+| `src/timeout.rs`         | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
+| `src/weights/`           | Per-atom weight loading for replay (feature `persist`)                        |
 
 ## Tests and benchmarks
 

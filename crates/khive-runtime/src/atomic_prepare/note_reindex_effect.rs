@@ -3,7 +3,9 @@
 use khive_storage::note::Note;
 
 use super::{KhiveRuntime, NamespaceToken, PostCommitEffect, PostCommitEmbeddingOutcome};
+use crate::curation::note_reindex::NoteReindexReport;
 use crate::error::RuntimeResult;
+#[cfg(test)]
 use crate::retrieval::EmbeddingTruncationReport;
 use uuid::Uuid;
 
@@ -22,7 +24,7 @@ pub(super) async fn apply(
     if note.version != version {
         return Ok(None);
     }
-    let reindex = runtime.reindex_note(token, &note).await;
+    let reindex = runtime.reindex_note_with_report(token, &note).await;
     notify_if_current(runtime, token, &note, reindex).await
 }
 
@@ -36,7 +38,7 @@ async fn notify_if_current(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     note: &Note,
-    reindex: RuntimeResult<EmbeddingTruncationReport>,
+    reindex: RuntimeResult<impl Into<NoteReindexReport>>,
 ) -> RuntimeResult<Option<PostCommitEmbeddingOutcome>> {
     let current = match runtime.notes(token)?.get_note(note.id).await {
         Ok(current) => current,
@@ -47,13 +49,15 @@ async fn notify_if_current(
         return reindex.map(|_| None);
     }
     runtime.fire_note_mutation_hook(&note.kind, note.id).await;
-    reindex.map(|truncation| {
+    reindex.map(|report| {
+        let report = report.into();
         Some(PostCommitEmbeddingOutcome {
             effect: PostCommitEffect::ReindexNote {
                 note_id: note.id,
                 version: note.version,
             },
-            truncation,
+            truncation: report.truncation,
+            failures: report.failures,
         })
     })
 }
