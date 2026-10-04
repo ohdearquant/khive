@@ -24,21 +24,22 @@ use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority};
 use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_vamana::bridge::AnnBridgeCore;
 use khive_vamana::distance::l2_normalize;
 use khive_vamana::{
-    read_commit_fingerprint, read_commit_info, read_external_ids_sidecar, segment_commit_digest,
-    write_external_ids_sidecar, CorpusFingerprint, VamanaConfig, VamanaIndex, VamanaSnapshot,
+    read_commit_info, segment_commit_digest, CorpusFingerprint, VamanaIndex, VamanaSnapshot,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+// Reached by the test modules through `use super::*`.
+#[cfg(test)]
+use khive_vamana::{write_external_ids_sidecar, VamanaConfig};
+
 pub(crate) struct AnnBridge {
-    index: VamanaIndex,
-    id_map: Vec<Uuid>,
-    /// Digest of the v2 commit record this mmap bridge loaded. New
-    /// checkpoints carry a per-publication nonce, including semantically
-    /// identical rotations, so this identifies the mapped file generation.
-    commit_digest: Option<[u8; 32]>,
+    /// The index, its id map and its commit digest; they read as fields of the
+    /// bridge through `Deref`.
+    core: AnnBridgeCore,
     /// Namespace write-generation this build's corpus scan started at or after
     /// (issue #770). Stamped just before install; `install_if_fresher` uses it
     /// to reject a late-arriving build whose scan predates a `clear_namespace`
@@ -49,6 +50,20 @@ pub(crate) struct AnnBridge {
     drop_probe: Option<Arc<()>>,
     #[cfg(test)]
     search_pause: Option<Arc<TestSearchPause>>,
+}
+
+impl std::ops::Deref for AnnBridge {
+    type Target = AnnBridgeCore;
+
+    fn deref(&self) -> &AnnBridgeCore {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for AnnBridge {
+    fn deref_mut(&mut self) -> &mut AnnBridgeCore {
+        &mut self.core
+    }
 }
 
 #[cfg(test)]
@@ -792,37 +807,20 @@ pub(crate) fn set_warm_wait_timeout_override_ms(ms: u64) {
 }
 
 impl AnnBridge {
-    pub fn build(mut vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
-        if dim == 0 {
-            return Err("dimension must be > 0".into());
-        }
-        if vectors.is_empty() || id_map.is_empty() {
-            return Err("no vectors to build ANN index from".into());
-        }
-        let n = vectors.len() / dim;
-        if n != id_map.len() {
-            return Err(format!(
-                "id_map length {} != vector count {}",
-                id_map.len(),
-                n
-            ));
-        }
-        // L2→cosine conversion requires unit vectors; normalize before building.
-        for row in vectors.chunks_exact_mut(dim) {
-            l2_normalize(row);
-        }
-        let cfg = VamanaConfig::with_dimensions(dim);
-        let index = VamanaIndex::build_owned(vectors, cfg).map_err(|e| format!("{e}"))?;
-        Ok(Self {
-            index,
-            id_map,
-            commit_digest: None,
+    fn from_core(core: AnnBridgeCore) -> Self {
+        Self {
+            core,
             generation: 0,
             #[cfg(test)]
             drop_probe: None,
             #[cfg(test)]
             search_pause: None,
-        })
+        }
+    }
+
+    pub fn build(vectors: Vec<f32>, dim: usize, id_map: Vec<Uuid>) -> Result<Self, String> {
+        let core = AnnBridgeCore::build(vectors, dim, id_map)?;
+        Ok(Self::from_core(core))
     }
 
     /// Stamp this bridge with the namespace write-generation its corpus scan
@@ -947,17 +945,13 @@ impl AnnBridge {
         if let Some(pause) = &self.search_pause {
             pause.wait();
         }
-        let mut q = query.to_vec();
-        l2_normalize(&mut q);
-        match self.index.search(&q, k) {
-            Ok(results) => results
+        match self.core.search_hits(query, k) {
+            Ok(hits) => hits
                 .into_iter()
-                .filter_map(|(idx, dist)| {
-                    self.id_map.get(idx as usize).map(|uuid| {
-                        // L2² → cosine: cos(a,b) = 1 - L2²(a,b)/2 for unit vectors
-                        let cosine = 1.0 - dist / 2.0;
-                        (*uuid, cosine.max(0.0))
-                    })
+                .map(|(uuid, dist)| {
+                    // L2² → cosine: cos(a,b) = 1 - L2²(a,b)/2 for unit vectors
+                    let cosine = 1.0 - dist / 2.0;
+                    (uuid, cosine.max(0.0))
                 })
                 .collect(),
             Err(e) => {
@@ -979,16 +973,12 @@ impl AnnBridge {
             .collect::<Result<_, _>>()?;
         let index =
             VamanaIndex::from_snapshot(&snapshot).map_err(|e| format!("snapshot restore: {e}"))?;
-        Ok(Self {
+        let core = AnnBridgeCore {
             index,
             id_map,
             commit_digest: None,
-            generation: 0,
-            #[cfg(test)]
-            drop_probe: None,
-            #[cfg(test)]
-            search_pause: None,
-        })
+        };
+        Ok(Self::from_core(core))
     }
 
     /// Save this bridge to `dir` atomically: writes v2 Vamana segments (commits
@@ -1010,30 +1000,11 @@ impl AnnBridge {
     /// prevents two writers from pairing one commit digest with another
     /// writer's id map.
     fn save_atomic_locked(&self, dir: &std::path::Path) -> Result<(), String> {
-        let count = self.id_map.len();
-        if count != self.index.num_vectors() {
-            return Err(format!(
-                "id_map length {count} != index.num_vectors() {}",
-                self.index.num_vectors()
-            ));
-        }
-
-        // Step 1: write v2 segments atomically (metadata.bin is the commit gate).
-        self.index
-            .save_atomic(dir)
-            .map_err(|e| format!("VamanaIndex::save_atomic: {e}"))?;
-
-        // Step 2: digest the just-committed record. Must be Some — we committed it.
-        let digest = segment_commit_digest(dir)
-            .map_err(|e| format!("segment_commit_digest after save: {e}"))?
-            .ok_or_else(|| {
-                "save_atomic succeeded but metadata.bin is absent (torn commit)".to_string()
-            })?;
-
-        // Step 3: write the id-map sidecar atomically (tmp rename), bound to the
-        // commit-record digest so any segment/sidecar pairing from different
-        // saves is self-detecting at load time.
-        write_external_ids_sidecar(dir, &digest, &self.id_map).map_err(|e| e.to_string())
+        // The core writes the v2 segments (metadata.bin is the commit gate), digests the
+        // just-committed record, then writes the id-map sidecar bound to that digest so any
+        // segment/sidecar pairing from different saves is self-detecting at load time.
+        self.core.save_atomic(dir)?;
+        Ok(())
     }
 
     /// Load a bridge from a segment directory previously written by
@@ -1045,54 +1016,11 @@ impl AnnBridge {
     /// Cold signal and rebuild from the corpus.
     #[allow(dead_code)]
     pub fn load(dir: &std::path::Path) -> Result<Self, String> {
-        // Step 1: require a v2 commit fingerprint. Absent/v1/torn → Cold.
-        read_commit_fingerprint(dir)
-            .map_err(|e| format!("read_commit_fingerprint: {e}"))?
-            .ok_or_else(|| {
-                "no v2 commit fingerprint: segment dir is absent, v1, or has a torn commit"
-                    .to_string()
-            })?;
-
-        // Step 2: raw-load the committed v2 index. VamanaIndex::load is v2-aware
-        // (ADR-079): it reads the segments, verifies their checksums, and restores
-        // graph + lifecycle without a corpus and without rebuilding. A torn or
-        // mismatched segment surfaces as an error, which the caller treats as Cold.
-        let index = VamanaIndex::load(dir).map_err(|e| format!("VamanaIndex::load: {e}"))?;
-
-        // Step 3: read the external_ids sidecar and run cross-checks.
-        let (sidecar_digest, id_map) = read_external_ids_sidecar(dir)?;
-
-        // Cross-check: the sidecar must be bound to the exact commit record on
-        // disk. A mismatch means a segment/sidecar pairing from different saves
-        // (crash between the segment commit and the sidecar write, either order).
-        let commit_digest = segment_commit_digest(dir)
-            .map_err(|e| format!("segment_commit_digest: {e}"))?
-            .ok_or_else(|| "metadata.bin vanished between fingerprint and digest".to_string())?;
-        if sidecar_digest != commit_digest {
-            return Err(
-                "external_ids.bin commit-digest mismatch: torn segment/sidecar pair".to_string(),
-            );
-        }
-
-        // Cross-check: sidecar UUID count must match the loaded index vector count.
-        if id_map.len() != index.num_vectors() {
-            return Err(format!(
-                "external_ids.bin count {} != index.num_vectors() {}",
-                id_map.len(),
-                index.num_vectors()
-            ));
-        }
-
-        Ok(Self {
-            index,
-            id_map,
-            commit_digest: Some(commit_digest),
-            generation: 0,
-            #[cfg(test)]
-            drop_probe: None,
-            #[cfg(test)]
-            search_pause: None,
-        })
+        // The core requires a v2 commit fingerprint (absent/v1/torn → Cold), raw-loads the
+        // committed v2 index (VamanaIndex::load is v2-aware, ADR-079), then cross-checks the
+        // external_ids sidecar against the exact commit record and the vector count.
+        let (core, _commit_digest) = AnnBridgeCore::load(dir)?;
+        Ok(Self::from_core(core))
     }
 }
 
