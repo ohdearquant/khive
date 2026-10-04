@@ -431,3 +431,100 @@ through migration and replay.
   `freshness_unmet` entry to the absent model.
 - The one-snapshot proof, timeout cap, cancellation, and no-unproven-success
   tests from Amendment 1 remain review-blocking.
+
+## Amendment 3 (2026-10-04): partitioned moves carry memory vectors with receipts
+
+**Status**: Proposed. Refs #3696.
+
+On acceptance, this amendment retires the `memory_vector_left_behind` refusal and
+replaces Amendment 2's partitioned-move refusal acceptance arm. A partitioned move
+carries each source memory vector to its note's target, alongside the receipt and
+fences in the same backend transaction. A vector that has no unique target refuses
+before writes under ADR-189 Amendment 2; partitioning does not turn that vector into
+a `left_behind` row.
+
+Only a matching existing fence is refreshed, using the exact destination upsert
+sequence returned in that transaction. Receipt model counts, explicit zero-model
+receipts and unrelated destination fences remain unchanged. This does not infer a
+fence from a database-wide maximum, change a receipt's expected model count, or
+create a fence merely because a receipt moved.
+
+### Superseded passages
+
+On acceptance, only the refusal mechanism, the description of partitioned vectors
+being left behind, and the corresponding refusal acceptance obligation in these
+three byte-exact Amendment 2 passages are superseded. They remain above as the
+historical record. The opaque sealed token, namespace/model validation, exact keyed
+replay with no new vector or log row, stored model set, exact upsert fences,
+one-snapshot session proof, bounded wait and cancellation requirements remain in
+force. The existing moved-memory session-recall acceptance before publication and
+after compaction remains required.
+
+Opening refusal sentence:
+
+```text
+It also makes a namespace move refuse, with reason `memory_vector_left_behind`, when the move
+would carry a memory's receipt or fence to a target that does not receive that memory's vector
+rows.
+```
+
+Refusal paragraph under “Namespace moves and stored receipt fences”:
+
+```text
+A move refuses, changing nothing, when it would carry a memory visibility receipt or fence into
+a target namespace that does not also receive the vector rows the source namespace holds for
+that memory. The refusal reason is `memory_vector_left_behind`. The rule is keyed on what the
+move carries, not on the shape of the move. ADR-189 specifies that every vector row moves with
+its subject; the move primitive as implemented carries vector rows only when every route names
+one target and reports them as left behind otherwise. Under that implementation a partitioning
+move refuses while the source holds vector rows for a memory note whose receipt or fence the
+move would carry. A single-target move, which carries the vector rows with the receipt, is
+unaffected, and so is a memory note that has no receipt or fence. A move primitive that carries
+each memory's vector rows to the target that receives its receipt does not meet the refusal
+condition. The refusal is decided before any row is written, so the source and every target stay
+as they were. Without it the destination would hold a receipt whose
+fence it can satisfy only through the published arm: a namespace-wide published watermark may
+already cover the original sequence while the vector remains in the source namespace and cannot
+be retrieved from the destination. The refusal keeps Arm A's rule that session recall never
+silently serves an uncovered state true by construction. Relaxing it, for example by returning
+a typed `freshness_unmet` for that model in the destination, needs a later amendment with its
+own proof.
+```
+
+Partitioned-move refusal acceptance arm:
+
+```text
+- A partitioning move whose source holds a vector for a fenced memory note, with the ANN
+  watermark already covering that memory's original write, refuses with
+  `memory_vector_left_behind` and leaves the source and every target unchanged: the note,
+  receipt, fences, and vector rows stay where they were and nothing is appended to the ANN write
+  log. That fixture must fail against a move implementation that carries receipts and fences
+  for every target but moves vector rows only for a single-target move, and a control that
+  removes only the refusal must turn it red. A partitioning move whose source holds vector rows
+  only for memory notes without a receipt or fence is not refused by this rule.
+```
+
+### Replacement acceptance
+
+- `namespace_move::partition_tests::partitioned_memory_vectors_refresh_exact_fences_and_preserve_the_model_set`
+  must carry the partitioned memories' vectors, receipts and fences to the same
+  target. Every stored fence must equal its own destination upsert sequence even
+  when a pre-existing watermark covers the old source sequence. Receipt model
+  counts two, one and zero must survive; the zero-model receipt must acquire no
+  fence; an unrelated resident fence must remain unchanged; composite foreign keys
+  must stay valid. Independently removing fence refresh or partitioned receipt
+  carry, or substituting a database-wide maximum or fixed model count, must fail
+  this fixture.
+- `namespace_move::partition_tests::partitioned_vectors_follow_every_source_class_and_its_sections`
+  must carry byte-exact source vectors to their logical subjects' targets and
+  append source-delete then destination-upsert instructions for every moved vector,
+  excluding destination residents. Removing partitioned carry must fail it.
+- `namespace_move::partition_tests::partitioned_orphan_and_competing_subject_routes_refuse_before_any_write`
+  must retain the distinct `unroutable_vector` refusal for zero or multiple distinct
+  source-subject targets, before any move write. Removing the zero-target or
+  multiple-target check must fail its corresponding case.
+
+These database fixtures establish row placement and durable fence values. They do
+not replace Amendment 2's session-recall and keyed-replay acceptance or the warmed
+consumer acceptance in ADR-189 Amendment 1. Seeding a covering watermark does not
+establish an actual consumer's session proof.
