@@ -48,6 +48,9 @@ use crate::ingest::CODE_INGEST_NAMESPACE;
 use crate::manifest;
 use crate::safe_source::{self, SourceReadError};
 
+mod file_pending;
+use file_pending::{stamp_l2_declarations, FileReference};
+
 const RUST_L2_SCANNER_IDENTITY_VERSION: u64 = 2;
 const RUST_L2_MAX_SOURCE_BYTES: usize = safe_source::MAX_INGEST_FILE_BYTES as usize;
 const RUST_L2_MAX_DELIMITER_DEPTH: usize = 64;
@@ -2846,6 +2849,7 @@ struct L2SweepState {
     current_declarations: HashMap<Uuid, L2OwnerKey>,
     /// File modules whose L2 ownership was successfully refreshed/stamped.
     current_modules: HashMap<Uuid, L2OwnerKey>,
+    current_files: BTreeMap<(Uuid, String), String>,
     /// Current declarations reused without parsing. Their outgoing edges are
     /// refreshed only after every target file's ownership is finalized.
     unchanged_declarations: BTreeSet<Uuid>,
@@ -3185,16 +3189,15 @@ fn push_module_path_variants(paths: &mut Vec<String>, path: String) {
     }
 }
 
-/// A `uuid5`-recomputable unresolved call/type reference recorded on the
-/// *declaring* symbol entity (mirrors L1.5's `UnresolvedSpec` on
-/// project/module entities). Kept content-hash-free by the same design: only
-/// the fields needed to retry resolution are stored.
+/// Unresolved call/type tuple. Declaration rows retain historical unions;
+/// accepted per-file entries alone authorize late materialization.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
 struct L2UnresolvedRef {
     segments: Vec<String>,
     evidence: String,
 }
 
+#[cfg(test)]
 fn read_l2_unresolved(properties: &Value) -> Vec<L2UnresolvedRef> {
     properties
         .get("l2_unresolved_references")
@@ -3816,56 +3819,6 @@ async fn clear_l2_ownership(
     Ok(())
 }
 
-/// Stamp the module's current-coverage `declaration_ids` (sorted, deduped)
-/// and scanner identity version after a successful parse.
-async fn stamp_l2_declarations(
-    rt: &KhiveRuntime,
-    token: &NamespaceToken,
-    module_id: Uuid,
-    declaration_ids: &[Uuid],
-    content_hash: &str,
-    file_label: &str,
-    report: &mut CodeSourceIngestReport,
-) -> Result<(), CodeSourceIngestError> {
-    let mut row_missing = false;
-    let mut invalid_properties = false;
-    mutate_entity(rt, token, module_id, file_label, report, |current| {
-        row_missing = current.is_none();
-        let mut module = current?.clone();
-        let Some(Value::Object(mut props)) = module.properties.clone() else {
-            invalid_properties = true;
-            return None;
-        };
-        props.insert(
-            "declaration_ids".into(),
-            json!(declaration_ids
-                .iter()
-                .map(Uuid::to_string)
-                .collect::<Vec<_>>()),
-        );
-        props.insert("l2_content_hash".into(), json!(content_hash));
-        props.insert(
-            "l2_scanner_identity_version".into(),
-            json!(RUST_L2_SCANNER_IDENTITY_VERSION),
-        );
-        module.properties = Some(Value::Object(props));
-        Some(module)
-    })
-    .await?;
-    if row_missing {
-        report.warnings.push(format!(
-            "L2 module {module_id} from this sweep was missing at stamp time; \
-             declaration_ids not recorded"
-        ));
-    } else if invalid_properties {
-        report.warnings.push(format!(
-            "L2 module {module_id} has missing or non-object properties at stamp time; \
-             declaration_ids not recorded"
-        ));
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn refresh_l2_declarations(
     rt: &KhiveRuntime,
@@ -4027,6 +3980,7 @@ async fn persist_l2_file(
     }
     let current_file_ids: BTreeSet<Uuid> = declaration_ids.iter().copied().collect();
 
+    let mut file_references = Vec::new();
     // Phase B: containment + same-project call/type-reference resolution.
     for (id, containing_module_path, decl) in &declared {
         let owner_id = declaration_owner_id(
@@ -4097,6 +4051,12 @@ async fn persist_l2_file(
                 });
             }
         }
+        file_references.extend(pending_references.iter().map(|pending| FileReference {
+            declaration_id: *id,
+            module_path: containing_module_path.clone(),
+            reference: pending.value.clone(),
+        }));
+        // Preserve declaration history without granting it late edge authority.
         record_l2_pending_batch(
             rt,
             token,
@@ -4145,16 +4105,20 @@ async fn persist_l2_file(
 
     declaration_ids.sort();
     declaration_ids.dedup();
-    stamp_l2_declarations(
+    if !stamp_l2_declarations(
         rt,
         token,
         module_id,
         &declaration_ids,
+        &file_references,
         content_hash,
         file_label,
         report,
     )
-    .await?;
+    .await?
+    {
+        return Ok(None);
+    }
     Ok(Some(declaration_ids))
 }
 
@@ -4337,6 +4301,12 @@ async fn run_l2_sweep(
             .is_none();
         let needs_reparse = recovering
             || refused
+            || existing_module
+                .as_ref()
+                .and_then(|entity| entity.properties.as_ref())
+                .and_then(|properties| file_pending::read_file(properties, &file_label))
+                .filter(|entry| entry.content_hash == hash)
+                .is_none()
             || l2_needs_reparse(
                 existing_module
                     .as_ref()
@@ -4392,8 +4362,8 @@ async fn run_l2_sweep(
             let declaration_ids = existing_module
                 .as_ref()
                 .and_then(|entity| entity.properties.as_ref())
-                .and_then(|properties| properties.get("declaration_ids"))
-                .and_then(read_declaration_ids)
+                .and_then(|properties| file_pending::read_file(properties, &file_label))
+                .map(|entry| entry.declaration_ids)
                 .unwrap_or_default();
             if refresh_l2_declarations(
                 rt,
@@ -4409,6 +4379,9 @@ async fn run_l2_sweep(
             )
             .await?
             {
+                state
+                    .current_files
+                    .insert((module_id, file_label.clone()), hash.clone());
                 state.mark_current_module(module_id, &proj_name, LANGUAGE);
                 state.mark_current_declarations(&declaration_ids, &proj_name, LANGUAGE);
                 state
@@ -4446,6 +4419,9 @@ async fn run_l2_sweep(
         )
         .await?
         {
+            state
+                .current_files
+                .insert((module_id, file_label.clone()), hash.clone());
             state.mark_current_module(module_id, &proj_name, LANGUAGE);
             state.mark_current_declarations(&declaration_ids, &proj_name, LANGUAGE);
         }
@@ -4618,7 +4594,7 @@ async fn refresh_unchanged_l2_edges(
 
 /// L2 synchronous re-resolve pass, run once after the whole L2 file walk
 /// completes (mirrors L1.5's `reresolve_pass`): revisits every symbol
-/// carrying pending call/type references and every module carrying pending
+/// carrying accepted per-file call/type references and every module carrying pending
 /// impls, and retries resolution against the now-fully-populated set. This
 /// is what makes edge convergence independent of file-visit order within one
 /// sweep, and lets a later sweep pick up targets that did not exist yet.
@@ -4635,145 +4611,7 @@ async fn l2_reresolve_pass(
         l2.symbol_dependencies_unresolved = 0;
     }
 
-    // Pass 1: pending call/type references on symbol entities.
-    let mut reader = sql
-        .reader()
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT id FROM entities WHERE deleted_at IS NULL \
-                  AND json_extract(properties,'$.l2_unresolved_references') IS NOT NULL"
-                .into(),
-            params: vec![],
-            label: Some("code_ingest_l2_reresolve_refs".into()),
-        })
-        .await
-        .map_err(|e| CodeSourceIngestError::Storage(e.to_string()))?;
-    for row in rows {
-        let Some(id) = row_uuid(&row) else { continue };
-        let Some(entity) = get_entity_opt(rt, token, id).await? else {
-            continue;
-        };
-        let Some(source_project) = entity
-            .properties
-            .as_ref()
-            .and_then(|p| p.get("source_project"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let Some(language) = entity
-            .properties
-            .as_ref()
-            .and_then(|p| p.get("language"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let Some(declaring_module_path) = entity
-            .properties
-            .as_ref()
-            .and_then(|p| p.get("module_path"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let source_project = source_project.to_string();
-        let language = language.to_string();
-        let declaring_module_path = declaring_module_path.to_string();
-        if !state.is_current_declaration(id, &source_project, &language, &no_current_file_ids) {
-            continue;
-        }
-        let pending = entity
-            .properties
-            .as_ref()
-            .map(read_l2_unresolved)
-            .unwrap_or_default();
-        if pending.is_empty() {
-            continue;
-        }
-        let original_pending: HashSet<_> = pending.iter().cloned().collect();
-        let mut still_pending = Vec::new();
-        let mut pending_changed = false;
-        for reference in pending {
-            let mut target = None;
-            let mut suppressed_self_type = false;
-            for candidate in symbol_candidate_ids(
-                &source_project,
-                &language,
-                &declaring_module_path,
-                &reference.segments,
-                &reference.evidence,
-            ) {
-                if candidate == id && reference.evidence == "type_reference" {
-                    suppressed_self_type = true;
-                    break;
-                }
-                if state.is_current_declaration(
-                    candidate,
-                    &source_project,
-                    &language,
-                    &no_current_file_ids,
-                ) {
-                    target = Some(candidate);
-                    break;
-                }
-            }
-            match target {
-                Some(target_id) => {
-                    upsert_l2_depends_on(
-                        rt,
-                        token,
-                        id,
-                        target_id,
-                        &reference.evidence,
-                        &language,
-                        sweep_time,
-                        state,
-                        report,
-                    )
-                    .await?;
-                    pending_changed = true;
-                }
-                None if suppressed_self_type => pending_changed = true,
-                None => still_pending.push(reference),
-            }
-        }
-        if let Some(l2) = report.l2.as_mut() {
-            l2.symbol_dependencies_unresolved += still_pending.len() as u64;
-        }
-        if pending_changed {
-            let label = id.to_string();
-            #[cfg(test)]
-            l2_batch_tests::pause_before_rebase().await;
-            mutate_entity(rt, token, id, &label, report, |current| {
-                let mut entity = current?.clone();
-                let mut rebased = entity
-                    .properties
-                    .as_ref()
-                    .map(read_l2_unresolved)
-                    .unwrap_or_default();
-                rebase_l2_pending(&mut rebased, &original_pending, &still_pending);
-                let mut props = entity
-                    .properties
-                    .clone()
-                    .and_then(|value| value.as_object().cloned())
-                    .unwrap_or_default();
-                if rebased.is_empty() {
-                    props.remove("l2_unresolved_references");
-                } else {
-                    props.insert(
-                        "l2_unresolved_references".into(),
-                        serde_json::to_value(&rebased).expect("serializes"),
-                    );
-                }
-                entity.properties = Some(Value::Object(props));
-                Some(entity)
-            })
-            .await?;
-        }
-    }
+    file_pending::reresolve(rt, token, sweep_time, state, report).await?;
 
     // Pass 2: pending positive impls on module entities.
     let mut reader = sql

@@ -389,9 +389,20 @@ async fn l2_recovery_attempt_precedes_changed_file_and_reresolve_failures() {
                 "fn ba() { bh(); }\nfn bh() {}\nfn new_target() {}\n",
             );
             let trigger = if reresolve {
+                let label = root
+                    .join("a.rs")
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string();
+                let path = format!(
+                    "$.l2_file_pending.{}.references",
+                    json!(file_pending::file_key(&label))
+                )
+                .replace('\'', "''");
                 format!(
-                    "CREATE TRIGGER recovery_fault BEFORE UPDATE ON entities WHEN NEW.id='{}' AND json_array_length(json_extract(OLD.properties,'$.l2_unresolved_references'))>0 AND json_extract(NEW.properties,'$.l2_unresolved_references') IS NULL BEGIN SELECT RAISE(ABORT,'reresolve_prefix'); END;",
-                    symbol("a", "aa")
+                    "CREATE TRIGGER recovery_fault BEFORE UPDATE ON entities WHEN NEW.id='{}' AND json_array_length(json_extract(OLD.properties,'{path}'))>0 AND json_array_length(json_extract(NEW.properties,'{path}'))=0 BEGIN SELECT RAISE(ABORT,'reresolve_prefix'); END;",
+                    module_uuid("fixture", "rust", "a")
                 )
             } else {
                 format!(
@@ -857,3 +868,9 @@ async fn l2_recovery_real_read_skip_retains_known_historical_strand() {
         );
     }
 }
+
+#[path = "l2_removed_pending_tests.rs"]
+mod pending_removed_tests;
+
+#[path = "l2_file_pending_gate_tests.rs"]
+mod file_pending_gate_tests;
