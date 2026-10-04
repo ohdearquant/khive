@@ -17,6 +17,9 @@ const SENDER: &str = "actor:sender";
 const RECIPIENT: &str = "actor:recipient";
 const NAMESPACE: &str = "local";
 
+#[path = "comm_attachment_replay/lifecycle_tests.rs"]
+mod lifecycle_tests;
+
 struct Fixture {
     registry: VerbRegistry,
     runtime: KhiveRuntime,
