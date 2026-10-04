@@ -57,6 +57,9 @@ use incremental::*;
 mod checkpoint_timer;
 #[path = "ann/delta.rs"]
 mod delta;
+#[path = "ann/final_tail.rs"]
+mod final_tail;
+use final_tail::fetch_final_tail_on;
 
 // ── types ─────────────────────────────────────────────────────────────────────
 
@@ -2509,76 +2512,6 @@ pub(crate) async fn fetch_final_tail(
     fetch_final_tail_on(reader.as_mut(), model, s, live_threshold).await
 }
 
-/// Same as [`fetch_final_tail`] but runs its single snapshot statement through
-/// a caller-supplied reader instead of acquiring its own handle. Serving paths
-/// also use this seam while coordinating the ADR-118 §1 registry guard.
-async fn fetch_final_tail_on(
-    reader: &mut dyn khive_storage::SqlReader,
-    model: &str,
-    s: u64,
-    live_threshold: Option<f64>,
-) -> Result<(Vec<(Uuid, Option<Vec<f32>>)>, u64), String> {
-    // `live_threshold` (ADR-118 §3): caps the scan to ceil(threshold × live
-    // corpus) newest rows in one statement snapshot; the outer ORDER BY
-    // restores ascending order so coalescing stays last-write-wins.
-    let table_name = format!("vec_{}", sanitize_model_key(model));
-    let (live_cte, order_limit) = match live_threshold {
-        Some(_) => (
-            format!(
-                "live AS (\
-                   SELECT COUNT(*) AS live_count FROM {table_name} v \
-                   JOIN notes n ON n.id = v.subject_id \
-                   WHERE v.embedding_model = ?1 \
-                     AND v.kind = 'note' AND v.field = 'note.content' \
-                     AND n.deleted_at IS NULL\
-                 ), "
-            ),
-            "ORDER BY seq DESC \
-             LIMIT (SELECT CAST(live_count * ?3 AS INTEGER) + \
-                       CASE WHEN CAST(live_count * ?3 AS INTEGER) < live_count * ?3 \
-                            THEN 1 ELSE 0 END FROM live)"
-                .to_string(),
-        ),
-        None => (String::new(), "ORDER BY seq".to_string()),
-    };
-    let mut params = vec![
-        SqlValue::Text(model.to_owned()),
-        SqlValue::Integer(s as i64),
-    ];
-    if let Some(threshold) = live_threshold {
-        params.push(SqlValue::Float(threshold));
-    }
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "WITH {live_cte}selected AS (\
-                   SELECT seq, subject_id, op FROM ann_write_log \
-                   WHERE embedding_model = ?1 \
-                     AND kind = 'note' AND field = 'note.content' AND seq > ?2 \
-                   {order_limit}\
-                 ) \
-                 SELECT selected.seq, selected.subject_id, selected.op, \
-                        vectors.embedding_model AS vector_model, \
-                        vectors.kind AS vector_kind, \
-                        vectors.field AS vector_field, vectors.embedding, \
-                        live_note.id AS live_note_id \
-                 FROM selected \
-                 LEFT JOIN {table_name} AS vectors \
-                   ON vectors.subject_id = selected.subject_id \
-                 LEFT JOIN notes AS live_note \
-                   ON live_note.id = selected.subject_id \
-                  AND live_note.deleted_at IS NULL \
-                 ORDER BY selected.seq"
-            ),
-            params,
-            label: Some("memory_ann_fresh_tail_snapshot".into()),
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-
-    parse_final_tail_rows(&rows, model, s)
-}
-
 /// Read registry protection, capped raw delta size, and final vector state in
 /// one statement. The count is exact when it is within `max_delta`; above the
 /// cap, `max_delta + 1` rows suffice to require a rebuild without materializing
@@ -4355,6 +4288,7 @@ mod owned_build_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod final_tail_tests;
     mod incremental_tests;
     mod maintenance_lock_tests;
     use serial_test::serial;
