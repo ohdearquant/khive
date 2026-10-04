@@ -12,6 +12,7 @@
 //! `schema_column_additions` are outside the compared list.
 
 use async_trait::async_trait;
+#[cfg(feature = "pack-agent")]
 use khive_pack_agent::AgentPack;
 use khive_pack_blob::BlobPack;
 use khive_pack_brain::BrainPack;
@@ -29,8 +30,10 @@ use khive_pack_memory::MemoryPack;
 use khive_pack_moodboard::MoodboardPack;
 use khive_pack_schedule::SchedulePack;
 use khive_pack_session::SessionPack;
+#[cfg(feature = "pack-telemetry")]
 use khive_pack_telemetry::TelemetryPack;
 use khive_pack_tool::ToolPack;
+#[cfg(feature = "pack-web")]
 use khive_pack_web::WebPack;
 use khive_pack_workspace::WorkspacePack;
 use khive_runtime::pack::{PackRegistry, PackRuntime};
@@ -88,7 +91,6 @@ fn linked_packs() -> Vec<Checked> {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     #[allow(unused_mut)] // only the optional-pack pushes below need `mut`
     let mut packs = vec![
-        checked(&AgentPack::from_runtime(rt.clone())),
         checked(&BlobPack::new(rt.clone())),
         // The factory installs `BrainPackRuntime`, which delegates every
         // accessor to the `BrainPack` compared here.
@@ -105,11 +107,15 @@ fn linked_packs() -> Vec<Checked> {
         checked(&MemoryPack::new_with_index_role(rt.clone(), false)),
         checked(&SchedulePack::new(rt.clone())),
         checked(&SessionPack::new(rt.clone())),
-        checked(&TelemetryPack::new(rt.clone())),
         checked(&ToolPack::new(rt.clone())),
-        checked(&WebPack::new(rt.clone())),
         checked(&WorkspacePack::new(rt.clone())),
     ];
+    #[cfg(feature = "pack-agent")]
+    packs.push(checked(&AgentPack::from_runtime(rt.clone())));
+    #[cfg(feature = "pack-telemetry")]
+    packs.push(checked(&TelemetryPack::new(rt.clone())));
+    #[cfg(feature = "pack-web")]
+    packs.push(checked(&WebPack::new(rt.clone())));
     #[cfg(feature = "pack-formal")]
     packs.push(checked(&FormalPack::new(rt.clone())));
     #[cfg(feature = "pack-moodboard")]
