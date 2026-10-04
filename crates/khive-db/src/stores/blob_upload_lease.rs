@@ -1,4 +1,4 @@
-//! Complete sidecars under the uploads/root write ownership; expiry comes in B.
+//! Complete sidecars and per-instance observation under uploads/root ownership.
 use super::*;
 
 pub(crate) const MAX_IDLE_SECS: u64 = 21_600;
@@ -206,4 +206,48 @@ pub(super) fn cleanup(context: &UploadContext, id: &UploadId) -> StorageResult<(
         .sync_directory("lease_sync_cleanup", &directory)
         .map_err(|error| map_io_err(error, "lease_sync_cleanup"))?;
     Ok(())
+}
+
+pub(super) fn expired(
+    context: &UploadContext,
+    id: &UploadId,
+    value: &Lease,
+    wall: SystemTime,
+    monotonic: std::time::Instant,
+) -> StorageResult<bool> {
+    let renewed = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_millis(value.renewed_at))
+        .ok_or_else(|| invalid("upload_lease", "unrepresentable renewal timestamp"))?;
+    if renewed
+        .duration_since(wall)
+        .is_ok_and(|ahead| ahead > Duration::from_secs(300))
+    {
+        tracing::warn!(upload_id = %id, renewed_at = value.renewed_at,
+            "upload lease clock fault: renewal exceeds five-minute future tolerance");
+    }
+    let threshold = Duration::from_secs(
+        value
+            .idle_secs
+            .checked_add(300)
+            .ok_or_else(|| invalid("upload_lease", "unrepresentable observation bound"))?,
+    );
+    let backstop = renewed
+        .checked_add(Duration::from_secs(value.idle_secs))
+        .and_then(|time| time.checked_add(Duration::from_secs(86_400)))
+        .ok_or_else(|| invalid("upload_lease", "unrepresentable lease backstop"))?;
+    let mut observations = context
+        .observations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let observed =
+        observations
+            .entry(id.clone())
+            .or_insert((value.owner, value.renew_seq, monotonic));
+    if (observed.0, observed.1) != (value.owner, value.renew_seq) {
+        *observed = (value.owner, value.renew_seq, monotonic);
+    }
+    Ok(monotonic
+        .checked_duration_since(observed.2)
+        .is_some_and(|age| age >= threshold)
+        || wall >= backstop)
 }

@@ -54,6 +54,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 # Integration binaries opt into explicit fixture constructors.
 khive-db = { path = ".", features = ["test-support"] }
 tokio = { workspace = true, features = ["full", "test-util"] }

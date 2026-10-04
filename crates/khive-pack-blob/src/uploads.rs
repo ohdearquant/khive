@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_storage::blob::UploadLeaseConfig;
 use khive_storage::{BlobStore, ContentRef, UploadId};
 use serde_json::{json, Value};
 
@@ -23,7 +24,7 @@ impl UploadPolicy {
         raw.parse::<usize>().ok().filter(|value| *value > 0)
     }
 
-    fn from_env() -> Self {
+    fn from_env(cap: Option<Duration>) -> Self {
         fn limit(name: &str, default: usize) -> usize {
             match std::env::var(name) {
                 Ok(raw) => UploadPolicy::positive_limit(&raw).unwrap_or_else(|| {
@@ -33,16 +34,28 @@ impl UploadPolicy {
                 Err(_) => default,
             }
         }
-        fn duration(name: &str, default: u64) -> Duration {
+        fn duration(name: &str, default: u64, cap: Option<Duration>) -> Duration {
             match std::env::var(name) {
                 Ok(raw) => match raw.parse::<u64>() {
-                    Ok(seconds)
-                        if seconds > 0
-                            && Instant::now()
-                                .checked_add(Duration::from_secs(seconds))
-                                .is_some() =>
-                    {
-                        Duration::from_secs(seconds)
+                    Ok(seconds) if seconds > 0 => {
+                        let resolved = cap.map_or(seconds, |cap| {
+                            if seconds > cap.as_secs() {
+                                tracing::warn!(
+                                    name,
+                                    configured = seconds,
+                                    clamp = cap.as_secs(),
+                                    "filesystem upload idle bound clamped to six hours"
+                                );
+                            }
+                            seconds.min(cap.as_secs())
+                        });
+                        let duration = Duration::from_secs(resolved);
+                        if Instant::now().checked_add(duration).is_some() {
+                            duration
+                        } else {
+                            tracing::warn!(name, "invalid upload duration; using default");
+                            Duration::from_secs(default)
+                        }
                     }
                     _ => {
                         tracing::warn!(name, "invalid upload duration; using default");
@@ -53,8 +66,8 @@ impl UploadPolicy {
             }
         }
         Self {
-            idle_for: duration("KHIVE_BLOB_UPLOAD_IDLE_SECS", 3600),
-            sweep_interval: duration("KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS", 600),
+            idle_for: duration("KHIVE_BLOB_UPLOAD_IDLE_SECS", 3600, cap),
+            sweep_interval: duration("KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS", 600, None),
             max_active: limit("KHIVE_BLOB_UPLOAD_MAX_ACTIVE", 128),
             max_per_actor: limit("KHIVE_BLOB_UPLOAD_MAX_PER_ACTOR", 16),
         }
@@ -135,6 +148,7 @@ struct UploadRecord {
     tail: Option<(usize, blake3::Hash)>,
     actor: String,
     last_part: Instant,
+    leased: bool,
     phase: UploadPhase,
     slot: Option<UploadSlot>,
 }
@@ -149,9 +163,13 @@ pub struct UploadManager {
 
 impl UploadManager {
     pub(crate) fn new(runtime: KhiveRuntime) -> Self {
+        let cap = runtime
+            .require_blob_store()
+            .ok()
+            .and_then(|store| store.upload_lease_idle_cap());
         Self {
             runtime,
-            policy: UploadPolicy::from_env(),
+            policy: UploadPolicy::from_env(cap),
             records: Arc::new(Mutex::new(HashMap::new())),
             slots: Arc::new(UploadSlots::default()),
         }
@@ -245,6 +263,20 @@ impl UploadManager {
                 return Ok(json!({"content_ref": reference.to_string(), "size": stored_size}));
             }
         }
+        let lease = if store.upload_lease_idle_cap().is_some() {
+            let main = self.runtime.core();
+            let owner = main.backend().database_owner_identity().map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "blob.begin: durable MAIN identity unavailable: {error}"
+                ))
+            })?;
+            Some(UploadLeaseConfig::new(
+                owner.durable_id(),
+                self.policy.idle_for,
+            )?)
+        } else {
+            None
+        };
         let slot = self.slots.reserve(&actor, self.policy)?;
         let records = Arc::clone(&self.records);
         // Once admitted, finish registration even if the calling request is
@@ -252,7 +284,10 @@ impl UploadManager {
         // and leave staging that no longer counts toward either ceiling.
         let id = tokio::spawn(async move {
             let last_part = Instant::now();
-            let id = store.begin_upload(size).await?;
+            let id = match lease {
+                Some(config) => store.begin_upload_with_lease(size, config).await?,
+                None => store.begin_upload(size).await?,
+            };
             let record = UploadRecord {
                 store,
                 size,
@@ -263,6 +298,7 @@ impl UploadManager {
                 tail: None,
                 actor,
                 last_part,
+                leased: lease.is_some(),
                 phase: UploadPhase::Active,
                 slot: Some(slot),
             };
@@ -301,8 +337,16 @@ impl UploadManager {
                         .into(),
                 ));
             }
-            // A retry did not write a new part or refresh the backend mtime;
-            // keep its idle clock unchanged as well.
+            if record.leased {
+                let accepted_at = Instant::now();
+                record.phase = UploadPhase::InFlight;
+                if let Err(error) = record.store.renew_upload(id).await {
+                    self.discard_after_error(id, &mut record).await;
+                    return Err(error.into());
+                }
+                record.last_part = accepted_at;
+                record.phase = UploadPhase::Active;
+            }
             return Ok(
                 json!({"next_index": record.next_index, "received_bytes": record.received_bytes}),
             );

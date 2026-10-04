@@ -2675,10 +2675,6 @@ impl BlobStore for FsBlobStore {
         uploads::renew(self, id.clone()).await
     }
 
-    async fn begin_upload(&self, declared_size: u64) -> StorageResult<UploadId> {
-        uploads::begin(self, declared_size).await
-    }
-
     async fn append_part(&self, id: &UploadId, bytes: Vec<u8>) -> StorageResult<u64> {
         uploads::append(self, id.clone(), bytes).await
     }
