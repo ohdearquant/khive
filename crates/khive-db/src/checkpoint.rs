@@ -4720,6 +4720,7 @@ mod tests {
             }
             let _run_owner = CheckpointRunTaskGuard::start(&pool, interval);
             let stop = Arc::new(AtomicBool::new(false));
+            let first_commits = Arc::new(AtomicUsize::new(0));
             let writer_connections: Vec<_> = (0..3)
                 .map(|_| {
                     let conn = rusqlite::Connection::open(&path).unwrap();
@@ -4734,11 +4735,17 @@ mod tests {
                 .map(|(writer_id, conn)| {
                     let writer_id = i64::try_from(writer_id).unwrap();
                     let stop = Arc::clone(&stop);
+                    let first_commits = Arc::clone(&first_commits);
                     std::thread::spawn(move || {
                         let mut commits = 0_u64;
                         while !stop.load(Ordering::SeqCst) {
                             match conn.execute("INSERT INTO t VALUES (?1)", [writer_id]) {
-                                Ok(_) => commits += 1,
+                                Ok(_) => {
+                                    commits += 1;
+                                    if commits == 1 {
+                                        first_commits.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                }
                                 Err(rusqlite::Error::SqliteFailure(code, _))
                                     if matches!(
                                         code.code,
@@ -4755,9 +4762,13 @@ mod tests {
                 .collect();
 
             let started = Instant::now();
+            let deadline = started + Duration::from_secs(30);
             let mut samples = 0;
             let mut bad_reports = Vec::new();
-            while started.elapsed() < Duration::from_millis(1_600) {
+            // Hold the window open until every writer has committed once, up to the deadline.
+            while started.elapsed() < Duration::from_millis(1_600)
+                || (first_commits.load(Ordering::SeqCst) < 3 && Instant::now() < deadline)
+            {
                 let report = crate::diagnostics::collect(
                     &pool,
                     crate::diagnostics::BuildIdentity::from_env("test", None),
@@ -4786,7 +4797,7 @@ mod tests {
                 .collect();
             assert!(
                 commits.iter().all(|commits| *commits > 0),
-                "all three connections must commit at {interval:?}: {commits:?}"
+                "every writer must commit before the deadline at {interval:?}: {commits:?}"
             );
             assert!(samples >= 2, "checkpoint probes must run at {interval:?}");
             assert!(
