@@ -27,6 +27,8 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::note_search_ann::NoteSearchAnnProvider;
 use crate::pack::KindHook;
 
+mod embedder_init;
+
 #[cfg(all(test, target_os = "macos"))]
 const IN_PROCESS_TEST_NOFILE_LIMIT: libc::rlim_t = 4096;
 #[cfg(all(test, target_os = "macos"))]
@@ -2454,76 +2456,6 @@ impl KhiveRuntime {
         token: Option<&NamespaceToken>,
     ) -> RuntimeResult<(Arc<dyn EmbeddingService>, bool)> {
         self.embedder_inner(name, token).await
-    }
-
-    async fn embedder_inner(
-        &self,
-        name: &str,
-        token: Option<&NamespaceToken>,
-    ) -> RuntimeResult<(Arc<dyn EmbeddingService>, bool)> {
-        // Fall back to the literal name (not the alias table) so custom
-        // providers registered with non-lattice names stay reachable.
-        let canonical_key = match parse_embedding_model_alias(name) {
-            Some(model) => model.to_string(),
-            None => name.to_owned(),
-        };
-        if request_excludes_embedder(&canonical_key) {
-            return Err(crate::RuntimeError::UnknownModel(name.to_string()));
-        }
-        // Clone the entry so we don't hold the RwLockGuard across the
-        // async OnceCell initialisation (Send bound).
-        let entry = {
-            let registry = self.embedder_registry.read().map_err(|_| {
-                crate::RuntimeError::Internal("embedder registry lock poisoned".into())
-            })?;
-            registry
-                .get_entry(&canonical_key)
-                .ok_or_else(|| crate::RuntimeError::UnknownModel(name.to_string()))?
-        };
-        let audited_document_preparation = entry.has_audited_document_preparation();
-        let (service, init_duration_us) = entry.resolve().await?;
-        if let Some(duration_us) = init_duration_us {
-            if let Some(token) = token {
-                self.emit_embedder_initialized(token, &canonical_key, duration_us)
-                    .await;
-            } else if let Ok(token) = self.authorize(self.config.default_namespace.clone()) {
-                self.emit_embedder_initialized(&token, &canonical_key, duration_us)
-                    .await;
-            }
-        }
-        Ok((service, audited_document_preparation))
-    }
-
-    async fn emit_embedder_initialized(
-        &self,
-        token: &NamespaceToken,
-        model_name: &str,
-        duration_us: i64,
-    ) {
-        // Lazy embedder construction can happen during daemon warm or an
-        // assertive request. A snapshot has no durable audit sink, so do not
-        // resolve an EventStore merely to attempt a known-rejected append.
-        if self.is_read_only() {
-            return;
-        }
-        let Ok(store) = self.events(token) else {
-            return;
-        };
-        let event = Event::new(
-            token.namespace().as_str(),
-            "embedder.init",
-            EventKind::EmbedderInitialized,
-            SubstrateKind::Event,
-            format!("{}:{}", token.actor().kind, token.actor().id),
-        )
-        .with_payload(serde_json::json!({
-            "model_name": model_name,
-            "duration_us": duration_us,
-        }))
-        .with_duration_us(duration_us);
-        if let Err(err) = store.append_event(event).await {
-            tracing::warn!(error = %err, model_name, "embedder initialization event append failed");
-        }
     }
 
     /// Register a custom embedding provider with this runtime.

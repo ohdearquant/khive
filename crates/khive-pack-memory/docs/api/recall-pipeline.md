@@ -26,7 +26,7 @@ Noise-only queries are rejected before expensive embedding work. `is_meaningful_
 
 FTS CJK bypass uses `contains_cjk` to route the text leg through the CJK-bypass tokenizer. The dense/vector leg has no separate query-language routing: it always searches every configured embedding engine and fuses the results (issue #1115), whether or not the query contains CJK.
 
-`embed_query_model` checks the pack-local LRU by `(model, query)` and embeds on the blocking pool when absent. It uses the runtime's query-side instruction prefix, which preserves the trained retrieval space for instruction-tuned models such as multilingual-e5. Cache hits clone the stored vector result.
+`embed_query_model` checks the pack-local LRU by `(model, query)` and awaits query embedding on a miss. Dropping the request cancels its query embedding; shared cold model initialization and its initialization event continue independently. It uses the runtime's query-side instruction prefix, which preserves the trained retrieval space for instruction-tuned models such as multilingual-e5. Cache hits clone the stored vector result.
 
 ## FTS candidate collection
 

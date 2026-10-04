@@ -243,6 +243,10 @@ type NamedEmbedResult = (String, Result<(String, Vec<f32>), RuntimeError>);
 #[path = "common_embedding_tests.rs"]
 mod embedding_tests;
 
+#[cfg(test)]
+#[path = "common_cold_embedding_tests.rs"]
+mod cold_embedding_tests;
+
 /// Partition per-engine embed results into successes, warning on each failure so one
 /// unhealthy embedding engine degrades recall instead of aborting it. Errors only if
 /// every engine failed.
