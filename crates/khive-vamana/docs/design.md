@@ -29,7 +29,7 @@ graph-based retrieval engine (ADR-048).
 
 - [`src/config.rs`](../src/config.rs) -- inline config validation tests
 - [`src/graph.rs`](../src/graph.rs) -- inline graph construction and search tests
-- [`src/index.rs`](../src/index.rs) -- inline persistence and snapshot tests
+- [`src/index_tests.rs`](../src/index_tests.rs) -- persistence and snapshot tests
 - [`tests/benchmark.rs`](../tests/benchmark.rs) -- integration recall tests
 
 **Benchmarks:**
