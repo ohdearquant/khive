@@ -105,7 +105,7 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     },
     HandlerDef {
         name: "schedule.agenda",
-        description: "List upcoming scheduled events.",
+        description: "List upcoming scheduled events ordered by UTC trigger instant, stored timestamp text, then UUID. Round-trip non-null next.after verbatim and next.after_id with the same time window until an empty page returns next=null; continuation is exclusive and does not pin a snapshot or promise more rows.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -113,14 +113,28 @@ pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
                 name: "from",
                 param_type: "string",
                 required: false,
-                description: "Start of time window in RFC 3339 format. Omit to start from earliest pending event.",
+                description: "Inclusive start of time window in RFC 3339 format. Omit to start from earliest pending event.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
                 name: "to",
                 param_type: "string",
                 required: false,
-                description: "End of time window in RFC 3339 format. Omit to include all future events.",
+                description: "Inclusive end of time window in RFC 3339 format. Omit to include all future events.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "after",
+                param_type: "string",
+                required: false,
+                description: "Exclusive continuation timestamp in RFC 3339 format, returned as next.after. Preserve its original text and supply together with after_id; existing from/to filters still apply.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
+                name: "after_id",
+                param_type: "string",
+                required: false,
+                description: "Continuation UUID, returned as next.after_id. Supply together with after; UUID breaks ties with the same UTC instant and stored timestamp text.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

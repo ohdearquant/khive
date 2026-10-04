@@ -2726,6 +2726,7 @@ dependencies = [
  "lattice-embed",
  "serde",
  "serde_json",
+ "serial_test",
  "tokio",
  "tracing",
  "uuid",
