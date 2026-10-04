@@ -43,6 +43,8 @@ lattice-router = ["dep:lattice-fann"]
 [dev-dependencies]
 lattice-embed = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["test-internals"] }
+rusqlite = { workspace = true, features = ["hooks"] }
 khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
 # Dev-only: exercises the real memory.recall -> BrainPack dispatch-hook path
 # (issue #459 regression). khive-pack-memory already carries khive-pack-brain

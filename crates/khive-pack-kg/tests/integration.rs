@@ -15409,7 +15409,7 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
 /// two independent reads of the same counters.
 ///
 /// The guarantee holds only because the audit row's `freeze()` runs during
-/// dispatch, before the envelope's `frozen_or_snapshot()`. Nothing in the
+/// dispatch, before the envelope's `shipping_snapshot()`. Nothing in the
 /// suite pinned that, so a refactor or a new envelope-assembly path could
 /// invert the order: the envelope would silently return a live snapshot, the
 /// two would disagree, and no test would fail — on numbers a customer can
@@ -15424,7 +15424,7 @@ async fn search_entity_hyphenated_adr_id_with_plain_terms_matches() {
 /// object, the late increment leaks into it and this fails.
 ///
 /// Limit, stated rather than implied: the envelope value is read through the
-/// same expression `stamp_usage` uses (`ctx.frozen_or_snapshot()`) rather than
+/// same expression `stamp_usage` uses (`ctx.shipping_snapshot()`) rather than
 /// by driving the MCP server, because the audit row is only reachable from the
 /// pack surface. That one-line wrapper is not covered here.
 #[tokio::test]
@@ -15455,7 +15455,7 @@ async fn envelope_usage_equals_audit_row_resource_units() {
     ctx.add(UsageUnit::DbRoundTrips, LATE);
 
     // Exactly what the response envelope stamps.
-    let envelope_usage = ctx.frozen_or_snapshot();
+    let envelope_usage = ctx.shipping_snapshot().expect("known committed usage");
 
     let events = pack
         .dispatch(
