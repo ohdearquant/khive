@@ -941,26 +941,46 @@ mod tests {
             events: std::sync::Arc::clone(&buffer),
         };
 
+        fn is_abandoned(e: &CapturedEvent) -> bool {
+            e.message.as_deref()
+                == Some(
+                    "knowledge.compose request abandoned before completion \
+                     (client disconnect, cancellation, or daemon shutdown)",
+                )
+        }
+
         tracing::subscriber::with_default(subscriber, || {
-            let mut t = ComposeTiming::start("abandoned", false);
-            t.begin(Phase::Rerank).unwrap();
-            std::thread::sleep(Duration::from_millis(5));
-            // No begin(next phase), no manual flush_active() — Rerank is
-            // still active when `t` is dropped, simulating a future dropped
-            // mid-phase (client disconnect, cancellation, daemon shutdown).
-            drop(t);
+            // The tests of this crate share one process when run by the
+            // standard harness. While this capture is the only scoped
+            // subscriber alive, tracing-core skips its dispatcher lock, so a
+            // test on another thread that hits the WARN callsite for the first
+            // time computes the callsite's interest from that thread's own
+            // default (no subscriber) and caches it as disabled; the event
+            // below then never reaches the capture. Rebuilding the interest
+            // cache from this thread just before the drop recomputes it with
+            // the capture installed. A first registration happens once per
+            // callsite, so one that races the rebuild can only spoil the first
+            // attempt. Every attempt drops a fresh value with Rerank still
+            // active, and the assertions below are unchanged.
+            for _ in 0..3 {
+                let mut t = ComposeTiming::start("abandoned", false);
+                t.begin(Phase::Rerank).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+                // No begin(next phase), no manual flush_active() — Rerank is
+                // still active when `t` is dropped, simulating a future dropped
+                // mid-phase (client disconnect, cancellation, daemon shutdown).
+                tracing::callsite::rebuild_interest_cache();
+                drop(t);
+                if buffer.lock().unwrap().iter().any(is_abandoned) {
+                    break;
+                }
+            }
         });
 
         let events = buffer.lock().unwrap();
         let abandoned = events
             .iter()
-            .find(|e| {
-                e.message.as_deref()
-                    == Some(
-                        "knowledge.compose request abandoned before completion \
-                         (client disconnect, cancellation, or daemon shutdown)",
-                    )
-            })
+            .find(|e| is_abandoned(e))
             .unwrap_or_else(|| panic!("expected the abandoned-request WARN, got: {events:?}"));
         let phases = abandoned
             .phases

@@ -1,19 +1,19 @@
 # Vamana Testing
 
-**Scope:** `crates/khive-vamana/src/` (inline unit tests) and `crates/khive-vamana/tests/`
+**Scope:** `crates/khive-vamana/src/` (unit tests) and `crates/khive-vamana/tests/`
 **Last reviewed:** 2026-06-06
 
 ---
 
 ## Test organization
 
-| Location                         | What it covers                                                                                                                                                                                                           |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `src/config.rs` `#[cfg(test)]`   | `VamanaConfig` validation: zero-dimension, zero-degree, non-finite alpha, alpha < 1.0, builder setters                                                                                                                   |
-| `src/distance.rs` `#[cfg(test)]` | `l2_squared` correctness, `cosine_from_l2sq`, `try_l2_squared` error on mismatch                                                                                                                                         |
-| `src/graph.rs` `#[cfg(test)]`    | `VisitedSet` generation semantics, `VamanaGraph::new` rejections, `greedy_search` correctness on line graphs, tie-breaking, `robust_prune` alpha-squared condition, build determinism, self-loop and duplicate rejection |
-| `src/index.rs` `#[cfg(test)]`    | `VamanaIndex::build` / `search` / `save` / `load` / `recall_at_k` / `to_snapshot` / `from_snapshot`; binary corruption tests; non-finite float rejection at all public boundaries                                        |
-| `tests/benchmark.rs`             | Integration recall tests at realistic corpus sizes                                                                                                                                                                       |
+| Location                            | What it covers                                                                                                                                                                                                           |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/config.rs` `#[cfg(test)]`      | `VamanaConfig` validation: zero-dimension, zero-degree, non-finite alpha, alpha < 1.0, builder setters                                                                                                                   |
+| `src/distance.rs` `#[cfg(test)]`    | `l2_squared` correctness, `cosine_from_l2sq`, `try_l2_squared` error on mismatch                                                                                                                                         |
+| `src/graph.rs` `#[cfg(test)]`       | `VisitedSet` generation semantics, `VamanaGraph::new` rejections, `greedy_search` correctness on line graphs, tie-breaking, `robust_prune` alpha-squared condition, build determinism, self-loop and duplicate rejection |
+| `src/index_tests.rs` `#[cfg(test)]` | `VamanaIndex::build` / `search` / `save` / `load` / `recall_at_k` / `to_snapshot` / `from_snapshot`; binary corruption tests; non-finite float rejection at all public boundaries                                        |
+| `tests/benchmark.rs`                | Integration recall tests at realistic corpus sizes                                                                                                                                                                       |
 
 ---
 

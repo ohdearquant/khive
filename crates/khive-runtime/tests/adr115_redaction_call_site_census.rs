@@ -17,11 +17,12 @@ use std::path::{Path, PathBuf};
 /// Files exempt from the census, relative to the Cargo workspace root
 /// (`crates/` — see [`find_workspace_root`]): the primitive's owning file
 /// (which also defines the `mask_for_redaction_surface` wrapper every other
-/// caller must go through), and this census test itself, which necessarily
-/// quotes the literal string `mask_secrets(` in its own controls and panic
-/// message.
+/// caller must go through), its extracted issue-2655 regression tests, and this
+/// census test itself, which quotes the literal string `mask_secrets(` in its
+/// controls and panic message.
 const EXEMPT_FILES: &[&str] = &[
     "khive-runtime/src/secret_gate.rs",
+    "khive-runtime/src/secret_gate/issue_2655_tests.rs",
     "khive-runtime/tests/adr115_redaction_call_site_census.rs",
 ];
 

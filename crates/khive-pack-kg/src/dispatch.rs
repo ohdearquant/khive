@@ -807,7 +807,8 @@ mod tests {
                     "kind": "concept",
                     "name": format!("{decoy_blob}decoy {i}"),
                     "description": format!("{decoy_blob}decoy {i} description"),
-                    "tags": ["decoy-tag"]
+                    "tags": ["decoy-tag"],
+                    "skip_dedup_check": true
                 }),
                 &registry,
                 &tok,
@@ -824,7 +825,8 @@ mod tests {
                     "kind": "concept",
                     "name": "cliff query target",
                     "description": "cliff query target description",
-                    "tags": ["cliff-target-tag"]
+                    "tags": ["cliff-target-tag"],
+                    "skip_dedup_check": true
                 }),
                 &registry,
                 &tok,
@@ -883,7 +885,8 @@ mod tests {
                     "kind": "concept",
                     "name": format!("{decoy_blob}decoy {i}"),
                     "description": format!("{decoy_blob}decoy {i} description"),
-                    "properties": {"domain": "other"}
+                    "properties": {"domain": "other"},
+                    "skip_dedup_check": true
                 }),
                 &registry,
                 &tok,
@@ -899,7 +902,8 @@ mod tests {
                     "kind": "concept",
                     "name": "props cliff signal target",
                     "description": "props cliff signal target description",
-                    "properties": {"domain": "props-target"}
+                    "properties": {"domain": "props-target"},
+                    "skip_dedup_check": true
                 }),
                 &registry,
                 &tok,

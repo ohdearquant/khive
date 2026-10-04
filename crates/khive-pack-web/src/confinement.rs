@@ -352,6 +352,8 @@ mod platform {
         walk(source.file, source.path, limit, before_open)
     }
     #[cfg(test)]
+    mod descriptor_retention_tests;
+    #[cfg(test)]
     mod descriptor_tests;
 }
 
