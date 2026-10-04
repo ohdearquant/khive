@@ -764,12 +764,22 @@ each email or Telegram channel poll, an internal, bounded cleanup pass selects
 expired quarantine messages in that channel's ingest namespace and exact
 `channel_kind`/`channel_slug`, then hard-deletes each note and its attachment.
 Subsequent polls continue through the backlog, including when no new messages
-arrive. The blob sweep reclaims an unowned original after its grace period;
-an unexpired quarantine note and its attachment remain available. This follows
+arrive. Hard deletion releases attachment ownership but leaves the original's
+blob bytes on disk; an unexpired quarantine note and its attachment remain
+available. This follows
 [ADR-121](../../../../docs/adr/ADR-121-attachments-first-class.md)'s rule that
 a live note owns its attachment and hard deletion releases that ownership.
 Cleanup failure holds the channel poll and is reported as a failure, so it
 cannot produce a success heartbeat or advance transport progress.
+
+Physical reclamation remains pending ([#3679](https://github.com/ohdearquant/khive/issues/3679)).
+The serving process has no caller for the committed-object collector
+([#3038](https://github.com/ohdearquant/khive/issues/3038)); the daemon's staged-upload
+expiry sweep does not collect committed originals. A future collector must preserve
+ADR-121's publish grace and satisfy its approved schema and producer review,
+complete ownership registration and manifest closure, store binding, and verified
+adoption of populated roots. [#3324](https://github.com/ohdearquant/khive/issues/3324)
+tracks the current schema gate, which also blocks collection on current databases.
 
 The number of quarantine records that hold an original is bounded per channel
 configuration (for email, `KHIVE_EMAIL_QUARANTINE_MAX_RETAINED`, default 256; see the
