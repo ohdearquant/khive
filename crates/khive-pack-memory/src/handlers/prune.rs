@@ -532,8 +532,8 @@ mod prune_recall_visibility_tests {
 
     /// #533 follow-up: `RecallConfig::default()` fuses via `FusionStrategy::Rrf
     /// { k: 10 }` (`config.rs`) — the shipped default is reached by omitting
-    /// `fusion_strategy` from the recall params entirely (an explicit `"rrf"`
-    /// string selects k=60). This test exercises that exact omitted-param path: seed a
+    /// `fusion_strategy` from the recall params entirely. This test exercises that exact
+    /// omitted-param path: seed a
     /// low-salience note, confirm it is recallable pre-prune via the FTS, vector, and
     /// default (fusion_strategy omitted) legs — proving each leg actually sees the
     /// note, not just vacuously agreeing on absence — then prune and confirm all

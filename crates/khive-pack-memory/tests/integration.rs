@@ -1088,6 +1088,79 @@ async fn test_recall_fuse_rrf_k1_uses_retrieval_adapter() {
     );
 }
 
+/// A recall request that names `rrf` fuses with the configured constant instead of a literal 60.
+///
+/// Three memories that all match the query rank first, second and third in the text arm. RRF
+/// relevance is calibrated by position between the best and the worst fused score, so the
+/// middle hit's relevance depends on the constant while the other two do not.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn test_recall_request_naming_rrf_uses_the_configured_constant() {
+    const QUERY: &str = "rrf constant probe vector search";
+
+    async fn middle_rank_score(registry: &VerbRegistry, params: Value) -> f64 {
+        let result = registry
+            .dispatch("memory.recall", params)
+            .await
+            .expect("memory.recall succeeds");
+        let hit_list = result.as_array().expect("array of hits");
+        assert_eq!(
+            hit_list.len(),
+            3,
+            "all three memories must be recalled: {hit_list:?}"
+        );
+        let scores: Vec<f64> = hit_list
+            .iter()
+            .map(|h| h["rank_score"].as_f64().expect("rank_score"))
+            .collect();
+        let total: f64 = scores.iter().sum();
+        let lowest = scores.iter().copied().fold(f64::INFINITY, f64::min);
+        let highest = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        total - lowest - highest
+    }
+
+    let registry = make_registry(make_runtime());
+    for content in [
+        "rrf constant probe memory about vector search",
+        "rrf constant probe record about vector search",
+        "rrf constant probe entry about vector search",
+    ] {
+        registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": content,
+                    "salience": 0.7,
+                    "decay": 0.01
+                }),
+            )
+            .await
+            .expect("memory.remember succeeds");
+    }
+
+    let unnamed_params = json!({ "query": QUERY });
+    let named_params = json!({ "query": QUERY, "fusion_strategy": "rrf" });
+    let named_at_sixty_params = json!({
+        "query": QUERY,
+        "fusion_strategy": "rrf",
+        "config": { "fuse_strategy": { "rrf": { "k": 60 } } }
+    });
+    let unnamed = middle_rank_score(&registry, unnamed_params).await;
+    let named = middle_rank_score(&registry, named_params).await;
+    let named_at_sixty = middle_rank_score(&registry, named_at_sixty_params).await;
+
+    assert!(
+        named_at_sixty > named + 1e-3,
+        "the middle hit must score higher at a configured constant of 60 than at 10: \
+         k=10 gave {named}, k=60 gave {named_at_sixty}"
+    );
+    assert!(
+        (named - unnamed).abs() < 1e-4,
+        "naming rrf under the default configuration must match omitting the strategy: \
+         named {named}, omitted {unnamed}"
+    );
+}
+
 /// Regression: after wiring khive-retrieval into fuse_candidates, the recall.fuse
 /// response shape must be unchanged — top-level strategy + candidate_limit, and
 /// per-candidate note_id + fused_score + source must all be present. Full recall

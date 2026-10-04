@@ -1169,3 +1169,229 @@ fn recall_params_distinguish_missing_session_fields_from_explicit_null() {
     assert_eq!(explicit_null.visibility_token.as_ref(), Some(&Value::Null));
     assert_eq!(explicit_null.timeout_ms.as_ref(), Some(&Value::Null));
 }
+
+// ── fusion_strategy request resolution ───────────────────────────────────
+
+/// Resolve `requested` against `configured` the way `memory.recall` does: take the effective
+/// configuration for the request, then apply the strategy the request names.
+fn resolve_request_config(requested: Option<&str>, configured: RecallConfig) -> RecallConfig {
+    let mut params = serde_json::json!({ "query": "fusion probe" });
+    if let Some(name) = requested {
+        params["fusion_strategy"] = serde_json::json!(name);
+    }
+    let p: RecallParams = serde_json::from_value(params).expect("recall params");
+    let mut cfg = p.effective_config(configured);
+    apply_requested_fusion_strategy(&mut cfg, p.fusion_strategy.as_deref())
+        .expect("named strategy applies");
+    cfg
+}
+
+/// Fuse a fixed pair of ranked lists under `cfg` and return the scores in fused order.
+///
+/// `id_a` ranks first in text and second in vector, `id_c` ranks first in vector and `id_b`
+/// second in text, so under RRF the order is a, c, b and every score depends on the constant.
+fn fused_probe_scores(cfg: &RecallConfig) -> Vec<f64> {
+    use khive_storage::types::{TextSearchHit, VectorSearchHit};
+    use std::collections::HashSet;
+
+    let id_a = Uuid::from_u128(0xAAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA_AAAA);
+    let id_b = Uuid::from_u128(0xBBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB_BBBB);
+    let id_c = Uuid::from_u128(0xCCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC_CCCC);
+
+    let text_hits = vec![
+        TextSearchHit {
+            subject_id: id_a,
+            score: 0.9_f64.into(),
+            rank: 1,
+            title: None,
+            snippet: None,
+        },
+        TextSearchHit {
+            subject_id: id_b,
+            score: 0.5_f64.into(),
+            rank: 2,
+            title: None,
+            snippet: None,
+        },
+    ];
+    let vector_hits = vec![
+        VectorSearchHit {
+            subject_id: id_c,
+            score: 0.95_f64.into(),
+            rank: 1,
+        },
+        VectorSearchHit {
+            subject_id: id_a,
+            score: 0.3_f64.into(),
+            rank: 2,
+        },
+    ];
+    let memory_ids: HashSet<Uuid> = [id_a, id_b, id_c].into_iter().collect();
+    let candidates = RecallCandidateSet {
+        namespace: "local".to_string(),
+        text_hits,
+        vector_hits_per_model: vec![("mock".to_string(), vector_hits)],
+        visible_namespaces: vec!["local".to_string()],
+        ann_degraded: false,
+        ann_degraded_reason: None,
+        session_unmet_models: Vec::new(),
+        timings: RecallStageTimings::default(),
+    };
+
+    fuse_candidates(&candidates, &memory_ids, cfg, 10)
+        .iter()
+        .map(|h| h.score.to_f64())
+        .collect()
+}
+
+/// The scores `fused_probe_scores` yields under RRF with constant `k`, in fused order.
+fn rrf_probe_expected(k: f64) -> [f64; 3] {
+    [
+        1.0 / (k + 1.0) + 1.0 / (k + 2.0),
+        1.0 / (k + 1.0),
+        1.0 / (k + 2.0),
+    ]
+}
+
+fn assert_scores_match(actual: &[f64], expected: [f64; 3], context: &str) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{context}: expected {expected:?}, got {actual:?}"
+    );
+    for (got, want) in actual.iter().zip(expected) {
+        assert!(
+            (got - want).abs() < 1e-6,
+            "{context}: expected {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+#[test]
+fn request_naming_rrf_fuses_with_the_configured_constant() {
+    let configured = RecallConfig {
+        fuse_strategy: FusionStrategy::Rrf { k: 25 },
+        ..RecallConfig::default()
+    };
+
+    let cfg = resolve_request_config(Some("rrf"), configured);
+
+    assert_eq!(
+        cfg.fuse_strategy,
+        FusionStrategy::Rrf { k: 25 },
+        "a request naming rrf must keep the configured constant, not a literal 60"
+    );
+    assert_scores_match(
+        &fused_probe_scores(&cfg),
+        rrf_probe_expected(25.0),
+        "rrf request under a configured constant of 25",
+    );
+}
+
+#[test]
+fn request_naming_rrf_scores_follow_the_configured_constant() {
+    let at_default = resolve_request_config(Some("rrf"), RecallConfig::default());
+    let at_sixty = resolve_request_config(
+        Some("rrf"),
+        RecallConfig {
+            fuse_strategy: FusionStrategy::Rrf { k: 60 },
+            ..RecallConfig::default()
+        },
+    );
+
+    let default_scores = fused_probe_scores(&at_default);
+    let sixty_scores = fused_probe_scores(&at_sixty);
+
+    assert_scores_match(
+        &default_scores,
+        rrf_probe_expected(10.0),
+        "rrf request under the default configuration",
+    );
+    assert_scores_match(
+        &sixty_scores,
+        rrf_probe_expected(60.0),
+        "rrf request under a configured constant of 60",
+    );
+    for (low_k, high_k) in default_scores.iter().zip(&sixty_scores) {
+        assert!(
+            low_k > high_k,
+            "a smaller configured constant must score every hit higher: \
+             {default_scores:?} vs {sixty_scores:?}"
+        );
+    }
+}
+
+#[test]
+fn request_naming_rrf_without_a_configured_constant_uses_the_fusion_default() {
+    let configured = RecallConfig {
+        fuse_strategy: FusionStrategy::Union,
+        ..RecallConfig::default()
+    };
+
+    let cfg = resolve_request_config(Some("rrf"), configured);
+
+    assert_eq!(
+        cfg.fuse_strategy,
+        FusionStrategy::Rrf { k: 60 },
+        "with no configured constant to keep, rrf falls back to the fusion default"
+    );
+    assert_scores_match(
+        &fused_probe_scores(&cfg),
+        rrf_probe_expected(60.0),
+        "rrf request under a configuration that is not rrf",
+    );
+}
+
+#[test]
+fn request_naming_no_strategy_leaves_the_configured_fusion_unchanged() {
+    let configured = RecallConfig {
+        fuse_strategy: FusionStrategy::Rrf { k: 25 },
+        ..RecallConfig::default()
+    };
+
+    let cfg = resolve_request_config(None, configured);
+
+    assert_eq!(
+        cfg.fuse_strategy,
+        FusionStrategy::Rrf { k: 25 },
+        "a request naming no strategy must keep the configured fusion"
+    );
+    assert_scores_match(
+        &fused_probe_scores(&cfg),
+        rrf_probe_expected(25.0),
+        "request naming no strategy under a configured constant of 25",
+    );
+
+    let at_default = resolve_request_config(None, RecallConfig::default());
+
+    assert_eq!(
+        at_default.fuse_strategy,
+        RecallConfig::default().fuse_strategy,
+        "a request naming no strategy must keep the default fusion"
+    );
+    assert_scores_match(
+        &fused_probe_scores(&at_default),
+        rrf_probe_expected(10.0),
+        "request naming no strategy under the default configuration",
+    );
+}
+
+#[test]
+fn request_naming_weighted_keeps_the_configured_weights() {
+    let configured = RecallConfig {
+        fuse_strategy: FusionStrategy::Weighted {
+            weights: vec![0.8, 0.2],
+        },
+        ..RecallConfig::default()
+    };
+
+    let cfg = resolve_request_config(Some("weighted"), configured);
+
+    assert_eq!(
+        cfg.fuse_strategy,
+        FusionStrategy::Weighted {
+            weights: vec![0.8, 0.2],
+        },
+        "a request naming weighted must keep the configured weights"
+    );
+}
