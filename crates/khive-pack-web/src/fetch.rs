@@ -997,7 +997,7 @@ pub(crate) async fn settle_content(
     let (typed_ref, bytes, truncated) = match body {
         None => (None, 0u64, false),
         Some((buffer, truncated)) => {
-            let store = crate::blob_store(runtime)?;
+            let store = runtime.require_blob_store()?;
             let len = buffer.len() as u64;
             let content_ref = store.put(buffer).await.map_err(RuntimeError::from)?;
             (Some(content_ref), len, truncated)
@@ -1951,7 +1951,7 @@ mod tests {
         assert!(!truncated2);
         assert_eq!(buffer2, small_body);
 
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref_parsed = ContentRef::from_hex(&content_ref).expect("valid content ref hex");
         let stored = store
             .get_bounded_verified(&content_ref_parsed, khive_storage::MAX_BLOB_WHOLE_BYTES)
@@ -2562,7 +2562,7 @@ mod tests {
     #[tokio::test]
     async fn arm30_fetch_put_matches_direct_put_content_addressing() {
         let (runtime, token, _dir) = test_runtime().await;
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
 
         let payload = b"identical bytes via either path".to_vec();
         let direct_ref = store.put(payload.clone()).await.expect("direct put");

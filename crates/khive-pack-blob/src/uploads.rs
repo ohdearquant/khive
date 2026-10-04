@@ -8,7 +8,7 @@ use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::{BlobStore, ContentRef, UploadId};
 use serde_json::{json, Value};
 
-use crate::handlers::{blob_store, max_request_part_raw_bytes, MAX_OBJECT_BYTES};
+use crate::handlers::{max_request_part_raw_bytes, MAX_OBJECT_BYTES};
 
 #[derive(Clone, Copy)]
 struct UploadPolicy {
@@ -168,7 +168,7 @@ impl UploadManager {
                 "blob uploads are unavailable because the blob pack runtime is read-only".into(),
             ));
         }
-        blob_store(&self.runtime)
+        self.runtime.require_blob_store()
     }
 
     fn unknown(id: &UploadId) -> RuntimeError {

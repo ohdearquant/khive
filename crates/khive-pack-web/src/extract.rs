@@ -1102,7 +1102,7 @@ async fn extract_text(
     let excerpt = text_excerpt(body);
     let excerpt_bytes = excerpt.len();
 
-    let store = crate::blob_store(runtime)?;
+    let store = runtime.require_blob_store()?;
     let content_ref = put_excerpt(store, excerpt, Arc::clone(derived_admission)).await?;
 
     let text_id = identity::derived_text_id(original_id, source_content_ref);
@@ -1255,14 +1255,9 @@ async fn run_extract_with_link_selection(
                 .collect()
         })
         .unwrap_or_default();
-    let hydrator = runtime.blob_hydrator().ok_or_else(|| {
-        RuntimeError::Unconfigured(
-            "no BlobStore installed on this server (configure [storage.blob] in khive.toml, or KHIVE_BLOB_ROOT)"
-                .to_string(),
-        )
-    })?;
+    let hydrator = runtime.require_blob_hydrator()?;
     verify_source_body(runtime, token, target_id, &source_content_ref).await?;
-    let blob_store = crate::blob_store(runtime)?;
+    let blob_store = runtime.require_blob_store()?;
     let size = match source_blob_size(blob_store.as_ref(), &content_ref).await {
         Ok(Some(size)) => size,
         Ok(None)
@@ -1862,7 +1857,7 @@ mod tests {
         .await
         .unwrap();
         let id = identity::document_id(site, &identity::path_and_query(&canonical));
-        let store = crate::blob_store(runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         let entity_type = if content_type.starts_with("text/html") {
             "page"
@@ -1913,7 +1908,7 @@ mod tests {
         body: &[u8],
         link_headers: &[&str],
     ) -> (String, Uuid) {
-        let store = crate::blob_store(runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = store.put(body.to_vec()).await.unwrap();
         let reference = content_ref.to_string();
         crate::entities::patch(
@@ -2204,7 +2199,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = khive_storage::ContentRef::from_hex(
             entity.properties.unwrap()["blob_ref"].as_str().unwrap(),
         )
@@ -3287,7 +3282,7 @@ mod tests {
             b"<a href='/old'>Old</a>",
         )
         .await;
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let second = store.put(b"<a href='/new'>New</a>".to_vec()).await.unwrap();
         crate::entities::patch(
             &runtime,
@@ -3538,7 +3533,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let store = crate::blob_store(&runtime).unwrap();
+        let store = runtime.require_blob_store().unwrap();
         let content_ref = khive_storage::ContentRef::from_hex(
             entity.properties.unwrap()["blob_ref"].as_str().unwrap(),
         )
