@@ -55,9 +55,8 @@ pub use khive_hnsw::{
 };
 // Formal proof: khive.Retrieval.HNSW.checkpoint_correctness
 pub use hybrid::{
-    fuse_search_results, fuse_search_results_checked, DualIndexConfig, DualIndexRouter,
-    DualIndexStrategy, HybridConfig, HybridSearcher, IdentityReranker, KeywordSearch, Query,
-    Reranker, VectorSearch,
+    fuse_search_results, fuse_search_results_checked, HybridConfig, HybridSearcher,
+    IdentityReranker, KeywordSearch, Query, Reranker, VectorSearch,
 };
 #[cfg(feature = "checkpoint")]
 pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};

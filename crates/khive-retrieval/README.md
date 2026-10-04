@@ -15,9 +15,6 @@ scoring throughout.
   are re-exported, and `khive-hnsw` and `khive-bm25` types are re-exported
   behind the `hnsw` and `bm25` features, so a caller depends on this one crate
   for the full hybrid path
-- **`DualIndexRouter`** — routes queries between a primary and legacy vector
-  index during a migration, with positional `[primary, legacy]` fusion and a
-  configurable auto-switch threshold
 - **Timeout/cancellation wrappers** — `search_with_timeout`,
   `search_with_deadline`, `search_with_cancellation` around any search future
 - **Feature-gated extensions** — see Configuration below

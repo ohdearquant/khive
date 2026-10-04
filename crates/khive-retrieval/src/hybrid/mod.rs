@@ -6,7 +6,6 @@
 mod config;
 #[cfg(feature = "native-rerank")]
 mod cross_encoder;
-pub mod dual_index;
 mod identity;
 mod searcher;
 
@@ -14,7 +13,6 @@ mod searcher;
 pub use config::{HybridConfig, Query, DEFAULT_POOL_MULTIPLIER};
 #[cfg(feature = "native-rerank")]
 pub use cross_encoder::{CrossEncoderScorer, NativeCrossEncoderReranker, RerankDocumentResolver};
-pub use dual_index::{DualIndexConfig, DualIndexRouter, DualIndexStrategy};
 pub use identity::IdentityReranker;
 pub use searcher::{
     fuse_search_results, fuse_search_results_checked, HybridSearcher, KeywordSearch, Reranker,
