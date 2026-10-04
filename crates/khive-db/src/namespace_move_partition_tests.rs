@@ -2,6 +2,9 @@ use super::tests::{migrated, route, seed_note};
 use super::*;
 use crate::namespace_move_fixture::{self as fixture, *};
 
+#[path = "namespace_move_section_tests.rs"]
+mod section_tests;
+
 const DOMAIN: &str = "66666666-6666-4666-8666-000000000001";
 const RESIDENT: &str = "77777777-7777-4777-8777-000000000001";
 const MEMORY: &str = "88888888-8888-4888-8888-000000000001";

@@ -14,27 +14,34 @@ pub(super) fn ordinary_atom_count(conn: &Connection, source: &str) -> rusqlite::
 
 pub(super) fn move_knowledge_atoms(
     conn: &Connection,
-    source: &str,
+    request: &MoveRequest,
     target: &str,
     mirrors: bool,
     rows: &mut BTreeMap<String, u64>,
 ) -> rusqlite::Result<u64> {
+    let source = request.source.as_str();
     let predicate = if mirrors {
         MIRROR_EXISTS.to_owned()
     } else {
         format!("NOT {MIRROR_EXISTS}")
     };
-    // Select parents while they still occupy source; target-resident parents
-    // never adopt a leftover section from source. All writes share the caller's
-    // transaction, and FTS remains maintained by the existing schema triggers.
-    let sections = conn.execute(
-        &format!(
-            "UPDATE knowledge_sections SET namespace = ?2 WHERE namespace = ?1 \
+    // Single-target vectors carry the whole source namespace, including
+    // historical sections whose parent already occupies another namespace.
+    let sections = if request.single_target().is_some() {
+        conn.execute(
+            "UPDATE knowledge_sections SET namespace = ?2 WHERE namespace = ?1",
+            rusqlite::params![source, target],
+        )?
+    } else {
+        conn.execute(
+            &format!(
+                "UPDATE knowledge_sections SET namespace = ?2 WHERE namespace = ?1 \
              AND atom_id IN (SELECT atom.id FROM knowledge_atoms AS atom \
                              WHERE atom.namespace = ?1 AND {predicate})"
-        ),
-        rusqlite::params![source, target],
-    )? as u64;
+            ),
+            rusqlite::params![source, target],
+        )?
+    } as u64;
     *rows.entry("knowledge_sections".into()).or_default() += sections;
     let moved = conn.execute(
         &format!(

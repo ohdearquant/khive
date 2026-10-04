@@ -409,10 +409,8 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
     Some(match table.name.as_str() {
         "notes" | "entities" | "graph_edges" | "knowledge_atoms" | "knowledge_domains" => Subject,
 
-        // A section is not a subject: it carries `atom_id REFERENCES
-        // knowledge_atoms(id)` and its uniqueness is `(atom_id, content_hash)`,
-        // with no namespace in it (`sql/schema.sql:166-182`). It follows its
-        // atom, and a caller cannot route it away from one.
+        // Partitioned sections follow their source atom. A routed single-target
+        // knowledge class carries every source section with its source vectors.
         "knowledge_sections" => SubjectKeyed {
             subject_column: "atom_id",
         },
@@ -1203,11 +1201,11 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
                 move_whole_table(conn, "graph_edges", source, target, &mut counts.rows)?
             }
             SubjectClass::Atom => {
-                move_knowledge_atoms(conn, source, target, false, &mut counts.rows)?
+                move_knowledge_atoms(conn, request, target, false, &mut counts.rows)?
             }
             SubjectClass::Domain => {
                 // A domain and its same-ID mirror atom form one logical subject.
-                move_knowledge_atoms(conn, source, target, true, &mut counts.rows)?;
+                move_knowledge_atoms(conn, request, target, true, &mut counts.rows)?;
                 move_whole_table(conn, "knowledge_domains", source, target, &mut counts.rows)?
             }
         };
