@@ -486,7 +486,9 @@ impl SqlNoteStore {
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-            f(guard.conn()).map_err(|e| map_err(e, op))
+            f(guard.conn())
+                .map_err(|e| map_err(e, op))
+                .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
@@ -540,14 +542,15 @@ impl SqlNoteStore {
                         request_state: WriterTaskRequestState::SideEffectsUnknown,
                     });
                 }
-                return Err(map_err(begin_error, op));
+                return Err(map_err(begin_error, op))
+                    .inspect_err(|error| pool.record_direct_writer_error(error));
             }
 
             let (result, terminal_state) = execute_wrapped_transaction(conn, op, f);
             if terminal_state.is_some() {
                 pool.retire_pooled_writer(conn);
             }
-            result
+            result.inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
@@ -2722,3 +2725,7 @@ mod comm_filter_plan_tests;
 #[cfg(test)]
 #[path = "note_list_plan_tests.rs"]
 mod note_list_plan_tests;
+
+#[cfg(test)]
+#[path = "note_busy_tests.rs"]
+mod direct_busy_tests;

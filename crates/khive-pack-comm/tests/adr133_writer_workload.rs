@@ -52,6 +52,10 @@ fn counter_delta(
             before.writer_task_acquisitions,
         ),
         timeouts: subtract(after.timeouts, before.timeouts),
+        direct_busy_refusals: after
+            .direct_busy_refusals
+            .checked_sub(before.direct_busy_refusals)
+            .expect("direct busy refusals are monotonic"),
         writer_task_begin_busy: subtract(
             after.writer_task_begin_busy,
             before.writer_task_begin_busy,

@@ -1173,6 +1173,21 @@ standalone writer opens, and the third counts dequeued writer-task requests that
 dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
 executes; SQLite `BEGIN`/statement failures are separate stages.
+`direct_writer_busy_refusals` counts instrumented direct typed-store and SQL executions
+whose final returned error retains SQLite's primary `SQLITE_BUSY` code, once per operation
+after the busy handler. It includes legacy pool-mutex writes, standalone writes, and direct
+transaction/maintenance requests. It excludes `SQLITE_LOCKED`, successful or absorbed failures,
+reader queries, writer-task requests, pool admission/checkouts, connection opens, infrastructure
+probes, and uninstrumented raw connection escapes. Unknown outcomes without a retained final
+BUSY cause do not increment it. It is a process-local counter owned by each physical pool;
+secondary databases report their own pool's count. Ordinary writer methods count their own final
+operation; a manual atomic unit counts its final unit error once, excluding absorbed inner failures
+and rollback cleanup. Observation inspects at most 32 preserved error-source nodes,
+counting the returned StorageError as node one, and makes at most 32 source calls.
+It descends through preserved storage wrappers; a cycle or exhausted budget without
+positive BUSY evidence contributes zero. An individual source call may itself not return.
+The existing wrapped COMMIT failure retains only Pool message text, so its discarded
+SQLite code is deliberately undercounted (+0). Existing error and retry semantics are unchanged.
 `writer_task_begin_busy` counts every busy/locked `BEGIN IMMEDIATE` refusal, matching its
 pre-retry meaning: a nonzero value reflects total contention regardless of retry policy.
 `writer_task_begin_busy_absorbed` is a subset of it — refusals a bounded pre-execution retry

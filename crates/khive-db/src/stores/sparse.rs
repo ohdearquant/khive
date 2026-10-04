@@ -263,7 +263,9 @@ impl SqliteSparseStore {
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-            f(guard.conn()).map_err(|e| map_err(e, op))
+            f(guard.conn())
+                .map_err(|e| map_err(e, op))
+                .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sparse, op, e))?
@@ -1070,3 +1072,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sparse_busy_tests.rs"]
+mod direct_busy_tests;

@@ -1,5 +1,9 @@
 //! SQL-backed `GraphStore`: edge CRUD, neighbor queries, and bounded BFS traversal.
 
+#[path = "graph/write_transaction.rs"]
+mod write_transaction;
+use write_transaction::run_graph_mutation_transaction;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -1045,54 +1049,6 @@ where
     .inspect_err(|error| khive_storage::usage::account_event_write(Err(error)))
 }
 
-fn run_graph_mutation_transaction<R, F>(
-    pool: &ConnectionPool,
-    conn: &rusqlite::Connection,
-    pooled: bool,
-    operation: F,
-) -> StorageResult<R>
-where
-    F: FnOnce(&rusqlite::Connection) -> StorageResult<R>,
-{
-    if !conn.is_autocommit() {
-        if pooled {
-            pool.retire_pooled_writer(conn);
-        }
-        return Err(StorageError::WriterTaskTerminated {
-            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-        });
-    }
-    if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
-        if !conn.is_autocommit() {
-            if pooled {
-                pool.retire_pooled_writer(conn);
-            }
-            return Err(StorageError::WriterTaskTerminated {
-                request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
-            });
-        }
-        crate::timeout_sink::maybe_emit_busy(
-            &crate::timeout_sink::db_label(pool),
-            crate::timeout_sink::Site::StandaloneGraph,
-            &error,
-        );
-        return Err(map_err(error, GRAPH_MUTATION_EVENTS_OP));
-    }
-    let _tx_handle = khive_storage::tx_registry::register_scoped(
-        Some(GRAPH_MUTATION_EVENTS_OP.to_string()),
-        pool.origin(),
-    );
-    let (result, terminal_state) = crate::writer_task::execute_wrapped_transaction(
-        conn,
-        "compose_graph_mutation_events.commit",
-        operation,
-    );
-    if pooled && terminal_state.is_some() {
-        pool.retire_pooled_writer(conn);
-    }
-    result
-}
-
 fn graph_mutation_conflict(message: &'static str) -> StorageError {
     StorageError::Conflict {
         capability: StorageCapability::Graph,
@@ -1376,15 +1332,18 @@ impl SqlGraphStore {
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
             let db = crate::timeout_sink::db_label(&self.pool);
+            let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
-                f(&conn).map_err(|e| {
-                    crate::timeout_sink::maybe_emit_busy(
-                        &db,
-                        crate::timeout_sink::Site::StandaloneGraph,
-                        &e,
-                    );
-                    map_err(e, op)
-                })
+                f(&conn)
+                    .map_err(|e| {
+                        crate::timeout_sink::maybe_emit_busy(
+                            &db,
+                            crate::timeout_sink::Site::StandaloneGraph,
+                            &e,
+                        );
+                        map_err(e, op)
+                    })
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
             })
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
@@ -1392,7 +1351,9 @@ impl SqlGraphStore {
             let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
                 let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
+                f(guard.conn())
+                    .map_err(|e| map_err(e, op))
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
             })
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
@@ -4015,3 +3976,7 @@ mod tests;
 #[cfg(test)]
 #[path = "graph_index_repair_tests.rs"]
 mod index_repair_tests;
+
+#[cfg(test)]
+#[path = "graph_busy_tests.rs"]
+mod direct_busy_tests;

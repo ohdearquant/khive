@@ -1,5 +1,9 @@
 //! sqlite-vec backed `VectorStore`: one vec0 table per embedding model, scoped to namespace.
 
+#[path = "vectors/provenance.rs"]
+mod provenance;
+use provenance::{provenance_read_sql, provenance_sidecar_exists};
+
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
@@ -41,36 +45,6 @@ pub(crate) fn delete_vector_statement(
             SqlValue::Text(namespace.to_string()),
         ],
         label: Some(format!("vec-delete-{table}")),
-    }
-}
-
-fn provenance_sidecar_exists(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'vector_provenance'",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
-    .optional()
-    .map(|row| row.is_some())
-}
-
-fn provenance_read_sql(table: &str, has_sidecar: bool) -> String {
-    if has_sidecar {
-        format!(
-            "SELECT v.embedding_model, v.field, v.embedding, p.embedding_digest, \
-                    p.text_fingerprint, p.updated_at \
-             FROM {table} AS v \
-             LEFT JOIN vector_provenance AS p \
-               ON p.model_key = ?1 AND p.subject_id = v.subject_id \
-              AND p.namespace = v.namespace \
-             WHERE v.subject_id = ?2 AND v.namespace = ?3"
-        )
-    } else {
-        format!(
-            "SELECT v.embedding_model, v.field, v.embedding, NULL, NULL, NULL \
-             FROM {table} AS v \
-             WHERE v.subject_id = ?1 AND v.namespace = ?2"
-        )
     }
 }
 
@@ -381,13 +355,15 @@ impl SqliteVecStore {
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-            f(guard.conn()).map_err(|e| {
-                crate::timeout_sink::maybe_emit_sqlite_full(
-                    &crate::timeout_sink::db_label(&pool),
-                    &e,
-                );
-                map_err(e, op)
-            })
+            f(guard.conn())
+                .map_err(|e| {
+                    crate::timeout_sink::maybe_emit_sqlite_full(
+                        &crate::timeout_sink::db_label(&pool),
+                        &e,
+                    );
+                    map_err(e, op)
+                })
+                .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Vectors, op, e))?
@@ -6640,3 +6616,7 @@ mod provenance_tests {
         assert_eq!(sidecar_count, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "vectors_busy_tests.rs"]
+mod direct_busy_tests;

@@ -9,6 +9,13 @@
 //!   connection.
 //! - **Memory**: Uses pool-backed approach (acquire pool connection per-query inside `spawn_blocking`).
 
+#[path = "sql_bridge/write_errors.rs"]
+mod write_errors;
+
+#[path = "sql_bridge/manual_atomic.rs"]
+mod manual_atomic;
+use manual_atomic::run_manual_atomic_unit;
+
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1995,6 +2002,8 @@ impl khive_storage::SqlReader for SqliteReader {
 // =============================================================================
 
 struct SqliteWriter {
+    // Manual atomic owners observe the final unit, excluding inner/cleanup errors.
+    observe_direct_errors: bool,
     /// `None` at construction when a `WriterTaskHandle` was obtained (ADR-136
     /// D1 gate 1: queue-first `writer()` skips the standalone open in that
     /// case). Ordinary `SqlReader` supertrait calls then use pooled readers;
@@ -2384,14 +2393,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute", e))?;
         self.handle = Some(handle);
-        let affected = result.map_err(|e| {
-            crate::timeout_sink::maybe_emit_busy(
-                &self.db,
-                crate::timeout_sink::Site::StandaloneSqlBridge,
-                &e,
-            );
-            map_rusqlite_err(e, "execute")
-        })?;
+        let affected = result.map_err(|e| self.map_direct_error(e, "execute"))?;
         Ok(affected as u64)
     }
 
@@ -2446,24 +2448,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
         self.handle = handle;
-        result.map_err(|failure| {
-            crate::timeout_sink::maybe_emit_busy(
-                &self.db,
-                crate::timeout_sink::Site::StandaloneSqlBridge,
-                &failure.error,
-            );
-            match failure.poison_reason {
-                Some(poison_reason) => StorageError::driver(
-                    StorageCapability::Sql,
-                    "execute_batch",
-                    PoisonedBatchError {
-                        original: failure.error,
-                        poison_reason,
-                    },
-                ),
-                None => map_rusqlite_err(failure.error, "execute_batch"),
-            }
-        })
+        result.map_err(|failure| self.map_direct_batch_failure(failure))
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
@@ -2500,14 +2485,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script", e))?;
         self.handle = Some(handle);
-        result.map_err(|e| {
-            crate::timeout_sink::maybe_emit_busy(
-                &self.db,
-                crate::timeout_sink::Site::StandaloneSqlBridge,
-                &e,
-            );
-            map_rusqlite_err(e, "execute_script")
-        })
+        result.map_err(|e| self.map_direct_error(e, "execute_script"))
     }
 
     async fn execute_script_top_level(
@@ -2552,14 +2530,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script_top_level", e))?;
         self.handle = Some(handle);
-        result.map_err(|e| {
-            crate::timeout_sink::maybe_emit_busy(
-                &self.db,
-                crate::timeout_sink::Site::StandaloneSqlBridge,
-                &e,
-            );
-            map_rusqlite_err(e, "execute_script_top_level")
-        })
+        result.map_err(|e| self.map_direct_error(e, "execute_script_top_level"))
     }
 }
 
@@ -3039,14 +3010,17 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e)
             })?;
-            let mut stmt = prepare_cached_sql_statement(&guard, &statement.sql)
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
-            bind_params(&mut stmt, &statement.params)
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
-            let rows = stmt
-                .raw_execute()
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
-            Ok(rows as u64)
+            let result = (|| {
+                let mut stmt = prepare_cached_sql_statement(&guard, &statement.sql)
+                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
+                bind_params(&mut stmt, &statement.params)
+                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
+                let rows = stmt
+                    .raw_execute()
+                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
+                Ok(rows as u64)
+            })();
+            result.inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e))?
@@ -3065,31 +3039,34 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e)
             })?;
-            let prepared = prepare_batch_statements(&guard, &statements)
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
-            guard
-                .execute_batch("BEGIN IMMEDIATE")
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("pool_writer.execute_batch".to_string()),
-                pool.origin(),
-            );
-            let result = execute_prepared_batch(&guard, prepared, &statements, None)
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"));
-            match result {
-                Ok(total) => {
-                    if let Err(e) = guard.execute_batch("COMMIT") {
+            let result = (|| {
+                let prepared = prepare_batch_statements(&guard, &statements)
+                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
+                guard
+                    .execute_batch("BEGIN IMMEDIATE")
+                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"))?;
+                let _tx_handle = khive_storage::tx_registry::register_scoped(
+                    Some("pool_writer.execute_batch".to_string()),
+                    pool.origin(),
+                );
+                let result = execute_prepared_batch(&guard, prepared, &statements, None)
+                    .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_batch"));
+                match result {
+                    Ok(total) => {
+                        if let Err(e) = guard.execute_batch("COMMIT") {
+                            let _ = guard.execute_batch("ROLLBACK");
+                            Err(map_rusqlite_err(e, "pool_writer.execute_batch"))
+                        } else {
+                            Ok(total)
+                        }
+                    }
+                    Err(e) => {
                         let _ = guard.execute_batch("ROLLBACK");
-                        Err(map_rusqlite_err(e, "pool_writer.execute_batch"))
-                    } else {
-                        Ok(total)
+                        Err(e)
                     }
                 }
-                Err(e) => {
-                    let _ = guard.execute_batch("ROLLBACK");
-                    Err(e)
-                }
-            }
+            })();
+            result.inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_writer.execute_batch", e))?
@@ -3106,6 +3083,7 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
             guard
                 .execute_batch(&script)
                 .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_script"))
+                .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| {
@@ -3311,47 +3289,6 @@ fn block_on_sync<F: std::future::Future>(fut: F) -> Result<F::Output, StorageErr
     }
 }
 
-/// Run `op` under a manual `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on `writer`
-/// — the pre-ADR-067 shape, used by [`SqlBridge::atomic_unit`] whenever no
-/// writer task applies to a file-backed pool.
-async fn run_manual_atomic_unit(
-    writer: &mut dyn khive_storage::SqlWriter,
-    op: AtomicUnitOp,
-    origin: khive_storage::tx_registry::TxOrigin,
-) -> khive_storage::types::StorageResult<Box<dyn Any + Send>> {
-    fn tx_stmt(sql: &str, label: &str) -> SqlStatement {
-        SqlStatement {
-            sql: sql.to_string(),
-            params: vec![],
-            label: Some(label.to_string()),
-        }
-    }
-    khive_storage::SqlWriter::execute(writer, tx_stmt("BEGIN IMMEDIATE", "begin")).await?;
-    let _tx_handle =
-        khive_storage::tx_registry::register_scoped(Some("atomic_unit".to_string()), origin);
-
-    let result = op(writer).await;
-
-    match result {
-        Ok(value) => {
-            match khive_storage::SqlWriter::execute(writer, tx_stmt("COMMIT", "commit")).await {
-                Ok(_) => Ok(value),
-                Err(e) => {
-                    let _ =
-                        khive_storage::SqlWriter::execute(writer, tx_stmt("ROLLBACK", "rollback"))
-                            .await;
-                    Err(e)
-                }
-            }
-        }
-        Err(e) => {
-            let _ =
-                khive_storage::SqlWriter::execute(writer, tx_stmt("ROLLBACK", "rollback")).await;
-            Err(e)
-        }
-    }
-}
-
 // =============================================================================
 // SqlBridge: the SqlAccess implementor
 // =============================================================================
@@ -3484,6 +3421,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 None
             };
             Ok(Box::new(SqliteWriter {
+                observe_direct_errors: true,
                 event_rows: None,
                 handle,
                 writer_task,
@@ -3593,6 +3531,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 let (conn, handle_slot) =
                     open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
                 let mut writer = SqliteWriter {
+                    observe_direct_errors: false,
                     event_rows: Some(Arc::clone(&event_rows)),
                     handle: Some(StandaloneHandle {
                         conn,
@@ -3604,7 +3543,9 @@ impl khive_storage::SqlAccess for SqlBridge {
                     db: crate::timeout_sink::db_label(&self.pool),
                     pool: Arc::clone(&self.pool),
                 };
-                run_manual_atomic_unit(&mut writer, op, self.pool.origin()).await
+                run_manual_atomic_unit(&mut writer, op, self.pool.origin())
+                    .await
+                    .inspect_err(|error| self.pool.record_direct_writer_error(error))
             } else {
                 // Every statement shares one connection. Keep its guard through
                 // commit/rollback so other units and ordinary writes cannot join it.
@@ -3630,7 +3571,8 @@ impl khive_storage::SqlAccess for SqlBridge {
                                     khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                             });
                         }
-                        return Err(map_rusqlite_err(error, "atomic_unit.begin"));
+                        return Err(map_rusqlite_err(error, "atomic_unit.begin"))
+                            .inspect_err(|error| pool.record_direct_writer_error(error));
                     }
                     let _tx_handle = khive_storage::tx_registry::register_scoped(
                         Some("atomic_unit".to_string()),
@@ -3650,7 +3592,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                     if terminal_state.is_some() {
                         pool.retire_pooled_writer(conn);
                     }
-                    result
+                    result.inspect_err(|error| pool.record_direct_writer_error(error))
                 })
                 .await
                 .map_err(|error| {
@@ -6945,6 +6887,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, _completed) = blocking_non_interrupting_progress_gate(&conn);
         let mut writer = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -7153,6 +7096,7 @@ mod tests {
             .unwrap();
         let conn = open_standalone_writer(&pool).unwrap();
         let mut writer = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -7221,6 +7165,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
         let mut writer = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -7314,6 +7259,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
         let mut writer = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -7406,6 +7352,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, completed) = blocking_non_interrupting_progress_gate(&conn);
         let writer = Arc::new(tokio::sync::Mutex::new(SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -7499,6 +7446,7 @@ mod tests {
         .unwrap();
         let conn = open_standalone_writer(&pool).unwrap();
         let mut writer = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -8076,6 +8024,7 @@ mod tests {
         let conn = open_standalone_writer(&pool).unwrap();
         conn.authorizer(Some(deny_rollback)).unwrap();
         let mut writer = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -8178,6 +8127,7 @@ mod tests {
         // batch's own `BEGIN IMMEDIATE` fails non-transiently.
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         let mut writer = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -8279,6 +8229,7 @@ mod tests {
         .unwrap();
         let conn = open_standalone_writer(&pool).unwrap();
         let mut writer = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: Some(StandaloneHandle {
                 conn,
@@ -9072,6 +9023,7 @@ mod tests {
             .expect("queue-enabled file pool must offer a writer task")
             .expect("writer task present under write_queue_enabled");
         let mut post_cancel = SqliteWriter {
+            observe_direct_errors: true,
             event_rows: None,
             handle: None,
             writer_task: Some(writer_task),
@@ -9632,3 +9584,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "sql_bridge/direct_busy_tests.rs"]
+mod direct_busy_tests;

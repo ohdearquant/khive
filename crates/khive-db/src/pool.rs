@@ -1,4 +1,7 @@
 //! Connection pool for SQLite: one exclusive writer, N concurrent readers.
+#[path = "pool/writer_acquisition.rs"]
+mod writer_acquisition;
+
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
 use rusqlite::hooks::{AuthContext, Authorization};
@@ -1586,6 +1589,11 @@ pub struct WriterAcquisitionSnapshot {
     pub writer_task_acquisitions: u64,
     /// Finite-wait pool writer checkouts that exhausted their deadline.
     pub timeouts: u64,
+    /// Instrumented direct executions whose final returned error retains SQLite's
+    /// primary DatabaseBusy code, once per operation after its busy handler.
+    /// Excludes LOCKED, checkout/open/admission failures, readers, writer tasks,
+    /// infrastructure probes and uninstrumented raw connection escapes.
+    pub direct_busy_refusals: u64,
     /// Every writer-task `BEGIN IMMEDIATE` attempt refused busy or locked,
     /// including refusals a subsequent bounded retry went on to absorb.
     /// Counted separately from `timeouts` because that counter names the
@@ -1619,86 +1627,12 @@ pub(crate) struct WriterAcquisitionCounters {
     standalone_acquisitions: AtomicU64,
     writer_task_acquisitions: AtomicU64,
     pooled_timeouts: AtomicU64,
+    direct_busy_refusals: AtomicU64,
     writer_task_begin_busy: AtomicU64,
     writer_task_begin_busy_absorbed: AtomicU64,
     writer_task_begin_errors: AtomicU64,
     writer_task_request_failures: AtomicU64,
     writer_task_side_effects_unknown: AtomicU64,
-}
-
-impl WriterAcquisitionCounters {
-    pub(crate) fn record_writer_task_acquisition(&self) {
-        self.writer_task_acquisitions
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one writer-task `BEGIN IMMEDIATE` refused busy or locked.
-    /// Called for every such refusal, whether or not a bounded retry goes
-    /// on to absorb it — this is the caller-facing contention count, and it
-    /// alone must equal the number of busy/locked refusals SQLite actually
-    /// returned, independent of retry policy.
-    pub(crate) fn record_writer_task_begin_busy(&self) {
-        self.writer_task_begin_busy.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one busy or locked `BEGIN IMMEDIATE` refusal hidden from the
-    /// caller by a subsequent bounded retry. This counter moves before the
-    /// next BEGIN attempt, in addition to (never instead of) the
-    /// `writer_task_begin_busy` call for the same refusal; it never implies
-    /// that the request closure ran.
-    pub(crate) fn record_writer_task_begin_busy_absorbed(&self) {
-        self.writer_task_begin_busy_absorbed
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one writer-task `BEGIN IMMEDIATE` that failed for any other
-    /// reason. Without this the non-busy arm reproduces, one level down, the
-    /// same silent-failure gap the busy counter closes.
-    pub(crate) fn record_writer_task_begin_error(&self) {
-        self.writer_task_begin_errors
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records one dequeued writer-task request that reached the writer seam
-    /// and terminated in error. Called exactly once per such request,
-    /// regardless of which terminal state it produced.
-    pub(crate) fn record_writer_task_request_failure(&self) {
-        self.writer_task_request_failures
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Records the subset of [`Self::record_writer_task_request_failure`]
-    /// whose terminal state was `SideEffectsUnknown`. Callers pair this call
-    /// with a `record_writer_task_request_failure()` call for the same
-    /// request rather than in place of it.
-    pub(crate) fn record_writer_task_side_effects_unknown(&self) {
-        self.writer_task_side_effects_unknown
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> WriterAcquisitionSnapshot {
-        let pooled_acquisitions = self.pooled_acquisitions.load(Ordering::Relaxed);
-        let standalone_acquisitions = self.standalone_acquisitions.load(Ordering::Relaxed);
-        let writer_task_acquisitions = self.writer_task_acquisitions.load(Ordering::Relaxed);
-        WriterAcquisitionSnapshot {
-            acquisitions: pooled_acquisitions
-                .saturating_add(standalone_acquisitions)
-                .saturating_add(writer_task_acquisitions),
-            pooled_acquisitions,
-            standalone_acquisitions,
-            writer_task_acquisitions,
-            timeouts: self.pooled_timeouts.load(Ordering::Relaxed),
-            writer_task_begin_busy: self.writer_task_begin_busy.load(Ordering::Relaxed),
-            writer_task_begin_busy_absorbed: self
-                .writer_task_begin_busy_absorbed
-                .load(Ordering::Relaxed),
-            writer_task_begin_errors: self.writer_task_begin_errors.load(Ordering::Relaxed),
-            writer_task_request_failures: self.writer_task_request_failures.load(Ordering::Relaxed),
-            writer_task_side_effects_unknown: self
-                .writer_task_side_effects_unknown
-                .load(Ordering::Relaxed),
-        }
-    }
 }
 
 impl<'pool> WriterGuard<'pool> {
@@ -6455,6 +6389,7 @@ mod tests {
                 standalone_acquisitions: 1,
                 writer_task_acquisitions: 0,
                 timeouts: 0,
+                direct_busy_refusals: 0,
                 writer_task_begin_busy: 0,
                 writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
@@ -6983,6 +6918,7 @@ mod tests {
                 standalone_acquisitions: 0,
                 writer_task_acquisitions: 0,
                 timeouts: 1,
+                direct_busy_refusals: 0,
                 // A pool-mutex checkout timeout must NOT bleed into the
                 // writer-task BEGIN counters: separate stages, separate
                 // counters. This is the mislabeling guard in assertion form.
@@ -7004,6 +6940,7 @@ mod tests {
                 standalone_acquisitions: 0,
                 writer_task_acquisitions: 0,
                 timeouts: 1,
+                direct_busy_refusals: 0,
                 writer_task_begin_busy: 0,
                 writer_task_begin_busy_absorbed: 0,
                 writer_task_begin_errors: 0,
