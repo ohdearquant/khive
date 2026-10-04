@@ -729,6 +729,29 @@ destination.
 zeroes. The fallback's count excludes specifically routed relations, and the `graph_edges` row
 total counts each moved row once. Bare-edge-only requests retain their prior rows and counts.
 
+### Totality, a target equal to the source, and collisions
+
+The namespace aggregates move only under a total, single-target move (Learned state; Amendment 1
+section 2; Amendment 3). For that test, the edge class counts as routed when every relation present
+in the source resolves to a route, through its specific key or through the fallback. Exhaustive
+specific relation routes are therefore total for edges with or without a bare `edge` route. The
+request is single-target when every route, specific relation routes included, names the same
+target. Exhaustive relation routes to one target carry the aggregates; relation routes to two or
+more targets leave them in place and report them as left behind, like any other partitioning move.
+
+Every route, specific relation routes included, refuses before any write when its target is the
+source namespace. The primitive already does this per route (`MoveError::TargetIsSource`, rendered
+as "routed to the namespace it is already in", checked in `namespace_move.rs` before the source
+inventory is read). This amendment states the rule and extends it to the new keys; it does not add
+a new refusal.
+
+Collision enumeration keeps Amendment 2's rule: per reachable constraint and per distinct target,
+over all source rows. `idx_graph_edges_unique_triple` carries the relation, so when relations go to
+different targets, a source edge can be reported as colliding in a target its relation is not
+routed to, and the move refuses. This is a stated limit, and it errs toward refusing, the safe side:
+no row is lost or overwritten, and the caller can split the move by target. Filtering the edge
+constraint by resolved route would remove the false refusal and is left to a later change.
+
 ### Vectors use the same resolved edge destination
 
 Amendment 2's partitioned vector resolution uses this same resolved edge route. A specific route
@@ -748,6 +771,9 @@ does not replace or change the status of the document or Amendments 1 through 3.
   Rust routes, duplicate relation routes and a target equal to source must refuse.
 - A bare-edge-only request preserves its prior behavior, including historical noncanonical stored
   relations and deleted rows. Destination and foreign residents remain unchanged.
+- With every other class routed to one target, exhaustive specific relation routes to that same
+  target, without a bare `edge` route, move the namespace aggregates. The same source with its
+  relations split across two targets leaves them in place and reports them as left behind.
 - Actual source edge vectors follow the resolved route in either route-list order, preserve bytes
   and append a source-delete then destination-upsert pair per moved vector. Vector kind and field do
   not choose the destination. Resident vectors remain unchanged and unlogged.
