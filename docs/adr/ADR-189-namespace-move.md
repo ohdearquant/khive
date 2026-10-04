@@ -749,8 +749,9 @@ Collision enumeration keeps Amendment 2's rule: per reachable constraint and per
 over all source rows. `idx_graph_edges_unique_triple` carries the relation, so when relations go to
 different targets, a source edge can be reported as colliding in a target its relation is not
 routed to, and the move refuses. This is a stated limit, and it errs toward refusing, the safe side:
-no row is lost or overwritten, and the caller can split the move by target. Filtering the edge
-constraint by resolved route would remove the false refusal and is left to a later change.
+no row is lost or overwritten. The caller has no partial move that avoids it, because every request
+must route every relation present in the source and no route may name the source. Filtering the
+edge constraint by resolved route would remove the false refusal and is left to a later change.
 
 ### Vectors use the same resolved edge destination
 
