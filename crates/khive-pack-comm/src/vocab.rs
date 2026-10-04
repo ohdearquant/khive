@@ -325,7 +325,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 16] = [
                 name: "ids",
                 param_type: "array of string",
                 required: true,
-                description: "One to 500 inbound message ids. Every target is validated before mutation and duplicate resolved ids are updated once.",
+                description: "One to 500 inbound message ids. `id` is accepted as an alias for `ids` for one message. Supply only one spelling, even when the values agree. Every target is validated before mutation and duplicate resolved ids are updated once.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
