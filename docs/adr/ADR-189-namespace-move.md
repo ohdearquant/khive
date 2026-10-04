@@ -598,3 +598,83 @@ These are `namespace_move::partition_tests` fixtures. The domain pair is seeded
 with writer-shaped SQL; those fixtures do not execute the public knowledge writer
 or establish warmed ANN consumer behavior. Amendment 1's consumer acceptance and
 ADR-144's session/replay acceptance remain separate requirements.
+
+## Amendment 3 (2026-10-04): tables a pack creates, and authorization state
+
+**Status: Proposed.** Refs #4040.
+
+The decision above classifies the tables the core schema creates. A pack can create its own
+table with a `namespace` column, and a move that meets rows in a table it has no rule for
+refuses with `UnknownTable`. Eight such tables existed without a rule. This amendment gives each
+one a rule and adds a test that fails when a ninth appears. Amendments 1 and 2 remain in force.
+
+### Rows keyed to a routed subject follow it
+
+`gtd_lifecycle_audit` rows are keyed by the task note they describe. They move with that note,
+to the note's destination, in single-target and partitioning moves alike. A row whose note stays
+in the source stays with it and is counted in `left_behind`. The task's history is read where the
+task is read, so it is not treated as an event log.
+
+### Receipts of work follow a total single-target move
+
+`knowledge_eval_runs`, `exec_runs`, `exec_events` and `git_receipts` record work done in a
+namespace and are keyed to no routed subject. They take the rule Amendment 1 gave
+`proposals_open`: a total single-target move carries them, and a partitioning move leaves them in
+the source and reports each table's row count in `left_behind`. `exec_events` rows belong to an
+`exec_runs` row in the same namespace, so the two tables move or stay together. The unique key of
+`exec_runs` is a partial index, which the collision enumeration does not read. A target that
+already holds a row with the same key therefore refuses the move as a failing statement and the
+caller's rollback, the rule Amendment 2 states for constraints that are not enumerated, and the
+error names the key's columns and not the rows.
+
+### Index snapshots are derived and are deleted, not moved
+
+`retrieval_snapshots` rows are rebuilt from the vectors they summarise. A move deletes the
+source namespace's snapshot rows, including rows stored under a composite key that begins with
+the namespace, and writes none for the target. The target's index is rebuilt by its next
+consumer under the rules of Amendment 1.
+
+### Authorization state is never carried
+
+`tool_policy` and `tool_grants` say what a namespace has allowed. No move carries them, in
+either shape: an allow row arriving in a target would grant there what the target never decided.
+They stay in the source and the move neither deletes nor rewrites them.
+
+Rows that stay are reported so that a caller can raise them with an operator:
+
+- `left_behind` names both tables with the number of rows that stayed;
+- the move result carries two counts, the policy rows that are not soft-deleted and the grant
+  rows that are not expired at the instant the move ran;
+- a move that leaves a policy row that is not soft-deleted or a grant that is not expired logs
+  one line at warn level naming the source namespace and the two counts, with no row contents.
+
+**Residual.** Authorization rows left under the old namespace name will meet any data later
+placed under that name. The operator disposes of them. A move never deletes authorization state,
+because a move that guessed wrong would silently widen or revoke access.
+
+### Every pack table has a rule, checked by a test
+
+A test builds one store holding the schema of every built-in pack, runs the namespace census over
+it, and requires each table the census finds to have a disposition or to be named in the
+excluded list. Its failure message names the tables without a rule.
+
+### Acceptance
+
+- A total single-target move of a source holding rows in all eight tables succeeds. Audit rows
+  and the four receipt tables are in the target, `exec_events` rows still match their `exec_runs`
+  row, the source's snapshot rows are gone and the target has none, authorization rows are
+  byte-identical in the source, `left_behind` names both authorization tables, and the two
+  operator counts equal the seeded live rows where the fixture also seeds one soft-deleted policy
+  row and one expired grant.
+- A partitioning move of the same source succeeds. Audit rows follow their notes, the four
+  receipt tables and both authorization tables stay and are counted in `left_behind`, and the
+  operator counts are as above.
+- A store without these tables, or a source with no rows in them, moves exactly as before.
+- A target that already holds an `exec_runs` row with the same unique key refuses the move with
+  the failing statement's error, and after the caller's rollback the source and target rows are
+  byte-identical to before.
+- Removing the rule for any one table fails the pack-schema test, and so does adding a
+  namespace-bearing table to the test store without a rule.
+- The liveness predicates for policy and grant rows are pinned by a test in the tool pack that
+  builds rows through the pack's own writers, so the move's counts cannot drift from what the
+  pack reads.
