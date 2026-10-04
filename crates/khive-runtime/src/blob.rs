@@ -427,6 +427,22 @@ impl BlobStore for ReadOnlyBlobStore {
         Err(Self::mutation_error("put"))
     }
 
+    fn upload_lease_idle_cap(&self) -> Option<std::time::Duration> {
+        self.inner.upload_lease_idle_cap()
+    }
+
+    async fn begin_upload_with_lease(
+        &self,
+        _size: u64,
+        _config: khive_storage::blob::UploadLeaseConfig,
+    ) -> StorageResult<UploadId> {
+        Err(Self::mutation_error("begin_upload_with_lease"))
+    }
+
+    async fn renew_upload(&self, _id: &UploadId) -> StorageResult<()> {
+        Err(Self::mutation_error("renew_upload"))
+    }
+
     async fn begin_upload(&self, _declared_size: u64) -> StorageResult<UploadId> {
         Err(Self::mutation_error("begin_upload"))
     }
@@ -499,12 +515,25 @@ mod tests {
         let inner = Arc::new(
             khive_db::stores::blob::FsBlobStore::new(dir.path().join("blobs"), 0).unwrap(),
         );
-        let id = inner.begin_upload(1).await.unwrap();
+        let config = khive_storage::blob::UploadLeaseConfig::new(
+            uuid::Uuid::from_bytes([1; 16]),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        let id = inner.begin_upload_with_lease(1, config).await.unwrap();
+        let stage_path = inner.root().join(".uploads").join(id.as_str());
+        let lease_path = stage_path.with_extension("lease");
+        let before = (
+            std::fs::read(&stage_path).unwrap(),
+            std::fs::read(&lease_path).unwrap(),
+        );
         let reference = ContentRef::from_hex("a".repeat(64)).unwrap();
         let guarded = ReadOnlyBlobStore {
             inner: inner.clone(),
         };
         let failures = [
+            guarded.begin_upload_with_lease(1, config).await.map(|_| ()),
+            guarded.renew_upload(&id).await,
             guarded.begin_upload(1).await.map(|_| ()),
             guarded.append_part(&id, vec![1]).await.map(|_| ()),
             guarded.commit_upload(&id, &reference).await,
@@ -515,6 +544,8 @@ mod tests {
                 .map(|_| ()),
         ];
         for (result, expected) in failures.into_iter().zip([
+            "begin_upload_with_lease",
+            "renew_upload",
             "begin_upload",
             "append_part",
             "commit_upload",
@@ -529,9 +560,20 @@ mod tests {
             };
             assert_eq!(operation, expected);
             assert!(message.contains("read-only"));
+            assert_eq!(
+                (
+                    std::fs::read(&stage_path).unwrap(),
+                    std::fs::read(&lease_path).unwrap()
+                ),
+                before
+            );
         }
         let uploads = inner.root().join(".uploads");
-        assert_eq!(std::fs::read_dir(&uploads).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&uploads).unwrap().count(), 2);
+        assert_eq!(
+            guarded.upload_lease_idle_cap(),
+            inner.upload_lease_idle_cap()
+        );
         assert_eq!(
             std::fs::metadata(uploads.join(id.as_str())).unwrap().len(),
             0

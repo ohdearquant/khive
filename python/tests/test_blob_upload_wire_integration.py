@@ -21,6 +21,7 @@ import struct
 import subprocess
 import tempfile
 import time
+import uuid
 
 from blake3 import blake3
 import pytest
@@ -179,12 +180,49 @@ class _Daemon:
 
     def staging(self) -> set[Path]:
         path = self.blobs / ".uploads"
-        return set(path.iterdir()) if path.exists() else set()
+        entries = set(path.iterdir()) if path.exists() else set()
+        stages = {entry for entry in entries if re.fullmatch(r"[0-9a-f]{32}", entry.name)}
+        for stage in stages:
+            self.lease(stage)
+        assert entries == stages | {stage.with_suffix(".lease") for stage in stages}, entries
+        return stages
 
     def stage(self, begin: dict) -> Path:
         path = self.blobs / ".uploads" / begin["upload_id"]
         assert path.is_file(), (path, self.staging())
+        self.lease(path)
         return path
+
+    def lease(self, stage: Path) -> dict:
+        sidecar = stage.with_suffix(".lease")
+        value = json.loads(sidecar.read_bytes())
+        assert set(value) == {"owner", "idle_secs", "renew_seq", "renewed_at"}, value
+        assert str(uuid.UUID(value["owner"])) == value["owner"]
+        assert value["idle_secs"] == min(self.idle, 21600)
+        assert type(value["renew_seq"]) is int and value["renew_seq"] >= 0
+        assert type(value["renewed_at"]) is int and value["renewed_at"] > 0
+        return value
+
+    def age_stopped_lease(self, stage: Path):
+        assert self.process is None, "age only the stopped daemon's private fixture"
+        value = self.lease(stage)
+        immutable = {key: value[key] for key in ("owner", "idle_secs", "renew_seq")}
+        value["renewed_at"] = int((time.time() - value["idle_secs"] - 86400 - 5) * 1000)
+        sidecar = stage.with_suffix(".lease")
+        with tempfile.NamedTemporaryFile(dir=sidecar.parent, delete=False) as temporary:
+            temporary.write(json.dumps(value).encode())
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            name = temporary.name
+        os.replace(name, sidecar)
+        if os.name == "posix":
+            descriptor = os.open(sidecar.parent, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        aged = self.lease(stage)
+        assert {key: aged[key] for key in immutable} == immutable
 
     def object(self, content_ref: str) -> Path:
         return self.blobs / content_ref[:2] / content_ref[2:4] / content_ref
@@ -518,6 +556,7 @@ def test_blob_upload_wire_restart_orphan_sweep_and_begin_again(upload_daemon_fac
     first_pid = daemon.process.pid
     daemon.stop()
     assert stage.read_bytes() == b"a", "shutdown must leave the orphan for restart sweep evidence"
+    daemon.age_stopped_lease(stage)
     daemon.start()
     assert daemon.process.pid != first_pid
     client = daemon.client()

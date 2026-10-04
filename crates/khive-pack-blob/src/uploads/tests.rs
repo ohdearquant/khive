@@ -52,11 +52,39 @@ fn manager_with_store(runtime: KhiveRuntime, store: Arc<dyn BlobStore>) -> Uploa
     manager
 }
 
+fn durable_runtime(dir: &Path) -> KhiveRuntime {
+    let backend = Arc::new(khive_db::StorageBackend::sqlite_for_test(dir.join("main.db")).unwrap());
+    backend.prepare_core_schema().unwrap();
+    KhiveRuntime::from_backend(backend, RuntimeConfig::no_embeddings())
+}
+
+fn staged_count(root: &Path) -> usize {
+    std::fs::read_dir(root.join(".uploads"))
+        .unwrap()
+        .filter(|entry| {
+            UploadId::from_hex(
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+            .is_ok()
+        })
+        .count()
+}
+
+fn lease(root: &Path, id: &UploadId) -> Value {
+    serde_json::from_slice(&std::fs::read(staged(root, id).with_extension("lease")).unwrap())
+        .unwrap()
+}
+
 fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("blobs");
     let store = Arc::new(FsBlobStore::new(root.clone(), 0).unwrap());
-    let manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    let manager = manager_with_store(durable_runtime(dir.path()), store.clone());
     Fixture {
         _dir: dir,
         root,
@@ -133,6 +161,200 @@ fn upload_ceiling_parser_accepts_positive_usize_and_rejects_invalid_values() {
 }
 
 #[tokio::test]
+async fn filesystem_idle_clamp_precedes_instant_fallback_and_preserves_non_fs_policy() {
+    if khive_storage::test_support::run_exact_test_in_child("KHIVE_IDLE_CLAMP_CHILD", false, |_| {})
+    {
+        return;
+    }
+    let log = tempfile::NamedTempFile::new().unwrap();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(Arc::new(log.reopen().unwrap()))
+            .without_time()
+            .with_ansi(false)
+            .finish(),
+    )
+    .unwrap();
+    let f = fixture();
+    for (raw, expected) in [
+        ("61", 61),
+        ("43200", 21600),
+        ("18446744073709551615", 21600),
+    ] {
+        std::env::set_var("KHIVE_BLOB_UPLOAD_IDLE_SECS", raw);
+        let manager = UploadManager::new(f.manager.runtime.clone());
+        let response = manager.begin(0, None, "uploader:a".into()).await;
+        assert!(
+            response.is_ok(),
+            "{raw}: FS begin must succeed: {response:?}"
+        );
+        let id = upload_id(&response.unwrap());
+        assert_eq!(manager.policy.idle_for.as_secs(), expected);
+        assert_eq!(lease(&f.root, &id)["idle_secs"], expected);
+        manager.abort(&id).await.unwrap();
+    }
+    std::env::set_var("KHIVE_BLOB_UPLOAD_IDLE_SECS", "43200");
+    assert_eq!(UploadPolicy::from_env(None).idle_for.as_secs(), 43200);
+    let text = std::fs::read_to_string(log.path()).unwrap();
+    assert!(text.contains("KHIVE_BLOB_UPLOAD_IDLE_SECS") && text.contains("configured=43200"));
+    assert!(text.contains("configured=18446744073709551615") && text.contains("clamp=21600"));
+    let warnings: Vec<_> = text
+        .lines()
+        .filter(|line| line.contains("configured=43200"))
+        .collect();
+    assert_eq!(warnings.len(), 1);
+    assert!(
+        warnings[0].contains("WARN")
+            && warnings[0].contains("KHIVE_BLOB_UPLOAD_IDLE_SECS")
+            && warnings[0].contains("clamp=21600")
+    );
+}
+
+#[tokio::test]
+async fn main_identity_is_authoritative_and_memory_refuses_before_staging() {
+    let f = fixture();
+    let main_path = f._dir.path().join("lease-owner-main.db");
+    let main = khive_db::StorageBackend::sqlite_for_test(&main_path).unwrap();
+    main.prepare_core_schema().unwrap();
+    let other_path = f._dir.path().join("secondary.db");
+    let other = Arc::new(khive_db::StorageBackend::sqlite_for_test(&other_path).unwrap());
+    other.prepare_core_schema().unwrap();
+    let owner = main.database_owner_identity().unwrap().durable_id();
+    assert_ne!(owner, other.database_owner_identity().unwrap().durable_id());
+    let pool = main.pool_arc();
+    assert!(!pool.writer_task_join_was_stored());
+    let lifetime = Arc::downgrade(&pool);
+    drop(pool);
+    drop(main);
+    assert!(lifetime.upgrade().is_none());
+    let settled = rusqlite::Connection::open(&main_path).unwrap();
+    let mode: String = settled
+        .pragma_update_and_check(None, "journal_mode", "DELETE", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode.to_ascii_lowercase(), "delete");
+    settled.close().unwrap();
+    let readonly =
+        Arc::new(khive_db::StorageBackend::sqlite_read_only_for_test(&main_path).unwrap());
+    assert!(readonly.is_read_only());
+    let acquisitions = readonly.pool().writer_acquisition_snapshot();
+    let runtime = KhiveRuntime::from_backend(
+        other,
+        RuntimeConfig {
+            db_path: Some(other_path),
+            backend_id: khive_runtime::config::BackendId::parse("assets").unwrap(),
+            ..RuntimeConfig::no_embeddings()
+        },
+    )
+    .with_core_backend(readonly.clone());
+    assert!(!runtime.is_read_only() && runtime.core().is_read_only());
+    let manager = manager_with_store(runtime, f.store.clone());
+    assert!(Arc::ptr_eq(
+        &manager.runtime.require_blob_store().unwrap(),
+        &manager.runtime.require_blob_store().unwrap()
+    ));
+    let id = begin(&manager, 0).await;
+    assert_eq!(lease(&f.root, &id)["owner"], owner.to_string());
+    manager.abort(&id).await.unwrap();
+    assert_eq!(readonly.pool().writer_acquisition_snapshot(), acquisitions);
+    assert_eq!(
+        readonly.database_owner_identity().unwrap().durable_id(),
+        owner
+    );
+    let memory = manager_with_store(KhiveRuntime::memory().unwrap(), f.store.clone());
+    let known = f.store.put(b"known".to_vec()).await.unwrap();
+    assert_eq!(
+        memory
+            .begin(5, Some(known.clone()), "actor".into())
+            .await
+            .unwrap()["content_ref"],
+        known.to_string()
+    );
+    let error = memory.begin(0, None, "actor".into()).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("durable MAIN database for staged filesystem uploads"));
+    assert_eq!(staged_count(&f.root), 0);
+    assert!(std::fs::read_dir(f.root.join(".uploads"))
+        .unwrap()
+        .next()
+        .is_none());
+    assert!(
+        memory.records.lock().unwrap().is_empty()
+            && memory.slots.by_actor.lock().unwrap().is_empty()
+    );
+}
+
+fn memory_fs_registry(
+    f: &Fixture,
+    transfers: bool,
+) -> (khive_runtime::VerbRegistry, Arc<UploadManager>) {
+    let mut config = RuntimeConfig::no_embeddings();
+    config.blob.file_transfers = transfers;
+    let runtime = KhiveRuntime::from_backend(
+        Arc::new(khive_db::StorageBackend::memory().unwrap()),
+        config,
+    );
+    runtime.install_blob_store(f.store.clone()).unwrap();
+    let pack = BlobPack::new(runtime);
+    let manager = pack.uploads.clone();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(pack);
+    (builder.build().unwrap(), manager)
+}
+
+fn assert_memory_durability_refusal(error: RuntimeError, manager: &UploadManager, root: &Path) {
+    assert!(matches!(error, RuntimeError::Unconfigured(_)), "{error}");
+    assert_eq!(
+        error.to_string(),
+        "unconfigured: durable MAIN database for staged filesystem uploads is not set"
+    );
+    assert!(!root.join(".uploads").exists());
+    assert!(manager.records.lock().unwrap().is_empty());
+    assert!(manager.slots.by_actor.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn public_begin_memory_main_reports_unconfigured_before_staging() {
+    let f = fixture();
+    let (registry, manager) = memory_fs_registry(&f, false);
+    let error = registry
+        .dispatch("blob.begin", json!({"size": 0}))
+        .await
+        .unwrap_err();
+    assert_memory_durability_refusal(error, &manager, &f.root);
+}
+
+#[tokio::test]
+async fn public_import_memory_main_reports_unconfigured_before_staging() {
+    if khive_storage::test_support::run_exact_test_in_child(
+        "KHIVE_MEMORY_IMPORT_CHILD",
+        false,
+        |_| {},
+    ) {
+        return;
+    }
+    let f = fixture();
+    let root = f._dir.path().canonicalize().unwrap();
+    std::fs::create_dir(root.join("imports")).unwrap();
+    std::fs::create_dir(root.join("exports")).unwrap();
+    std::env::set_var("KHIVE_IMPORT_FROM_ROOT", root.join("imports"));
+    std::env::set_var("KHIVE_SAVE_TO_ROOT", root.join("exports"));
+    let bytes = b"valid confined import";
+    std::fs::write(root.join("imports/source.bin"), bytes).unwrap();
+    let (registry, manager) = memory_fs_registry(&f, true);
+    let error = registry
+        .dispatch("blob.import", json!({"path": "source.bin"}))
+        .await
+        .unwrap_err();
+    assert_memory_durability_refusal(error, &manager, &f.root);
+    assert_eq!(
+        std::fs::read(root.join("imports/source.bin")).unwrap(),
+        bytes
+    );
+    assert!(!f.store.exists(&content_ref(bytes)).await.unwrap());
+}
+
+#[tokio::test]
 async fn total_active_upload_ceiling_refuses_before_staging_and_abort_restores_slot() {
     let mut f = fixture();
     f.manager.policy.max_active = 2;
@@ -147,10 +369,7 @@ async fn total_active_upload_ceiling_refuses_before_staging_and_abort_restores_s
         "total",
         2,
     );
-    assert_eq!(
-        std::fs::read_dir(f.root.join(".uploads")).unwrap().count(),
-        2
-    );
+    assert_eq!(staged_count(&f.root), 2);
     let retained_record = f.manager.record(&first).unwrap();
     f.manager.abort(&first).await.unwrap();
     assert!(!staged(&f.root, &first).exists());
@@ -230,10 +449,7 @@ async fn known_reference_bypasses_full_upload_ceilings_without_reserving_slot() 
         assert!(result.get("upload_id").is_none());
     }
     assert_eq!(f.manager.records.lock().unwrap().len(), 1);
-    assert_eq!(
-        std::fs::read_dir(f.root.join(".uploads")).unwrap().count(),
-        1
-    );
+    assert_eq!(staged_count(&f.root), 1);
     assert_upload_ceiling(
         f.manager
             .begin(0, None, "uploader:b".into())
@@ -252,7 +468,7 @@ async fn concurrent_begins_reserve_total_and_actor_slots_before_backend_returns(
     let f = fixture();
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.pause_after_begin.store(true, Ordering::SeqCst);
-    let mut manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    let mut manager = manager_with_store(durable_runtime(f._dir.path()), store.clone());
     manager.policy.max_active = 2;
     manager.policy.max_per_actor = 1;
     let manager = Arc::new(manager);
@@ -296,10 +512,7 @@ async fn concurrent_begins_reserve_total_and_actor_slots_before_backend_returns(
         2,
     );
     assert_eq!(store.begin_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(
-        std::fs::read_dir(f.root.join(".uploads")).unwrap().count(),
-        2
-    );
+    assert_eq!(staged_count(&f.root), 2);
     store.pause_after_begin.store(false, Ordering::SeqCst);
     store.release_begin.notify_waiters();
     let first_id = upload_id(
@@ -327,7 +540,7 @@ async fn failed_backend_begin_releases_total_and_actor_reservation() {
     let f = fixture();
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.begin_failures.store(1, Ordering::SeqCst);
-    let mut manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    let mut manager = manager_with_store(durable_runtime(f._dir.path()), store.clone());
     manager.policy.max_active = 1;
     manager.policy.max_per_actor = 1;
     let error = manager
@@ -351,7 +564,7 @@ async fn failed_cleanup_retains_upload_slots_until_sweep_succeeds() {
     let f = fixture();
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.abort_failures.store(2, Ordering::SeqCst);
-    let mut manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    let mut manager = manager_with_store(durable_runtime(f._dir.path()), store.clone());
     manager.policy.max_active = 2;
     manager.policy.max_per_actor = 1;
     let id = begin(&manager, 0).await;
@@ -397,7 +610,7 @@ async fn cancelled_begin_keeps_reservation_and_staging_until_expiry_cleanup() {
     let f = fixture();
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.pause_after_begin.store(true, Ordering::SeqCst);
-    let mut manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    let mut manager = manager_with_store(durable_runtime(f._dir.path()), store.clone());
     manager.policy.max_active = 1;
     manager.policy.max_per_actor = 1;
     let manager = Arc::new(manager);
@@ -469,7 +682,7 @@ async fn wrong_index_refuses_without_changing_upload() {
 }
 
 #[tokio::test]
-async fn identical_tail_retry_preserves_hash_counts_and_idle_clocks() {
+async fn identical_tail_retry_preserves_hash_counts_and_advances_idle_clocks() {
     let f = fixture();
     let id = begin(&f.manager, 6).await;
     let accepted = f.manager.put_part(&id, 0, b"abc".to_vec()).await.unwrap();
@@ -490,7 +703,8 @@ async fn identical_tail_retry_preserves_hash_counts_and_idle_clocks() {
         assert_eq!(record.next_index, 1);
         assert_eq!(record.hasher.finalize(), hash);
         assert_eq!(record.tail, tail);
-        assert_eq!(record.last_part, last_part);
+        assert!(record.last_part > last_part);
+        assert_eq!(lease(&f.root, &id)["renew_seq"], 2);
     }
     assert_eq!(
         std::fs::metadata(&path).unwrap().modified().unwrap(),
@@ -1032,6 +1246,8 @@ async fn restart_orphan_sweep_removes_staging_without_a_live_record() {
     assert_unknown(restarted.commit(&id).await.unwrap_err());
     assert!(staged(&f.root, &id).exists());
     age_file(&staged(&f.root, &id));
+    // Deliberate legacy recovery leftover, not a live ownerless producer.
+    std::fs::remove_file(staged(&f.root, &id).with_extension("lease")).unwrap();
     assert_eq!(restarted.sweep().await.unwrap(), 1);
     assert!(!staged(&f.root, &id).exists());
     let new_id = begin(&restarted, 2).await;
@@ -1114,6 +1330,7 @@ async fn read_only_runtime_refuses_every_upload_operation_without_mutation() {
         .lock()
         .unwrap()
         .insert(id.clone(), f.manager.record(&id).unwrap());
+    let before = std::fs::read(staged(&f.root, &id).with_extension("lease")).unwrap();
     for result in [
         readonly.begin(0, None, "uploader:a".into()).await,
         readonly.put_part(&id, 0, b"a".to_vec()).await,
@@ -1125,6 +1342,10 @@ async fn read_only_runtime_refuses_every_upload_operation_without_mutation() {
         assert!(error.to_string().contains("read-only"), "{error}");
     }
     assert_eq!(std::fs::read(staged(&f.root, &id)).unwrap(), b"a");
+    assert_eq!(
+        std::fs::read(staged(&f.root, &id).with_extension("lease")).unwrap(),
+        before
+    );
     assert!(readonly.records.lock().unwrap().contains_key(&id));
     assert!(!f.store.exists(&content_ref(b"a")).await.unwrap());
     f.manager.abort(&id).await.unwrap();
@@ -1145,6 +1366,9 @@ struct ControlledStore {
     fail_after_append: AtomicBool,
     wrong_append_length: AtomicBool,
     appended: tokio::sync::Notify,
+    fail_renew: AtomicBool,
+    pause_renew: AtomicBool,
+    renewing: tokio::sync::Notify,
 }
 
 impl ControlledStore {
@@ -1163,6 +1387,9 @@ impl ControlledStore {
             fail_after_append: AtomicBool::new(false),
             wrong_append_length: AtomicBool::new(false),
             appended: tokio::sync::Notify::new(),
+            fail_renew: AtomicBool::new(false),
+            pause_renew: AtomicBool::new(false),
+            renewing: tokio::sync::Notify::new(),
         }
     }
 }
@@ -1173,7 +1400,26 @@ impl BlobStore for ControlledStore {
         self.inner.put(bytes).await
     }
 
-    async fn begin_upload(&self, size: u64) -> StorageResult<UploadId> {
+    fn upload_lease_idle_cap(&self) -> Option<Duration> {
+        self.inner.upload_lease_idle_cap()
+    }
+
+    async fn renew_upload(&self, id: &UploadId) -> StorageResult<()> {
+        if self.pause_renew.load(Ordering::SeqCst) {
+            self.renewing.notify_one();
+            std::future::pending::<()>().await;
+        }
+        if self.fail_renew.load(Ordering::SeqCst) {
+            return Err(StorageError::Internal("injected renewal failure".into()));
+        }
+        self.inner.renew_upload(id).await
+    }
+
+    async fn begin_upload_with_lease(
+        &self,
+        size: u64,
+        config: UploadLeaseConfig,
+    ) -> StorageResult<UploadId> {
         self.begin_calls.fetch_add(1, Ordering::SeqCst);
         if self
             .begin_failures
@@ -1182,7 +1428,7 @@ impl BlobStore for ControlledStore {
         {
             return Err(StorageError::Internal("injected begin failure".into()));
         }
-        let id = self.inner.begin_upload(size).await?;
+        let id = self.inner.begin_upload_with_lease(size, config).await?;
         self.begun_ids.lock().unwrap().push(id.clone());
         if self.pause_after_begin.load(Ordering::SeqCst) {
             self.begun.notify_one();
@@ -1251,7 +1497,7 @@ async fn failed_abort_is_retained_and_retried_by_successive_sweeps() {
     let f = fixture();
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.abort_failures.store(2, Ordering::SeqCst);
-    let manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    let manager = manager_with_store(durable_runtime(f._dir.path()), store.clone());
     let id = begin(&manager, 1).await;
     assert!(manager
         .abort(&id)
@@ -1280,7 +1526,7 @@ async fn failed_error_cleanup_retains_aborted_upload_until_sweep_retries() {
     let f = fixture();
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.abort_failures.store(1, Ordering::SeqCst);
-    let manager = manager_with_store(KhiveRuntime::memory().unwrap(), store.clone());
+    let manager = manager_with_store(durable_runtime(f._dir.path()), store.clone());
     let id = begin(&manager, 3).await;
     manager.put_part(&id, 0, b"abc".to_vec()).await.unwrap();
     let error = manager.put_part(&id, 0, b"abd".to_vec()).await.unwrap_err();
@@ -1298,7 +1544,7 @@ async fn append_failure_after_real_write_aborts_and_never_acknowledges() {
     let f = fixture();
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.fail_after_append.store(true, Ordering::SeqCst);
-    let manager = manager_with_store(KhiveRuntime::memory().unwrap(), store);
+    let manager = manager_with_store(durable_runtime(f._dir.path()), store);
     let id = begin(&manager, 3).await;
     let error = manager.put_part(&id, 0, b"abc".to_vec()).await.unwrap_err();
     assert!(error
@@ -1314,7 +1560,7 @@ async fn inconsistent_backend_length_aborts_and_never_acknowledges() {
     let f = fixture();
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.wrong_append_length.store(true, Ordering::SeqCst);
-    let manager = manager_with_store(KhiveRuntime::memory().unwrap(), store);
+    let manager = manager_with_store(durable_runtime(f._dir.path()), store);
     let id = begin(&manager, 3).await;
     let error = manager.put_part(&id, 0, b"abc".to_vec()).await.unwrap_err();
     assert!(error.to_string().contains("staged upload length differs"));
@@ -1328,7 +1574,7 @@ async fn cancelled_append_never_acknowledges_inconsistent_staged_bytes() {
     let store = Arc::new(ControlledStore::new(f.store.clone()));
     store.pause_after_append.store(true, Ordering::SeqCst);
     let manager = Arc::new(manager_with_store(
-        KhiveRuntime::memory().unwrap(),
+        durable_runtime(f._dir.path()),
         store.clone(),
     ));
     let id = begin(&manager, 6).await;
@@ -1359,10 +1605,68 @@ async fn cancelled_append_never_acknowledges_inconsistent_staged_bytes() {
 }
 
 #[tokio::test]
+async fn failed_or_cancelled_tail_renewal_never_acknowledges_or_advances_acceptance() {
+    for cancel in [false, true] {
+        let f = fixture();
+        let store = Arc::new(ControlledStore::new(f.store.clone()));
+        let manager = Arc::new(manager_with_store(
+            durable_runtime(f._dir.path()),
+            store.clone(),
+        ));
+        let id = begin(&manager, 3).await;
+        manager.put_part(&id, 0, b"abc".to_vec()).await.unwrap();
+        let record = manager.record(&id).unwrap();
+        let clock = record.lock().await.last_part;
+        store.abort_failures.store(1, Ordering::SeqCst);
+        store.pause_renew.store(cancel, Ordering::SeqCst);
+        store.fail_renew.store(!cancel, Ordering::SeqCst);
+        let task = tokio::spawn({
+            let manager = manager.clone();
+            let id = id.clone();
+            async move { manager.put_part(&id, 0, b"abc".to_vec()).await }
+        });
+        if cancel {
+            tokio::time::timeout(Duration::from_secs(10), store.renewing.notified())
+                .await
+                .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(record.lock().await.phase == UploadPhase::InFlight);
+            assert_unknown(manager.put_part(&id, 0, b"abc".to_vec()).await.unwrap_err());
+        } else {
+            assert!(task
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("injected renewal failure"));
+        }
+        let record = record.lock().await;
+        assert!(record.phase == UploadPhase::Aborted);
+        assert_eq!(
+            (record.received_bytes, record.next_index, record.last_part),
+            (3, 1, clock)
+        );
+        assert_eq!(record.hasher.finalize(), blake3::hash(b"abc"));
+        assert_eq!(lease(&f.root, &id)["renew_seq"], 1);
+        assert_eq!(std::fs::read(staged(&f.root, &id)).unwrap(), b"abc");
+        drop(record);
+        assert_eq!(manager.sweep().await.unwrap(), 1);
+        assert!(
+            !staged(&f.root, &id).exists()
+                && !staged(&f.root, &id).with_extension("lease").exists()
+        );
+        assert!(!f.store.exists(&content_ref(b"abc")).await.unwrap());
+    }
+}
+
+#[tokio::test]
 async fn independent_capabilities_allow_cross_actor_append_commit_and_abort() {
     let f = fixture();
     let mut builder = VerbRegistryBuilder::new();
-    builder.register(BlobPack::new(f.manager.runtime.clone()));
+    let pack = BlobPack::new(f.manager.runtime.clone());
+    let manager = pack.uploads.clone();
+    builder.register(pack);
     let registry = builder.build().unwrap();
     let actor_a = RequestIdentity {
         namespace: "local".into(),
@@ -1385,6 +1689,21 @@ async fn independent_capabilities_allow_cross_actor_append_commit_and_abort() {
     let first_id = upload_id(&first);
     let second_id = upload_id(&second);
     assert_ne!(first_id, second_id);
+    let owner = f
+        .manager
+        .runtime
+        .core()
+        .backend()
+        .database_owner_identity()
+        .unwrap()
+        .durable_id();
+    for id in [&first_id, &second_id] {
+        assert_eq!(lease(&f.root, id)["owner"], owner.to_string());
+        assert_eq!(
+            lease(&f.root, id)["idle_secs"],
+            manager.policy.idle_for.as_secs()
+        );
+    }
     registry
         .dispatch_with_identity(
             "blob.put_part",
@@ -1393,6 +1712,18 @@ async fn independent_capabilities_allow_cross_actor_append_commit_and_abort() {
         )
         .await
         .unwrap();
+    let clock = manager.record(&first_id).unwrap().lock().await.last_part;
+    let retry = registry
+        .dispatch_with_identity(
+            "blob.put_part",
+            json!({"upload_id": first_id.to_string(), "index": 0, "bytes": BASE64.encode(b"abc")}),
+            Some(actor_a.clone()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry, json!({"next_index": 1, "received_bytes": 3}));
+    assert_eq!(lease(&f.root, &first_id)["renew_seq"], 2);
+    assert!(manager.record(&first_id).unwrap().lock().await.last_part > clock);
     registry
         .dispatch_with_identity(
             "blob.put_part",

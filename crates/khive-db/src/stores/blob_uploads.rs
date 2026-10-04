@@ -25,11 +25,21 @@
 use super::*;
 
 const UPLOAD_DIRECTORY: &str = ".uploads";
+#[path = "blob_upload_lease.rs"]
+pub(super) mod lease;
+#[cfg(test)]
+#[path = "blob_upload_lease_tests.rs"]
+mod lease_tests;
+#[cfg(unix)]
+type UploadDirectory = fs::File;
+#[cfg(not(unix))]
+type UploadDirectory = PathBuf;
 
 struct UploadContext {
     root: PathBuf,
     root_handle: Arc<fs::File>,
     floor_bytes: u64,
+    observations: Arc<StdMutex<lease::Observations>>,
     #[cfg(unix)]
     publication: BlobPublication,
 }
@@ -46,6 +56,7 @@ async fn run<T: Send + 'static>(
         root: store.root.clone(),
         root_handle: Arc::clone(&store.root_handle),
         floor_bytes: store.floor_bytes,
+        observations: Arc::clone(&store.upload_observations),
         #[cfg(unix)]
         publication: BlobPublication {
             #[cfg(test)]
@@ -154,14 +165,20 @@ impl UploadContext {
     }
 }
 
-pub(super) async fn begin(store: &FsBlobStore, declared_size: u64) -> StorageResult<UploadId> {
+pub(super) async fn begin_leased(
+    store: &FsBlobStore,
+    size: u64,
+    config: UploadLeaseConfig,
+) -> StorageResult<UploadId> {
+    let declared_size = size;
     if declared_size > MAX_BLOB_WHOLE_BYTES {
         return Err(invalid(
             "begin_upload",
             "declared upload exceeds the 64 MiB ceiling",
         ));
     }
-    run(store, "begin_upload", |context| {
+    run(store, "begin_upload", move |context| {
+        let lease = lease::Lease::begin(config)?;
         let directory = context
             .directory(true)
             .map_err(|error| map_io_err(error, "begin_upload"))?;
@@ -179,9 +196,41 @@ pub(super) async fn begin(store: &FsBlobStore, declared_size: u64) -> StorageRes
                 .open(directory.join(id.as_str()));
             match created {
                 Ok(file) => {
-                    file.sync_all()
-                        .map_err(|error| map_io_err(error, "begin_upload_sync"))?;
-                    return Ok(id);
+                    let result = (|| {
+                        lease::step(&context, "begin_upload_sync", || file.sync_all())?;
+                        lease::publish(&context, &directory, &id, &lease)?;
+                        #[cfg(unix)]
+                        context
+                            .publication
+                            .sync_directory("upload_sync_root", &context.root_handle)
+                            .map_err(|error| map_io_err(error, "upload_sync_root"))?;
+                        Ok(id.clone())
+                    })();
+                    drop(file);
+                    if result.is_err() {
+                        match lease::unlink(&directory, id.as_str()) {
+                            Ok(()) => {
+                                if let Err(error) = lease::cleanup(&context, &id) {
+                                    tracing::warn!(upload_id = %id, %error,
+                                        "failed upload begin cleanup; \
+                                         original begin error retained");
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                if let Err(error) = lease::cleanup(&context, &id) {
+                                    tracing::warn!(upload_id = %id, %error,
+                                        "failed upload begin cleanup; \
+                                         original begin error retained");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(upload_id = %id, %error,
+                                    "failed upload begin stage cleanup; \
+                                     siblings retained for repair");
+                            }
+                        }
+                    }
+                    return result;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(map_io_err(error, "begin_upload")),
@@ -224,6 +273,9 @@ pub(super) async fn append(
         #[cfg(not(unix))]
         let opened = open_staging(&directory.join(id.as_str()), true);
         let mut file = opened.map_err(|error| upload_error(error, &id, "append_part"))?;
+        let renewal = lease::read(&directory, &id)?
+            .ok_or_else(|| invalid("append_part", "missing upload lease"))?
+            .next()?;
         let before = file
             .metadata()
             .map_err(|error| map_io_err(error, "append_part_stat"))?
@@ -237,8 +289,7 @@ pub(super) async fn append(
             .map_err(|error| map_io_err(error, "append_part_write"))?;
         file.set_modified(SystemTime::now())
             .map_err(|error| map_io_err(error, "append_part_touch"))?;
-        file.sync_all()
-            .map_err(|error| map_io_err(error, "append_part_sync"))?;
+        lease::step(&context, "append_part_sync", || file.sync_all())?;
         if file
             .metadata()
             .map_err(|error| map_io_err(error, "append_part_stat"))?
@@ -250,7 +301,22 @@ pub(super) async fn append(
                 "staged length changed during append",
             ));
         }
+        lease::publish(&context, &directory, &id, &renewal)?;
         Ok(after)
+    })
+    .await
+}
+
+pub(super) async fn renew(store: &FsBlobStore, id: UploadId) -> StorageResult<()> {
+    run(store, "renew_upload", move |context| {
+        let directory = context
+            .directory(false)
+            .map_err(|error| upload_error(error, &id, "renew_upload"))?;
+        lease::open(&directory, id.as_str())
+            .map_err(|error| upload_error(error, &id, "renew_upload"))?;
+        let value = lease::read(&directory, &id)?
+            .ok_or_else(|| invalid("renew_upload", "missing upload lease"))?;
+        lease::publish(&context, &directory, &id, &value.next()?)
     })
     .await
 }
@@ -261,7 +327,8 @@ pub(super) async fn commit(
     content_ref: ContentRef,
 ) -> StorageResult<()> {
     run(store, "commit_upload", move |context| {
-        commit_staged(&context, &id, &content_ref)
+        commit_staged(&context, &id, &content_ref)?;
+        lease::cleanup(&context, &id)
     })
     .await
 }
@@ -374,19 +441,37 @@ pub(super) async fn abort(store: &FsBlobStore, id: UploadId) -> StorageResult<()
             fs::remove_file(directory.join(id.as_str()))
         })();
         match result {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(()) => lease::cleanup(&context, &id),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                lease::cleanup(&context, &id)
+            }
             Err(error) => Err(map_io_err(error, "abort_upload")),
         }
     })
     .await
 }
 
-pub(super) async fn sweep(store: &FsBlobStore, idle_for: Duration) -> StorageResult<u64> {
+pub(super) async fn sweep(store: &FsBlobStore, _idle_for: Duration) -> StorageResult<u64> {
+    sweep_at(store, None).await
+}
+
+async fn sweep_at(
+    store: &FsBlobStore,
+    clocks: Option<(SystemTime, std::time::Instant)>,
+) -> StorageResult<u64> {
     run(store, "sweep_uploads", move |context| {
+        let (wall, monotonic) =
+            clocks.unwrap_or_else(|| (SystemTime::now(), std::time::Instant::now()));
         let directory = match context.directory(false) {
             Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                context
+                    .observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
+                return Ok(0);
+            }
             Err(error) => return Err(map_io_err(error, "sweep_uploads_open")),
         };
         #[cfg(unix)]
@@ -400,51 +485,79 @@ pub(super) async fn sweep(store: &FsBlobStore, idle_for: Duration) -> StorageRes
                 .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
                 .collect::<std::io::Result<Vec<_>>>()
         });
-        let now = SystemTime::now();
+        let mut live = std::collections::HashSet::new();
         let mut removed = 0;
+        let mut failure = None;
         for name in names.map_err(|error| map_io_err(error, "sweep_uploads_list"))? {
-            let Ok(id) = UploadId::from_hex(name) else {
-                continue;
-            };
-            #[cfg(unix)]
-            let opened = {
-                use std::os::fd::AsRawFd;
-                openat_regular_file_no_follow(directory.as_raw_fd(), id.as_str(), libc::O_RDONLY)
-            };
-            #[cfg(not(unix))]
-            let opened = open_staging(&directory.join(id.as_str()), false);
-            let file = match opened {
-                Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(map_io_err(error, "sweep_uploads_stat")),
-            };
-            let modified = file
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .map_err(|error| map_io_err(error, "sweep_uploads_stat"))?;
-            drop(file);
-            if now
-                .duration_since(modified)
-                .is_ok_and(|age| age >= idle_for)
-            {
-                #[cfg(unix)]
-                let deleted = {
-                    use std::os::fd::AsRawFd;
-                    unlink_entry_at(directory.as_raw_fd(), id.as_str())
-                };
-                #[cfg(not(unix))]
-                let deleted = fs::remove_file(directory.join(id.as_str()));
-                match deleted {
-                    Ok(()) => removed += 1,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(map_io_err(error, "sweep_uploads_delete")),
+            let result = (|| {
+                if let Some(raw) = name.strip_suffix(".lease") {
+                    if let Ok(id) = UploadId::from_hex(raw) {
+                        if matches!(lease::open(&directory, id.as_str()), Err(ref error)
+                            if error.kind() == std::io::ErrorKind::NotFound)
+                        {
+                            lease::cleanup(&context, &id)?;
+                        }
+                    }
+                    return Ok(());
                 }
+                let Ok(id) = UploadId::from_hex(name.clone()) else {
+                    return Ok(());
+                };
+                let file = match lease::open(&directory, id.as_str()) {
+                    Ok(file) => file,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(map_io_err(error, "sweep_uploads_stat")),
+                };
+                live.insert(id.clone());
+                let value = lease::read(&directory, &id);
+                if !matches!(value, Ok(Some(_))) {
+                    context
+                        .observations
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&id);
+                }
+                let expired = match value? {
+                    Some(value) => lease::expired(&context, &id, &value, wall, monotonic)?,
+                    None => wall
+                        .duration_since(
+                            file.metadata()
+                                .and_then(|m| m.modified())
+                                .map_err(|error| map_io_err(error, "sweep_uploads_stat"))?,
+                        )
+                        .is_ok_and(|age| age >= Duration::from_secs(86_400)),
+                };
+                drop(file);
+                if expired {
+                    lease::unlink(&directory, id.as_str())
+                        .map_err(|error| map_io_err(error, "sweep_uploads_delete"))?;
+                    lease::cleanup(&context, &id)?;
+                    removed += 1;
+                }
+                Ok::<_, StorageError>(())
+            })();
+            if let Err(error) = result {
+                tracing::warn!(entry = %name, %error,
+                    "upload lease sweep retained an invalid entry for repair");
+                failure.get_or_insert(error);
             }
         }
-        Ok(removed)
+        context
+            .observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|id, _| live.contains(id));
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(removed),
+        }
     })
     .await
 }
+
+#[cfg(test)]
+#[path = "blob_upload_expiry_tests.rs"]
+mod expiry_tests;
 
 #[cfg(test)]
 mod tests {
@@ -460,8 +573,23 @@ mod tests {
         store.root().join(UPLOAD_DIRECTORY).join(id.as_str())
     }
 
+    async fn begin(store: &FsBlobStore, size: u64) -> StorageResult<UploadId> {
+        let dir = tempfile::tempdir().unwrap();
+        let main = crate::StorageBackend::sqlite_for_test(dir.path().join("main.db")).unwrap();
+        store
+            .begin_upload_with_lease(
+                size,
+                UploadLeaseConfig::new(
+                    main.database_owner_identity().unwrap().durable_id(),
+                    Duration::from_secs(3600),
+                )
+                .unwrap(),
+            )
+            .await
+    }
+
     async fn stage(store: &FsBlobStore, bytes: &[u8]) -> (UploadId, ContentRef) {
-        let id = store.begin_upload(bytes.len() as u64).await.unwrap();
+        let id = begin(store, bytes.len() as u64).await.unwrap();
         let midpoint = bytes.len() / 2;
         assert_eq!(
             store
@@ -561,15 +689,16 @@ mod tests {
     async fn upload_abort_and_restart_sweep_leave_committed_and_live_files() {
         let (_dir, store) = fixture();
         let object = store.put(b"committed".to_vec()).await.unwrap();
-        let live = store.begin_upload(1).await.unwrap();
+        let live = begin(&store, 1).await.unwrap();
         store.append_part(&live, vec![1]).await.unwrap();
-        let aborted = store.begin_upload(0).await.unwrap();
+        let aborted = begin(&store, 0).await.unwrap();
         store.abort_upload(&aborted).await.unwrap();
         store.abort_upload(&aborted).await.unwrap();
         assert!(!staged(&store, &aborted).exists());
 
-        let orphan = store.begin_upload(1).await.unwrap();
+        let orphan = begin(&store, 1).await.unwrap();
         store.append_part(&orphan, vec![2]).await.unwrap();
+        fs::remove_file(staged(&store, &orphan).with_extension("lease")).unwrap();
         fs::File::options()
             .write(true)
             .open(staged(&store, &orphan))
@@ -604,7 +733,7 @@ mod tests {
     #[tokio::test]
     async fn upload_each_part_checks_floor_before_writing() {
         let (_dir, mut store) = fixture();
-        let id = store.begin_upload(3).await.unwrap();
+        let id = begin(&store, 3).await.unwrap();
         store.append_part(&id, vec![1]).await.unwrap();
         store.floor_bytes = u64::MAX;
         assert!(matches!(
@@ -621,11 +750,11 @@ mod tests {
     async fn upload_ceiling_refuses_before_creation_or_append() {
         let (_dir, store) = fixture();
         assert!(matches!(
-            store.begin_upload(MAX_BLOB_WHOLE_BYTES + 1).await,
+            begin(&store, MAX_BLOB_WHOLE_BYTES + 1).await,
             Err(StorageError::InvalidInput { .. })
         ));
         assert!(!store.root().join(UPLOAD_DIRECTORY).exists());
-        let id = store.begin_upload(MAX_BLOB_WHOLE_BYTES).await.unwrap();
+        let id = begin(&store, MAX_BLOB_WHOLE_BYTES).await.unwrap();
         let file = fs::File::options()
             .write(true)
             .open(staged(&store, &id))
@@ -661,6 +790,8 @@ mod tests {
                 "put_sync_parent",
                 "put_sync_root",
                 "upload_sync_staging",
+                "lease_unlink",
+                "lease_sync_cleanup",
             ]);
             assert_eq!(*hook.completed.lock().unwrap(), expected);
             let target = shard_path(store.root(), &reference);
@@ -668,6 +799,7 @@ mod tests {
                 target.parent().unwrap().to_path_buf(),
                 target.parent().unwrap().parent().unwrap().to_path_buf(),
                 store.root().to_path_buf(),
+                store.root().join(UPLOAD_DIRECTORY),
                 store.root().join(UPLOAD_DIRECTORY),
             ];
             let expected_inodes: Vec<_> = expected_paths
@@ -754,9 +886,9 @@ mod tests {
         fs::write(&victim, b"unchanged").unwrap();
         let uploads = store.root().join(UPLOAD_DIRECTORY);
         symlink(&outside, &uploads).unwrap();
-        assert!(store.begin_upload(1).await.is_err());
+        assert!(begin(&store, 1).await.is_err());
         fs::remove_file(&uploads).unwrap();
-        let id = store.begin_upload(1).await.unwrap();
+        let id = begin(&store, 1).await.unwrap();
         fs::remove_file(staged(&store, &id)).unwrap();
         symlink(&victim, staged(&store, &id)).unwrap();
         assert!(store.append_part(&id, vec![1]).await.is_err());
@@ -772,14 +904,14 @@ mod tests {
     #[tokio::test]
     async fn upload_operations_refuse_a_replaced_root() {
         let (dir, store) = fixture();
-        let id = store.begin_upload(1).await.unwrap();
+        let id = begin(&store, 1).await.unwrap();
         let moved = dir.path().join("original");
         fs::rename(store.root(), &moved).unwrap();
         fs::create_dir(store.root()).unwrap();
         let sentinel = store.root().join("sentinel");
         fs::write(&sentinel, b"replacement").unwrap();
         let reference = ContentRef::from_hex("a".repeat(64)).unwrap();
-        assert!(store.begin_upload(0).await.is_err());
+        assert!(begin(&store, 0).await.is_err());
         assert!(store.append_part(&id, vec![1]).await.is_err());
         assert!(store.commit_upload(&id, &reference).await.is_err());
         assert!(store.abort_upload(&id).await.is_err());
@@ -798,7 +930,7 @@ mod tests {
     async fn upload_cancelled_append_keeps_write_ownership_until_io_finishes() {
         let (_dir, store) = fixture();
         let store = Arc::new(store);
-        let id = store.begin_upload(1).await.unwrap();
+        let id = begin(&store, 1).await.unwrap();
         let (reached, release, done) = sync_hook::install(store.root());
         let writer = store.clone();
         let upload = id.clone();

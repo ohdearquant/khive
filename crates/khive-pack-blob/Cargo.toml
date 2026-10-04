@@ -27,7 +27,9 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
-khive-db = { version = "0.9.0", path = "../khive-db" }
+khive-storage = { version = "0.9.0", path = "../khive-storage", features = ["test-support"] }
+tracing-subscriber = { workspace = true }
+khive-db = { version = "0.9.0", path = "../khive-db", features = ["test-support"] }
 rusqlite = { workspace = true }
 
 [[test]]

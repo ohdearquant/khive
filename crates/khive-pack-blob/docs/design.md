@@ -77,13 +77,15 @@ base64 string, accepts parts in order starting at zero, and returns integer
 `part_limit` derives from the live request-parser and frame caps, minus an 8192-byte
 request reserve, scaled by 3/4; it currently equals 780,288 decoded bytes.
 
-An identical resend of the last part is acknowledged without changing bytes, hash,
-index or activity time. An altered tail retry aborts the upload. Other out-of-order
-indices are refused with `InvalidInput` without advancing it. A next part crossing
-declared size also aborts; exceeding only `part_limit` refuses the part while retaining
-the upload. Invalid base64 is refused before appending. A successful append records
-activity from before backend I/O, so a slow sync cannot make the pack clock newer than
-an already expiring stage.
+For filesystem uploads, an identical resend of the last part renews the lease and
+activity time without changing bytes, hash, index or stage mtime. A backend without
+lease support keeps its previous retry activity semantics. An altered tail retry
+aborts the upload. Other out-of-order indices are refused with `InvalidInput`
+without advancing it. A next part crossing declared size also aborts; exceeding
+only `part_limit` refuses the part while retaining the upload. Invalid base64 is
+refused before appending. A successful append, or an accepted filesystem tail
+renewal, records activity from before backend I/O, so a slow sync cannot make the
+pack clock newer than an already expiring stage.
 Cancelled or failed backend writes invalidate the record; cleanup failures retain
 an unusable record for the next sweep to retry.
 
@@ -113,17 +115,67 @@ These are process-local concurrency bounds, not disk quotas or request rate limi
 Staging orphaned by a process restart is still reclaimed by backend sweeping.
 
 Only the daemon starts the upload sweep component. Each tick expires pack records
-and calls backend `sweep_uploads` for orphan staging, using the same idle policy as
-the verbs. `put_part` and `commit` also enforce expiry directly: once begin or the last
-accepted new part is at least the idle bound old, they discard the upload and report
-unknown upload. Failures warn and retry on the next tick. The component joins the existing
-daemon cancellation and drain path. `KHIVE_BLOB_UPLOAD_IDLE_SECS` defaults to 3600;
+and calls backend `sweep_uploads` for staging recovery. Filesystem expiry uses each
+lease's recorded owner bound; other backends retain their existing idle policy.
+`put_part` and `commit` also enforce the pack's idle bound directly: once begin or
+the last accepted new part or filesystem tail renewal is at least that bound old,
+they discard the upload and report unknown upload. Failures warn and retry on the
+next tick. The component joins the existing daemon cancellation and drain path.
+`KHIVE_BLOB_UPLOAD_IDLE_SECS` defaults to 3600;
 `KHIVE_BLOB_UPLOAD_SWEEP_INTERVAL_SECS` defaults to 600. Both accept positive integer
 seconds; invalid values use the default with a warning. The first tick is delayed
-by the interval. The filesystem stages below `.uploads/`, which object GC ignores.
+by the interval. Filesystem stages are below `.uploads/`, which object GC ignores.
 The current staged-upload backend is `FsBlobStore`. `S3BlobStore` retains whole-object
 put/get/stat support but inherits Unsupported for staging methods; its known-reference
 begin shortcut can still return an existing object without staging.
+
+## Shared-root lease activation (ADR-173 Amendment 1)
+
+Before using a shared filesystem root, drain uploads from older producers and
+upgrade every daemon allowed to sweep it. Ownerless filesystem begin is
+Unsupported; append and renewal require valid leases. The fixed no-lease expiry
+floor handles crash leftovers, not a second active-upload protocol. Do not run
+mixed old and lease-aware sweepers.
+
+With filesystem staging, `blob.begin` and `blob.import` require durable MAIN;
+an in-memory MAIN reports Unconfigured before creating an upload.
+
+The host conveys a validated durable store binding identity, or effective MAIN's
+installed durable identity before binding exists, and the owning daemon's positive
+whole-second bound. No caller actor, PID or random fallback supplies that owner.
+The fixed bound is capped at 21,600 seconds for FS only; larger configured values
+warn with KHIVE_BLOB_UPLOAD_IDLE_SECS, the original value and the clamp. S3 policy
+and its staged Unsupported behavior remain unchanged. Known-content begin needs
+no staging, reservation or lease owner.
+
+Begin creates/syncs the stage and a complete four-field sibling `<id>.lease`
+(owner, idle_secs, renew_seq=0, renewed_at). The timestamp is Unix milliseconds;
+validation requires a non-nil owner UUID and
+a representable checked millisecond expiry deadline. A u64 sequence may reach its
+maximum, but its next renewal refuses without wrapping.
+New parts sync bytes then atomically renew the same owner/bound with checked next
+sequence; accepted identical tails renew without appending. Rejected calls renew
+neither lease nor local clock. Failed renewal never ACKs and follows existing
+abort/terminal cleanup. Lease publication writes a unique temporary sibling,
+syncs it, replaces the lease and on Unix syncs the directory; begin also persists
+the `.uploads` root entry. Root write ownership spans append, renewal and sweep,
+including cancellation. Commit/abort remove the lease only after staging is gone;
+cleanup failures remain visible/retryable. Lease writes obey the capacity floor.
+
+Each retained sweeper store has an instance-local observation of (owner, renew_seq)
+and its own monotonic first-seen time. Changed pairs restart it. Any sweeper may
+reap unknown owners after that lease's own idle_secs + 300 unchanged seconds.
+Restart/host sleep delays observation. The wall backstop is renewed_at + idle_secs
++ 24 hours; a no-lease leftover uses a fixed 24-hour stage-mtime floor. Malformed
+present leases retain/report rather than fall back. Future timestamps >300 seconds
+report a clock fault without changing expiry. Backward wall movement delays wall
+arms; it cannot shorten monotonic observation. Remove vanished-stage observations
+and recognized orphan lease files under the root lock; never follow symlinks or
+sweep arbitrary temporary names. Temporary publication cleanup is best effort;
+a failed unlink reports the retained name for repair. Failed begin cleanup also
+reports its failure while returning the original begin error. A bad lease is
+retained and reported while the sweep continues processing healthy siblings; the
+call still returns an error if any entry failed.
 
 ## Filesystem platform limits
 
