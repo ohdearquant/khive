@@ -36,12 +36,7 @@ pub fn now_micros() -> i64 {
 /// kind collapses to its id so a configured `lambda:khive` reads back as
 /// itself.
 pub fn actor_label(token: &NamespaceToken) -> String {
-    let actor = token.actor();
-    if actor.kind == "actor" {
-        actor.id.clone()
-    } else {
-        format!("{}:{}", actor.kind, actor.id)
-    }
+    token.actor().label()
 }
 
 fn text(row: &SqlRow, col: &str) -> Option<String> {

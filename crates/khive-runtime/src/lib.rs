@@ -141,9 +141,9 @@ pub use khive_db::{
     CheckpointLifecycleOwner, CheckpointTick, ConnectionPool, StorageBackend,
 };
 pub use khive_gate::{
-    classify_operation, is_valid_mailbox_actor_label, ActorRef, AllowAllGate, AuditDecision,
-    AuditEvent, CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError, GateRef,
-    GateRequest, MailboxPolicyError, MailboxReadGate, Obligation, OperationAccess,
+    classify_operation, is_valid_mailbox_actor_label, split_stamped_label, ActorRef, AllowAllGate,
+    AuditDecision, AuditEvent, CallerEnrollmentGate, Gate, GateContext, GateDecision, GateError,
+    GateRef, GateRequest, MailboxPolicyError, MailboxReadGate, Obligation, OperationAccess,
     CLASSIFIED_OPERATIONS, OPERATION_CLASSIFIER_VERSION, RUNTIME_STAMPED_ACTOR_KINDS,
 };
 pub use khive_storage::types::TraversalOptions;
