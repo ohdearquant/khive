@@ -60,6 +60,9 @@
 //! identify the main pool's counter window; a secondary pool's reader/writer
 //! counters have their own reconstruction window. Checkpoint counters remain global.
 
+#[path = "diagnostics/writer_contention.rs"]
+mod writer_contention;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -837,7 +840,8 @@ pub struct ReaderContentionDiagnostics {
     /// Queries on a checked-out pooled reader that SQLite refused with
     /// `SQLITE_BUSY` after `configured_busy_timeout_ms` elapsed. Counted after
     /// checkout succeeded, so it is disjoint from `reader_checkout_timeouts`.
-    /// Writer refusals are not included; see `writer_task_begin_busy`.
+    /// Writer refusals are not included; see `direct_writer_busy_refusals` and
+    /// `writer_task_begin_busy`.
     pub reader_busy_timeouts: u64,
     /// Pooled reader guards live when the snapshot was captured.
     pub active_pooled_reader_checkouts: u64,
@@ -915,6 +919,9 @@ pub struct WriterContentionDiagnostics {
     pub writer_task_acquisitions: u64,
     /// Main-pool writer checkouts that exhausted their finite deadline.
     pub writer_acquisition_timeouts: u64,
+    /// Final instrumented direct execution refusals retaining primary SQLITE_BUSY,
+    /// once per operation; excludes SQLITE_LOCKED and task/reader/open/admission errors.
+    pub direct_writer_busy_refusals: u64,
     /// Every writer-task `BEGIN IMMEDIATE` attempt refused busy or locked,
     /// whether or not a subsequent bounded retry absorbed it. A refusal not
     /// absorbed by a retry also surfaces to the caller as the retryable
@@ -1066,70 +1073,6 @@ pub struct RuntimeAuditBatchMetrics {
     /// Wall-clock ms at which `admission_unresolved_obligations` last moved;
     /// `None` until it moves.
     pub admission_unresolved_obligations_last_at_ms: Option<u64>,
-}
-
-impl WriterContentionDiagnostics {
-    fn snapshot(
-        pool: &ConnectionPool,
-        audit_append_failures: Option<u64>,
-        runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
-    ) -> Self {
-        let writer = pool.writer_acquisition_snapshot();
-        let unavailable_reason =
-            || Some("no audit-batch control is registered with this runtime instance".to_string());
-        Self {
-            writer_acquisitions: writer.acquisitions,
-            pooled_writer_acquisitions: writer.pooled_acquisitions,
-            standalone_writer_acquisitions: writer.standalone_acquisitions,
-            writer_task_acquisitions: writer.writer_task_acquisitions,
-            writer_acquisition_timeouts: writer.timeouts,
-            writer_task_begin_busy: writer.writer_task_begin_busy,
-            writer_task_begin_busy_absorbed: writer.writer_task_begin_busy_absorbed,
-            writer_task_begin_errors: writer.writer_task_begin_errors,
-            writer_task_request_failures: writer.writer_task_request_failures,
-            writer_task_side_effects_unknown: writer.writer_task_side_effects_unknown,
-            audit_append_failures,
-            audit_append_failures_unavailable_reason: audit_append_failures.is_none().then(|| {
-                "runtime audit instrumentation was not supplied to khive-db diagnostics".to_string()
-            }),
-            audit_obligation_append_failures: None,
-            audit_obligation_append_failures_unavailable_reason: Some(
-                "runtime obligation audit instrumentation was not supplied to khive-db diagnostics"
-                    .to_string(),
-            ),
-            audit_batch_flush_failures: runtime_audit_batch_metrics.map(|m| m.flush_failures),
-            audit_batch_flush_failures_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-            audit_degraded_rows: runtime_audit_batch_metrics.map(|m| m.degraded_rows),
-            audit_degraded_rows_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-            audit_degraded: runtime_audit_batch_metrics.map(|m| m.degraded),
-            audit_degraded_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-            audit_admission_refused_obligations: runtime_audit_batch_metrics
-                .map(|m| m.admission_refused_obligations),
-            audit_admission_refused_obligations_last_at_ms: runtime_audit_batch_metrics
-                .and_then(|m| m.admission_refused_obligations_last_at_ms),
-            audit_admission_refused_obligations_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-            audit_admission_unresolved_obligations: runtime_audit_batch_metrics
-                .map(|m| m.admission_unresolved_obligations),
-            audit_admission_unresolved_obligations_last_at_ms: runtime_audit_batch_metrics
-                .and_then(|m| m.admission_unresolved_obligations_last_at_ms),
-            audit_admission_unresolved_obligations_unavailable_reason: runtime_audit_batch_metrics
-                .is_none()
-                .then(unavailable_reason)
-                .flatten(),
-        }
-    }
 }
 
 /// Live graph-edge rows compared with the durable list-cursor ledger.

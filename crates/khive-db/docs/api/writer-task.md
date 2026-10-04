@@ -202,6 +202,38 @@ either the delay schedule or the shared `busy_timeout` budget runs out moves
 `writer_task_begin_busy` N times and `writer_task_begin_busy_absorbed`
 N-1 times (every refusal but the final, unretried one).
 
+### Direct writer busy refusals
+
+`writer_acquisition_snapshot().direct_busy_refusals` is an additive per-pool
+counter, serialized as `writer_contention.direct_writer_busy_refusals`. An
+instrumented direct write increments it once only when its final returned error
+retains a typed SQLite primary `SQLITE_BUSY` cause. This covers ordinary legacy
+pooled/file-backed store writes, explicit typed transactions, graph composition,
+standalone and pool-backed SQL execution, and direct manual atomic units.
+
+The observer follows the complete preserved `Error::source` chain, including
+`WriterTaskRequestFailed` and nested `StorageError::Driver` nodes, and recognizes
+bare rusqlite errors and the SQLite-layer wrapper. It inspects at most 32 nodes,
+counting the returned StorageError as node one, and makes at most 32 `source()`
+calls. A BUSY cause deeper than that bound is conservatively undercounted; a
+cycle or exhausted budget without positive BUSY evidence contributes zero. An
+arbitrary individual `source()` implementation may itself fail to return; the
+node budget does not bound that call's behavior. Error messages are never used
+as SQLite-code evidence.
+
+A rolled-back typed body error preserves its cause and can contribute one.
+The existing wrapped COMMIT failure instead retains a text-only `Pool` error;
+its original SQLite code is unavailable and therefore contributes zero. This
+undercount does not change the returned COMMIT error or transaction cleanup.
+For a manual atomic unit, the outer unit is the observation boundary: inner
+execution and rollback cleanup do not increment separately. An absorbed inner
+BUSY followed by final success also contributes zero.
+
+Success, primary `SQLITE_LOCKED`, reader errors, writer-task queue execution and
+BEGIN counters, connection opening, checkout/admission/infrastructure errors,
+cause-free unknown outcomes, and raw connection escapes are excluded. The
+observer does not change errors, retry policy, writer retirement or admission.
+
 ### Bounded enqueue admission (#1382)
 
 Production store write paths and the SQL bridge's writer requests use

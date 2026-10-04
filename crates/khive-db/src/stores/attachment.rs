@@ -150,7 +150,9 @@ impl SqlAttachmentStore {
             let guard = pool
                 .try_writer()
                 .map_err(|error| map_sqlite_err(error, operation))?;
-            f(guard.conn()).map_err(|error| map_err(error, operation))
+            f(guard.conn())
+                .map_err(|error| map_err(error, operation))
+                .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|error| StorageError::driver(StorageCapability::Attachments, operation, error))?
@@ -392,3 +394,7 @@ impl AttachmentStore for SqlAttachmentStore {
         .await
     }
 }
+
+#[cfg(test)]
+#[path = "attachment_busy_tests.rs"]
+mod direct_busy_tests;

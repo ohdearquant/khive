@@ -419,14 +419,21 @@ impl Fts5TextSearch {
     {
         let result = if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
-            tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))
-                .await
-                .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?
+            let pool = Arc::clone(&self.pool);
+            tokio::task::spawn_blocking(move || {
+                f(&conn)
+                    .map_err(|e| map_err(e, op))
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
+            })
+            .await
+            .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?
         } else {
             let pool = Arc::clone(&self.pool);
             tokio::task::spawn_blocking(move || {
                 let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn()).map_err(|e| map_err(e, op))
+                f(guard.conn())
+                    .map_err(|e| map_err(e, op))
+                    .inspect_err(|error| pool.record_direct_writer_error(error))
             })
             .await
             .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?
@@ -2062,3 +2069,7 @@ fn rename_namespace_dml(
 #[cfg(test)]
 #[path = "text_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "text_busy_tests.rs"]
+mod direct_busy_tests;
