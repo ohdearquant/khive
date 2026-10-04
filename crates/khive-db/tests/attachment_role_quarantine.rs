@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use khive_db::migrations::{read_schema_version, run_migrations};
+use khive_db::migrations::{latest_schema_version, read_schema_version, run_migrations};
 use khive_db::stores::blob::FsBlobStore;
 use khive_db::StorageBackend;
 use khive_storage::attachment::validate_attachment_role;
@@ -245,7 +245,10 @@ fn attachment_role_migration_quarantines_exact_rows_and_preserves_live_schema() 
          WHERE type IN ('index', 'trigger') ORDER BY type, name",
     );
     assert_eq!(before.len(), 3);
-    assert_eq!(run_migrations(&mut conn).expect("V47 upgrade"), 47);
+    assert_eq!(
+        run_migrations(&mut conn).expect("V47 upgrade"),
+        latest_schema_version()
+    );
     assert_eq!(attachment_rows(&conn, "attachments"), vec![valid]);
     let quarantined = attachment_rows(&conn, "attachment_quarantine");
     assert_eq!(quarantined, vec![c0, c1]);
@@ -275,7 +278,10 @@ fn attachment_role_migration_quarantines_exact_rows_and_preserves_live_schema() 
     assert_check_refusal(&conn, "prefix\u{85}tail", "post-upgrade-c1");
     let live_after = attachment_rows(&conn, "attachments");
     let quarantine_after = attachment_rows(&conn, "attachment_quarantine");
-    assert_eq!(run_migrations(&mut conn).expect("idempotent rerun"), 47);
+    assert_eq!(
+        run_migrations(&mut conn).expect("idempotent rerun"),
+        latest_schema_version()
+    );
     assert_eq!(attachment_rows(&conn, "attachments"), live_after);
     assert_eq!(
         attachment_rows(&conn, "attachment_quarantine"),
@@ -321,7 +327,7 @@ async fn migrated_v47_gc_preserves_exact_v21_admission_refusal() {
     }
     assert_eq!(
         backend.prepare_core_schema().expect("migrate quarantine"),
-        47
+        latest_schema_version()
     );
     let (live_before, quarantine_before) = {
         let mut reader = backend.sql().reader().await.expect("snapshot reader");
@@ -475,7 +481,10 @@ fn attachment_role_migration_installs_absent_claim_fences() {
         "prefix\u{85}tail",
         "strict-c1-after-missing-fence-upgrade",
     );
-    assert_eq!(migration.expect("successful migration result"), 47);
+    assert_eq!(
+        migration.expect("successful migration result"),
+        latest_schema_version()
+    );
     assert_eq!(attachment_rows(&conn, "attachments"), vec![valid]);
     assert_eq!(
         attachment_rows(&conn, "attachment_quarantine"),
@@ -492,7 +501,10 @@ fn attachment_role_migration_replays_tail_without_losing_quarantine() {
     let rejected = row("rejected", "content\0tail", &"b".repeat(64));
     insert_row(&conn, &valid).expect("legacy readable row");
     insert_row(&conn, &rejected).expect("legacy rejected-role row");
-    assert_eq!(run_migrations(&mut conn).expect("first V47 upgrade"), 47);
+    assert_eq!(
+        run_migrations(&mut conn).expect("first V47 upgrade"),
+        latest_schema_version()
+    );
     let live_before = attachment_rows(&conn, "attachments");
     let quarantine_before = rows(
         &conn,
@@ -517,7 +529,10 @@ fn attachment_role_migration_replays_tail_without_losing_quarantine() {
         "the migration operation must accept its existing quarantine on tail replay: {migration:?}"
     );
     assert_check_refusal(&conn, "prefix\u{85}tail", "strict-c1-after-tail-replay");
-    assert_eq!(migration.expect("successful migration result"), 47);
+    assert_eq!(
+        migration.expect("successful migration result"),
+        latest_schema_version()
+    );
     assert_eq!(attachment_rows(&conn, "attachments"), live_before);
     assert_eq!(
         rows(
