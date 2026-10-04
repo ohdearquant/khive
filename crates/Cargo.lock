@@ -2445,6 +2445,7 @@ dependencies = [
  "chrono",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",
@@ -2461,7 +2462,6 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
