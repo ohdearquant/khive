@@ -30,6 +30,7 @@ uuid = { workspace = true, optional = true }
 khive-quant = { version = "0.9.0", path = "../khive-quant", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
+khive-fs = { version = "0.9.0", path = "../khive-fs" }
 libc = { workspace = true }
 nix = { version = "0.31", features = ["dir"] }
 

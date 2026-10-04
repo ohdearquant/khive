@@ -23,6 +23,8 @@
 //! handle-relative file operations. Only targets without handle-relative
 //! filesystem facilities use the documented best-effort path fallback.
 
+#[cfg(unix)]
+use khive_fs::directory_walk::{walk_to_directory, BudgetExhausted, LinkContext, LinkPolicy};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -237,14 +239,110 @@ pub(crate) fn verify_original_dir_identity(
     Ok(())
 }
 
+/// Most ancestor symlinks one segment-directory walk may follow.
+#[cfg(unix)]
+const MAX_ANCESTOR_SYMLINKS: u32 = 40;
+
+/// The link policy of the segment-directory walk: an ancestor symlink is followed only when
+/// `trusted_ancestor_symlink` accepts it. The shared walk reports every failure as an
+/// `io::Error`, so the policy keeps the typed error of a refusal for `walk_error` to return.
+/// `reading_link` is set from the moment a link is accepted until the walk has read its target,
+/// which is how a failed `readlinkat` is told from a failure to open a directory.
+#[cfg(unix)]
+struct SidecarLinkPolicy {
+    effective_uid: u32,
+    reading_link: bool,
+    failure: Option<ExternalIdsWriteError>,
+}
+
+#[cfg(unix)]
+impl SidecarLinkPolicy {
+    /// Keep the typed error and hand the walk an error of its own to stop with.
+    fn refuse(&mut self, error: ExternalIdsWriteError) -> std::io::Error {
+        self.failure = Some(error);
+        std::io::Error::other("segment dir walk refused")
+    }
+}
+
+#[cfg(unix)]
+impl LinkPolicy for SidecarLinkPolicy {
+    fn before_follow(&mut self, ctx: &LinkContext<'_>) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        if ctx.is_last {
+            let error = ExternalIdsWriteError::InvalidPath {
+                context: "open segment dir",
+                detail: "final component is a symlink".into(),
+            };
+            return Err(self.refuse(error));
+        }
+        let parent_meta = match ctx.parent.metadata() {
+            Ok(meta) => meta,
+            Err(e) => {
+                let error = ExternalIdsWriteError::io("stat symlink parent", e);
+                return Err(self.refuse(error));
+            }
+        };
+        let symlink_uid = ctx.link_stat.st_uid;
+        let parent_uid = parent_meta.uid();
+        let parent_mode = parent_meta.mode();
+        if !trusted_ancestor_symlink(symlink_uid, parent_uid, parent_mode, self.effective_uid) {
+            let error = ExternalIdsWriteError::UntrustedAncestorSymlink {
+                component: ctx.name.to_os_string(),
+                symlink_uid,
+                parent_uid,
+                parent_mode,
+            };
+            return Err(self.refuse(error));
+        }
+        self.reading_link = true;
+        Ok(())
+    }
+
+    fn after_read(&mut self, _ctx: &LinkContext<'_>) -> std::io::Result<()> {
+        self.reading_link = false;
+        Ok(())
+    }
+}
+
+/// The typed error for the error that ended a walk.
+///
+/// A failure the policy recorded wins. A spent link budget is the next case. An error that
+/// carries no OS error number is the walk refusing a path component before the kernel saw it.
+/// Any other error is a system error, from reading a link target while `reading_link` is set and
+/// from opening a directory otherwise.
+#[cfg(unix)]
+fn walk_error(policy: SidecarLinkPolicy, error: std::io::Error) -> ExternalIdsWriteError {
+    if let Some(failure) = policy.failure {
+        return failure;
+    }
+    let exhausted = error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<BudgetExhausted>());
+    if exhausted {
+        return ExternalIdsWriteError::InvalidPath {
+            context: "open segment dir",
+            detail: "too many ancestor symlinks".into(),
+        };
+    }
+    if error.raw_os_error().is_none() {
+        return ExternalIdsWriteError::InvalidPath {
+            context: "segment dir path component",
+            detail: error.to_string(),
+        };
+    }
+    let context = if policy.reading_link {
+        "read trusted ancestor symlink"
+    } else {
+        "open segment dir"
+    };
+    ExternalIdsWriteError::io(context, error)
+}
+
 #[cfg(unix)]
 pub(crate) fn open_dir_with_trusted_symlinks(
     dir: &std::path::Path,
 ) -> Result<std::fs::File, ExternalIdsWriteError> {
-    use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::io::AsRawFd as _;
-
     if dir.as_os_str().is_empty() {
         return Err(ExternalIdsWriteError::InvalidPath {
             context: "open segment dir",
@@ -252,203 +350,21 @@ pub(crate) fn open_dir_with_trusted_symlinks(
         });
     }
 
-    let mut pending = owned_components(dir)?;
-    let mut current = open_start_directory(dir.is_absolute())?;
-    let effective_uid = unsafe { libc::geteuid() } as u32;
-    let mut followed_symlinks = 0usize;
-
-    while let Some(component) = pending.pop_front() {
-        let name = std::ffi::CString::new(component.as_bytes()).map_err(|e| {
-            ExternalIdsWriteError::InvalidPath {
-                context: "segment dir path component",
-                detail: e.to_string(),
-            }
-        })?;
-        match open_directory_at(current.as_raw_fd(), &name) {
-            Ok(next) => current = next,
-            Err(open_error) => {
-                let link_meta = metadata_at_no_follow(current.as_raw_fd(), &name)?;
-                if link_meta.st_mode & libc::S_IFMT != libc::S_IFLNK {
-                    return Err(ExternalIdsWriteError::io(
-                        format!("open segment dir component {component:?}"),
-                        open_error,
-                    ));
-                }
-                if pending.is_empty() {
-                    return Err(ExternalIdsWriteError::InvalidPath {
-                        context: "open segment dir",
-                        detail: "final component is a symlink".into(),
-                    });
-                }
-
-                let parent_meta = current
-                    .metadata()
-                    .map_err(|e| ExternalIdsWriteError::io("stat symlink parent", e))?;
-                let symlink_uid = link_meta.st_uid;
-                let parent_uid = parent_meta.uid();
-                let parent_mode = parent_meta.mode();
-                if !trusted_ancestor_symlink(symlink_uid, parent_uid, parent_mode, effective_uid) {
-                    return Err(ExternalIdsWriteError::UntrustedAncestorSymlink {
-                        component,
-                        symlink_uid,
-                        parent_uid,
-                        parent_mode,
-                    });
-                }
-
-                followed_symlinks += 1;
-                if followed_symlinks > 40 {
-                    return Err(ExternalIdsWriteError::InvalidPath {
-                        context: "open segment dir",
-                        detail: "too many ancestor symlinks".into(),
-                    });
-                }
-                let target = read_link_at(current.as_raw_fd(), &name, link_meta.st_size)?;
-                let target_is_absolute = target.is_absolute();
-                let mut target_components = owned_components(&target)?;
-                target_components.append(&mut pending);
-                pending = target_components;
-                if target_is_absolute {
-                    current = open_start_directory(true)?;
-                }
-            }
-        }
-    }
-
-    Ok(current)
-}
-
-#[cfg(unix)]
-fn owned_components(
-    path: &std::path::Path,
-) -> Result<std::collections::VecDeque<std::ffi::OsString>, ExternalIdsWriteError> {
-    let mut components = std::collections::VecDeque::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::RootDir | std::path::Component::CurDir => {}
-            std::path::Component::ParentDir | std::path::Component::Normal(_) => {
-                components.push_back(component.as_os_str().to_os_string());
-            }
-            std::path::Component::Prefix(_) => {
-                return Err(ExternalIdsWriteError::InvalidPath {
-                    context: "open segment dir",
-                    detail: "unsupported path prefix".into(),
-                });
-            }
-        }
-    }
-    Ok(components)
-}
-
-#[cfg(unix)]
-fn open_start_directory(absolute: bool) -> Result<std::fs::File, ExternalIdsWriteError> {
-    use std::os::unix::io::FromRawFd as _;
-
-    let start = if absolute { c"/" } else { c"." };
-    // SAFETY: `start` is NUL-terminated; a successful fd is uniquely owned.
-    let fd = unsafe {
-        libc::open(
-            start.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let mut policy = SidecarLinkPolicy {
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        effective_uid: unsafe { libc::geteuid() } as u32,
+        reading_link: false,
+        failure: None,
     };
-    if fd < 0 {
-        return Err(ExternalIdsWriteError::io(
-            "open segment dir root",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: `fd` is newly returned and transferred exactly once.
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-}
-
-#[cfg(unix)]
-fn open_directory_at(
-    parent_fd: std::os::unix::io::RawFd,
-    name: &std::ffi::CStr,
-) -> Result<std::fs::File, std::io::Error> {
-    use std::os::unix::io::FromRawFd as _;
-
-    // SAFETY: `name` and `parent_fd` are live; a successful fd is uniquely owned.
-    let fd = unsafe {
-        libc::openat(
-            parent_fd,
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
+    let walked = walk_to_directory(dir, &mut policy, MAX_ANCESTOR_SYMLINKS);
+    let mut pinned = walked.map_err(|error| walk_error(policy, error))?;
+    let Some(final_dir) = pinned.pop() else {
+        return Err(ExternalIdsWriteError::InvalidPath {
+            context: "open segment dir",
+            detail: "walk pinned no directory".into(),
+        });
     };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is newly returned and transferred exactly once.
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-}
-
-#[cfg(unix)]
-fn metadata_at_no_follow(
-    parent_fd: std::os::unix::io::RawFd,
-    name: &std::ffi::CStr,
-) -> Result<libc::stat, ExternalIdsWriteError> {
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `metadata` is writable and both lookup arguments are live.
-    let rc = unsafe {
-        libc::fstatat(
-            parent_fd,
-            name.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        return Err(ExternalIdsWriteError::io(
-            "inspect segment dir component without following symlink",
-            std::io::Error::last_os_error(),
-        ));
-    }
-    // SAFETY: successful `fstatat` initialized the output structure.
-    Ok(unsafe { metadata.assume_init() })
-}
-
-#[cfg(unix)]
-fn read_link_at(
-    parent_fd: std::os::unix::io::RawFd,
-    name: &std::ffi::CStr,
-    size_hint: libc::off_t,
-) -> Result<std::path::PathBuf, ExternalIdsWriteError> {
-    use std::os::unix::ffi::OsStringExt as _;
-
-    let hinted = usize::try_from(size_hint).unwrap_or(0).saturating_add(1);
-    let mut capacity = hinted.clamp(256, 65_536);
-    loop {
-        let mut bytes = vec![0u8; capacity];
-        // SAFETY: the buffer is writable and the lookup arguments are live.
-        let len = unsafe {
-            libc::readlinkat(
-                parent_fd,
-                name.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
-        if len < 0 {
-            return Err(ExternalIdsWriteError::io(
-                "read trusted ancestor symlink",
-                std::io::Error::last_os_error(),
-            ));
-        }
-        let len = len as usize;
-        if len < bytes.len() {
-            bytes.truncate(len);
-            return Ok(std::ffi::OsString::from_vec(bytes).into());
-        }
-        if capacity == 65_536 {
-            return Err(ExternalIdsWriteError::InvalidPath {
-                context: "open segment dir",
-                detail: "ancestor symlink target is too long".into(),
-            });
-        }
-        capacity = (capacity * 2).min(65_536);
-    }
+    Ok(final_dir)
 }
 
 #[cfg(unix)]
@@ -886,6 +802,138 @@ mod tests {
             0o40722,
             effective_uid
         ));
+    }
+
+    /// A segment dir reached through `links` ancestor symlinks, each pointing at the one before.
+    #[cfg(unix)]
+    fn segment_behind_symlink_chain(links: usize) -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempdir();
+        let real = root.path().join("real");
+        std::fs::create_dir_all(real.join("segment")).expect("create segment dir");
+        let mut target = real;
+        for index in 0..links {
+            let link = root.path().join(format!("link{index}"));
+            std::os::unix::fs::symlink(&target, &link).expect("create chained symlink");
+            target = link;
+        }
+        (root, target.join("segment"))
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_external_ids_sidecar_reports_a_missing_directory_component() {
+        let root = tempdir();
+        let missing = root.path().join("absent").join("segment");
+
+        let err = write_external_ids_sidecar(&missing, &[1u8; 32], &[])
+            .expect_err("a missing ancestor of the segment dir must be refused");
+
+        let source = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(err.to_string(), format!("open segment dir: {source}"));
+        assert!(matches!(err, ExternalIdsWriteError::Io { .. }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_external_ids_sidecar_reports_a_component_that_is_not_a_directory() {
+        let root = tempdir();
+        std::fs::write(root.path().join("plain"), b"not a directory").expect("write file");
+        let segment_dir = root.path().join("plain").join("segment");
+
+        let err = write_external_ids_sidecar(&segment_dir, &[2u8; 32], &[])
+            .expect_err("a file in the segment dir path must be refused");
+
+        let source = std::io::Error::from_raw_os_error(libc::ENOTDIR);
+        assert_eq!(err.to_string(), format!("open segment dir: {source}"));
+        assert!(matches!(err, ExternalIdsWriteError::Io { .. }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_dir_with_trusted_symlinks_follows_at_most_forty_ancestor_symlinks() {
+        let (_within_root, within) = segment_behind_symlink_chain(40);
+        open_dir_with_trusted_symlinks(&within)
+            .expect("forty chained ancestor symlinks are within the limit");
+
+        let (_beyond_root, beyond) = segment_behind_symlink_chain(41);
+        let err = open_dir_with_trusted_symlinks(&beyond)
+            .expect_err("the forty-first ancestor symlink must be refused");
+        assert_eq!(
+            err.to_string(),
+            "open segment dir: too many ancestor symlinks"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_external_ids_sidecar_reports_a_nul_byte_in_a_path_component() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempdir();
+        let mut raw = root.path().as_os_str().as_bytes().to_vec();
+        raw.extend_from_slice(b"/seg\0ment");
+        let dir = std::path::Path::new(std::ffi::OsStr::from_bytes(&raw));
+
+        let err = write_external_ids_sidecar(dir, &[5u8; 32], &[])
+            .expect_err("a NUL byte in the segment dir path must be refused");
+
+        assert_eq!(
+            err.to_string(),
+            "segment dir path component: NUL in path component"
+        );
+        assert!(matches!(err, ExternalIdsWriteError::InvalidPath { .. }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_external_ids_sidecar_reports_a_symlinked_final_component() {
+        let real_dir = tempdir();
+        let link_parent = tempdir();
+        let dir_link = link_parent.path().join("segment");
+        std::os::unix::fs::symlink(real_dir.path(), &dir_link).expect("symlink segment dir");
+
+        let err = write_external_ids_sidecar(&dir_link, &[6u8; 32], &[])
+            .expect_err("a symlinked final component must be refused");
+
+        assert_eq!(
+            err.to_string(),
+            "open segment dir: final component is a symlink"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_external_ids_sidecar_reports_the_untrusted_symlink_details() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let real_parent = tempdir();
+        let real_segment = real_parent.path().join("segment");
+        std::fs::create_dir(&real_segment).expect("create real segment dir");
+
+        let link_parent = tempdir();
+        std::fs::set_permissions(link_parent.path(), std::fs::Permissions::from_mode(0o777))
+            .expect("make symlink parent world-writable");
+        let parent_link = link_parent.path().join("parent");
+        std::os::unix::fs::symlink(real_parent.path(), &parent_link).expect("symlink ancestor");
+
+        let err = write_external_ids_sidecar(&parent_link.join("segment"), &[3u8; 32], &[])
+            .expect_err("a symlink in a world-writable parent must be refused");
+
+        let uid = unsafe { libc::geteuid() } as u32;
+        match err {
+            ExternalIdsWriteError::UntrustedAncestorSymlink {
+                component,
+                symlink_uid,
+                parent_uid,
+                parent_mode,
+            } => {
+                assert_eq!(component, std::ffi::OsString::from("parent"));
+                assert_eq!(symlink_uid, uid);
+                assert_eq!(parent_uid, uid);
+                assert_eq!(parent_mode, 0o40777);
+            }
+            other => panic!("expected an untrusted ancestor symlink, got: {other}"),
+        }
     }
 
     #[test]
