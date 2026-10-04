@@ -3011,10 +3011,15 @@ pub fn configured_storage_check_targets(
     }
 }
 
+#[path = "serve_targeted_migration.rs"]
+mod targeted_migration;
+
 /// Migrate storage without constructing pack runtimes or loading embedders.
 ///
 /// When `[[backends]]` is present this executes the same deduplicated,
 /// secondary-first inventory and main V21 cutover barrier as normal MCP boot.
+/// Independent targets open only that backend after whole-topology preflight.
+/// Newly collapsed identities refuse before core-schema migration.
 /// With no declared topology it uses the single-backend boot coordinator. No
 /// runtime is exposed and no pack DDL is applied.
 pub async fn migrate_configured_storage_topology(
@@ -3056,25 +3061,15 @@ pub async fn migrate_configured_storage_topology(
             .find(|backend| backend.name == target)
             .expect("the planner validated the selected backend")
             .clone();
-        let policy = wal_ceiling_policy_for_backend(&base_config, &selected)?;
-        let backend = Arc::new(open_backend_with_wal_ceiling(&selected, None, policy)?);
-        prepare_core_schema_for_boot(Arc::clone(&backend), format!("backend {}", selected.name))
-            .await?;
-        crate::attachment_cutover::require_secondary_attachment_empty(
-            Arc::clone(&backend),
-            &selected.name,
-        )
-        .await?;
-        crate::attachment_cutover::coordinate_empty_secondary_attachment_cutover(
-            Arc::clone(&backend),
-            &selected.name,
-        )
-        .await?;
-        return Ok(vec![BackendSchemaMigrationStatus {
-            backend: selected.name,
-            applied_version: read_applied_schema_version(backend.sql().as_ref()).await?,
-            prerequisite: false,
-        }]);
+        return Ok(vec![
+            targeted_migration::migrate_selected_storage_backend_with(
+                &base_config,
+                &plan.effective_backends,
+                &selected,
+                open_backend_with_wal_ceiling,
+            )
+            .await?,
+        ]);
     }
 
     let prepared = prepare_configured_storage_topology(
@@ -5573,6 +5568,10 @@ fn apply_config_pack_selection(
     }
     base
 }
+
+#[cfg(all(test, unix))]
+#[path = "serve_targeted_alias_tests.rs"]
+mod targeted_alias_tests;
 
 #[cfg(test)]
 mod tests {
