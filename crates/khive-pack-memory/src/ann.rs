@@ -4286,6 +4286,7 @@ mod owned_build_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod generation_pin_tests;
     mod incremental_tests;
     mod maintenance_lock_tests;
     use serial_test::serial;
