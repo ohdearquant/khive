@@ -10,7 +10,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use khive_fusion::FusionStrategy;
-use khive_retrieval::{fuse_search_results, HybridConfig};
+use khive_retrieval::hybrid::{
+    combine_best_ranked_evidence, fuse_labelled_scored, HitLabel, HybridConfig,
+};
 use khive_runtime::{
     fts_text_leg_or_err, MemoryRecallPipeline, NamespaceToken, NoteCandidate, RuntimeError,
     SearchHit, SearchSource, VerbRegistry,
@@ -791,14 +793,6 @@ impl TextSnippetPolicy {
 
 pub(super) const RECALL_DIAGNOSTIC_SNIPPET_CHARS: usize = 200;
 
-#[derive(Default)]
-pub(super) struct CandidateMeta {
-    pub(super) in_text: bool,
-    pub(super) in_vector: bool,
-    pub(super) title: Option<String>,
-    pub(super) snippet: Option<String>,
-}
-
 #[derive(Clone, Copy)]
 pub(super) struct RecallCandidateParams<'a> {
     pub(super) candidate_limit: u32,
@@ -851,20 +845,30 @@ pub(super) fn retrieval_hybrid_config(strategy: &FusionStrategy, limit: usize) -
     config
 }
 
-pub(super) fn source_from_meta(meta: &CandidateMeta) -> SearchSource {
-    match (meta.in_vector, meta.in_text) {
-        (true, true) => SearchSource::Both,
-        (true, false) => SearchSource::Vector,
-        (false, true) => SearchSource::Text,
-        (false, false) => SearchSource::Text,
-    }
-}
-
 /// Combine N per-model vector source lists into one via Union (max score per ID).
 pub(super) fn combine_vector_sources_union(
     sources: Vec<Vec<(Uuid, DeterministicScore)>>,
 ) -> Vec<(Uuid, DeterministicScore)> {
     khive_fusion::union_fusion(sources)
+}
+
+/// Rows of one vector arm, each labelled as returned by the vector leg alone.
+fn vector_labelled(
+    rows: Vec<(Uuid, DeterministicScore)>,
+) -> Vec<(Uuid, DeterministicScore, HitLabel)> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(rank, (id, score))| {
+            let label = HitLabel {
+                rank,
+                signals: khive_runtime::SearchSignals::default(),
+                source: SearchSource::Vector,
+                title: None,
+                snippet: None,
+            };
+            (id, score, label)
+        })
+        .collect()
 }
 
 pub(super) fn fuse_candidates(
@@ -873,22 +877,20 @@ pub(super) fn fuse_candidates(
     cfg: &RecallConfig,
     limit: usize,
 ) -> Vec<SearchHit> {
-    let mut meta = HashMap::<Uuid, CandidateMeta>::new();
-
     let text_source: Vec<_> = candidates
         .text_hits
         .iter()
         .filter(|h| memory_ids.contains(&h.subject_id))
-        .map(|h| {
-            let entry = meta.entry(h.subject_id).or_default();
-            entry.in_text = true;
-            if entry.title.is_none() {
-                entry.title = h.title.clone();
-            }
-            if entry.snippet.is_none() {
-                entry.snippet = h.snippet.clone();
-            }
-            (h.subject_id, h.score)
+        .enumerate()
+        .map(|(rank, h)| {
+            let label = HitLabel {
+                rank,
+                signals: khive_runtime::SearchSignals::default(),
+                source: SearchSource::Text,
+                title: h.title.clone(),
+                snippet: h.snippet.clone(),
+            };
+            (h.subject_id, h.score, label)
         })
         .collect();
 
@@ -898,10 +900,7 @@ pub(super) fn fuse_candidates(
         .map(|(_, hits)| {
             hits.iter()
                 .filter(|h| memory_ids.contains(&h.subject_id))
-                .map(|h| {
-                    meta.entry(h.subject_id).or_default().in_vector = true;
-                    (h.subject_id, h.score)
-                })
+                .map(|h| (h.subject_id, h.score))
                 .collect()
         })
         .collect();
@@ -911,17 +910,20 @@ pub(super) fn fuse_candidates(
     let is_weighted = matches!(&cfg.fuse_strategy, FusionStrategy::Weighted { .. });
 
     let sources: Vec<Vec<_>> = if vector_only {
-        vec![combine_vector_sources_union(vector_sources), vec![]]
+        vec![
+            vector_labelled(combine_vector_sources_union(vector_sources)),
+            vec![],
+        ]
     } else if keyword_only {
         vec![vec![], text_source]
     } else if is_weighted && vector_sources.len() > 1 {
-        let combined_vector = combine_vector_sources_union(vector_sources);
+        let combined_vector = vector_labelled(combine_vector_sources_union(vector_sources));
         vec![combined_vector, text_source]
     } else {
-        let mut s = if vector_sources.is_empty() {
+        let mut s: Vec<Vec<_>> = if vector_sources.is_empty() {
             vec![vec![]]
         } else {
-            vector_sources
+            vector_sources.into_iter().map(vector_labelled).collect()
         };
         s.push(text_source);
         s
@@ -932,16 +934,18 @@ pub(super) fn fuse_candidates(
     }
 
     let retrieval_cfg = retrieval_hybrid_config(&cfg.fuse_strategy, limit);
-    fuse_search_results(sources, &retrieval_cfg)
+    let mut emitted = HashSet::new();
+    fuse_labelled_scored(sources, &retrieval_cfg, combine_best_ranked_evidence)
         .into_iter()
-        .map(|(id, score)| {
-            let m = meta.remove(&id).unwrap_or_default();
-            let (source, title, snippet) = if vector_only {
+        .map(|(id, score, label)| {
+            // A pass-through strategy returns a repeated id once per copy, and only the first
+            // copy carries the labels its appearances combine to.
+            let (source, title, snippet) = if emitted.insert(id) {
+                (label.source, label.title, label.snippet)
+            } else if vector_only {
                 (SearchSource::Vector, None, None)
-            } else if keyword_only {
-                (SearchSource::Text, m.title, m.snippet)
             } else {
-                (source_from_meta(&m), m.title, m.snippet)
+                (SearchSource::Text, None, None)
             };
             SearchHit {
                 entity_id: id,
