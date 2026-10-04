@@ -480,3 +480,124 @@ because every step here asserts an absence except the two controls that bracket 
 
 The arm's home is the knowledge pack, above `khive-db`, because that is where the consumer surface
 and the watermark actually live.
+
+## Amendment 2 (2026-10-04): logical domain routes and partitioned vector destinations
+
+**Status: Proposed.** Refs #3696.
+
+This amendment refines the route-key and derived-parent descriptions above for a
+domain's mirror atom and adds the partitioned vector destination rule. Amendment 1's
+paired ANN instructions, warmed source/target consumer acceptance, per-backend
+transaction and resume rules remain in force.
+
+### Canonical Domain owns its mirror
+
+`knowledge.upsert_domains` publishes a canonical `knowledge_domains` row and a
+mirror `knowledge_atoms` row with the same ID and namespace as one logical record.
+`knowledge.index` indexes that atom under `knowledge.atom`. For routing, a domain
+row owns an atom row exactly when both ID and namespace match. Tags, slugs, names
+and vector kind/field do not establish this pairing.
+
+The `domain` route carries the canonical row, its same-ID/same-namespace mirror,
+and the mirror's source sections and vectors. The `atom` route covers only atoms
+without that matching domain row. Its inventory excludes mirrors, so a backend
+holding only domains and mirrors needs no `atom` route. An explicit `atom` route
+with no ordinary atoms still succeeds with count zero. Soft-deleted rows retain
+the same classification and move with the other rows.
+
+A section contributes its parent's route only when the section and parent atom
+both occupy the source namespace. A mirror section follows `domain`; an ordinary
+atom's section follows `atom`. Sections are selected before the parent moves, so
+an atom already in a target or another namespace cannot supply that parent route
+for a leftover source section. Atom and Domain route order does not change the
+result: neither route moves the other's logical records. Domains may have a
+different target from ordinary atoms.
+
+This is a pairing rule for the two knowledge tables, not a priority between
+unrelated classes sharing an ID. A note, entity, edge or another admitted subject
+with that ID still contributes its route. Different target namespaces constitute
+ambiguity; multiple source subjects naming the same target do not.
+
+### Exactly one source destination before writes
+
+A partitioned request has no single target shared by every route. In each backend,
+every vector row in a runtime `vec_*` table whose namespace is the source must
+resolve by subject ID to exactly one distinct target among the routed source
+subjects described above. Vector kind/field do not select a physical subject
+class. Zero destinations or multiple distinct destinations refuse that backend's
+whole move before temporary staging, base/vector DML or ANN log writes, with
+reason `unroutable_vector` (`MoveError::UnroutableVector`, including the subject ID,
+table and destination count). Existing malformed-route, unknown-table,
+unrouted-class and stream-member checks may refuse first.
+
+An absent source subject, or a source section with no source parent, contributes
+no destination through that physical class. If no other routed source subject
+with the same ID contributes one, the vector therefore refuses with zero
+destinations. This applies separately to each backend receiving the route map;
+it does not undo a transaction already committed on another backend. The
+single-target vector branch retains its existing whole-source-namespace behavior.
+In a single-target move, routing a knowledge class carries every source
+`knowledge_sections` row to that target, even when its parent atom already occupies
+the target or a third namespace.
+
+Every successful partitioned move carries all source vector rows to those unique
+targets, preserves their bytes, and appends source-delete then destination-upsert
+instructions. Runtime vector tables are never reported as `left_behind` in a
+successful partitioned move. Destination and foreign vector rows are outside the
+source staged set. Vector provenance and other retained bookkeeping or
+namespace-scoped aggregates keep their separate existing accounting.
+
+An earlier partitioning move may have left a vector in source after moving its
+physical subject elsewhere. A second partitioned move does not infer a target
+from that now-foreign subject. If no routed source subject with the same ID
+remains, it refuses with zero destinations before writes; if another such subject
+remains, the normal distinct-target rule applies. This amendment provides no
+automatic repair or cleanup for already stranded rows.
+
+### Bound route data and existing collision policy
+
+Route values are bound through `VALUES`, with six fixed subject/section SELECT
+branches. Adding kind routes does not add compound SELECT terms; SQLite's bind
+variable limits still apply. This is no promise of unlimited routes or constant
+work as a route map grows.
+
+The existing conservative collision enumeration remains per reachable constraint
+and distinct target over source rows, rather than filtering each query to one
+route class. In particular, a domain mirror slug collision can refuse even when
+there is no Atom route. Constraints not enumerated still refuse through plain
+failing statements and caller rollback. This amendment adds no conflict winner,
+replacement policy or cross-backend atomicity.
+
+### Acceptance
+
+- `partitioned_vectors_follow_every_source_class_and_its_sections` must route a
+  writer-shaped domain/mirror pair separately from ordinary atoms, move both
+  physical domain rows together, preserve bytes and paired logs, exclude residents
+  and become a no-op on repeat. Removing mirror exclusion or physical mirror carry
+  must fail it.
+- `domain_mirror_and_sections_need_only_domain_route_in_either_order` must carry
+  domain, mirror, section and vectors with no Atom route in either route-list
+  order, preserving bytes, counts, foreign keys and repeated-call behavior.
+  Counting mirrors as ordinary atoms or routing their sections through Atom must
+  fail it.
+- `source_section_with_foreign_parent_refuses_before_any_write` must use distinct
+  identities and refuse its source vector with zero destinations while preserving
+  `total_changes()`. Removing the source-parent namespace predicate must fail it.
+- `foreign_vector_for_source_subject_stays_outside_the_staged_set` must leave a
+  foreign vector untouched, without logging it, while moving its actual source
+  subject. Removing the staging namespace predicate must fail the explicit
+  successful-move assertion after valid fixture setup.
+- `partition_routes_above_compound_select_limit_still_move_real_vectors` must
+  admit 501 additional distinct kind routes and move actual source vectors.
+  Reintroducing the compound SELECT term limit must fail the explicit successful
+  move assertion after valid setup.
+- `domain_mirror_slug_collision_refuses_without_an_atom_route` must return the
+  named collision before any write, without depending on an Atom route.
+- `partitioned_orphan_and_competing_subject_routes_refuse_before_any_write` must
+  refuse zero and multiple distinct destinations before writes; independently
+  removing either check must fail its corresponding case.
+
+These are `namespace_move::partition_tests` fixtures. The domain pair is seeded
+with writer-shaped SQL; those fixtures do not execute the public knowledge writer
+or establish warmed ANN consumer behavior. Amendment 1's consumer acceptance and
+ADR-144's session/replay acceptance remain separate requirements.
