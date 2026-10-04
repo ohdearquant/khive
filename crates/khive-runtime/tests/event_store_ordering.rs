@@ -161,7 +161,7 @@ async fn split_query_events_orders_by_created_at_then_id_desc() {
     let rows = events();
     seed(
         legacy.as_ref(),
-        [2_usize, 0, 5]
+        [0_usize, 5, 2]
             .into_iter()
             .map(|i| rows[i].clone())
             .collect(),
