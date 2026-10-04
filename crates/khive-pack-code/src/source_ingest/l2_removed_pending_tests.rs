@@ -164,7 +164,11 @@ async fn l2_alias_removal_preserves_the_other_physical_producer() {
         );
         assert_eq!(
             work.parsed,
-            [root.join("foo/mod.rs").canonicalize().unwrap()]
+            [
+                root.join("foo/mod.rs").canonicalize().unwrap(),
+                root.join("foo.rs").canonicalize().unwrap(),
+            ],
+            "the shared module hash conservatively reparses the later alias too"
         );
         source(&root.join("foo"), "target.rs", "fn ghost(){}\n");
         l2(&rt, &token, &root, 30).await;
@@ -324,23 +328,25 @@ async fn l2_legacy_pending_store_parses_once_before_accepting_empty() {
 async fn l2_alias_shared_hash_cannot_authorize_another_producer() {
     for wal in [true, false] {
         let (_dir, root, rt, token) = fixture(wal);
-        source(&root, "foo.rs", "fn helper(){missing();}\n");
-        source(&root.join("foo"), "mod.rs", "fn helper(){}\n");
+        // The walker sorts mod.rs before foo.rs; the later alias supplies
+        // the shared module hash, while each file retains its own hash.
+        source(&root, "foo.rs", "fn helper(){}\n");
+        source(&root.join("foo"), "mod.rs", "fn helper(){missing();}\n");
         l2(&rt, &token, &root, 10).await;
-        let before = pending_file(&rt, &token, &root, "foo.rs", "foo").await;
+        let before = pending_file(&rt, &token, &root, "foo/mod.rs", "foo").await;
         let module = stored(&rt, &token, module_uuid("fixture", "rust", "foo")).await;
         assert_ne!(
             before["content_hash"],
             module.properties.unwrap()["l2_content_hash"]
         );
-        source(&root, "foo.rs", "fn helper(){}\n");
+        source(&root.join("foo"), "mod.rs", "fn helper(){}\n");
         let (_, work) = l2(&rt, &token, &root, 20).await;
         assert!(
             work.parsed
-                .contains(&root.join("foo.rs").canonicalize().unwrap()),
+                .contains(&root.join("foo/mod.rs").canonicalize().unwrap()),
             "own accepted hash must match the source"
         );
-        let after = pending_file(&rt, &token, &root, "foo.rs", "foo").await;
+        let after = pending_file(&rt, &token, &root, "foo/mod.rs", "foo").await;
         assert_ne!(before["content_hash"], after["content_hash"]);
         assert_eq!(after["references"], json!([]));
     }
