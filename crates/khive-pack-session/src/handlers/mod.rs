@@ -19,10 +19,7 @@ use khive_storage::note::Note;
 
 use crate::vocab::SESSION_KIND;
 
-pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
-}
+pub(crate) use khive_runtime::deser_params as deser;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct SessionRecord {

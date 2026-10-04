@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use khive_runtime::RuntimeError;
+pub(crate) use khive_runtime::deser_params as deser;
 
 // deny_unknown_fields so typo kwargs are rejected at deserialization rather than silently dropped.
 #[derive(Deserialize)]
@@ -296,9 +296,4 @@ pub(crate) struct CursorCommitParams {
     pub generation: u64,
     #[serde(default)]
     pub high_water: Option<u64>,
-}
-
-pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
-    serde_json::from_value(params)
-        .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
