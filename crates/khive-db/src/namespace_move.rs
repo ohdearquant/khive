@@ -61,7 +61,8 @@ use subject_routes::routed_subjects;
 
 /// A routable subject class: a record that exists in its own right.
 ///
-/// Qualified by kind for the two classes that carry one. Nothing in the schema
+/// Notes and entities qualify by kind; edges optionally qualify by relation.
+/// Nothing in the schema
 /// stops a note kind and an entity kind sharing a spelling, so an unqualified
 /// key would route both on a store that has them, and a refusal naming
 /// `note:observation` is one a caller can act on where `observation` is not.
@@ -70,6 +71,7 @@ pub enum SubjectClass {
     Note(String),
     Entity(String),
     Edge,
+    EdgeRelation(String),
     Atom,
     Domain,
 }
@@ -87,6 +89,11 @@ impl SubjectClass {
         match key.split_once(':') {
             Some(("note", kind)) if !kind.is_empty() => Ok(Self::Note(kind.to_string())),
             Some(("entity", kind)) if !kind.is_empty() => Ok(Self::Entity(kind.to_string())),
+            Some(("edge", relation))
+                if khive_types::EdgeRelation::VALID_NAMES.contains(&relation) =>
+            {
+                Ok(Self::EdgeRelation(relation.to_string()))
+            }
             _ => Err(MoveError::UnknownSubjectClass {
                 key: key.to_string(),
             }),
@@ -98,6 +105,7 @@ impl SubjectClass {
             Self::Note(kind) => format!("note:{kind}"),
             Self::Entity(kind) => format!("entity:{kind}"),
             Self::Edge => "edge".to_string(),
+            Self::EdgeRelation(relation) => format!("edge:{relation}"),
             Self::Atom => "atom".to_string(),
             Self::Domain => "domain".to_string(),
         }
@@ -142,7 +150,16 @@ impl MoveRequest {
     }
 
     fn route_for(&self, class: &SubjectClass) -> Option<&MoveRoute> {
-        self.routes.iter().find(|route| &route.class == class)
+        self.routes
+            .iter()
+            .find(|route| &route.class == class)
+            .or_else(|| match class {
+                SubjectClass::EdgeRelation(_) => self
+                    .routes
+                    .iter()
+                    .find(|route| route.class == SubjectClass::Edge),
+                _ => None,
+            })
     }
 
     /// Every route names the same target, and every class present in the source
@@ -279,7 +296,7 @@ impl std::fmt::Display for MoveError {
         match self {
             Self::UnknownSubjectClass { key } => write!(
                 f,
-                "no subject class named {key:?}; expected note:<kind>, entity:<kind>, edge, atom or domain"
+                "no subject class named {key:?}; expected note:<kind>, entity:<kind>, edge:<relation>, edge, atom or domain"
             ),
             Self::DuplicateRoute { class } => {
                 write!(f, "{class} is routed more than once")
@@ -538,7 +555,7 @@ struct SourceInventory {
     /// `notes` and `entities` rows per `kind`, which is what a route key names.
     note_kinds: BTreeMap<String, u64>,
     entity_kinds: BTreeMap<String, u64>,
-    edges: u64,
+    edge_relations: BTreeMap<String, u64>,
     atoms: u64,
     domains: u64,
     /// Namespace-bearing tables holding rows here that [`disposition`] has no
@@ -576,6 +593,19 @@ fn kinds_in_namespace(
     Ok(out)
 }
 
+fn edge_relations_in_namespace(
+    conn: &Connection,
+    namespace: &str,
+) -> rusqlite::Result<BTreeMap<String, u64>> {
+    conn.prepare(
+        "SELECT relation, COUNT(*) FROM graph_edges WHERE namespace = ?1 GROUP BY relation",
+    )?
+    .query_map([namespace], |row| {
+        Ok((row.get(0)?, row.get::<_, i64>(1)? as u64))
+    })?
+    .collect()
+}
+
 /// Soft-deleted rows are counted and moved with the rest, deliberately.
 ///
 /// They are rows, they carry the namespace, and several of the partial unique
@@ -591,7 +621,7 @@ fn read_source(
     let mut inventory = SourceInventory {
         note_kinds: kinds_in_namespace(conn, "notes", source)?,
         entity_kinds: kinds_in_namespace(conn, "entities", source)?,
-        edges: count_in_namespace(conn, "graph_edges", source)?,
+        edge_relations: edge_relations_in_namespace(conn, source)?,
         atoms: ordinary_atom_count(conn, source)?,
         domains: count_in_namespace(conn, "knowledge_domains", source)?,
         unknown: Vec::new(),
@@ -641,6 +671,13 @@ pub fn validate(
 ) -> Result<(), MoveError> {
     let mut seen = BTreeSet::new();
     for route in &request.routes {
+        if let SubjectClass::EdgeRelation(relation) = &route.class {
+            if !khive_types::EdgeRelation::VALID_NAMES.contains(&relation.as_str()) {
+                return Err(MoveError::UnknownSubjectClass {
+                    key: route.class.render(),
+                });
+            }
+        }
         if !seen.insert(route.class.clone()) {
             return Err(MoveError::DuplicateRoute {
                 class: route.class.render(),
@@ -677,7 +714,9 @@ pub fn validate(
     for (kind, rows) in &inventory.entity_kinds {
         unrouted(SubjectClass::Entity(kind.clone()), *rows)?;
     }
-    unrouted(SubjectClass::Edge, inventory.edges)?;
+    for (relation, rows) in &inventory.edge_relations {
+        unrouted(SubjectClass::EdgeRelation(relation.clone()), *rows)?;
+    }
     unrouted(SubjectClass::Atom, inventory.atoms)?;
     unrouted(SubjectClass::Domain, inventory.domains)?;
 
@@ -980,6 +1019,38 @@ fn move_whole_table(
     Ok(moved)
 }
 
+fn move_edges(
+    conn: &Connection,
+    request: &MoveRequest,
+    route: &MoveRoute,
+    rows: &mut BTreeMap<String, u64>,
+) -> rusqlite::Result<u64> {
+    let mut parameters: Vec<rusqlite::types::Value> =
+        vec![request.source.clone().into(), route.target.clone().into()];
+    let predicate = if let SubjectClass::EdgeRelation(relation) = &route.class {
+        parameters.push(relation.clone().into());
+        "relation = ?3".to_owned()
+    } else {
+        let mut excluded = Vec::new();
+        for specific in &request.routes {
+            if let SubjectClass::EdgeRelation(relation) = &specific.class {
+                parameters.push(relation.clone().into());
+                excluded.push(format!("?{}", parameters.len()));
+            }
+        }
+        if excluded.is_empty() {
+            return move_whole_table(conn, "graph_edges", &request.source, &route.target, rows);
+        }
+        format!("relation NOT IN ({})", excluded.join(", "))
+    };
+    let moved = conn.execute(
+        &format!("UPDATE graph_edges SET namespace = ?2 WHERE namespace = ?1 AND {predicate}"),
+        rusqlite::params_from_iter(parameters),
+    )? as u64;
+    *rows.entry("graph_edges".into()).or_default() += moved;
+    Ok(moved)
+}
+
 /// Carry a note's visibility receipt and fences without breaking their composite
 /// foreign key. Copy the receipt under the target first, re-key its fences, then
 /// remove the source receipt. The counts describe rows carried, not the extra
@@ -1253,8 +1324,8 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
             SubjectClass::Entity(kind) => {
                 move_kinded_subject(conn, &ENTITY_TABLES, source, target, kind, &mut counts.rows)?
             }
-            SubjectClass::Edge => {
-                move_whole_table(conn, "graph_edges", source, target, &mut counts.rows)?
+            SubjectClass::Edge | SubjectClass::EdgeRelation(_) => {
+                move_edges(conn, request, route, &mut counts.rows)?
             }
             SubjectClass::Atom => {
                 move_knowledge_atoms(conn, request, target, false, &mut counts.rows)?
@@ -2253,6 +2324,10 @@ fn issue2673_namespace_move_advances_entity_version_without_changing_timestamp()
 #[cfg(all(test, feature = "vectors"))]
 #[path = "namespace_move_partition_tests.rs"]
 mod partition_tests;
+
+#[cfg(test)]
+#[path = "namespace_move_edge_tests.rs"]
+mod edge_tests;
 
 #[cfg(test)]
 #[path = "namespace_move_pack_tables_tests.rs"]
