@@ -978,6 +978,16 @@ impl Drop for ReaderQueryInProgress<'_> {
     }
 }
 
+/// One pool-wide reader admission permit acquired before any connection is
+/// selected, with the instant its checkout wait began so a single
+/// `checkout_timeout` bounds both the permit wait and the connection pick.
+/// Hand it to [`ConnectionPool::reader_with_admission`], which moves the permit
+/// into the resulting [`ReaderGuard`].
+pub(crate) struct ReaderAdmission {
+    slot: tokio::sync::OwnedSemaphorePermit,
+    started: Instant,
+}
+
 /// A reader connection checked out from the pool.
 /// Returns the connection to the pool on drop.
 pub struct ReaderGuard<'pool> {
@@ -1960,6 +1970,81 @@ impl ConnectionPool {
             admission_attempt = admission_attempt.saturating_add(1);
         };
 
+        self.reader_with_admission(
+            ReaderAdmission {
+                slot: admission_slot,
+                started,
+            },
+            should_stop,
+        )
+    }
+
+    /// Wait for one pool-wide reader admission permit on the async side, so a
+    /// read that has to queue costs a task and not a blocking-pool thread.
+    ///
+    /// The wait is bounded by `checkout_timeout` and by the current request's
+    /// cancellation and deadline, and it yields the same `Ok(Some)` / `Ok(None)`
+    /// / `Err` outcomes the permit loop in [`Self::reader_until`] does, resolved
+    /// through the same refusal mapping as [`Self::resolve_reader_checkout`].
+    /// Dropping the future abandons the wait without taking a permit.
+    pub(crate) async fn acquire_reader_admission(
+        &self,
+        capability: StorageCapability,
+        operation: &'static str,
+    ) -> Result<ReaderAdmission, StorageError> {
+        let context = khive_storage::capture_request_read_context();
+        let started = Instant::now();
+        let stopped = context.stop_reason().is_some();
+        let outcome: Result<Option<ReaderAdmission>, SqliteError> = if stopped {
+            Ok(None)
+        } else {
+            tokio::select! {
+                biased;
+                _ = context.wait_for_stop() => Ok(None),
+                waited = tokio::time::timeout(
+                    self.config.checkout_timeout,
+                    Arc::clone(&self.sql_bridge_reader_slots).acquire_owned(),
+                ) => match waited {
+                    Ok(Ok(slot)) => Ok(Some(ReaderAdmission { slot, started })),
+                    Ok(Err(_closed)) => Err(SqliteError::InvalidData(
+                        "reader admission semaphore is closed".to_string(),
+                    )),
+                    Err(_elapsed) => {
+                        self.reader_acquisition_counters.record_checkout_timeout();
+                        Err(pool_exhausted_error(
+                            self.config.checkout_timeout,
+                            self.max_readers,
+                        ))
+                    }
+                },
+            }
+        };
+        match outcome {
+            Ok(Some(admission)) => Ok(admission),
+            Ok(None) => Err(self.reader_checkout_refusal(capability, operation, None)),
+            Err(error) => Err(self.reader_checkout_refusal(capability, operation, Some(error))),
+        }
+    }
+
+    /// Select the reader connection for an admission permit already held.
+    ///
+    /// This is [`Self::reader_until`] after its permit loop: the same
+    /// `should_stop` polling, the same `Ok(Some)` / `Ok(None)` / `Err`
+    /// outcomes, and the remainder of the one `checkout_timeout` that began
+    /// when the permit wait did.
+    pub(crate) fn reader_with_admission<C>(
+        &self,
+        admission: ReaderAdmission,
+        should_stop: C,
+    ) -> Result<Option<ReaderGuard<'_>>, SqliteError>
+    where
+        C: Fn() -> bool,
+    {
+        let ReaderAdmission {
+            slot: admission_slot,
+            started,
+        } = admission;
+
         if self.max_readers == 0 {
             self.ensure_pooled_writer_active()?;
             loop {
@@ -2392,21 +2477,35 @@ impl ConnectionPool {
                 guard.label_operation(operation);
                 Ok(guard)
             }
-            Ok(None) => Err(StorageError::Timeout {
+            Ok(None) => Err(self.reader_checkout_refusal(capability, operation, None)),
+            Err(error) => Err(self.reader_checkout_refusal(capability, operation, Some(error))),
+        }
+    }
+
+    /// The refusal for a reader checkout that produced nothing, shared by
+    /// [`Self::resolve_reader_checkout`] and [`Self::acquire_reader_admission`]
+    /// so the arms documented on the former have one home. `None` is the
+    /// stopped-request arm; `Some` carries the failed checkout's error.
+    fn reader_checkout_refusal(
+        &self,
+        capability: StorageCapability,
+        operation: &'static str,
+        error: Option<SqliteError>,
+    ) -> StorageError {
+        let Some(error) = error else {
+            return StorageError::Timeout {
                 operation: operation.into(),
-            }),
-            Err(error) => {
-                let is_pool_exhausted = matches!(
-                    &error,
-                    SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
-                        if code.code == rusqlite::ErrorCode::DatabaseBusy
-                );
-                if is_pool_exhausted {
-                    Err(self.reader_admission_timeout(operation))
-                } else {
-                    Err(StorageError::driver(capability, operation, error))
-                }
-            }
+            };
+        };
+        let is_pool_exhausted = matches!(
+            &error,
+            SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        );
+        if is_pool_exhausted {
+            self.reader_admission_timeout(operation)
+        } else {
+            StorageError::driver(capability, operation, error)
         }
     }
 
