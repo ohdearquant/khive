@@ -221,7 +221,7 @@ fn decode(row: &SqlRow) -> Result<Receipt, RuntimeError> {
 }
 
 fn opt_text(value: Option<&str>) -> SqlValue {
-    value.map_or(SqlValue::Null, |value| SqlValue::Text(value.to_string()))
+    SqlValue::from_opt_text(value)
 }
 
 fn json_sql(value: &Value) -> SqlValue {
