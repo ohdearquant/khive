@@ -1274,7 +1274,7 @@ impl WebSectionConfig {
 /// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
 /// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
-/// destination keys cannot be silently dropped.
+/// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
     #[serde(default)]

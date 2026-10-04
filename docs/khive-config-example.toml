@@ -15,7 +15,8 @@
 #
 # Unknown top-level keys are ignored (forward-compatible). These tables are closed, so
 # an unknown key in them fails startup: [actor], [gate], [brain], [blob], [telemetry],
-# [storage], [exec] (not its [exec.limits] subtable), [web], and each [[backends]] entry.
+# [storage], [exec] (not its [exec.limits] subtable), [web], and each [[backends]] and
+# [[mounts]] entry.
 #
 # Sections in this file:
 #   [actor]         default identity + namespace read/write scope
