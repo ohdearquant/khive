@@ -108,6 +108,10 @@ fn build_registry_with_runtime(
     runtime: KhiveRuntime,
 ) -> (VerbRegistry, KhiveRuntime, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
+    let backend =
+        Arc::new(khive_db::StorageBackend::sqlite_for_test(dir.path().join("main.db")).unwrap());
+    backend.prepare_core_schema().unwrap();
+    let runtime = KhiveRuntime::from_backend(backend, runtime.config().clone());
     let store = FsBlobStore::new(dir.path().to_path_buf(), 0).expect("fs blob store");
     runtime
         .install_blob_store(std::sync::Arc::new(store))

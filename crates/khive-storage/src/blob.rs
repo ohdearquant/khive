@@ -193,6 +193,46 @@ pub struct BlobOrphanSweepResult {
     pub grace_period_skipped: u64,
 }
 
+/// Immutable owner policy conveyed by the host, never by upload wire arguments.
+#[derive(Clone, Copy, Debug)]
+pub struct UploadLeaseConfig {
+    owner: uuid::Uuid,
+    idle_secs: u64,
+}
+
+impl UploadLeaseConfig {
+    /// Construct a positive whole-second bound; the backend enforces its cap.
+    pub fn new(owner: uuid::Uuid, idle: std::time::Duration) -> StorageResult<Self> {
+        if owner.is_nil() {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Blob,
+                operation: "upload_lease_config".into(),
+                message: "upload lease owner must be a non-nil durable UUID".into(),
+            });
+        }
+        if idle.is_zero() || idle.subsec_nanos() != 0 {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Blob,
+                operation: "upload_lease_config".into(),
+                message: "upload lease bound must be positive whole seconds".into(),
+            });
+        }
+        Ok(Self {
+            owner,
+            idle_secs: idle.as_secs(),
+        })
+    }
+
+    /// Validated durable MAIN/store identity supplied by the host.
+    pub fn owner(&self) -> uuid::Uuid {
+        self.owner
+    }
+    /// The owning daemon's fixed bound, in seconds.
+    pub fn idle_secs(&self) -> u64 {
+        self.idle_secs
+    }
+}
+
 /// Content-addressed binary object CRUD.
 ///
 /// Every method is backend-agnostic: the filesystem backend
@@ -218,6 +258,30 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
         self.size(content_ref).await
     }
 
+    /// Lease policy capability, not an authorization or ownership decision.
+    /// None preserves non-filesystem policy and explicit Unsupported defaults.
+    fn upload_lease_idle_cap(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Create and sync staging plus an atomic complete immutable-owner lease.
+    /// Hosts convey durable identity and the resolved bound before admission.
+    async fn begin_upload_with_lease(
+        &self,
+        declared_size: u64,
+        config: UploadLeaseConfig,
+    ) -> StorageResult<UploadId> {
+        let _ = (declared_size, config);
+        Err(unsupported_upload("begin_upload_with_lease"))
+    }
+
+    /// Renew a validated lease without appending bytes, including tail resends.
+    /// Success follows file sync, replacing rename and supported dir barriers.
+    async fn renew_upload(&self, id: &UploadId) -> StorageResult<()> {
+        let _ = id;
+        Err(unsupported_upload("renew_upload"))
+    }
+
     /// Create an empty staging object. The pack keeps the declared size,
     /// incremental hash, sequence and idle clock. Backends enforce their
     /// capacity policy on each append. Unsupported backends refuse explicitly.
@@ -227,7 +291,8 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
     }
 
     /// Append and synchronize bytes, returning the total staged length.
-    /// The caller serializes parts and aborts after any uncertain append.
+    /// Leased backends synchronize bytes then renew under one root ownership.
+    /// The caller serializes parts and aborts after any uncertain append/renewal.
     async fn append_part(&self, id: &UploadId, bytes: Vec<u8>) -> StorageResult<u64> {
         let _ = (id, bytes);
         Err(unsupported_upload("append_part"))
@@ -247,9 +312,13 @@ pub trait BlobStore: Send + Sync + std::fmt::Debug + 'static {
         Err(unsupported_upload("abort_upload"))
     }
 
-    /// Remove visible staging objects idle for at least the given duration.
-    /// This never visits committed objects. Open S3 multipart uploads require
-    /// the deployment's incomplete-multipart lifecycle rule instead.
+    /// Remove staging objects the backend can show are abandoned. The filesystem
+    /// backend ignores `idle_for`: it removes a leased upload once it has seen that
+    /// lease unchanged for the lease's own bound plus a fixed margin, or once the
+    /// lease's last renewal plus its bound plus 24 hours has passed, and an upload
+    /// with no lease once its file is 24 hours old. Backends without staged uploads
+    /// refuse. This never visits committed objects. Open S3 multipart uploads
+    /// require the deployment's incomplete-multipart lifecycle rule instead.
     async fn sweep_uploads(&self, idle_for: std::time::Duration) -> StorageResult<u64> {
         let _ = idle_for;
         Err(unsupported_upload("sweep_uploads"))

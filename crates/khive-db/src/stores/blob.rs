@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use khive_fs::fd_relative::{clear_errno, current_errno};
 use khive_storage::blob::{
     BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef, UploadId,
-    MAX_BLOB_WHOLE_BYTES,
+    UploadLeaseConfig, MAX_BLOB_WHOLE_BYTES,
 };
 use khive_storage::error::StorageError;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue, StorageResult};
@@ -38,6 +38,9 @@ use uuid::Uuid;
 
 #[path = "blob_uploads.rs"]
 mod uploads;
+#[path = "blob_write_locks.rs"]
+mod write_locks;
+use write_locks::write_lock_for_root;
 
 const ROOT_WRITE_LOCK_FILE: &str = ".khive-blob-write.lock";
 const DATABASE_GC_LOCK_SUFFIX: &str = ".khive-blob-gc.lock";
@@ -2481,41 +2484,6 @@ pub async fn acquire_database_gc_owner(sql: &dyn SqlAccess) -> StorageResult<Dat
         })?
 }
 
-/// Process-wide registry of per-canonical-root write locks.
-///
-/// A `Mutex` field scoped to one `FsBlobStore` instance does NOT serialize
-/// writes across independently constructed stores for the same root — and
-/// callers construct fresh stores for the same root routinely
-/// (`StorageBackend::blob_store` builds a new `FsBlobStore` on every call).
-/// Keying a shared `Arc<tokio::sync::Mutex<()>>` by
-/// the filesystem's own canonical path closes that gap: every `FsBlobStore`
-/// for the same root, however many separate `new` calls produced them,
-/// resolves to the exact same lock.
-fn root_write_locks() -> &'static StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> {
-    static REGISTRY: OnceLock<StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
-        OnceLock::new();
-    REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
-}
-
-/// Look up (or create) the shared write lock for `root`'s canonical path.
-///
-/// `root` must already exist when this is called — `FsBlobStore::new`
-/// creates it first, and `Path::canonicalize` requires the path to exist.
-/// The lookup-or-insert happens under the registry's own (synchronous, very
-/// briefly held) lock, so two `FsBlobStore::new` calls racing for the same
-/// root cannot each install a different `Arc` and defeat the sharing this
-/// exists for.
-fn write_lock_for_root(root: &Path) -> std::io::Result<Arc<tokio::sync::Mutex<()>>> {
-    let canonical = root.canonicalize()?;
-    let mut locks = root_write_locks()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(locks
-        .entry(canonical)
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone())
-}
-
 /// A `BlobStore` backed by a BLAKE3-sharded directory tree.
 #[derive(Debug)]
 pub struct FsBlobStore {
@@ -2542,6 +2510,7 @@ pub struct FsBlobStore {
     /// lock to coordinate with publishers and transactional sweeps in other
     /// processes.
     write_lock: Arc<tokio::sync::Mutex<()>>,
+    upload_observations: Arc<StdMutex<uploads::lease::Observations>>,
     /// How long a blob with zero live references is left alone before an
     /// orphan sweep will delete it — see `within_publish_grace`. Bounds the
     /// window between `put` (bytes land, lock released) and the later,
@@ -2624,6 +2593,7 @@ impl FsBlobStore {
             root_handle,
             floor_bytes,
             write_lock,
+            upload_observations: Arc::default(),
             orphan_sweep_grace: Self::DEFAULT_ORPHAN_SWEEP_GRACE,
         })
     }
@@ -2660,8 +2630,28 @@ impl BlobStore for FsBlobStore {
         })?
     }
 
-    async fn begin_upload(&self, declared_size: u64) -> StorageResult<UploadId> {
-        uploads::begin(self, declared_size).await
+    fn upload_lease_idle_cap(&self) -> Option<Duration> {
+        Some(Duration::from_secs(uploads::lease::MAX_IDLE_SECS))
+    }
+
+    async fn begin_upload_with_lease(
+        &self,
+        size: u64,
+        config: UploadLeaseConfig,
+    ) -> StorageResult<UploadId> {
+        uploads::begin_leased(self, size, config).await
+    }
+
+    async fn renew_upload(&self, id: &UploadId) -> StorageResult<()> {
+        uploads::renew(self, id.clone()).await
+    }
+
+    async fn begin_upload(&self, _declared_size: u64) -> StorageResult<UploadId> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Blob,
+            operation: "begin_upload".into(),
+            message: "the filesystem store requires a lease: use begin_upload_with_lease".into(),
+        })
     }
 
     async fn append_part(&self, id: &UploadId, bytes: Vec<u8>) -> StorageResult<u64> {

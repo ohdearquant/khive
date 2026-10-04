@@ -59,9 +59,16 @@ impl Drop for Roots {
     }
 }
 
+fn durable_runtime(roots: &Roots, config: khive_runtime::RuntimeConfig) -> KhiveRuntime {
+    let backend =
+        Arc::new(khive_db::StorageBackend::sqlite_for_test(roots.path("main.db")).unwrap());
+    backend.prepare_core_schema().unwrap();
+    KhiveRuntime::from_backend(backend, config)
+}
+
 fn registry(roots: &Roots) -> (VerbRegistry, Arc<FsBlobStore>) {
     let store = Arc::new(FsBlobStore::new(roots.path("cas"), 0).unwrap());
-    let runtime = KhiveRuntime::memory().unwrap();
+    let runtime = durable_runtime(roots, khive_runtime::RuntimeConfig::no_embeddings());
     runtime.install_blob_store(store.clone()).unwrap();
     let mut builder = VerbRegistryBuilder::new();
     PackRegistry::register_packs(&["blob".into()], runtime, &mut builder).unwrap();
@@ -460,7 +467,7 @@ async fn configured_file_transfer_opt_in_reaches_both_runtime_conversion_paths()
             resolved.db_path = None;
             resolved.embedding_model = None;
             resolved.additional_embedding_models.clear();
-            let runtime = KhiveRuntime::new(resolved).unwrap();
+            let runtime = durable_runtime(&roots, resolved);
             let store = Arc::new(FsBlobStore::new(roots.path(&format!("cas-{index}")), 0).unwrap());
             runtime.install_blob_store(store).unwrap();
             let mut builder = VerbRegistryBuilder::new();

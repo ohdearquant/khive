@@ -51,6 +51,18 @@ async fn upload_defaults_refuse_for_backends_without_staging() {
     let id = khive_storage::UploadId::from_bytes(&[1; 16]);
     let reference = ContentRef::from_hex("a".repeat(64)).unwrap();
     let failures = [
+        store
+            .begin_upload_with_lease(
+                1,
+                khive_storage::blob::UploadLeaseConfig::new(
+                    uuid::Uuid::from_bytes([1; 16]),
+                    std::time::Duration::from_secs(60),
+                )
+                .unwrap(),
+            )
+            .await
+            .map(|_| ()),
+        store.renew_upload(&id).await,
         store.begin_upload(1).await.map(|_| ()),
         store.append_part(&id, vec![1]).await.map(|_| ()),
         store.commit_upload(&id, &reference).await,
@@ -61,6 +73,8 @@ async fn upload_defaults_refuse_for_backends_without_staging() {
             .map(|_| ()),
     ];
     for (result, expected) in failures.into_iter().zip([
+        "begin_upload_with_lease",
+        "renew_upload",
         "begin_upload",
         "append_part",
         "commit_upload",
@@ -72,6 +86,7 @@ async fn upload_defaults_refuse_for_backends_without_staging() {
         };
         assert_eq!(operation, expected);
     }
+    assert!(store.upload_lease_idle_cap().is_none());
     assert!(store.objects.lock().unwrap().is_empty());
 }
 
