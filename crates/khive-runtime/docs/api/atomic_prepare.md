@@ -97,7 +97,15 @@ become stale. A create emits `LinkCreated`; replacement and resurrection emit
 conflicts fail during prepare with guidance to pass `resurrect=true`.
 
 `apply_post_commit_effects_with_report` returns one `PostCommitEmbeddingOutcome` for every reindex
-effect it successfully executes. Each outcome retains the originating effect identity plus its
-typed truncation report, allowing CLI or pack response builders to attach warnings to the exact
-write without rerunning registry prediction. The original `apply_post_commit_effects` remains the
-unit-returning compatibility wrapper.
+effect it successfully executes. Each outcome retains the originating effect identity, its
+typed truncation report, and the eligible-model `failures` (`ReindexModelFailure`: model, stage,
+error) that did not undo the committed note, allowing CLI or pack response builders to attach
+warnings to the exact write without rerunning registry prediction. The original
+`apply_post_commit_effects` remains the unit-returning compatibility wrapper.
+
+When any effect fails, `apply_post_commit_effects_with_report` returns one `Err` and drops the
+outcomes of the effects that completed. `apply_post_commit_effects_with_failures` runs the same
+effects and returns a `PostCommitEffectsReport { outcomes, failures }` instead, so a caller can
+disclose model failures and truncation advisories even when a sibling effect failed closed;
+`PostCommitEffectsReport::failure_error` rebuilds the aggregate error, and
+`apply_post_commit_effects_with_report` is a thin wrapper over it.
