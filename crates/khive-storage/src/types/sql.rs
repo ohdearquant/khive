@@ -20,6 +20,26 @@ pub enum SqlValue {
     Timestamp(DateTime<Utc>),
 }
 
+impl SqlValue {
+    /// Bind optional text: `Some` becomes [`SqlValue::Text`], including the empty
+    /// string, and `None` becomes [`SqlValue::Null`].
+    pub fn from_opt_text(value: Option<&str>) -> SqlValue {
+        match value {
+            Some(text) => SqlValue::Text(text.to_owned()),
+            None => SqlValue::Null,
+        }
+    }
+
+    /// Bind an optional integer: `Some` becomes [`SqlValue::Integer`], including
+    /// zero, and `None` becomes [`SqlValue::Null`].
+    pub fn from_opt_i64(value: Option<i64>) -> SqlValue {
+        match value {
+            Some(number) => SqlValue::Integer(number),
+            None => SqlValue::Null,
+        }
+    }
+}
+
 /// A parameterized SQL statement with optional diagnostic label.
 ///
 /// `sql` is one SQLite statement, not a script. Backends must reject trailing
