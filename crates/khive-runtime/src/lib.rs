@@ -55,6 +55,7 @@ mod note_write_tests;
 pub mod objectives;
 pub mod operations;
 pub mod pack;
+pub mod pack_metadata;
 mod params;
 pub mod phase_events;
 pub mod portability;
