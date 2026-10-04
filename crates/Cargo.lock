@@ -2234,6 +2234,7 @@ name = "khive-fs"
 version = "0.9.0"
 dependencies = [
  "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2498,6 +2499,7 @@ dependencies = [
  "chrono",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-pack-blob",
  "khive-pack-kg",
  "khive-pack-tool",
@@ -2539,6 +2541,7 @@ dependencies = [
  "encoding_rs",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-pack-blob",
  "khive-pack-exec",
  "khive-pack-kg",
@@ -2623,6 +2626,7 @@ dependencies = [
  "khive-fusion",
  "khive-pack-brain",
  "khive-pack-kg",
+ "khive-retrieval",
  "khive-runtime",
  "khive-score",
  "khive-storage",
@@ -2826,6 +2830,7 @@ dependencies = [
  "flate2",
  "inventory",
  "khive-db",
+ "khive-fs",
  "khive-pack-kg",
  "khive-runtime",
  "khive-storage",

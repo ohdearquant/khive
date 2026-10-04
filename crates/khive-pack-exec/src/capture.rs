@@ -138,12 +138,14 @@ fn read_regular_bounded(
 #[cfg(unix)]
 mod platform {
     use super::{read_regular_bounded, CaptureRead, CapturedContent};
+    use khive_fs::fd_relative::{c_name, list_names, open_at, stat_at, stat_fd};
     use std::collections::BTreeMap;
-    use std::ffi::{CStr, CString, OsStr, OsString};
+    use std::ffi::{OsStr, OsString};
     use std::fs::{File, OpenOptions};
     use std::io;
-    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    use std::os::fd::AsRawFd;
+    #[cfg(target_vendor = "apple")]
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
     use std::sync::Arc;
@@ -290,52 +292,18 @@ mod platform {
         }
     }
 
-    fn c_name(name: &OsStr) -> io::Result<CString> {
-        CString::new(name.as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in capture name"))
-    }
-
-    fn stat_fd(file: &File) -> io::Result<libc::stat> {
-        let mut stat = std::mem::MaybeUninit::uninit();
-        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+    /// The shared descriptor helpers refuse a NUL byte in a name with their own wording; capture
+    /// reports it as a capture name. Any other error passes through unchanged.
+    fn capture_name_error(error: io::Error) -> io::Error {
+        if error.kind() == io::ErrorKind::InvalidInput && error.raw_os_error().is_none() {
+            io::Error::new(io::ErrorKind::InvalidInput, "NUL in capture name")
+        } else {
+            error
         }
-        Ok(unsafe { stat.assume_init() })
-    }
-
-    fn stat_at(parent: &File, name: &OsStr) -> io::Result<libc::stat> {
-        let name = c_name(name)?;
-        let mut stat = std::mem::MaybeUninit::uninit();
-        if unsafe {
-            libc::fstatat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { stat.assume_init() })
     }
 
     fn changed() -> io::Error {
         io::Error::other("capture entry changed after inspection")
-    }
-
-    fn open_at(parent: &File, name: &OsStr, directory: bool) -> io::Result<File> {
-        let name = c_name(name)?;
-        let flags = libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if directory { libc::O_DIRECTORY } else { 0 };
-        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { File::from_raw_fd(fd) })
     }
 
     fn open_checked(
@@ -350,7 +318,7 @@ mod platform {
                 if stat_at(parent, name).is_ok_and(|current| Identity::from(&current) != expected) {
                     return Err(changed());
                 }
-                return Err(error);
+                return Err(capture_name_error(error));
             }
         };
         let stat = stat_fd(&file)?;
@@ -369,92 +337,6 @@ mod platform {
             opened = Some(child);
         }
         Ok(opened)
-    }
-
-    struct DirStream(*mut libc::DIR);
-
-    impl Drop for DirStream {
-        fn drop(&mut self) {
-            unsafe { libc::closedir(self.0) };
-        }
-    }
-
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-        target_os = "freebsd"
-    ))]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::__error() }
-    }
-
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "emscripten",
-        target_os = "redox",
-        target_os = "hurd"
-    ))]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::__errno_location() }
-    }
-
-    #[cfg(any(
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "android",
-        target_os = "cygwin",
-        target_os = "nuttx"
-    ))]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::__errno() }
-    }
-
-    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::___errno() }
-    }
-
-    #[cfg(target_os = "aix")]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::_Errno() }
-    }
-
-    #[cfg(target_os = "haiku")]
-    fn errno_location() -> *mut libc::c_int {
-        unsafe { libc::_errnop() }
-    }
-
-    fn names(directory: &File) -> io::Result<Vec<OsString>> {
-        let fd = open_at(directory, OsStr::new("."), true)?.into_raw_fd();
-        let stream = unsafe { libc::fdopendir(fd) };
-        if stream.is_null() {
-            let error = io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(error);
-        }
-        let stream = DirStream(stream);
-        let mut result = Vec::new();
-        loop {
-            unsafe { *errno_location() = 0 };
-            let entry = unsafe { libc::readdir(stream.0) };
-            if entry.is_null() {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(0) {
-                    return Err(error);
-                }
-                break;
-            }
-            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
-            if name != b"." && name != b".." {
-                result.push(OsString::from_vec(name.to_vec()));
-            }
-        }
-        result.sort();
-        Ok(result)
     }
 
     fn read_link_at(parent: &File, name: &OsStr, max_bytes: u64) -> io::Result<CaptureRead> {
@@ -496,7 +378,7 @@ mod platform {
             let opened_parent = open_directory_path(&self.root, &self.parent_path)?;
             let parent = opened_parent.as_ref().unwrap_or(&self.root);
             if self.mode == 120000 {
-                let checked = stat_at(parent, &self.name)?;
+                let checked = stat_at(parent, &self.name).map_err(capture_name_error)?;
                 if Identity::from(&checked) != self.identity {
                     return Err(changed());
                 }
@@ -527,7 +409,7 @@ mod platform {
                     )
                 })?;
             let directory = opened_directory.as_ref().unwrap_or(&root.directory);
-            let entries = names(directory).map_err(|error| {
+            let entries = list_names(directory).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!("read capture directory {rel:?}: {error}"),
@@ -549,6 +431,7 @@ mod platform {
                     ));
                 }
                 let stat = stat_at(directory, &name).map_err(|error| {
+                    let error = capture_name_error(error);
                     io::Error::new(
                         error.kind(),
                         format!("stat capture entry {child_rel:?}: {error}"),
@@ -592,6 +475,8 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[cfg(target_vendor = "apple")]
+        use std::os::fd::FromRawFd;
 
         #[test]
         fn capture_open_does_not_follow_symlink_in_run_directory() {
@@ -602,6 +487,34 @@ mod platform {
                 .unwrap();
             let root = CaptureRoot::open(run.path()).unwrap();
             assert!(open_at(&root.directory, OsStr::new("link"), false).is_err());
+        }
+
+        #[test]
+        fn a_nul_byte_in_a_capture_name_keeps_the_capture_error_text() {
+            use std::os::unix::ffi::OsStrExt;
+
+            let run = tempfile::tempdir().unwrap();
+            let root = CaptureRoot::open(run.path()).unwrap();
+            let name = OsStr::from_bytes(b"a\0b");
+            let found = |kind: libc::mode_t, mode: u32| Found {
+                root: Arc::clone(&root.directory),
+                parent_path: Arc::new(Vec::new()),
+                name: name.to_os_string(),
+                identity: Identity {
+                    dev: 0,
+                    ino: 0,
+                    kind,
+                },
+                mode,
+            };
+            let regular = found(libc::S_IFREG, 644);
+            let symlink = found(libc::S_IFLNK, 120000);
+            for entry in [regular, symlink] {
+                let mode = entry.mode;
+                let error = entry.read_content_bounded(16).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "mode {mode}");
+                assert_eq!(error.to_string(), "NUL in capture name", "mode {mode}");
+            }
         }
 
         /// Create `levels` nested directories named `name` below `root` by

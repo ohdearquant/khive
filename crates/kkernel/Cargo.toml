@@ -13,9 +13,9 @@ description = "khive kernel — stdio MCP server binary and admin CLI (sync, pac
 
 [dependencies]
 khive-mounts = { version = "0.9.0", path = "../khive-mounts" }
-khive-pack-agent = { version = "0.9.0", path = "../khive-pack-agent" }
+khive-pack-agent = { version = "0.9.0", path = "../khive-pack-agent", optional = true }
 khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
-khive-mcp = { version = "0.9.0", path = "../khive-mcp" }
+khive-mcp = { version = "0.9.0", path = "../khive-mcp", default-features = false }
 khive-score = { version = "0.9.0", path = "../khive-score" }
 khive-db = { version = "0.9.0", path = "../khive-db" }
 khive-storage = { version = "0.9.0", path = "../khive-storage" }
@@ -30,8 +30,8 @@ khive-pack-comm = { version = "0.9.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.9.0", path = "../khive-pack-schedule" }
 khive-pack-formal = { version = "0.9.0", path = "../khive-pack-formal", optional = true }
 khive-pack-code = { version = "0.9.0", path = "../khive-pack-code" }
-khive-pack-web = { version = "0.9.0", path = "../khive-pack-web" }
-khive-pack-telemetry = { version = "0.9.0", path = "../khive-pack-telemetry" }
+khive-pack-web = { version = "0.9.0", path = "../khive-pack-web", optional = true }
+khive-pack-telemetry = { version = "0.9.0", path = "../khive-pack-telemetry", optional = true }
 khive-pack-knowledge = { version = "0.9.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.9.0", path = "../khive-pack-session" }
 khive-pack-tool = { version = "0.9.0", path = "../khive-pack-tool" }
@@ -71,13 +71,28 @@ rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 # Re-declares the [dependencies] khive-mcp with test instrumentation enabled:
 # Cargo unifies features across the build graph, so test builds see the
 # armed-capture hook while the release dependency above stays untouched.
-khive-mcp = { version = "0.9.0", path = "../khive-mcp", features = ["test-forward-seam"] }
+# Default features stay off here too: a test build that left them on would link
+# the optional packs into a kkernel built without them.
+khive-mcp = { version = "0.9.0", path = "../khive-mcp", default-features = false, features = ["test-forward-seam"] }
 khive-gate-rego = { version = "0.9.0", path = "../khive-gate-rego" }
 khive-storage = { version = "0.9.0", path = "../khive-storage", features = ["test-support"] }
 khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["test-internals"] }
 blake3 = { workspace = true }
 
 [features]
+# The default set links every pack this binary has always linked. The agent,
+# telemetry and web packs are optional; formal and moodboard stay off.
+default = ["pack-agent", "pack-telemetry", "pack-web"]
+# Pass-through, plus links kkernel's own force-link reference: enables the agent
+# pack. A build without it does not link or register the pack, so it is absent
+# from the pack list the server reports and `--pack agent` is an unknown pack.
+pack-agent = ["khive-mcp/pack-agent", "khive-pack-agent"]
+# Pass-through, plus links kkernel's own force-link reference: enables the
+# telemetry pack (same behaviour without it as pack-agent).
+pack-telemetry = ["khive-mcp/pack-telemetry", "khive-pack-telemetry"]
+# Pass-through, plus links kkernel's own force-link reference: enables the web
+# pack and its HTTP client (same behaviour without it as pack-agent).
+pack-web = ["khive-mcp/pack-web", "khive-pack-web"]
 # Pass-through: enables the deterministic hash embedder in the serve path (bench use only).
 bench-embedder = ["khive-mcp/bench-embedder"]
 # Pass-through: enables the SMTP/IMAP email polling loop. Inert without KHIVE_EMAIL_* env vars.
@@ -102,3 +117,8 @@ path = "src/main.rs"
 name = "mount_fixture"
 path = "../khive-mounts/tests/fixture.rs"
 harness = false
+
+# Selects the agent pack in every scenario, so it is built only with the feature.
+[[test]]
+name = "mounts"
+required-features = ["pack-agent"]

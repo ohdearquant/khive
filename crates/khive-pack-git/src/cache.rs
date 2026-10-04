@@ -33,6 +33,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+#[cfg(unix)]
+use khive_fs::fd_relative::{open_dir_at, stat_at, stat_fd};
 use uuid::Uuid;
 
 use crate::source::{cache_key, redact_repo_url};
@@ -756,12 +758,12 @@ fn delete_verified_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), Cache
         .ok_or_else(|| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
     let root_fd = unix_fd::open_dir_nofollow(root)
         .map_err(|e| io_err("delete_verified_owned_entry: open root", root, e))?;
-    let target_fd = unix_fd::openat_dir_nofollow(&root_fd, name)
+    let target_fd = open_dir_at(&root_fd, name)
         .map_err(|_| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
     if !is_owned_entry_via_fd(&target_fd) {
         return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
     }
-    let target_id = unix_fd::fstat(&target_fd)
+    let target_id = stat_fd(&target_fd)
         .map_err(|e| io_err("delete_verified_owned_entry: fstat target", repo_dir, e))?;
 
     let namespace_root = ensure_staging_namespace(root)
@@ -790,7 +792,7 @@ fn delete_verified_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), Cache
     // that slipped into `name`'s place in the syscalls between the checks
     // above and the `renameat` call.
     let moved_path = namespace_root.join(&trash_name);
-    let moved_id = unix_fd::fstatat_nofollow(&namespace_fd, trash_name_os).map_err(|e| {
+    let moved_id = stat_at(&namespace_fd, trash_name_os).map_err(|e| {
         io_err(
             "delete_verified_owned_entry: fstat moved entry",
             &moved_path,
@@ -838,8 +840,7 @@ impl ValidatedSlot {
     #[cfg(test)]
     fn for_test(dir: &Path) -> Self {
         let parent = unix_fd::open_dir_nofollow(dir).expect("open test slot dir");
-        let git_dir =
-            unix_fd::openat_dir_nofollow(&parent, std::ffi::OsStr::new(".git")).unwrap_or(parent);
+        let git_dir = open_dir_at(&parent, std::ffi::OsStr::new(".git")).unwrap_or(parent);
         Self { git_dir }
     }
 }
@@ -921,10 +922,10 @@ fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
     // left open: after `is_owned_entry_via_fd` confirms `.git` is a directory,
     // a shared-root writer can still swap `.git` for a symlink at an ancestor
     // repo, which a later `--git-dir .git` (re-resolved by name) would follow.
-    // `openat_dir_nofollow` refuses that symlink (`ELOOP`) and otherwise pins
+    // `open_dir_at` refuses that symlink (`ELOOP`) and otherwise pins
     // the exact `.git` inode, so `git_at_slot`'s `--git-dir .` can never reach
     // outside the validated slot.
-    let git_dir = unix_fd::openat_dir_nofollow(&fd, std::ffi::OsStr::new(".git"))
+    let git_dir = open_dir_at(&fd, std::ffi::OsStr::new(".git"))
         .map_err(|_| CacheError::UnsafeToReplace(repo_dir.to_path_buf()))?;
     Ok(ValidatedSlot { git_dir })
 }
@@ -953,18 +954,17 @@ fn revalidate_owned_slot(repo_dir: &Path) -> Result<ValidatedSlot, CacheError> {
 /// `path.join(...)` by name. See crates/khive-pack-git/docs/api/cache.md#is_owned_entry.
 #[cfg(unix)]
 fn is_owned_entry_via_fd(target_fd: &std::fs::File) -> bool {
-    let git_is_directory = unix_fd::fstatat_nofollow(target_fd, std::ffi::OsStr::new(".git"))
+    let git_is_directory = stat_at(target_fd, std::ffi::OsStr::new(".git"))
         .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFDIR);
-    let marker_is_regular_file =
-        unix_fd::fstatat_nofollow(target_fd, std::ffi::OsStr::new(MARKER_FILE))
-            .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG);
+    let marker_is_regular_file = stat_at(target_fd, std::ffi::OsStr::new(MARKER_FILE))
+        .is_ok_and(|st| (st.st_mode & libc::S_IFMT) == libc::S_IFREG);
     git_is_directory && marker_is_regular_file
 }
 
-/// `openat`/`fstatat`/`renameat` primitives bound to an already-opened
-/// directory descriptor rather than a pathname, mirroring the
-/// `O_NOFOLLOW`/`fstat` idiom used in `khive-db`'s WAL-pin sidecar and
-/// `khive-vamana`'s external-id sidecar: every operation after the initial
+/// The two primitives `khive_fs::fd_relative` has no equivalent for: the
+/// path-based directory open and `renameat`. The descriptor-relative `openat`,
+/// `fstatat` and `fstat` the cache needs (`open_dir_at`, `stat_at`, `stat_fd`)
+/// come from that shared module: every operation after the initial
 /// `open`/`openat` is relative to a handle the kernel resolved once, immune
 /// to the original pathname being swapped out from under it afterward.
 #[cfg(unix)]
@@ -976,14 +976,7 @@ mod unix_fd {
     use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::path::Path;
 
-    fn cstring(component: &OsStr) -> io::Result<CString> {
-        CString::new(component.as_bytes()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "path component contains a NUL byte",
-            )
-        })
-    }
+    use khive_fs::fd_relative;
 
     /// Open `path` as a directory, refusing to follow a symlink at the
     /// final component. The returned handle is bound to that exact inode:
@@ -1009,60 +1002,6 @@ mod unix_fd {
         Ok(unsafe { fs::File::from_raw_fd(fd) })
     }
 
-    /// `openat(dir, name, O_DIRECTORY | O_NOFOLLOW)` — open the single path
-    /// component `name` as a directory relative to `dir`'s own descriptor,
-    /// refusing a symlink at that component.
-    pub(super) fn openat_dir_nofollow(dir: &fs::File, name: &OsStr) -> io::Result<fs::File> {
-        let c_name = cstring(name)?;
-        // SAFETY: `dir.as_raw_fd()` is a live directory descriptor;
-        // `c_name` is NUL-terminated for the duration of the call.
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                c_name.as_ptr(),
-                libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `fd` was just returned by a successful `openat`.
-        Ok(unsafe { fs::File::from_raw_fd(fd) })
-    }
-
-    /// `fstatat(dir, name, AT_SYMLINK_NOFOLLOW)` — the identity of `name`
-    /// as it stands right now, resolved relative to `dir`'s own descriptor
-    /// rather than a fresh pathname walk from the filesystem root.
-    pub(super) fn fstatat_nofollow(dir: &fs::File, name: &OsStr) -> io::Result<libc::stat> {
-        let c_name = cstring(name)?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: `dir.as_raw_fd()` is live; `c_name` is NUL-terminated;
-        // `st` is a valid out-param for the duration of the call.
-        let rc = unsafe {
-            libc::fstatat(
-                dir.as_raw_fd(),
-                c_name.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(st)
-    }
-
-    pub(super) fn fstat(file: &fs::File) -> io::Result<libc::stat> {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: `file.as_raw_fd()` is live; `st` is a valid out-param for
-        // the duration of the call.
-        let rc = unsafe { libc::fstat(file.as_raw_fd(), &mut st) };
-        if rc != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(st)
-    }
-
     /// `renameat(from, name, to, to_name)` — move `name` out of `from` and
     /// into `to` under `to_name`, both endpoints fd-relative so neither is
     /// re-resolved by pathname at the moment of the move.
@@ -1072,8 +1011,8 @@ mod unix_fd {
         to: &fs::File,
         to_name: &OsStr,
     ) -> io::Result<()> {
-        let c_name = cstring(name)?;
-        let c_to_name = cstring(to_name)?;
+        let c_name = fd_relative::c_name(name)?;
+        let c_to_name = fd_relative::c_name(to_name)?;
         // SAFETY: both fds are live directory descriptors; both C strings
         // are NUL-terminated for the duration of the call.
         let rc = unsafe {
@@ -4390,3 +4329,7 @@ printf 'finished\n' > '{}'
 #[cfg(all(test, unix))]
 #[path = "cache_stderr_tests.rs"]
 mod stderr_tests;
+
+#[cfg(all(test, unix))]
+#[path = "cache_fd_tests.rs"]
+mod fd_tests;

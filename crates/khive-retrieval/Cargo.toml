@@ -62,12 +62,16 @@ storage-adapters = ["khive-storage"]
 native-rerank = []
 # Native embedding service (delegated to lattice-embed; reserved for future feature-gating)
 embed = []
+# Hidden helpers shared by the packs that keep file-backed ANN checkpoints: the checkpoint
+# directory lock, the rotation watcher loop and the consumer registry. The registry runs its
+# SQL through khive-storage and logs through tracing.
+ann = ["khive-storage", "tracing"]
 
 [dev-dependencies]
 criterion = { workspace = true }
 khive-score = { version = "0.9.0", path = "../khive-score" }
 khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
-# Only the storage-adapters tests use khive-db; `vectors` loads sqlite-vec for them.
+# Only the storage-adapters and ann registry tests use khive-db; `vectors` loads sqlite-vec.
 khive-db = { version = "0.9.0", path = "../khive-db", features = ["vectors"] }
 
 [[bench]]

@@ -26,6 +26,7 @@ khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
 khive-storage = { version = "0.9.0", path = "../khive-storage" }
 khive-fold = { version = "0.9.0", path = "../khive-fold" }
 khive-fusion = { version = "0.9.0", path = "../khive-fusion" }
+khive-retrieval = { version = "0.9.0", path = "../khive-retrieval", default-features = false, features = ["ann"] }
 khive-score = { version = "0.9.0", path = "../khive-score" }
 khive-vamana = { version = "0.9.0", path = "../khive-vamana" }
 inventory = { workspace = true }

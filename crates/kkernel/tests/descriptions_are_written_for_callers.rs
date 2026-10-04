@@ -88,8 +88,10 @@ fn collect(pack: &'static str, handlers: &'static [HandlerDef], out: &mut Vec<(S
 /// population is exactly what goes stale: an earlier revision of this file was
 /// one pack short and reported a clean scan of a surface it had not walked.
 fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
-    vec![
-        ("agent", khive_pack_agent::AgentPack::HANDLERS),
+    // The agent, telemetry and web packs are optional features, so they join
+    // below only in a build that links them.
+    #[allow(unused_mut)]
+    let mut packs = vec![
         ("blob", khive_pack_blob::BlobPack::HANDLERS),
         ("brain", khive_pack_brain::BrainPack::HANDLERS),
         ("code", khive_pack_code::CodePack::HANDLERS),
@@ -102,17 +104,27 @@ fn packs() -> Vec<(&'static str, &'static [HandlerDef])> {
         ("memory", khive_pack_memory::MemoryPack::HANDLERS),
         ("schedule", khive_pack_schedule::SchedulePack::HANDLERS),
         ("session", khive_pack_session::SessionPack::HANDLERS),
-        ("telemetry", khive_pack_telemetry::TelemetryPack::HANDLERS),
         ("tool", khive_pack_tool::ToolPack::HANDLERS),
-        ("web", khive_pack_web::WebPack::HANDLERS),
         ("workspace", khive_pack_workspace::WorkspacePack::HANDLERS),
-    ]
+    ];
+    #[cfg(feature = "pack-agent")]
+    packs.push(("agent", khive_pack_agent::AgentPack::HANDLERS));
+    #[cfg(feature = "pack-telemetry")]
+    packs.push(("telemetry", khive_pack_telemetry::TelemetryPack::HANDLERS));
+    #[cfg(feature = "pack-web")]
+    packs.push(("web", khive_pack_web::WebPack::HANDLERS));
+    packs
 }
 
-/// Linked and publishable, but outside the default set a fresh install loads.
-/// A deployment turns these on by configuration, with no rebuild, so their
-/// descriptions reach callers and belong in this scan.
-const PACKS_OUTSIDE_THE_SHIPPED_SET: [&str; 3] = ["agent", "telemetry", "web"];
+/// Linked and publishable, but outside the default set a fresh install loads,
+/// each paired with whether this build links it. A deployment that links one
+/// turns it on by configuration, with no rebuild, so its descriptions reach
+/// callers and belong in this scan.
+const PACKS_OUTSIDE_THE_SHIPPED_SET: [(&str, bool); 3] = [
+    ("agent", cfg!(feature = "pack-agent")),
+    ("telemetry", cfg!(feature = "pack-telemetry")),
+    ("web", cfg!(feature = "pack-web")),
+];
 
 fn offenders() -> Vec<(Site, String)> {
     let mut out = Vec::new();
@@ -140,7 +152,8 @@ fn no_shipped_description_carries_an_internal_reference() {
     let beyond_shipped: BTreeSet<String> = scanned_packs.difference(&shipped).cloned().collect();
     let declared_extra: BTreeSet<String> = PACKS_OUTSIDE_THE_SHIPPED_SET
         .iter()
-        .map(|s| s.to_string())
+        .filter(|(_, linked)| *linked)
+        .map(|(name, _)| name.to_string())
         .collect();
     assert_eq!(
         beyond_shipped, declared_extra,

@@ -1089,11 +1089,7 @@ fn validate_ndjson_records(entities: &[NdjsonEntity], edges: &[NdjsonEdge]) -> R
                 .map_err(|e| anyhow!("edge {i} ({}) properties rejected: {e}", r.edge_id))?;
         }
 
-        let (source, target) = if relation.is_symmetric() && r.target < r.source {
-            (r.target, r.source)
-        } else {
-            (r.source, r.target)
-        };
+        let (source, target) = relation.canonical_endpoints(r.source, r.target);
         if !triples.insert((source, target, relation)) {
             bail!(
                 "edge {i} ({}): duplicate edge triple (source={}, target={}, relation={:?})",

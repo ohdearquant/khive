@@ -1,5 +1,8 @@
 use super::*;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
+use std::time::Duration;
 
 const CHILD_CASE: &str = "KHIVE_WEB_DESCRIPTOR_CHILD_CASE";
 
@@ -246,4 +249,50 @@ fn unrelated_root_failures_keep_any_root_and_outside_root_behavior() {
     );
     cfg.read_roots.push(root.display().to_string());
     assert_eq!(open_files(&cfg, &root, 100, &mut |_| {}).unwrap().len(), 1);
+}
+
+fn swap_in_fifo(path: &Path) {
+    std::fs::remove_file(path).unwrap();
+    let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: name is NUL-terminated for the duration of the call.
+    let rc = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+    assert_eq!(rc, 0);
+}
+
+#[test]
+fn raced_in_fifo_is_refused_without_blocking_the_open() {
+    let tree = tempfile::tempdir().unwrap();
+    let root = tree.path().canonicalize().unwrap();
+    let page = root.join("page.html");
+    std::fs::write(&page, b"body").unwrap();
+    let cfg = WebSectionConfig {
+        read_roots: vec![root.display().to_string()],
+        ..Default::default()
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let swapped = page.clone();
+    // The regular file is swapped for a FIFO after it was checked and before it is opened. An
+    // open that can block waits here for a writer that never comes, so it runs on a worker.
+    let worker = std::thread::spawn(move || {
+        let outcome = open_files(&cfg, &root, 100, &mut |path| {
+            if path == swapped {
+                swap_in_fifo(&swapped);
+            }
+        });
+        let count = outcome.map(|files| files.len());
+        let message = count.map_err(|error| error.to_string());
+        sender.send(message).unwrap();
+    });
+    let received = receiver.recv_timeout(Duration::from_secs(5));
+    if received.is_err() {
+        // A blocked open is waiting for a writer; supply one so the worker can finish.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&page);
+    }
+    worker.join().unwrap();
+    let message = received.expect("open blocked on a FIFO");
+    let error = message.unwrap_err();
+    assert!(error.contains("ingest_path_changed"), "{error}");
 }

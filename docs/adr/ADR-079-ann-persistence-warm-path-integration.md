@@ -1044,7 +1044,7 @@ after registry loss (`write_force_rebuild_sentinel_row`, vamana.rs:1268). Its
 `prepare_full_corpus_scan` (vamana.rs:1380) promotes an absent or pending row to `-1` before a full
 scan. The registry records the difference in lifetime: `-1` never expires and `-2` retires after 24
 hours (`RECOVERING_WATERMARK`, `PENDING_WATERMARK` and `PENDING_GRACE_US`,
-`crates/khive-runtime/src/ann_registry.rs:19-28`).
+`crates/khive-retrieval/src/ann/registry.rs:19-28`).
 
 Wildcard rows enter the compaction minimum of every namespace in the pair (Amendment 1,
 "Global-scope consumers", step 2). A wildcard row held at `-1` would therefore stop log compaction

@@ -9,7 +9,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use khive_runtime::ann_registry::{self, CompactionScope, WatermarkAuthority, PENDING_WATERMARK};
+use khive_retrieval::ann::registry::{
+    self as ann_registry, CompactionScope, WatermarkAuthority, PENDING_WATERMARK,
+};
 use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{
     is_benign_shutdown_cancellation, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
@@ -1347,23 +1349,20 @@ fn start_rotation_watcher_with_shutdown(
     }
 
     let ann = Arc::downgrade(ann);
+    let tick = move || {
+        let ann = ann.upgrade();
+        let ann_root = ann_root.clone();
+        async move {
+            let Some(ann) = ann else {
+                return std::ops::ControlFlow::Break(());
+            };
+            refresh_rotated_segments_in_root(&ann_root, &ann).await;
+            std::ops::ControlFlow::Continue(())
+        }
+    };
     Some(khive_runtime::spawn_named_tracked_task(
         "memory_ann_rotation_watch",
-        async move {
-            let start = tokio::time::Instant::now() + ROTATION_WATCH_INTERVAL;
-            let mut ticks = tokio::time::interval_at(start, ROTATION_WATCH_INTERVAL);
-            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = ticks.tick() => {}
-                }
-                let Some(ann) = ann.upgrade() else {
-                    break;
-                };
-                refresh_rotated_segments_in_root(&ann_root, &ann).await;
-            }
-        },
+        khive_retrieval::ann::rotation_watch_loop(ROTATION_WATCH_INTERVAL, shutdown, tick),
     ))
 }
 
@@ -2116,32 +2115,10 @@ fn ann_segment_dir_from_root(ann_root: &std::path::Path, model: &str) -> std::pa
     ann_root.join(hex)
 }
 
-fn acquire_bridge_checkpoint_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
-    std::fs::create_dir_all(dir).map_err(|error| {
-        format!(
-            "create memory ANN checkpoint directory {}: {error}",
-            dir.display()
-        )
-    })?;
-    let lock_path = dir.join(".bridge-checkpoint.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| format!("open memory ANN lock {}: {error}", lock_path.display()))?;
-    lock.lock()
-        .map_err(|error| format!("acquire memory ANN lock {}: {error}", lock_path.display()))?;
-    Ok(lock)
-}
-
 async fn acquire_bridge_checkpoint_lock_async(
     dir: std::path::PathBuf,
 ) -> Result<std::fs::File, String> {
-    tokio::task::spawn_blocking(move || acquire_bridge_checkpoint_lock(&dir))
-        .await
-        .map_err(|error| format!("memory ANN lock task failed: {error}"))?
+    khive_retrieval::ann::acquire_checkpoint_lock_async(dir, "memory ANN").await
 }
 
 /// Install `candidate`, replacing an equal-or-newer-generation incumbent but
@@ -2202,19 +2179,12 @@ async fn register_consumer_identity(
         // durable consumer to age-retire, so that's sufficient here.
         let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: "INSERT OR IGNORE INTO ann_consumer_watermark \
-                      (consumer, namespace, embedding_model, watermark) \
-                      VALUES (?1, ?2, ?3, ?4)"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(consumer.into()),
-                    SqlValue::Text(ANN_WILDCARD_NS.into()),
-                    SqlValue::Text(model.to_owned()),
-                    SqlValue::Integer(PENDING_WATERMARK),
-                ],
-                label: Some("memory_ann_register_pathless_consumer".into()),
-            })
+            .execute(ann_registry::pathless_register_pending(
+                "memory_",
+                consumer,
+                ANN_WILDCARD_NS,
+                model,
+            ))
             .await
             .map_err(|e| e.to_string())?;
         return Ok(());
@@ -2291,28 +2261,9 @@ async fn read_consumer_watermark(
     consumer: &str,
 ) -> Result<Option<i64>, String> {
     let sql = rt.sql();
-    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT watermark FROM ann_consumer_watermark \
-                  WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3"
-                .into(),
-            params: vec![
-                SqlValue::Text(consumer.into()),
-                SqlValue::Text(ANN_WILDCARD_NS.into()),
-                SqlValue::Text(model.to_owned()),
-            ],
-            label: Some("memory_ann_read_own_watermark".into()),
-        })
+    ann_registry::read_watermark(sql.as_ref(), "memory_", consumer, ANN_WILDCARD_NS, model)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(rows
-        .into_iter()
-        .next()
-        .and_then(|row| match row.get("watermark") {
-            Some(SqlValue::Integer(n)) => Some(*n),
-            _ => None,
-        }))
+        .map_err(|e| e.to_string())
 }
 
 /// Conditionally raise this consumer's registered watermark after a durable
@@ -2338,29 +2289,16 @@ async fn raise_consumer_watermark_with_authority(
     let raised = if ann_segment_dir(rt, model).is_none() {
         let watermark = i64::try_from(s)
             .map_err(|_| format!("memory ANN watermark {s} exceeds SQLite INTEGER range"))?;
-        let predicate = match authority {
-            WatermarkAuthority::PendingOrActive => {
-                "(watermark = -2 OR (watermark >= 0 AND watermark <= ?4))"
-            }
-            WatermarkAuthority::Active => "watermark >= 0 AND watermark <= ?4",
-            WatermarkAuthority::Recovering => "watermark = -1",
-        };
         let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: format!(
-                    "UPDATE ann_consumer_watermark SET watermark = ?4 \
-                     WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3 \
-                       AND {predicate}"
-                ),
-                params: vec![
-                    SqlValue::Text(consumer.into()),
-                    SqlValue::Text(ANN_WILDCARD_NS.into()),
-                    SqlValue::Text(model.to_owned()),
-                    SqlValue::Integer(watermark),
-                ],
-                label: Some("memory_ann_raise_pathless_watermark".into()),
-            })
+            .execute(ann_registry::pathless_raise_watermark(
+                "memory_",
+                consumer,
+                ANN_WILDCARD_NS,
+                model,
+                watermark,
+                authority,
+            ))
             .await
             .map_err(|e| e.to_string())?
             == 1
@@ -2395,18 +2333,11 @@ async fn compact_log(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
         // multi-statement transaction between pooled writer operations.
         let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
         writer
-            .execute(SqlStatement {
-                sql: "DELETE FROM ann_write_log \
-                      WHERE embedding_model = ?1 \
-                        AND seq <= (SELECT MIN(watermark.watermark) \
-                                    FROM ann_consumer_watermark watermark \
-                                    WHERE (watermark.namespace = ann_write_log.namespace \
-                                           OR watermark.namespace = '*') \
-                                      AND watermark.embedding_model = ?1)"
-                    .into(),
-                params: vec![SqlValue::Text(model.to_owned())],
-                label: Some("memory_ann_compact_pathless_log".into()),
-            })
+            .execute(ann_registry::pathless_compact_log(
+                "memory_",
+                CompactionScope::Model,
+                model,
+            ))
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())?;
