@@ -73,6 +73,7 @@ rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 # armed-capture hook while the release dependency above stays untouched.
 khive-mcp = { version = "0.9.0", path = "../khive-mcp", features = ["test-forward-seam"] }
 khive-gate-rego = { version = "0.9.0", path = "../khive-gate-rego" }
+khive-retrieval = { version = "0.9.0", path = "../khive-retrieval" }
 khive-storage = { version = "0.9.0", path = "../khive-storage", features = ["test-support"] }
 khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["test-internals"] }
 blake3 = { workspace = true }

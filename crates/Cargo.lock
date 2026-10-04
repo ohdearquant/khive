@@ -3115,6 +3115,7 @@ dependencies = [
  "khive-pack-workspace",
  "khive-repo-showcase",
  "khive-request",
+ "khive-retrieval",
  "khive-runtime",
  "khive-score",
  "khive-storage",

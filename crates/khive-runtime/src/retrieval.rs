@@ -1636,6 +1636,9 @@ fn rrf_fuse(
 }
 
 #[cfg(test)]
+mod rrf_fuse_label_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
