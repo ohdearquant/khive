@@ -1,0 +1,7018 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex as StdMutex};
+
+use async_trait::async_trait;
+use khive_pack_kg::KgPack;
+use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, RuntimeError, VerbRegistryBuilder};
+use khive_storage::Entity;
+use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+use serde_json::{json, Value};
+use serial_test::serial;
+use tokio::sync::Notify;
+use tracing::field::{Field, Visit};
+use uuid::Uuid;
+
+use crate::MemoryPack;
+
+mod timing {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test_support/timing.rs"
+    ));
+}
+
+#[test]
+fn session_retry_deadline_obeys_caller_window_but_first_attempt_does_not() {
+    let now = std::time::Instant::now();
+    let request_cap = now + std::time::Duration::from_secs(2);
+    let caller_cap = now + std::time::Duration::from_millis(25);
+    assert_eq!(
+        super::session_attempt_deadline(true, caller_cap, request_cap),
+        request_cap,
+        "timeout_ms=0 still permits one immediate proof and candidate attempt"
+    );
+    assert_eq!(
+        super::session_attempt_deadline(false, caller_cap, request_cap),
+        caller_cap,
+        "a retry already in flight must end at the caller's wait deadline"
+    );
+    assert_eq!(
+        super::session_attempt_deadline(false, request_cap, caller_cap),
+        caller_cap,
+        "the request cap can end a retry sooner than the caller window"
+    );
+}
+
+#[test]
+fn rank_sort_keeps_nan_last_and_breaks_equal_scores_by_id() {
+    let mut scores = [
+        (f32::NAN, "nan-b"),
+        (0.5, "mid-b"),
+        (0.75, "high"),
+        (f32::NAN, "nan-a"),
+        (0.5, "mid-a"),
+        (-0.25, "low"),
+    ];
+    scores.sort_by(|a, b| super::compare_rank_scores_desc(a.0, b.0).then(a.1.cmp(b.1)));
+    assert_eq!(
+        scores.map(|(_, id)| id),
+        ["high", "mid-a", "mid-b", "low", "nan-a", "nan-b"]
+    );
+}
+
+/// Keeps a file-backed test runtime alive before removing its database directory.
+/// Fields are declared in drop order: the runtime closes before the guard cleans up.
+struct TestRuntime {
+    runtime: KhiveRuntime,
+    _temp_dir: Option<tempfile::TempDir>,
+}
+
+impl TestRuntime {
+    fn in_memory(runtime: KhiveRuntime) -> Self {
+        Self {
+            runtime,
+            _temp_dir: None,
+        }
+    }
+}
+
+impl std::ops::Deref for TestRuntime {
+    type Target = KhiveRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        &self.runtime
+    }
+}
+
+fn memory_runtime_with_fresh_tail(ann_fresh_tail_enabled: bool) -> KhiveRuntime {
+    KhiveRuntime::memory()
+        .expect("in-memory runtime")
+        .with_ann_fresh_tail_enabled(ann_fresh_tail_enabled)
+}
+
+#[derive(Clone, Debug, Default)]
+struct CapturedWarning {
+    fields: HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct WarningVisitor(CapturedWarning);
+
+impl Visit for WarningVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0
+            .fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.fields.insert(
+            field.name().to_string(),
+            format!("{value:?}").trim_matches('"').to_string(),
+        );
+    }
+}
+
+struct WarningCapture {
+    warnings: Arc<StdMutex<Vec<CapturedWarning>>>,
+}
+
+impl tracing::Subscriber for WarningCapture {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut visitor = WarningVisitor::default();
+            event.record(&mut visitor);
+            self.warnings.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// `limit=0` returns no hits, the same as `top_k=0`; a lower clamp of one
+/// used to turn it into a single hit.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_limit_zero_returns_no_hits_like_top_k_zero() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+    for i in 0..3 {
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            &format!("limit zero probe note {i}"),
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let hits_for = |params: serde_json::Value| {
+        let registry = &registry;
+        async move {
+            let out = registry
+                .dispatch("memory.recall", params)
+                .await
+                .expect("recall dispatch");
+            match out {
+                serde_json::Value::Array(items) => items.len(),
+                serde_json::Value::Object(map) => map
+                    .get("results")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0),
+                _ => panic!("unexpected recall shape"),
+            }
+        }
+    };
+
+    let control = hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 2})).await;
+    assert_eq!(
+        control, 2,
+        "limit=2 is the control and must return two hits"
+    );
+    let by_top_k =
+        hits_for(serde_json::json!({"query": "limit zero probe note", "top_k": 0})).await;
+    assert_eq!(by_top_k, 0, "top_k=0 returns no hits");
+    let by_limit =
+        hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 0})).await;
+    assert_eq!(by_limit, 0, "limit=0 returns no hits, the same as top_k=0");
+}
+
+/// Exercises `$` sanitization; serialized because non-empty recall tracks background work.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_with_dollar_sign_query_does_not_error() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "use $prev.id to chain calls",
+        Some(0.7),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "$prev.id",
+                "limit": 10
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_ok(),
+        "#388 memory.recall must not hard-fail on a '$'-bearing query, got: {:?}",
+        result.err()
+    );
+}
+
+use crate::test_support::HashVecProvider;
+
+/// Verifies `@` is quoted as an unsafe FTS5 bareword and dispatch succeeds.
+// `#[serial(background_tasks)]`: kept to match the fixture setup used by
+// the sibling dollar-sign test above.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_with_residual_fts5_char_now_sanitized() {
+    const MODEL: &str = "recall-residual-char-test-model";
+    const DIMS: usize = 32;
+    const NOTE_TEXT: &str = "foo@bar chain call helper note";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    // embedding_model: None — create_note auto-detects the registered
+    // custom provider (resolve_embedding_model only handles lattice
+    // aliases; custom provider names go through the auto-detect path).
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    // Query text matches the note content exactly so the hash-vec embedder
+    // (which has no semantic notion of similarity) would produce an
+    // identical vector for query and note if the FTS leg degraded instead
+    // of failing loud.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": NOTE_TEXT,
+                "limit": 10
+            }),
+        )
+        .await;
+
+    let value = result.unwrap_or_else(|e| {
+        panic!("#916 memory.recall must not fail on an '@'-bearing query, got: {e:?}")
+    });
+    let hits = value.as_array().expect("recall result must be an array");
+    assert!(
+        !hits.is_empty(),
+        "#916 '@'-bearing query must still find the seeded note; got {value:?}"
+    );
+}
+
+// ── #836: bounded ANN readiness wait + FTS-only degraded fallback ─────────
+
+/// A held ANN warm lock must time out to a marked FTS-only result.
+/// See `crates/khive-pack-memory/docs/recall-reliability.md`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_836_degrades_to_fts_only_when_ann_lock_is_held() {
+    const MODEL: &str = "recall-836-ann-timeout-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "issue 836 bounded ann acquire recall fts fallback note";
+    const ANN_READY_TIMEOUT_MS: u64 = 100;
+    const CALLER_DEADLINE_MS: u64 = 1_000;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let pack = MemoryPack::new(rt.clone());
+    let ann_handle = pack.ann.clone();
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry");
+
+    // Simulate the daemon's boot-time background warm holding the
+    // per-model single-flight lock mid-build (ann.rs `model_warm_lock`),
+    // exactly the contention #836 diagnosed.
+    let key = crate::ann::AnnKey::new(MODEL);
+    let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        registry.dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "836 bounded ann acquire",
+                "limit": 10,
+                "config": {
+                    "ann_ready_timeout_ms": ANN_READY_TIMEOUT_MS,
+                    "recall_deadline_ms": CALLER_DEADLINE_MS
+                }
+            }),
+        ),
+    )
+    .await
+    .expect("#836 recall exceeded the held-stage hang watchdog")
+    .expect("recall must not error when the ANN leg times out");
+    let elapsed = start.elapsed();
+
+    let results = result.as_array().expect("recall result must be an array");
+    assert!(
+        !results.is_empty(),
+        "FTS leg must still surface the seeded note when the ANN leg degrades"
+    );
+    for r in results {
+        assert_eq!(
+            r.get("degraded").and_then(Value::as_str),
+            Some("ann_unavailable"),
+            "#836 degraded result must carry the ann_unavailable marker, got: {r:?}"
+        );
+    }
+
+    // Coverage retains the watchdog and result assertions without making
+    // instrumented scheduling part of the caller-latency contract.
+    let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 2;
+    if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
+        assert!(
+            elapsed < caller_bound,
+            "#836 recall exceeded its caller-derived completion bound \
+                 {caller_bound:?}, took {elapsed:?}"
+        );
+    }
+}
+
+/// Uncontended ANN readiness must not add a degradation marker.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_836_normal_path_has_no_degraded_marker() {
+    const MODEL: &str = "recall-836-ann-normal-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "issue 836 normal path recall without any ann contention";
+
+    let rt = memory_runtime_with_fresh_tail(true);
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "836 normal path recall",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall must succeed on the normal, uncontended path");
+
+    let results = result.as_array().expect("recall result must be an array");
+    assert!(
+        !results.is_empty(),
+        "normal recall must surface the seeded note"
+    );
+    for r in results {
+        assert!(
+            r.get("degraded").is_none(),
+            "normal recall must not carry a degraded marker, got: {r:?}"
+        );
+    }
+}
+
+/// A degraded recall and a clean recall must be distinguishable on the
+/// EVENT plane, not only in the response envelope. Both serve a caller
+/// successfully, so a consumer counting recalls sees two identical rows
+/// unless the degradation is carried into the payload. Fails on
+/// `63f1f78d1`, where `recall_executed` carried no degradation field at
+/// all and the two arms below produced byte-identical markers.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_executed_event_carries_the_degradation() {
+    const MODEL: &str = "recall-degraded-event-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "degraded event plane recall marker seeded note";
+    const DEGRADED_QUERY: &str = "degraded event plane recall";
+    const CLEAN_QUERY: &str = "event plane recall marker";
+
+    let rt = memory_runtime_with_fresh_tail(true);
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let pack = MemoryPack::new(rt.clone());
+    let ann_handle = pack.ann.clone();
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry");
+
+    let key = crate::ann::AnnKey::new(MODEL);
+    let held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+    registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": DEGRADED_QUERY,
+                "limit": 10,
+                "config": { "ann_ready_timeout_ms": 100 }
+            }),
+        )
+        .await
+        .expect("degraded recall must still serve");
+    drop(held);
+
+    // The control arm, in the same test and against the same store: an
+    // uncontended recall must produce the OPPOSITE marker, otherwise the
+    // assertion below passes on a field that is simply always true.
+    registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": CLEAN_QUERY,
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("uncontended recall must serve");
+
+    // Both emissions are fired off the response path via
+    // `track_background_task`, so poll for the pair rather than assume
+    // they have landed.
+    let store = rt.events(&token).expect("event store for local namespace");
+    let mut events = Vec::new();
+    for _ in 0..100 {
+        let page = store
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![khive_types::EventKind::RecallExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events");
+        if page.items.len() >= 2 {
+            events = page.items;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        events.len(),
+        2,
+        "both recalls must emit a recall_executed event, got: {events:?}"
+    );
+
+    let find = |q: &str| {
+        events
+            .iter()
+            .find(|e| e.payload["query"] == serde_json::json!(q))
+            .unwrap_or_else(|| panic!("no recall_executed event for query {q:?}: {events:?}"))
+    };
+
+    let degraded = find(DEGRADED_QUERY);
+    assert_eq!(
+        degraded.payload["degraded"],
+        serde_json::json!(true),
+        "a degraded recall must say so on the event plane, got: {:?}",
+        degraded.payload
+    );
+    let reason = degraded.payload["degraded_reason"]
+        .as_str()
+        .unwrap_or_else(|| panic!("degraded event must carry a reason: {:?}", degraded.payload));
+    assert!(
+        !reason.is_empty(),
+        "the degradation reason must be the failure-site string, not an empty placeholder"
+    );
+
+    let clean = find(CLEAN_QUERY);
+    assert_eq!(
+        clean.payload["degraded"],
+        serde_json::json!(false),
+        "an uncontended recall must not be reported as degraded, got: {:?}",
+        clean.payload
+    );
+    assert_eq!(
+        clean.payload["degraded_reason"],
+        serde_json::Value::Null,
+        "a clean recall carries no reason at all, got: {:?}",
+        clean.payload
+    );
+}
+
+/// #1477: an exceptional fresh-tail skip (here, the runtime's exact leg is
+/// disabled, as production can request via construction-time
+/// `KHIVE_ANN_FRESH_TAIL=0`) forfeits read-your-writes visibility on the
+/// warm-index path — that is degraded serving, not an ordinary healthy
+/// response, and must be disclosed on a non-empty response the same way
+/// #836's bounded-wait degradation already is. Fails on `f74c5461f`, where
+/// a skipped fresh-tail leg on the warm-index path left `degraded: false`
+/// and no per-item marker at all.
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+#[serial_test::serial(config_ledger)]
+async fn recall_1477_skipped_fresh_tail_stamps_degraded() {
+    const MODEL: &str = "recall-1477-fresh-tail-disabled-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "issue 1477 fresh tail disabled recall degradation note";
+
+    let rt = memory_runtime_with_fresh_tail(false);
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let pack = MemoryPack::new(rt.clone());
+    let ann_handle = pack.ann.clone();
+
+    // Warm the ANN bridge synchronously so the fresh-tail leg is
+    // exercised via the warm-index branch (initial_raw_hits present),
+    // not the ANN-not-ready branch.
+    crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+        .await
+        .expect("warm ann build");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "1477 fresh tail disabled recall",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall must not error when the fresh-tail leg is disabled");
+
+    let results = result.as_array().expect("recall result must be an array");
+    assert!(
+        !results.is_empty(),
+        "the seeded note must still surface via the warm-index candidates"
+    );
+    for r in results {
+        assert_eq!(
+            r.get("degraded").and_then(Value::as_str),
+            Some("ann_unavailable"),
+            "#1477 a disabled fresh-tail leg must stamp the existing \
+                 degradation marker on a non-empty response, got: {r:?}"
+        );
+        let reason = r
+            .get("degraded_reason")
+            .and_then(Value::as_str)
+            .expect("#1477 a disabled fresh-tail leg must carry a degraded_reason string");
+        assert!(
+            !reason.is_empty(),
+            "#1477 degraded_reason must be non-empty (captured at the \
+                 failure site), got: {r:?}"
+        );
+    }
+}
+
+/// #2587: a fresh-tail skip that discarded an error must carry it out to
+/// the caller. One label covers causes that differ in what the caller
+/// should do next, so the label alone cannot separate a retryable read
+/// from a store that needs rebuilding. This is the non-empty response
+/// shape: the per-hit stamp plus an enriched `degraded_reason`.
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+#[serial_test::serial(config_ledger)]
+async fn recall_2587_degraded_reason_carries_the_error_on_a_non_empty_response() {
+    const MODEL: &str = "recall-2587-non-empty-enriched-reason-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "issue 2587 enriched degraded reason recall note";
+    const QUERY: &str = "2587 enriched degraded reason recall";
+
+    let rt = memory_runtime_with_fresh_tail(true);
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let pack = MemoryPack::new(rt.clone());
+    let ann_handle = pack.ann.clone();
+
+    // Warm the bridge synchronously so the fresh-tail leg runs on the
+    // warm-index branch, as in the disabled-leg test above.
+    crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+        .await
+        .expect("warm ann build");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry");
+
+    // Control, same store and same query: a healthy recall carries no
+    // degradation fields at all, so the assertions below cannot pass on a
+    // path that always reports degraded.
+    let clean = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({ "query": QUERY, "limit": 10 }),
+        )
+        .await
+        .expect("healthy recall must serve");
+    let clean_results = clean
+        .as_array()
+        .expect("a healthy recall keeps the bare-array shape");
+    assert!(
+        !clean_results.is_empty(),
+        "control: the seeded note must surface, got: {clean:?}"
+    );
+    for r in clean_results {
+        assert_eq!(
+            r.get("degraded"),
+            None,
+            "control: a healthy recall carries no degradation stamp, got: {r:?}"
+        );
+        assert_eq!(
+            r.get("degraded_reason"),
+            None,
+            "control: a healthy recall carries no reason, got: {r:?}"
+        );
+    }
+
+    // Fault injection: remove the write-log table the fresh-tail leg's
+    // tail fetch reads, so the leg skips for a nameable reason. (Test
+    // fixture database, mirroring the DROP TABLE fault pattern used by
+    // the event-store acquisition test further down this file.)
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("fault injection writer");
+        writer
+            .execute(khive_storage::types::SqlStatement {
+                sql: "DROP TABLE ann_write_log".into(),
+                params: vec![],
+                label: Some("test_drop_write_log_for_enriched_reason".into()),
+            })
+            .await
+            .expect("drop the write-log table");
+    }
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({ "query": QUERY, "limit": 10 }),
+        )
+        .await
+        .expect("a degraded recall must still serve");
+
+    let results = result
+        .as_array()
+        .expect("a non-empty degraded recall keeps the bare-array shape");
+    assert!(
+        !results.is_empty(),
+        "the warm-index candidates must still be served, got: {result:?}"
+    );
+    for r in results {
+        assert_eq!(
+            r.get("degraded").and_then(Value::as_str),
+            Some("ann_unavailable"),
+            "#2587 a skipped fresh-tail leg must still stamp the marker, got: {r:?}"
+        );
+        let reason = r
+            .get("degraded_reason")
+            .and_then(Value::as_str)
+            .expect("#2587 a degraded hit must carry a degraded_reason string");
+        assert!(
+            reason.contains("fresh-tail: tail fetch failed"),
+            "#2587 the reason must keep its failure-site label, got: {reason:?}"
+        );
+        assert!(
+            reason.contains("ann_write_log"),
+            "#2587 the reason must carry the error that caused the skip, \
+                 not only the label every read failure at that site shares, \
+                 got: {reason:?}"
+        );
+    }
+}
+
+/// #2587 companion: the empty-result shape must carry the same enriched
+/// reason. Here the bounded ANN wait expires and the no-index fresh-tail
+/// tier then fails its own read, so the response is the degraded-empty
+/// envelope rather than a bare array.
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+#[serial_test::serial(config_ledger)]
+async fn recall_2587_degraded_reason_carries_the_error_on_an_empty_response() {
+    const MODEL: &str = "recall-2587-empty-enriched-reason-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "alpha bravo charlie delta echo foxtrot";
+    const QUERY: &str = "zulu yankee xray whiskey victor";
+
+    let rt = memory_runtime_with_fresh_tail(true);
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let pack = MemoryPack::new(rt.clone());
+    let ann_handle = pack.ann.clone();
+
+    // One warm registers and activates this consumer, which the capped
+    // fresh-tail tier requires before it will run at all.
+    crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+        .await
+        .expect("warm ann build");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry");
+
+    let key = crate::ann::AnnKey::new(MODEL);
+    // Evict the serving bridge and hold the warm lock so the recall's
+    // bounded wait expires: that is the branch whose fresh-tail leg runs
+    // on the no-index tier.
+    crate::ann::clear_key(&ann_handle, &key).await;
+    let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+
+    // Control, before the fault: a term-disjoint query over a degraded
+    // but readable store returns the degraded-empty envelope WITHOUT the
+    // fresh-tail skip folded in, so the assertion below is about the
+    // enrichment and not about degradation being reported at all.
+    let clean = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": QUERY,
+                "limit": 10,
+                "config": { "ann_ready_timeout_ms": 100 }
+            }),
+        )
+        .await
+        .expect("bounded-wait recall must still serve");
+    let clean_reason = clean
+        .as_object()
+        .and_then(|obj| obj.get("degraded_reason"))
+        .and_then(Value::as_str)
+        .expect("control: a bounded-wait degradation carries its own reason");
+    assert!(
+        !clean_reason.contains("ann_write_log"),
+        "control: nothing has failed in the write log yet, got: {clean_reason:?}"
+    );
+
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("fault injection writer");
+        writer
+            .execute(khive_storage::types::SqlStatement {
+                sql: "DROP TABLE ann_write_log".into(),
+                params: vec![],
+                label: Some("test_drop_write_log_for_empty_enriched_reason".into()),
+            })
+            .await
+            .expect("drop the write-log table");
+    }
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": QUERY,
+                "limit": 10,
+                "config": { "ann_ready_timeout_ms": 100 }
+            }),
+        )
+        .await
+        .expect("a degraded-empty recall must not error");
+
+    let obj = result
+        .as_object()
+        .expect("#2587 a degraded-empty recall must return the envelope shape");
+    assert_eq!(
+        obj.get("results"),
+        Some(&serde_json::json!([])),
+        "#2587 this scenario is the empty shape, got: {result:?}"
+    );
+    assert_eq!(
+        obj.get("degraded").and_then(Value::as_bool),
+        Some(true),
+        "#2587 a degraded-empty recall must set degraded: true, got: {result:?}"
+    );
+    let reason = obj
+        .get("degraded_reason")
+        .and_then(Value::as_str)
+        .expect("#2587 a degraded-empty recall must carry a degraded_reason string");
+    assert!(
+        reason.contains("fresh-tail: tail-existence read failed"),
+        "#2587 the reason must keep its failure-site label, got: {reason:?}"
+    );
+    assert!(
+        reason.contains("ann_write_log"),
+        "#2587 the reason must carry the error that caused the skip, got: {reason:?}"
+    );
+}
+
+/// A budget cutoff at the first ranked candidate and an ANN degradation
+/// can hold at once, and the budget-cap envelope returns before the
+/// degradation envelope: without the degraded fields on that early
+/// return, a capped-empty degraded response reads as
+/// clean-empty-but-truncated and the caller loses the signal that
+/// distinguishes degraded-empty from a genuine no-match.
+#[tokio::test]
+#[serial(adr118_fresh_tail)]
+#[serial_test::serial(config_ledger)]
+async fn recall_budget_capped_empty_response_still_discloses_ann_degradation() {
+    const MODEL: &str = "recall-budget-capped-degraded-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "budget capped degraded disclosure note body";
+
+    let rt = memory_runtime_with_fresh_tail(false);
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let pack = MemoryPack::new(rt.clone());
+    let ann_handle = pack.ann.clone();
+
+    // A one-character budget guarantees the first ranked candidate
+    // exceeds it, so ranking survives but serving empties: budget_capped
+    // with zero results.
+    {
+        let mut cfg = pack.config.lock().unwrap();
+        cfg.scoring = Some(crate::scoring::ScoringConfig {
+            default_token_budget: 1,
+            chars_per_token: 1,
+            ..Default::default()
+        });
+    }
+
+    // Warm the ANN bridge so the disabled fresh-tail leg is what makes
+    // the response degraded (as in the #1477 test above), not ANN
+    // unavailability.
+    crate::ann::ensure_ann_for_model(&rt, &token, &ann_handle, MODEL)
+        .await
+        .expect("warm ann build");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "budget capped degraded disclosure",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("capped degraded recall must not error");
+
+    let obj = result
+        .as_object()
+        .expect("capped-empty response must be the envelope shape, not a bare array");
+    assert_eq!(
+        obj.get("truncated").and_then(Value::as_bool),
+        Some(true),
+        "budget cutoff at the first candidate must disclose truncation: {result:?}"
+    );
+    assert!(
+        obj.get("results")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "this scenario is specifically the capped-EMPTY shape: {result:?}"
+    );
+    assert_eq!(
+        obj.get("degraded").and_then(Value::as_bool),
+        Some(true),
+        "a budget cutoff must not silence the concurrent ANN degradation: {result:?}"
+    );
+    let reason = obj
+        .get("degraded_reason")
+        .and_then(Value::as_str)
+        .expect("capped-empty degraded response must carry degraded_reason");
+    assert!(
+        !reason.is_empty(),
+        "degraded_reason must be non-empty (captured at the failure site): {result:?}"
+    );
+}
+
+/// #1657: ANN timeout plus no FTS match is a third state — the response
+/// must carry the machine-readable degraded marker and a non-empty reason
+/// captured at the failure site, never a bare [] (indistinguishable from a
+/// genuine no-match) and never an error.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn recall_1657_degraded_with_zero_fts_hits_carries_marker_and_reason() {
+    const MODEL: &str = "recall-1657-ann-timeout-empty-model";
+    const DIMS: usize = 16;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    // Deliberately no notes seeded: the FTS leg has nothing to match, so
+    // an ANN-degraded recall resolves to an empty result set that must
+    // still carry the degradation evidence.
+    let pack = MemoryPack::new(rt.clone());
+    let ann_handle = pack.ann.clone();
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry");
+
+    let key = crate::ann::AnnKey::new(MODEL);
+    let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "no such content exists anywhere",
+                "limit": 10,
+                "config": { "ann_ready_timeout_ms": 100 }
+            }),
+        )
+        .await
+        .expect("recall must not error when both legs come up empty under ANN degradation");
+
+    let obj = result.as_object().expect(
+            "#1657 degraded-empty recall must return an object carrying the degraded marker, not a bare array",
+        );
+    assert_eq!(
+        obj.get("results"),
+        Some(&serde_json::json!([])),
+        "#1657 degraded-empty recall must carry an empty results array, got: {result:?}"
+    );
+    assert_eq!(
+        obj.get("degraded").and_then(Value::as_bool),
+        Some(true),
+        "#1657 degraded-empty recall must set degraded: true, got: {result:?}"
+    );
+    let reason = obj
+        .get("degraded_reason")
+        .and_then(Value::as_str)
+        .expect("#1657 degraded-empty recall must carry a degraded_reason string");
+    assert!(
+        !reason.trim().is_empty(),
+        "#1657 degraded_reason must be non-empty (captured at the failure site), got: {result:?}"
+    );
+}
+
+/// #1657 companion arm: a genuine no-match (no degradation) keeps the
+/// marker absent — the two empty outcomes must stay distinguishable.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn recall_1657_genuine_empty_match_has_no_degraded_marker() {
+    const MODEL: &str = "recall-1657-genuine-empty-model";
+    const DIMS: usize = 16;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    // No notes seeded and no lock held: the store genuinely has nothing
+    // and every engine serves normally, so the response must be a bare
+    // empty array with no degraded marker.
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "no such content exists anywhere",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall must succeed on a genuinely empty store");
+
+    assert_eq!(
+            result,
+            serde_json::json!([]),
+            "#1657 a genuine no-match must stay a bare empty array with no degraded marker, got: {result:?}"
+        );
+}
+
+/// #1657 failure-site arms: `collect_model_ann_hits` converts a per-model
+/// retrieval failure into a degraded outcome (ADR-031 engine isolation)
+/// and must capture the reason at the failure site with {:?} formatting —
+/// never assemble it later from memory of the failure. The bounded-wait
+/// timeout arm likewise records why this model served FTS-only.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn recall_1657_degraded_outcome_captures_reason_at_failure_site() {
+    const MODEL: &str = "recall-1657-failure-site-model";
+    const COLD_MODEL: &str = "recall-1657-failure-site-cold-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "issue 1657 failure site reason capture note";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+    rt.register_embedder(HashVecProvider {
+        model_name: COLD_MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let ann = crate::ann::new_shared();
+    let key = crate::ann::AnnKey::new(MODEL);
+
+    // Build a real warm index so the failpoint fails the warm-ANN leg
+    // itself (not an empty/never-built index).
+    crate::ann::ensure_ann_for_model(&rt, &token, &ann, MODEL)
+        .await
+        .expect("ensure ANN for the seeded note");
+    assert!(
+        crate::ann::is_current(&ann, &key).await,
+        "the ensured ANN must be current before the failure is injected"
+    );
+
+    // Arm 1 — retrieval failure: the failpoint makes the inner warm-ANN
+    // search return an error; the wrapper must degrade (not propagate) and
+    // capture the actual error with {:?} at the failure site.
+    super::super::common::retrieval_failpoints::fail_ann(MODEL);
+    let outcome = super::super::common::collect_model_ann_hits(
+        &rt,
+        &ann,
+        &token,
+        "local",
+        &["local".to_string()],
+        MODEL.to_string(),
+        vec![0.0_f32; DIMS],
+        10,
+        40,
+        2,
+        1_000,
+        None,
+    )
+    .await
+    .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
+    super::super::common::retrieval_failpoints::clear_ann(MODEL);
+
+    assert!(
+        outcome.degraded,
+        "#1657 a failed warm-ANN leg must mark the per-model outcome degraded"
+    );
+    let reason = outcome
+        .degraded_reason
+        .expect("#1657 a degraded per-model outcome must carry a failure-site reason");
+    assert!(
+        reason.contains("test-injected ANN retrieval failure"),
+        "#1657 the reason must be captured at the failure site from the actual \
+             error with {{:?}} formatting, got: {reason:?}"
+    );
+
+    // Arm 2 — bounded-wait timeout: hold the cold model's real detached
+    // ensure task unresolved so the receiver cannot win the timeout race.
+    let build_hook = super::super::common::retrieval_failpoints::hold_ann_build(COLD_MODEL);
+    let outcome2 = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        super::super::common::collect_model_ann_hits(
+            &rt,
+            &ann,
+            &token,
+            "local",
+            &["local".to_string()],
+            COLD_MODEL.to_string(),
+            vec![0.0_f32; DIMS],
+            10,
+            40,
+            2,
+            0,
+            None,
+        ),
+    )
+    .await
+    .expect("the readiness wait must stay bounded while the detached build is held")
+    .expect("the wrapper must degrade to FTS-only, never propagate a retrieval failure");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        build_hook.wait_entered(),
+    )
+    .await
+    .expect("detached ANN build must reach the test hook");
+    build_hook.release();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        build_hook.wait_completed(),
+    )
+    .await
+    .expect("detached ANN build must finish after the hook releases it");
+
+    assert!(
+        outcome2.degraded,
+        "#1657 a bounded-out readiness wait must mark the per-model outcome degraded"
+    );
+    let reason2 = outcome2
+        .degraded_reason
+        .expect("#1657 a timed-out per-model outcome must carry a failure-site reason");
+    assert!(
+        reason2.contains("bounded wait"),
+        "#1657 the timeout arm must record the bounded wait as the reason, \
+             got: {reason2:?}"
+    );
+}
+
+/// A self-build timeout must leave a tracked build that warms later recalls.
+/// See `crates/khive-pack-memory/docs/recall-reliability.md`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_836_self_build_timeout_detaches_build_instead_of_dropping_it() {
+    const MODEL: &str = "recall-836-self-build-detach-model";
+    const DIMS: usize = 16;
+    const NOTE_TEXT: &str = "issue 836 self build detach recall regression note";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(HashVecProvider {
+        model_name: MODEL.to_owned(),
+        dims: DIMS,
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let pack = MemoryPack::new(rt.clone());
+    let ann_handle = pack.ann.clone();
+    let build_hook = super::super::common::retrieval_failpoints::hold_ann_build(MODEL);
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(pack);
+    let registry = builder.build().expect("registry");
+
+    // Deliberately no lock held here — this is the self-build case: this
+    // recall's own detached `ensure_ann_for_model` call is the only
+    // build in flight for this model.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "836 self build detach",
+                "limit": 10,
+                "config": { "ann_ready_timeout_ms": 0 }
+            }),
+        )
+        .await
+        .expect("recall must not error when the self-build ANN leg times out");
+
+    let results = result.as_array().expect("recall result must be an array");
+    assert!(
+        !results.is_empty(),
+        "FTS leg must still surface the seeded note while the ANN leg degrades"
+    );
+    for r in results {
+        assert_eq!(
+            r.get("degraded").and_then(Value::as_str),
+            Some("ann_unavailable"),
+            "first recall must still degrade to FTS-only within the \
+                 near-zero timeout, got: {r:?}"
+        );
+    }
+
+    // The detached build must keep running after the timed-out recall.
+    // Its test-only completion signal is the pass condition; the outer
+    // timeout is only a hang failsafe.
+    let key = crate::ann::AnnKey::new(MODEL);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        build_hook.wait_entered(),
+    )
+    .await
+    .expect("detached ANN build must reach the test hook");
+    build_hook.release();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        build_hook.wait_completed(),
+    )
+    .await
+    .expect("detached ANN build must finish after the hook releases it");
+    assert!(
+        crate::ann::is_current(&ann_handle, &key).await,
+        "the detached build must eventually install a fresh ANN index for \
+             {MODEL} instead of being dropped on timeout (#836)"
+    );
+
+    // A later recall must now take the vector path — no degraded marker.
+    let result2 = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "836 self build detach",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall must succeed once the detached build has warmed the index");
+    let results2 = result2.as_array().expect("recall result must be an array");
+    assert!(
+        !results2.is_empty(),
+        "warmed recall must still surface the seeded note"
+    );
+    for r in results2 {
+        assert!(
+            r.get("degraded").is_none(),
+            "a recall issued after the detached build completes must take \
+                 the vector path, not degrade, got: {r:?}"
+        );
+    }
+}
+
+// ── ADR-081 §5 (#394): recall serve-time attribution + ledger append ──────
+
+fn build_full_rt_with_brain() -> TestRuntime {
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-recall-adr081-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let db_path = tmp.path().join("khive.db");
+
+    let runtime = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: Some(db_path),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        ..khive_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime");
+    TestRuntime {
+        runtime,
+        _temp_dir: Some(tmp),
+    }
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn hot_path_guard_g1_recall_batches_served_targets_into_one_writer_acquisition() {
+    use khive_runtime::audit_batch::AuditBatchConfig;
+
+    async fn await_tracked_background_idle() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while khive_runtime::background_task_count() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tracked recall and audit tasks must drain");
+    }
+
+    const QUERY: &str = "violet orchard writer acquisition witness";
+    let rt = build_full_rt_with_brain();
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    for _ in 0..8 {
+        rt.create_note(&token, "memory", None, QUERY, Some(0.8), None, vec![])
+            .await
+            .expect("seed a distinct matching memory");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+    builder
+        .with_runtime_event_store(&rt)
+        .expect("use the runtime's real audit batch");
+    // One audit row per generation keeps the miss/hit fixed-cost control stable.
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_rows_per_generation: std::num::NonZeroUsize::new(1).unwrap(),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("registry");
+    assert!(registry.audit_batch_handle().is_some());
+    assert!(
+        rt.backend()
+            .pool()
+            .writer_task_handle()
+            .expect("writer task lookup")
+            .is_some(),
+        "this guard requires the file-backed writer task"
+    );
+
+    await_tracked_background_idle().await;
+    let warm = registry
+        .dispatch("memory.recall", json!({"query": QUERY, "limit": 8}))
+        .await
+        .expect("warm recall");
+    assert_eq!(warm.as_array().expect("warm hits").len(), 8);
+    await_tracked_background_idle().await;
+
+    let before = rt
+        .db_diagnostics()
+        .await
+        .expect("before diagnostics")
+        .writer_contention
+        .writer_task_acquisitions;
+    let miss = registry
+        .dispatch(
+            "memory.recall",
+            json!({"query": "unseeded hazelnut zephyr", "limit": 8}),
+        )
+        .await
+        .expect("no-hit fixed-cost control");
+    assert!(miss.as_array().expect("no-hit results").is_empty());
+    await_tracked_background_idle().await;
+    let after_miss = rt
+        .db_diagnostics()
+        .await
+        .expect("control diagnostics")
+        .writer_contention
+        .writer_task_acquisitions;
+
+    let hit = registry
+        .dispatch("memory.recall", json!({"query": QUERY, "limit": 8}))
+        .await
+        .expect("measured recall");
+    assert_eq!(hit.as_array().expect("measured hits").len(), 8);
+    await_tracked_background_idle().await;
+    let after_hit = rt
+        .db_diagnostics()
+        .await
+        .expect("after diagnostics")
+        .writer_contention
+        .writer_task_acquisitions;
+
+    let event_page = rt
+        .events(&token)
+        .expect("event store")
+        .query_events(
+            khive_storage::EventFilter {
+                kinds: vec![khive_types::EventKind::RecallExecuted],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                limit: 10,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("recall telemetry");
+    assert_eq!(event_page.items.len(), 3, "each recall emitted telemetry");
+    let mut reader = rt.sql().reader().await.expect("serve ledger reader");
+    let ledger_row = reader
+        .query_row(khive_storage::types::SqlStatement {
+            sql: "SELECT COUNT(*) AS count FROM brain_serve_ledger WHERE query_raw = ?1".into(),
+            params: vec![khive_storage::types::SqlValue::Text(QUERY.into())],
+            label: None,
+        })
+        .await
+        .expect("serve ledger query")
+        .expect("count row");
+    assert!(
+        matches!(
+            ledger_row.get("count"),
+            Some(khive_storage::types::SqlValue::Integer(16))
+        ),
+        "warm and measured recalls each persisted eight served targets: {ledger_row:?}"
+    );
+
+    let miss_acquisitions = after_miss - before;
+    let hit_acquisitions = after_hit - after_miss;
+    assert_eq!(
+            hit_acquisitions,
+            miss_acquisitions + 1,
+            "eight served targets may add only one writer-task acquisition beyond the fixed audit and telemetry work"
+        );
+    drop(reader);
+    registry
+        .shutdown_audit_batch()
+        .await
+        .expect("audit batch drains before fixture teardown");
+}
+
+// `#[serial(background_tasks)]`: see the note on
+// `recall_with_dollar_sign_query_does_not_error` above — this test
+// directly exercises the same `track_background_task`-driven ledger
+// append it names, so it shares the process-wide counter.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_stamps_served_by_profile_id_and_appends_serve_ledger_row() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    let note_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "adr081 recall stamp note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr081-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.activate",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "adr081-recall-v1",
+            }),
+        )
+        .await
+        .expect("activate profile");
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "adr081-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr081 recall stamp note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall");
+
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "must find the seeded note");
+    assert_eq!(
+        hits[0]["served_by_profile_id"],
+        serde_json::json!("adr081-recall-v1"),
+        "recall response must stamp the resolved serving profile"
+    );
+    assert_eq!(hits[0]["serve_attribution"], json!("profile"));
+
+    // The ledger append is fired via track_background_task off the response
+    // path, so poll briefly rather than assume it has landed by the time recall returns.
+    let target_id = note_id.id.to_string();
+    let mut found = false;
+    for _ in 0..100 {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT served_by_profile_id FROM brain_serve_ledger \
+                          WHERE target_id = ?1"
+                    .into(),
+                params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                label: None,
+            })
+            .await
+            .expect("query row");
+        if let Some(row) = row {
+            assert!(
+                matches!(
+                    row.get("served_by_profile_id"),
+                    Some(khive_storage::types::SqlValue::Text(s)) if s == "adr081-recall-v1"
+                ),
+                "ledger row must carry the same served_by_profile_id as the response stamp"
+            );
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        found,
+        "serve ledger row for the recalled target must appear within 2s"
+    );
+}
+
+// ADR-081 amendment regression, paired with
+// `recall_stamps_served_by_profile_id_and_appends_serve_ledger_row` above:
+// a bound default profile whose record cannot be read must persist the
+// `unattributed` marker on the serve ledger row itself, not just on the
+// response — see `serve_ledger_stored_unattributed_marker_forces_zero_weight_failsafe`
+// in khive-pack-brain for the paired downstream-scorer assertion this
+// stored marker exists to preserve.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_with_unreadable_bound_profile_persists_unattributed_marker_on_ledger_row() {
+    use khive_pack_brain::BrainPack;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-recall-adr081-unattributed-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let db_path = tmp.path().join("khive.db");
+
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: Some(db_path),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        // Never created via `brain.create_profile` below — `brain.profile`
+        // dispatch fails, which recall.rs treats as an unreadable bound
+        // profile (ADR-104 §1), not a hard error.
+        brain_profile: Some("ghost-unreadable-recall-v1".to_string()),
+        ..khive_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    let note_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "adr081 unattributed ledger marker note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr081 unattributed ledger marker note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall succeeds with an unreadable bound profile");
+
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "must find the seeded note");
+    assert!(
+        hits[0].get("served_by_profile_id").is_none() || hits[0]["served_by_profile_id"].is_null(),
+        "unreadable bound profile must not be stamped as served_by"
+    );
+    assert_eq!(hits[0]["serve_attribution"], json!("unattributed"));
+
+    // The ledger append is fired via track_background_task off the response
+    // path, so poll briefly rather than assume it has landed by the time recall returns.
+    let target_id = note_id.id.to_string();
+    let mut found = false;
+    for _ in 0..100 {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT served_by_profile_id, serve_attribution \
+                          FROM brain_serve_ledger WHERE target_id = ?1"
+                    .into(),
+                params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                label: None,
+            })
+            .await
+            .expect("query row");
+        if let Some(row) = row {
+            assert!(
+                matches!(
+                    row.get("served_by_profile_id"),
+                    None | Some(khive_storage::types::SqlValue::Null)
+                ),
+                "ledger row must not carry a served_by_profile_id for an unreadable profile"
+            );
+            assert!(
+                    matches!(
+                        row.get("serve_attribution"),
+                        Some(khive_storage::types::SqlValue::Text(s)) if s == "unattributed"
+                    ),
+                    "ledger row must persist the unattributed marker, not collapse into a bare null; got {row:?}"
+                );
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        found,
+        "serve ledger row for the recalled target must appear within 2s"
+    );
+}
+
+// ── #866: `recall_executed` event-plane emission ────────────────────────
+
+// `#[serial(background_tasks)]`: shares `recall_stamps_served_by_profile_id_
+// and_appends_serve_ledger_row`'s rationale above: this test drives the
+// same `track_background_task`-fired path (serve-ledger append +
+// `recall_executed` emission now live in the same tracked task).
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_emits_exactly_one_recall_executed_event() {
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "866 recall executed event note",
+        Some(0.7),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "866 recall executed event note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall");
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "must find the seeded note");
+
+    // The emission is fired via track_background_task off the response
+    // path (same seam as the serve-ledger append), so poll briefly rather
+    // than assume it has landed by the time recall returns.
+    let store = rt.events(&token).expect("event store for local namespace");
+    let mut recall_events = Vec::new();
+    for _ in 0..100 {
+        let page = store
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![khive_types::EventKind::RecallExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events");
+        if !page.items.is_empty() {
+            recall_events = page.items;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(
+        recall_events.len(),
+        1,
+        "exactly one recall_executed event per recall serve, got: {recall_events:?}"
+    );
+    let event = &recall_events[0];
+    assert_eq!(event.kind, khive_types::EventKind::RecallExecuted);
+    assert_eq!(event.verb, "memory.recall");
+    assert_eq!(
+        event.payload["result_count"],
+        serde_json::json!(hits.len()),
+        "result_count must match the number of returned results"
+    );
+    assert_eq!(
+        event.payload["served_by_profile_id"],
+        serde_json::Value::Null,
+        "no profile was bound/resolved for this call"
+    );
+    assert_eq!(
+        event.payload["serve_attribution"],
+        json!("unspecified"),
+        "telemetry must preserve ordinary omission as a distinct state"
+    );
+    assert!(
+        event.payload["query_class"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "query_class must be a non-empty deterministic key, got: {:?}",
+        event.payload["query_class"]
+    );
+    assert!(
+        event.payload["latency_us"]
+            .as_i64()
+            .is_some_and(|us| us >= 0),
+        "latency_us must be a non-negative measured duration, got: {:?}",
+        event.payload["latency_us"]
+    );
+    assert!(
+        event.payload["actor"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "actor must be stamped, got: {:?}",
+        event.payload["actor"]
+    );
+    assert_eq!(event.payload["actor"], serde_json::json!(event.actor));
+
+    let counts = registry
+        .dispatch(
+            "brain.event_counts",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "since": "1970-01-01T00:00:00Z",
+                "kind": "recall_executed",
+            }),
+        )
+        .await
+        .expect("brain.event_counts");
+    assert_eq!(counts["total"], serde_json::json!(1));
+    assert_eq!(
+        counts["counts_by_kind"]["recall_executed"],
+        serde_json::json!(1)
+    );
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn successful_empty_recall_emits_recall_executed_event() {
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "no matching memory exists",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall");
+    assert_eq!(result, serde_json::json!([]));
+
+    let store = rt.events(&token).expect("event store for local namespace");
+    let mut recall_events = Vec::new();
+    for _ in 0..100 {
+        let page = store
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![khive_types::EventKind::RecallExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events");
+        if !page.items.is_empty() {
+            recall_events = page.items;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(recall_events.len(), 1);
+    assert_eq!(
+        recall_events[0].payload["result_count"],
+        serde_json::json!(0)
+    );
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_failure_emits_no_recall_executed_event() {
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    // `RecallParams::query` has no `#[serde(default)]`, so omitting it fails
+    // deserialization before the handler can schedule telemetry.
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "limit": 10
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "a recall missing the required `query` field must fail, not silently succeed"
+    );
+
+    // Give any (incorrectly fired) background emission a moment to land,
+    // then assert the event plane stayed empty for this kind.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let store = rt.events(&token).expect("event store for local namespace");
+    let page = store
+        .query_events(
+            khive_storage::EventFilter {
+                kinds: vec![khive_types::EventKind::RecallExecuted],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                limit: 50,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("query_events");
+    assert!(
+        page.items.is_empty(),
+        "a failed recall must not emit any recall_executed event, got: {:?}",
+        page.items
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_event_store_acquisition_failure_warns_without_failing_response() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let db_path = tmp.path().join("khive.db");
+    let backend = Arc::new(khive_db::StorageBackend::sqlite(&db_path).expect("backend"));
+    {
+        let mut writer = backend.pool().writer().expect("migration writer");
+        khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+    }
+    let config = khive_runtime::RuntimeConfig {
+        db_path: Some(db_path),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        ..khive_runtime::RuntimeConfig::default()
+    };
+    let rt = KhiveRuntime::from_backend(Arc::clone(&backend), config);
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    // Seed the real note and FTS legs without create_note's NoteCreated
+    // append: the tested backend's event accessor must remain cold.
+    let note = khive_storage::Note::new(
+        ns.as_str(),
+        "memory",
+        "event acquisition failure recall note",
+    )
+    .with_salience(0.7);
+    rt.notes(&token)
+        .expect("note store")
+        .upsert_note(note.clone())
+        .await
+        .expect("seed real memory row");
+    rt.text_for_notes(&token)
+        .expect("note FTS store")
+        .upsert_document(khive_storage::types::TextDocument {
+            subject_id: note.id,
+            kind: khive_types::SubstrateKind::Note,
+            record_kind: Some("memory".into()),
+            namespace: ns.as_str().to_owned(),
+            title: None,
+            body: note.content,
+            tags: vec![],
+            metadata: None,
+            updated_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("seed real lexical leg");
+    let event_rows = rt
+        .sql()
+        .reader()
+        .await
+        .expect("premise reader")
+        .query_scalar(khive_storage::types::SqlStatement {
+            sql: "SELECT COUNT(*) FROM events".into(),
+            params: vec![],
+            label: Some("recall_acquisition_cold_premise".into()),
+        })
+        .await
+        .expect("inspect migrated event table without acquiring EventStore");
+    assert!(
+        matches!(event_rows, Some(khive_storage::types::SqlValue::Integer(0))),
+        "fixture must not emit create/other events before cold acquisition"
+    );
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    {
+        let writer = backend.pool().writer().expect("fault injection writer");
+        writer
+            .conn()
+            .execute_batch("DROP TABLE events; PRAGMA query_only = ON;")
+            .expect("remove only the event schema and reject its recreation");
+    }
+
+    let warnings = Arc::new(StdMutex::new(Vec::new()));
+    let _capture = tracing::subscriber::set_default(WarningCapture {
+        warnings: Arc::clone(&warnings),
+    });
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "event acquisition failure recall note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("event-store acquisition failure must not fail memory.recall");
+    assert!(!result.as_array().expect("bare array result").is_empty());
+
+    let warning = loop {
+        if let Some(warning) = warnings.lock().unwrap().iter().find(|warning| {
+                warning.fields.get("message").map(String::as_str)
+                    == Some("recall_executed event store acquisition failed; recall result is unaffected")
+            }).cloned() {
+                break warning;
+            }
+        assert!(
+            khive_runtime::background_task_count() > 0,
+            "background task completed without an observable acquisition warning"
+        );
+        tokio::task::yield_now().await;
+    };
+
+    assert_eq!(
+        warning.fields.get("namespace").map(String::as_str),
+        Some("local")
+    );
+    assert_eq!(
+        warning.fields.get("event_kind").map(String::as_str),
+        Some("recall_executed")
+    );
+    assert!(warning
+        .fields
+        .get("error")
+        .is_some_and(|error| !error.is_empty()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn warm_recall_event_store_acquisition_finishes_while_writer_is_held() {
+    use std::time::Duration;
+
+    let rt = KhiveRuntime::memory().expect("runtime");
+    let token = rt.authorize(Namespace::local()).expect("local");
+    rt.events(&token)
+        .expect("first real event accessor initializes its schema");
+    let pool = rt.backend().pool();
+    let bound = Duration::from_secs(1).min(pool.config().checkout_timeout / 2);
+    assert!(bound >= Duration::from_millis(100));
+    let writer = pool
+        .writer()
+        .expect("hold writer after event initialization");
+    let before = pool.writer_acquisition_snapshot();
+    let acquiring_rt = rt.clone();
+    // This is emit_recall_executed_event's actual accessor. Appending the
+    // event remains writer work; the companion isolates acquisition only.
+    let mut acquiring = tokio::task::spawn_blocking(move || acquiring_rt.events(&token));
+    let while_held = tokio::time::timeout(bound, &mut acquiring).await;
+    drop(writer);
+    let store = match while_held {
+        Ok(joined) => joined
+            .expect("event acquisition worker joins")
+            .expect("warm event accessor"),
+        Err(_) => {
+            let _ = tokio::time::timeout(bound, acquiring).await;
+            panic!("warm recall event accessor must return before writer release");
+        }
+    };
+    let after = pool.writer_acquisition_snapshot();
+    assert_eq!(after.timeouts, before.timeouts);
+    assert_eq!(
+        after.pooled_acquisitions, before.pooled_acquisitions,
+        "warm event acquisition must not request the writer"
+    );
+    let page = store
+        .query_events(
+            khive_storage::EventFilter::default(),
+            khive_storage::types::PageRequest {
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .await
+        .expect("the acquired handle reads the real event table after release");
+    assert!(page.items.is_empty());
+}
+
+// `#[serial(background_tasks)]`: see the note on
+// `recall_with_dollar_sign_query_does_not_error` above — this test
+// directly exercises the same `track_background_task`-driven ledger
+// append it names, so it shares the process-wide counter.
+//
+// #697 (c): the serve-time stamp resolves through an actor-scoped binding,
+// not just a namespace-scoped one. Before #697, `resolve_serving_profile`
+// called `resolve_consumer_profile` with no actor, so a binding keyed on
+// actor (namespace left "*") could never match here.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_stamps_served_by_profile_id_via_actor_binding() {
+    use khive_pack_brain::BrainPack;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-recall-actor-binding-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let db_path = tmp.path().join("khive.db");
+
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: Some(db_path),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        actor_id: Some("leo".to_string()),
+        ..khive_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    assert_eq!(
+        token.actor().id,
+        "leo",
+        "test setup: token must carry the configured actor"
+    );
+
+    let note_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "actor binding recall stamp note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    // `VerbRegistry` mints its own per-dispatch tokens from its own
+    // construction-baked actor id (independent of `RuntimeConfig::actor_id`,
+    // which only affects tokens minted directly via `rt.authorize`) — bake
+    // the same actor here so `registry.dispatch` calls carry it too.
+    builder.with_actor_id(Some("leo".to_string()));
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "leo-actor-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.activate",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "leo-actor-recall-v1",
+            }),
+        )
+        .await
+        .expect("activate profile");
+    // Bind by actor only — namespace defaults to the "*" wildcard — so a
+    // namespace-only resolution can never reach this binding.
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "actor": "leo",
+                "profile_id": "leo-actor-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile to actor");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "actor binding recall stamp note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall");
+
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "must find the seeded note");
+    assert_eq!(
+        hits[0]["served_by_profile_id"],
+        serde_json::json!("leo-actor-recall-v1"),
+        "recall response must stamp the actor-bound profile, not the default"
+    );
+
+    // The ledger append is fired via track_background_task off the response
+    // path — poll briefly rather than assume it has landed by the time recall returns.
+    let target_id = note_id.id.to_string();
+    let mut found = false;
+    for _ in 0..100 {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT served_by_profile_id FROM brain_serve_ledger \
+                          WHERE target_id = ?1"
+                    .into(),
+                params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                label: None,
+            })
+            .await
+            .expect("query row");
+        if let Some(row) = row {
+            assert!(
+                matches!(
+                    row.get("served_by_profile_id"),
+                    Some(khive_storage::types::SqlValue::Text(s)) if s == "leo-actor-recall-v1"
+                ),
+                "serve ledger row must carry the actor-bound profile id"
+            );
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        found,
+        "serve ledger row for the recalled target must appear within 2s"
+    );
+
+    registry
+        .dispatch(
+            "brain.deactivate",
+            json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+        )
+        .await
+        .expect("deactivate the bound profile");
+    registry
+        .dispatch(
+            "brain.archive",
+            json!({"namespace": ns.as_str(), "profile_id": "leo-actor-recall-v1"}),
+        )
+        .await
+        .expect("archive the bound profile");
+    let resolution = registry
+        .dispatch(
+            "brain.resolve",
+            json!({"namespace": ns.as_str(), "consumer_kind": "recall"}),
+        )
+        .await
+        .expect("resolve after archiving");
+    assert_eq!(resolution["matched_binding"], false);
+
+    let after_archive = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "namespace": ns.as_str(),
+                "query": "actor binding recall stamp note",
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("recall falls through after archived binding");
+    let hits = after_archive.as_array().expect("bare array result");
+    assert!(!hits.is_empty());
+    assert!(
+        hits[0].get("served_by_profile_id").is_none() || hits[0]["served_by_profile_id"].is_null()
+    );
+    assert_eq!(hits[0]["serve_attribution"], json!("unspecified"));
+}
+
+// The actor-resolved profile must both project weights and stamp the response.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
+    use khive_pack_brain::BrainPack;
+
+    let tmp = tempfile::Builder::new()
+        .prefix("khive-mem-recall-adr104-resolution-")
+        .tempdir_in(std::env::temp_dir())
+        .expect("temp dir");
+    let db_path = tmp.path().join("khive.db");
+
+    let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: Some(db_path),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+        actor_id: Some("leo".to_string()),
+        ..khive_runtime::RuntimeConfig::default()
+    })
+    .expect("runtime");
+    rt.register_embedder(FixedVecProvider {
+        model_name: ADR104_MODEL.to_string(),
+        map: adr104_fixed_vectors(),
+    });
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    assert_eq!(
+        token.actor().id,
+        "leo",
+        "test setup: token must carry the configured actor"
+    );
+
+    let note_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_H_CONTENT,
+            Some(0.1),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note")
+        .id;
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    builder.with_actor_id(Some("leo".to_string()));
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104-resolution-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "actor": "leo",
+                "profile_id": "adr104-resolution-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile to actor");
+
+    // Skew the posterior so the assertion verifies projection, not only stamping.
+    adr104_skew_salience(&registry, "adr104-resolution-v1", note_id, 30).await;
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": ADR104_QUERY,
+                "fusion_strategy": "vector_only",
+                "embedding_model": ADR104_MODEL,
+                "include_breakdown": true,
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall");
+
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "must find the seeded note");
+    assert_eq!(
+        hits[0]["served_by_profile_id"],
+        serde_json::json!("adr104-resolution-v1"),
+        "recall response must stamp the actor-resolved profile, not the \
+             profile_id override path (which was not used in this test)"
+    );
+
+    let profile_component = hits[0]["breakdown"]["profile_component"]
+        .as_f64()
+        .expect("profile_component present under include_breakdown");
+    assert!(
+        (profile_component - 1.0).abs() > 1e-6,
+        "serve-time projection must have used the actor-resolved profile's \
+             skewed posterior state, not defaults: profile_component={profile_component}"
+    );
+}
+
+// Anonymous callers must not match an explicit `actor="local"` binding.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_anonymous_caller_does_not_match_explicit_actor_local_binding() {
+    use khive_pack_brain::BrainPack;
+
+    // No `actor_id` configured — `rt.authorize` mints the anonymous actor
+    // (id="local"), matching an unauthenticated caller.
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    assert!(
+        token.actor().is_anonymous(),
+        "test setup: token must carry the anonymous actor"
+    );
+
+    let note_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "anonymous actor binding fall-through note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    // No `with_actor_id` call — registry-minted tokens stay anonymous too.
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "anon-local-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.activate",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "anon-local-recall-v1",
+            }),
+        )
+        .await
+        .expect("activate profile");
+    // Bind explicitly to actor="local" — the exact id anonymous tokens carry.
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "actor": "local",
+                "profile_id": "anon-local-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile to actor=local");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "anonymous actor binding fall-through note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall");
+
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "must find the seeded note");
+    assert!(
+        hits[0].get("served_by_profile_id").is_none(),
+        "anonymous caller must NOT match the actor=\"local\" binding: the \
+             serve stamp must be omitted (unresolved profile), not carry \
+             anon-local-recall-v1: {:?}",
+        hits[0]
+    );
+
+    // The target note's id must never appear in the ledger with the
+    // bound profile — poll briefly to catch a delayed async append.
+    let target_id = note_id.id.to_string();
+    for _ in 0..20 {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT served_by_profile_id FROM brain_serve_ledger \
+                          WHERE target_id = ?1"
+                    .into(),
+                params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                label: None,
+            })
+            .await
+            .expect("query row");
+        if let Some(row) = row {
+            assert!(
+                !matches!(
+                    row.get("served_by_profile_id"),
+                    Some(khive_storage::types::SqlValue::Text(s)) if s == "anon-local-recall-v1"
+                ),
+                "serve ledger row must not credit the actor=\"local\" binding \
+                     to an anonymous caller"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+// `#[serial(background_tasks)]`: non-empty recall — see the note on
+// `recall_with_dollar_sign_query_does_not_error` above.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_without_brain_pack_omits_stamp_and_does_not_error() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "no brain pack loaded note",
+        Some(0.7),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "no brain pack loaded note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall must succeed even without a brain pack loaded");
+
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty());
+    assert!(
+        hits[0].get("served_by_profile_id").is_none(),
+        "no brain pack registered => no profile resolvable => no stamp"
+    );
+    assert_eq!(
+        hits[0]["serve_attribution"],
+        json!("unspecified"),
+        "ordinary omission must remain distinct from a failed profile read"
+    );
+}
+
+// ── Auto entity-name extraction (dead `entity_names` parameter fix) ────────
+
+/// Return one hit's score; a single-note RRF corpus isolates entity adjustment effects.
+async fn dispatch_single_note_recall(
+    content: &str,
+    query: &str,
+    entity_names: Option<&[&str]>,
+) -> f64 {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+    rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let mut params = serde_json::json!({
+        "query": query,
+        "fusion_strategy": "rrf",
+        "limit": 10
+    });
+    if let Some(names) = entity_names {
+        params["entity_names"] = serde_json::json!(names);
+    }
+
+    let result = registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("memory.recall");
+    let hits = result.as_array().expect("bare array result");
+    assert_eq!(hits.len(), 1, "single-note corpus must yield one hit");
+    hits[0]["rank_score"].as_f64().expect("rank_score")
+}
+
+/// Omitted entity names auto-extract a 1.3x boost; explicit empty opts out.
+/// See `crates/khive-pack-memory/docs/recall-reliability.md`.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn recall_auto_extraction_from_capitalized_query_fires_entity_match() {
+    const CONTENT: &str = "the committee reviewed the proposal from Zenlake last week";
+    const QUERY: &str = "committee proposal Zenlake";
+
+    let auto_score = dispatch_single_note_recall(CONTENT, QUERY, None).await;
+    let opted_out_score = dispatch_single_note_recall(CONTENT, QUERY, Some(&[])).await;
+
+    assert!(
+        auto_score > opted_out_score,
+        "auto-extraction (entity_names omitted) must boost the score \
+             above the explicit-opt-out baseline: auto={auto_score} \
+             opted_out={opted_out_score}"
+    );
+    let ratio = auto_score / opted_out_score;
+    assert!(
+        (ratio - 1.3).abs() < 0.01,
+        "expected ~1.3x lift from EntityMatch firing on the \
+             auto-extracted candidate, got ratio {ratio}"
+    );
+}
+
+/// An explicit empty entity list disables automatic extraction.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn recall_explicit_empty_entity_names_disables_boost_where_auto_extraction_would_fire() {
+    const CONTENT: &str = "the committee reviewed the proposal from Zenlake last week";
+    const QUERY: &str = "committee proposal Zenlake";
+
+    let opted_out_score = dispatch_single_note_recall(CONTENT, QUERY, Some(&[])).await;
+    // An all-stopword query provides a baseline with no entity boost opportunity.
+    let never_boosted_baseline =
+        dispatch_single_note_recall("is it for me too", "is it for me", None).await;
+
+    assert!(
+        (opted_out_score - never_boosted_baseline).abs() < 1e-4,
+        "explicit entity_names: [] must land on the same unboosted score \
+             as a query that never had an entity candidate to begin with: \
+             opted_out={opted_out_score} baseline={never_boosted_baseline}"
+    );
+}
+
+/// A non-empty explicit entity list passes through even when the query yields none.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn recall_explicit_nonempty_entity_names_suppresses_auto_extraction() {
+    const QUERY: &str = "is it for me"; // every token is an ENTITY_STOPWORDS entry
+    const CONTENT: &str = "is it for me glorptastic";
+
+    let auto_extracted_score = dispatch_single_note_recall(CONTENT, QUERY, None).await;
+    let explicit_score = dispatch_single_note_recall(CONTENT, QUERY, Some(&["glorptastic"])).await;
+
+    assert!(
+        explicit_score > auto_extracted_score,
+        "explicit entity_names must be honored (not overridden by \
+             query-derived auto-extraction, which yields empty candidates \
+             for this all-stopword query): auto={auto_extracted_score} \
+             explicit={explicit_score}"
+    );
+    let ratio = explicit_score / auto_extracted_score;
+    assert!(
+        (ratio - 1.3).abs() < 0.01,
+        "expected ~1.3x lift from the EntityMatch adjustment when the \
+             explicit entity_names path is honored, got ratio {ratio}"
+    );
+}
+
+// `#[serial(background_tasks)]`: both `timed_recall` calls below return
+// non-empty results — see the note on
+// `recall_with_dollar_sign_query_does_not_error` above.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_profile_resolution_latency_is_bounded() {
+    use khive_pack_brain::BrainPack;
+    use std::time::Duration;
+
+    async fn timed_recall(with_brain: bool) -> Duration {
+        let rt = if with_brain {
+            build_full_rt_with_brain()
+        } else {
+            TestRuntime::in_memory(KhiveRuntime::memory().expect("in-memory runtime"))
+        };
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "latency probe note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        if with_brain {
+            builder.register(BrainPack::new(rt.clone()));
+        }
+        let registry = builder.build().expect("registry");
+
+        if with_brain {
+            registry
+                .dispatch(
+                    "brain.create_profile",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "name": "latency-recall-v1",
+                        "consumer_kind": "recall",
+                    }),
+                )
+                .await
+                .expect("create profile");
+            registry
+                .dispatch(
+                    "brain.activate",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "profile_id": "latency-recall-v1",
+                    }),
+                )
+                .await
+                .expect("activate profile");
+            registry
+                .dispatch(
+                    "brain.bind",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "profile_id": "latency-recall-v1",
+                        "consumer_kind": "recall",
+                    }),
+                )
+                .await
+                .expect("bind profile");
+        }
+
+        let start = std::time::Instant::now();
+        registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "latency probe note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall");
+        start.elapsed()
+    }
+
+    let without_brain = timed_recall(false).await;
+    let with_brain = timed_recall(true).await;
+    eprintln!(
+        "[ADR-081 §5 latency] recall without brain pack: {without_brain:?}; \
+             recall with brain pack (profile resolution + async ledger dispatch): {with_brain:?}"
+    );
+    // Dispatch uses this same cached deadline when the request has no override.
+    let caller_bound = Duration::from_millis(crate::pack::recall_deadline_ms()).saturating_mul(2);
+    if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
+        assert!(
+            with_brain < caller_bound,
+            "profile resolution exceeded its configured caller-derived completion bound \
+                 {caller_bound:?}, got {with_brain:?}"
+        );
+    }
+}
+
+// ── ADR-104 Stage A: serve-time profile projection ─────────────────────
+
+/// Exact-text vectors make ADR-104 cosine gaps analytically controllable.
+struct FixedVecService {
+    map: HashMap<String, Vec<f32>>,
+}
+
+#[async_trait]
+impl EmbeddingService for FixedVecService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|t| self.map.get(t).cloned().unwrap_or_else(|| vec![0.0; 8]))
+            .collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "fixed-vec"
+    }
+}
+
+struct FixedVecProvider {
+    model_name: String,
+    map: HashMap<String, Vec<f32>>,
+}
+
+#[async_trait]
+impl EmbedderProvider for FixedVecProvider {
+    fn name(&self) -> &str {
+        &self.model_name
+    }
+
+    fn dimensions(&self) -> usize {
+        8
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(FixedVecService {
+            map: self.map.clone(),
+        }))
+    }
+}
+
+const ADR104_TRAINING_ACTOR: &str = "memory-recall-training";
+const ADR104_MODEL: &str = "adr104-fixed-vec-model";
+const ADR104_QUERY: &str = "profile ranking probe query";
+const ADR104_FILLER_LOW: &str = "filler low relevance content";
+const ADR104_FILLER_HIGH: &str = "filler high relevance content";
+const ADR104_H_CONTENT: &str = "candidate h content marker";
+const ADR104_L_CONTENT: &str = "candidate l content marker";
+
+/// Unit vectors anchor H/L inside a known percentile band rather than at its extremes.
+fn adr104_fixed_vectors() -> HashMap<String, Vec<f32>> {
+    let mut m = HashMap::new();
+    m.insert(
+        ADR104_QUERY.to_string(),
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    m.insert(
+        ADR104_FILLER_LOW.to_string(),
+        vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    m.insert(
+        ADR104_FILLER_HIGH.to_string(),
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    m.insert(
+        ADR104_H_CONTENT.to_string(),
+        vec![0.717, 0.6971, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    m.insert(
+        ADR104_L_CONTENT.to_string(),
+        vec![0.5, 0.8660254, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    m
+}
+
+/// Build a controlled four-note corpus whose profile salience projection flips H/L order.
+async fn adr104_build_ranking_corpus() -> (
+    TestRuntime,
+    khive_runtime::VerbRegistry,
+    Namespace,
+    Uuid,
+    Uuid,
+) {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    rt.register_embedder(FixedVecProvider {
+        model_name: ADR104_MODEL.to_string(),
+        map: adr104_fixed_vectors(),
+    });
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        ADR104_FILLER_LOW,
+        Some(0.5),
+        None,
+        vec![],
+    )
+    .await
+    .expect("filler low note");
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        ADR104_FILLER_HIGH,
+        Some(0.5),
+        None,
+        vec![],
+    )
+    .await
+    .expect("filler high note");
+    let h_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_H_CONTENT,
+            Some(0.1),
+            None,
+            vec![],
+        )
+        .await
+        .expect("candidate h note")
+        .id;
+    let l_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_L_CONTENT,
+            Some(0.9),
+            None,
+            vec![],
+        )
+        .await
+        .expect("candidate l note")
+        .id;
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(BrainPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    (rt, registry, ns, h_id, l_id)
+}
+
+/// Send useful feedback that updates both global salience and target posterior.
+async fn adr104_skew_salience(
+    registry: &khive_runtime::VerbRegistry,
+    profile_id: &str,
+    target_id: Uuid,
+    n: usize,
+) {
+    for _ in 0..n {
+        registry
+            .dispatch(
+                "brain.feedback",
+                serde_json::json!({
+                    "target_id": target_id.to_string(),
+                    "signal": "useful",
+                    "served_by_profile_id": profile_id,
+                }),
+            )
+            .await
+            .expect("skew salience posterior");
+    }
+}
+
+/// Index of the hit whose `id` matches `id` in a `memory.recall` hits array.
+fn adr104_position(hits: &[Value], id: Uuid) -> usize {
+    let target = id.to_string();
+    hits.iter()
+        .position(|h| h["id"].as_str() == Some(target.as_str()))
+        .unwrap_or_else(|| panic!("id {target} not present in recall hits: {hits:?}"))
+}
+
+/// Different profile state must flip ordering for the same corpus and query.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn adr104_profile_differentiated_ranking_flips_order() {
+    let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104-skew-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    adr104_skew_salience(&registry, "adr104-skew-recall-v1", h_id, 30).await;
+
+    let base_params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "limit": 10,
+    });
+
+    let default_result = registry
+        .dispatch("memory.recall", base_params.clone())
+        .await
+        .expect("default recall");
+    let default_hits = default_result.as_array().expect("bare array result");
+
+    let mut skewed_params = base_params;
+    skewed_params["profile_id"] = serde_json::json!("adr104-skew-recall-v1");
+    let skewed_result = registry
+        .dispatch("memory.recall", skewed_params)
+        .await
+        .expect("skewed-profile recall");
+    let skewed_hits = skewed_result.as_array().expect("bare array result");
+
+    assert!(
+        adr104_position(default_hits, h_id) < adr104_position(default_hits, l_id),
+        "at configured-default weights H's relevance edge must win: {default_hits:?}"
+    );
+    assert!(
+        adr104_position(skewed_hits, l_id) < adr104_position(skewed_hits, h_id),
+        "under the salience-skewed profile L must overtake H — if this still \
+             matches the default ordering, the serve-time projection call is not \
+             wired into scoring: {skewed_hits:?}"
+    );
+}
+
+/// Without a resolved profile, loading the brain pack must not change scores.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_no_profile_scores_identically_with_or_without_brain_pack() {
+    use khive_pack_brain::BrainPack;
+
+    async fn score_for(with_brain: bool) -> f64 {
+        let rt = if with_brain {
+            build_full_rt_with_brain()
+        } else {
+            TestRuntime::in_memory(KhiveRuntime::memory().expect("in-memory runtime"))
+        };
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "adr104 no-profile baseline note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        if with_brain {
+            builder.register(BrainPack::new(rt.clone()));
+        }
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104 no-profile baseline note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall");
+        let hits = result.as_array().expect("bare array result");
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].get("served_by_profile_id").is_none(),
+            "no bound profile => no stamp, whether or not brain is loaded"
+        );
+        hits[0]["rank_score"].as_f64().expect("rank_score")
+    }
+
+    let without_brain = score_for(false).await;
+    let with_brain = score_for(true).await;
+    assert!(
+        (without_brain - with_brain).abs() < 1e-9,
+        "ADR-104 §1: with no resolvable profile, scoring must be byte-identical \
+             to the pre-change baseline regardless of whether the brain pack is \
+             loaded: without_brain={without_brain} with_brain={with_brain}"
+    );
+}
+
+/// Explicit profile override stamps results/ledger; an unknown ID is an error.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_profile_id_override_stamps_ledger_and_rejects_unknown_profile() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let note = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "adr104 profile_id override note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    // No binding created — the override must serve purely from the
+    // explicit `profile_id` param, bypassing binding resolution.
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104-override-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr104 profile_id override note",
+                "profile_id": "adr104-override-v1",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall with profile_id override");
+
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty());
+    assert_eq!(
+        hits[0]["served_by_profile_id"],
+        serde_json::json!("adr104-override-v1"),
+        "profile_id override must stamp the named profile with no binding required"
+    );
+    assert_eq!(hits[0]["serve_attribution"], json!("profile"));
+
+    let target_id = note.id.to_string();
+    let mut found = false;
+    for _ in 0..100 {
+        let mut reader = rt.sql().reader().await.expect("reader");
+        let row = reader
+            .query_row(khive_storage::types::SqlStatement {
+                sql: "SELECT served_by_profile_id FROM brain_serve_ledger \
+                          WHERE target_id = ?1"
+                    .into(),
+                params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                label: None,
+            })
+            .await
+            .expect("query row");
+        if let Some(row) = row {
+            assert!(
+                matches!(
+                    row.get("served_by_profile_id"),
+                    Some(khive_storage::types::SqlValue::Text(s)) if s == "adr104-override-v1"
+                ),
+                "serve ledger row must carry the profile_id override"
+            );
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        found,
+        "serve ledger row for the override must appear within 2s"
+    );
+
+    let bad_result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr104 profile_id override note",
+                "profile_id": "adr104-does-not-exist",
+                "limit": 10
+            }),
+        )
+        .await;
+    assert!(
+        bad_result.is_err(),
+        "unknown profile_id must be a per-op error, not a silent fallback to defaults"
+    );
+
+    registry
+        .dispatch(
+            "brain.deactivate",
+            json!({"namespace": ns.as_str(), "profile_id": "adr104-override-v1"}),
+        )
+        .await
+        .expect("deactivate explicit profile before archiving");
+    registry
+        .dispatch(
+            "brain.archive",
+            json!({"namespace": ns.as_str(), "profile_id": "adr104-override-v1"}),
+        )
+        .await
+        .expect("archive explicit profile");
+    let archived = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "namespace": ns.as_str(),
+                "query": "adr104 profile_id override note",
+                "profile_id": "adr104-override-v1",
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect_err("archived profile must not serve recall");
+    assert!(
+        matches!(archived, RuntimeError::InvalidInput(ref message) if message.contains("archived")),
+        "archived explicit profile must be refused: {archived:?}"
+    );
+}
+
+/// #1505: an explicit profile override is resolved in recall's effective
+/// namespace, not the registry's baked/default namespace. The arm-only
+/// profile is also applied to scoring, proving this is more than a stamp.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn namespaced_recall_loads_arm_profile_and_applies_its_state() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    let arm_ns = Namespace::parse("bench-arm-a").expect("arm namespace");
+    let arm_token = rt.authorize(arm_ns.clone()).expect("arm token");
+    let note = rt
+        .create_note(
+            &arm_token,
+            "memory",
+            None,
+            "bench arm isolated profile recall note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create arm note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(BrainPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": arm_ns.as_str(),
+                "name": "bench-arm-a-recall-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create arm-only profile");
+    for _ in 0..12 {
+        registry
+            .dispatch(
+                "brain.feedback",
+                serde_json::json!({
+                    "namespace": arm_ns.as_str(),
+                    "target_id": note.id.to_string(),
+                    "signal": "useful",
+                    "served_by_profile_id": "bench-arm-a-recall-v1",
+                }),
+            )
+            .await
+            .expect("tune arm profile");
+    }
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": arm_ns.as_str(),
+                "query": "bench arm isolated profile recall note",
+                "profile_id": "bench-arm-a-recall-v1",
+                "include_breakdown": true,
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("namespaced recall must load the arm-only profile");
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "arm note must be recalled");
+    assert_eq!(
+        hits[0]["served_by_profile_id"],
+        serde_json::json!("bench-arm-a-recall-v1")
+    );
+    let component = hits[0]["breakdown"]["profile_component"]
+        .as_f64()
+        .expect("profile component");
+    assert!(
+        (component - 1.0).abs() > 1e-6,
+        "arm profile feedback must affect scoring, got neutral component {component}"
+    );
+}
+
+/// Breakdown reports neutral/default profile state and learned entity posterior state.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() {
+    {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "adr104 breakdown no-profile note",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104 breakdown no-profile note",
+                    "include_breakdown": true,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall");
+        let hits = result.as_array().expect("bare array result");
+        assert_eq!(hits.len(), 1);
+        let breakdown = &hits[0]["breakdown"];
+        assert_eq!(
+            breakdown["profile_component"].as_f64(),
+            Some(1.0),
+            "no profile served the request => profile_component must be neutral 1.0"
+        );
+        assert!(
+            breakdown["entity_posterior_mean"].is_null(),
+            "no profile served the request => entity_posterior_mean must be absent"
+        );
+    }
+
+    let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104-breakdown-skew-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    // Seeds both the global salience posterior (drives component 1) and
+    // H's per-entity posterior (reported by component 3) in one loop.
+    adr104_skew_salience(&registry, "adr104-breakdown-skew-v1", h_id, 30).await;
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": ADR104_QUERY,
+                "fusion_strategy": "vector_only",
+                "embedding_model": ADR104_MODEL,
+                "profile_id": "adr104-breakdown-skew-v1",
+                "include_breakdown": true,
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall");
+    let hits = result.as_array().expect("bare array result");
+
+    let h_pos = adr104_position(hits, h_id);
+    let l_pos = adr104_position(hits, l_id);
+    assert!(
+        l_pos < h_pos,
+        "the component-1 salience-projection margin (matching the \
+             profile-differentiated ranking test) is wide enough that H's \
+             bounded (<=+15%) component-2 entity term does not overturn it: \
+             {hits:?}"
+    );
+
+    let h_component = hits[h_pos]["breakdown"]["profile_component"]
+        .as_f64()
+        .expect("profile_component present");
+    assert!(
+        (h_component - 1.0).abs() > 1e-6,
+        "H's score moved under projected weights (differentiating profile) => \
+             profile_component must be != 1.0, got {h_component}"
+    );
+    let h_ent_mean = hits[h_pos]["breakdown"]["entity_posterior_mean"]
+        .as_f64()
+        .expect("H has a seeded entity posterior");
+    assert!(
+        h_ent_mean > 0.9,
+        "H received 30 'useful' signals against an uninformative Beta(1,1) \
+             prior; its entity posterior mean must be high, got {h_ent_mean}"
+    );
+
+    assert!(
+        hits[l_pos]["breakdown"]["entity_posterior_mean"].is_null(),
+        "L never received feedback => entity_posterior_mean must be absent, \
+             not a guessed prior mean"
+    );
+}
+
+/// Identical store, query, and profile state must yield identical ranks and scores.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_profile_projection_is_deterministic_across_repeated_calls() {
+    let (_rt, registry, ns, h_id, _l_id) = adr104_build_ranking_corpus().await;
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104-determinism-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    adr104_skew_salience(&registry, "adr104-determinism-v1", h_id, 30).await;
+
+    let params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": ADR104_QUERY,
+        "fusion_strategy": "vector_only",
+        "embedding_model": ADR104_MODEL,
+        "profile_id": "adr104-determinism-v1",
+        "limit": 10
+    });
+
+    let first = registry
+        .dispatch("memory.recall", params.clone())
+        .await
+        .expect("first recall");
+    let second = registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("second recall");
+
+    let first_hits = first.as_array().expect("bare array result");
+    let second_hits = second.as_array().expect("bare array result");
+
+    let first_order: Vec<&str> = first_hits
+        .iter()
+        .map(|h| h["id"].as_str().expect("id"))
+        .collect();
+    let second_order: Vec<&str> = second_hits
+        .iter()
+        .map(|h| h["id"].as_str().expect("id"))
+        .collect();
+    assert_eq!(
+        first_order, second_order,
+        "identical store/query/profile-state must produce identical ranking \
+             across repeated calls"
+    );
+
+    let first_scores: Vec<f64> = first_hits
+        .iter()
+        .map(|h| h["rank_score"].as_f64().expect("rank_score"))
+        .collect();
+    let second_scores: Vec<f64> = second_hits
+        .iter()
+        .map(|h| h["rank_score"].as_f64().expect("rank_score"))
+        .collect();
+    assert_eq!(
+        first_scores, second_scores,
+        "identical store/query/profile-state must produce byte-identical \
+             rank_score values"
+    );
+}
+
+// ── ADR-104 Stage B: bounded per-entity posterior term (row-B gate) ────
+
+/// A missing entity posterior is an exact identity under a fresh default profile.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn adr104_stage_b_no_posterior_candidate_scores_identically_with_fresh_profile() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "adr104b neutrality probe note",
+        Some(0.6),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104b-neutral-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+
+    let with_profile = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr104b neutrality probe note",
+                "profile_id": "adr104b-neutral-v1",
+                "include_breakdown": true,
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall with fresh profile");
+    let without_profile = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr104b neutrality probe note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall with defaults");
+
+    let with_hits = with_profile.as_array().expect("bare array result");
+    let without_hits = without_profile.as_array().expect("bare array result");
+    assert_eq!(with_hits.len(), 1);
+    assert_eq!(without_hits.len(), 1);
+
+    assert!(
+        with_hits[0]["breakdown"]["entity_posterior_mean"].is_null(),
+        "fresh profile holds no posterior for this UUID => entity_posterior_mean absent"
+    );
+
+    let score_with = with_hits[0]["rank_score"].as_f64().expect("rank_score");
+    let score_without = without_hits[0]["rank_score"].as_f64().expect("rank_score");
+    assert!(
+        (score_with - score_without).abs() < 1e-9,
+        "no-posterior candidate must score identically served vs unserved: \
+             with_profile={score_with} without_profile={score_without}"
+    );
+}
+
+/// One useful signal lifts only the targeted profile's next equivalent recall.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+    let note_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "adr104b feedback lift probe note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note")
+        .id;
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    for name in ["adr104b-lift-a-v1", "adr104b-lift-b-v1"] {
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": name,
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+    }
+
+    async fn recall_score(
+        registry: &khive_runtime::VerbRegistry,
+        ns: &Namespace,
+        profile_id: Option<&str>,
+    ) -> f64 {
+        let mut params = serde_json::json!({
+            "namespace": ns.as_str(),
+            "query": "adr104b feedback lift probe note",
+            "limit": 10
+        });
+        if let Some(pid) = profile_id {
+            params["profile_id"] = serde_json::json!(pid);
+        }
+        let result = registry
+            .dispatch("memory.recall", params)
+            .await
+            .expect("recall");
+        let hits = result.as_array().expect("bare array result");
+        assert_eq!(hits.len(), 1);
+        hits[0]["rank_score"].as_f64().expect("rank_score")
+    }
+
+    let a_before = recall_score(&registry, &ns, Some("adr104b-lift-a-v1")).await;
+    let b_before = recall_score(&registry, &ns, Some("adr104b-lift-b-v1")).await;
+    let default_before = recall_score(&registry, &ns, None).await;
+    assert!(
+        (a_before - default_before).abs() < 1e-9 && (b_before - default_before).abs() < 1e-9,
+        "both fresh profiles must start identical to defaults: a={a_before} \
+             b={b_before} default={default_before}"
+    );
+
+    registry
+        .dispatch(
+            "brain.feedback",
+            serde_json::json!({
+                "target_id": note_id.to_string(),
+                "signal": "useful",
+                "served_by_profile_id": "adr104b-lift-a-v1",
+            }),
+        )
+        .await
+        .expect("one explicit useful signal under profile A");
+
+    let a_after = recall_score(&registry, &ns, Some("adr104b-lift-a-v1")).await;
+    let b_after = recall_score(&registry, &ns, Some("adr104b-lift-b-v1")).await;
+    let default_after = recall_score(&registry, &ns, None).await;
+
+    assert!(
+        a_after > a_before,
+        "one useful signal under profile A must lift the score under \
+             profile A: before={a_before} after={a_after}"
+    );
+    assert!(
+        (b_after - b_before).abs() < 1e-9,
+        "profile B never received the signal => its score must be \
+             unchanged: before={b_before} after={b_after}"
+    );
+    assert!(
+        (default_after - default_before).abs() < 1e-9,
+        "defaults (no profile) must be unchanged by feedback given under \
+             an explicit profile: before={default_before} after={default_after}"
+    );
+}
+
+/// Near-saturated entity feedback must remain inside the ±15% pipeline clamp.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn adr104_stage_b_saturated_posterior_never_exceeds_clamp_bound_end_to_end() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+    let note_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "adr104b clamp probe note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note")
+        .id;
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104b-clamp-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+
+    let baseline = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr104b clamp probe note",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("baseline recall");
+    let baseline_score = baseline.as_array().expect("array")[0]["rank_score"]
+        .as_f64()
+        .expect("rank_score");
+
+    adr104_skew_salience(&registry, "adr104b-clamp-v1", note_id, 200).await;
+
+    let saturated = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr104b clamp probe note",
+                "profile_id": "adr104b-clamp-v1",
+                "include_breakdown": true,
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("saturated-profile recall");
+    let hits = saturated.as_array().expect("array");
+    let saturated_score = hits[0]["rank_score"].as_f64().expect("rank_score");
+    let ent_mean = hits[0]["breakdown"]["entity_posterior_mean"]
+        .as_f64()
+        .expect("entity_posterior_mean present after 200 signals");
+    assert!(
+        ent_mean > 0.95,
+        "expected a near-saturated mean, got {ent_mean}"
+    );
+
+    // Divide out the global component to assert the entity clamp in isolation.
+    let profile_component = hits[0]["breakdown"]["profile_component"]
+        .as_f64()
+        .expect("profile_component present");
+    let implied_entity_term = (saturated_score / baseline_score) / profile_component;
+    assert!(
+        implied_entity_term <= crate::scoring::ENTITY_POSTERIOR_CLAMP_MAX as f64 + 1e-6,
+        "entity term must never exceed the +15% clamp bound: implied={implied_entity_term}"
+    );
+    assert!(
+        implied_entity_term >= crate::scoring::ENTITY_POSTERIOR_CLAMP_MIN as f64 - 1e-6,
+        "entity term must never fall below the -15% clamp bound: implied={implied_entity_term}"
+    );
+}
+
+/// Matched global feedback counts isolate the target-specific entity multiplier.
+/// See `crates/khive-pack-memory/docs/recall-reliability.md`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+
+    let target_x_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "adr104b isolation target x note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note x")
+        .id;
+    let target_y_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "adr104b isolation target y note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note y")
+        .id;
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    for name in ["adr104b-iso-x-v1", "adr104b-iso-y-v1"] {
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": name,
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+    }
+
+    // Equal signal counts keep global state equal while entity state differs.
+    adr104_skew_salience(&registry, "adr104b-iso-x-v1", target_x_id, 1).await;
+    adr104_skew_salience(&registry, "adr104b-iso-y-v1", target_y_id, 1).await;
+
+    // Shared vocabulary can return both notes, so locate the target by ID.
+    async fn recall_target_x(
+        registry: &khive_runtime::VerbRegistry,
+        ns: &Namespace,
+        profile_id: &str,
+        target_x_id: Uuid,
+    ) -> (f64, f64, Option<f64>) {
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104b isolation target x note",
+                    "profile_id": profile_id,
+                    "include_breakdown": true,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall");
+        let hits = result.as_array().expect("bare array result");
+        let pos = adr104_position(hits, target_x_id);
+        let rank_score = hits[pos]["rank_score"].as_f64().expect("rank_score");
+        let profile_component = hits[pos]["breakdown"]["profile_component"]
+            .as_f64()
+            .expect("profile_component present");
+        let entity_posterior_mean = hits[pos]["breakdown"]["entity_posterior_mean"].as_f64();
+        (rank_score, profile_component, entity_posterior_mean)
+    }
+
+    let (score_under_x, component_under_x, ent_mean_under_x) =
+        recall_target_x(&registry, &ns, "adr104b-iso-x-v1", target_x_id).await;
+    let (score_under_y, component_under_y, ent_mean_under_y) =
+        recall_target_x(&registry, &ns, "adr104b-iso-y-v1", target_x_id).await;
+
+    assert!(
+        (component_under_x - component_under_y).abs() < 1e-9,
+        "component 1 (profile_component) must be identical under both \
+             profiles — they received the same global feedback count, just \
+             on different targets: under_x={component_under_x} under_y={component_under_y}"
+    );
+    assert!(
+        ent_mean_under_x.is_some(),
+        "profile X received feedback directly on target_x => entity_posterior_mean must be present"
+    );
+    assert!(
+        ent_mean_under_y.is_none(),
+        "profile Y's signal targeted target_y, not target_x => target_x must have no \
+             posterior under profile Y: got {ent_mean_under_y:?}"
+    );
+
+    let expected_term = crate::scoring::entity_posterior_term(
+        ent_mean_under_x,
+        crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+    ) as f64;
+    let observed_ratio = score_under_x / score_under_y;
+    assert!(
+        (observed_ratio - expected_term).abs() < 1e-4,
+        "with component 1 held constant, the rank_score ratio between the \
+             two profiles must equal the entity term exactly: observed={observed_ratio} \
+             expected={expected_term} (ent_mean_under_x={ent_mean_under_x:?})"
+    );
+}
+
+/// The entity term must apply after weighted reranking, not only default scoring.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
+    use khive_pack_brain::BrainPack;
+
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+    let note_id = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "adr104b reranker path probe note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note")
+        .id;
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104b-rerank-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+
+    let params = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": "adr104b reranker path probe note",
+        "profile_id": "adr104b-rerank-v1",
+        "include_breakdown": true,
+        "config": {
+            "reranker_weights": {
+                "relevance": 0.6,
+                "salience": 0.3,
+                "temporal": 0.1
+            }
+        },
+        "limit": 10
+    });
+
+    let before = registry
+        .dispatch("memory.recall", params.clone())
+        .await
+        .expect("recall before feedback");
+    let before_hits = before.as_array().expect("array");
+    let score_before = before_hits[0]["rank_score"].as_f64().expect("rank_score");
+    assert!(
+        before_hits[0]["breakdown"]["entity_posterior_mean"].is_null(),
+        "no feedback yet => entity_posterior_mean must be absent"
+    );
+
+    registry
+        .dispatch(
+            "brain.feedback",
+            serde_json::json!({
+                "target_id": note_id.to_string(),
+                "signal": "useful",
+                "served_by_profile_id": "adr104b-rerank-v1",
+            }),
+        )
+        .await
+        .expect("one explicit useful signal");
+
+    let after = registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("recall after feedback");
+    let after_hits = after.as_array().expect("array");
+    let score_after = after_hits[0]["rank_score"].as_f64().expect("rank_score");
+    let ent_mean_after = after_hits[0]["breakdown"]["entity_posterior_mean"]
+        .as_f64()
+        .expect("entity_posterior_mean present after feedback");
+
+    assert!(
+        score_after > score_before,
+        "the entity term must lift rank_score on the weighted-rerank path too: \
+             before={score_before} after={score_after}"
+    );
+
+    let expected_ratio = crate::scoring::entity_posterior_term(
+        Some(ent_mean_after),
+        crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+    ) as f64;
+    let observed_ratio = score_after / score_before;
+    assert!(
+        (observed_ratio - expected_ratio).abs() < 1e-4,
+        "reranker-path score ratio must equal the entity term exactly \
+             (weighted_rerank's inputs are unaffected by the one signal, so \
+             the entire delta must be the Stage B multiplier): \
+             observed={observed_ratio} expected={expected_ratio}"
+    );
+}
+
+// ── ADR-104 R2: measured per-recall overhead of the profile-state read ─
+
+/// Ignored benchmark comparing median/p95 recall with and without profile-state reads.
+#[tokio::test]
+#[ignore]
+#[serial_test::serial(config_ledger)]
+async fn adr104_r2_measure_profile_state_read_overhead() {
+    use khive_pack_brain::BrainPack;
+
+    const ITERATIONS: usize = 150;
+
+    async fn recall_once(registry: &khive_runtime::VerbRegistry, params: &Value) {
+        registry
+            .dispatch("memory.recall", params.clone())
+            .await
+            .expect("recall");
+    }
+
+    fn percentile(mut samples: Vec<f64>, p: f64) -> f64 {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((samples.len() - 1) as f64 * p).round() as usize;
+        samples[idx]
+    }
+
+    let rt = build_full_rt_with_brain();
+    let ns = Namespace::parse("local").expect("ns");
+    let token = rt.authorize(ns.clone()).expect("token");
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "adr104 r2 overhead probe note",
+        Some(0.6),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let brain = BrainPack::new(rt.clone());
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(brain);
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "name": "adr104-r2-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("create profile");
+    registry
+        .dispatch(
+            "brain.bind",
+            serde_json::json!({
+                "namespace": ns.as_str(),
+                "profile_id": "adr104-r2-v1",
+                "consumer_kind": "recall",
+            }),
+        )
+        .await
+        .expect("bind profile");
+
+    // A fresh unbound namespace exercises the genuine no-profile path.
+    let unbound_ns = Namespace::parse("adr104-r2-unbound").expect("ns");
+    let unbound_token = rt.authorize(unbound_ns.clone()).expect("token");
+    rt.create_note(
+        &unbound_token,
+        "memory",
+        None,
+        "adr104 r2 overhead probe note",
+        Some(0.6),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note in unbound namespace");
+    let params_without_profile = serde_json::json!({
+        "namespace": unbound_ns.as_str(),
+        "query": "adr104 r2 overhead probe note",
+        "limit": 10,
+    });
+
+    let params_with_profile = serde_json::json!({
+        "namespace": ns.as_str(),
+        "query": "adr104 r2 overhead probe note",
+        "limit": 10,
+    });
+
+    // Warm up (first-call effects: ANN index build, query embedding cache).
+    recall_once(&registry, &params_without_profile).await;
+    recall_once(&registry, &params_with_profile).await;
+
+    let mut without_profile_us: Vec<f64> = Vec::with_capacity(ITERATIONS);
+    let mut with_profile_us: Vec<f64> = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = std::time::Instant::now();
+        recall_once(&registry, &params_without_profile).await;
+        without_profile_us.push(start.elapsed().as_micros() as f64);
+
+        let start = std::time::Instant::now();
+        recall_once(&registry, &params_with_profile).await;
+        with_profile_us.push(start.elapsed().as_micros() as f64);
+    }
+
+    let median_without = percentile(without_profile_us.clone(), 0.50);
+    let p95_without = percentile(without_profile_us, 0.95);
+    let median_with = percentile(with_profile_us.clone(), 0.50);
+    let p95_with = percentile(with_profile_us, 0.95);
+
+    eprintln!(
+        "[ADR-104 R2] N={ITERATIONS} iterations\n\
+             without profile-state read: median={median_without:.1}us p95={p95_without:.1}us\n\
+             with profile-state read:    median={median_with:.1}us p95={p95_with:.1}us\n\
+             delta:                      median={:.1}us p95={:.1}us",
+        median_with - median_without,
+        p95_with - p95_without,
+    );
+}
+
+// ── #733 slice 1: optional `namespace` param on memory.recall ──────────
+
+/// Poll eventually consistent ANN results, returning the last response on exhaustion.
+async fn recall_until(
+    registry: &khive_runtime::VerbRegistry,
+    verb: &str,
+    args: Value,
+    mut ready: impl FnMut(&Value) -> bool,
+) -> Value {
+    let mut result = registry
+        .dispatch(verb, args.clone())
+        .await
+        .unwrap_or_else(|e| panic!("{verb}: {e}"));
+    // 7.5s tolerates blocking-pool contention; common cases settle in milliseconds.
+    for _ in 0..300 {
+        if ready(&result) {
+            return result;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        result = registry
+            .dispatch(verb, args.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{verb}: {e}"));
+    }
+    result
+}
+
+/// Seed two local memories and one bench-a memory sharing a query term.
+async fn ns733_seed_three_memories() -> (khive_runtime::VerbRegistry, Uuid, Uuid, Uuid) {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    async fn remember(
+        registry: &khive_runtime::VerbRegistry,
+        content: &str,
+        namespace: &str,
+    ) -> Uuid {
+        let result = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": content,
+                    "memory_type": "semantic",
+                    "namespace": namespace,
+                }),
+            )
+            .await
+            .expect("memory.remember");
+        result["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid")
+    }
+
+    let local_id_1 = remember(&registry, "ns733 probe term local arm one", "local").await;
+    let local_id_2 = remember(&registry, "ns733 probe term local arm two", "local").await;
+    let bench_id = remember(&registry, "ns733 probe term bench arm alpha", "bench-a").await;
+
+    (registry, local_id_1, local_id_2, bench_id)
+}
+
+/// A bound actor that remembers an episodic memory recalls it on the same
+/// identity without naming a namespace: the actor namespace joins the
+/// default read set where the token is minted (ADR-007 Rev 4 Rule 3b), so
+/// the write scope of `memory.remember` and the read scope of
+/// `memory.recall` agree for one identity. An anonymous caller keeps
+/// exactly `local`, and an explicit `namespace=local` stays precise.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn bound_actor_recalls_its_episodic_memory_without_a_namespace_param() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+    let identity = || khive_runtime::RequestIdentity {
+        namespace: "local".to_string(),
+        actor_id: Some("lambda:probe".to_string()),
+        visible_namespaces: vec![],
+        ..Default::default()
+    };
+    let remembered = registry
+        .dispatch_with_identity(
+            "memory.remember",
+            json!({
+                "content": "bound actor probe term episodic arm",
+                "memory_type": "episodic",
+                "tags": ["bound-actor-run"],
+            }),
+            Some(identity()),
+        )
+        .await
+        .expect("memory.remember as the bound actor");
+    let id = remembered["id"].as_str().expect("id").to_string();
+    let recall = json!({
+        "query": "bound actor probe term",
+        "tags": ["bound-actor-run"],
+        "limit": 10,
+    });
+    let has = |result: &Value| {
+        result
+            .as_array()
+            .map(|hits| hits.iter().any(|h| h["id"].as_str() == Some(id.as_str())))
+            .unwrap_or(false)
+    };
+
+    let mut result = Value::Null;
+    for _ in 0..300 {
+        result = registry
+            .dispatch_with_identity("memory.recall", recall.clone(), Some(identity()))
+            .await
+            .expect("memory.recall as the bound actor");
+        if has(&result) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        has(&result),
+        "the bound actor must recall its own episodic memory with no namespace param: {result:?}"
+    );
+
+    // Controls run after the positive arm so the index is warm: an absence
+    // below is scope, not consistency.
+    let anonymous = registry
+        .dispatch("memory.recall", recall.clone())
+        .await
+        .expect("memory.recall anonymous");
+    assert!(
+        !has(&anonymous),
+        "an anonymous caller keeps exactly the local read set: {anonymous:?}"
+    );
+    let mut precise = recall.clone();
+    precise["namespace"] = json!("local");
+    let scoped = registry
+        .dispatch_with_identity("memory.recall", precise, Some(identity()))
+        .await
+        .expect("memory.recall namespace=local as the bound actor");
+    assert!(
+        !has(&scoped),
+        "an explicit namespace=local is a precise scope, never widened: {scoped:?}"
+    );
+}
+
+/// With no override, recall uses exactly the caller token's visible namespaces.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn ns733_recall_namespace_absent_regresses_to_local_only() {
+    let (registry, local_id_1, local_id_2, _bench_id) = ns733_seed_three_memories().await;
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "ns733 probe term",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall with no namespace param");
+    let hits = result.as_array().expect("bare array result");
+    let ids: HashSet<Uuid> = hits
+        .iter()
+        .map(|h| h["id"].as_str().expect("id").parse::<Uuid>().expect("uuid"))
+        .collect();
+
+    assert_eq!(
+        ids,
+        HashSet::from([local_id_1, local_id_2]),
+        "no namespace param => must resolve to exactly the caller's default \
+             visible namespace set (local), never bench-a: {hits:?}"
+    );
+}
+
+/// An explicit namespace narrows recall to that exact namespace.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn ns733_recall_namespace_explicit_returns_only_that_namespace() {
+    let (registry, _local_id_1, _local_id_2, bench_id) = ns733_seed_three_memories().await;
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "ns733 probe term",
+                "namespace": "bench-a",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall with namespace=bench-a");
+    let hits = result.as_array().expect("bare array result");
+    let ids: HashSet<Uuid> = hits
+        .iter()
+        .map(|h| h["id"].as_str().expect("id").parse::<Uuid>().expect("uuid"))
+        .collect();
+
+    assert_eq!(
+        ids,
+        HashSet::from([bench_id]),
+        "namespace=\"bench-a\" must return exactly the bench-a memory and \
+             neither local memory: {hits:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn direct_recall_rejects_namespace_token_mismatch() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let pack = MemoryPack::new(rt.clone());
+    let token = rt.authorize(Namespace::local()).expect("local token");
+    let registry = VerbRegistryBuilder::new()
+        .build()
+        .expect("empty registry builds");
+
+    let err = pack
+        .handle_recall(
+            &token,
+            serde_json::json!({
+                "namespace": "bench-arm-a",
+                "query": "direct mismatch regression",
+            }),
+            &registry,
+            None,
+        )
+        .await
+        .expect_err("a local token must not elevate into a measurement arm");
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("does not match authorized token namespace")),
+        "unexpected error: {err:?}"
+    );
+}
+
+/// An absent namespace returns an empty successful result.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn ns733_recall_namespace_no_match_returns_empty_ok() {
+    let (registry, ..) = ns733_seed_three_memories().await;
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "ns733 probe term",
+                "namespace": "bench-nonexistent",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("memory.recall with a namespace matching no memories must still be Ok");
+    let hits = result.as_array().expect("bare array result");
+    assert!(
+        hits.is_empty(),
+        "namespace matching no memories must yield an empty result set, got: {hits:?}"
+    );
+}
+
+/// An invalid namespace is a per-operation error naming the supplied value.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn ns733_recall_invalid_namespace_is_a_per_op_error() {
+    let (registry, ..) = ns733_seed_three_memories().await;
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "ns733 probe term",
+                "namespace": "bad namespace",
+                "limit": 10
+            }),
+        )
+        .await;
+
+    let err = result
+        .expect_err("an invalid namespace string must be a per-op error, not a silent fallback");
+    let msg = err.to_string();
+    // Checking the supplied value distinguishes this from a generic namespace error.
+    assert!(
+        msg.contains("bad namespace"),
+        "error message must name the supplied invalid value \"bad namespace\", got: {msg}"
+    );
+}
+
+const NS733_ANN_MODEL: &str = "ns733-ann-namespace-model";
+const NS733_QUERY: &str = "ns733 ann overfetch query";
+const NS733_TARGET_CONTENT: &str = "ns733 ann overfetch bench target";
+const NS733_INCREMENTAL_CONTENT: &str = "ns733 ann overfetch incremental local filler";
+const NS733_FILLER_COUNT: usize = 35;
+
+/// Fixed vectors place the bench-a target deterministically behind all local fillers.
+fn ns733_ann_fixed_vectors() -> HashMap<String, Vec<f32>> {
+    let mut m = HashMap::new();
+    m.insert(
+        NS733_QUERY.to_string(),
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    for i in 0..NS733_FILLER_COUNT {
+        m.insert(
+            format!("ns733 ann overfetch local filler {i}"),
+            vec![0.9, 0.4358899, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+    }
+    m.insert(
+        NS733_TARGET_CONTENT.to_string(),
+        vec![0.5, 0.8660254, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    m.insert(
+        NS733_INCREMENTAL_CONTENT.to_string(),
+        vec![0.9, 0.4358899, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    m
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Ns733NamespaceMetadata {
+    Exact,
+    ConservativelyEmpty,
+}
+
+/// Widening finds only the bench-a target; disabling widening leaves it unreachable.
+/// See `crates/khive-pack-memory/docs/recall-reliability.md`.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace() {
+    assert_ns733_overfetch_with_namespace_metadata(Ns733NamespaceMetadata::Exact).await;
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn ns733_recall_ann_overfetch_retries_with_current_empty_namespace_metadata() {
+    assert_ns733_overfetch_with_namespace_metadata(Ns733NamespaceMetadata::ConservativelyEmpty)
+        .await;
+}
+
+async fn assert_ns733_overfetch_with_namespace_metadata(metadata: Ns733NamespaceMetadata) {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(FixedVecProvider {
+        model_name: NS733_ANN_MODEL.to_string(),
+        map: ns733_ann_fixed_vectors(),
+    });
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let memory_pack = MemoryPack::new(rt.clone());
+    let ann = memory_pack.ann_for_test();
+    let ann_key = crate::ann::AnnKey::from_token(NS733_ANN_MODEL);
+    // Remember queues background warms. Keep them behind the model lock
+    // until every seed has landed, so the first build scans one complete
+    // corpus and can prove the exact namespace metadata it learned.
+    let seed_warm_guard = crate::ann::hold_model_warm_lock_for_test(&ann, &ann_key).await;
+    builder.register(memory_pack);
+    let registry = builder.build().expect("registry");
+
+    // Omitting the model fans out to the sole registered custom provider.
+    for i in 0..NS733_FILLER_COUNT {
+        registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": format!("ns733 ann overfetch local filler {i}"),
+                    "memory_type": "semantic",
+                    "namespace": "local",
+                }),
+            )
+            .await
+            .expect("remember filler");
+    }
+    let target_id = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": NS733_TARGET_CONTENT,
+                "memory_type": "semantic",
+                "namespace": "bench-a",
+            }),
+        )
+        .await
+        .expect("remember target")["id"]
+        .as_str()
+        .expect("id")
+        .parse::<Uuid>()
+        .expect("valid uuid");
+    drop(seed_warm_guard);
+
+    // Establish readiness from this test's own ANN state rather than inferring it
+    // from a successful recall. The fresh-tail leg can surface the newest target
+    // while the installed bridge is still stale, which would make the following
+    // one-round assertion observe a different engine state under load. The
+    // single-flight ensure installs the complete seeded generation, and the idle
+    // barrier drains any fire-and-forget warm started by `memory.remember`.
+    let local_token = rt
+        .authorize(Namespace::local())
+        .expect("authorize local for deterministic ANN warm");
+    crate::ann::ensure_ann_for_model(&rt, &local_token, &ann, NS733_ANN_MODEL)
+        .await
+        .expect("synchronously warm the complete ns733 corpus");
+    crate::ann::wait_until_warm_idle(&ann, &ann_key).await;
+    assert!(
+        crate::ann::is_current(&ann, &ann_key).await,
+        "test-owned ANN must cover the final seeded generation"
+    );
+    assert_eq!(
+        crate::ann::index_namespace_set(&ann, &ann_key).await,
+        Some(HashSet::from(["local".to_string(), "bench-a".to_string()])),
+        "the full corpus warm must record both namespaces exactly"
+    );
+
+    // The exact branch keeps that full-build metadata. The other branch
+    // adds one later note and forces incremental maintenance, which clears
+    // namespace metadata while keeping the bridge current. Both branches
+    // must then exercise the same overfetch assertions below.
+    let expected_namespace_set = match metadata {
+        Ns733NamespaceMetadata::Exact => {
+            Some(HashSet::from(["local".to_string(), "bench-a".to_string()]))
+        }
+        Ns733NamespaceMetadata::ConservativelyEmpty => {
+            let incremental_guard = crate::ann::hold_model_warm_lock_for_test(&ann, &ann_key).await;
+            registry
+                .dispatch(
+                    "memory.remember",
+                    serde_json::json!({
+                        "content": NS733_INCREMENTAL_CONTENT,
+                        "memory_type": "semantic",
+                        "namespace": "local",
+                    }),
+                )
+                .await
+                .expect("remember one incremental local filler");
+            drop(incremental_guard);
+            crate::ann::ensure_ann_for_model(&rt, &local_token, &ann, NS733_ANN_MODEL)
+                .await
+                .expect("apply the one-note incremental ANN tail");
+            crate::ann::wait_until_warm_idle(&ann, &ann_key).await;
+            Some(HashSet::new())
+        }
+    };
+    assert!(
+        crate::ann::is_current(&ann, &ann_key).await,
+        "{metadata:?} branch must cover its final write"
+    );
+    assert_eq!(
+        crate::ann::index_namespace_set(&ann, &ann_key).await,
+        expected_namespace_set,
+        "{metadata:?} branch must retain its expected namespace metadata"
+    );
+
+    let base_params = serde_json::json!({
+        "query": NS733_QUERY,
+        "namespace": "bench-a",
+        "fusion_strategy": "vector_only",
+        "embedding_model": NS733_ANN_MODEL,
+        "config": { "candidate_limit": 1, "ann_overfetch_max_rounds": 2 },
+        "limit": 1,
+    });
+
+    // Case 1: two rounds of widening — the target must be found, and only the target.
+    let widened_result = registry
+        .dispatch("memory.recall", base_params.clone())
+        .await
+        .expect("memory.recall with two widening rounds");
+    let widened_hits = widened_result.as_array().expect("bare array result");
+    assert_eq!(
+        widened_hits.len(),
+        1,
+        "two widening rounds must surface exactly the bench-a target, got: {widened_hits:?}"
+    );
+    assert_eq!(
+        widened_hits[0]["id"]
+            .as_str()
+            .and_then(|s| s.parse::<Uuid>().ok()),
+        Some(target_id),
+        "the single hit must be the bench-a target, not a local filler"
+    );
+
+    // Case 2: widening disabled (`ann_overfetch_max_rounds: 1`) — round 1's
+    // narrow window is exhausted entirely by `local` fillers ranked ahead
+    // of the target, so the namespace-scoped post-filter finds nothing.
+    let mut disabled_params = base_params;
+    disabled_params["config"]["ann_overfetch_max_rounds"] = serde_json::json!(1);
+    let disabled_result = registry
+        .dispatch("memory.recall", disabled_params)
+        .await
+        .expect("memory.recall with widening disabled");
+    let disabled_hits = disabled_result.as_array().expect("bare array result");
+    assert!(
+        disabled_hits.is_empty(),
+        "with widening disabled, round 1's over-fetch window is saturated by \
+             closer local fillers and must not reach the bench-a target: {disabled_hits:?}"
+    );
+}
+
+// ── #733: verbose multi-model breakdown must not
+// leak off-namespace ANN candidate IDs ──────────────────────────────────
+
+const NS733B_MODEL_A: &str = "ns733b-breakdown-model-a";
+const NS733B_MODEL_B: &str = "ns733b-breakdown-model-b";
+const NS733B_QUERY: &str = "ns733b breakdown query";
+const NS733B_TARGET_CONTENT: &str = "ns733b breakdown bench target";
+const NS733B_FILLER_COUNT: usize = 5;
+
+/// Reuse the controlled namespace vector ordering for both registered models.
+fn ns733b_fixed_vectors() -> HashMap<String, Vec<f32>> {
+    let mut m = HashMap::new();
+    m.insert(
+        NS733B_QUERY.to_string(),
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    for i in 0..NS733B_FILLER_COUNT {
+        m.insert(
+            format!("ns733b breakdown local filler {i}"),
+            vec![0.9, 0.4358899, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+    }
+    m.insert(
+        NS733B_TARGET_CONTENT.to_string(),
+        vec![0.5, 0.8660254, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    );
+    m
+}
+
+/// Seed local fillers and one bench-a target across every registered model.
+async fn ns733b_seed_two_model_corpus(
+    registry: &khive_runtime::VerbRegistry,
+) -> (HashSet<Uuid>, Uuid) {
+    let mut local_filler_ids: HashSet<Uuid> = HashSet::new();
+    for i in 0..NS733B_FILLER_COUNT {
+        let r = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": format!("ns733b breakdown local filler {i}"),
+                    "memory_type": "semantic",
+                    "namespace": "local",
+                }),
+            )
+            .await
+            .expect("remember filler");
+        local_filler_ids.insert(
+            r["id"]
+                .as_str()
+                .expect("id")
+                .parse::<Uuid>()
+                .expect("valid uuid"),
+        );
+    }
+    let target_id = registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": NS733B_TARGET_CONTENT,
+                "memory_type": "semantic",
+                "namespace": "bench-a",
+            }),
+        )
+        .await
+        .expect("remember target")["id"]
+        .as_str()
+        .expect("id")
+        .parse::<Uuid>()
+        .expect("valid uuid");
+    (local_filler_ids, target_id)
+}
+
+/// Multi-model verbose breakdown must exclude every off-namespace ANN candidate.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates() {
+    // Poll only through the bounded stale-serve window; never retry corpus setup.
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(FixedVecProvider {
+        model_name: NS733B_MODEL_A.to_string(),
+        map: ns733b_fixed_vectors(),
+    });
+    rt.register_embedder(FixedVecProvider {
+        model_name: NS733B_MODEL_B.to_string(),
+        map: ns733b_fixed_vectors(),
+    });
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
+
+    let recall_args = serde_json::json!({
+        "query": NS733B_QUERY,
+        "namespace": "bench-a",
+        "fusion_strategy": "vector_only",
+        "include_breakdown": true,
+        "limit": 10,
+    });
+    let result = recall_until(&registry, "memory.recall", recall_args, |r| {
+        r["candidates"]["vector_candidates_per_model"]
+            .as_array()
+            .is_some_and(|per_model| {
+                per_model.iter().any(|entry| {
+                    entry["hits"].as_array().is_some_and(|hits| {
+                        hits.iter().any(|hit| {
+                            hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
+                                == Some(target_id)
+                        })
+                    })
+                })
+            })
+    })
+    .await;
+
+    ns733b_assert_breakdown(&result, &local_filler_ids, target_id);
+}
+
+/// Assert both model breakdowns exclude local fillers and retain the bench target.
+fn ns733b_assert_breakdown(result: &Value, local_filler_ids: &HashSet<Uuid>, target_id: Uuid) {
+    let per_model = result["candidates"]["vector_candidates_per_model"]
+        .as_array()
+        .expect("multi-model breakdown present (two models registered)");
+    assert_eq!(
+        per_model.len(),
+        2,
+        "both registered models must appear in the breakdown: {per_model:?}"
+    );
+
+    for model_entry in per_model {
+        let hits = model_entry["hits"].as_array().expect("hits array");
+        for hit in hits {
+            let id = hit["id"]
+                .as_str()
+                .expect("id")
+                .parse::<Uuid>()
+                .expect("valid uuid");
+            assert!(
+                !local_filler_ids.contains(&id),
+                "namespace=\"bench-a\" breakdown must not leak a local filler \
+                     UUID ({id}) for model {:?}: {model_entry:?}",
+                model_entry["model"]
+            );
+        }
+    }
+
+    // Sanity: the fix must not have filtered away everything — the
+    // bench-a target itself is entitled to appear (proves this is a
+    // real filter, not a filter-everything regression).
+    let any_model_has_target =
+        per_model.iter().any(|entry| {
+            entry["hits"].as_array().unwrap().iter().any(|hit| {
+                hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) == Some(target_id)
+            })
+        });
+    assert!(
+        any_model_has_target,
+        "the bench-a target must still appear in at least one model's \
+             breakdown after the namespace filter: {per_model:?}"
+    );
+}
+
+// ── #733: `memory.recall_candidates` must be
+// covered by its own regression, independent of `memory.recall`'s ──────
+
+/// The candidates subhandler's independent model map must exclude off-namespace IDs.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn ns733b_recall_candidates_multi_model_excludes_off_namespace_candidates() {
+    // Candidate diagnostics share the same bounded stale-serve window as recall.
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(FixedVecProvider {
+        model_name: NS733B_MODEL_A.to_string(),
+        map: ns733b_fixed_vectors(),
+    });
+    rt.register_embedder(FixedVecProvider {
+        model_name: NS733B_MODEL_B.to_string(),
+        map: ns733b_fixed_vectors(),
+    });
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
+
+    // Registry dispatch scopes the token before stripping this sub-handler's namespace.
+    let recall_candidates_args = serde_json::json!({
+        "query": NS733B_QUERY,
+        "namespace": "bench-a",
+        "limit": 10,
+    });
+    let result = recall_until(
+        &registry,
+        "memory.recall_candidates",
+        recall_candidates_args,
+        |r| {
+            r["vector_candidates_per_model"]
+                .as_object()
+                .is_some_and(|per_model| {
+                    per_model.values().any(|hits| {
+                        hits.as_array().is_some_and(|hits| {
+                            hits.iter().any(|hit| {
+                                hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
+                                    == Some(target_id)
+                            })
+                        })
+                    })
+                })
+        },
+    )
+    .await;
+
+    let per_model = result["vector_candidates_per_model"]
+        .as_object()
+        .expect("multi-model breakdown present (two models registered)");
+    assert_eq!(
+        per_model.len(),
+        2,
+        "both registered models must appear in the breakdown: {per_model:?}"
+    );
+
+    for (model_name, hits) in per_model {
+        let hits = hits.as_array().expect("hits array");
+        for hit in hits {
+            let id = hit["id"]
+                .as_str()
+                .expect("id")
+                .parse::<Uuid>()
+                .expect("valid uuid");
+            assert!(
+                !local_filler_ids.contains(&id),
+                "namespace=\"bench-a\" recall_candidates breakdown must not leak a \
+                     local filler UUID ({id}) for model {model_name:?}: {hits:?}"
+            );
+        }
+    }
+
+    // Sanity: the fix must not have filtered away everything — the
+    // bench-a target itself is entitled to appear (proves this is a
+    // real filter, not a filter-everything regression).
+    let any_model_has_target = per_model.values().any(|hits| {
+        hits.as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) == Some(target_id))
+    });
+    assert!(
+        any_model_has_target,
+        "the bench-a target must still appear in at least one model's \
+             recall_candidates breakdown after the namespace filter: {per_model:?}"
+    );
+}
+
+// ── ADR-104 §5 (Stage C): entity-anchored candidate extraction ─────────────
+
+/// Recalls one note after optionally seeding the entity needed for anchored lookup.
+async fn dispatch_single_note_recall_with_entity(
+    entity_name: Option<&str>,
+    content: &str,
+    query: &str,
+    entity_names: Option<&[&str]>,
+) -> f64 {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+        .await
+        .expect("create note");
+
+    if let Some(name) = entity_name {
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(Entity::new(ns.as_str(), "concept", name))
+            .await
+            .expect("seed entity");
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let mut params = serde_json::json!({
+        "query": query,
+        "fusion_strategy": "rrf",
+        "limit": 10
+    });
+    if let Some(names) = entity_names {
+        params["entity_names"] = serde_json::json!(names);
+    }
+
+    let result = registry
+        .dispatch("memory.recall", params)
+        .await
+        .expect("memory.recall");
+    let hits = result.as_array().expect("bare array result");
+    assert_eq!(hits.len(), 1, "single-note corpus must yield one hit");
+    hits[0]["rank_score"].as_f64().expect("rank_score")
+}
+
+/// Anchored lookup gives a lowercase real-entity query the EntityMatch boost.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_lowercase_query_naming_real_entity_gets_boost() {
+    const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+    const QUERY: &str = "committee proposal zenlake";
+
+    let anchored_score =
+        dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, None).await;
+    let opted_out_score =
+        dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, Some(&[])).await;
+
+    assert!(
+        anchored_score > opted_out_score,
+        "a lowercase query naming a real entity must be boosted above the \
+             explicit opt-out baseline: anchored={anchored_score} opted_out={opted_out_score}"
+    );
+    let ratio = anchored_score / opted_out_score;
+    assert!(
+        (ratio - 1.3).abs() < 0.01,
+        "expected ~1.3x lift from EntityMatch firing on the entity-anchored \
+             candidate, got ratio {ratio}"
+    );
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_duplicate_name_crowding_preserves_each_candidate_boost() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    let store = rt.entities(&token).expect("entity store");
+
+    let mut older_b = Entity::new(ns.as_str(), "concept", "crowdbeta");
+    older_b.created_at = 1;
+    older_b.updated_at = 1;
+    store
+        .upsert_entity(older_b)
+        .await
+        .expect("seed candidate B");
+
+    for created_at in 2..=258 {
+        let mut newer_a = Entity::new(ns.as_str(), "concept", "CrowdAlpha");
+        newer_a.created_at = created_at;
+        newer_a.updated_at = created_at;
+        store
+            .upsert_entity(newer_a)
+            .await
+            .expect("seed duplicate candidate A");
+    }
+
+    let anchored = MemoryPack::new(rt)
+        .entity_anchored_candidates(&token, "crowdalpha crowdbeta")
+        .await
+        .expect("Stage C lookup");
+    assert!(anchored.contains(&"crowdalpha".to_string()));
+    assert!(anchored.contains(&"crowdbeta".to_string()));
+
+    let baseline_names = vec!["crowdalpha".to_string()];
+    let now_millis = chrono::Utc::now().timestamp_millis();
+    let score = |entity_names: &[String]| {
+        crate::scoring::calculate_score(
+            &crate::scoring::ScoreInput {
+                salience: 0.5,
+                memory_type_str: "semantic",
+                content: "the archive concerns crowdbeta",
+                created_at_millis: now_millis,
+                decay_factor: 0.005,
+                now_millis,
+                relevance_score: 0.2,
+                entity_names,
+            },
+            &crate::scoring::ScoringConfig::default(),
+        )
+    };
+    let boosted = score(&anchored);
+    let baseline = score(&baseline_names);
+    assert!(boosted > baseline);
+    assert!(
+        (boosted / baseline - 1.3).abs() < 0.01,
+        "candidate B must retain its EntityMatch boost after candidate A duplicate crowding: \
+             boosted={boosted} baseline={baseline}"
+    );
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_non_ascii_case_lookup_end_to_end_is_bounded() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+    rt.entities(&token)
+        .expect("entity store")
+        .upsert_entity(Entity::new(ns.as_str(), "concept", "École"))
+        .await
+        .expect("seed entity");
+    let pack = MemoryPack::new(rt);
+
+    let same_spelling = pack
+        .entity_anchored_candidates(&token, "École research archive")
+        .await
+        .expect("same-spelling extraction");
+    let different_case = pack
+        .entity_anchored_candidates(&token, "école research archive")
+        .await
+        .expect("differently-cased extraction");
+
+    // Bounded contract: ASCII is case-insensitive, but cased non-ASCII
+    // characters require the exact form used by the stored entity name.
+    assert_eq!(same_spelling, vec!["école"]);
+    assert!(different_case.is_empty());
+}
+
+/// Bounded substring enumeration finds entities in unsegmented CJK queries.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_unsegmented_cjk_query_gets_entity_via_substring() {
+    const ENTITY_NAME: &str = "北京大学";
+    // Identical query/content isolates entity matching from retrieval relevance.
+    const CONTENT: &str = "我在北京大学学习";
+    const QUERY: &str = "我在北京大学学习";
+
+    let anchored_score =
+        dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, None).await;
+    let opted_out_score =
+        dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, Some(&[])).await;
+
+    assert!(
+        anchored_score > opted_out_score,
+        "an unsegmented CJK query containing a real entity name must be \
+             boosted above the explicit opt-out baseline: anchored={anchored_score} \
+             opted_out={opted_out_score}"
+    );
+    let ratio = anchored_score / opted_out_score;
+    assert!(
+        (ratio - 1.3).abs() < 0.01,
+        "expected ~1.3x lift from EntityMatch firing on the CJK \
+             substring-anchored candidate, got ratio {ratio}"
+    );
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_late_cjk_entity_survives_candidate_cap() {
+    const ENTITY_NAME: &str = "龍鳳凰";
+    let mut query: String = (0..62)
+        .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+        .collect();
+    query.push_str(ENTITY_NAME);
+    assert_eq!(query.chars().count(), 65);
+
+    let anchored_score =
+        dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), &query, &query, None).await;
+    let opted_out_score =
+        dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), &query, &query, Some(&[])).await;
+
+    assert!(
+        anchored_score > opted_out_score,
+        "a CJK entity in the final 10 characters of a 65-character unsegmented query must \
+             survive the candidate cap: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+    );
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_first_cjk_entity_survives_candidate_cap() {
+    let query: String = (0..20)
+        .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+        .collect();
+    let entity_name: String = query.chars().take(2).collect();
+    assert_eq!(query.chars().count(), 20);
+
+    let anchored_score =
+        dispatch_single_note_recall_with_entity(Some(&entity_name), &query, &query, None).await;
+    let opted_out_score =
+        dispatch_single_note_recall_with_entity(Some(&entity_name), &query, &query, Some(&[]))
+            .await;
+
+    assert!(
+        anchored_score > opted_out_score,
+        "a CJK entity in the first two characters of a 20-character unsegmented query must \
+             survive the candidate cap: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+    );
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_eight_character_cjk_entity_matches() {
+    const ENTITY_NAME: &str = "甲乙丙丁戊己庚辛";
+    const QUERY: &str = "甲乙丙丁戊己庚辛";
+
+    let anchored_score =
+        dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, None).await;
+    let opted_out_score =
+        dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, Some(&[])).await;
+
+    assert!(
+        anchored_score > opted_out_score,
+        "an eight-character CJK entity must match at the documented maximum: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+    );
+}
+
+/// A token with no matching entity receives no lexical-overlap reward.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_lowercase_token_naming_no_entity_gets_no_boost() {
+    const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+    const QUERY: &str = "committee proposal zenlake";
+
+    let auto_score = dispatch_single_note_recall_with_entity(None, CONTENT, QUERY, None).await;
+    let opted_out_score =
+        dispatch_single_note_recall_with_entity(None, CONTENT, QUERY, Some(&[])).await;
+
+    assert!(
+        (auto_score - opted_out_score).abs() < 1e-4,
+        "no real entity named \"zenlake\" exists, so a lowercase query \
+             naming it must not be boosted: auto={auto_score} opted_out={opted_out_score}"
+    );
+}
+
+/// Explicit entity names override extraction; an empty list remains a full opt-out.
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_explicit_entity_names_still_win_over_anchored_extraction() {
+    const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+    const QUERY: &str = "committee proposal zenlake";
+
+    let anchored_score =
+        dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, None).await;
+    let opted_out_score =
+        dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, Some(&[])).await;
+    let explicit_score = dispatch_single_note_recall_with_entity(
+        Some("zenlake"),
+        CONTENT,
+        QUERY,
+        Some(&["zenlake"]),
+    )
+    .await;
+
+    assert!(
+        (explicit_score - anchored_score).abs() < 1e-6,
+        "explicit entity_names=[\"zenlake\"] must reach the same boosted \
+             score as Stage C anchored extraction (both resolve to the same \
+             single candidate here): explicit={explicit_score} anchored={anchored_score}"
+    );
+    assert!(
+        (explicit_score - opted_out_score).abs() > 1e-6,
+        "explicit non-empty entity_names must still be honored (boosted \
+             above the opt-out baseline): explicit={explicit_score} opted_out={opted_out_score}"
+    );
+}
+
+/// Candidate extraction covers ASCII case, non-ASCII forms, stopwords, and caps.
+#[test]
+fn entity_lookup_candidates_extracts_unigrams_and_bigrams_lowercased() {
+    let out = crate::scoring::entity_lookup_candidates("New York City guide");
+    assert!(out.contains(&"new".to_string()));
+    assert!(out.contains(&"york".to_string()));
+    assert!(out.contains(&"city".to_string()));
+    assert!(out.contains(&"guide".to_string()));
+    assert!(out.contains(&"new york".to_string()));
+    assert!(out.contains(&"york city".to_string()));
+    assert!(out.contains(&"city guide".to_string()));
+}
+
+#[test]
+fn entity_lookup_candidates_preserves_raw_non_ascii_case() {
+    let out = crate::scoring::entity_lookup_candidates("ÉCOLE Research");
+    assert!(out.contains(&"ÉCOLE".to_string()));
+    assert!(out.contains(&"École".to_string()));
+    assert!(!out.contains(&"école".to_string()));
+}
+
+#[test]
+fn entity_lookup_candidates_enumerates_bounded_cjk_substrings() {
+    let out = crate::scoring::entity_lookup_candidates("我在北京大学学习");
+    assert!(out.contains(&"北京大学".to_string()));
+    assert!(!out.iter().any(|candidate| candidate.chars().count() == 1));
+    assert!(out.iter().all(|candidate| candidate.chars().count() <= 8));
+}
+
+#[test]
+fn entity_lookup_candidates_samples_both_cjk_endpoints() {
+    let query: String = (0..20)
+        .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+        .collect();
+    let first_bigram: String = query.chars().take(2).collect();
+    let final_bigram: String = query.chars().skip(18).collect();
+
+    let out = crate::scoring::entity_lookup_candidates(&query);
+
+    assert!(out.contains(&first_bigram));
+    assert!(out.contains(&final_bigram));
+}
+
+#[tokio::test]
+#[serial(background_tasks)]
+async fn adr104_stage_c_long_query_preserves_adjacent_bigram_entity_for_ascii_case() {
+    const ENTITY_NAME: &str = "silver comet";
+    const LOWERCASE_QUERY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india \
+                                      juliet kilo lima mike november oscar papa silver comet";
+    const TITLE_CASE_QUERY: &str = "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India \
+                                       Juliet Kilo Lima Mike November Oscar Papa Silver Comet";
+
+    for query in [LOWERCASE_QUERY, TITLE_CASE_QUERY] {
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), query, query, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), query, query, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "an 18-token query must retain and match its final adjacent bigram entity \
+                 regardless of ASCII case: query={query:?} anchored={anchored_score} \
+                 opted_out={opted_out_score}"
+        );
+    }
+}
+
+#[test]
+fn entity_lookup_candidates_empty_query_returns_empty() {
+    assert!(crate::scoring::entity_lookup_candidates("").is_empty());
+    assert!(crate::scoring::entity_lookup_candidates("   ").is_empty());
+}
+
+// A controlled `Notify` makes deadline contention deterministic across hosts.
+
+struct SlowEmbedService {
+    hold: Arc<Notify>,
+}
+
+#[async_trait]
+impl EmbeddingService for SlowEmbedService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.hold.notified().await;
+        Ok(texts.iter().map(|_| vec![0.0_f32; 8]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "slow-notify"
+    }
+}
+
+struct SlowEmbedProvider {
+    model_name: String,
+    hold: Arc<Notify>,
+}
+
+#[async_trait]
+impl EmbedderProvider for SlowEmbedProvider {
+    fn name(&self) -> &str {
+        &self.model_name
+    }
+
+    fn dimensions(&self) -> usize {
+        8
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(SlowEmbedService {
+            hold: self.hold.clone(),
+        }))
+    }
+}
+
+/// Deadline overrides accept positive values, fall through on null, and reject invalid input.
+#[test]
+fn recall_889_parse_deadline_override_precedence_and_validation() {
+    use crate::pack::parse_recall_deadline_override as parse_override;
+
+    assert_eq!(
+        parse_override(&serde_json::json!({ "query": "x", "limit": 5 })).unwrap(),
+        None,
+        "absent config.recall_deadline_ms must fall through to the process default"
+    );
+    assert_eq!(
+        parse_override(&serde_json::json!({
+            "config": { "recall_deadline_ms": Value::Null }
+        }))
+        .unwrap(),
+        None,
+        "an explicit JSON null override must fall through like an absent one"
+    );
+    assert_eq!(
+        parse_override(&serde_json::json!({ "config": { "recall_deadline_ms": 5000 } })).unwrap(),
+        Some(5000),
+        "a valid positive override must win over the process default"
+    );
+
+    for bad in [
+        serde_json::json!({ "config": { "recall_deadline_ms": 0 } }),
+        serde_json::json!({ "config": { "recall_deadline_ms": -5 } }),
+        serde_json::json!({ "config": { "recall_deadline_ms": "not-a-number" } }),
+        serde_json::json!({ "config": { "recall_deadline_ms": [1, 2] } }),
+    ] {
+        match parse_override(&bad) {
+            Err(RuntimeError::InvalidInput(_)) => {}
+            other => {
+                panic!("expected InvalidInput for a malformed override {bad:?}, got: {other:?}")
+            }
+        }
+    }
+}
+
+/// Invalid or absent operator deadline values fall back to 30 seconds.
+#[test]
+fn recall_889_env_deadline_ms_validates_and_falls_back_to_default() {
+    use crate::pack::parse_recall_deadline_env as parse_env;
+
+    const DEFAULT_MS: u64 = 30_000;
+    assert_eq!(parse_env(None), DEFAULT_MS);
+    assert_eq!(parse_env(Some("5000")), 5000);
+
+    for bad in ["0", "-5", "not-a-number", ""] {
+        assert_eq!(
+            parse_env(Some(bad)),
+            DEFAULT_MS,
+            "invalid env value {bad:?} must fall back to the default, not brick the daemon"
+        );
+    }
+}
+
+/// A zero request deadline is a per-operation `InvalidInput` error.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn recall_889_zero_deadline_override_returns_invalid_input_via_dispatch() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "issue 889 zero deadline override validation note",
+        Some(0.7),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "889 zero deadline override validation",
+                "limit": 10,
+                "config": { "recall_deadline_ms": 0 }
+            }),
+        )
+        .await;
+
+    match result {
+        Err(RuntimeError::InvalidInput(msg)) => {
+            assert!(
+                msg.contains("recall_deadline_ms"),
+                "InvalidInput message should name the offending field, got: {msg:?}"
+            );
+        }
+        other => panic!("expected InvalidInput for a zero deadline override, got: {other:?}"),
+    }
+}
+
+async fn held_embed_deadline_result_with_caller_delay(caller_delay: Option<std::time::Duration>) {
+    const MODEL: &str = "recall-889-slow-model";
+    const CALLER_DEADLINE_MS: u64 = 50;
+    let hold = Arc::new(Notify::new());
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(SlowEmbedProvider {
+        model_name: MODEL.to_owned(),
+        hold: hold.clone(),
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    // The setup embed consumes the sole permit, so the recall embed genuinely blocks.
+    hold.notify_one();
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "issue 889 held embed stage test note",
+        Some(0.7),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let start = std::time::Instant::now();
+    let completed = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        registry.dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "889 held embed stage test",
+                "limit": 10,
+                "config": { "recall_deadline_ms": CALLER_DEADLINE_MS }
+            }),
+        ),
+    )
+    .await;
+    // Simulate an instrumented caller resuming after the real recall outcome.
+    if let Some(delay) = caller_delay {
+        tokio::time::sleep(delay).await;
+    }
+    let elapsed = start.elapsed();
+
+    // Release the timed-out worker so it does not occupy a blocking-pool slot.
+    hold.notify_one();
+    let result = completed.expect("#889 recall exceeded the held-stage hang watchdog");
+
+    match result {
+        Err(RuntimeError::DeadlineExceeded {
+            operation,
+            budget_ms,
+            ..
+        }) => {
+            assert_eq!(operation, "memory.recall");
+            assert_eq!(
+                budget_ms, CALLER_DEADLINE_MS,
+                "#889 deadline error must retain the caller budget"
+            );
+        }
+        other => {
+            panic!("#889 expected DeadlineExceeded with the embed stage held, got: {other:?}")
+        }
+    }
+
+    let caller_bound = std::time::Duration::from_millis(CALLER_DEADLINE_MS) * 10;
+    if let Some(caller_bound) = timing::duration_bound(caller_bound, None) {
+        assert!(
+            elapsed < caller_bound,
+            "#889 recall exceeded its caller-derived completion bound \
+                 {caller_bound:?}, took {elapsed:?}"
+        );
+    }
+}
+
+/// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+    held_embed_deadline_result_with_caller_delay(None).await;
+}
+
+#[test]
+#[serial_test::serial(config_ledger)]
+fn recall_889_coverage_delay_retains_typed_deadline_outcome() {
+    const CHILD: &str = "KHIVE_RECALL_TIMING_COVERAGE_CHILD";
+    const NAME: &str =
+        "handlers::recall::tests::recall_889_coverage_delay_retains_typed_deadline_outcome";
+    if std::env::var_os(CHILD).is_some() {
+        assert!(std::env::var_os("LLVM_PROFILE_FILE").is_some());
+        tokio::runtime::Runtime::new().unwrap().block_on(
+            held_embed_deadline_result_with_caller_delay(Some(std::time::Duration::from_millis(
+                750,
+            ))),
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let output_path = dir.path().join("child-output.txt");
+    let output = std::fs::File::create(&output_path).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1")
+        .env("LLVM_PROFILE_FILE", dir.path().join("recall-%p.profraw"))
+        .stdout(std::process::Stdio::from(output.try_clone().unwrap()))
+        .stderr(std::process::Stdio::from(output))
+        .spawn()
+        .unwrap();
+    let watchdog = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= watchdog {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("coverage fixture watchdog expired; no semantic outcome");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let output = std::fs::read_to_string(output_path).unwrap();
+    assert!(status.success(), "coverage recall child failed:\n{output}");
+    assert!(
+        output.contains("1 passed; 0 failed"),
+        "coverage recall requires nonzero exact child selection: {output}"
+    );
+}
+
+// ── #30/#889: tracing-capture harness for the deadline-exceeded WARN ──────
+//
+// The reported incident (`memory.recall` hit the 300s client timeout with
+// zero daemon-side evidence) is exactly the case where `handle_recall`'s
+// own future is dropped by `tokio::time::timeout`, never reaching
+// `recall.rs`'s slow-request WARN. The abandoned-request WARN added to
+// `handle_recall_with_deadline` in `pack.rs` is the one that must fire
+// instead; a real `tracing::Subscriber` installed only as this test's
+// thread-local default (`tracing::subscriber::with_default`) observes it
+// without a multi-second sleep or interfering with any other test.
+
+#[derive(Clone, Debug, Default)]
+struct CapturedEvent {
+    message: Option<String>,
+    fields: std::collections::HashMap<String, String>,
+}
+
+#[derive(Default)]
+struct CapturedEventVisitor(CapturedEvent);
+
+impl tracing::field::Visit for CapturedEventVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let formatted = format!("{value:?}");
+        if field.name() == "message" {
+            self.0.message = Some(
+                formatted
+                    .trim_start_matches('"')
+                    .trim_end_matches('"')
+                    .to_string(),
+            );
+        } else {
+            self.0.fields.insert(field.name().to_string(), formatted);
+        }
+    }
+
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.0
+            .fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+
+struct CaptureSubscriber {
+    events: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+}
+
+impl tracing::Subscriber for CaptureSubscriber {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = CapturedEventVisitor::default();
+        event.record(&mut visitor);
+        self.events.lock().unwrap().push(visitor.0);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// A deadline-exceeded recall emits an unconditional daemon-side WARN — the
+/// exact evidence #30/#889 reported as missing during the incident.
+#[test]
+#[serial_test::serial(config_ledger)]
+fn recall_30_deadline_exceeded_emits_abandoned_slow_path_warn() {
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = CaptureSubscriber {
+        events: Arc::clone(&buffer),
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+
+    tracing::subscriber::with_default(subscriber, || {
+        runtime.block_on(async {
+            const MODEL: &str = "recall-30-warn-model";
+            let hold = Arc::new(Notify::new());
+
+            let rt = KhiveRuntime::memory().expect("in-memory runtime");
+            rt.register_embedder(SlowEmbedProvider {
+                model_name: MODEL.to_owned(),
+                hold: hold.clone(),
+            });
+
+            let ns = Namespace::parse("local").expect("local namespace");
+            let token = rt.authorize(ns).expect("authorize local");
+
+            hold.notify_one();
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                "issue 30 abandoned slow-path warn test note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(MemoryPack::new(rt.clone()));
+            let registry = builder.build().expect("registry");
+
+            let result = registry
+                .dispatch(
+                    "memory.recall",
+                    serde_json::json!({
+                        "query": "30 abandoned slow-path warn test",
+                        "limit": 10,
+                        "config": { "recall_deadline_ms": 50 }
+                    }),
+                )
+                .await;
+            hold.notify_one();
+            assert!(
+                matches!(result, Err(RuntimeError::DeadlineExceeded { .. })),
+                "expected DeadlineExceeded, got: {result:?}"
+            );
+        });
+    });
+
+    let events = buffer.lock().unwrap();
+    let warn = events
+        .iter()
+        .find(|e| {
+            e.message.as_deref() == Some("memory.recall exceeded its deadline and was abandoned")
+        })
+        .unwrap_or_else(|| panic!("expected the abandoned-deadline WARN, got: {events:?}"));
+    assert_eq!(
+        warn.fields.get("operation").map(String::as_str),
+        Some("\"memory.recall\"")
+    );
+    assert_eq!(warn.fields.get("budget_ms").map(String::as_str), Some("50"));
+    assert!(
+        warn.fields.contains_key("elapsed_ms"),
+        "abandoned WARN must carry elapsed_ms, got: {warn:?}"
+    );
+}
+
+/// `RECALL_SLOW_THRESHOLD_MS` stays sane: high enough that a healthy recall
+/// never trips it, low enough it fires well before the deadline default.
+/// Sanity-bounds the const rather than pinning it exactly, so a deliberate
+/// future retune doesn't require touching the test — but a typo (e.g.
+/// dropping three zeros) still fails loudly. Both sides are
+/// compile-time-constant, so `clippy::assertions_on_constants` requires
+/// the `const { }` wrapper (mirrors `COMPOSE_SLOW_THRESHOLD_MS`'s
+/// `slow_threshold_is_sane` test, #887).
+#[test]
+fn recall_slow_threshold_is_sane() {
+    const {
+        assert!(
+            super::RECALL_SLOW_THRESHOLD_MS >= 1_000,
+            "threshold must not fire on ordinary sub-second recalls"
+        );
+    }
+    const {
+        assert!(
+            super::RECALL_SLOW_THRESHOLD_MS < 30_000,
+            "threshold must fire before the default 30s recall_deadline_ms budget expires"
+        );
+    }
+}
+
+#[test]
+fn completed_slow_recall_warning_names_every_retrieval_stage() {
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = CaptureSubscriber {
+        events: Arc::clone(&buffer),
+    };
+    let timings = super::RecallStageTimings::from_millis_for_test(11, 22, 33, 44, 55);
+
+    tracing::subscriber::with_default(subscriber, || {
+        super::emit_slow_recall_warning(
+            super::RECALL_SLOW_THRESHOLD_MS,
+            &timings,
+            7,
+            9,
+            false,
+            true,
+            false,
+        );
+    });
+
+    let events = buffer.lock().unwrap();
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.message.as_deref() == Some("memory.recall exceeded slow-request threshold")
+        })
+        .unwrap_or_else(|| panic!("expected completed slow-recall warning, got {events:?}"));
+    for (field, expected) in [
+        ("embed_ms", "11"),
+        ("fts_ms", "22"),
+        ("ann_ms", "33"),
+        ("fresh_tail_ms", "44"),
+        ("hydrate_ms", "55"),
+        ("embed_attempted", "true"),
+        ("fts_attempted", "true"),
+        ("ann_attempted", "true"),
+        ("fresh_tail_attempted", "true"),
+        ("hydrate_attempted", "true"),
+    ] {
+        assert_eq!(
+            warning.fields.get(field).map(String::as_str),
+            Some(expected),
+            "missing or incorrect {field}: {warning:?}"
+        );
+    }
+}
+
+#[test]
+fn slow_recall_warning_keeps_skipped_and_fast_stages_distinct() {
+    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = CaptureSubscriber {
+        events: Arc::clone(&buffer),
+    };
+    let mut timings = super::RecallStageTimings::default();
+    timings.add_hydration(std::time::Duration::from_micros(500));
+    tracing::subscriber::with_default(subscriber, || {
+        super::emit_slow_recall_warning(
+            super::RECALL_SLOW_THRESHOLD_MS,
+            &timings,
+            0,
+            0,
+            false,
+            false,
+            false,
+        );
+    });
+    let events = buffer.lock().unwrap();
+    let warning = events
+        .iter()
+        .find(|event| {
+            event.message.as_deref() == Some("memory.recall exceeded slow-request threshold")
+        })
+        .expect("slow warning must be emitted");
+    for stage in ["embed", "fts", "ann", "fresh_tail", "hydrate"] {
+        assert_eq!(
+            warning
+                .fields
+                .get(&format!("{stage}_ms"))
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            warning
+                .fields
+                .get(&format!("{stage}_attempted"))
+                .map(String::as_str),
+            Some(if stage == "hydrate" { "true" } else { "false" }),
+            "{stage}: {warning:?}",
+        );
+    }
+}
+
+/// A deadline-exceeded dispatch does not affect a concurrent sibling dispatch.
+/// See `crates/khive-pack-memory/docs/recall-reliability.md`.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn recall_889_deadline_exceeded_does_not_affect_concurrent_sibling_op() {
+    const MODEL: &str = "recall-889-slow-sibling-model";
+    let hold = Arc::new(Notify::new());
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(SlowEmbedProvider {
+        model_name: MODEL.to_owned(),
+        hold: hold.clone(),
+    });
+
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    hold.notify_one();
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "issue 889 sibling isolation held note",
+        Some(0.7),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let slow_recall = registry.dispatch(
+        "memory.recall",
+        serde_json::json!({
+            "query": "889 sibling isolation held note",
+            "limit": 10,
+            "config": { "recall_deadline_ms": 50 }
+        }),
+    );
+    // `stats` touches no embedder and no held model, so it must
+    // complete quickly regardless of the sibling recall's fate.
+    let sibling_stats = registry.dispatch("stats", serde_json::json!({}));
+
+    let (slow_result, sibling_result) = tokio::join!(slow_recall, sibling_stats);
+    hold.notify_one();
+
+    let slow_err = slow_result.expect_err("expected the held-stage recall to time out");
+    match &slow_err {
+        RuntimeError::DeadlineExceeded {
+            operation,
+            budget_ms,
+            ..
+        } => {
+            assert_eq!(operation, "memory.recall");
+            assert_eq!(*budget_ms, 50);
+        }
+        other => panic!("expected DeadlineExceeded, got: {other:?}"),
+    }
+    let slow_err_text = slow_err.to_string();
+    assert!(
+        slow_err_text.to_lowercase().contains("deadline"),
+        "DeadlineExceeded display text must name the deadline for operator/CLI \
+             visibility, got: {slow_err_text:?}"
+    );
+
+    assert!(
+        sibling_result.is_ok(),
+        "a concurrently-dispatched sibling op must succeed independently of a \
+             sibling deadline timeout — isolation must hold at the VerbRegistry \
+             dispatch boundary the MCP parallel-batch executor sits on top of; got: {:?}",
+        sibling_result.err()
+    );
+}
+
+/// The 30-second default leaves normal uncontended recall unchanged.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn recall_889_normal_path_succeeds_within_default_deadline() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "issue 889 normal path recall note",
+        Some(0.7),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "889 normal path recall",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("recall must succeed within the default deadline");
+
+    let results = result.as_array().expect("recall result must be an array");
+    assert!(
+        !results.is_empty(),
+        "normal recall must surface the seeded note"
+    );
+}
+
+/// A generous request override leaves normal recall unchanged.
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn recall_889_generous_override_succeeds() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    rt.create_note(
+        &token,
+        "memory",
+        None,
+        "issue 889 generous override recall note",
+        Some(0.7),
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "889 generous override recall",
+                "limit": 10,
+                "config": { "recall_deadline_ms": 120_000 }
+            }),
+        )
+        .await
+        .expect("recall must succeed under a generous override");
+
+    let results = result.as_array().expect("recall result must be an array");
+    assert!(
+        !results.is_empty(),
+        "normal recall must surface the seeded note under a generous override"
+    );
+}
+
+// ── #1116: one engine failing must degrade recall, not abort it ──────────
+
+struct FailingEmbedService;
+
+#[async_trait]
+impl EmbeddingService for FailingEmbedService {
+    async fn embed(
+        &self,
+        _texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Err(EmbedError::ModelNotLoaded(
+            "simulated embedding engine outage".to_string(),
+        ))
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "failing-embed"
+    }
+}
+
+struct FailingEmbedProvider {
+    model_name: String,
+}
+
+#[async_trait]
+impl EmbedderProvider for FailingEmbedProvider {
+    fn name(&self) -> &str {
+        &self.model_name
+    }
+
+    fn dimensions(&self) -> usize {
+        8
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(FailingEmbedService))
+    }
+}
+
+/// One embedding engine failing must degrade recall to the healthy engine, not abort it.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_1116_one_failed_engine_still_serves_the_healthy_engines_hits() {
+    const HEALTHY_MODEL: &str = "recall-1116-healthy-model";
+    const FAILING_MODEL: &str = "recall-1116-failing-model";
+    const NOTE_TEXT: &str = "issue 1116 partial engine outage recall note";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(HashVecProvider {
+        model_name: HEALTHY_MODEL.to_owned(),
+        dims: 16,
+    });
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    // Seed while only the healthy engine is registered — write-time
+    // indexing embeds under every registered model, so the failing
+    // engine is added only after setup, isolating #1116's assertion to
+    // the read-time recall path (embed-on-write is a separate,
+    // already-best-effort path).
+    registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": NOTE_TEXT,
+                "memory_type": "semantic",
+            }),
+        )
+        .await
+        .expect("remember note under the healthy model");
+
+    rt.register_embedder(FailingEmbedProvider {
+        model_name: FAILING_MODEL.to_owned(),
+    });
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": NOTE_TEXT,
+                "fusion_strategy": "vector_only",
+                "limit": 10,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "recall must still serve the healthy engine when one engine's \
+                     embedder fails, got error: {e:?}"
+            )
+        });
+
+    let hits = result.as_array().expect("recall result must be an array");
+    assert!(
+        !hits.is_empty(),
+        "recall must surface the healthy engine's hits despite the other \
+             engine's embedder failing; got {result:?}"
+    );
+}
+
+/// If every engine's embedder fails, recall must error rather than silently return empty.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_1116_all_engines_failed_returns_error_not_empty() {
+    const FAILING_MODEL_A: &str = "recall-1116-all-failed-model-a";
+    const FAILING_MODEL_B: &str = "recall-1116-all-failed-model-b";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(FailingEmbedProvider {
+        model_name: FAILING_MODEL_A.to_owned(),
+    });
+    rt.register_embedder(FailingEmbedProvider {
+        model_name: FAILING_MODEL_B.to_owned(),
+    });
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "issue 1116 total engine outage recall query",
+                "fusion_strategy": "vector_only",
+                "limit": 10,
+            }),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "recall must error when every embedding engine failed, not silently \
+             return empty results: {result:?}"
+    );
+}
+
+// ── #1116: one engine's ANN/sqlite-vec retrieval failing must degrade that
+// engine to FTS-only, not abort recall across every engine ──────────────
+
+use super::super::common::retrieval_failpoints;
+
+/// One engine's ANN retrieval failing must degrade recall to the healthy engine.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_1116_one_engine_ann_retrieval_failure_still_serves_healthy() {
+    const HEALTHY_MODEL: &str = "recall-1116-ann-healthy-model";
+    const FAILING_MODEL: &str = "recall-1116-ann-failing-model";
+    const NOTE_TEXT: &str = "issue 1116 ann retrieval failure recall note";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(HashVecProvider {
+        model_name: HEALTHY_MODEL.to_owned(),
+        dims: 16,
+    });
+    rt.register_embedder(HashVecProvider {
+        model_name: FAILING_MODEL.to_owned(),
+        dims: 16,
+    });
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": NOTE_TEXT,
+                "memory_type": "semantic",
+            }),
+        )
+        .await
+        .expect("remember note under both models");
+
+    retrieval_failpoints::fail_ann(FAILING_MODEL);
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": NOTE_TEXT,
+                "fusion_strategy": "vector_only",
+                "limit": 10,
+            }),
+        )
+        .await;
+    retrieval_failpoints::clear_ann(FAILING_MODEL);
+
+    let result = result.unwrap_or_else(|e| {
+        panic!(
+            "recall must still serve the healthy engine when one engine's \
+                 ANN retrieval fails, got error: {e:?}"
+        )
+    });
+    let hits = result.as_array().expect("recall result must be an array");
+    assert!(
+        !hits.is_empty(),
+        "recall must surface the healthy engine's hits despite the other \
+             engine's ANN retrieval failing; got {result:?}"
+    );
+}
+
+/// One engine's sqlite-vec retrieval failing must degrade recall to the healthy engine.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_1116_one_engine_sqlite_vec_retrieval_failure_still_serves_healthy() {
+    const HEALTHY_MODEL: &str = "recall-1116-vec-healthy-model";
+    const FAILING_MODEL: &str = "recall-1116-vec-failing-model";
+    const NOTE_TEXT: &str = "issue 1116 sqlite-vec retrieval failure recall note";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    // Register the failing-retrieval model before the remember so a real
+    // index exists to search — the failpoint forces the sqlite-vec
+    // fallback route and fails it, not an empty/never-built index.
+    rt.register_embedder(HashVecProvider {
+        model_name: FAILING_MODEL.to_owned(),
+        dims: 16,
+    });
+    rt.register_embedder(HashVecProvider {
+        model_name: HEALTHY_MODEL.to_owned(),
+        dims: 16,
+    });
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    registry
+        .dispatch(
+            "memory.remember",
+            serde_json::json!({
+                "content": NOTE_TEXT,
+                "memory_type": "semantic",
+            }),
+        )
+        .await
+        .expect("remember note under both models");
+
+    retrieval_failpoints::fail_vec(FAILING_MODEL);
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": NOTE_TEXT,
+                "fusion_strategy": "vector_only",
+                "limit": 10,
+            }),
+        )
+        .await;
+    retrieval_failpoints::clear_vec(FAILING_MODEL);
+
+    let result = result.unwrap_or_else(|e| {
+        panic!(
+            "recall must still serve the healthy engine when one engine's \
+                 sqlite-vec retrieval fails, got error: {e:?}"
+        )
+    });
+    let hits = result.as_array().expect("recall result must be an array");
+    assert!(
+        !hits.is_empty(),
+        "recall must surface the healthy engine's hits despite the other \
+             engine's sqlite-vec retrieval failing; got {result:?}"
+    );
+}
+
+// ── RecallExecuted event plane emission ─────────────────
+
+/// `memory.recall` must persist a `RecallExecuted` event carrying the full
+/// served result-id list (`candidates` + `selected`), the typed result
+/// kind, the full query text, `served_by_profile_id`, the calling actor,
+/// and a timestamp — not just the transient in-memory brain-posterior
+/// stamp.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_persists_recall_executed_event_with_full_payload() {
+    const NOTE_TEXT: &str = "khive#36 recall executed event payload coverage note";
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    let note = rt
+        .create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+        .await
+        .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let before = khive_runtime::background_task_count();
+    let result = registry
+        .dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": NOTE_TEXT,
+                "limit": 10,
+            }),
+        )
+        .await
+        .expect("memory.recall must succeed");
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "seeded note must be recalled");
+
+    // The RecallExecuted event append happens on a tracked background
+    // task off the response path; wait for it to drain before querying.
+    for _ in 0..200 {
+        if khive_runtime::background_task_count() <= before {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let store = rt.events(&token).expect("event store");
+    let page = store
+        .query_events(
+            khive_storage::event::EventFilter {
+                kinds: vec![khive_types::EventKind::RecallExecuted],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query_events");
+
+    assert_eq!(
+        page.items.len(),
+        1,
+        "exactly one RecallExecuted event must be persisted: {page:?}"
+    );
+    let event = &page.items[0];
+    assert_eq!(event.verb, "memory.recall");
+    assert_eq!(
+        event.actor,
+        format!("{}:{}", token.actor().kind, token.actor().id)
+    );
+    assert_eq!(event.payload["query"], serde_json::json!(NOTE_TEXT));
+    assert_eq!(event.payload["result_kind"], serde_json::json!("note"));
+    assert_eq!(event.payload["result_count"], serde_json::json!(1));
+    let selected = event.payload["selected"]
+        .as_array()
+        .expect("selected must be an array")
+        .clone();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0], serde_json::json!(note.id.to_string()));
+    let candidates = event.payload["candidates"]
+        .as_array()
+        .expect("candidates must be an array");
+    assert_eq!(
+        candidates, &selected,
+        "candidates mirrors selected at this emission boundary"
+    );
+}
+
+/// created_after/created_before: half-open [after, before) window over
+/// note.created_at, boundary pinned at one exact instant so the inclusive
+/// and exclusive rules yield different results; plus the empty-window and
+/// date-only-rejection error paths.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_created_at_window_filters_half_open() {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    fn result_ids(v: &Value) -> Vec<String> {
+        let arr = v
+            .as_array()
+            .or_else(|| v.get("results").and_then(|r| r.as_array()))
+            .expect("array-shaped recall response");
+        arr.iter()
+            .map(|r| r["id"].as_str().expect("result id").to_string())
+            .collect()
+    }
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    let note_a = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "timewindow fixture alpha note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note a");
+    let note_b = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "timewindow fixture beta note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note b");
+
+    // Controlled instants, recent enough that decay does not zero the
+    // scores: T_A one hour before T_B, T_B one hour before now.
+    let t_b = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+    let t_a = t_b - 3_600_000_000;
+    let iso = |us: i64| {
+        chrono::DateTime::from_timestamp_micros(us)
+            .expect("valid micros")
+            .to_rfc3339()
+    };
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        for (id, us) in [(note_a.id, t_a), (note_b.id, t_b)] {
+            let changed = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET created_at = ? WHERE id = ?".to_string(),
+                    params: vec![SqlValue::Integer(us), SqlValue::Text(id.to_string())],
+                    label: Some("test.recall_window.set_created_at".to_string()),
+                })
+                .await
+                .expect("set created_at");
+            assert_eq!(changed, 1, "created_at UPDATE must hit exactly one row");
+        }
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let recall = |extra: Value| {
+        let registry = &registry;
+        async move {
+            let mut params = json!({
+                "query": "timewindow fixture",
+                "limit": 10
+            });
+            for (k, v) in extra.as_object().expect("extra params object") {
+                params[k] = v.clone();
+            }
+            registry.dispatch("memory.recall", params).await
+        }
+    };
+
+    // Control: no window returns both.
+    let both = recall(json!({})).await.expect("no-window recall");
+    let both_ids = result_ids(&both);
+    assert!(
+        both_ids.contains(&note_a.id.to_string()) && both_ids.contains(&note_b.id.to_string()),
+        "control must return both fixtures, got {both_ids:?}"
+    );
+
+    // created_after at exactly T_B is INCLUSIVE: only B survives.
+    let after = recall(json!({ "created_after": iso(t_b) }))
+        .await
+        .expect("created_after recall");
+    assert_eq!(
+        result_ids(&after),
+        vec![note_b.id.to_string()],
+        "created_after=T_B must keep exactly the note created AT T_B"
+    );
+
+    // created_before at exactly T_B is EXCLUSIVE: only A survives.
+    let before = recall(json!({ "created_before": iso(t_b) }))
+        .await
+        .expect("created_before recall");
+    assert_eq!(
+        result_ids(&before),
+        vec![note_a.id.to_string()],
+        "created_before=T_B must drop the note created AT T_B"
+    );
+
+    // Empty window (after == before) is an input error, not a silent [].
+    let empty = recall(json!({
+        "created_after": iso(t_b),
+        "created_before": iso(t_b)
+    }))
+    .await;
+    let empty_err = empty.expect_err("empty window must error").to_string();
+    assert!(
+        empty_err.contains("window is empty"),
+        "empty-window error must say so, got: {empty_err}"
+    );
+
+    // Date-only bounds are rejected, naming the accepted format.
+    let date_only = recall(json!({ "created_after": "2026-08-20" })).await;
+    let date_err = date_only
+        .expect_err("date-only bound must be rejected")
+        .to_string();
+    assert!(
+        date_err.contains("RFC 3339"),
+        "date-only rejection must name RFC 3339, got: {date_err}"
+    );
+}
+
+/// The re-gather loop must widen on window-starved candidate sets: with
+/// more strong out-of-window rows than the initial candidate window, an
+/// eligible in-window row ranks below the first fetch entirely. Counting
+/// raw candidates would stop widening immediately and return [] while an
+/// eligible memory exists; counting window-eligible candidates widens
+/// until it is found.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn recall_widens_when_out_of_window_candidates_crowd_out_eligible_ones() {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    // The default RecallConfig pins candidate_limit at 150 and
+    // max_recall_candidates at 200, so the initial fetch is 150 and one
+    // widening round reaches 200. Seed 160 fillers that out-rank the
+    // target on FTS (query terms repeated, so higher term frequency)
+    // plus one weaker-ranked eligible target: the target sits outside
+    // the 150-candidate first fetch and inside the widened 200.
+    let mut filler_ids = Vec::new();
+    for i in 0..160 {
+        let filler = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                &format!(
+                    "crowdout probe fixture {i} crowdout probe fixture \
+                         crowdout probe fixture"
+                ),
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create filler");
+        filler_ids.push(filler.id);
+    }
+    let target = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            "crowdout probe fixture sentinel",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+
+    // Fillers sit before the window bound, the target inside it.
+    let t_target = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+    let t_old = t_target - 3_600_000_000;
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        for (id, us) in filler_ids
+            .iter()
+            .map(|id| (*id, t_old))
+            .chain(std::iter::once((target.id, t_target)))
+        {
+            let changed = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET created_at = ? WHERE id = ?".to_string(),
+                    params: vec![SqlValue::Integer(us), SqlValue::Text(id.to_string())],
+                    label: Some("test.recall_crowdout.set_created_at".to_string()),
+                })
+                .await
+                .expect("set created_at");
+            assert_eq!(changed, 1, "created_at UPDATE must hit exactly one row");
+        }
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    // Fixture precondition: without a window the target must NOT be in
+    // the un-widened result set — the fillers out-rank it.
+    let unwindowed = registry
+        .dispatch(
+            "memory.recall",
+            json!({ "query": "crowdout probe fixture", "limit": 2 }),
+        )
+        .await
+        .expect("unwindowed recall");
+    let unwindowed_ids: Vec<String> = unwindowed
+        .as_array()
+        .or_else(|| unwindowed.get("results").and_then(|r| r.as_array()))
+        .expect("array-shaped recall response")
+        .iter()
+        .map(|r| r["id"].as_str().expect("result id").to_string())
+        .collect();
+    assert!(
+        !unwindowed_ids.contains(&target.id.to_string()),
+        "fixture precondition: the target must be crowded out without a window"
+    );
+
+    let windowed = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": "crowdout probe fixture",
+                "limit": 2,
+                "created_after": chrono::DateTime::from_timestamp_micros(t_target)
+                    .expect("valid micros")
+                    .to_rfc3339(),
+            }),
+        )
+        .await
+        .expect("windowed recall");
+    let windowed_ids: Vec<String> = windowed
+        .as_array()
+        .or_else(|| windowed.get("results").and_then(|r| r.as_array()))
+        .expect("array-shaped recall response")
+        .iter()
+        .map(|r| r["id"].as_str().expect("result id").to_string())
+        .collect();
+    assert_eq!(
+        windowed_ids,
+        vec![target.id.to_string()],
+        "the window must recover the eligible memory via widening"
+    );
+}
+
+const STRATEGY_PROBE_QUERY: &str = "widening strategy probe query";
+const STRATEGY_PROBE_TARGET: &str = "widening strategy probe query sentinel";
+const STRATEGY_PROBE_INITIAL_CANDIDATE_LIMIT: u32 = 4;
+const STRATEGY_PROBE_MAX_RECALL_CANDIDATES: usize = 8;
+const STRATEGY_PROBE_KEYWORD_FILLERS: usize = 5;
+const STRATEGY_PROBE_VECTOR_DECOYS: usize = 2;
+
+fn strategy_probe_recall_config() -> Value {
+    json!({
+        "candidate_limit": STRATEGY_PROBE_INITIAL_CANDIDATE_LIMIT,
+        "scoring": {
+            "max_recall_candidates": STRATEGY_PROBE_MAX_RECALL_CANDIDATES,
+        },
+        // One re-gather round is the behavior this fixture exercises.
+        "ann_overfetch_max_rounds": 2,
+    })
+}
+
+/// Query and vector decoys share one direction. The keyword target has a
+/// distinct, lower vector score that remains above `min_raw_relevance`,
+/// while fillers are orthogonal. This keeps the decoys first without
+/// letting zero-score vector tie ordering intermittently filter the target.
+struct StrategyProbeVecService;
+
+#[async_trait]
+impl EmbeddingService for StrategyProbeVecService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        Ok(texts
+            .iter()
+            .map(|t| {
+                if t == STRATEGY_PROBE_QUERY || t.starts_with("vector decoy") {
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                } else if t == STRATEGY_PROBE_TARGET {
+                    // cosine(query, target) ~= 0.316: below the decoys,
+                    // above the default raw-vector floor of 0.10.
+                    vec![1.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                } else {
+                    vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                }
+            })
+            .collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "strategy-probe-vec"
+    }
+}
+
+struct StrategyProbeVecProvider;
+
+#[async_trait]
+impl EmbedderProvider for StrategyProbeVecProvider {
+    fn name(&self) -> &str {
+        "strategy-probe-model"
+    }
+
+    fn dimensions(&self) -> usize {
+        8
+    }
+
+    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+        Ok(Arc::new(StrategyProbeVecService))
+    }
+}
+
+/// The widening stop condition must count only candidates the selected
+/// fusion strategy can keep. Under `keyword_only`, in-window notes found
+/// only by the vector leg are discarded at fusion; counting the hydrated
+/// union let them satisfy the break condition, so widening stopped with
+/// zero keyword survivors and returned a false-empty result even though
+/// an in-window keyword match existed one widening round deeper.
+#[tokio::test]
+#[serial(background_tasks)]
+#[serial_test::serial(config_ledger)]
+async fn keyword_only_widening_ignores_vector_leg_candidates() {
+    use khive_storage::types::{SqlStatement, SqlValue};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    rt.register_embedder(StrategyProbeVecProvider);
+    let ns = Namespace::parse("local").expect("local namespace");
+    let token = rt.authorize(ns).expect("authorize local");
+
+    // One more out-of-window keyword filler than the request-local initial
+    // cap. All fillers out-rank the target on FTS, so the target sits
+    // outside the 4-candidate first fetch and inside the explicitly capped
+    // widened fetch of 8. Keeping both bounds request-local avoids coupling
+    // this fixture to production defaults or a 150-row rank boundary.
+    let mut filler_ids = Vec::new();
+    for i in 0..STRATEGY_PROBE_KEYWORD_FILLERS {
+        let filler = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                &format!(
+                    "widening strategy probe query filler {i} widening \
+                         strategy probe query widening strategy probe query"
+                ),
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create filler");
+        filler_ids.push(filler.id);
+    }
+    // The in-window keyword match, reachable only via widening.
+    let target = rt
+        .create_note(
+            &token,
+            "memory",
+            None,
+            STRATEGY_PROBE_TARGET,
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+    // In-window vector-leg-only decoys: top vector hits (same direction
+    // as the query), never FTS hits (no query terms). Enough of them to
+    // satisfy `limit` on their own if the count wrongly includes them.
+    let mut decoy_ids = Vec::new();
+    for i in 0..STRATEGY_PROBE_VECTOR_DECOYS {
+        let decoy = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                &format!("vector decoy {i}"),
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create decoy");
+        decoy_ids.push(decoy.id);
+    }
+
+    // Fillers sit before the window bound; target and decoys inside it.
+    let t_in = chrono::Utc::now().timestamp_micros() - 3_600_000_000;
+    let t_old = t_in - 3_600_000_000;
+    {
+        let sql = rt.sql();
+        let mut writer = sql.writer().await.expect("writer");
+        for (id, us) in filler_ids
+            .iter()
+            .map(|id| (*id, t_old))
+            .chain(std::iter::once((target.id, t_in)))
+            .chain(decoy_ids.iter().map(|id| (*id, t_in)))
+        {
+            let changed = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE notes SET created_at = ? WHERE id = ?".to_string(),
+                    params: vec![SqlValue::Integer(us), SqlValue::Text(id.to_string())],
+                    label: Some("test.recall_strategy_widening.set_created_at".to_string()),
+                })
+                .await
+                .expect("set created_at");
+            assert_eq!(changed, 1, "created_at UPDATE must hit exactly one row");
+        }
+    }
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(MemoryPack::new(rt.clone()));
+    let registry = builder.build().expect("registry");
+
+    let recall_ids = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .or_else(|| v.get("results").and_then(|r| r.as_array()))
+            .expect("array-shaped recall response")
+            .iter()
+            .map(|r| r["id"].as_str().expect("result id").to_string())
+            .collect()
+    };
+
+    // Fixture precondition 1: the vector leg is live and the decoys are
+    // its top hits — otherwise the reproduction arm proves nothing.
+    let vector_probe = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": STRATEGY_PROBE_QUERY,
+                "limit": STRATEGY_PROBE_VECTOR_DECOYS,
+                "fusion_strategy": "vector_only",
+                "config": strategy_probe_recall_config(),
+            }),
+        )
+        .await
+        .expect("vector_only probe recall");
+    let vector_probe_ids = recall_ids(&vector_probe);
+    assert_eq!(vector_probe_ids.len(), STRATEGY_PROBE_VECTOR_DECOYS);
+    for decoy in &decoy_ids {
+        assert!(
+            vector_probe_ids.contains(&decoy.to_string()),
+            "fixture precondition: decoys must be vector-reachable, got {vector_probe_ids:?}"
+        );
+    }
+
+    // Fixture precondition 2: without a window the target is crowded out
+    // of keyword_only results by the fillers.
+    let unwindowed = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": STRATEGY_PROBE_QUERY,
+                "limit": 2,
+                "fusion_strategy": "keyword_only",
+                "config": strategy_probe_recall_config(),
+            }),
+        )
+        .await
+        .expect("unwindowed keyword_only recall");
+    assert!(
+        !recall_ids(&unwindowed).contains(&target.id.to_string()),
+        "fixture precondition: the target must be crowded out without a window"
+    );
+
+    // The reproduction arm: windowed keyword_only recall must widen past
+    // the in-window vector decoys and find the keyword target. Counting
+    // the hydrated union here returned [] (the decoys satisfied the
+    // break condition, then fusion discarded them).
+    let windowed = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": STRATEGY_PROBE_QUERY,
+                "limit": 2,
+                "fusion_strategy": "keyword_only",
+                "config": strategy_probe_recall_config(),
+                "created_after": chrono::DateTime::from_timestamp_micros(t_in)
+                    .expect("valid micros")
+                    .to_rfc3339(),
+            }),
+        )
+        .await
+        .expect("windowed keyword_only recall");
+    assert_eq!(
+        recall_ids(&windowed),
+        vec![target.id.to_string()],
+        "keyword_only widening must not stop on vector-leg-only candidates"
+    );
+}
