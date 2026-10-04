@@ -6,8 +6,7 @@
 //! See `crates/khive-pack-memory/docs/api/memory-lifecycle.md`.
 
 use khive_brain_core::{
-    BalancedRecallState, BetaPosterior, BrainSignal, FeedbackEventKind, FeedbackSignal,
-    ServeAttribution,
+    BalancedRecallState, BrainSignal, FeedbackEventKind, FeedbackSignal, ServeAttribution,
 };
 use uuid::Uuid;
 
@@ -42,49 +41,29 @@ pub fn on_recall_miss(state: &mut BalancedRecallState) {
 ///
 /// Unknown signal strings are silently ignored.
 pub fn on_explicit_feedback(state: &mut BalancedRecallState, target_id: Uuid, signal: &str) {
-    // Try semantic event kind first (weighted updates), then legacy signal.
-    if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal) {
-        let w = event_kind.update_weight();
-        if event_kind.is_positive() {
-            state.salience.update_success_weighted(w);
-        } else {
-            state.salience.update_failure_weighted(w);
+    let feedback = if let Some(event_kind) = FeedbackEventKind::from_signal_str(signal) {
+        let effective_weight = event_kind.update_weight();
+        BrainSignal::SemanticFeedback {
+            target_id,
+            event_kind,
+            effective_weight,
+            served_by_profile_id: None,
+            section_signals: None,
         }
-        // Corrections also penalise the relevance posterior (strongest negative signal).
-        if event_kind == FeedbackEventKind::Correction {
-            state.relevance.update_failure_weighted(w);
-        }
-        // Per-entity posterior (weighted).
-        let posterior = state
-            .entity_posteriors
-            .get_or_insert(target_id, || BetaPosterior::new(1.0, 1.0));
-        if event_kind.is_positive() {
-            posterior.update_success_weighted(w);
-        } else {
-            posterior.update_failure_weighted(w);
-        }
-        state.total_events += 1;
-    } else if let Ok(fb) =
+    } else if let Ok(signal) =
         serde_json::from_value::<FeedbackSignal>(serde_json::Value::String(signal.to_owned()))
     {
-        // Legacy signal: useful / not_useful / wrong
-        let positive = matches!(fb, FeedbackSignal::Useful);
-        if positive {
-            state.salience.update_success();
-        } else {
-            state.salience.update_failure();
+        BrainSignal::Feedback {
+            target_id,
+            signal,
+            served_by_profile_id: None,
+            section_signals: None,
         }
-        let posterior = state
-            .entity_posteriors
-            .get_or_insert(target_id, || BetaPosterior::new(1.0, 1.0));
-        if positive {
-            posterior.update_success();
-        } else {
-            posterior.update_failure();
-        }
-        state.total_events += 1;
-    }
-    // Unknown signal → no-op (don't poison state with bad data).
+    } else {
+        return;
+    };
+    state.apply_feedback_posteriors(&feedback);
+    state.total_events += 1;
 }
 
 #[cfg(test)]
