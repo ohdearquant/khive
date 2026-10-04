@@ -21,6 +21,7 @@ pub mod error;
 pub mod eval;
 pub mod hit;
 pub mod hybrid;
+pub mod materialization;
 pub mod metrics;
 #[cfg(feature = "persist")]
 pub mod persist;
@@ -65,6 +66,13 @@ pub use khive_hnsw::{HnswCheckpoint, HnswCheckpointStore};
 // ahead of the model port. TODO(port-rerank): khive-inference model impl still deferred.
 #[cfg(feature = "native-rerank")]
 pub use hybrid::{CrossEncoderScorer, NativeCrossEncoderReranker, RerankDocumentResolver};
+pub use materialization::{
+    materialize_ranked_prefix, DropCounts, DropDiagnostic, DropReason, MaterializationDecision,
+    MaterializationError, MaterializationLimitError, MaterializationLimits, MaterializedItem,
+    MaterializedPrefix, RankedCandidate, MAX_MATERIALIZATION_CANDIDATES,
+    MAX_MATERIALIZATION_DIAGNOSTICS, MAX_MATERIALIZATION_DROP_REASONS,
+    MAX_MATERIALIZATION_LOADER_BATCH, MAX_MATERIALIZATION_OUTPUTS,
+};
 pub use metrics::{MetricEvent, MetricValue, MetricsSink, NoopSink, RecordingSink};
 #[cfg(feature = "persist")]
 pub use persist::{

@@ -2462,8 +2462,18 @@ No measurement of how often shared owners occur in practice is claimed.
 Root alternation alone is not an unconditional prohibition on reuse. Empty sets
 satisfy the all-declaration predicate vacuously. Identical module/declaration
 identities with unchanged bytes can share refreshed declaration and edge rows.
-Repeated identical
-opaque sweep-time strings can satisfy equality even for different declarations.
+Known gap: reuse eligibility compares a retained observation's sweep-time string
+with the completed predecessor's string and does not compare run identity. The
+string is the invocation's wall-clock reading in RFC 3339 form with the
+fractional digits the reading has (none, three, six or nine), so its precision
+is that of the platform clock, down to nanoseconds, not seconds. The production
+handler reads the clock once per invocation and applies no per-owner uniqueness.
+The trigger is therefore two invocations for one owner and language that read an
+identical clock value (the same tick, or a clock stepped back onto an earlier
+value): a completed invocation then grants reuse for declarations and natural
+edges that it did not observe and that another invocation stamped with the same
+string. No such collision has been measured. Making observation run identity the
+authority, with rows that carry none reparsed once, is tracked in #3752.
 These cases retain the accepted identity, empty-coverage and opaque-time rules;
 they do not introduce root provenance. Partially aliased declarations must still
 pass both edge audits. A file that retains a removed live derived natural edge

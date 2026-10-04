@@ -796,6 +796,10 @@ pub(crate) struct AgendaParams {
     pub to: Option<String>,
     #[serde(default)]
     pub limit: Option<u32>,
+    #[serde(default)]
+    pub after: Option<String>,
+    #[serde(default)]
+    pub after_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1016,6 +1020,29 @@ pub(crate) async fn handle_agenda(
         None => None,
     };
 
+    let after_instant = match (&p.after, &p.after_id) {
+        (None, None) => None,
+        (Some(value), Some(id)) => {
+            value.parse::<DateTime<Utc>>().map_err(|_| {
+                RuntimeError::InvalidInput(format!(
+                    "agenda.after: must be an RFC 3339 timestamp; got {value:?}"
+                ))
+            })?;
+            let id = Uuid::parse_str(id).map_err(|_| {
+                RuntimeError::InvalidInput(format!("agenda.after_id: must be a UUID; got {id:?}"))
+            })?;
+            Some(NoteInstantSeekAfter {
+                value: value.clone(),
+                id,
+            })
+        }
+        _ => {
+            return Err(RuntimeError::InvalidInput(
+                "agenda: `after` and `after_id` must be supplied together".into(),
+            ));
+        }
+    };
+
     // The exact SQL predicate and sort parse stored RFC 3339 text into a UTC
     // key. Chrono accepts four-digit date prefixes and offsets under one day,
     // so widened local-date bounds can use the existing raw trigger index.
@@ -1073,11 +1100,13 @@ pub(crate) async fn handle_agenda(
         property_filters,
         order_by: Some(("$.trigger_at".to_string(), SortDir::Asc)),
         order_by_instant: true,
+        after_instant,
         ..Default::default()
     };
 
     const PAGE_SIZE: u32 = 64;
     let mut events = Vec::with_capacity(limit as usize);
+    let mut next = Value::Null;
     while events.len() < limit as usize {
         let page_limit = PAGE_SIZE.min(limit - events.len() as u32);
         let page = store
@@ -1104,6 +1133,7 @@ pub(crate) async fn handle_agenda(
                 value: value.to_string(),
                 id: last.id,
             });
+            next = json!({ "after": value, "after_id": last.id });
         }
         events.extend(page.items.iter().map(note_to_event_json));
         if page_len < page_limit {
@@ -1112,7 +1142,7 @@ pub(crate) async fn handle_agenda(
     }
     let count = events.len();
 
-    Ok(json!({ "events": events, "count": count }))
+    Ok(json!({ "events": events, "count": count, "next": next }))
 }
 
 /// `cancel` — cancel a scheduled event.

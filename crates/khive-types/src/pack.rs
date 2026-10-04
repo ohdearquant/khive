@@ -251,6 +251,9 @@ pub enum VerbPresentationPolicy {
     /// Preserve `created_at` and `updated_at` strings on immediate `results`
     /// array members in Agent mode.
     StreamBatchReceipts,
+    /// Preserve the root agenda continuation and empty event array in Agent mode.
+    /// Event rows retain the ordinary metadata transform.
+    AgendaContinuation,
 }
 
 impl HandlerDef {
@@ -278,6 +281,7 @@ impl HandlerDef {
             | "git.ingest_cursor" => VerbPresentationPolicy::AlwaysVerbose,
             "stream.append" => VerbPresentationPolicy::StreamAppendReceipt,
             "stream.batch" => VerbPresentationPolicy::StreamBatchReceipts,
+            "schedule.agenda" => VerbPresentationPolicy::AgendaContinuation,
             _ => VerbPresentationPolicy::Standard,
         }
     }

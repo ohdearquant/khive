@@ -844,13 +844,25 @@ pub fn present_with_policy_at(
     match mode {
         PresentationMode::Verbose | PresentationMode::Human => value,
         PresentationMode::Agent => {
+            // These root paths are selected by the registered agenda handler,
+            // never by a payload marker or a nested lookalike. The cursor's
+            // timestamp spelling and full UUID jointly define its seek position.
+            let mut value = value;
+            let agenda_next = (policy == VerbPresentationPolicy::AgendaContinuation)
+                .then(|| value.as_object_mut().and_then(|map| map.remove("next")))
+                .flatten();
+            let agenda_empty = policy == VerbPresentationPolicy::AgendaContinuation
+                && value
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty);
             let config = AgentTransformConfig {
                 preserved_nulls: LIFECYCLE_NULL_PRESERVE.iter().copied().collect(),
                 scores: SCORE_FIELDS.iter().copied().collect(),
                 payload_timestamps: PAYLOAD_TIMESTAMP_FIELDS.iter().copied().collect(),
                 now,
             };
-            transform_agent(
+            let mut value = transform_agent(
                 value,
                 &config,
                 AgentTreeContext {
@@ -863,7 +875,16 @@ pub fn present_with_policy_at(
                         _ => ReceiptContext::None,
                     },
                 },
-            )
+            );
+            if let Some(map) = value.as_object_mut() {
+                if let Some(next) = agenda_next {
+                    map.insert("next".into(), next);
+                }
+                if agenda_empty {
+                    map.insert("events".into(), Value::Array(Vec::new()));
+                }
+            }
+            value
         }
     }
 }

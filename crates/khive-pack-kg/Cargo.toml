@@ -29,6 +29,7 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 khive-gate = { version = "0.9.0", path = "../khive-gate" }

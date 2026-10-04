@@ -9,6 +9,7 @@
 //! It does not register a text embedder provider.
 
 pub mod handlers;
+mod materialization;
 mod model;
 mod pack;
 mod preference;
