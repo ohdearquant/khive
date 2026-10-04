@@ -60,7 +60,7 @@ Supported strategies are:
 
 | Request value  | Behavior                                                            |
 | -------------- | ------------------------------------------------------------------- |
-| `rrf`          | Reciprocal-rank fusion with `k = 60`.                               |
+| `rrf`          | Reciprocal-rank fusion with the configured `k`, or `60` if none.    |
 | `weighted`     | Weighted text/vector fusion; configured pack weights govern values. |
 | `union`        | Union candidate sets.                                               |
 | `vector_only`  | Ignore text candidates.                                             |

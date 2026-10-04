@@ -325,21 +325,7 @@ impl MemoryPack {
         }
 
         let mut cfg = p.effective_config(self.active_config());
-        if let Some(ref fs) = p.fusion_strategy {
-            let mut new_strategy = super::common::parse_fusion_strategy_str(fs)?;
-            if let (
-                FusionStrategy::Weighted {
-                    weights: ref mut new_w,
-                },
-                FusionStrategy::Weighted {
-                    weights: ref existing_w,
-                },
-            ) = (&mut new_strategy, &cfg.fuse_strategy)
-            {
-                *new_w = existing_w.clone();
-            }
-            cfg.fuse_strategy = new_strategy;
-        }
+        super::common::apply_requested_fusion_strategy(&mut cfg, p.fusion_strategy.as_deref())?;
         cfg.validate()?;
 
         let effective_min_score: f32 = {

@@ -17,10 +17,25 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
 
 /// Convert one path component into a NUL-terminated C string.
 ///
-/// A name with an interior NUL byte is refused with `ErrorKind::InvalidInput`, because the
-/// kernel would otherwise see a shorter name than the caller meant.
+/// Every helper in this module hands the name to an `*at` system call, which reads it as a path.
+/// A name that is not one component is therefore refused with `ErrorKind::InvalidInput` before
+/// any system call: an empty name and a name containing `/`. A name starting with `/` would
+/// ignore the parent descriptor, and in `a/b` the no-follow flags apply to `b` only.
+///
+/// `.` and `..` are single components and are accepted: `list_names` reopens a directory through
+/// `.`, and a directory walk steps up through `..`. What `..` means is the caller's policy.
+///
+/// A name with an interior NUL byte is refused the same way, because the kernel would otherwise
+/// see a shorter name than the caller meant.
 pub fn c_name(name: &OsStr) -> io::Result<CString> {
-    CString::new(name.as_bytes())
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path component must be a single name",
+        ));
+    }
+    CString::new(bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path component"))
 }
 
