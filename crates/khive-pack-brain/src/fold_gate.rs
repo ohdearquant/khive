@@ -26,7 +26,7 @@ pub const IMPLICIT_MASS_CAP: f64 = 1.5;
 pub const IMPLICIT_MASS_HALF_LIFE_US: f64 = 7.0 * 24.0 * 3600.0 * 1_000_000.0;
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
-    RuntimeError::Internal(format!("fold gate {context}: {e}"))
+    RuntimeError::internal_with_context(format!("fold gate {context}"), e)
 }
 
 /// Decay `old_mass` forward by `delta_us` microseconds under the shared half-life.
@@ -453,6 +453,16 @@ async fn fold_within_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fold_gate_sql_err_message_is_prefixed_context_and_error() {
+        match sql_err("insert", "boom") {
+            RuntimeError::Internal(message) => {
+                assert_eq!(message, "fold gate insert: boom");
+            }
+            other => panic!("expected RuntimeError::Internal, got {other:?}"),
+        }
+    }
 
     #[test]
     fn decayed_mass_zero_delta_is_unchanged() {
