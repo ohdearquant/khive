@@ -1,4 +1,4 @@
-use super::tests::{migrated, route};
+use super::tests::{migrated, route, seed_note};
 use super::*;
 
 const RELATIONS: [&str; 5] = [
@@ -257,13 +257,20 @@ fn bare_edge_route_preserves_legacy_rows_and_counts() {
     tx.commit().unwrap();
 }
 
-fn snapshots_in(conn: &Connection, namespace: &str) -> i64 {
-    conn.query_row(
-        "SELECT COUNT(*) FROM brain_profile_snapshots WHERE namespace = ?1",
-        [namespace],
-        |row| row.get(0),
-    )
-    .unwrap()
+fn aggregates_in(conn: &Connection, namespace: &str) -> [i64; 3] {
+    [
+        "brain_profile_snapshots",
+        "brain_event_log",
+        "proposals_open",
+    ]
+    .map(|table| {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE namespace = ?1"),
+            [namespace],
+            |row| row.get(0),
+        )
+        .unwrap()
+    })
 }
 
 #[test]
@@ -271,11 +278,16 @@ fn exhaustive_relation_routes_move_aggregates_only_to_a_single_target() {
     for with_fallback in [false, true] {
         for split in [false, true] {
             let conn = prepared();
-            conn.execute(
+            seed_note(&conn, "n1", "source", "observation");
+            conn.execute_batch(
                 "INSERT INTO brain_profile_snapshots \
-                 (profile_id, namespace, snapshot_json, updated_at) \
-                 VALUES ('p', 'source', '{}', 1)",
-                [],
+                 (profile_id, namespace, snapshot_json, updated_at) VALUES ('p', 'source', '{}', 1); \
+                 INSERT INTO brain_event_log \
+                 (profile_id, namespace, event_kind, payload, created_at) \
+                 VALUES ('p', 'source', 'fold', '{}', 1); \
+                 INSERT INTO proposals_open \
+                 (proposal_id, namespace, proposer, title, status, created_at, updated_at) \
+                 VALUES ('q', 'source', 'someone', 'a title', 'open', 1, 1);",
             )
             .unwrap();
             let mut routes: Vec<MoveRoute> = RELATIONS
@@ -289,21 +301,28 @@ fn exhaustive_relation_routes_move_aggregates_only_to_a_single_target() {
                     route(&format!("edge:{relation}"), target)
                 })
                 .collect();
+            routes.push(route("note:observation", "target"));
             if with_fallback {
                 routes.push(route("edge", "target"));
             }
             let request = MoveRequest::new("source", routes);
             let counts = move_namespace(&conn, &request).unwrap();
             assert_eq!(counts.rows.get("graph_edges"), Some(&5));
+            assert_eq!(counts.subjects.get("note:observation"), Some(&1));
             if split {
-                assert_eq!(counts.left_behind.get("brain_profile_snapshots"), Some(&1));
-                assert_eq!(snapshots_in(&conn, "source"), 1);
-                assert_eq!(snapshots_in(&conn, "target"), 0);
+                for table in [
+                    "brain_profile_snapshots",
+                    "brain_event_log",
+                    "proposals_open",
+                ] {
+                    assert_eq!(counts.left_behind.get(table), Some(&1), "{table}");
+                }
+                assert_eq!(aggregates_in(&conn, "source"), [1, 1, 1]);
+                assert_eq!(aggregates_in(&conn, "target"), [0, 0, 0]);
             } else {
                 assert!(counts.left_behind.is_empty(), "{:?}", counts.left_behind);
-                assert_eq!(counts.rows.get("brain_profile_snapshots"), Some(&1));
-                assert_eq!(snapshots_in(&conn, "source"), 0);
-                assert_eq!(snapshots_in(&conn, "target"), 1);
+                assert_eq!(aggregates_in(&conn, "source"), [0, 0, 0]);
+                assert_eq!(aggregates_in(&conn, "target"), [1, 1, 1]);
             }
         }
     }
