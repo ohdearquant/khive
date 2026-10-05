@@ -4,10 +4,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
-use khive_types::{
-    EdgeEndpointRule, EntityTypeDef, HandlerDef, Pack, PackColumnAddition, PackSchemaPlan,
-};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_types::{EntityTypeDef, HandlerDef, Pack, PackColumnAddition, PackSchemaPlan};
 
 use crate::handlers;
 use crate::vocab::{
@@ -45,13 +43,7 @@ impl Pack for ToolPack {
 struct ToolPackFactory;
 
 impl khive_runtime::PackFactory for ToolPackFactory {
-    fn name(&self) -> &'static str {
-        PACK_NAME
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(ToolPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(ToolPack::new(runtime))
@@ -62,44 +54,7 @@ inventory::submit! { khive_runtime::PackRegistration(&ToolPackFactory) }
 
 #[async_trait]
 impl PackRuntime for ToolPack {
-    fn name(&self) -> &str {
-        <ToolPack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <ToolPack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <ToolPack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <ToolPack as Pack>::HANDLERS
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        &[]
-    }
-
-    fn entity_types(&self) -> &'static [EntityTypeDef] {
-        <ToolPack as Pack>::ENTITY_TYPES
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <ToolPack as Pack>::REQUIRES
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: PACK_NAME,
-            statements: &TOOL_SCHEMA_PLAN_STMTS,
-        }
-    }
-
-    fn schema_column_additions(&self) -> &'static [PackColumnAddition] {
-        <Self as Pack>::SCHEMA_COLUMN_ADDITIONS
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     async fn dispatch(
         &self,
