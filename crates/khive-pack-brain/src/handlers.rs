@@ -3616,29 +3616,7 @@ impl DispatchHook for BrainPack {
 
 #[async_trait]
 impl khive_runtime::pack::PackRuntime for BrainPack {
-    fn name(&self) -> &str {
-        <BrainPack as khive_types::Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <BrainPack as khive_types::Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <BrainPack as khive_types::Pack>::ENTITY_KINDS
-    }
-
-    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
-        <BrainPack as khive_types::Pack>::BRAIN_CONSUMER_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        BRAIN_HANDLERS
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <BrainPack as khive_types::Pack>::REQUIRES
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     async fn apply_profile_section_feedback(
         &self,
