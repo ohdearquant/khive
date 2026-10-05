@@ -1211,6 +1211,16 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "load_limits",
         "khive-runtime/src/daemon/load_limits.rs",
     ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "store_guard",
+        "khive-runtime/src/daemon/store_guard.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "store_identity",
+        "khive-runtime/src/daemon/store_identity.rs",
+    ),
 ];
 
 impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {

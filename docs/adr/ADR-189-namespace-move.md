@@ -745,16 +745,25 @@ as "routed to the namespace it is already in", checked in `namespace_move.rs` be
 inventory is read). This amendment states the rule and extends it to the new keys; it does not add
 a new refusal.
 
-Collision enumeration keeps Amendment 2's rule: per reachable constraint and per distinct target,
-over all source rows. `idx_graph_edges_unique_triple` carries the relation, so when relations go to
-different targets, a source edge can be reported as colliding in a target its relation is not
-routed to, and the move refuses. This is a stated limit, and it errs toward refusing, the safe side:
-no row is lost or overwritten. One request cannot avoid it, because every request must route every
-relation present in the source and no route may name the source. Two steps can: move each
-destination's share to its own fresh, empty namespace first, where nothing can collide, then move
-each of those to its real destination, which checks only that destination's own rows. Filtering the
-edge constraint by resolved route would remove the false refusal and the extra step, and is left to
-a later change.
+**Proposed collision exception (#4121, 2026-10-05).** This replaces the earlier requirement to
+check every source edge against every routed target. Collision enumeration still visits each
+reachable constraint once per distinct target. For `graph_edges`'s named
+`idx_graph_edges_unique_triple` constraint only, it considers source edges whose resolved relation
+route names that target: the specific `edge:<relation>` route wins, otherwise the bare `edge`
+fallback applies. This is the same resolution used by the move itself, independent of route-list
+order. A stored legacy relation without a specific route still follows the bare fallback.
+
+A matching triple resident in another routed target does not refuse the move when the source edge
+will not be written there. A matching triple in the edge's actual destination still refuses before
+any write and reports the same table, constraint, target and key. Several routes naming one target
+do not duplicate a reported collision. Soft-deleted source edges remain in this check; the triple
+index is not partial. No resident row is overwritten or merged.
+
+All other constraints retain Amendment 2's conservative source-row enumeration, including domain
+mirror slug collisions without an Atom route. Partial and expression index exclusions, the plain
+statement constraint backstop and caller-owned transaction/rollback behavior are unchanged. This
+exception does not change route validation, edge/vector destinations, aggregate totality or any ADR
+status.
 
 ### Vectors use the same resolved edge destination
 
@@ -762,8 +771,10 @@ Amendment 2's partitioned vector resolution uses this same resolved edge route. 
 plus a fallback does not contribute two destinations for one edge. Different physical subjects
 sharing an ID still obey the existing distinct-target ambiguity rule. Source scoping, vector bytes,
 paired ANN instructions, collision refusal, transaction ownership, aggregate handling and
-repeated-call behavior retain their existing rules. This amendment extends the route grammar; it
-does not replace or change the status of the document or Amendments 1 through 3.
+repeated-call behavior retain their existing rules. This amendment extends the route grammar and,
+for the graph-edge triple constraint only, replaces Amendment 2's rule of checking every source edge
+against every routed target. It changes nothing else in Amendments 1 through 3 and does not change
+the status of the document.
 
 ### Acceptance
 
@@ -778,10 +789,17 @@ does not replace or change the status of the document or Amendments 1 through 3.
 - With every other class routed to one target, exhaustive specific relation routes to that same
   target, without a bare `edge` route, move the namespace aggregates. The same source with its
   relations split across two targets leaves them in place and reports them as left behind.
-- A source relation routed to one target whose triple is already resident in another routed target
-  refuses before any write, naming the unique triple and that target. Moving each share to a fresh
-  empty namespace and then on to its destination succeeds, places every edge where it was routed and
-  leaves the resident unchanged. Removing the collision refusal must fail this test.
+- Source relations A and B routed to T1 and T2 move directly when T2 holds a resident with A's
+  triple: assert exact per-ID destinations, unchanged nonnamespace fields and resident rows, per-route
+  counts and zero moves on repetition. Cover exhaustive specific routes and a specific route with
+  the bare fallback in either route-list order, including legacy relations and deleted source edges.
+- With A's triple resident in its actual T1 destination, refuse before any write and report the
+  exact table, unique-triple constraint, target and triple key. The same refusal applies to fallback
+  destinations; several routes sharing a target report one collision. Assert unchanged rows and no
+  writes, with a moved unrelated row in the fixture so bypassing preflight cannot pass unnoticed.
+- Removing only the edge route predicate must make the unchanged direct-success fixture fail on
+  the false refusal. Skipping collision preflight must make the unchanged named-refusal fixture
+  fail. Both controls must compile, and each fixture must pass again after exact restoration.
 - Actual source edge vectors follow the resolved route in either route-list order, preserve bytes
   and append a source-delete then destination-upsert pair per moved vector. Vector kind and field do
   not choose the destination. Resident vectors remain unchanged and unlogged.

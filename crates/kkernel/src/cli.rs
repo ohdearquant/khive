@@ -4,7 +4,11 @@
 //! Lives in the library (rather than `main.rs`) so downstream distributions
 //! can embed the full CLI in their own binary with additional packs linked
 //! in: `fn main() { kkernel::cli::cli_main() }` plus a force-link `use` per
-//! extra pack crate (ADR-027 self-registration).
+//! extra pack crate (ADR-027 self-registration). On verified 64-bit Linux/macOS,
+//! an embedding binary must first call the unsafe
+//! `khive_db::pool::initialize_claimed_file_observer` at process startup before
+//! any SQLite I/O or worker threads. Daemon claimed-file boot refuses without
+//! that initialization; the stock binary performs it before calling this CLI.
 //!
 //! See `crates/kkernel/docs/usage.md` for the full subcommand reference.
 
@@ -459,7 +463,7 @@ pub async fn cli_main() -> Result<()> {
                 }
             };
             let config_source = loaded_config.as_ref().map(|(_, source)| source.as_path());
-            let khive_cfg = loaded_config
+            let mut khive_cfg = loaded_config
                 .as_ref()
                 .map(|(config, _)| config.clone())
                 .unwrap_or_default();
@@ -484,7 +488,7 @@ pub async fn cli_main() -> Result<()> {
                 let (cli_ns_explicit, cli_ns) = khive_mcp::args::resolve_cli_namespace(&a)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-                let (base_cfg, db_anchor) =
+                let (base_cfg, mut db_anchor) =
                     khive_mcp::serve::resolve_runtime_config_with_db_anchor(
                         khive_mcp::serve::RuntimeConfigInputs {
                             db: a.db.as_deref(),
@@ -505,7 +509,7 @@ pub async fn cli_main() -> Result<()> {
                 // is set — it supervises an events daemon at the derived
                 // socket (`start_daemon_components_if_daemon`), so upgrade
                 // the resolved event plane from direct mode to forwarding.
-                let base_cfg = {
+                let mut base_cfg = {
                     let mut base_cfg = base_cfg;
                     if a.daemon {
                         khive_mcp::serve::enable_events_forwarding_for_daemon(&mut base_cfg);
@@ -534,9 +538,43 @@ pub async fn cli_main() -> Result<()> {
                 } else {
                     khive_runtime::daemon::acquire_recovery_lock()
                 };
+                // Claim every physical SQLite backend before the coordinator
+                // opens stores. The binding remains live through serve_server
+                // so a daemon under another HOME cannot serve an overlapping
+                // backend set while this daemon owns it (#3069).
+                #[cfg(unix)]
+                if a.daemon {
+                    khive_mcp::daemon::refuse_serving_socket_before_store_claim().await?;
+                }
+                #[cfg(unix)]
+                let store_guards = if a.daemon {
+                    let plan = khive_mcp::serve::prepare_daemon_store_plan(
+                        &mut base_cfg.db_path,
+                        &mut db_anchor,
+                        &mut khive_cfg.backends,
+                        a.db.as_deref() == Some(":memory:"),
+                    )?;
+                    let mut guards =
+                        khive_runtime::daemon::claim_stores(&plan.paths, &plan.read_only_paths)?;
+                    plan.assert_aliases_unchanged()?;
+                    khive_runtime::daemon::bind_daemon_store_files(
+                        &mut guards,
+                        &plan.read_only_paths,
+                    )?;
+                    // Check the binding now; each pool also verifies the held
+                    // file identity before identity initialization and WAL setup.
+                    khive_runtime::daemon::assert_daemon_store_identities(&guards)?;
+                    Some(guards)
+                } else {
+                    None
+                };
                 #[cfg(not(unix))]
                 let boot_guard: Option<std::fs::File> = None;
 
+                #[cfg(unix)]
+                let daemon_claims = store_guards.as_deref();
+                #[cfg(not(unix))]
+                let daemon_claims = None;
                 let (server, schedule_rt) =
                     build_multi_backend_server_with_coordinator_and_pool_size(
                         base_cfg,
@@ -544,8 +582,13 @@ pub async fn cli_main() -> Result<()> {
                         a.db.as_deref(),
                         db_anchor.as_deref(),
                         max_readers,
+                        daemon_claims,
                     )
                     .await?;
+                #[cfg(unix)]
+                if let Some(guards) = store_guards.as_deref() {
+                    khive_runtime::daemon::assert_daemon_store_identities(guards)?;
+                }
 
                 khive_mcp::serve::serve_server(
                     server,
@@ -654,6 +697,7 @@ async fn build_multi_backend_server_with_coordinator_and_db_anchor(
         cli_db_override,
         db_anchor,
         None,
+        None,
     )
     .await
 }
@@ -664,13 +708,15 @@ async fn build_multi_backend_server_with_coordinator_and_pool_size(
     cli_db_override: Option<&str>,
     db_anchor: Option<&std::path::Path>,
     max_readers: Option<usize>,
+    daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
-    let multi = khive_mcp::serve::build_registry_for_multi_backend_with_db_anchor_and_max_readers(
+    let multi = khive_mcp::serve::build_registry_for_multi_backend_with_db_anchor_and_max_readers_and_claims(
         base_cfg,
         khive_cfg,
         cli_db_override,
         db_anchor,
         max_readers,
+        daemon_claims,
     )
     .await?;
 

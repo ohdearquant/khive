@@ -30,9 +30,11 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
                 khive_types::ErrorKind::Internal,
                 Some("post_commit_degraded" | "embedding_input_truncated"),
             ) => Some("committed"),
-            (khive_types::ErrorKind::Conflict, Some("key_conflict" | "fence_conflict")) => {
-                Some("not_committed")
-            }
+            // These keyed conflicts certify that this request wrote no domain record.
+            (
+                khive_types::ErrorKind::Conflict,
+                Some("key_conflict" | "fence_conflict" | "idempotency_key_conflict"),
+            ) => Some("not_committed"),
             (khive_types::ErrorKind::Unavailable, Some("key_holder_unresolved")) => Some("unknown"),
             // ADR-174 A1.1: a stream member refusal carries
             // `domain_disposition: not_committed` wherever it surfaces. In
@@ -375,6 +377,24 @@ mod tests {
             assert_eq!(value["domain_disposition"], expected);
             assert_eq!(value["details"]["extra"], "retained");
         }
+    }
+
+    #[test]
+    fn idempotency_key_conflict_projects_not_committed() {
+        let source = KhiveError::conflict("different content under an existing key").with_details(
+            Details::new([
+                ("reason", "idempotency_key_conflict"),
+                ("key", "operation-1"),
+                ("existing_id", "holder-1"),
+            ]),
+        );
+        let value = runtime_error_value(source.into(), DomainDisposition::Unknown);
+        assert_eq!(value["kind"], "conflict");
+        assert_eq!(value["details"]["reason"], "idempotency_key_conflict");
+        assert_eq!(
+            value["domain_disposition"], "not_committed",
+            "keyed refusal must project not_committed"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-"""Ordered fences across two isolated daemon processes sharing one scratch store.
+"""Ordered fences survive sequential daemon owners of one scratch store.
 
 Set KKERNEL to the binary built from this checkout. No production stores are used.
 """
@@ -30,18 +30,20 @@ def one(session, verb, **args):
 
 
 @contextlib.contextmanager
-def second_daemon(scratch):
+def fence_daemon(scratch, label):
     binary = os.environ.get("KKERNEL")
     assert binary, "set KKERNEL to this checkout's freshly built binary"
     root = Path(scratch["root"])
-    socket = root / "peer.sock"
+    socket = root / f"{label}.sock"
+    database = root / "fences.db"
     env = os.environ.copy()
-    env.update(KHIVE_SOCKET=str(socket), KHIVE_PID=str(root / "peer.pid"),
-               KHIVE_LOCK=str(root / "peer.lock"),
-               KHIVE_RECOVERER_LOCK=str(root / "peer.recoverer.lock"))
+    env.update(KHIVE_SOCKET=str(socket), KHIVE_PID=str(root / f"{label}.pid"),
+               KHIVE_LOCK=str(root / f"{label}.lock"),
+               KHIVE_RECOVERER_LOCK=str(root / f"{label}.recoverer.lock"))
     command = [binary, "mcp", "--daemon", "--config", str(root / "khive.toml"),
-               "--db", str(root / "scratch.db")]
-    with (root / "peer.stderr").open("wb") as stderr:
+               "--db", str(database)]
+    stderr_path = root / f"{label}.stderr"
+    with stderr_path.open("wb") as stderr:
         process = subprocess.Popen(command, cwd=root, env=env,
                                    stdout=subprocess.DEVNULL, stderr=stderr)
         try:
@@ -50,8 +52,8 @@ def second_daemon(scratch):
             last = None
             while time.monotonic() < deadline:
                 if process.poll() is not None:
-                    pytest.fail(f"second daemon exited {process.returncode}: "
-                                f"{(root / 'peer.stderr').read_text()}")
+                    pytest.fail(f"{label} daemon exited {process.returncode}: "
+                                f"{stderr_path.read_text()}")
                 if socket.exists():
                     try:
                         one(client, "stats")
@@ -60,9 +62,9 @@ def second_daemon(scratch):
                         last = error
                 time.sleep(0.1)
             else:
-                pytest.fail(f"second daemon not ready: {last}")
+                pytest.fail(f"{label} daemon not ready: {last}")
             assert process.pid != os.getpid()
-            yield client
+            yield client, process.pid
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGTERM)
@@ -73,20 +75,44 @@ def second_daemon(scratch):
                 process.wait()
 
 
+def assert_second_boot_refused(scratch, holder_pid):
+    """A competing HOME/socket cannot serve the same opened database."""
+    binary = os.environ.get("KKERNEL")
+    assert binary, "set KKERNEL to this checkout's freshly built binary"
+    root = Path(scratch["root"])
+    env = os.environ.copy()
+    env.update(KHIVE_SOCKET=str(root / "fence-contender.sock"),
+               KHIVE_PID=str(root / "fence-contender.pid"),
+               KHIVE_LOCK=str(root / "fence-contender.lock"),
+               KHIVE_RECOVERER_LOCK=str(root / "fence-contender.recoverer.lock"))
+    contender = subprocess.run(
+        [binary, "mcp", "--daemon", "--config", str(root / "khive.toml"),
+         "--db", str(root / "fences.db")],
+        cwd=root, env=env, capture_output=True, text=True, timeout=15,
+    )
+    assert contender.returncode != 0, "a second daemon must not serve the held store"
+    assert f"pid {holder_pid}" in contender.stderr, contender.stderr
+    assert str(root / "fences.db") in contender.stderr, contender.stderr
+
+
 def test_ordered_fences_two_daemons_stale_and_missing(scratch_daemon):
-    first = Session(SocketTransport(scratch_daemon["socket"]), actor_id="fence-test")
     prefix = f"fences/{uuid.uuid4()}"
-    leases = [one(first, "create", kind="head", key=f"{prefix}/{i}", content="{}")
-              for i in range(2)]
     fences = [{"key": f"{prefix}/{i}", "kind": "head", "expected_version": 1}
               for i in range(2)]
-    target = one(first, "create", kind="head", content="{}")
-    with second_daemon(scratch_daemon) as second:
+    with fence_daemon(scratch_daemon, "fence-first") as (first, holder_pid):
+        leases = [one(first, "create", kind="head", key=f"{prefix}/{i}", content="{}")
+                  for i in range(2)]
+        target = one(first, "create", kind="head", content="{}")
+        assert_second_boot_refused(scratch_daemon, holder_pid)
+
+    # The second owner reads the first owner's durable rows after shutdown;
+    # concurrent daemons on this database are refused by the store claim.
+    with fence_daemon(scratch_daemon, "fence-second") as (second, _):
         one(second, "stream.append", stream=prefix, record="first", fence=fences)
         one(second, "update", id=target["id"], content='{"ok":true}', fence=fences[:1])
         target = one(second, "get", id=target["id"])
         assert target["version"] == 2
-        renewed = one(first, "update", id=leases[1]["id"], expected_version=1,
+        renewed = one(second, "update", id=leases[1]["id"], expected_version=1,
                       content='{"renewed":true}')
         assert renewed["version"] == 2
         for atomic in [True, False]:
@@ -132,5 +158,5 @@ def test_ordered_fences_two_daemons_stale_and_missing(scratch_daemon):
             after = one(second, "get", id=target["id"])
             assert (after["version"], after["content"]) == (2, target["content"])
         for original in [leases[0], renewed]:
-            after = one(first, "get", id=original["id"])
+            after = one(second, "get", id=original["id"])
             assert (after["version"], after["content"]) == (original["version"], original["content"])

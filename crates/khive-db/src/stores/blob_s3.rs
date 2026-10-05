@@ -788,19 +788,21 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
-    // `std::env::set_var`/`remove_var` mutate real process-global state, so
-    // the credential-precedence tests below must not interleave under the
-    // crate's default parallel test runner.
+    // Retain the credential fixture lock within each isolated child. Store
+    // construction receives fixed credentials before child startup.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn clear_aws_env() {
-        std::env::remove_var("AWS_ACCESS_KEY_ID");
-        std::env::remove_var("AWS_SECRET_ACCESS_KEY");
-        std::env::remove_var("AWS_SESSION_TOKEN");
+        crate::test_process::remove_var("AWS_ACCESS_KEY_ID");
+        crate::test_process::remove_var("AWS_SECRET_ACCESS_KEY");
+        crate::test_process::remove_var("AWS_SESSION_TOKEN");
     }
 
     #[test]
     fn credentials_from_env_errors_when_both_missing() {
+        if crate::test_process::run_in_child(|_| {}) {
+            return;
+        }
         let _guard = ENV_LOCK.lock().unwrap();
         clear_aws_env();
         let err = S3Credentials::from_env().unwrap_err();
@@ -810,9 +812,12 @@ mod tests {
 
     #[test]
     fn credentials_from_env_errors_when_only_access_key_set() {
+        if crate::test_process::run_in_child(|_| {}) {
+            return;
+        }
         let _guard = ENV_LOCK.lock().unwrap();
         clear_aws_env();
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        crate::test_process::set_var("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
         let err = S3Credentials::from_env().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("AWS_SECRET_ACCESS_KEY"));
@@ -825,9 +830,12 @@ mod tests {
 
     #[test]
     fn credentials_from_env_errors_when_only_secret_key_set() {
+        if crate::test_process::run_in_child(|_| {}) {
+            return;
+        }
         let _guard = ENV_LOCK.lock().unwrap();
         clear_aws_env();
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "supersecret");
+        crate::test_process::set_var("AWS_SECRET_ACCESS_KEY", "supersecret");
         let err = S3Credentials::from_env().unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("AWS_ACCESS_KEY_ID"));
@@ -840,10 +848,13 @@ mod tests {
 
     #[test]
     fn credentials_from_env_accepts_the_required_pair() {
+        if crate::test_process::run_in_child(|_| {}) {
+            return;
+        }
         let _guard = ENV_LOCK.lock().unwrap();
         clear_aws_env();
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "supersecret");
+        crate::test_process::set_var("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        crate::test_process::set_var("AWS_SECRET_ACCESS_KEY", "supersecret");
         let creds = S3Credentials::from_env().unwrap();
         assert_eq!(creds.access_key_id, "AKIAEXAMPLE");
         assert_eq!(creds.secret_access_key, "supersecret");
@@ -853,11 +864,14 @@ mod tests {
 
     #[test]
     fn credentials_from_env_reads_optional_session_token() {
+        if crate::test_process::run_in_child(|_| {}) {
+            return;
+        }
         let _guard = ENV_LOCK.lock().unwrap();
         clear_aws_env();
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "supersecret");
-        std::env::set_var("AWS_SESSION_TOKEN", "sessiontoken");
+        crate::test_process::set_var("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        crate::test_process::set_var("AWS_SECRET_ACCESS_KEY", "supersecret");
+        crate::test_process::set_var("AWS_SESSION_TOKEN", "sessiontoken");
         let creds = S3Credentials::from_env().unwrap();
         assert_eq!(creds.session_token.as_deref(), Some("sessiontoken"));
         clear_aws_env();
@@ -865,16 +879,19 @@ mod tests {
 
     fn store_for_key_tests() -> S3BlobStore {
         let _guard = ENV_LOCK.lock().unwrap();
-        clear_aws_env();
-        std::env::set_var("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
-        std::env::set_var("AWS_SECRET_ACCESS_KEY", "supersecret");
-        let store = S3BlobStore::new(valid_config()).unwrap();
-        clear_aws_env();
-        store
+        S3BlobStore::new(valid_config()).unwrap()
     }
 
     #[test]
     fn shard_key_matches_fs_blob_store_shape() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+                .env("AWS_SECRET_ACCESS_KEY", "supersecret")
+                .env_remove("AWS_SESSION_TOKEN");
+        }) {
+            return;
+        }
         let store = store_for_key_tests();
         let content_ref = ContentRef::from_hex("a".repeat(64)).unwrap();
         let key = store.shard_key(&content_ref);
@@ -884,6 +901,14 @@ mod tests {
 
     #[test]
     fn parse_shard_key_roundtrips_a_valid_key() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+                .env("AWS_SECRET_ACCESS_KEY", "supersecret")
+                .env_remove("AWS_SESSION_TOKEN");
+        }) {
+            return;
+        }
         let store = store_for_key_tests();
         let content_ref = ContentRef::from_hex("b".repeat(64)).unwrap();
         let key = store.shard_key(&content_ref);
@@ -892,6 +917,14 @@ mod tests {
 
     #[test]
     fn parse_shard_key_rejects_a_foreign_key_under_the_prefix() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+                .env("AWS_SECRET_ACCESS_KEY", "supersecret")
+                .env_remove("AWS_SESSION_TOKEN");
+        }) {
+            return;
+        }
         let store = store_for_key_tests();
         let foreign = ObjectPath::from("blobs/README.txt");
         assert_eq!(store.parse_shard_key(&foreign), None);
@@ -899,6 +932,14 @@ mod tests {
 
     #[test]
     fn parse_shard_key_rejects_mismatched_shard_segments() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+                .env("AWS_SECRET_ACCESS_KEY", "supersecret")
+                .env_remove("AWS_SESSION_TOKEN");
+        }) {
+            return;
+        }
         let store = store_for_key_tests();
         let hex = "c".repeat(64);
         // Shard segments deliberately don't match the hex's own prefix.
@@ -908,6 +949,14 @@ mod tests {
 
     #[test]
     fn parse_shard_key_rejects_extra_path_segments() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+                .env("AWS_SECRET_ACCESS_KEY", "supersecret")
+                .env_remove("AWS_SESSION_TOKEN");
+        }) {
+            return;
+        }
         let store = store_for_key_tests();
         let hex = "d".repeat(64);
         let bad = ObjectPath::from(format!("blobs/dd/dd/{hex}/extra"));
@@ -916,6 +965,14 @@ mod tests {
 
     #[test]
     fn parse_shard_key_rejects_key_outside_the_configured_prefix() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+                .env("AWS_SECRET_ACCESS_KEY", "supersecret")
+                .env_remove("AWS_SESSION_TOKEN");
+        }) {
+            return;
+        }
         let store = store_for_key_tests();
         let hex = "e".repeat(64);
         let bad = ObjectPath::from(format!("other-prefix/ee/ee/{hex}"));

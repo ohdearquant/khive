@@ -414,7 +414,7 @@ fn edge_vectors_follow_the_resolved_relation_not_both_matching_routes() {
 }
 
 #[test]
-fn a_cross_target_false_collision_refuses_directly_and_moves_in_two_steps() {
+fn relation_moves_through_intermediate_namespaces_preserve_residents() {
     let mut conn = migrated();
     edge(&conn, 0, "source", "depends_on");
     edge(&conn, 1, "source", "supports");
@@ -429,29 +429,6 @@ fn a_cross_target_false_collision_refuses_directly_and_moves_in_two_steps() {
     )
     .unwrap();
     let before = content(&conn);
-    let untouched = (places(&conn), changes(&conn));
-
-    let direct = MoveRequest::new(
-        "source",
-        vec![
-            route("edge:depends_on", "target-a"),
-            route("edge:supports", "target-b"),
-        ],
-    );
-    let Err(MoveError::Collisions { collisions }) = move_namespace(&conn, &direct) else {
-        panic!("a split move whose relation shares a triple with another target must refuse");
-    };
-    assert_eq!(collisions.len(), 1);
-    assert_eq!(
-        (
-            collisions[0].table.as_str(),
-            collisions[0].constraint.as_str(),
-            collisions[0].target.as_str(),
-        ),
-        ("graph_edges", "idx_graph_edges_unique_triple", "target-b")
-    );
-    assert_eq!((places(&conn), changes(&conn)), untouched);
-
     let staged = MoveRequest::new(
         "source",
         vec![
@@ -484,4 +461,227 @@ fn a_cross_target_false_collision_refuses_directly_and_moves_in_two_steps() {
         ])
     );
     assert_eq!(content(&conn), before);
+}
+
+fn resident_copy(conn: &Connection, resident: usize, source: usize, namespace: &str) {
+    conn.execute(
+        "INSERT INTO graph_edges \
+         (id, namespace, source_id, target_id, relation, weight, created_at, updated_at, deleted_at, metadata) \
+         SELECT ?1, ?2, source_id, target_id, relation, weight, created_at, updated_at, \
+         deleted_at, metadata FROM graph_edges WHERE id = ?3",
+        rusqlite::params![id(resident), namespace, id(source)],
+    )
+    .unwrap();
+}
+
+#[test]
+fn edge_collision_preflight_checks_only_resolved_destinations() {
+    for fallback in [false, true] {
+        for fallback_first in [false, true] {
+            for deleted in [false, true] {
+                let mut conn = migrated();
+                let second_relation = if fallback {
+                    "legacy'relation"
+                } else {
+                    "supports"
+                };
+                edge(&conn, 0, "source", "depends_on");
+                edge(&conn, 1, "source", second_relation);
+                if deleted {
+                    conn.execute(
+                        "UPDATE graph_edges SET deleted_at = 9 WHERE id = ?1",
+                        [id(0)],
+                    )
+                    .unwrap();
+                }
+                resident_copy(&conn, 200, 0, "target-b");
+                resident_copy(&conn, 201, 0, "unused-target");
+                resident_copy(&conn, 202, 0, "foreign");
+                let before = content(&conn);
+                let second_key = if fallback { "edge" } else { "edge:supports" };
+                let mut routes = vec![
+                    route("edge:depends_on", "target'a"),
+                    route("edge:refutes", "unused-target"),
+                ];
+                if fallback_first {
+                    routes.insert(0, route(second_key, "target-b"));
+                } else {
+                    routes.push(route(second_key, "target-b"));
+                }
+                let request = MoveRequest::new("source", routes);
+                let tx = conn.transaction().unwrap();
+                let counts = move_namespace(&tx, &request).expect(
+                    "route-aware edge collision must allow an unrelated destination resident",
+                );
+                assert_eq!(
+                    counts.subjects,
+                    BTreeMap::from([
+                        ("edge:depends_on".into(), 1),
+                        ("edge:refutes".into(), 0),
+                        (second_key.into(), 1),
+                    ])
+                );
+                assert_eq!(counts.rows.get("graph_edges"), Some(&2));
+                assert_eq!(counts.ann_log_appended, 0);
+                assert_eq!(
+                    places(&tx),
+                    BTreeMap::from([
+                        (id(0), "target'a".into()),
+                        (id(1), "target-b".into()),
+                        (id(200), "target-b".into()),
+                        (id(201), "unused-target".into()),
+                        (id(202), "foreign".into()),
+                    ])
+                );
+                assert_eq!(content(&tx), before);
+                tx.commit().unwrap();
+                let tx = conn.transaction().unwrap();
+                let repeated = move_namespace(&tx, &request).unwrap();
+                assert_eq!(
+                    repeated.subjects,
+                    BTreeMap::from([
+                        ("edge:depends_on".into(), 0),
+                        ("edge:refutes".into(), 0),
+                        (second_key.into(), 0),
+                    ])
+                );
+                assert_eq!(repeated.rows.get("graph_edges"), Some(&0));
+                assert_eq!(content(&tx), before);
+                assert_eq!(places(&tx)[&id(0)], "target'a");
+                assert_eq!(places(&tx)[&id(1)], "target-b");
+                tx.commit().unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn edge_collision_preflight_keeps_named_refusal_before_any_write() {
+    for (fallback, shared_target, colliding_index) in
+        [(false, false, 0), (true, false, 1), (true, true, 0)]
+    {
+        for fallback_first in [false, true] {
+            for deleted in [false, true] {
+                let mut conn = migrated();
+                let second_relation = if fallback {
+                    "legacy'relation"
+                } else {
+                    "supports"
+                };
+                edge(&conn, 0, "source", "depends_on");
+                edge(&conn, 1, "source", second_relation);
+                if deleted {
+                    conn.execute(
+                        "UPDATE graph_edges SET deleted_at = 9 WHERE id = ?1",
+                        [id(colliding_index)],
+                    )
+                    .unwrap();
+                }
+                seed_note(&conn, "unrelated", "source", "observation");
+                let second_target = if shared_target {
+                    "target'a"
+                } else {
+                    "target-b"
+                };
+                let collision_target = if colliding_index == 0 {
+                    "target'a"
+                } else {
+                    second_target
+                };
+                resident_copy(&conn, 200, colliding_index, collision_target);
+                let second_key = if fallback { "edge" } else { "edge:supports" };
+                let mut routes = vec![route("edge:depends_on", "target'a")];
+                if fallback_first {
+                    routes.insert(0, route(second_key, second_target));
+                } else {
+                    routes.push(route(second_key, second_target));
+                }
+                routes.insert(0, route("note:observation", "note-target"));
+                let request = MoveRequest::new("source", routes);
+                let before = (places(&conn), content(&conn), changes(&conn));
+                let tx = conn.transaction().unwrap();
+                let error = move_namespace(&tx, &request).unwrap_err();
+                let MoveError::Collisions { collisions } = error else {
+                    panic!(
+                        "true destination collision must retain named preflight refusal: {error:?}"
+                    );
+                };
+                assert_eq!(collisions.len(), 1, "one collision per distinct target");
+                let collision = &collisions[0];
+                assert_eq!(collision.table, "graph_edges");
+                assert_eq!(collision.constraint, "idx_graph_edges_unique_triple");
+                assert_eq!(collision.target, collision_target);
+                let relation = if colliding_index == 0 {
+                    "depends_on"
+                } else {
+                    second_relation
+                };
+                assert_eq!(collision.key, format!(
+                    "aaaaaaaa-aaaa-4aaa-8aaa-{colliding_index:012}, bbbbbbbb-bbbb-4bbb-8bbb-{colliding_index:012}, {relation}"
+                ));
+                assert_eq!((places(&tx), content(&tx), changes(&tx)), before);
+                let note_namespace: String = tx
+                    .query_row(
+                        "SELECT namespace FROM notes WHERE id = 'unrelated'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(note_namespace, "source");
+                tx.rollback().unwrap();
+                assert_eq!((places(&conn), content(&conn), changes(&conn)), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn edge_collision_preflight_skips_targets_the_edge_is_not_routed_to() {
+    for fallback_first in [false, true] {
+        let mut conn = migrated();
+        edge(&conn, 0, "source", "depends_on");
+        edge(&conn, 1, "source", "legacy'relation");
+        seed_note(&conn, "unrelated", "source", "observation");
+        // Each resident carries a source edge's triple in a target that edge is not written to:
+        // the fallback-routed edge's triple in the specific route's target and in a target named
+        // only by a note route, and the specific edge's triple in that note-only target.
+        resident_copy(&conn, 200, 1, "target'a");
+        resident_copy(&conn, 201, 1, "note-target");
+        resident_copy(&conn, 202, 0, "note-target");
+        let before = content(&conn);
+        let mut routes = vec![
+            route("edge:depends_on", "target'a"),
+            route("note:observation", "note-target"),
+        ];
+        if fallback_first {
+            routes.insert(0, route("edge", "target-b"));
+        } else {
+            routes.push(route("edge", "target-b"));
+        }
+        let request = MoveRequest::new("source", routes);
+        let tx = conn.transaction().unwrap();
+        let counts = move_namespace(&tx, &request)
+            .expect("an edge is checked only against the target its relation route resolves to");
+        assert_eq!(counts.rows.get("graph_edges"), Some(&2));
+        assert_eq!(
+            places(&tx),
+            BTreeMap::from([
+                (id(0), "target'a".into()),
+                (id(1), "target-b".into()),
+                (id(200), "target'a".into()),
+                (id(201), "note-target".into()),
+                (id(202), "note-target".into()),
+            ])
+        );
+        assert_eq!(content(&tx), before);
+        let note_namespace: String = tx
+            .query_row(
+                "SELECT namespace FROM notes WHERE id = 'unrelated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note_namespace, "note-target");
+        tx.commit().unwrap();
+    }
 }

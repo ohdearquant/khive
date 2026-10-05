@@ -127,7 +127,10 @@ fn assert_conflict(receipt: &Value, key: &str, holder_id: &str) {
     );
     assert_eq!(error["details"]["key"], key, "{receipt}");
     assert_eq!(error["details"]["existing_id"], holder_id, "{receipt}");
-    assert_eq!(error["domain_disposition"], "unknown", "{receipt}");
+    assert_eq!(
+        error["domain_disposition"], "not_committed",
+        "the keyed conflict is refused before this request writes: {receipt}"
+    );
     assert!(error.get("domain_result").is_none(), "{receipt}");
 }
 

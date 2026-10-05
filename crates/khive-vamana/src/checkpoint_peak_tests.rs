@@ -1,19 +1,25 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// These totals include every successful allocation, even outside a measurement.
-// A pre-existing allocation can therefore be freed or resized without charging
-// its original bytes to the measurement or underflowing an enabled-only counter.
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
+// libtest's main thread can allocate while its test thread measures synchronous
+// checkpoint I/O. Keep a signed per-thread ledger, including outside a measure:
+// freeing a pre-existing or transferred allocation must not underflow it.
+thread_local! {
+    static LIVE_BYTES: Cell<i128> = const { Cell::new(0) };
+    static PEAK_BYTES: Cell<i128> = const { Cell::new(0) };
+}
 
 pub(super) fn record_allocation(size: usize) {
-    let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
-    PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+    // Const-initialized Cell access allocates nothing; teardown may lack TLS.
+    let _ = LIVE_BYTES.try_with(|bytes| {
+        let live = bytes.get() + size as i128;
+        bytes.set(live);
+        let _ = PEAK_BYTES.try_with(|peak| peak.set(peak.get().max(live)));
+    });
 }
 
 pub(super) fn record_deallocation(size: usize) {
-    LIVE_BYTES.fetch_sub(size, Ordering::Relaxed);
+    let _ = LIVE_BYTES.try_with(|bytes| bytes.set(bytes.get() - size as i128));
 }
 
 pub(super) fn record_reallocation(old_size: usize, new_size: usize) {
@@ -24,29 +30,31 @@ pub(super) fn record_reallocation(old_size: usize, new_size: usize) {
     }
 }
 
+fn live_bytes() -> i128 {
+    LIVE_BYTES.with(Cell::get)
+}
+
 #[derive(Debug)]
 struct HeapPeak {
-    baseline: usize,
-    peak: usize,
-    after: usize,
+    baseline: i128,
+    peak: i128,
+    after: i128,
 }
 
 impl HeapPeak {
     fn additional_bytes(&self) -> usize {
-        self.peak - self.baseline
+        usize::try_from(self.peak - self.baseline).unwrap()
     }
 }
 
 fn measure_peak<T>(operation: impl FnOnce() -> T) -> (T, HeapPeak) {
-    // Only the exact child test measures this process-wide counter. Other tests
-    // in the parent can allocate concurrently without entering this process.
-    let baseline = LIVE_BYTES.load(Ordering::Relaxed);
-    PEAK_BYTES.store(baseline, Ordering::Relaxed);
+    let baseline = live_bytes();
+    PEAK_BYTES.with(|peak| peak.set(baseline));
     let result = operation();
     let peak = HeapPeak {
         baseline,
-        peak: PEAK_BYTES.load(Ordering::Relaxed),
-        after: LIVE_BYTES.load(Ordering::Relaxed),
+        peak: PEAK_BYTES.with(Cell::get),
+        after: live_bytes(),
     };
     (result, peak)
 }
@@ -95,20 +103,73 @@ fn live_heap_accounts_for_frees_and_successful_and_failed_resizes() {
             let grown = ALLOCATOR.realloc(pointer, layout, 32 * 1024);
             assert!(!grown.is_null());
             let grown_layout = Layout::from_size_align(32 * 1024, 8).unwrap();
-            let before_failure = LIVE_BYTES.load(Ordering::Relaxed);
+            let before_failure = live_bytes();
             // This valid request exceeds the addressable heap; failure must not
             // decrement the still-owned original or account nonexistent bytes.
             let impossible_size = (isize::MAX as usize) & !7;
             let failed = ALLOCATOR.realloc(grown, grown_layout, impossible_size);
             assert!(failed.is_null());
-            assert_eq!(LIVE_BYTES.load(Ordering::Relaxed), before_failure);
+            assert_eq!(live_bytes(), before_failure);
             let shrunk = ALLOCATOR.realloc(grown, grown_layout, 8 * 1024);
             assert!(!shrunk.is_null());
             ALLOCATOR.dealloc(shrunk, old_layout);
         });
         assert_eq!(peak.additional_bytes(), 24 * 1024);
-        assert_eq!(peak.after + old_layout.size(), peak.baseline);
+        assert_eq!(peak.after + old_layout.size() as i128, peak.baseline);
     }
+}
+
+#[test]
+fn live_heap_ignores_concurrent_allocations_on_another_thread() {
+    if run_in_child("live_heap_ignores_concurrent_allocations_on_another_thread") {
+        return;
+    }
+    fn wait_for(phase: &AtomicUsize, expected: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while phase.load(Ordering::Acquire) != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "allocation rendezvous timed out"
+            );
+            std::thread::yield_now();
+        }
+    }
+    let phase = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        let other = scope.spawn(|| {
+            wait_for(&phase, 1);
+            let layout = Layout::from_size_align(128 * 1024, 8).unwrap();
+            // SAFETY: the nonzero layout is valid; the successful pointer is
+            // freed exactly once, after the measuring thread observes it.
+            unsafe {
+                let pointer = ALLOCATOR.alloc_zeroed(layout);
+                assert!(!pointer.is_null());
+                phase.store(2, Ordering::Release);
+                wait_for(&phase, 3);
+                ALLOCATOR.dealloc(pointer, layout);
+            }
+            phase.store(4, Ordering::Release);
+        });
+        let (during_allocation, peak) = measure_peak(|| {
+            phase.store(1, Ordering::Release);
+            wait_for(&phase, 2);
+            let during = live_bytes();
+            phase.store(3, Ordering::Release);
+            wait_for(&phase, 4);
+            during
+        });
+        other.join().unwrap();
+        assert_eq!(
+            during_allocation, peak.baseline,
+            "another thread entered the live-byte ledger"
+        );
+        assert_eq!(peak.after, peak.baseline);
+        assert_eq!(
+            peak.additional_bytes(),
+            0,
+            "another thread entered the measured peak"
+        );
+    });
 }
 
 fn checkpoint(dimensions: usize) -> (tempfile::TempDir, VamanaIndex) {

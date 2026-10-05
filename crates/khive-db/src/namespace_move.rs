@@ -770,6 +770,49 @@ fn validate_partitioned_vector_moves(
     Ok(())
 }
 
+fn edge_collision_target_predicate(
+    request: &MoveRequest,
+    target: &str,
+    parameters: &mut Vec<rusqlite::types::Value>,
+) -> String {
+    let fallback = request
+        .route_for(&SubjectClass::Edge)
+        .is_some_and(|route| route.target == target);
+    let mut matching = Vec::new();
+    let mut specific = Vec::new();
+    for route in &request.routes {
+        if let SubjectClass::EdgeRelation(relation) = &route.class {
+            if route.target != target && !fallback {
+                continue;
+            }
+            parameters.push(relation.clone().into());
+            let parameter = format!("?{}", parameters.len());
+            if route.target == target {
+                matching.push(parameter.clone());
+            }
+            if fallback {
+                specific.push(parameter);
+            }
+        }
+    }
+    let mut alternatives = Vec::new();
+    if !matching.is_empty() {
+        alternatives.push(format!("source.relation IN ({})", matching.join(", ")));
+    }
+    if fallback {
+        alternatives.push(if specific.is_empty() {
+            "1".to_owned()
+        } else {
+            format!("source.relation NOT IN ({})", specific.join(", "))
+        });
+    }
+    if alternatives.is_empty() {
+        "0".to_owned()
+    } else {
+        alternatives.join(" OR ")
+    }
+}
+
 /// Collisions the pre-flight can enumerate exactly, for one constraint.
 ///
 /// Exactness is the admission criterion, not coverage. A constraint qualifies
@@ -825,7 +868,7 @@ fn validate_partitioned_vector_moves(
 fn collisions_for(
     conn: &Connection,
     constraint: &NamespaceConstraint,
-    source: &str,
+    request: &MoveRequest,
     target: &str,
 ) -> rusqlite::Result<Vec<Collision>> {
     if constraint.partial || !constraint.columns_are_nameable() {
@@ -849,7 +892,7 @@ fn collisions_for(
         // A uniqueness constraint on `namespace` alone: one row per namespace,
         // and a second one arriving is a collision whatever its other columns.
         // Handled by the same query with an empty key rendering.
-        return collisions_on_namespace_alone(conn, constraint, source, target);
+        return collisions_on_namespace_alone(conn, constraint, &request.source, target);
     }
 
     let table = namespace_census::quote_ident(&constraint.table);
@@ -869,15 +912,20 @@ fn collisions_for(
         .map(|c| format!("source.{}", namespace_census::quote_ident(c)))
         .collect::<Vec<_>>()
         .join(", ");
-    let sql = format!(
+    let mut parameters = vec![request.source.clone().into(), target.to_owned().into()];
+    let mut sql = format!(
         "SELECT {select} FROM {table} AS source \
          JOIN {table} AS target ON target.namespace = ?2 AND {join} \
          WHERE source.namespace = ?1"
     );
+    if constraint.table == "graph_edges" && constraint.index == "idx_graph_edges_unique_triple" {
+        let predicate = edge_collision_target_predicate(request, target, &mut parameters);
+        sql.push_str(&format!(" AND ({predicate})"));
+    }
 
     let mut stmt = conn.prepare(&sql)?;
     let column_count = others.len();
-    let rows = stmt.query_map([source, target], move |row| {
+    let rows = stmt.query_map(rusqlite::params_from_iter(parameters), move |row| {
         let mut parts = Vec::with_capacity(column_count);
         for i in 0..column_count {
             parts.push(match row.get_ref(i)? {
@@ -1277,13 +1325,8 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
     let census = namespace_census::census(conn)?;
     validate(conn, &census, request)?;
 
-    // Over DISTINCT targets, not over routes. `collisions_for` is a function of
-    // the constraint and the two namespaces and does not read the route's class,
-    // so two routes sharing a target ask the same question twice and the answers
-    // are byte-identical. A `Collision` carries no route, so the repeats are not
-    // a second fact about a second class, they are the same row printed again.
-    // Found by the fixture, which planted three note kinds bound for one target
-    // and read back the same collision three times.
+    // A collision names a target rather than a route. Routes sharing that
+    // target must not repeat the same collision, including relation routes.
     let mut targets: BTreeSet<&str> = BTreeSet::new();
     for route in &request.routes {
         targets.insert(route.target.as_str());
@@ -1291,7 +1334,7 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
     let mut collisions = Vec::new();
     for constraint in namespace_census::reachable_constraints(&census) {
         for target in &targets {
-            collisions.extend(collisions_for(conn, constraint, &request.source, target)?);
+            collisions.extend(collisions_for(conn, constraint, request, target)?);
         }
     }
     if !collisions.is_empty() {
