@@ -21,6 +21,9 @@ use crate::{
 /// Errors produced while loading or validating a `KhiveConfig`.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error(transparent)]
+    Credential(#[from] crate::credentials::CredentialError),
+
     #[error("mount configuration: {reason}")]
     InvalidMountConfig { reason: String },
 
@@ -1277,6 +1280,13 @@ impl WebSectionConfig {
 /// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
+    /// Read by `credentials::read_tables` at load, never by this derive.
+    #[serde(skip)]
+    pub credentials: Vec<crate::credentials::CredentialConfig>,
+
+    #[serde(skip)]
+    pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
+
     #[serde(default)]
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
@@ -1459,10 +1469,12 @@ impl KhiveConfig {
         let diagnostic_path = std::fs::canonicalize(&resolved).unwrap_or_else(|_| resolved.clone());
         let raw = std::fs::read_to_string(&resolved)
             .map_err(|source| ConfigError::from(source).in_file(&diagnostic_path))?;
-        let cfg: KhiveConfig = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
+        let mut cfg: KhiveConfig = toml::from_str(&raw).map_err(|source| ConfigError::Parse {
             path: diagnostic_path.clone(),
             source,
         })?;
+        crate::credentials::read_tables(&raw, &mut cfg)
+            .map_err(|error| ConfigError::from(error).in_file(&diagnostic_path))?;
         cfg.validate()
             .map_err(|error| error.in_file(&diagnostic_path))?;
         Ok(Some(cfg))
@@ -1651,6 +1663,10 @@ impl KhiveConfig {
         self.git_write.validate_dev_loop()?;
         self.telemetry.validate()?;
         self.web.validate()?;
+        crate::credentials::CredentialConfig::validate_all(&self.credentials)?;
+        if let Some(receipts) = &self.visibility_receipts {
+            receipts.validate(&self.credentials)?;
+        }
 
         // Reject a top-level `db` key loudly instead of letting serde's
         // forward-compatible unknown-key tolerance silently swallow it: a
@@ -2086,35 +2102,7 @@ fn config_from_env_parts(primary_model: Option<String>, additional: Vec<String>)
 mod tests {
     use super::*;
 
-    #[test]
-    fn exec_timeouts_validate_effective_values_and_deadlines() {
-        let mut config = KhiveConfig::default();
-        config.exec.timeout_default_s = Some(900.0);
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
-        ));
-
-        config.exec.timeout_default_s = None;
-        config.exec.timeout_max_s = Some(1.0);
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
-        ));
-
-        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
-            config.exec.timeout_max_s = None;
-            config.exec.timeout_default_s = Some(invalid);
-            assert!(matches!(
-                config.validate(),
-                Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
-            ));
-        }
-
-        config.exec.timeout_default_s = None;
-        config.exec.timeout_max_s = Some(600.0);
-        config.validate().expect("valid resolved exec bounds");
-    }
+    include!("engine_config_timeout_tests.rs");
 
     #[test]
     fn exec_binary_digest_timeout_is_bounded_at_load() {

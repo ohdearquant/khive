@@ -2761,6 +2761,8 @@ version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
+ "chacha20poly1305",
  "chrono",
  "chrono-tz",
  "iana-time-zone",
@@ -2783,6 +2785,7 @@ dependencies = [
  "parking_lot",
  "proc-macro2",
  "quote",
+ "rand 0.8.7",
  "ring",
  "rusqlite",
  "serde",
@@ -2799,6 +2802,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-general-category",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
