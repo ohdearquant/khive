@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use khive_runtime::{KhiveRuntime, NamespaceToken, PackRuntime, RuntimeError, VerbRegistry};
-use khive_types::{HandlerDef, IdResolutionMode, Pack, ParamDef, VerbCategory, Visibility};
+use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibility};
 use serde_json::Value;
 
 use crate::{handlers, TelemetryPack};
@@ -172,13 +172,7 @@ pub(crate) static TELEMETRY_HANDLERS: [HandlerDef; 4] = [
 struct TelemetryPackFactory;
 
 impl khive_runtime::PackFactory for TelemetryPackFactory {
-    fn name(&self) -> &'static str {
-        TelemetryPack::NAME
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        TelemetryPack::REQUIRES
-    }
+    khive_runtime::pack_factory_metadata!(TelemetryPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime> {
         Box::new(TelemetryPack::new(runtime))
@@ -196,25 +190,7 @@ impl PackRuntime for TelemetryPack {
             .validate_activation()
             .map_err(|error| RuntimeError::InvalidInput(error.to_string()))
     }
-    fn name(&self) -> &str {
-        <Self as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <Self as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <Self as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <Self as Pack>::HANDLERS
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <Self as Pack>::REQUIRES
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     async fn dispatch(
         &self,

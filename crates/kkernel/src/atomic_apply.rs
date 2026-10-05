@@ -1559,6 +1559,12 @@ mod tests {
         assert!(Telemetry::NOTE_KINDS.is_empty());
         assert!(Telemetry::EDGE_RULES.is_empty());
         assert!(Telemetry::ENTITY_TYPES.is_empty());
+        // `pack_runtime_metadata!` returns these consts, so they belong to the exemption too.
+        assert!(Telemetry::BRAIN_CONSUMER_KINDS.is_empty());
+        assert!(Telemetry::NOTE_KIND_SPECS.is_empty());
+        assert!(Telemetry::NOTE_EMBEDDING_POLICIES.is_empty());
+        assert!(Telemetry::SCHEMA_PLAN.is_none());
+        assert!(Telemetry::SCHEMA_COLUMN_ADDITIONS.is_empty());
         let implementation = include_str!("../../khive-pack-telemetry/src/pack.rs")
             .split_once("impl PackRuntime for TelemetryPack {")
             .expect("telemetry runtime implementation")
@@ -1568,7 +1574,8 @@ mod tests {
         for line in implementation.lines() {
             let method = line
                 .strip_prefix("    fn ")
-                .or_else(|| line.strip_prefix("    async fn "));
+                .or_else(|| line.strip_prefix("    async fn "))
+                .or_else(|| line.strip_prefix("    khive_runtime::"));
             if let Some(method) = method {
                 methods.push(method.split('(').next().unwrap());
             }
@@ -1576,15 +1583,7 @@ mod tests {
         methods.sort_unstable();
         assert_eq!(
             methods,
-            [
-                "dispatch",
-                "entity_kinds",
-                "handlers",
-                "name",
-                "note_kinds",
-                "requires",
-                "validate_config"
-            ],
+            ["dispatch", "pack_runtime_metadata!", "validate_config"],
             "new runtime hooks require reconsidering the atomic telemetry exemption"
         );
         let cfg = RuntimeConfig {
