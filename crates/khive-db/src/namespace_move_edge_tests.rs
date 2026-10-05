@@ -634,3 +634,54 @@ fn edge_collision_preflight_keeps_named_refusal_before_any_write() {
         }
     }
 }
+
+#[test]
+fn edge_collision_preflight_skips_targets_the_edge_is_not_routed_to() {
+    for fallback_first in [false, true] {
+        let mut conn = migrated();
+        edge(&conn, 0, "source", "depends_on");
+        edge(&conn, 1, "source", "legacy'relation");
+        seed_note(&conn, "unrelated", "source", "observation");
+        // Each resident carries a source edge's triple in a target that edge is not written to:
+        // the fallback-routed edge's triple in the specific route's target and in a target named
+        // only by a note route, and the specific edge's triple in that note-only target.
+        resident_copy(&conn, 200, 1, "target'a");
+        resident_copy(&conn, 201, 1, "note-target");
+        resident_copy(&conn, 202, 0, "note-target");
+        let before = content(&conn);
+        let mut routes = vec![
+            route("edge:depends_on", "target'a"),
+            route("note:observation", "note-target"),
+        ];
+        if fallback_first {
+            routes.insert(0, route("edge", "target-b"));
+        } else {
+            routes.push(route("edge", "target-b"));
+        }
+        let request = MoveRequest::new("source", routes);
+        let tx = conn.transaction().unwrap();
+        let counts = move_namespace(&tx, &request)
+            .expect("an edge is checked only against the target its relation route resolves to");
+        assert_eq!(counts.rows.get("graph_edges"), Some(&2));
+        assert_eq!(
+            places(&tx),
+            BTreeMap::from([
+                (id(0), "target'a".into()),
+                (id(1), "target-b".into()),
+                (id(200), "target'a".into()),
+                (id(201), "note-target".into()),
+                (id(202), "note-target".into()),
+            ])
+        );
+        assert_eq!(content(&tx), before);
+        let note_namespace: String = tx
+            .query_row(
+                "SELECT namespace FROM notes WHERE id = 'unrelated'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note_namespace, "note-target");
+        tx.commit().unwrap();
+    }
+}
