@@ -12,6 +12,9 @@
 
 ## Context
 
+This ADR serves a producer's request of 2026-10-05: a holder recorded as `part_of` a company it holds
+a stake in is wrong, and the graph needs a relation that states the holding itself.
+
 An organization graph built from public filings records who holds a stake in whom. A beneficial
 owner of more than five percent of a class of a company's registered equity securities files a
 statement that names the holder, the company, the percentage of the class, and the date. Funds,
@@ -76,11 +79,16 @@ otherwise drop small holders as if they were uncertain.
 
 The size and the date of the stake go in edge metadata, with conventional keys:
 
-| key          | meaning                                                          |
-| ------------ | ---------------------------------------------------------------- |
-| `pct`        | percentage of the class or of the owned entity, `0 < pct <= 100` |
-| `as_of`      | ISO-8601 date the percentage was reported for                    |
-| `valid_from` | ISO-8601 date the interest began, when known                     |
+| key          | meaning                                                                                                                                                      |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pct`        | percentage held, `0 < pct <= 100`, of the class named by `class`, or of the whole owned entity when `class` is absent                                        |
+| `class`      | the class of securities `pct` refers to, as the report names it                                                                                              |
+| `as_of`      | ISO-8601 date the percentage was reported for                                                                                                                |
+| `valid_from` | ISO-8601 date the interest began, when known                                                                                                                 |
+| `by_class`   | for a holder with stakes in more than one class of one owned entity: a list of `{class, pct, as_of}`, one entry per class; `pct` and `class` are then absent |
+
+A reader therefore knows from the edge alone what a percentage is a percentage of. Stakes in several
+classes stay on the one edge the unique index allows for the pair, in `by_class`.
 
 The keys are conventional, not governed: ADR-002 governs metadata only where one relation carries
 several meanings that need different traversals (`depends_on`), and `owns` carries one. A producer may
@@ -99,9 +107,9 @@ producer that keeps it records each report as its own record, for example a note
 `owns` is not transitive, and the runtime materializes nothing. Indirect ownership (A holds 50% of B,
 B holds 40% of C) is a computation over `pct` along a path, done by the reader that needs it; walking
 `owns` twice without that arithmetic would claim that a holder of a holder owns the company outright.
-`neighbors` returns each edge's id, relation and weight and `traverse` returns paths, neither with the
-edge's metadata, so a reader that needs `pct` reads the edges it was given (by edge id, or through
-`query`). Control (a majority of
+`neighbors` returns each edge's id, relation and weight, and `traverse` returns paths whose nodes carry
+the id of the edge that reached them (`via_edge`); neither returns the edge's metadata, so a reader
+that needs `pct` reads the edges by those ids, or through `query`. Control (a majority of
 votes, a right to appoint the board) is not asserted by `owns` and is not derived from it by the
 runtime.
 
@@ -128,15 +136,15 @@ people (`Jane Doe`, `John Roe`), with these edges:
 
 Under each cheaper encoding, every `owns` edge above is written in that encoding instead.
 
-| Family | Hypothesis                                             | Defeating fixture and query                                                                                                                                                                                                                                                                                                                                                                |
-| ------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Cv     | converse of `contains`                                 | `neighbors(Target Co, relations=[contains], direction=out)` ("the organizational tree under Target Co") returns Index Fund and Jane Doe under the converse encoding. With `owns`, it returns nothing.                                                                                                                                                                                      |
-| Er     | `part_of` restricted to person/org → org endpoints     | `neighbors(Target Co, relations=[part_of], direction=in)` as "shareholders of Target Co" returns John Roe, who holds no stake. With `owns` it returns Index Fund and Jane Doe. The encoding also cannot store Jane Doe's two facts: the unique index holds one `part_of` row for Jane Doe → Target Co, so deleting her employment when she leaves deletes her stake.                       |
-| At     | `part_of` with `metadata.predicate = beneficial_owner` | `traverse(roots=[Parent Co], relations=[part_of], direction=in)`, the parts of Parent Co, returns Subsidiary Co and, through it, Index Fund. `traverse` filters by relation and weight only, so no call to it can exclude the stake. With `owns`, the same call returns Subsidiary Co only. Jane Doe's employment and stake again collide on one row.                                      |
-| Po     | an existing relation with a polarity attribute         | No existing relation has ownership as its positive or negative reading, so the hypothesis has no instance to test. Recorded as not applicable, as ADR-196 recorded it.                                                                                                                                                                                                                     |
-| Ch     | a chain of existing relations                          | "What does Index Fund hold": with the `owns` edges removed, Index Fund has no incident edge, so every chain of existing relations from it returns nothing. `neighbors(Index Fund, relations=[owns], direction=out)` returns Subsidiary Co and Target Co.                                                                                                                                   |
-| Mv     | a reachability view over existing relations            | The same query: a reachability view over the existing relations from Index Fund is empty, because Index Fund has no other edge.                                                                                                                                                                                                                                                            |
-| Sr     | a typed sub-relation of `part_of`                      | A reader of the parent relation that does not know the sub-type runs the At query and gets Index Fund as a part of Parent Co. The sub-relation also points the wrong way for the parent: `part_of` runs part → whole, and `Parent Co owns Subsidiary Co` holds beside `Subsidiary Co part_of Parent Co` with both directions true at once, which a sub-relation of `part_of` cannot state. |
+| Family | Hypothesis                                             | Defeating fixture and query                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ------ | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cv     | converse of `contains`                                 | Under the converse encoding `Target Co contains Jane Doe` is refused at write time: the endpoint contract has no `Org contains Person` row, so a person's stake cannot be stored at all. The organization stakes it can store enter the organizational tree: `neighbors(Target Co, relations=[contains], direction=outgoing)` ("the organizational tree under Target Co") returns Index Fund. With `owns` it returns nothing, and Jane Doe's stake is stored.                                     |
+| Er     | `part_of` restricted to person/org → org endpoints     | `neighbors(Target Co, relations=[part_of], direction=incoming)` as "shareholders of Target Co" returns John Roe, who holds no stake. With `owns` it returns Index Fund and Jane Doe. The encoding also cannot store Jane Doe's two facts: the unique index holds one `part_of` row for Jane Doe → Target Co, so deleting her employment when she leaves deletes her stake.                                                                                                                        |
+| At     | `part_of` with `metadata.predicate = beneficial_owner` | `traverse(roots=[Parent Co], relations=[part_of], direction=incoming)`, the parts of Parent Co, returns Subsidiary Co and, through it, Index Fund. `traverse` filters by relation and weight only, so no call to it can exclude the stake. With `owns`, the same call returns Subsidiary Co only. Jane Doe's employment and stake again collide on one row.                                                                                                                                       |
+| Po     | an existing relation with a polarity attribute         | Instantiated on the nearest host, `part_of` with a sign attribute (`sign = holding`, read as "is held by" rather than "is a member of"), every stake written as holder `part_of` company. A sign-blind reader asks for the members of Target Co with `neighbors(Target Co, relations=[part_of], direction=incoming)` and gets Index Fund beside Jane Doe and John Roe. With `owns` the same call returns Jane Doe and John Roe only. Jane Doe's employment and stake collide on one row here too. |
+| Ch     | a chain of existing relations                          | "What does Index Fund hold": with the `owns` edges removed, Index Fund has no incident edge, so every chain of existing relations from it returns nothing. `neighbors(Index Fund, relations=[owns], direction=outgoing)` returns Subsidiary Co and Target Co.                                                                                                                                                                                                                                     |
+| Mv     | a reachability view over existing relations            | The same query: a reachability view over the existing relations from Index Fund is empty, because Index Fund has no other edge.                                                                                                                                                                                                                                                                                                                                                                   |
+| Sr     | a typed sub-relation of `part_of`                      | A reader of the parent relation that does not know the sub-type runs the At query and gets Index Fund as a part of Parent Co. The sub-relation also points the wrong way for the parent: `part_of` runs part → whole, and `Parent Co owns Subsidiary Co` holds beside `Subsidiary Co part_of Parent Co` with both directions true at once, which a sub-relation of `part_of` cannot state.                                                                                                        |
 
 ## Consequences
 
