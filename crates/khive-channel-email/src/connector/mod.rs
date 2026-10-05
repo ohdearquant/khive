@@ -12,28 +12,28 @@ pub use smtp::SmtpSender;
 
 /// A parsed RFC 822 address (addr-spec only, display name stripped).
 ///
-/// Stored in lowercase for case-insensitive comparison per RFC 5321.
+/// ASCII case is folded for comparison; non-ASCII characters remain exact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailAddress(String);
 
 impl MailAddress {
     /// Parse a raw header value into a `MailAddress`.
     ///
-    /// Strips display names and angle brackets; lowercases the result.
+    /// Strips display names and angle brackets; folds ASCII case only.
     /// Returns `None` if no valid addr-spec can be extracted.
     pub fn parse(raw: &str) -> Option<Self> {
         let trimmed = raw.trim();
         // Handle "Display Name <addr@example.com>" form.
         if let Some(start) = trimmed.rfind('<') {
             if let Some(end) = trimmed[start..].find('>') {
-                let addr = trimmed[start + 1..start + end].trim().to_lowercase();
+                let addr = trimmed[start + 1..start + end].trim().to_ascii_lowercase();
                 if addr.contains('@') {
                     return Some(Self(addr));
                 }
             }
         }
         // Plain addr-spec.
-        let lower = trimmed.to_lowercase();
+        let lower = trimmed.to_ascii_lowercase();
         if lower.contains('@') {
             return Some(Self(lower));
         }
@@ -49,7 +49,7 @@ impl MailAddress {
     /// canonicalization: for `gmail.com`/`googlemail.com` addresses, dots and a
     /// `+tag` suffix in the local part are insignificant and the two domains are
     /// equivalent (they route to the same mailbox). Non-Gmail domains compare by
-    /// exact (already-lowercased) addr-spec, where dots ARE significant.
+    /// exact (ASCII-folded) addr-spec, where dots ARE significant.
     ///
     /// This exists because clients such as Gmail emit the account's canonical
     /// From (often dotless) which need not string-match a dotted address a human
@@ -93,13 +93,13 @@ pub struct RawEmail {
     /// `external_id` in `comm.ingest`; derived from UIDVALIDITY and UID so
     /// dedup works even when a message has no `Message-ID` header.
     pub imap_external_id: String,
-    /// All parsed sender addresses from the `From:` header (addr-spec, lowercase).
+    /// All parsed sender addresses from the `From:` header (addr-spec, ASCII case folded).
     ///
     /// The authorization check requires exactly one entry matching the configured
     /// maintainer address. Zero entries or more than one cause the message to be
     /// rejected as unauthorized before any note is written.
     pub from_addrs: Vec<String>,
-    /// Parsed address from the `Sender:` header, if present (addr-spec, lowercase).
+    /// Parsed address from the `Sender:` header, if present (addr-spec, ASCII case folded).
     ///
     /// When present, must also match the configured maintainer address.
     pub sender_addr: Option<String>,

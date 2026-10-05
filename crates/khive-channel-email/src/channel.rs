@@ -949,6 +949,108 @@ mod tests {
         assert_eq!(envs.len(), 1, "plain addr-spec must be accepted");
     }
 
+    #[tokio::test]
+    async fn raw_sender_allowlist_folds_only_ascii_case() {
+        for (case, maintainer, from, sender, accepted) in [
+            (
+                "ASCII case variant",
+                "Kevin@Example.COM",
+                "KEVIN@EXAMPLE.COM",
+                Some("KeViN@Example.Com"),
+                true,
+            ),
+            (
+                "Kelvin sign in From",
+                "kevin@example.com",
+                "\u{212a}evin@example.com",
+                None,
+                false,
+            ),
+            (
+                "Kelvin sign in Sender",
+                "kevin@example.com",
+                "kevin@example.com",
+                Some("\u{212a}evin@example.com"),
+                false,
+            ),
+            (
+                "Kelvin sign in configured maintainer",
+                "Maintainer <\u{212a}evin@example.com>",
+                "kevin@example.com",
+                None,
+                false,
+            ),
+            (
+                "Exact non-ASCII mailbox with ASCII case variant",
+                "Maintainer <\u{212a}EVIN@Example.Com>",
+                "\u{212a}evin@example.com",
+                Some("\u{212a}EVIN@EXAMPLE.COM"),
+                true,
+            ),
+            (
+                "Non-ASCII case variant",
+                "\u{00c9}ric@example.com",
+                "\u{00e9}ric@example.com",
+                None,
+                false,
+            ),
+        ] {
+            let sender_header = sender
+                .map(|address| format!("Sender: Delegate <{address}>\r\n"))
+                .unwrap_or_default();
+            let raw = format!(
+                "From: Maintainer <{from}>\r\n\
+                 {sender_header}\
+                 To: inbox@example.com\r\n\
+                 Authentication-Results: {TEST_AUTHSERV_ID}; dmarc=pass header.from=example.com\r\n\
+                 X-Khive-Thread-ID: existing-thread\r\n\
+                 Subject: Sender identity\r\n\r\nbody"
+            );
+            let email = parse_raw_bytes(42, raw.as_bytes(), "imap.example.com", 9)
+                .expect("raw SMTPUTF8 fixture must parse");
+            let channel = build_channel(maintainer, vec![email.clone()]);
+            assert!(
+                channel.evaluate_auth(&email).is_ok(),
+                "{case}: auth baseline"
+            );
+            let envelopes = channel.poll(Utc::now()).await.unwrap();
+            assert_eq!(envelopes.len(), 1, "{case}: preserve the message");
+            let envelope = &envelopes[0];
+            if accepted {
+                assert_eq!(
+                    envelope.from,
+                    format!("email:{}", from.to_ascii_lowercase()),
+                    "{case}"
+                );
+                assert!(!envelope.metadata.contains_key("quarantined"), "{case}");
+                assert_eq!(
+                    envelope.correlation_external_id.as_deref(),
+                    Some("existing-thread"),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(envelope.from, EMAIL_QUARANTINE_SENDER, "{case}");
+                assert_eq!(
+                    envelope
+                        .metadata
+                        .get("quarantine_reason")
+                        .map(String::as_str),
+                    Some("off-allowlist"),
+                    "{case}"
+                );
+                assert_eq!(
+                    envelope.metadata.get("quarantined").map(String::as_str),
+                    Some("true"),
+                    "{case}"
+                );
+                assert_eq!(
+                    envelope.correlation_external_id, None,
+                    "{case}: quarantine cannot inherit thread context"
+                );
+            }
+        }
+    }
+
     // --- Authorization: rejected senders (Fix 1) ---
 
     #[tokio::test]
