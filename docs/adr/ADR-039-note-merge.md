@@ -203,6 +203,145 @@ had content. It signals whether the append path actually ran.
 surviving edge, contains the complete dropped row, and nests any incident annotation rows removed
 by the hard-delete cascade. The field is also populated predictively by `dry_run=true`.
 
+## Amendment 1 (2026-10-05): guarded merge for a caller that planned it
+
+**Status**: Accepted (2026-10-05)
+
+### Context
+
+A caller can plan a note merge from an earlier read. A repair tool that groups
+duplicate records is one example: it reads the candidates, decides which pairs
+belong together, and then merges them one at a time. Three things that caller
+needs are missing from `merge_note`:
+
+- The merge does not know what the caller read, so an edit between the read and
+  the merge is merged silently.
+- The facts that justified the pairing (which entity a note is attached to,
+  which entity a merged-away entity was merged into) can change in the same
+  window, and checking them before the merge, outside the writer transaction,
+  leaves that window open.
+- The field-level rules take each property from one of the two notes, so a
+  reference that is stale on the note the policy keeps it from cannot be
+  corrected by the merge, and the provenance entry cannot say why the merge
+  happened.
+
+### Decision
+
+The runtime offers a guarded variant of `merge_note` for packs and other
+in-process callers. It takes the two note ids, the existing policy, content
+strategy and dry-run arguments, and a guard with four parts. It returns the
+existing merge summary together with the survivor's committed version.
+
+The guarded merge runs every check the unguarded merge runs, in the same
+places: before the transaction, stream membership and the refusal of
+schedule-managed notes; inside it, the kind, quarantine and reserved-property
+checks. It adds the secret checks on the guard's own values below before the
+transaction starts. The guard is evaluated inside the single transaction
+described under Atomicity, on the writer connection, after both notes are read
+there and before the first write. Any refusal writes nothing: no note row,
+edge, index entry or event changes. A dry run takes the same path on the writer
+connection, inside a transaction that writes nothing, as the unguarded dry run
+already does; the Atomicity section's statement that a dry run opens no write
+transaction does not describe the current code. It evaluates the whole guard and
+returns the survivor's current version. Its answer is advisory: nothing holds
+the window after it returns, so a later merge with the same guard can still
+refuse.
+
+1. **Expected versions.** The guard names the version the caller read for each
+   note. Every update of a note row advances its version (the
+   `bump_note_version` trigger), so a matching version means nothing the caller
+   read on that note has changed. A different stored version refuses the merge
+   with the existing stale-snapshot error for that note. A successful merge
+   returns the survivor's committed version, so the caller can merge the next
+   duplicate into the same survivor without reading it again.
+2. **Assertions.** The guard carries a list of assertions. Each is a value of a
+   closed set that the runtime evaluates with its own read statements; a caller
+   never supplies SQL or code, so an assertion cannot write. The merge is
+   refused with a conflict naming the first assertion that does not hold:
+   - `EntityLive { entity }`: the entity exists in the caller's namespace, is
+     not deleted and was not merged away.
+   - `EntityLineageReaches { entity, canonical }`: `canonical` is live in the
+     caller's namespace, and either `entity` equals `canonical` or the walk
+     that starts at `entity` and follows, in the caller's namespace, the record
+     each merged-away entity keeps of the entity it was merged into reaches
+     `canonical` within 64 steps. A missing record, a deleted entity with no
+     such record, or a cycle ends the walk without holding. The record is
+     `merged_into`, which entity merge writes on the merged-away row when it
+     tombstones it (ADR-014, `merge_entity` semantics, step 9); the earlier
+     sentences of this file that say entity merge hard-deletes `from_id` do not
+     describe the current entity merge.
+   - `NoteEdgeTo { note, relation, target }`: a live `relation` edge from
+     `note` to `target` exists in the caller's namespace, with its target in
+     this store.
+   - `NoteEdgeTargetsWithin { note, relation, target_kind, allowed }`:
+     `allowed` is a live entity of kind `target_kind` in the caller's
+     namespace, and every live `relation` edge row stored under the caller's
+     namespace whose source is `note` and whose target is a live entity of kind
+     `target_kind` in the caller's namespace targets `allowed`. Only edge rows
+     stored under the caller's namespace are read, and only the caller's
+     namespace's entities are looked up: an edge to any other target (a note,
+     an event, an edge, a deleted entity, an entity of another kind, anything
+     in another namespace or another store, or no record) does not count, so
+     the outcome depends on no record outside the caller's namespace. The
+     assertion therefore does not constrain an edge row stored under another
+     namespace or an edge to such a target, and the merge handles those edges
+     exactly as it does without a guard; a caller that must constrain them
+     cannot use this assertion.
+
+   Evaluation charges the merge's transaction budget.
+3. **Survivor property override.** The guard may name top-level property keys
+   and values. After the field-level rules and the restoration of the keys the
+   merge keeps from the survivor, each named key is set to its value before
+   provenance is appended; a JSON null is stored as null, and an override never
+   removes a key. Absent properties start as an empty object; if the
+   properties the field-level rules produce are present and are not a JSON
+   object, a guard carrying an override is refused. An override is refused
+   when it names `_merge_history`, a key the secret gate or the web receipt
+   reserves, or a key a generic update of this note refuses: the note kind's
+   owned keys and, on a note kind a pack owns, the owner-established keys. Any
+   other key, such as a pack's reference to an entity, may be overridden. Every
+   value passes the content secret check a note property update runs.
+4. **History annotation.** The guard may carry one JSON value, at most 4 KiB
+   serialized, recorded unchanged under `annotation` in the `_merge_history`
+   entry this merge appends. The runtime does not interpret it, and it passes
+   the same content secret check. If the `_merge_history` value the field-level
+   rules leave on the survivor is present and is not an array (under
+   `PreferFrom` that value can come from the absorbed note), the guarded merge
+   is refused instead of dropping the new entry, which is what the unguarded
+   merge does.
+
+Without a guard, `merge_note` is unchanged: the same statements in the same
+order, the same errors, budget charges, event and post-commit behaviour. The
+`merge` verb gains no parameter.
+
+### Tests required
+
+- A version mismatch on either note refuses and leaves both notes, their edges,
+  index rows and the event log unchanged; a matching guard merges and returns
+  the survivor's new version; a dry run returns the current version and writes
+  nothing.
+- Each assertion has a case that holds and a case that refuses, and a refusal
+  writes nothing. For each assertion, a change committed after the caller's read
+  and before the merge starts makes it refuse.
+- `EntityLineageReaches` refuses when `canonical` was itself merged away or
+  deleted, and `NoteEdgeTargetsWithin` refuses when `allowed` was.
+- `NoteEdgeTargetsWithin` ignores edges to notes, to deleted entities and to
+  entities of another kind, gives the same outcome for an edge to an entity of
+  another namespace as for an edge to an id with no record, and ignores an edge
+  row stored under another namespace whatever its target.
+- An override replaces the survivor's value. Overrides of `_merge_history`, the
+  secret-gate key, a message's channel key, and an owner-established key on a
+  pack-owned kind are refused, as is an override when the merged properties are
+  present and not an object; an override on two notes without properties
+  creates the object. A credential-shaped override value or annotation is
+  refused before the transaction starts.
+- An annotation is stored verbatim in the new history entry; one over 4 KiB is
+  refused, and so is a `PreferFrom` merge whose absorbed note's
+  `_merge_history` is not an array.
+- A schedule-managed note is refused by the guarded merge as by the unguarded
+  one.
+- The existing `merge_note` tests pass unchanged with no guard.
+
 ## Rationale
 
 ### Why extend `merge` rather than add a new verb?
