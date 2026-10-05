@@ -42,7 +42,12 @@ their stored type and marked retired, where a single such row previously
 failed the whole read. Compose, search and suggest do not serve them, and they
 cannot be challenged or adjudicated. Re-submitting a retired row's content
 under a current type through `knowledge.edit` retypes it in place, because
-sections are keyed by content.
+sections are keyed by content. A row is typed with a retired type when its
+stored type is any spelling that the heading alias table resolved to that type
+before this amendment, after the table's normalization (for example
+`reference`, `see_also` or `notes`), not only when it is `references` or
+`other`. Reads and the serving filters recognise it by the retired type it
+names, never by exact string.
 
 **Profile state.** A persisted section posterior map that carries a retired
 type loads with that entry dropped and the eight remaining entries unchanged.

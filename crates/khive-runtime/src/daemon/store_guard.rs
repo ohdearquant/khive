@@ -261,8 +261,8 @@ pub fn bind_daemon_store_files(
         } else {
             libc::O_RDWR | libc::O_CREAT
         };
-        // A created database gets SQLite's own default mode, subject to the umask.
-        let file = open_claimed_entry(&guard.parent_dir, filename, flags, 0o644)
+        // The creation mode keeps new stores private without changing existing permissions.
+        let file = open_claimed_entry(&guard.parent_dir, filename, flags, 0o600)
             .map_err(|error| bind_open_error(&error, &guard.database, read_only))?;
         let metadata = file.metadata()?;
         anyhow::ensure!(

@@ -59,9 +59,19 @@ pub(super) const MIN_ATOM_CONTENT_WORDS: usize = 20;
 
 /// SQL predicate on `knowledge_sections.section_type` that leaves out rows typed with a
 /// retired section type (ADR-048, 2026-10-04 amendment). Stored rows keep their retired
-/// type unchanged, so every query that reads sections for serving appends this predicate.
-/// A unit test pins it to `SectionType::RETIRED_NAMES`.
-pub(super) const SERVABLE_SECTION: &str = "section_type NOT IN ('references', 'other')";
+/// type unchanged, under any spelling the earlier alias table resolved to it, so every
+/// query that reads sections for serving appends this predicate. It normalizes the stored
+/// value the way `SectionType::normalize_name` does (Unicode whitespace trimmed, each
+/// character listed by code point, `-` and space mapped to `_`, ASCII lowercased) and
+/// compares the result with every retired spelling. Unit tests pin it to
+/// `SectionType::RETIRED_SPELLINGS`, to the characters `str::trim` removes, and to
+/// `SectionType::normalize_name` on the same inputs.
+pub(super) const SERVABLE_SECTION: &str = "lower(replace(replace(trim(section_type, \
+     char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, \
+     8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)), '-', '_'), ' ', '_')) \
+     NOT IN ('references', 'reference', 'bibliography', 'related', 'see_also', \
+     'further_reading', 'citations', 'links', 'other', 'misc', 'miscellaneous', 'notes', \
+     'appendix')";
 
 /// Compute sha256(content)[:16] as a hex string for dedup keying.
 pub(super) fn content_hash(content: &str) -> String {
@@ -448,12 +458,61 @@ mod tests {
     }
 
     #[test]
-    fn servable_section_predicate_excludes_exactly_the_retired_names() {
-        let names = khive_brain_core::SectionType::RETIRED_NAMES
-            .iter()
-            .map(|name| format!("'{name}'"))
+    fn servable_section_predicate_excludes_every_retired_spelling() {
+        let whitespace = (0..=u32::from(char::MAX))
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+            .map(|c| u32::from(c).to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        assert_eq!(SERVABLE_SECTION, format!("section_type NOT IN ({names})"));
+        let spellings = khive_brain_core::SectionType::RETIRED_SPELLINGS
+            .iter()
+            .map(|(spelling, _)| format!("'{spelling}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            SERVABLE_SECTION,
+            format!(
+                "lower(replace(replace(trim(section_type, char({whitespace})), \
+                 '-', '_'), ' ', '_')) NOT IN ({spellings})"
+            )
+        );
+    }
+
+    #[test]
+    fn servable_section_normalization_equals_normalize_name() {
+        let (expression, _) = SERVABLE_SECTION
+            .split_once(" NOT IN ")
+            .expect("the predicate compares a normalized value");
+        let sql = format!("SELECT {}", expression.replacen("section_type", "?1", 1));
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut inputs = vec![
+            "References".to_string(),
+            "See-Also".to_string(),
+            "see also".to_string(),
+            "FURTHER-reading".to_string(),
+            "Core Model".to_string(),
+            "Boundary-Conditions".to_string(),
+            "Example".to_string(),
+            "pitfall".to_string(),
+            "Ré-Sumé Notes".to_string(),
+            "a\tb".to_string(),
+            String::new(),
+            " \t\n".to_string(),
+        ];
+        for c in (0..=u32::from(char::MAX)).filter_map(char::from_u32) {
+            if c.is_whitespace() {
+                inputs.push(format!("{c}See-Also{c}"));
+                inputs.push(format!("{c}{c}Notes {c}"));
+            }
+        }
+        for input in &inputs {
+            let normalized: String = conn.query_row(&sql, [input], |row| row.get(0)).unwrap();
+            assert_eq!(
+                normalized,
+                khive_brain_core::SectionType::normalize_name(input),
+                "{input:?}"
+            );
+        }
     }
 }

@@ -241,6 +241,8 @@ fn store_guard_missing_read_only_database_refuses_without_creation() {
         "{error}"
     );
     assert!(!database.exists());
+    assert!(!root.join("missing-snapshot.db-wal").exists());
+    assert!(!root.join("missing-snapshot.db-shm").exists());
 }
 
 #[test]
@@ -383,7 +385,7 @@ fn store_guard_read_only_claim_refuses_a_missing_parent_without_creating_anythin
 }
 
 #[test]
-fn store_guard_creates_a_missing_database_with_the_default_sqlite_mode() {
+fn store_guard_creates_a_private_database_and_sqlite_sidecars() {
     if crate::test_process::run_in_child() {
         return;
     }
@@ -392,12 +394,141 @@ fn store_guard_creates_a_missing_database_with_the_default_sqlite_mode() {
     let database = root.join("new.db");
     // SAFETY: umask only changes this process's creation mask, and the
     // isolated child runs no other test.
-    unsafe { libc::umask(0o002) };
+    unsafe { libc::umask(0) };
     let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+    assert!(!database.exists());
+    bind_daemon_store_files(&mut guards, &[]).unwrap();
+    assert_eq!(
+        std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_daemon_store_identities(&guards).unwrap();
+
+    let connection = rusqlite::Connection::open(&database).expect("open claimed database");
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .expect("enable WAL");
+    assert_eq!(journal_mode, "wal");
+    connection
+        .execute_batch(
+            "CREATE TABLE permission_fixture (value INTEGER NOT NULL); \
+             INSERT INTO permission_fixture VALUES (1);",
+        )
+        .expect("commit fixture write");
+    let value: i64 = connection
+        .query_row("SELECT value FROM permission_fixture", [], |row| row.get(0))
+        .expect("read committed fixture");
+    assert_eq!(value, 1);
+
+    // The last SQLite connection can remove its sidecars when it closes.
+    for path in [
+        &database,
+        &root.join("new.db-wal"),
+        &root.join("new.db-shm"),
+    ] {
+        let metadata = std::fs::metadata(path).expect("written database and live sidecars");
+        assert!(metadata.is_file(), "{}", path.display());
+        assert!(metadata.len() > 0, "{}", path.display());
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o600,
+            "{}",
+            path.display()
+        );
+    }
+    assert_daemon_store_identities(&guards).unwrap();
+    connection
+        .close()
+        .unwrap_or_else(|(_, error)| panic!("close fixture connection: {error}"));
+    drop(guards);
+    assert_eq!(
+        std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn store_guard_preserves_an_existing_database_mode_through_sqlite_shutdown() {
+    if crate::test_process::run_in_child() {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("fixture");
+    let root = dir.path().canonicalize().expect("canonical fixture");
+    let database = root.join("existing.db");
+    // SAFETY: this isolated child runs only this test, so no other test observes the mask.
+    unsafe { libc::umask(0) };
+    let seed = rusqlite::Connection::open(&database).expect("create existing fixture");
+    seed.execute_batch(
+        "CREATE TABLE permission_fixture (value INTEGER NOT NULL); \
+         INSERT INTO permission_fixture VALUES (1);",
+    )
+    .expect("seed existing database");
+    seed.close()
+        .unwrap_or_else(|(_, error)| panic!("close seed connection: {error}"));
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let original_identity = regular_store_identity(&database).unwrap();
+    assert!(original_identity.is_some());
+    assert_eq!(
+        std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+
+    let mut guards = acquire_daemon_store_guards([database.clone()]).unwrap();
+    assert_eq!(
+        std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
     bind_daemon_store_files(&mut guards, &[]).unwrap();
     assert_eq!(
         std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
         0o644
+    );
+    let connection = rusqlite::Connection::open(&database).expect("open existing claimed database");
+    assert_eq!(
+        std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    let journal_mode: String = connection
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .expect("enable WAL");
+    assert_eq!(journal_mode, "wal");
+    connection
+        .execute("INSERT INTO permission_fixture VALUES (2)", [])
+        .expect("commit another fixture write");
+    let values: i64 = connection
+        .query_row("SELECT SUM(value) FROM permission_fixture", [], |row| {
+            row.get(0)
+        })
+        .expect("read preserved and new rows");
+    assert_eq!(values, 3);
+
+    for path in [
+        &database,
+        &root.join("existing.db-wal"),
+        &root.join("existing.db-shm"),
+    ] {
+        let metadata = std::fs::metadata(path).expect("written database and live sidecars");
+        assert!(metadata.is_file(), "{}", path.display());
+        assert!(metadata.len() > 0, "{}", path.display());
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o644,
+            "{}",
+            path.display()
+        );
+    }
+    assert_daemon_store_identities(&guards).unwrap();
+    connection
+        .close()
+        .unwrap_or_else(|(_, error)| panic!("close fixture connection: {error}"));
+    drop(guards);
+    assert_eq!(
+        std::fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(
+        regular_store_identity(&database).unwrap(),
+        original_identity
     );
 }
 
