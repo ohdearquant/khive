@@ -31,6 +31,7 @@ impl TryFrom<[EventCountDimension; 2]> for EventCountGroupBy {
 }
 
 impl EventCountGroupBy {
+    #[cfg(test)]
     pub(crate) fn add_to_result(
         self,
         result: &mut Value,
@@ -38,16 +39,32 @@ impl EventCountGroupBy {
         default_actor: Option<&str>,
         truncated: bool,
     ) {
-        let mut counts: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+        let mut cross = EventCountCross::default();
         for event in items {
-            let actor = default_actor.unwrap_or(event.actor.as_str());
-            *counts
-                .entry(event.verb.clone())
-                .or_default()
-                .entry(actor.to_owned())
-                .or_default() += 1;
+            cross.observe(event, default_actor);
         }
+        cross.add_to_result(result, truncated);
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct EventCountCross {
+    counts: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+impl EventCountCross {
+    pub(crate) fn observe(&mut self, event: &Event, default_actor: Option<&str>) {
+        let actor = default_actor.unwrap_or(event.actor.as_str());
+        *self
+            .counts
+            .entry(event.verb.clone())
+            .or_default()
+            .entry(actor.to_owned())
+            .or_default() += 1;
+    }
+
+    pub(crate) fn add_to_result(self, result: &mut Value, truncated: bool) {
         result[BrainPack::truncatable_total_key("counts_by_verb_and_actor", truncated)] =
-            json!(counts);
+            json!(self.counts);
     }
 }
