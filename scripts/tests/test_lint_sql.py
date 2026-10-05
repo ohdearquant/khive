@@ -205,6 +205,146 @@ class SqlLintTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("5 file(s) OK", result.stdout)
 
+    def gtd_fixture(self):
+        directory = self.root / "crates/khive-pack-gtd/sql"
+        directory.mkdir(parents=True, exist_ok=True)
+        statements = {
+            "ddl": "CREATE TABLE IF NOT EXISTS gtd_lifecycle_audit (\n"
+                   "    note_id TEXT NOT NULL,\n    from_state TEXT NOT NULL,\n"
+                   "    to_state TEXT NOT NULL,\n    note TEXT,\n"
+                   "    at INTEGER NOT NULL,\n    namespace TEXT\n)\n",
+            "note-index": "CREATE INDEX IF NOT EXISTS idx_gtd_audit_note "
+                          "ON gtd_lifecycle_audit(note_id, at DESC)\n",
+            "table-info": "PRAGMA table_info(gtd_lifecycle_audit)\n",
+            "add-namespace": "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT\n",
+        }
+        for name, sql in statements.items():
+            (directory / f"task-lifecycle-audit-{name}.sql").write_text(sql)
+        (directory / "audit-insert.sql").write_text(
+            "INSERT INTO gtd_lifecycle_audit "
+            "(note_id, from_state, to_state, note, at, namespace) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6)\n"
+        )
+        return directory
+
+    def test_gtd_legacy_upgrade_and_canonical_query_schema_both_validate(self):
+        self.gtd_fixture()
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("5 file(s) OK (1 prepared, 4 executed)", result.stdout)
+
+    def test_gtd_upgrade_errors_and_wrong_layouts_are_never_suppressed(self):
+        cases = [
+            ("add-namespace", "ALTER TABLE absent ADD COLUMN namespace TEXT\n", "no such table"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespase TEXT\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace BLOB\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT DEFAULT 'x'\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT NOT NULL DEFAULT 'x'\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLMN namespace TEXT\n", "after upgrade"),
+            ("add-namespace", "ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT; SELECT 1;\n", "one statement"),
+            ("add-namespace", "SELECT 1\n", "must contain pack DDL"),
+            ("table-info", "PRAGMA table_info(absent)\n", "before upgrade"),
+        ]
+        for name, sql, diagnostic in cases:
+            with self.subTest(name=name, sql=sql):
+                directory = self.gtd_fixture()
+                (directory / f"task-lifecycle-audit-{name}.sql").write_text(sql)
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(diagnostic, result.stdout)
+
+    def test_gtd_syntax_error_and_missing_bundle_file_fail(self):
+        directory = self.gtd_fixture()
+        path = directory / "task-lifecycle-audit-add-namespace.sql"
+        path.write_text("ALTER TABLE gtd_lifecycle_audit ADD COLUMN (\n")
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAILED legacy fixture", result.stdout)
+        self.assertIn("syntax error", result.stdout)
+        path.unlink()
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("incomplete GTD upgrade bundle", result.stdout)
+
+    def test_gtd_legacy_fixture_requires_the_exact_old_layout(self):
+        self.gtd_fixture()
+        script = self.root / "scripts/lint-sql.sh"
+        original = script.read_text()
+        for before, after in [
+            ("CREATE TABLE gtd_lifecycle_audit (", "CREATE TABLE wrong_fixture ("),
+            ("    at INTEGER NOT NULL\n)\n", "    at INTEGER NOT NULL,\n    namespace TEXT\n)\n"),
+        ]:
+            with self.subTest(after=after):
+                self.assertEqual(original.count(before), 1)
+                script.write_text(original.replace(before, after))
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("legacy fixture: unexpected table layout", result.stdout)
+        script.write_text(original)
+
+    def test_gtd_canonical_layout_must_match_the_upgraded_layout(self):
+        directory = self.gtd_fixture()
+        path = directory / "task-lifecycle-audit-ddl.sql"
+        source = path.read_text()
+        for broken in [source.replace(",\n    namespace TEXT", ""),
+                       source.replace("namespace TEXT", "namespace BLOB")]:
+            with self.subTest(broken=broken):
+                path.write_text(broken)
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("canonical schema: unexpected table layout", result.stdout)
+
+    def test_gtd_upgrade_registration_does_not_exempt_neighboring_ddl(self):
+        directory = self.gtd_fixture()
+        (directory / "zz-unregistered.sql").write_text(
+            "ALTER TABLE absent ADD COLUMN missing TEXT\n"
+        )
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("zz-unregistered.sql: FAILED to load", result.stdout)
+        self.assertIn("no such table", result.stdout)
+
+    def test_gtd_queries_keep_name_and_bind_checks_without_executing(self):
+        directory = self.gtd_fixture()
+        query = directory / "audit-insert.sql"
+        original = query.read_text()
+        for broken, diagnostic in [
+            (original.replace("gtd_lifecycle_audit", "absent"), "no such table"),
+            (original.replace("namespace)", "missing)"), "no column named missing"),
+            (original.replace("?6", "?8"), "positional binds must run 1..N"),
+        ]:
+            with self.subTest(broken=broken):
+                query.write_text(broken)
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stdout)
+        query.write_text(original)
+        (directory / "zz-no-insert.sql").write_text(
+            "CREATE TRIGGER no_insert BEFORE INSERT ON gtd_lifecycle_audit "
+            "BEGIN SELECT RAISE(ABORT, 'query executed INSERT'); END;\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("6 file(s) OK (1 prepared, 5 executed)", result.stdout)
+
+    def test_gtd_fixture_keeps_ddl_local_and_current_query_schema_shared(self):
+        self.gtd_fixture()
+        unrelated = self.root / "crates/unrelated/sql"
+        unrelated.mkdir(parents=True)
+        index = unrelated / "unexpected_index.sql"
+        index.write_text("CREATE INDEX unexpected ON gtd_lifecycle_audit(namespace)\n")
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected_index.sql: FAILED to load", result.stdout)
+        self.assertIn("no such table", result.stdout)
+        index.unlink()
+        (unrelated / "allowed_query.sql").write_text(
+            "SELECT namespace FROM gtd_lifecycle_audit WHERE note_id = ?1\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("6 file(s) OK (2 prepared, 4 executed)", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
