@@ -518,7 +518,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::RunAtomicUnit,
         stamp: StampCapability::ReservationOnly,
         family: Some("entity.update"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/curation.rs::tests::persist_prepared_entity_update_rejects_reserved_final_object" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/curation_tests.rs::persist_prepared_entity_update_rejects_reserved_final_object" },
     },
     RouteInventoryEntry {
         id: "curation.outbound.delivery",
@@ -531,7 +531,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-runtime/src/curation.rs::tests::outbound_property_replacements_refuse_carried_reserved_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/curation_tests.rs::outbound_property_replacements_refuse_carried_reserved_key" },
     },
     RouteInventoryEntry {
         id: "curation.outbound.owner",
@@ -544,7 +544,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-runtime/src/curation.rs::tests::outbound_property_replacements_refuse_carried_reserved_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/curation_tests.rs::outbound_property_replacements_refuse_carried_reserved_key" },
     },
     RouteInventoryEntry {
         id: "curation.merge.entity",
