@@ -146,7 +146,7 @@ R=$(fresh_repo c13d)
 mkdir -p "$R/atoms"; printf '{"a":1}\n' >"$R/atoms/LEDGER.jsonl"
 printf '%s\n' '^atoms/ledger\.jsonl$ 128' >"$R/.check-json-data-exemptions"
 git -C "$R" add atoms/LEDGER.jsonl .check-json-data-exemptions
-[ "$(run_guard "$R")" = 1 ] && grep -q 'atoms/LEDGER.jsonl' "$ERR" && pass || fail "a path was covered by an exemption written for its lower-cased spelling"
+[ "$(run_guard "$R")" = 1 ] && grep -qF 'atoms/LEDGER.jsonl — JSONL/NDJSON staged outside a benchmark-results path' "$ERR" && pass || fail "a path was covered by an exemption written for its lower-cased spelling"
 
 echo "--- case 14: comments and blank lines are ignored ---"
 R=$(fresh_repo c14)
