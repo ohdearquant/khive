@@ -1766,7 +1766,8 @@ mod tests {
     }
 
     fn canonical_v20_backend(db_path: &Path) -> Arc<StorageBackend> {
-        let backend = Arc::new(StorageBackend::sqlite(db_path).expect("V20 fixture backend"));
+        let backend =
+            Arc::new(StorageBackend::sqlite_for_test(db_path).expect("V20 fixture backend"));
         let mut writer = backend.pool().try_writer().expect("V20 fixture writer");
         let conn = writer.conn_mut();
         conn.execute_batch(

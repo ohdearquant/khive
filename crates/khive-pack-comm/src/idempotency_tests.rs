@@ -69,7 +69,8 @@ fn parties() -> (VerbRegistry, VerbRegistry, KhiveRuntime) {
 
 fn file_parties() -> (tempfile::TempDir, VerbRegistry, VerbRegistry, KhiveRuntime) {
     let dir = tempfile::tempdir().unwrap();
-    let backend = khive_db::StorageBackend::sqlite(dir.path().join("messages.db")).unwrap();
+    let backend =
+        khive_db::StorageBackend::sqlite_for_test(dir.path().join("messages.db")).unwrap();
     {
         let mut writer = backend.pool().try_writer().unwrap();
         khive_db::run_migrations(writer.conn_mut()).unwrap();

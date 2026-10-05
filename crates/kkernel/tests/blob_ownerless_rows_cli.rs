@@ -8,7 +8,8 @@ fn current_quiescent_member_prints_a_complete_json_report() {
     let database = dir.path().join("main.db");
     let config = dir.path().join("config.toml");
     std::fs::write(&config, "").expect("empty config");
-    let backend = khive_db::StorageBackend::sqlite(&database).expect("create fixture database");
+    let backend =
+        khive_db::StorageBackend::sqlite_for_test(&database).expect("create fixture database");
     backend
         .prepare_core_schema()
         .expect("migrate fixture database");

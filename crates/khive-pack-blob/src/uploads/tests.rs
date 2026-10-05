@@ -1758,7 +1758,7 @@ async fn independent_capabilities_allow_cross_actor_append_commit_and_abort() {
 #[tokio::test]
 async fn transactional_gc_preserves_committed_and_staging_then_upload_sweep_only_reaps_staging() {
     let f = fixture();
-    let backend = khive_db::StorageBackend::sqlite(f._dir.path().join("gc.db")).unwrap();
+    let backend = khive_db::StorageBackend::sqlite_for_test(f._dir.path().join("gc.db")).unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
         let conn = writer.conn_mut();
@@ -1779,13 +1779,17 @@ async fn transactional_gc_preserves_committed_and_staging_then_upload_sweep_only
             .unwrap();
             tx.commit().unwrap();
         }
-        khive_db::migrations::stage_attachment_cutover(conn).unwrap();
-        khive_db::migrations::finalize_attachment_cutover(conn).unwrap();
-        assert_eq!(
-            khive_db::migrations::read_schema_version(conn).unwrap(),
-            khive_db::migrations::ATTACHMENT_CUTOVER_VERSION
-        );
     }
+    let owner = khive_db::stores::blob::acquire_database_gc_owner(backend.sql().as_ref())
+        .await
+        .unwrap();
+    backend.stage_attachment_cutover(&owner).unwrap();
+    backend.finalize_attachment_cutover(&owner).unwrap();
+    assert_eq!(
+        backend.schema_version().unwrap(),
+        khive_db::migrations::ATTACHMENT_CUTOVER_VERSION
+    );
+    drop(owner);
     let reference = f.store.put(b"committed control".to_vec()).await.unwrap();
     {
         let writer = backend.pool().writer().unwrap();

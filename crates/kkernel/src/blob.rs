@@ -504,7 +504,7 @@ mod tests {
     }
 
     fn fixture(path: &Path) -> StorageBackend {
-        let backend = StorageBackend::sqlite(path).expect("create fixture database");
+        let backend = StorageBackend::sqlite_for_test(path).expect("create fixture database");
         backend
             .prepare_core_schema()
             .expect("migrate fixture database");
@@ -740,7 +740,7 @@ mod tests {
         let id = uuid::Uuid::from_u128(1).to_string();
         insert_attachment(&backend, &id).await;
         drop(backend);
-        drop(StorageBackend::sqlite(&stale).expect("unmigrated sqlite file"));
+        drop(StorageBackend::sqlite_for_test(&stale).expect("unmigrated sqlite file"));
         khive_storage::test_support::freeze_snapshot_sidecars(&main);
         khive_storage::test_support::freeze_snapshot_sidecars(&stale);
         std::fs::write(&config, "").expect("empty config");
