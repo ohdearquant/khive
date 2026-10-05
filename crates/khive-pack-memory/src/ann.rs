@@ -9,9 +9,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use khive_retrieval::ann::registry::{
-    self as ann_registry, CompactionScope, WatermarkAuthority, PENDING_WATERMARK,
-};
+use khive_retrieval::ann::corpus::{CorpusScope, LiveRowJoin};
+use khive_retrieval::ann::registry::{self as ann_registry, WatermarkAuthority, PENDING_WATERMARK};
 use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{
     is_benign_shutdown_cancellation, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
@@ -2335,6 +2334,15 @@ async fn raise_watermark(rt: &KhiveRuntime, model: &str, s: u64) -> Result<(), S
     raise_watermark_with_authority(rt, model, s, WatermarkAuthority::Active).await
 }
 
+fn memory_corpus() -> CorpusScope<'static> {
+    CorpusScope {
+        namespace: None,
+        record_kind: Some("note"),
+        field: "note.content",
+        live_join: Some(LiveRowJoin::Notes),
+    }
+}
+
 /// Compact the write log for `model` across every namespace, each bounded by
 /// its own wildcard-inclusive registry minimum (ADR-079 Amendment 1 §A step
 /// 3). A namespace with no registered rows yields `seq <= NULL`, which
@@ -2350,7 +2358,7 @@ async fn compact_log(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
         writer
             .execute(ann_registry::pathless_compact_log(
                 "memory_",
-                CompactionScope::Model,
+                memory_corpus().compaction_scope(),
                 model,
             ))
             .await
@@ -2358,7 +2366,7 @@ async fn compact_log(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         return Ok(());
     }
-    ann_registry::compact_write_log(sql.as_ref(), CompactionScope::Model, model)
+    ann_registry::compact_write_log(sql.as_ref(), memory_corpus().compaction_scope(), model)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -2378,25 +2386,7 @@ async fn scope_counts(rt: &KhiveRuntime, model: &str, s: u64) -> Result<(u64, u6
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT \
-                   (SELECT COUNT(*) FROM {table_name} v \
-                     JOIN notes n ON n.id = v.subject_id \
-                     WHERE v.embedding_model = ?1 \
-                       AND v.kind = 'note' AND v.field = 'note.content' \
-                       AND n.deleted_at IS NULL) AS live, \
-                   (SELECT COUNT(*) FROM ann_write_log \
-                     WHERE embedding_model = ?1 \
-                       AND kind = 'note' AND field = 'note.content' \
-                       AND seq > ?2) AS tail"
-            ),
-            params: vec![
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Integer(s as i64),
-            ],
-            label: Some("memory_ann_scope_counts".into()),
-        })
+        .query_all(memory_corpus().scope_counts(&table_name, model, s, "memory_ann_scope_counts"))
         .await
         .map_err(|e| e.to_string())?;
     let row = rows
@@ -2417,18 +2407,7 @@ async fn tail_exists(rt: &KhiveRuntime, model: &str, s: u64) -> Result<bool, Str
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT EXISTS(SELECT 1 FROM ann_write_log \
-                    WHERE embedding_model = ?1 \
-                      AND kind = 'note' AND field = 'note.content' \
-                      AND seq > ?2) AS has_tail"
-                .into(),
-            params: vec![
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Integer(s as i64),
-            ],
-            label: Some("memory_ann_tail_exists".into()),
-        })
+        .query_all(memory_corpus().tail_exists(model, s, "memory_ann_tail_exists"))
         .await
         .map_err(|e| e.to_string())?;
     match rows.first().and_then(|row| row.get("has_tail")) {
@@ -8937,3 +8916,7 @@ mod tests {
 #[cfg(test)]
 #[path = "ann/bridge_incremental_tests.rs"]
 mod bridge_incremental_tests;
+
+#[cfg(test)]
+#[path = "ann/corpus_statement_tests.rs"]
+mod corpus_statement_tests;
