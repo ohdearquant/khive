@@ -56,6 +56,11 @@ meaning with `EntityOfType` rules for their subtypes (for example, a clinical Su
 (artifact, service, resource) are left to the first pack that emits them, through the same additive
 mechanism.
 
+> **Amended 2026-10-05 (ADR-002)**: the base contract has two rows, `Concept located_in Concept` and
+> `Org located_in Concept`. Organization is a base kind, and the jurisdiction an organization is
+> registered in is a location fact that a store using only the base `kg` pack needs as an edge. The
+> additive route above remains the way to add rows for other kinds.
+
 ### D2: Query semantics
 
 `located_in` is not transitive on its own, and the runtime materializes nothing. The chain a reader
@@ -78,6 +83,11 @@ redundancy. This collision is resolved by the second Er row below, which tests `
 `extends` directly, and recorded as a closed, separately guarded exemption beside the ratified
 `supports`/`refutes` pair. In ADR-002's reciprocal-pair classification `located_in` is order-like: A in
 B and B in A contradict each other.
+
+> **Amended 2026-10-05 (ADR-002)**: with the `Org located_in Concept` base row the two signatures differ,
+> so the tripwire no longer reports a collision and the separately guarded exemption is withdrawn. The
+> second Er row still stands: it tests `located_in` against `extends` on the `Concept -> Concept` pair
+> they share.
 
 ## Non-redundancy certificate (ADR-076 D2)
 
