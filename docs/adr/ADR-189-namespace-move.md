@@ -763,7 +763,7 @@ All other constraints retain Amendment 2's conservative source-row enumeration, 
 mirror slug collisions without an Atom route. Partial and expression index exclusions, the plain
 statement constraint backstop and caller-owned transaction/rollback behavior are unchanged. This
 exception does not change route validation, edge/vector destinations, aggregate totality or any ADR
-status. The dependent implementation requires approval of this contract change before merge.
+status.
 
 ### Vectors use the same resolved edge destination
 
@@ -771,8 +771,10 @@ Amendment 2's partitioned vector resolution uses this same resolved edge route. 
 plus a fallback does not contribute two destinations for one edge. Different physical subjects
 sharing an ID still obey the existing distinct-target ambiguity rule. Source scoping, vector bytes,
 paired ANN instructions, collision refusal, transaction ownership, aggregate handling and
-repeated-call behavior retain their existing rules. This amendment extends the route grammar; it
-does not replace or change the status of the document or Amendments 1 through 3.
+repeated-call behavior retain their existing rules. This amendment extends the route grammar and,
+for the graph-edge triple constraint only, replaces Amendment 2's rule of checking every source edge
+against every routed target. It changes nothing else in Amendments 1 through 3 and does not change
+the status of the document.
 
 ### Acceptance
 
