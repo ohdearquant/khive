@@ -30,6 +30,8 @@ use khive_storage::types::VectorRecord;
 use khive_storage::VectorStore;
 use khive_types::{Pack, SubstrateKind};
 
+mod record_repair;
+
 // ─── progress bar ─────────────────────────────────────────────────────────────
 
 struct ProgressBar {
@@ -137,6 +139,13 @@ impl ProgressBar {
 /// `kkernel mcp`).
 #[derive(Parser, Debug)]
 pub struct ReindexArgs {
+    /// Repair only this live entity or note: restore its FTS document and fill
+    /// missing kind-eligible model vectors, preserving healthy indexes.
+    #[arg(long, value_name = "UUID", conflicts_with_all = [
+        "model", "batch_size", "knowledge_only", "no_sections", "sections_only", "rebuild_fts"
+    ])]
+    pub id: Option<Uuid>,
+
     /// Database path (defaults to `~/.khive/khive.db`). `:memory:` selects an
     /// ephemeral in-memory database in single-backend mode. When discovered
     /// config declares `[[backends]]`, this must explicitly match one declared
@@ -568,6 +577,7 @@ async fn run_reindex_with_setup(
     config_setup: impl FnOnce(khive_runtime::RuntimeConfig) -> khive_runtime::RuntimeConfig,
     runtime_setup: impl FnOnce(&KhiveRuntime) -> Result<()>,
 ) -> Result<()> {
+    record_repair::validate_args(&args)?;
     let validated_target =
         validate_declared_reindex_target(args.db.as_deref(), args.config.as_deref())?;
 
@@ -608,6 +618,10 @@ async fn run_reindex_with_setup(
         .authorize(resolved_ns)
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to authorize namespace")?;
+
+    if let Some(id) = args.id {
+        return record_repair::run(&rt, &token, id, args.human, args.best_effort).await;
+    }
 
     // `--sections-only` is the narrowest scope: knowledge sections alone.
     let do_graph = !args.knowledge_only && !args.sections_only; // entities + notes
@@ -1440,6 +1454,8 @@ fn print_report(report: &ReindexReport, human: bool) {
 
 #[cfg(test)]
 mod tests {
+    mod record_repair_tests;
+
     use super::*;
     use crate::dbpath::resolve_db_override;
     use clap::Parser;
@@ -1583,6 +1599,7 @@ default = false
         };
 
         let args = |model: Option<String>| ReindexArgs {
+            id: None,
             db: Some(db_path.to_str().unwrap().to_owned()),
             config: Some(config.clone()),
             model,
@@ -3635,6 +3652,7 @@ read_only = true
 
         // run_reindex with no embedding model and --no-knowledge.
         let args = ReindexArgs {
+            id: None,
             db: Some(db_path.clone()),
             config: Some(config.clone()),
             model: None,
@@ -3919,6 +3937,7 @@ read_only = true
         }
 
         let args = ReindexArgs {
+            id: None,
             db: Some(db_path.clone()),
             config: Some(config.clone()),
             model: None,
@@ -4062,6 +4081,7 @@ read_only = true
         seed_desynced_knowledge_fts(&db_path, &config).await;
 
         let args = ReindexArgs {
+            id: None,
             db: Some(db_path.clone()),
             config: Some(config.clone()),
             model: None,
@@ -4103,6 +4123,7 @@ read_only = true
         seed_desynced_knowledge_fts(&db_path, &config).await;
 
         let args = ReindexArgs {
+            id: None,
             db: Some(db_path.clone()),
             config: Some(config.clone()),
             model: None,
@@ -4143,6 +4164,7 @@ read_only = true
         seed_desynced_knowledge_fts(&db_path, &config).await;
 
         let args = ReindexArgs {
+            id: None,
             db: Some(db_path.clone()),
             config: Some(config.clone()),
             model: None,
@@ -4270,6 +4292,7 @@ read_only = true
 
     fn snapshot_reindex_args(dir: &std::path::Path, best_effort: bool) -> ReindexArgs {
         ReindexArgs {
+            id: None,
             db: Some(dir.join("reindex.db").to_str().unwrap().to_owned()),
             config: Some(write_empty_test_config(dir)),
             model: None,
