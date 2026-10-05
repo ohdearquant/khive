@@ -4702,9 +4702,9 @@ impl KhiveRuntime {
     /// Returns `Ok(Some(note))` when the note was newly written.  Returns
     /// `Ok(None)` when a unique constraint (e.g. the channel-scoped `external_id`
     /// partial index on comm message notes) was already satisfied by an existing row,
-    /// making this call a no-op.  FTS indexing and vector embedding are
-    /// attempted on success but treated as best-effort: failures are logged
-    /// and do not abort the write.
+    /// making this call a no-op. Indexing failures after an insert return a
+    /// typed `post_commit_degraded` error with the committed record ID and
+    /// `retryable=false`. Healthy models still run; the note is not rolled back.
     ///
     /// This method is intentionally narrower than `create_note`: it skips
     /// salience/decay, annotates edges, and embedding-model selection, which
@@ -4898,18 +4898,28 @@ impl KhiveRuntime {
             return Ok(None);
         }
 
-        // Best-effort FTS: log and continue on failure.
-        if let Ok(fts) = self.text_for_notes(token) {
-            if let Err(e) = fts.upsert_document(note_fts_document(&note)).await {
-                tracing::warn!(
-                    note_id = %note.id,
-                    error = %e,
-                    "try_create_note: FTS indexing failed (non-fatal)"
-                );
+        let mut degradations = Vec::new();
+        match self.text_for_notes(token) {
+            Ok(fts) => {
+                if let Err(error) = fts.upsert_document(note_fts_document(&note)).await {
+                    record_post_commit_degradation(
+                        &mut degradations,
+                        "try_create_note",
+                        note.id,
+                        "fts_upsert",
+                        error,
+                    );
+                }
             }
+            Err(error) => record_post_commit_degradation(
+                &mut degradations,
+                "try_create_note",
+                note.id,
+                "fts_acquisition",
+                error,
+            ),
         }
 
-        // Best-effort vector embedding: log and continue on failure.
         let embed_model_names = self.embedding_models_for_note_kind(kind);
         for model_name in &embed_model_names {
             match self
@@ -4930,38 +4940,47 @@ impl KhiveRuntime {
                             "try_create_note: embedding input truncated; full content stored unchanged"
                         );
                     }
-                    if let Ok(vs) = self.vectors_for_model(token, model_name) {
-                        if let Err(e) = vs
-                            .insert(
-                                note.id,
-                                SubstrateKind::Note,
-                                ns,
-                                "note.content",
-                                vec![outcome.vector],
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                note_id = %note.id,
-                                model = %model_name,
-                                error = %e,
-                                "try_create_note: vector insert failed (non-fatal)"
-                            );
+                    match self.vectors_for_model(token, model_name) {
+                        Ok(vs) => {
+                            if let Err(error) = vs
+                                .insert(
+                                    note.id,
+                                    SubstrateKind::Note,
+                                    ns,
+                                    "note.content",
+                                    vec![outcome.vector],
+                                )
+                                .await
+                            {
+                                record_post_commit_degradation(
+                                    &mut degradations,
+                                    "try_create_note",
+                                    note.id,
+                                    "vector_insert",
+                                    format!("model {model_name}: {error}"),
+                                );
+                            }
                         }
+                        Err(error) => record_post_commit_degradation(
+                            &mut degradations,
+                            "try_create_note",
+                            note.id,
+                            "vector_acquisition",
+                            format!("model {model_name}: {error}"),
+                        ),
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        note_id = %note.id,
-                        model = %model_name,
-                        error = %e,
-                        "try_create_note: embedding failed (non-fatal)"
-                    );
-                }
+                Err(error) => record_post_commit_degradation(
+                    &mut degradations,
+                    "try_create_note",
+                    note.id,
+                    "embedding",
+                    format!("model {model_name}: {error}"),
+                ),
             }
         }
 
-        Ok(Some(note))
+        legacy_post_commit_result("try_create_note", note.id, Some(note), degradations)
     }
 
     // REASON: private inner function unifies all create_note variants; it receives every
@@ -8952,6 +8971,7 @@ mod tests {
     use std::sync::Arc;
 
     mod embed_failure_latency;
+    mod try_create_note;
 
     fn rt() -> KhiveRuntime {
         KhiveRuntime::memory().unwrap()
@@ -22016,157 +22036,6 @@ mod tests {
             matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
             "unexpected error: {err:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn try_create_note_rejects_reserved_secret_gate_key() {
-        let rt = rt();
-        let tok = NamespaceToken::local();
-        let err = rt
-            .try_create_note(
-                &tok,
-                "observation",
-                None,
-                "reserved-key conditional note",
-                Some(reserved_key_props()),
-            )
-            .await
-            .expect_err("caller-supplied reserved key must be rejected");
-        assert!(
-            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("khive:secret_gate")),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    /// One value for each key of the `message` entry of the kind-owned property
-    /// list, shaped like what the owning transport writes.
-    fn transport_owned_message_properties() -> [(&'static str, serde_json::Value); 7] {
-        use serde_json::json;
-
-        [
-            ("quarantined", json!(true)),
-            ("channel_kind", json!("email")),
-            ("channel_slug", json!("forged-channel")),
-            ("delivery_hold", json!("external_id_unverifiable")),
-            ("delivery_hold_reason", json!("forged hold")),
-            ("delivery_hold_at", json!("2026-01-01T00:00:00Z")),
-            ("external_id_diagnostic_note_id", json!("diag-note")),
-        ]
-    }
-
-    #[tokio::test]
-    async fn try_create_note_refuses_every_transport_owned_message_property() {
-        let rt = rt();
-        let tok = NamespaceToken::local();
-
-        for (key, value) in transport_owned_message_properties() {
-            let err = rt
-                .try_create_note(
-                    &tok,
-                    "message",
-                    None,
-                    "forged transport-owned property via direct runtime write",
-                    Some(serde_json::json!({ key: value })),
-                )
-                .await
-                .expect_err(&format!("try_create_note must refuse `{key}`"));
-            assert!(
-                matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains(key)),
-                "refusal must name `{key}`: {err:?}"
-            );
-        }
-
-        let left_behind = rt
-            .list_notes(&tok, Some("message"), 100, 0)
-            .await
-            .expect("list must succeed");
-        assert!(
-            left_behind.is_empty(),
-            "refused writes must leave no row behind: {left_behind:?}"
-        );
-
-        // Control: the same read sees a message row, and the refusal is key-scoped.
-        let created = rt
-            .try_create_note(
-                &tok,
-                "message",
-                None,
-                "ordinary message",
-                Some(serde_json::json!({"direction": "inbound"})),
-            )
-            .await
-            .expect("a message without transport-owned properties is accepted")
-            .expect("the insert is not deduplicated");
-        let rows = rt
-            .list_notes(&tok, Some("message"), 100, 0)
-            .await
-            .expect("list must succeed");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].id, created.id);
-    }
-
-    #[tokio::test]
-    async fn trusted_ingest_accepts_every_transport_owned_message_property() {
-        let rt = rt();
-        let tok = NamespaceToken::local();
-        let capability = crate::pack::ChannelIngestCapability { _sealed: () };
-
-        let mut written = Vec::new();
-        for (key, value) in transport_owned_message_properties() {
-            let note = rt
-                .try_create_note_as_trusted_ingest(
-                    &capability,
-                    &tok,
-                    "message",
-                    None,
-                    "trusted ingest establishes a transport-owned property",
-                    Some(serde_json::json!({ key: value })),
-                    None,
-                )
-                .await
-                .unwrap_or_else(|err| panic!("trusted ingest refused `{key}`: {err}"))
-                .expect("the insert is not deduplicated");
-            written.push((key, value, note.id));
-        }
-
-        let mut everything = serde_json::Map::new();
-        for (key, value) in transport_owned_message_properties() {
-            everything.insert(key.to_string(), value);
-        }
-        let all_at_once = rt
-            .try_create_note_as_trusted_ingest(
-                &capability,
-                &tok,
-                "message",
-                None,
-                "trusted ingest establishes every transport-owned property",
-                Some(serde_json::Value::Object(everything)),
-                None,
-            )
-            .await
-            .expect("trusted ingest must accept all transport-owned properties at once")
-            .expect("the insert is not deduplicated");
-
-        let rows = rt
-            .list_notes(&tok, Some("message"), 100, 0)
-            .await
-            .expect("list must succeed");
-        assert_eq!(rows.len(), written.len() + 1);
-        for (key, value, id) in written {
-            let row = rows
-                .iter()
-                .find(|note| note.id == id)
-                .expect("the trusted ingest row is persisted");
-            let props = row.properties.as_ref().expect("properties");
-            assert_eq!(props[key], value, "must persist `{key}`");
-        }
-        let stored = rows
-            .iter()
-            .find(|note| note.id == all_at_once.id)
-            .and_then(|note| note.properties.as_ref())
-            .and_then(serde_json::Value::as_object)
-            .expect("the all-at-once row keeps its properties");
-        assert_eq!(stored.len(), 7);
     }
 
     #[tokio::test]
