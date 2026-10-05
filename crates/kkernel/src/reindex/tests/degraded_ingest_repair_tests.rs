@@ -140,6 +140,7 @@ async fn reindex_restores_the_fts_document_a_degraded_conditional_insert_lacks()
     };
 
     run_reindex_without_embeddings(ReindexArgs {
+        id: None,
         db: Some(db_path.clone()),
         config: Some(config.clone()),
         model: None,
