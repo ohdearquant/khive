@@ -14,11 +14,17 @@ use khive_storage::types::DeleteMode;
 #[derive(Clone)]
 pub(super) enum Phase {
     ThreadPage(Vec<Uuid>),
+    ThreadRendered(usize),
+    ThreadRetained { stage: &'static str, rows: usize },
+    ThreadOwners(Vec<Uuid>),
     BatchRead(Vec<Uuid>),
     ValidatedWindow(Vec<Uuid>),
     ValidatedAll,
     AtomicCommitted,
 }
+
+#[path = "read_cluster_tests/thread_baseline.rs"]
+mod thread_baseline;
 
 type HookFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type Hook = Arc<dyn Fn(Phase) -> HookFuture + Send + Sync>;
