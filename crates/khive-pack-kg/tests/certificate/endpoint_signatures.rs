@@ -64,12 +64,13 @@ const D3_RATIFIED_COLLISIONS: &[(&str, &str)] = &[("refutes", "supports")];
 /// Signature collisions resolved by a passing Er fixture in the later relation's
 /// certificate (CERTIFIED_RELATIONS in coverage.rs), rather than by system role.
 ///
-/// This list is CLOSED and separate from `D3_RATIFIED_COLLISIONS`.  `located_in` (ADR-196)
-/// and `extends` both carry the single base pair `concept -> concept`; the `located_in`
-/// certificate defeats Er with a fixture in which an organ occupies a space it does not
-/// constitute.  A new collision must not be silenced by appending here without a passing Er
-/// fixture for one of the two relations.
-const CERTIFIED_ER_COLLISIONS: &[(&str, &str)] = &[("extends", "located_in")];
+/// This list is CLOSED and separate from `D3_RATIFIED_COLLISIONS`.  It held
+/// `("extends", "located_in")` while both carried only the base pair `concept -> concept`;
+/// the 2026-10-05 ADR-002 amendment gave `located_in` a second base row (`org -> concept`),
+/// so the signatures differ and the exemption is withdrawn rather than left stale.  The
+/// `located_in` certificate still defeats Er over the shared pair.  A new collision must not
+/// be silenced by appending here without a passing Er fixture for one of the two relations.
+const CERTIFIED_ER_COLLISIONS: &[(&str, &str)] = &[];
 
 /// Endpoint-signature collision tripwire (supplementary Er signal, ADR-076 §D2).
 ///
@@ -148,29 +149,28 @@ fn d3_ratified_collisions_is_exactly_refutes_supports() {
     );
 }
 
-/// Guard: `CERTIFIED_ER_COLLISIONS` is a closed list containing exactly the one certified case.
+/// Guard: `CERTIFIED_ER_COLLISIONS` is a closed list, empty since the 2026-10-05 amendment.
 ///
 /// Appending to it to suppress a new collision must update this equality, which forces
-/// reviewer attention; the entry needs a passing Er fixture in coverage.rs's certificate for
-/// `located_in` (or the relation that replaces it).
+/// reviewer attention; an entry needs a passing Er fixture in coverage.rs's certificate for
+/// one of the two relations.
 #[test]
-fn certified_er_collisions_is_exactly_extends_located_in() {
+fn certified_er_collisions_is_empty() {
     assert_eq!(
         CERTIFIED_ER_COLLISIONS,
-        &[("extends", "located_in")],
-        "CERTIFIED_ER_COLLISIONS must contain exactly the one ADR-196 case \
-         (\"extends\", \"located_in\"); a new collision is resolved by a passing Er fixture \
-         in the relation's certificate, then recorded here deliberately"
+        &[] as &[(&str, &str)],
+        "CERTIFIED_ER_COLLISIONS must be empty; a new collision is resolved by a passing Er \
+         fixture in the relation's certificate, then recorded here deliberately"
     );
 }
 
-/// The `extends`/`located_in` collision is present and resolved by the `located_in` Er fixture.
+/// `located_in` has exactly the two base rows of ADR-196 D1 as amended 2026-10-05, and no
+/// longer shares its signature with `extends`.
 ///
-/// Asserts the collision is real, so a rule change that removes it (or adds a base row for
-/// `located_in` beyond `concept -> concept`) fails here for investigation rather than leaving
-/// a stale exemption behind.
+/// A rule change that adds or drops a `located_in` base row, or that makes the two signatures
+/// equal again, fails here for investigation instead of passing the collision tripwire.
 #[test]
-fn extends_and_located_in_share_the_concept_to_concept_signature_adr196() {
+fn located_in_base_rows_are_concept_and_org_and_differ_from_extends_adr196() {
     let base_triples: Vec<(String, String, String)> = base_entity_endpoint_rules()
         .iter()
         .map(|(src, rel, tgt)| (src.to_string(), rel.as_str().to_string(), tgt.to_string()))
@@ -186,14 +186,18 @@ fn extends_and_located_in_share_the_concept_to_concept_signature_adr196() {
     let located_in = pairs_of("located_in");
     assert_eq!(
         located_in,
-        vec![("concept".to_string(), "concept".to_string())],
-        "located_in's base contract is exactly one row, `concept -> concept` (ADR-196 D1)"
+        vec![
+            ("concept".to_string(), "concept".to_string()),
+            ("org".to_string(), "concept".to_string()),
+        ],
+        "located_in's base contract is exactly `concept -> concept` and `org -> concept` \
+         (ADR-196 D1, amended 2026-10-05)"
     );
-    assert_eq!(
+    assert_ne!(
         pairs_of("extends"),
         located_in,
-        "extends and located_in are expected to share the concept -> concept signature; \
-         if this fails, revisit CERTIFIED_ER_COLLISIONS"
+        "extends and located_in must not share a signature; if they do again, the collision \
+         needs an Er fixture and a CERTIFIED_ER_COLLISIONS entry"
     );
 }
 

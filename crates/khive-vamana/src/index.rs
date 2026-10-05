@@ -23,8 +23,7 @@ use crate::{
     distance::l2_squared,
     error::{Result, VamanaError},
     graph::{
-        greedy_search_inner, greedy_search_inner_sq8, is_tombstoned_bit, robust_prune_inner,
-        sort_dedup_u32, CodesView, VamanaGraph, VisitedSet,
+        is_tombstoned_bit, robust_prune_inner, sort_dedup_u32, CodesView, VamanaGraph, VisitedSet,
     },
 };
 
@@ -243,70 +242,6 @@ impl VamanaIndex {
             gs_codes: CodeStore::Owned(gs_codes),
             last_applied_seq: None,
         })
-    }
-
-    /// Search for `k` nearest neighbors. Errors if dimension mismatch or non-finite query values.
-    ///
-    /// Uses `GsSq8Codec` for acquisition-tier traversal; returned distances are exact f32 L2²
-    /// (ADR-052 §1 two-tier: SQ8 for candidate selection, exact f32 for final results).
-    pub fn search(&self, query: &[f32], k: usize) -> Result<Vec<(u32, f32)>> {
-        if query.len() != self.dimensions {
-            return Err(VamanaError::DimensionMismatch {
-                expected: self.dimensions,
-                actual: query.len(),
-            });
-        }
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        require_finite(query, "search query")?;
-
-        let tombstones = if self.tombstone_count > 0 {
-            Some(self.tombstones.as_slice())
-        } else {
-            None
-        };
-        let mut visited = self.search_visited.checkout(self.num_vectors);
-
-        // OOD fallback (ADR-052 §2): if any query component lies outside the codec's
-        // trained range [min_d, min_d + 255·gs], encoding clamps that dimension and
-        // SQ8 distances cannot correctly order the frontier. Fall back to exact f32
-        // greedy search for this query; in-distribution queries keep the SQ8 path.
-        let result = if self.gs_codec.is_in_distribution(query) {
-            let query_enc = self.gs_codec.encode(query);
-            greedy_search_inner_sq8(
-                self.vectors()?,
-                self.dimensions,
-                self.gs_codes.view(),
-                &self.gs_codec,
-                self.graph.adjacency(),
-                query,
-                &query_enc.codes,
-                self.graph.medoid(),
-                k,
-                self.config.search_list_size,
-                &mut visited,
-                tombstones,
-            )
-        } else {
-            greedy_search_inner(
-                self.vectors()?,
-                self.dimensions,
-                self.graph.adjacency(),
-                query,
-                self.graph.medoid(),
-                k,
-                self.config.search_list_size,
-                &mut visited,
-                tombstones,
-            )
-        };
-
-        let mut output = result.results;
-        output.sort_unstable_by(|(a_id, a_d), (b_id, b_d)| {
-            a_d.total_cmp(b_d).then_with(|| a_id.cmp(b_id))
-        });
-        Ok(output)
     }
 
     /// Encode this index into the ADR-110 portable container.
@@ -3667,6 +3602,11 @@ pub fn read_commit_fingerprint(path: &Path) -> Result<Option<PersistedFingerprin
 pub fn corpus_content_hash(vectors: &[f32]) -> [u8; 32] {
     *blake3::hash(cast_slice(vectors)).as_bytes()
 }
+
+mod search;
+
+#[cfg(test)]
+use crate::graph::{greedy_search_inner, greedy_search_inner_sq8};
 
 #[cfg(all(test, feature = "mmap"))]
 #[path = "checkpoint_allocation_tests.rs"]
