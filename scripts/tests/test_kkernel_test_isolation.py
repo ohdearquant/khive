@@ -17,23 +17,32 @@ TRIGGERS = (
     "execute_atomic_ops_file(", "run_reindex(",
     "run_reindex_without_embeddings(", "run_reindex_offline(",
 )
-MODULES = ("exec.rs", "cli.rs", "code_ingest.rs", "reindex.rs", "pack_introspect.rs",
+MODULES = ("exec.rs", "exec_tests.rs", "cli.rs", "code_ingest.rs", "reindex.rs", "pack_introspect.rs",
            "atomic_apply.rs", "atomic_project_origin_tests.rs")
 
 
-def functions(source):
-    # These modules use one four-space test-module level. Matching the
+def functions(source, indent="    "):
+    # Inline modules use four spaces; extracted test modules use column zero. Matching the
     # closing line at that same level keeps nested blocks and raw fixture JSON.
-    for match in re.finditer(r"(?m)^    (?:async )?fn (\w+)(?:<[^>]*>)?\(", source):
-        end = source.index("\n    }", match.end())
+    for match in re.finditer(r"(?m)^" + re.escape(indent) + r"(?:async )?fn (\w+)(?:<[^>]*>)?\(", source):
+        end = source.index("\n" + indent + "}", match.end())
         start = source.index("{", match.end(), end) + 1
-        before = max(source.rfind("\n    }", 0, match.start()),
-                     source.rfind("\n    //", 0, match.start()))
+        before = max(source.rfind("\n" + indent + "}", 0, match.start()),
+                     source.rfind("\n" + indent + "//", 0, match.start()))
         yield match.group(1), source[before:match.start()], source[start:end]
 
 
+def module_functions(filename):
+    indent = "" if filename == "exec_tests.rs" else "    "
+    return functions((SOURCE / filename).read_text(), indent)
+
+
+def isolation(filename):
+    return ISOLATION.replace("\n    ", "\n") if filename == "exec_tests.rs" else ISOLATION
+
+
 def function(filename, name):
-    return next(body for found, _, body in functions((SOURCE / filename).read_text())
+    return next(body for found, _, body in module_functions(filename)
                 if found == name)
 
 
@@ -47,24 +56,24 @@ class KkernelTestIsolationTests(unittest.TestCase):
     def test_environment_and_fallback_cases_enter_exact_children(self):
         count = 0
         for filename in MODULES:
-            for name, attributes, body in functions((SOURCE / filename).read_text()):
+            for name, attributes, body in module_functions(filename):
                 if "#[test]" not in attributes and "#[tokio::test" not in attributes:
                     continue
                 if not any(trigger in body for trigger in TRIGGERS):
                     continue
                 count += 1
-                self.assertTrue(body.strip().startswith(ISOLATION),
+                self.assertTrue(body.strip().startswith(isolation(filename)),
                                 f"{filename}:{name} must enter exact child before fixture setup")
         self.assertGreaterEqual(count, 89, "fixture census must not become vacuous")
 
     def test_atomic_execution_callers_enter_exact_children(self):
         count = 0
-        for filename in ("exec.rs", "atomic_apply.rs", "atomic_project_origin_tests.rs"):
-            for name, attributes, body in functions((SOURCE / filename).read_text()):
+        for filename in ("exec.rs", "exec_tests.rs", "atomic_apply.rs", "atomic_project_origin_tests.rs"):
+            for name, attributes, body in module_functions(filename):
                 if "#[tokio::test" not in attributes or "execute_atomic_ops_file(" not in body:
                     continue
                 count += 1
-                self.assertTrue(body.strip().startswith(ISOLATION),
+                self.assertTrue(body.strip().startswith(isolation(filename)),
                                 f"{filename}:{name} atomic caller must enter exact child")
         self.assertEqual(count, 22, "all direct atomic execution witnesses must be counted")
 
@@ -75,7 +84,7 @@ class KkernelTestIsolationTests(unittest.TestCase):
             "reindex_fts_fixture_clears_primary_and_additional_models",
         }
         count = 0
-        for name, attributes, body in functions((SOURCE / "reindex.rs").read_text()):
+        for name, attributes, body in module_functions("reindex.rs"):
             if "#[tokio::test" not in attributes:
                 continue
             if not re.search(r"\brun_reindex(?:_without_embeddings|_offline)?\(", body):
