@@ -5,10 +5,8 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry,
-};
-use khive_types::{EdgeEndpointRule, HandlerDef, Pack, PackColumnAddition, PackSchemaPlan};
+use khive_runtime::{KhiveRuntime, KindHook, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_types::{HandlerDef, Pack, PackColumnAddition, PackSchemaPlan};
 
 use crate::{handlers, vocab::SESSION_HANDLERS};
 
@@ -43,13 +41,7 @@ impl Pack for SessionPack {
 struct SessionPackFactory;
 
 impl khive_runtime::PackFactory for SessionPackFactory {
-    fn name(&self) -> &'static str {
-        "session"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(SessionPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(SessionPack::new(runtime))
@@ -60,43 +52,10 @@ inventory::submit! { khive_runtime::PackRegistration(&SessionPackFactory) }
 
 #[async_trait]
 impl PackRuntime for SessionPack {
-    fn name(&self) -> &str {
-        <SessionPack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <SessionPack as Pack>::NOTE_KINDS
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
         (kind == "session").then(|| Arc::new(crate::hook::SessionKindHook) as Arc<dyn KindHook>)
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <SessionPack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <SessionPack as Pack>::HANDLERS
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        &[]
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <SessionPack as Pack>::REQUIRES
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "session",
-            statements: &crate::vocab::SESSION_SCHEMA_PLAN_STMTS,
-        }
-    }
-
-    fn schema_column_additions(&self) -> &'static [PackColumnAddition] {
-        <Self as Pack>::SCHEMA_COLUMN_ADDITIONS
     }
 
     async fn warm(&self) {
