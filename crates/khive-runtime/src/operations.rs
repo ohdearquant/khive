@@ -1197,11 +1197,10 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     // depends_on); the endpoint pair is intentionally narrow (document only,
     // no service/concept targets — see ADR-191 D2/F10).
     ("document", EdgeRelation::LinksTo, "document"),
-    // ADR-002 amendment (ADR-196): location — the source occupies, or is
-    // manifested in, the target without being a constituent of it. The base
-    // contract is one row; packs and Subjects narrow it with typed endpoint
-    // rules for their own subtypes.
+    // ADR-196 location, amended 2026-10-05: the source occupies or is manifested in the target
+    // without being a constituent of it; base rows for concept and org, packs narrow the rest.
     ("concept", EdgeRelation::LocatedIn, "concept"),
+    ("org", EdgeRelation::LocatedIn, "concept"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -1249,6 +1248,7 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("concept", EdgeRelation::CompetesWith, "concept"),
     ("project", EdgeRelation::CompetesWith, "project"),
     ("service", EdgeRelation::CompetesWith, "service"),
+    ("org", EdgeRelation::CompetesWith, "org"),
     ("concept", EdgeRelation::ComposedWith, "concept"),
     ("project", EdgeRelation::ComposedWith, "project"),
     // Versioning (Supersedes — Concept/Document/Artifact/Service/Dataset only)
@@ -21065,8 +21065,8 @@ mod tests {
     }
 
     // ── Location endpoint pair (ADR-196) ─────────────────────────────────────
-    // The base contract is one row, concept->concept; other base kinds are left
-    // to the first pack that emits them.
+    // Base rows are concept->concept and org->concept (amended 2026-10-05); other
+    // base kinds are left to the first pack that emits them.
 
     #[tokio::test]
     async fn link_concept_located_in_concept_allowed_other_base_kinds_rejected() {

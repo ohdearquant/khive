@@ -939,7 +939,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                     part_of: concept->concept, project->project, project->org. \
                     instance_of: *->concept (any source kind), service->project. \
                     links_to: document->document. \
-                    located_in: concept->concept. \
+                    located_in: concept->concept, org->concept. \
                     extends: concept->concept. variant_of: concept->concept, artifact->artifact. \
                     introduced_by: concept->document, concept->person, concept->org, artifact->document, project->document, service->document, document->person, document->org. \
                     derived_from: artifact->dataset, artifact->document, artifact->project, artifact->artifact, document->document. \
@@ -947,7 +947,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                     depends_on: project->project, service->project, service->service, service->artifact, service->dataset, artifact->project, artifact->service, document->document. \
                     enables: concept->concept, service->concept, dataset->concept. \
                     implements: project->concept, service->concept. \
-                    competes_with (symmetric): concept<->concept, project<->project, service<->service. \
+                    competes_with (symmetric): concept<->concept, project<->project, service<->service, org<->org. \
                     composed_with (symmetric): concept<->concept, project<->project. \
                     supersedes: concept->concept, document->document, artifact->artifact, service->service, dataset->dataset, note->note (same-substrate only). \
                     supports / refutes: concept->concept, document->concept, dataset->concept, artifact->concept (evidence -> claim), note->note (same-substrate only). \
