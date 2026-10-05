@@ -74,7 +74,7 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     // `INSERT ... namespace` doesn't silently fail on legacy schemas.
     let rows = match w
         .query_all(SqlStatement {
-            sql: "PRAGMA table_info(gtd_lifecycle_audit)".into(),
+            sql: khive_runtime::sql!("task-lifecycle-audit-table-info").into(),
             params: vec![],
             label: Some("gtd_audit_schema_info".into()),
         })
@@ -93,7 +93,7 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
 
     if !has_namespace {
         if let Err(e) = w
-            .execute_script("ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT".into())
+            .execute_script(khive_runtime::sql!("task-lifecycle-audit-add-namespace").into())
             .await
         {
             tracing::warn!(
@@ -137,10 +137,7 @@ pub async fn write_audit_record_with_status(
 ) -> bool {
     let now = Utc::now().timestamp_micros();
     let stmt = SqlStatement {
-        sql: "INSERT INTO gtd_lifecycle_audit \
-              (note_id, from_state, to_state, note, at, namespace) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-            .into(),
+        sql: khive_runtime::sql!("task-lifecycle-audit-insert").into(),
         params: vec![
             SqlValue::Text(note_id.as_hyphenated().to_string()),
             SqlValue::Text(from.to_string()),
