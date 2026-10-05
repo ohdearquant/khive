@@ -180,6 +180,58 @@ impl PostCommitDegradation {
     }
 }
 
+// One list declares the stages, so the variants, `ALL` and the labels cannot drift apart.
+macro_rules! conditional_insert_stages {
+    ($($stage:ident => $label:literal),+ $(,)?) => {
+        /// The post-commit stages a conditional note insert reports in its committed
+        /// `post_commit_degraded` outcome. The comm ingest decoder accepts a stage only
+        /// when it is the label of a member of [`ConditionalInsertStage::ALL`], and the
+        /// insert can record a stage only through this type, so every label the
+        /// runtime emits is one the decoder accepts.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum ConditionalInsertStage {
+            $($stage,)+
+        }
+
+        impl ConditionalInsertStage {
+            /// Every stage, generated from the same list as the variants.
+            pub const ALL: &'static [Self] = &[$(Self::$stage,)+];
+
+            pub const fn label(self) -> &'static str {
+                match self {
+                    $(Self::$stage => $label,)+
+                }
+            }
+        }
+    };
+}
+
+conditional_insert_stages! {
+    FtsAcquisition => "fts_acquisition",
+    FtsUpsert => "fts_upsert",
+    Embedding => "embedding",
+    VectorAcquisition => "vector_acquisition",
+    VectorInsert => "vector_insert",
+}
+
+impl ConditionalInsertStage {
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|stage| stage.label() == label)
+    }
+}
+
+fn record_conditional_insert_degradation(
+    degradations: &mut Vec<PostCommitDegradation>,
+    id: Uuid,
+    stage: ConditionalInsertStage,
+    error: impl ToString,
+) {
+    record_post_commit_degradation(degradations, "try_create_note", id, stage.label(), error);
+}
+
 fn record_post_commit_degradation(
     degradations: &mut Vec<PostCommitDegradation>,
     operation: &'static str,
@@ -4902,20 +4954,18 @@ impl KhiveRuntime {
         match self.text_for_notes(token) {
             Ok(fts) => {
                 if let Err(error) = fts.upsert_document(note_fts_document(&note)).await {
-                    record_post_commit_degradation(
+                    record_conditional_insert_degradation(
                         &mut degradations,
-                        "try_create_note",
                         note.id,
-                        "fts_upsert",
+                        ConditionalInsertStage::FtsUpsert,
                         error,
                     );
                 }
             }
-            Err(error) => record_post_commit_degradation(
+            Err(error) => record_conditional_insert_degradation(
                 &mut degradations,
-                "try_create_note",
                 note.id,
-                "fts_acquisition",
+                ConditionalInsertStage::FtsAcquisition,
                 error,
             ),
         }
@@ -4952,29 +5002,26 @@ impl KhiveRuntime {
                                 )
                                 .await
                             {
-                                record_post_commit_degradation(
+                                record_conditional_insert_degradation(
                                     &mut degradations,
-                                    "try_create_note",
                                     note.id,
-                                    "vector_insert",
+                                    ConditionalInsertStage::VectorInsert,
                                     format!("model {model_name}: {error}"),
                                 );
                             }
                         }
-                        Err(error) => record_post_commit_degradation(
+                        Err(error) => record_conditional_insert_degradation(
                             &mut degradations,
-                            "try_create_note",
                             note.id,
-                            "vector_acquisition",
+                            ConditionalInsertStage::VectorAcquisition,
                             format!("model {model_name}: {error}"),
                         ),
                     }
                 }
-                Err(error) => record_post_commit_degradation(
+                Err(error) => record_conditional_insert_degradation(
                     &mut degradations,
-                    "try_create_note",
                     note.id,
-                    "embedding",
+                    ConditionalInsertStage::Embedding,
                     format!("model {model_name}: {error}"),
                 ),
             }

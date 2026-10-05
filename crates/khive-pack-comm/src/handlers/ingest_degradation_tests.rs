@@ -425,6 +425,30 @@ fn committed_ingest_decoder_preserves_the_exact_report() {
 }
 
 #[test]
+fn committed_ingest_decoder_accepts_every_stage_the_runtime_can_record() {
+    use khive_runtime::ConditionalInsertStage as Stage;
+    // `Stage::ALL` is generated from the same declaration as the variants, so this loop
+    // reaches every stage the runtime can record.
+    let labels: std::collections::BTreeSet<_> = Stage::ALL.iter().map(|s| s.label()).collect();
+    assert_eq!(
+        labels.len(),
+        Stage::ALL.len(),
+        "stage labels must be distinct"
+    );
+    for &stage in Stage::ALL {
+        assert_eq!(Stage::from_label(stage.label()), Some(stage));
+        let id = Uuid::new_v4();
+        let mut details = error_details(id);
+        details.last_mut().unwrap().1 =
+            json!([{"stage": stage.label(), "error": "stage failure"}]).to_string();
+        assert!(
+            committed_ingest_degradations(&committed_error(details)).is_some(),
+            "the decoder must accept the runtime stage {stage:?}"
+        );
+    }
+}
+
+#[test]
 fn committed_ingest_decoder_rejects_unrelated_and_malformed_errors() {
     let id = Uuid::parse_str("12345678-abcd-4234-8234-123456789abc").unwrap();
     assert!(

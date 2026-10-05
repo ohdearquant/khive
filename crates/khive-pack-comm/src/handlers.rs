@@ -2860,14 +2860,7 @@ fn committed_ingest_degradations(error: &RuntimeError) -> Option<(Uuid, Value)> 
                         .get("stage")
                         .and_then(Value::as_str)
                         .is_some_and(|stage| {
-                            matches!(
-                                stage,
-                                "fts_acquisition"
-                                    | "fts_upsert"
-                                    | "embedding"
-                                    | "vector_acquisition"
-                                    | "vector_insert"
-                            )
+                            khive_runtime::ConditionalInsertStage::from_label(stage).is_some()
                         })
                     && entry
                         .get("error")

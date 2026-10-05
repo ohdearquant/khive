@@ -42,7 +42,7 @@ insertion failures. `operation=try_create_note` identifies all three conditional
 entry points. Healthy models continue, and a duplicate returns `None` without indexing.
 The trusted `comm.ingest` handler preserves its committed acknowledgement and one inbox
 wake while adding `post_commit_degradations`; precommit and unrelated errors still
-propagate. This additive ingest response is specified in the Proposed 2026-10-05
+propagate. This additive ingest response is specified in the 2026-10-05
 amendment to [ADR-056](../../../docs/adr/ADR-056-channel-transport-layer.md).
 
 ### atomic_hard_delete_with_edge_purge
