@@ -15,7 +15,18 @@ const LEGACY_SQL_WRITERS: &[&str] = &[
     "khive-db/sql/031-note-versions.sql",
     "khive-db/sql/notes-ddl.sql",
 ];
-const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[];
+const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
+    (
+        "khive-pack-gtd/sql/task-transition-update.sql",
+        GTD,
+        "gtd_transition_statement",
+    ),
+    (
+        "khive-pack-gtd/sql/task-repair-update.sql",
+        GTD_REPAIR,
+        "checked_update_sql",
+    ),
+];
 
 const DB: &str = "khive-db/src/stores/note.rs";
 const MIGRATIONS: &str = "khive-db/src/migrations.rs";
@@ -1306,4 +1317,31 @@ fn loaded_sql_cannot_hide_version_changes_duplicates_or_shadowing() {
             .len(),
         1
     );
+}
+
+#[test]
+fn application_sql_inventory_rejects_orphans_and_wrong_callers() {
+    let mut assets = StaticSqlSources::new();
+    for asset in LEGACY_SQL_WRITERS
+        .iter()
+        .copied()
+        .chain(APPLICATION_SQL_WRITERS.iter().map(|(asset, _, _)| *asset))
+    {
+        assets.insert(asset.into(), "UPDATE notes SET content='fixture'".into());
+    }
+    let links = APPLICATION_SQL_WRITERS
+        .iter()
+        .map(|(asset, path, owner)| (asset.to_string(), path.to_string(), owner.to_string()))
+        .collect::<BTreeSet<_>>();
+    assert_sql_ownership(&assets, &links);
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &BTreeSet::new())).is_err());
+    let mut wrong = links.clone();
+    let first = wrong.pop_first().unwrap();
+    wrong.insert((first.0, first.1, "unrelated_writer".into()));
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &wrong)).is_err());
+    assets.insert(
+        "sample/sql/unreferenced.sql".into(),
+        "UPDATE notes SET content='rogue'".into(),
+    );
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &links)).is_err());
 }

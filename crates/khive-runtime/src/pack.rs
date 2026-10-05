@@ -9476,6 +9476,7 @@ pub(crate) mod tests {
         const CONVERTED: &[&str] = &[
             "khive-pack-brain",
             "khive-pack-git",
+            "khive-pack-gtd",
             "khive-pack-kg",
             "kkernel",
         ];
