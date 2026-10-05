@@ -289,6 +289,145 @@ creating a reply.
 
 The current behavior may have already delivered or correlated legacy rows. A3 does not rewrite past sends or claims cryptographic provenance. Historical sending domains must be explicitly configured to preserve otherwise valid own-ID claims after a mailbox-domain change. This amendment requires source changes at all three sinks and at the hold/diagnostic path in the same coherent implementation; a one-method runtime guard does not implement the decision.
 
+## Amendment 4 (2026-10-05): refuse boot-known recipient policy violations before message creation
+
+**Status: Proposed.**
+
+### Scope
+
+For `comm.send` and `comm.reply` addressed to `email:<address>`, a recipient
+policy already known by the serving process must decide admission before a
+fresh message is committed. A successful storage receipt must not conceal a
+recipient rejection that the process can already determine.
+
+This amends §1's transport-blind send rule only to permit this local policy
+decision, and §2's asynchronous allowlist failure rule only for fresh
+requests. Admission performs no transport I/O and does not promise delivery.
+Section 2 continues to govern previously queued messages. The outcome
+properties, retry classification, verified Message-ID ownership and
+at-least-once ordering in the existing decision and Amendments 1–3 remain in
+force. No verb, delivery-state value, note kind or storage schema is added.
+
+### One immutable policy for admission and delivery
+
+The host resolves the email recipient policy once during runtime
+construction, before registering the comm runtime or starting delivery. The
+comm runtime and its outbox use that same immutable policy. Requests,
+runtime clones and outbox cycles must not independently reread environment
+configuration. A forwarded request uses the serving process's policy.
+
+Policy resolution preserves the existing recipient selection rules:
+
+1. Split `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` on commas, trim each value,
+   and discard empty values. A nonempty result is the configured recipient
+   set.
+2. Otherwise, use the first configured `KHIVE_EMAIL_MAINTAINER_ADDRESS`
+   address, parsed by the existing maintainer-address rules, as the default
+   recipient. Additional maintainer addresses do not implicitly become
+   allowed outbound recipients.
+3. With neither an explicit recipient set nor a configured default
+   recipient, the policy is **absent**. Unreadable or invalid configured
+   policy is a configuration error; it must not become an unrestricted
+   policy by being treated as absent.
+
+Recipient comparison remains exact and case-sensitive after configuration
+trimming. This amendment adds no domain wildcard or address case folding.
+The policy distinguishes **configured** from **absent**; an absent policy
+is not an assertion that every recipient is deliverable.
+
+The host must resolve these public policy inputs independently of SMTP/IMAP
+credentials and connector startup. A configured policy still applies when
+delivery or polling is disabled, credentials are unavailable, or the outbox
+has not started. Single-backend and routed multi-backend hosts install the
+same policy on the comm runtime and the outbox that serves it. An embedder
+can supply a policy at construction; without one, it uses the absent state.
+Other authorization and read-only restrictions continue to apply.
+
+When policy is absent, send/reply retain the existing ability to queue mail
+without a running delivery component. That wanted backlog has no new age
+cutoff. Starting a later process with configured policy applies that
+process's defensive outbox check to the backlog.
+
+### Fresh refusal and exact keyed replay
+
+Existing request, mailbox, thread and parent-header validation remains in
+force. For a fresh request whose resolved email recipient is excluded by a
+configured policy, send/reply returns the existing typed permission-denied
+form before creating either message copy, claiming an idempotency key,
+writing attachment ownership, publishing message indexes or waking the
+inbox. It creates no failed-delivery note and invents no outbound ID. The
+refusal describes this request's lack of a commit; it does not claim that a
+concurrent request can never commit the same key.
+
+An exact keyed retry of an already committed message is a receipt lookup,
+not fresh delivery admission. Its precedence is:
+
+1. Look up the live holder of the existing actor/namespace-scoped message
+   key. Validate the exact request, both committed message copies and their
+   attachment identities under the existing replay rules. A mismatch or
+   incomplete pair retains the existing conflict behavior.
+2. A valid holder returns the original receipt even if the current policy
+   would deny a fresh send. This does not create another pair, publish
+   another wake, reset delivery state or request retransmission. A key
+   never bypasses caller authorization or the existing replay checks.
+3. If no holder exists, apply the current policy before creation. An
+   allowed creator retains the atomic unique-key claim and reconciles a
+   competing holder through the same exact replay validation.
+4. A denied creator's refusal linearizes at its **final no-holder
+   observation**. A holder observed before that observation must be
+   validated and reconciled instead of being described as uncommitted. A
+   competing holder committed afterward does not retroactively turn the
+   denied request into a writer; a later retry can retrieve that receipt.
+   The denied request itself never claims the key.
+
+### Defensive delivery checks and observable outcomes
+
+The outbox retains its recipient check for historic queued rows and rows
+created through other authorized writers. With configured policy, a denied
+queued recipient still receives §2's permanent `delivery="failed"` outcome
+and an explanatory `last_error`, without SMTP.
+
+Amendment 3's stored Message-ID verification precedes this defensive
+allowlist classification. An unverifiable nonempty `external_id` remains a
+visible `external_id_unverifiable` hold; recipient rejection must not replace
+that hold with a terminal failure that conceals the unresolved identity.
+Verified IDs retain claim-before-send and send-before-delivery-stamp timing.
+Transient failures retain backoff and are not promoted to terminal failure
+by attempt count. Cancellation and credential-based AUTH classification are
+unchanged.
+
+Email delivery state belongs to the outbound message note's properties.
+The sender can inspect that note through its caller-authored
+`comm.inbox(box="sent")` view, including the `properties` field. A successful
+SMTP handoff is represented by `delivery="delivered"`; permanent failures,
+transient retry metadata and identity holds remain distinguishable through
+their existing properties. This does not attest that the remote recipient
+stored or read the message.
+
+[`comm.transport_status` under ADR-105](ADR-105-cross-node-comm-transport.md)
+reports sender transport records and verified cross-node receipts. It is
+not an alias for these email note properties. Absence of such a record
+remains `unknown`; this amendment neither synthesizes a sender transport
+record for email nor maps SMTP acceptance to `recipient_stored`.
+
+### Acceptance
+
+The following cases use the real request and outbox paths with a mock
+transport; no real email is required.
+
+| Case                            | Required behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| E1 — fresh refusal              | Both send and reply to a configured denied recipient refuse synchronously. Neither message copy, key claim, attachment owner, message index publication nor inbox wake is produced; the transport is untouched. The same request to an allowed recipient retains the original pair receipt and one wake.                                                                                                                                                               |
+| E2 — shared policy              | Single-backend, routed multi-backend and forwarded requests use the serving comm runtime's policy. Disabled polling, unavailable credentials and an unstarted outbox do not remove a configured refusal. Changing environment values after construction cannot change admission and delivery independently.                                                                                                                                                            |
+| E3 — configured versus absent   | Explicit recipients take precedence over the primary-maintainer fallback; trimming, exact case-sensitive matching and first-maintainer selection remain stable. Absent policy preserves the wanted backlog. Invalid configured policy causes a configuration error rather than unrestricted admission. Refusal output exposes neither credentials nor the complete recipient set.                                                                                      |
+| E4 — replay and races           | An exact committed keyed replay after policy revocation returns the original receipt without writes, wake or retransmission. Altered payload, broken pair and attachment mismatch retain conflicts. A competing holder committed immediately before the final no-holder observation is reconciled; one committed immediately afterward leaves the denied request uncommitted and is available to a later retry. Allowed competing creators still commit only one pair. |
+| D1 — sender-visible state       | Read the original outbound ID through the sender's sent view after successful delivery, historic-row policy failure, transient failure and an unverifiable-ID hold. Verify the corresponding existing properties and mailbox visibility. Separately exercise ADR-105 `pending`, `recipient_stored`, `recipient_quarantined`, `failed` and `unknown` results; SMTP success must not be reported as verified recipient storage.                                          |
+| D2 — retained delivery behavior | Preserve single send across two ordinary poll cycles; a failure after SMTP acceptance but before the stamp may redeliver with the same verified claimed Message-ID. Post-auth permanent rejection fails only its message, retryable AUTH failures retain their restart behavior, cancellation retains in-flight settlement, and the configured comm backend receives the delivery updates.                                                                             |
+
+This amendment addresses the email-admission portion of #1760. It does not
+change thread retrieval, queue-page selection or the semantics of other
+channel prefixes.
+
 ## Consequences
 
 - Operator-configured-recipient email delivery works, including the backlog written
