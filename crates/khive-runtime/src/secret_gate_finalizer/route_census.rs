@@ -2330,26 +2330,9 @@ fn live_workspace_sources() -> Vec<(String, String)> {
     sources
 }
 
-fn live_migration_sources() -> Vec<(String, String)> {
-    let sql_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates directory")
-        .join("khive-db/sql");
-    let mut sources = Vec::new();
-    for entry in
-        std::fs::read_dir(&sql_dir).unwrap_or_else(|error| panic!("{}: {error}", sql_dir.display()))
-    {
-        let path = entry.expect("SQL source entry").path();
-        if path.extension().is_some_and(|extension| extension == "sql") {
-            let name = path.file_name().expect("SQL source name").to_string_lossy();
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            sources.push((format!("khive-db/sql/{name}"), source));
-        }
-    }
-    sources.sort_by(|a, b| a.0.cmp(&b.0));
-    sources
-}
+#[path = "route_census_migrations.rs"]
+mod migrations;
+use migrations::live_migration_sources;
 
 #[cfg(test)]
 #[path = "route_census_occurrence_tests.rs"]
