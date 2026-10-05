@@ -287,3 +287,164 @@ async fn retired_section_rows_are_read_marked_and_never_served() {
 
     assert_eq!(f.stored_retired_rows().await, 2, "retired rows are kept");
 }
+
+#[tokio::test]
+async fn retired_type_alias_spellings_are_read_marked_and_never_served() {
+    // Stores written before the retirement also hold the spellings the earlier alias
+    // table resolved to a retired type; they are recognised after normalization, not by
+    // exact string. A non-canonical spelling of a current type still reads and serves.
+    const ALIAS_MARKER: &str = "zzaliasretiredmarker";
+    const RETIRED_SPELLINGS: [&str; 4] = ["reference", "See-Also", " Notes ", "misc"];
+    let f = Fixture::new();
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({"atoms": [{"slug": SLUG, "name": NAME, "content": ATOM}]}),
+    )
+    .await
+    .expect("upsert atom");
+    f.dispatch(
+        "knowledge.edit",
+        json!({"id": SLUG, "sections": [{"section_type": "overview", "content": CURRENT}]}),
+    )
+    .await
+    .expect("current section");
+    let atom = f
+        .dispatch("knowledge.get", json!({"id": SLUG}))
+        .await
+        .expect("get atom");
+    let atom_id = atom["id"].as_str().expect("atom id").to_owned();
+    for (i, spelling) in RETIRED_SPELLINGS.iter().enumerate() {
+        f.insert_section(
+            &format!("22730000-0000-4000-8000-00000000001{i}"),
+            &atom_id,
+            spelling,
+            &format!("{ALIAS_MARKER} {spelling}\nsecond line"),
+        )
+        .await;
+    }
+    f.insert_section(
+        "22730000-0000-4000-8000-000000000020",
+        &atom_id,
+        "example",
+        "A worked example stored under a non-canonical spelling of a current type.",
+    )
+    .await;
+
+    let got = f
+        .dispatch(
+            "knowledge.get",
+            json!({"id": SLUG, "include_sections": true}),
+        )
+        .await
+        .expect("a retired alias spelling does not fail the whole read");
+    let sections = got["sections"].as_array().expect("sections array");
+    assert_eq!(sections.len(), 6, "{got}");
+    for spelling in RETIRED_SPELLINGS {
+        let row = sections
+            .iter()
+            .find(|s| s["section_type"] == spelling)
+            .unwrap_or_else(|| panic!("no row stored as {spelling:?} in {got}"));
+        assert_eq!(row["retired"], true, "{spelling:?}: {got}");
+    }
+    let example = sections
+        .iter()
+        .find(|s| s["section_type"] == "examples")
+        .unwrap_or_else(|| panic!("the example row reads as examples: {got}"));
+    assert!(example.get("retired").is_none(), "{got}");
+
+    let composed = f
+        .dispatch(
+            "knowledge.compose",
+            json!({"atom_ids": [SLUG], "query": QUERY, "explain": true, "blend_kg": false}),
+        )
+        .await
+        .expect("compose");
+    let mut served: Vec<&str> = composed["data"]["sections"]
+        .as_array()
+        .expect("sections are reported when explain is set")
+        .iter()
+        .filter_map(|s| s["section_type"].as_str())
+        .collect();
+    served.sort_unstable();
+    assert_eq!(served, vec!["example", "overview"], "{composed}");
+    assert!(!composed.to_string().contains(ALIAS_MARKER), "{composed}");
+
+    // One line each for the overview and the example; the four retired rows would add
+    // eight more.
+    let searched = f
+        .dispatch(
+            "knowledge.search",
+            json!({"query": QUERY, "rerank": false, "include_drafts": true}),
+        )
+        .await
+        .expect("search");
+    let hit = searched["results"]
+        .as_array()
+        .expect("results")
+        .iter()
+        .find(|r| r["name"] == NAME)
+        .unwrap_or_else(|| panic!("atom not found by search: {searched}"));
+    assert_eq!(hit["body_lines"], 2, "{searched}");
+    assert!(!searched.to_string().contains(ALIAS_MARKER), "{searched}");
+
+    let suggested = f
+        .dispatch("knowledge.suggest", json!({"query": QUERY}))
+        .await
+        .expect("suggest");
+    assert!(!suggested.to_string().contains(ALIAS_MARKER), "{suggested}");
+}
+
+#[tokio::test]
+async fn legacy_spellings_of_current_types_read_as_those_types() {
+    // Bulk-imported stores hold `pitfall`, `definition` and `comparison`, which no
+    // table resolved before; a single such row used to fail the whole atom read.
+    const LEGACY: [(&str, &str); 3] = [
+        ("pitfall", "failure_modes"),
+        ("definition", "core_model"),
+        ("comparison", "expert_lens"),
+    ];
+    let f = Fixture::new();
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({"atoms": [{"slug": SLUG, "name": NAME, "content": ATOM}]}),
+    )
+    .await
+    .expect("upsert atom");
+    f.dispatch(
+        "knowledge.edit",
+        json!({"id": SLUG, "sections": [{"section_type": "overview", "content": CURRENT}]}),
+    )
+    .await
+    .expect("current section");
+    let atom = f
+        .dispatch("knowledge.get", json!({"id": SLUG}))
+        .await
+        .expect("get atom");
+    let atom_id = atom["id"].as_str().expect("atom id").to_owned();
+    for (i, (stored, _)) in LEGACY.iter().enumerate() {
+        f.insert_section(
+            &format!("22730000-0000-4000-8000-00000000003{i}"),
+            &atom_id,
+            stored,
+            &format!("A section stored under the legacy spelling {stored}."),
+        )
+        .await;
+    }
+
+    let got = f
+        .dispatch(
+            "knowledge.get",
+            json!({"id": SLUG, "include_sections": true}),
+        )
+        .await
+        .expect("a legacy spelling does not fail the whole read");
+    let sections = got["sections"].as_array().expect("sections array");
+    assert_eq!(sections.len(), 4, "{got}");
+    for (stored, reads_as) in LEGACY {
+        let row = sections
+            .iter()
+            .find(|s| s["section_type"] == reads_as)
+            .unwrap_or_else(|| panic!("the {stored:?} row reads as {reads_as}: {got}"));
+        assert!(row.get("retired").is_none(), "{stored:?}: {got}");
+    }
+}

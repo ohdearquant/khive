@@ -46,7 +46,8 @@ assert_eq!(SectionType::ALL.len(), 8);
 `SectionType` is a closed 8-value taxonomy (`Overview`, `CoreModel`,
 `BoundaryConditions`, `Formalism`, `OperationalGuidance`, `Examples`, `FailureModes`,
 `ExpertLens`) used to weight knowledge-atom sections during composition. The names
-`references` and `other` were retired: `SectionType::RETIRED_NAMES` lists them, and a persisted
+`references` and `other` were retired: `SectionType::RETIRED_NAMES` lists them,
+`SectionType::RETIRED_SPELLINGS` lists every stored spelling that names them, and a persisted
 posterior map that still carries them loads with those entries dropped. `SectionPosteriorState::weights` samples via Thompson sampling while
 `exploration_epoch > 0` (early life, more exploration) and falls back to
 `derive_deterministic_weights` (posterior means) once the epoch is exhausted, so
