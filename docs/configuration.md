@@ -13,6 +13,10 @@ multi-backend deployment model specifically, see
 ties those two together and covers the parts operators hit first: discovery
 order and the `--db` interaction.
 
+For named credential references and the receipt-key custody seam, see
+[Credential custody](credentials.md). These tables validate at startup; receipt
+issuance and web credential binding are staged separately.
+
 ---
 
 ## Config file discovery order
