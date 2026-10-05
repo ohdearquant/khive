@@ -5,6 +5,8 @@
 - Depends on: [ADR-056](ADR-056-channel-transport-layer.md) (channel transport
   abstraction), [ADR-057](ADR-057-comm-actor-addressed-delivery.md) (actor-addressed
   dual-write), [ADR-017](ADR-017-pack-standard.md) (pack vocabulary additivity)
+- 2026-10-05: the node client crate now lives with the hosted service, and later versions of the
+  node protocol are specified there. Version 1 (Appendix A and the amendments below) stays as written.
 
 ## Context
 
