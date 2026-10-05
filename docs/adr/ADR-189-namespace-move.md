@@ -570,12 +570,11 @@ branches. Adding kind routes does not add compound SELECT terms; SQLite's bind
 variable limits still apply. This is no promise of unlimited routes or constant
 work as a route map grows.
 
-Collision enumeration remains per reachable constraint and distinct target over
-source rows, with one exception: the graph-edge triple constraint follows the
-resolved relation route described in Amendment 4's #4121 proposal. Other
-constraints are not filtered by route class. In particular, a domain mirror slug
-collision can refuse even when there is no Atom route. Constraints not enumerated
-still refuse through plain failing statements and caller rollback. This amendment adds no conflict winner,
+The existing conservative collision enumeration remains per reachable constraint
+and distinct target over source rows, rather than filtering each query to one
+route class. In particular, a domain mirror slug collision can refuse even when
+there is no Atom route. Constraints not enumerated still refuse through plain
+failing statements and caller rollback. This amendment adds no conflict winner,
 replacement policy or cross-backend atomicity.
 
 ### Acceptance
