@@ -52,6 +52,7 @@ phase_lint() {
 
     echo "=== CI Workflow Contract Tests ==="
     python3 "$SCRIPT_DIR/tests/test_ci_workflows.py"
+    python3 "$SCRIPT_DIR/tests/test_ci_infra_retry.py"
 
     echo "=== CI Empty-HOME Sentinel Tests ==="
     python3 "$SCRIPT_DIR/tests/test_ci_home_sentinel.py"

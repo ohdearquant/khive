@@ -5,6 +5,12 @@ name: CI infra retry
 # failures are deliberately excluded: a green retry must not hide a flake.
 # If matrix fail-fast cancelled a sibling, rerun the whole workflow so that
 # cancellation cannot leave main red after the failed job recovers.
+# A job cancelled before any runner picked it up (no steps, no runner) is the
+# same setup-only case: it never ran repository code. When no leaf job failed
+# and every cancelled job, CI gate included, has that shape, the run is retried
+# once too. A job cancelled after a runner was assigned is never treated this
+# way, and a job that timed out or ended in any state other than success,
+# skipped, failure or cancelled rules out a retry of any kind.
 # A declined retry fails this job. This workflow only runs after a failed CI
 # attempt, so a green check here would sit beside a red CI on the same commit
 # and read as a pass to anyone scanning the check list; a red one names the
@@ -97,6 +103,43 @@ jobs:
             .jobs[]
             | select(.conclusion == "cancelled" and .name != "CI gate")
           ] | length' <<<"$jobs_json")"
+          # Cancelled before a runner was assigned: no steps, no runner. Such a
+          # job never ran repository code, whichever job it is.
+          all_cancelled_count="$(jq '[
+            .jobs[]
+            | select(.conclusion == "cancelled")
+          ] | length' <<<"$jobs_json")"
+          setup_cancelled_count="$(jq '[
+            .jobs[]
+            | select(.conclusion == "cancelled")
+            | select(
+                ((.steps // []) | length) == 0
+                and (.runner_id // 0) == 0
+                and (.runner_name // "") == ""
+              )
+          ] | length' <<<"$jobs_json")"
+          setup_cancelled_names="$(jq -r '[
+            .jobs[]
+            | select(.conclusion == "cancelled")
+            | select(
+                ((.steps // []) | length) == 0
+                and (.runner_id // 0) == 0
+                and (.runner_name // "") == ""
+              )
+            | .name
+          ] | join(", ")' <<<"$jobs_json")"
+          # A job that timed out, failed to start for a workflow reason, or
+          # ended in any state other than these four is never an
+          # infrastructure outcome, so it rules out every retry below.
+          unexpected_names="$(jq -r '[
+            .jobs[]
+            | select(
+                (.conclusion // "none")
+                | IN("success", "skipped", "failure", "cancelled")
+                | not
+              )
+            | "\(.name) (\(.conclusion // "none"))"
+          ] | join(", ")' <<<"$jobs_json")"
           failed_names="$(jq -r '[
             .jobs[]
             | select(.conclusion == "failure")
@@ -119,6 +162,9 @@ jobs:
           # A normally failing CI gate only reflects a failed dependency and
           # is ignored. If it is the sole failure and itself dies in setup,
           # however, it is the infrastructure failure that needs recovery.
+          # With no failed leaf job, cancellations alone make the run eligible
+          # only when every cancelled job is setup-only; one cancelled after
+          # it started (a step timeout) keeps the run red.
           eligible=false
           if [ "$failed_count" -gt 0 ] \
             && [ "$failed_count" -eq "$infra_count" ]; then
@@ -127,28 +173,37 @@ jobs:
             && [ "$gate_failed_count" -gt 0 ] \
             && [ "$gate_failed_count" -eq "$gate_infra_count" ]; then
             eligible=true
+          elif [ "$failed_count" -eq 0 ] \
+            && [ "$all_cancelled_count" -gt 0 ] \
+            && [ "$setup_cancelled_count" -eq "$all_cancelled_count" ]; then
+            eligible=true
+          fi
+          if [ -n "$unexpected_names" ]; then
+            eligible=false
           fi
 
           if [ "$eligible" != true ]; then
             {
               echo "### CI infra retry: no automatic retry"
               echo
-              echo "Run ${RUN_ID} had ${failed_count} failed leaf job(s), ${infra_count} setup-only leaf failure(s), ${gate_infra_count}/${gate_failed_count} setup-only CI gate failure(s), and ${cancelled_count} cancelled leaf job(s)."
+              echo "Run ${RUN_ID} had ${failed_count} failed leaf job(s), ${infra_count} setup-only leaf failure(s), ${gate_infra_count}/${gate_failed_count} setup-only CI gate failure(s), ${cancelled_count} cancelled leaf job(s), and ${setup_cancelled_count}/${all_cancelled_count} cancelled job(s) that never got a runner."
               echo "Failed jobs: ${failed_names:-none}."
+              echo "Jobs in another state: ${unexpected_names:-none}."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "No automatic retry: ${failed_count} failed leaf job(s), ${infra_count} setup-only. Failed jobs: ${failed_names:-none}."
+            echo "No automatic retry: ${failed_count} failed leaf job(s), ${infra_count} setup-only; ${setup_cancelled_count}/${all_cancelled_count} cancelled job(s) never got a runner. Failed jobs: ${failed_names:-none}. Jobs in another state: ${unexpected_names:-none}."
             echo "CI stays red on this commit; this job fails so the check list says so."
             exit 1
           fi
 
-          if [ "$cancelled_count" -eq 0 ]; then
+          if [ "$all_cancelled_count" -eq 0 ]; then
             rerun_endpoint="rerun-failed-jobs"
             rerun_scope="failed jobs"
           else
             # GitHub's failed-jobs endpoint does not include jobs cancelled by
-            # matrix fail-fast. A full rerun restores that lost sibling lane.
+            # matrix fail-fast. A full rerun restores that lost sibling lane,
+            # and a job cancelled before it got a runner, CI gate included.
             rerun_endpoint="rerun"
-            rerun_scope="the full workflow (${cancelled_count} cancelled leaf job(s))"
+            rerun_scope="the full workflow (${all_cancelled_count} cancelled job(s))"
           fi
 
           gh api --method POST \
@@ -157,5 +212,5 @@ jobs:
           {
             echo "### CI infra retry requested"
             echo
-            echo "Re-running ${rerun_scope} for run ${RUN_ID} after setup-only failure(s): ${infra_names}."
+            echo "Re-running ${rerun_scope} for run ${RUN_ID} after setup-only failure(s): ${infra_names:-none}; cancelled before a runner: ${setup_cancelled_names:-none}."
           } >> "$GITHUB_STEP_SUMMARY"
