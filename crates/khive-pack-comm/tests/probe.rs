@@ -1396,7 +1396,7 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     // then insert a pre-existing inbound message the old way -- `notes_seq`
     // does not exist yet at V6, so this note has no sequence row.
     {
-        let backend = khive_db::StorageBackend::sqlite(&path).expect("open v6 backend");
+        let backend = khive_db::StorageBackend::sqlite_for_test(&path).expect("open v6 backend");
         let writer = backend.pool().try_writer().expect("writer");
         let conn = writer.conn();
         conn.execute_batch(
@@ -1540,7 +1540,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
         CREATE INDEX IF NOT EXISTS idx_notes_seq_note_id ON notes_seq(note_id);";
 
     {
-        let backend = khive_db::StorageBackend::sqlite(&path).expect("open backend");
+        let backend = khive_db::StorageBackend::sqlite_for_test(&path).expect("open backend");
         let writer = backend.pool().try_writer().expect("writer");
         let conn = writer.conn();
         conn.execute_batch(

@@ -1,5 +1,83 @@
 use super::query_embedding_models_conn;
 use super::*;
+use super::{
+    apply_schema_plan_for_test as apply_schema_plan,
+    finalize_attachment_cutover_for_test as finalize_attachment_cutover,
+    run_migrations_for_test as run_migrations,
+    stage_attachment_cutover_for_test as stage_attachment_cutover,
+};
+use crate::{ConnectionPool, PoolConfig};
+
+#[test]
+fn service_schema_bootstrap_refusal_precedes_its_tracking_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join("service-bootstrap.db")),
+        write_queue_enabled: Some(false),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    pool.set_test_write_admission(100, |_| Ok(100));
+    let admission = pool.write_admission();
+    let writer = pool.writer_for_admitted_operation().unwrap();
+    let plan = ServiceSchemaPlan {
+        service: "capacity-bootstrap",
+        sqlite: &[],
+        postgres: &[],
+    };
+
+    assert!(!table_exists(writer.conn(), "_schema_versions"));
+    assert!(matches!(
+        apply_schema_plan_with_admission(writer.conn(), &plan, &admission),
+        Err(SqliteError::CapacityFloor { .. })
+    ));
+    assert!(!table_exists(writer.conn(), "_schema_versions"));
+    assert!(writer.conn().is_autocommit());
+}
+
+#[test]
+fn core_bootstrap_refusal_precedes_ledger_and_post_begin_refusal_rolls_back() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut pool = ConnectionPool::new(PoolConfig {
+        path: Some(dir.path().join("core-bootstrap.db")),
+        write_queue_enabled: Some(false),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    pool.set_test_write_admission(100, |_| Ok(100));
+    let admission = pool.write_admission();
+    let mut writer = pool.writer_for_admitted_operation().unwrap();
+    assert!(matches!(
+        run_migrations_with_busy_timeout(writer.conn_mut(), &admission),
+        Err(SqliteError::CapacityFloor { .. })
+    ));
+    assert!(!table_exists(writer.conn(), "_schema_migrations"));
+    assert!(writer.conn().is_autocommit());
+    drop(writer);
+
+    let samples = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&samples);
+    pool.set_test_write_admission(100, move |_| {
+        Ok(if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+            101
+        } else {
+            100
+        })
+    });
+    let admission = pool.write_admission();
+    let mut writer = pool.writer_for_admitted_operation().unwrap();
+    assert!(matches!(
+        run_migrations_with_busy_timeout(writer.conn_mut(), &admission),
+        Err(SqliteError::CapacityFloor { .. })
+    ));
+    assert_eq!(samples.load(Ordering::SeqCst), 2);
+    assert!(table_exists(writer.conn(), "_schema_migrations"));
+    assert_eq!(read_schema_version(writer.conn()).unwrap(), 0);
+    assert!(writer.conn().is_autocommit());
+}
 
 fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")
@@ -260,7 +338,7 @@ fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
         sqlite: MIGRATIONS,
         postgres: &[],
     };
-    let conn = open_memory();
+    let mut conn = open_memory();
     conn.execute_batch(SCHEMA_VERSION_TABLE).unwrap();
     conn.execute_batch(
         "CREATE TRIGGER reject_schema_version
@@ -271,7 +349,7 @@ fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
     )
     .unwrap();
 
-    apply_schema_plan(&conn, &plan).expect_err("ledger failure must abort the migration");
+    apply_schema_plan(&mut conn, &plan).expect_err("ledger failure must abort the migration");
 
     assert!(
         !table_exists(&conn, "migration_effect"),
@@ -335,11 +413,11 @@ fn concurrent_service_schema_opens_apply_a_migration_once() {
         let path = path.clone();
         let start = std::sync::Arc::clone(&start);
         workers.push(std::thread::spawn(move || {
-            let conn = Connection::open(&path).expect("open worker connection");
+            let mut conn = Connection::open(&path).expect("open worker connection");
             conn.busy_timeout(std::time::Duration::from_secs(5))
                 .expect("busy timeout");
             start.wait();
-            apply_schema_plan(&conn, &PLAN).map_err(|error| error.to_string())
+            apply_schema_plan(&mut conn, &PLAN).map_err(|error| error.to_string())
         }));
     }
     start.wait();
@@ -5605,4 +5683,107 @@ fn acknowledgement_journal_partial_one_column_refuses_without_changing_rows() {
 #[test]
 fn acknowledgement_journal_partial_two_columns_refuses_without_changing_rows() {
     assert_acknowledgement_journal_partial_columns_refused(true);
+}
+
+#[test]
+fn both_bootstrap_ledgers_refuse_capacity_and_probe_errors_without_wal_growth() {
+    for probe_error in [false, true] {
+        for service in [true, false] {
+            let fixture = tempfile::tempdir().unwrap();
+            let path = fixture.path().join("bootstrap-probe.db");
+            let mut pool = ConnectionPool::new(PoolConfig {
+                path: Some(path.clone()),
+                write_queue_enabled: Some(false),
+                ..PoolConfig::for_test()
+            })
+            .unwrap();
+            pool.set_test_write_admission(100, move |_| {
+                if probe_error {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected probe refusal",
+                    ))
+                } else {
+                    Ok(100)
+                }
+            });
+            let wal = PathBuf::from(format!("{}-wal", path.display()));
+            let before = std::fs::metadata(&wal).ok().map(|metadata| metadata.len());
+            let admission = pool.write_admission();
+            let mut writer = pool.writer_for_admitted_operation().unwrap();
+            let result = if service {
+                apply_schema_plan_with_admission(
+                    writer.conn(),
+                    &ServiceSchemaPlan {
+                        service: "probe-refusal",
+                        sqlite: &[],
+                        postgres: &[],
+                    },
+                    &admission,
+                )
+            } else {
+                run_migrations_with_busy_timeout(writer.conn_mut(), &admission).map(|_| ())
+            };
+            if probe_error {
+                assert!(matches!(
+                    result,
+                    Err(SqliteError::CapacityUnavailable {
+                        phase: khive_storage::CapacityUnavailablePhase::Probe,
+                        ..
+                    })
+                ));
+            } else {
+                assert!(matches!(result, Err(SqliteError::CapacityFloor { .. })));
+            }
+            assert!(!table_exists(writer.conn(), "_schema_versions"));
+            assert!(!table_exists(writer.conn(), "_schema_migrations"));
+            assert!(writer.conn().is_autocommit());
+            assert_eq!(
+                std::fs::metadata(&wal).ok().map(|metadata| metadata.len()),
+                before
+            );
+        }
+    }
+}
+
+#[test]
+fn service_bootstrap_and_migration_have_separate_admission_samples() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    static STEPS: &[Migration] = &[Migration {
+        id: "capacity_probe",
+        up_sql: "SELECT 1;",
+        down_sql: None,
+        is_already_applied: None,
+    }];
+    let fixture = tempfile::tempdir().unwrap();
+    let mut pool = ConnectionPool::new(PoolConfig {
+        path: Some(fixture.path().join("bootstrap-above.db")),
+        write_queue_enabled: Some(false),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    let samples = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&samples);
+    pool.set_test_write_admission(100, move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        Ok(101)
+    });
+    let admission = pool.write_admission();
+    let writer = pool.writer_for_admitted_operation().unwrap();
+    apply_schema_plan_with_admission(
+        writer.conn(),
+        &ServiceSchemaPlan {
+            service: "above-reserve",
+            sqlite: STEPS,
+            postgres: &[],
+        },
+        &admission,
+    )
+    .unwrap();
+    assert_eq!(samples.load(Ordering::SeqCst), 2);
+    assert!(table_exists(writer.conn(), "_schema_versions"));
+    assert!(writer.conn().is_autocommit());
 }

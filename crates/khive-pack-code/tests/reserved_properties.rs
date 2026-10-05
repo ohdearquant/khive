@@ -31,11 +31,13 @@ fn run_with_private_home_in_child() -> bool {
     let physical_temp = std::env::temp_dir()
         .canonicalize()
         .expect("physical temporary directory");
-    let home = tempfile::tempdir_in(physical_temp).expect("private child HOME");
+    let home = tempfile::tempdir_in(&physical_temp).expect("private child HOME");
+    let locks = tempfile::tempdir_in(&physical_temp).expect("private child lock directory");
     let output = Command::new(std::env::current_exe().expect("integration test executable"))
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
         .env(CHILD_TEST, name)
         .env("HOME", home.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", locks.path())
         .env("KHIVE_DB", "")
         .output()
         .expect("spawn isolated reservation test");

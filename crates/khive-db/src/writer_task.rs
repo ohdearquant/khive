@@ -209,6 +209,9 @@ pub struct WriteRequest<R: Send + 'static> {
     op: WriteOp<R>,
     reply: oneshot::Sender<Result<R, StorageError>>,
     top_level: bool,
+    /// Only the typed checkpoint entry point may bypass disk admission.
+    checkpoint_bypass: bool,
+    vacuum_copy_headroom: bool,
     telemetry: WriteTelemetry,
 }
 
@@ -289,6 +292,10 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
     /// [`Self::execute_and_reply_top_level`] (no transaction wrap) instead
     /// of [`Self::execute_and_reply`] (wrapped in `BEGIN IMMEDIATE`).
     fn is_top_level(&self) -> bool;
+
+    fn is_checkpoint_bypass(&self) -> bool;
+
+    fn needs_vacuum_headroom(&self) -> bool;
 
     /// Time from the caller constructing this request (before bounded-channel
     /// admission) until the writer task dequeued it.
@@ -595,6 +602,14 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
         self.top_level
     }
 
+    fn is_checkpoint_bypass(&self) -> bool {
+        self.checkpoint_bypass
+    }
+
+    fn needs_vacuum_headroom(&self) -> bool {
+        self.vacuum_copy_headroom
+    }
+
     fn queue_wait(&self) -> Duration {
         self.telemetry.queue_wait()
     }
@@ -682,7 +697,7 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        self.enqueue_inner(op, false).await
+        self.enqueue_inner(op, false, false, false).await
     }
 
     /// Shared enqueue path for both transaction-wrapped ([`Self::enqueue`])
@@ -692,6 +707,8 @@ impl WriterTaskHandle {
         &self,
         op: F,
         top_level: bool,
+        checkpoint_bypass: bool,
+        vacuum_copy_headroom: bool,
     ) -> Result<oneshot::Receiver<Result<R, StorageError>>, StorageError>
     where
         R: Send + 'static,
@@ -708,6 +725,8 @@ impl WriterTaskHandle {
             op: Box::new(op),
             reply: reply_tx,
             top_level,
+            checkpoint_bypass,
+            vacuum_copy_headroom,
             telemetry,
         };
 
@@ -808,7 +827,7 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let reply_rx = self.enqueue_inner(op, true).await?;
+        let reply_rx = self.enqueue_inner(op, true, false, false).await?;
         reply_rx
             .await
             .map_err(|_| writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown))?
@@ -823,16 +842,52 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        let reply_rx =
-            match tokio::time::timeout(self.enqueue_timeout, self.enqueue_inner(op, true)).await {
-                Ok(Ok(reply_rx)) => reply_rx,
-                Ok(Err(e)) => return Err(e),
-                Err(_elapsed) => {
-                    let timeout_ms = self.enqueue_timeout.as_millis() as u64;
-                    crate::timeout_sink::emit_queue_saturation(&self.db, timeout_ms);
-                    return Err(StorageError::WriteQueueFull { timeout_ms });
-                }
-            };
+        self.send_top_level_bounded_inner(op, false, false).await
+    }
+
+    /// Checkpoint-only top-level dispatch. It remains serialized by the
+    /// writer task but never waits for the capacity lease or floor probe.
+    pub(crate) async fn send_checkpoint_bounded<R, F>(&self, op: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        self.send_top_level_bounded_inner(op, true, false).await
+    }
+
+    /// Typed VACUUM dispatch with a copy-sized metadata estimate at dequeue.
+    pub(crate) async fn send_vacuum_bounded<R, F>(&self, op: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        self.send_top_level_bounded_inner(op, false, true).await
+    }
+
+    async fn send_top_level_bounded_inner<R, F>(
+        &self,
+        op: F,
+        checkpoint_bypass: bool,
+        vacuum_copy_headroom: bool,
+    ) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        let reply_rx = match tokio::time::timeout(
+            self.enqueue_timeout,
+            self.enqueue_inner(op, true, checkpoint_bypass, vacuum_copy_headroom),
+        )
+        .await
+        {
+            Ok(Ok(reply_rx)) => reply_rx,
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                let timeout_ms = self.enqueue_timeout.as_millis() as u64;
+                crate::timeout_sink::emit_queue_saturation(&self.db, timeout_ms);
+                return Err(StorageError::WriteQueueFull { timeout_ms });
+            }
+        };
 
         reply_rx
             .await
@@ -869,6 +924,11 @@ impl WriterTaskHandle {
 /// runs until every handle clone is dropped and the channel closes; a request
 /// panic, failed rollback, or poisoned connection puts it into the permanent
 /// terminal state documented below.
+///
+/// # Aborts
+/// Retiring an unsettled writer aborts if cleanup cannot restore autocommit and
+/// owned SQLite close also fails, after reporting path, volume, and errors to
+/// stderr and tracing. This also applies if its blocking owner unwinds.
 ///
 /// `capacity` bounds the channel (`PoolConfig::write_queue_capacity` /
 /// `KHIVE_WRITE_QUEUE_CAPACITY`, ADR-067 recommends 256).
@@ -1024,6 +1084,56 @@ fn begin_immediate_with_retry(
 /// supervisor or connection restart; later sends observe the closed channel.
 /// See
 /// `crates/khive-db/docs/api/writer-task.md` for the full failure matrix.
+struct BlockingWriterConnection {
+    conn: Option<Connection>,
+    admission: Arc<crate::pool::WriteAdmission>,
+    volume_lease: Option<crate::disk_guard::VolumeLease>,
+}
+
+impl BlockingWriterConnection {
+    fn new(conn: Connection, admission: Arc<crate::pool::WriteAdmission>) -> Self {
+        Self {
+            conn: Some(conn),
+            admission,
+            volume_lease: None,
+        }
+    }
+
+    fn finish(
+        mut self,
+        state: Option<WriterTaskRequestState>,
+    ) -> (Option<Connection>, Option<WriterTaskRequestState>) {
+        if state.is_some() {
+            self.retire();
+            (None, state)
+        } else {
+            (self.conn.take(), None)
+        }
+    }
+
+    fn retire(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.admission.close_retired_connection(conn);
+        }
+    }
+}
+
+impl Drop for BlockingWriterConnection {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+impl std::ops::Deref for BlockingWriterConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn
+            .as_ref()
+            .expect("blocking writer owns its connection until settlement")
+    }
+}
+
 async fn run_writer_task(
     mut conn: Connection,
     mut rx: mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>,
@@ -1043,6 +1153,7 @@ async fn run_writer_task(
         let blocking_admission = Arc::clone(&write_admission);
         let blocking_db = db.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            let mut conn = BlockingWriterConnection::new(conn, Arc::clone(&blocking_admission));
             let acquisition_counters = blocking_counters;
             // A top-level request deliberately skips BEGIN, so it would
             // silently join any transaction leaked by an earlier request.
@@ -1055,18 +1166,44 @@ async fn run_writer_task(
                 );
                 let request_state = WriterTaskRequestState::NotStarted;
                 request.reply_error(writer_task_terminated(request_state));
-                return (conn, Some(request_state));
+                return conn.finish(Some(request_state));
             }
 
-            if let Err(error) = blocking_admission.check() {
-                request.reply_error(error.into_storage_error(
-                    khive_storage::StorageCapability::Sql,
-                    "writer_task_admission",
-                ));
-                return (conn, None);
-            }
+            // The lease precedes SQLite writer acquisition and remains held
+            // until the request has committed, rolled back, or returned to
+            // autocommit. Checkpoint requests deliberately skip both steps.
+            conn.volume_lease = if request.is_checkpoint_bypass() {
+                None
+            } else {
+                match blocking_admission.acquire() {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        request.reply_error(error.into_storage_error(
+                            khive_storage::StorageCapability::Sql,
+                            "writer_task_admission",
+                        ));
+                        return conn.finish(None);
+                    }
+                }
+            };
 
             let terminal_state = if request.is_top_level() {
+                if !request.is_checkpoint_bypass() {
+                    let admission = if request.needs_vacuum_headroom() {
+                        blocking_admission
+                            .vacuum_headroom()
+                            .and_then(|headroom| blocking_admission.check_with_headroom(headroom))
+                    } else {
+                        blocking_admission.check()
+                    };
+                    if let Err(error) = admission {
+                        request.reply_error(error.into_storage_error(
+                            khive_storage::StorageCapability::Sql,
+                            "writer_task_admission",
+                        ));
+                        return conn.finish(None);
+                    }
+                }
                 // ADR-067 Component A:
                 // no BEGIN IMMEDIATE for this request — some statements
                 // (e.g. VACUUM) are rejected by SQLite inside any open
@@ -1092,6 +1229,31 @@ async fn run_writer_task(
                     );
                 match begin_outcome {
                     Ok(()) => {
+                        if let Err(error) = blocking_admission.check() {
+                            let request_state =
+                                match rollback_after_failure(&conn, "capacity admission") {
+                                    RollbackDisposition::RolledBack => None,
+                                    RollbackDisposition::SideEffectsUnknown => {
+                                        Some(WriterTaskRequestState::SideEffectsUnknown)
+                                    }
+                                };
+                            drop(tx_span);
+                            let error = if let Some(state) = request_state {
+                                writer_task_terminated(state)
+                            } else {
+                                error.into_storage_error(
+                                    khive_storage::StorageCapability::Sql,
+                                    "writer_task_admission",
+                                )
+                            };
+                            sealed::Sealed::reply_error_after_begin(
+                                request,
+                                error,
+                                queue_wait,
+                                transaction_acquire,
+                            );
+                            return conn.finish(request_state);
+                        }
                         acquisition_counters.record_writer_task_acquisition();
                         sealed::Sealed::execute_and_reply_reporting_terminal(
                             request,
@@ -1139,12 +1301,12 @@ async fn run_writer_task(
                     }
                 }
             };
-            (conn, terminal_state)
+            conn.finish(terminal_state)
         })
         .await;
 
         match outcome {
-            Ok((returned_conn, None)) => conn = returned_conn,
+            Ok((Some(returned_conn), None)) => conn = returned_conn,
             Ok((_returned_conn, Some(request_state))) => {
                 acquisition_counters.record_writer_task_request_failure();
                 if request_state == WriterTaskRequestState::SideEffectsUnknown {
@@ -1162,6 +1324,7 @@ async fn run_writer_task(
                 close_and_fail_queued_requests(&mut rx).await;
                 return;
             }
+            Ok((None, None)) => unreachable!("a reusable writer returns its connection"),
             Err(join_err) => {
                 acquisition_counters.record_writer_task_request_failure();
                 tracing::error!(
@@ -1416,16 +1579,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_begin_reply_lifecycle.db");
         let cfg = PoolConfig {
-            path: Some(path),
+            path: Some(path.clone()),
             busy_timeout: Duration::from_millis(150),
             ..PoolConfig::for_test()
         };
         let pool = ConnectionPool::new(cfg).unwrap();
         let view = database_tx_view(&pool);
         let handle = spawn(&pool, 8).expect("writer task spawn");
-        let lock_holder = pool.try_writer().expect("pool writer");
+        // An independent SQLite writer does not hold khive's cooperative
+        // volume lease, so this reaches the intended BEGIN-busy branch.
+        let lock_holder = rusqlite::Connection::open(&path).expect("external writer");
         lock_holder
-            .conn()
             .execute_batch("BEGIN IMMEDIATE")
             .expect("hold database write lock");
         let op_ran = Arc::new(AtomicBool::new(false));
@@ -1450,7 +1614,6 @@ mod tests {
             .expect("release parked reply sender");
         wait_for_writer_span_to_close(&view).await;
         lock_holder
-            .conn()
             .execute_batch("ROLLBACK")
             .expect("release database write lock");
 
@@ -1477,11 +1640,10 @@ mod tests {
     #[tokio::test]
     #[serial(tx_registry)]
     async fn begin_immediate_failure_replies_error_without_running_op() {
-        // Real lock contention, not a simulation: hold the database-level
-        // write lock from the pool's own writer connection (the unmigrated
-        // path this fix is guarding against) so the writer task's dedicated
-        // connection genuinely fails `BEGIN IMMEDIATE` with `SQLITE_BUSY`
-        // after a short `busy_timeout`.
+        // Real lock contention, not a simulation: an independent SQLite
+        // connection holds the database write lock without taking khive's
+        // cooperative volume lease. The writer task therefore reaches its
+        // dedicated connection's `BEGIN IMMEDIATE` and receives SQLITE_BUSY.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_begin_failure.db");
         let cfg = PoolConfig {
@@ -1500,8 +1662,8 @@ mod tests {
 
         let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
 
-        let lock_holder = pool.try_writer().unwrap();
-        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        let lock_holder = rusqlite::Connection::open(&path).unwrap();
+        lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
         let op_ran = Arc::new(AtomicBool::new(false));
         let op_ran_clone = Arc::clone(&op_ran);
@@ -1532,7 +1694,7 @@ mod tests {
 
         // Release the contended lock, then verify no row landed from the
         // failed request.
-        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+        lock_holder.execute_batch("ROLLBACK").unwrap();
         drop(lock_holder);
 
         handle
@@ -1575,7 +1737,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_begin_transient_contention.db");
         let pool = ConnectionPool::new(PoolConfig {
-            path: Some(path),
+            path: Some(path.clone()),
             busy_timeout: Duration::from_millis(500),
             ..PoolConfig::for_test()
         })
@@ -1588,8 +1750,11 @@ mod tests {
                 .unwrap();
         }
         let handle = spawn(&pool, 8).expect("writer task spawn");
-        let lock_holder = pool.try_writer().unwrap();
-        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+        // A second khive writer would contend on the cooperative volume lease
+        // before SQLite. This fixture needs an independent SQLite writer so it
+        // exercises the intended BEGIN busy-handler path.
+        let lock_holder = Connection::open(&path).unwrap();
+        lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
         let op_runs = Arc::new(AtomicUsize::new(0));
         let op_runs_in_request = Arc::clone(&op_runs);
@@ -1603,7 +1768,7 @@ mod tests {
         });
         let release_future = async {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+            lock_holder.execute_batch("ROLLBACK").unwrap();
         };
         let (result, ()) = tokio::join!(send_future, release_future);
 
@@ -1632,438 +1797,7 @@ mod tests {
         assert_eq!(rows, 1, "exactly one closure execution commits one row");
     }
 
-    // `#[serial(tx_registry)]`: same rationale as
-    // `begin_immediate_failure_replies_error_without_running_op`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial(tx_registry)]
-    async fn transient_begin_refusal_retries_once_and_restores_timeout() {
-        // Force the first contended BEGIN to return immediately, leaving
-        // budget for the Rust retry. The holder is released only after that
-        // refusal is counted, so an uncontended first attempt cannot pass.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("writer_task_begin_transient_contention.db");
-        let busy_timeout = Duration::from_secs(5);
-        let configured_timeout_ms = i64::try_from(busy_timeout.as_millis()).unwrap();
-        let pool = ConnectionPool::new(PoolConfig {
-            path: Some(path),
-            busy_timeout,
-            ..PoolConfig::for_test()
-        })
-        .unwrap();
-        {
-            let writer = pool.try_writer().unwrap();
-            writer
-                .conn()
-                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-                .unwrap();
-        }
-        let handle = spawn(&pool, 8).expect("writer task spawn");
-        let begin_attempts = Arc::new(AtomicUsize::new(0));
-        let begin_attempts_in_setup = Arc::clone(&begin_attempts);
-        handle
-            .send_top_level(move |conn| {
-                // A successful timeout reduction installs SQLite's normal busy
-                // handler for attempt two; only the first refusal is immediate.
-                conn.busy_handler(None)
-                    .map_err(|error| StorageError::Internal(error.to_string()))?;
-                count_begin_attempts(conn, begin_attempts_in_setup)
-                    .map_err(|error| StorageError::Internal(error.to_string()))
-            })
-            .await
-            .expect("install connection-local contention observers");
-        let lock_holder = pool.try_writer().unwrap();
-        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
-
-        let op_runs = Arc::new(AtomicUsize::new(0));
-        let op_runs_in_request = Arc::clone(&op_runs);
-        let send_future = handle.send(move |conn| {
-            op_runs_in_request.fetch_add(1, Ordering::SeqCst);
-            conn.execute("INSERT INTO t (id) VALUES (1)", [])
-                .map_err(|error| StorageError::Pool {
-                    operation: "test_insert_after_transient_contention".into(),
-                    message: error.to_string(),
-                })?;
-            conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
-                .map_err(|error| StorageError::Internal(error.to_string()))
-        });
-        let release_future = async {
-            let observed = tokio::time::timeout(Duration::from_secs(2), async {
-                while pool.writer_acquisition_snapshot().writer_task_begin_busy == 0 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-            })
-            .await;
-            // Release even when the handshake times out, so a failing test
-            // cannot strand the writer behind its own fixture lock.
-            lock_holder.conn().execute_batch("ROLLBACK").unwrap();
-            observed.expect("first BEGIN refusal must be observed before releasing the lock");
-        };
-        let (result, ()) = tokio::join!(send_future, release_future);
-
-        assert_eq!(
-            result.expect("BEGIN IMMEDIATE succeeds once the transient lock clears"),
-            configured_timeout_ms,
-            "the configured timeout must be restored before the operation runs"
-        );
-        assert_eq!(
-            begin_attempts.load(Ordering::SeqCst),
-            2,
-            "the request must actually retry BEGIN"
-        );
-        assert_eq!(
-            op_runs.load(Ordering::SeqCst),
-            1,
-            "the FnOnce request closure must execute exactly once"
-        );
-
-        let settled = pool.writer_acquisition_snapshot();
-        assert_eq!(
-            settled.writer_task_begin_busy, 1,
-            "the first real BEGIN refusal must be observed"
-        );
-        assert_eq!(settled.writer_task_begin_busy_absorbed, 1);
-        let next_timeout = handle
-            .send_top_level(|conn| {
-                conn.query_row("PRAGMA busy_timeout", [], |row| row.get::<_, i64>(0))
-                    .map_err(|error| StorageError::Internal(error.to_string()))
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            next_timeout, configured_timeout_ms,
-            "the next request must retain the configured timeout"
-        );
-        assert_eq!(
-            begin_attempts.load(Ordering::SeqCst),
-            2,
-            "timeout probes and top-level setup must not count as BEGIN attempts"
-        );
-        let reader = pool.reader().unwrap();
-        let rows: i64 = reader
-            .conn()
-            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 1, "exactly one closure execution commits one row");
-    }
-
-    fn count_begin_attempts(conn: &Connection, attempts: Arc<AtomicUsize>) -> rusqlite::Result<()> {
-        conn.authorizer(Some(move |context: AuthContext<'_>| {
-            if matches!(
-                context.action,
-                AuthAction::Transaction {
-                    operation: TransactionOperation::Begin
-                }
-            ) {
-                attempts.fetch_add(1, Ordering::SeqCst);
-            }
-            Authorization::Allow
-        }))
-    }
-
-    #[test]
-    fn failed_busy_timeout_reduction_stops_before_a_second_begin() {
-        let dir = tempfile::tempdir().unwrap();
-        let pool = file_pool(&dir.path().join("writer_task_timeout_update_failure.db"));
-        let conn = pool.open_standalone_writer_untracked().unwrap();
-        let busy_timeout = Duration::from_secs(5);
-        // Return BUSY before the budget expires, without manufacturing the
-        // BEGIN result. Only the timeout setter below injects a failure.
-        conn.busy_handler(None).unwrap();
-        let original_timeout: i64 = conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        count_begin_attempts(&conn, Arc::clone(&attempts)).unwrap();
-        let lock_holder = pool.try_writer().unwrap();
-        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
-        let counters = pool.writer_acquisition_counters();
-        let mut timeout_updates = Vec::new();
-
-        let (result, _, reported_attempts) =
-            begin_immediate_with_retry(&conn, &counters, busy_timeout, |_, timeout| {
-                timeout_updates.push(timeout);
-                Err(rusqlite::Error::InvalidQuery)
-            });
-
-        let error = result.expect_err("failed timeout reduction must surface the busy refusal");
-        assert_eq!(
-            error.sqlite_error_code(),
-            Some(rusqlite::ErrorCode::DatabaseBusy),
-            "preserve the original BEGIN error, not the injected setter error"
-        );
-        assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            1,
-            "failed reduction must not issue a second BEGIN"
-        );
-        assert_eq!(reported_attempts as usize, attempts.load(Ordering::SeqCst));
-        assert_eq!(timeout_updates.len(), 1, "a failed first update must not trigger retries or a spurious restoration call through the injected setter");
-        assert!(timeout_updates[0] < busy_timeout);
-        assert!(!timeout_updates[0].is_zero());
-        let unchanged_timeout: i64 = conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            unchanged_timeout, original_timeout,
-            "the failed setter did not change the connection timeout"
-        );
-        assert!(
-            conn.is_autocommit(),
-            "the refused acquisition must not open a transaction"
-        );
-        let snapshot = pool.writer_acquisition_snapshot();
-        assert_eq!(snapshot.writer_task_begin_busy, 1);
-        assert_eq!(
-            snapshot.writer_task_begin_busy_absorbed, 0,
-            "an unretried refusal must not be counted as absorbed"
-        );
-
-        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
-        drop(lock_holder);
-        conn.busy_timeout(busy_timeout).unwrap();
-        let (positive, _, reported_attempts) =
-            begin_immediate_with_retry(&conn, &counters, busy_timeout, Connection::busy_timeout);
-        positive.expect(
-            "the same connection and observer must see a valid BEGIN once contention clears",
-        );
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            reported_attempts, 1,
-            "attempt count is local to this request"
-        );
-        conn.execute_batch("ROLLBACK").unwrap();
-    }
-
-    // `#[serial(tx_registry)]`: same rationale as
-    // `begin_immediate_failure_replies_error_without_running_op`.
-    #[tokio::test]
-    #[serial(tx_registry)]
-    async fn contended_begin_exhaustion_separates_absorbed_and_surfaced_refusals() {
-        // Real contention: a refused write must be COUNTED, not merely
-        // reported to its caller. Before this counter, `db_diagnostics`
-        // showed a clean writer while requests were being refused after a
-        // full busy timeout, so an operator could not distinguish this
-        // daemon from one that had never refused a write.
-        //
-        // The lock is held continuously for the whole request, so SQLite's
-        // own busy handler already spends the entire configured
-        // `busy_timeout` internally before this call returns BUSY — the
-        // shared retry budget introduced to bound total acquisition time to
-        // one window (see `begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention`)
-        // is therefore already spent the instant this first refusal
-        // surfaces, and no further attempt is retried. Real, sustained
-        // contention against a single busy_timeout window can only ever
-        // produce exactly one busy refusal and zero absorbed ones; a
-        // multi-refusal absorbed sequence requires a refusal shape that
-        // returns before the timeout elapses (for example SQLITE_LOCKED),
-        // which this integration test cannot reproduce deterministically.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("writer_task_begin_busy_counter.db");
-        let cfg = PoolConfig {
-            path: Some(path.clone()),
-            busy_timeout: Duration::from_millis(150),
-            ..PoolConfig::for_test()
-        };
-        let pool = ConnectionPool::new(cfg).unwrap();
-        {
-            let writer = pool.try_writer().unwrap();
-            writer
-                .conn()
-                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-                .unwrap();
-        }
-
-        let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
-
-        let before = pool.writer_acquisition_snapshot();
-        assert_eq!(
-            before.writer_task_begin_busy, 0,
-            "baseline: nothing has been refused yet"
-        );
-        assert_eq!(before.writer_task_begin_busy_absorbed, 0);
-
-        let lock_holder = pool.try_writer().unwrap();
-        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
-
-        let result = handle
-            .send(|conn| {
-                conn.execute("INSERT INTO t (id) VALUES (1)", [])
-                    .map_err(|e| StorageError::Pool {
-                        operation: "test_insert".into(),
-                        message: e.to_string(),
-                    })
-            })
-            .await;
-        assert!(
-            matches!(&result, Err(StorageError::WriterTaskBusy { .. })),
-            "precondition: the request must actually be refused busy, got {result:?}"
-        );
-
-        let after = pool.writer_acquisition_snapshot();
-        assert_eq!(
-            after.writer_task_begin_busy, 1,
-            "the single refusal the caller was told about must still be counted"
-        );
-        assert_eq!(
-            after.writer_task_begin_busy_absorbed, 0,
-            "a refusal that already spent the whole shared budget waiting out \
-             SQLite's own busy handler must not be retried, so nothing is absorbed"
-        );
-        assert_eq!(
-            after.writer_task_begin_errors, 0,
-            "a busy refusal must not be counted as a non-busy BEGIN error"
-        );
-        assert_eq!(
-            after.timeouts, before.timeouts,
-            "a writer-task BEGIN refusal must not be mislabeled as a pool-mutex \
-             checkout timeout — separate ADR-135 F6 stages, separate counters"
-        );
-
-        // Discriminating arm: a SUCCEEDING request must not move the failure
-        // counter. Without this the assertion above would also pass against a
-        // counter that simply counted every request.
-        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
-        drop(lock_holder);
-        handle
-            .send(|conn| {
-                conn.execute("INSERT INTO t (id) VALUES (2)", [])
-                    .map_err(|e| StorageError::Pool {
-                        operation: "test_insert_after_busy".into(),
-                        message: e.to_string(),
-                    })
-            })
-            .await
-            .expect("the writer task survives transient contention");
-
-        let settled = pool.writer_acquisition_snapshot();
-        assert_eq!(
-            settled.writer_task_begin_busy, 1,
-            "a successful request must leave the refusal counter untouched"
-        );
-        assert_eq!(
-            settled.writer_task_begin_busy_absorbed, 0,
-            "an uncontended request must not move the absorbed counter"
-        );
-        assert!(
-            settled.writer_task_acquisitions > after.writer_task_acquisitions,
-            "and it must still register as a success"
-        );
-    }
-
-    // `#[serial(tx_registry)]`: same rationale as
-    // `begin_immediate_failure_replies_error_without_running_op`.
-    #[tokio::test]
-    #[serial(tx_registry)]
-    async fn begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention() {
-        // Before this fix, three BEGIN attempts each ran under their own
-        // full `busy_timeout`, so persistent contention could hold the
-        // serialized writer for roughly three windows plus the 15 ms of
-        // explicit backoff. A held writer lock that is never released for
-        // the life of this test reproduces that persistent contention:
-        // total time from send to the final refusal must stay within one
-        // busy_timeout window plus the sleeps, not three.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("writer_task_begin_retry_budget.db");
-        let busy_timeout = Duration::from_millis(150);
-        let cfg = PoolConfig {
-            path: Some(path),
-            busy_timeout,
-            ..PoolConfig::for_test()
-        };
-        let pool = ConnectionPool::new(cfg).unwrap();
-        {
-            let writer = pool.try_writer().unwrap();
-            writer
-                .conn()
-                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
-                .unwrap();
-        }
-
-        let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
-        let lock_holder = pool.try_writer().unwrap();
-        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
-
-        let result = handle
-            .send(|conn| {
-                conn.execute("INSERT INTO t (id) VALUES (1)", [])
-                    .map_err(|e| StorageError::Pool {
-                        operation: "test_insert".into(),
-                        message: e.to_string(),
-                    })
-            })
-            .await;
-
-        assert!(
-            matches!(&result, Err(StorageError::WriterTaskBusy { .. })),
-            "precondition: the request must actually be refused busy, got {result:?}"
-        );
-        // Against a lock that is never released, SQLite's busy handler spends
-        // the whole configured window inside the first `BEGIN IMMEDIATE`, so
-        // the shared budget is exhausted the moment that refusal surfaces:
-        // exactly one attempt is made and nothing is absorbed. Three
-        // unbounded attempts would have recorded two absorbed refusals and
-        // waited roughly three windows. The attempt count is the bound's
-        // deterministic signature; wall-clock time is not asserted because
-        // scheduler delay on a loaded host dwarfs a 150 ms window.
-        let counters = pool.writer_acquisition_snapshot();
-        assert_eq!(
-            counters.writer_task_begin_busy, 1,
-            "one busy refusal must surface after the shared budget is spent"
-        );
-        assert_eq!(
-            counters.writer_task_begin_busy_absorbed, 0,
-            "a refusal that already consumed the whole budget must not be retried"
-        );
-
-        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
-    }
-
-    #[tokio::test]
-    #[serial(tx_registry)]
-    async fn writer_task_resamples_capacity_for_each_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("writer_task_capacity.db");
-        let mut pool = file_pool(&path);
-        let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let observed = Arc::clone(&samples);
-        pool.set_test_write_admission(100, move |_| {
-            match observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
-                0 => Ok(102),
-                1 => Ok(100),
-                extra => panic!("unexpected capacity sample {extra}"),
-            }
-        });
-        let operations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handle = spawn(&pool, 8).unwrap();
-
-        let first_count = Arc::clone(&operations);
-        handle
-            .send(move |_| {
-                first_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok::<_, StorageError>(())
-            })
-            .await
-            .expect("first request should clear the reserve");
-        let second_count = Arc::clone(&operations);
-        let second = handle
-            .send(move |_| {
-                second_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok::<_, StorageError>(())
-            })
-            .await;
-
-        assert!(matches!(
-            second,
-            Err(StorageError::CapacityFloor {
-                capability: khive_storage::StorageCapability::Sql,
-                available_bytes: 100,
-                floor_bytes: 100,
-                ..
-            })
-        ));
-        assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(operations.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
+    include!("writer_task_admission_retry_tests.rs");
 
     // `#[serial(tx_registry)]`: shares the key with the checkpoint
     // `tx_age_sweep_*` tests — see the note on
@@ -2591,6 +2325,8 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: true,
+            checkpoint_bypass: false,
+            vacuum_copy_headroom: false,
             telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
@@ -2639,6 +2375,8 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            checkpoint_bypass: false,
+            vacuum_copy_headroom: false,
             telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
@@ -2723,6 +2461,8 @@ mod tests {
                         })
                 },
                 true,
+                false,
+                false,
             )
             .await
             .expect("top-level request must queue behind active request");
@@ -2781,6 +2521,8 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            checkpoint_bypass: false,
+            vacuum_copy_headroom: false,
             telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
@@ -2827,6 +2569,8 @@ mod tests {
             }),
             reply: reply_tx,
             top_level: false,
+            checkpoint_bypass: false,
+            vacuum_copy_headroom: false,
             telemetry: WriteTelemetry::new(None, "test".to_string(), 0, None),
         };
 
@@ -3403,3 +3147,89 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod volume_lease_close_tests {
+    use super::*;
+    use crate::disk_guard::{observe_close_with_lease, VolumeIdentity};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn terminal_and_unwinding_writer_close_before_volume_lease_release() {
+        for unwind in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let path = fixture.path().join("writer-poison.db");
+            let locks = fixture.path().join("locks");
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(include_str!("../tests/fixtures/disk-admission.sql"))
+                .unwrap();
+            let identity = VolumeIdentity::resolve(&path).unwrap();
+            let policy = crate::migrations::MigrationWritePolicy::new(
+                crate::DiskGuardEnvironment::default()
+                    .resolve(Some(0), Some(100))
+                    .unwrap(),
+                &locks,
+            )
+            .unwrap();
+            let admission = Arc::new(
+                crate::pool::WriteAdmission::for_migration_policy(Some(path.clone()), &policy)
+                    .unwrap(),
+            );
+            let mut owned = BlockingWriterConnection::new(conn, admission);
+            owned.volume_lease = Some(
+                identity
+                    .acquire(Duration::from_millis(2000), Some(&locks))
+                    .unwrap(),
+            );
+            let closed = observe_close_with_lease(&owned, locks.join(identity.lock_filename()));
+            owned
+                .execute_batch("BEGIN IMMEDIATE; INSERT INTO admission_payload VALUES (1)")
+                .unwrap();
+            owned
+                .authorizer(Some(
+                    |context: rusqlite::hooks::AuthContext<'_>| match context.action {
+                        rusqlite::hooks::AuthAction::Transaction {
+                            operation: rusqlite::hooks::TransactionOperation::Rollback,
+                        } => rusqlite::hooks::Authorization::Deny,
+                        _ => rusqlite::hooks::Authorization::Allow,
+                    },
+                ))
+                .unwrap();
+            assert!(owned.execute_batch("ROLLBACK").is_err());
+            if unwind {
+                assert!(catch_unwind(AssertUnwindSafe(move || {
+                    let _owned = owned;
+                    panic!("force blocking-owner unwind");
+                }))
+                .is_err());
+            } else {
+                let (returned, state) =
+                    owned.finish(Some(WriterTaskRequestState::SideEffectsUnknown));
+                assert!(returned.is_none());
+                assert_eq!(state, Some(WriterTaskRequestState::SideEffectsUnknown));
+            }
+            assert_eq!(
+                closed.load(Ordering::SeqCst),
+                1,
+                "connection closes with its OS lease still held, unwind={unwind}"
+            );
+            let _competitor = identity
+                .acquire(Duration::from_millis(2000), Some(&locks))
+                .unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.busy_timeout(Duration::ZERO).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT count(*) FROM admission_payload", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0);
+            conn.execute_batch("COMMIT").unwrap();
+        }
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "writer_task_identity_tests.rs"]
+mod identity_tests;

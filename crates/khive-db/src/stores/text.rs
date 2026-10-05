@@ -358,12 +358,6 @@ impl Fts5TextSearch {
         }
     }
 
-    fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_writer()
-            .map_err(|e| map_sqlite_err(e, "open_fts_writer"))
-    }
-
     /// Re-derive writer-task availability at write time instead of trusting
     /// only the field cached at construction (ADR-136 D1 gate 3 amendment).
     /// `self.writer_task` permanently caches `None` when this store was
@@ -404,40 +398,22 @@ impl Fts5TextSearch {
         self.with_writer_unmanaged(op, f).await
     }
 
-    /// Legacy standalone-connection / pool-mutex write path, bypassing the
-    /// WriterTask channel unconditionally regardless of
-    /// `KHIVE_WRITE_QUEUE`.
-    ///
-    /// Reserved for closures that manage their own transaction (a bare
-    /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`) — those cannot be sent through
-    /// the WriterTask channel, which already wraps every request in its own
-    /// transaction. `rename_namespace` is the only caller.
+    /// Direct standalone or pooled typed transaction path, bypassing the
+    /// WriterTask channel after routing has selected a compatibility fallback.
+    /// Callbacks contain DML only; this seam owns BEGIN and settlement.
     async fn with_writer_unmanaged<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
-        let result = if self.is_file_backed {
-            let conn = self.open_standalone_writer()?;
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                f(&conn)
-                    .map_err(|e| map_err(e, op))
-                    .inspect_err(|error| pool.record_direct_writer_error(error))
+        let pool = Arc::clone(&self.pool);
+        let result = tokio::task::spawn_blocking(move || {
+            pool.execute_direct_transaction(StorageCapability::Text, op, move |conn| {
+                f(conn).map_err(|error| map_err(error, op))
             })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?
-        } else {
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn())
-                    .map_err(|e| map_err(e, op))
-                    .inspect_err(|error| pool.record_direct_writer_error(error))
-            })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?
-        };
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Text, op, e))?;
         if let Err(err) = &result {
             let msg = err.to_string();
             if msg.contains("locked") || msg.contains("busy") {
@@ -1158,10 +1134,7 @@ impl TextSearch for Fts5TextSearch {
         // owns the transaction. `current_writer_task("fts_upsert")`
         // (ADR-136 D1 gate 3
         // amendment) re-checks past a construction-time `None` cache so a
-        // handle that only became available later is still used here rather
-        // than falling to `with_writer`'s BEGIN-IMMEDIATE-wrapped closure
-        // below (that closure is not safe to send through the queue, which
-        // already wraps its own transaction).
+        // handle that only became available later is still used here.
         if let Some(writer_task) = self.current_writer_task("fts_upsert")? {
             let table2 = table.clone();
             return writer_task
@@ -1172,23 +1145,9 @@ impl TextSearch for Fts5TextSearch {
                 .await;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
-        let origin = self.pool.origin();
+        // The direct typed unit owns the transaction around this DML body.
         self.with_writer("fts_upsert", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("text_upsert_document".to_string()),
-                origin,
-            );
-
-            if let Err(e) = upsert_document_dml(conn, &table, &document) {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-
-            conn.execute_batch("COMMIT")?;
-            Ok(())
+            upsert_document_dml(conn, &table, &document)
         })
         .await
     }
@@ -1217,21 +1176,9 @@ impl TextSearch for Fts5TextSearch {
                 .await;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
-        let origin = self.pool.origin();
+        // The direct typed unit owns the transaction around the complete batch.
         self.with_writer("fts_upsert_batch", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("text_upsert_batch".to_string()),
-                origin,
-            );
-
-            let summary = batch_upsert_documents_dml(conn, &table, &documents, attempted)?;
-
-            conn.execute_batch("COMMIT")?;
-
-            Ok(summary)
+            batch_upsert_documents_dml(conn, &table, &documents, attempted)
         })
         .await
     }
@@ -1273,27 +1220,11 @@ impl TextSearch for Fts5TextSearch {
                 .await;
         }
 
-        let origin = self.pool.origin();
         self.with_writer("fts_delete", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("text_delete_document".to_string()),
-                origin,
-            );
-
-            match delete_document_dml(conn, &table, &namespace, subject_id) {
-                Ok(deleted) => {
-                    conn.execute_batch("COMMIT")?;
-                    Ok(deleted)
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(match e {
-                        SqliteError::Rusqlite(inner) => inner,
-                        other => rusqlite::Error::InvalidParameterName(other.to_string()),
-                    })
-                }
-            }
+            delete_document_dml(conn, &table, &namespace, subject_id).map_err(|error| match error {
+                SqliteError::Rusqlite(inner) => inner,
+                other => rusqlite::Error::InvalidParameterName(other.to_string()),
+            })
         })
         .await
     }
@@ -1950,26 +1881,9 @@ impl Fts5TextSearch {
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteFtsRenameNamespace);
 
-        let origin = self.pool.origin();
         self.with_writer_unmanaged("fts_rename_namespace", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("text_rename_namespace".to_string()),
-                origin,
-            );
-            // The SELECT now runs inside this same `BEGIN IMMEDIATE` — same
-            // TOCTOU fix as the queue path above, applied to the legacy
-            // standalone-connection path too.
-            match rename_namespace_dml(conn, &table, &old_ns, &new_ns) {
-                Ok(moved) => {
-                    conn.execute_batch("COMMIT")?;
-                    Ok(moved)
-                }
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(e)
-                }
-            }
+            // The SELECT and writes share the typed unit's transaction.
+            rename_namespace_dml(conn, &table, &old_ns, &new_ns)
         })
         .await
     }

@@ -15,7 +15,7 @@ fn process_json() -> serde_json::Value {
     let pool = ConnectionPool::new(PoolConfig {
         read_only: true,
         write_queue_enabled: Some(false),
-        ..PoolConfig::default()
+        ..PoolConfig::for_test()
     })
     .expect("inspection pool");
     let report = collect(

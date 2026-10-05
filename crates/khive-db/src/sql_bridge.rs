@@ -1264,12 +1264,28 @@ fn open_standalone_reader(pool: &ConnectionPool) -> Result<rusqlite::Connection,
         .map_err(|error| StorageError::driver(StorageCapability::Sql, "open_reader", error))
 }
 
+#[cfg(test)]
 fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection, StorageError> {
-    let config = pool.config();
     let conn = pool
         .open_standalone_writer()
         .map_err(|e| e.into_storage_error(StorageCapability::Sql, "open_writer"))?;
+    configure_standalone_writer(pool, conn)
+}
 
+fn open_admitted_standalone_writer(
+    pool: &ConnectionPool,
+) -> Result<rusqlite::Connection, StorageError> {
+    let conn = pool
+        .open_standalone_writer_for_admitted_operation()
+        .map_err(|e| e.into_storage_error(StorageCapability::Sql, "open_writer"))?;
+    configure_standalone_writer(pool, conn)
+}
+
+fn configure_standalone_writer(
+    pool: &ConnectionPool,
+    conn: rusqlite::Connection,
+) -> Result<rusqlite::Connection, StorageError> {
+    let config = pool.config();
     conn.busy_timeout(config.busy_timeout)
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
     conn.pragma_update(None, "cache_size", "-65536")
@@ -1316,13 +1332,14 @@ async fn open_standalone_reader_on_blocking(
     open_standalone_on_blocking(pool, slot, "open_reader", open_standalone_reader).await
 }
 
-/// [`open_standalone_writer`] lifted onto the blocking thread pool; see
-/// [`open_standalone_reader_on_blocking`] for the blocking rationale.
+/// Open the writer handle without a premature capacity sample. Its later
+/// operation owns admission; a cold handle must allow a recovery checkpoint.
+/// See [`open_standalone_reader_on_blocking`] for the blocking rationale.
 async fn open_standalone_writer_on_blocking(
     pool: Arc<ConnectionPool>,
     slot: OwnedSemaphorePermit,
 ) -> khive_storage::types::StorageResult<(rusqlite::Connection, OwnedSemaphorePermit)> {
-    open_standalone_on_blocking(pool, slot, "open_writer", open_standalone_writer).await
+    open_standalone_on_blocking(pool, slot, "open_writer", open_admitted_standalone_writer).await
 }
 
 // =============================================================================
@@ -2503,28 +2520,52 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // wrap entirely.
         if let Some(writer_task) = self.writer_task.clone() {
             let pool = Arc::clone(&self.pool);
-            return writer_task
-                .send_top_level_bounded(move |conn| {
-                    execute_top_level_maintenance(&pool, conn, maintenance)
-                        .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
-                })
-                .await;
+            let execute = move |conn: &rusqlite::Connection| {
+                execute_top_level_maintenance(&pool, conn, maintenance)
+                    .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
+            };
+            return if maintenance == TopLevelMaintenance::WalCheckpointTruncate {
+                writer_task.send_checkpoint_bounded(execute).await
+            } else {
+                writer_task.send_vacuum_bounded(execute).await
+            };
         }
 
-        // Flag off / no writer task: identical to `execute_script`'s own
-        // flag-off path — a bare `execute_batch` on the standalone
-        // connection, already transaction-free. This is a request-path
-        // maintenance operation, so it has the same reserve check as an
-        // ordinary standalone write. Only infrastructure checkpoint
-        // connections are exempt.
-        self.admit_standalone_write("execute_script_top_level")?;
+        // Flag off / no writer task: keep the volume lease through the
+        // whole top-level operation. A checkpoint is a recovery bypass;
+        // VACUUM uses a copy-sized DB/WAL metadata estimate.
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script_top_level".into(),
             message: "connection already consumed".into(),
         })?;
         let pool = Arc::clone(&self.pool);
+        let db = self.db.clone();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            let res = execute_top_level_maintenance(&pool, &handle.conn, maintenance);
+            let res = (|| {
+                let admission = pool.write_admission();
+                let _lease = if maintenance == TopLevelMaintenance::Vacuum {
+                    let lease = admission.acquire().map_err(|error| {
+                        error.into_storage_error(StorageCapability::Sql, "execute_script_top_level")
+                    })?;
+                    let headroom = admission.vacuum_headroom().map_err(|error| {
+                        error.into_storage_error(StorageCapability::Sql, "execute_script_top_level")
+                    })?;
+                    admission.check_with_headroom(headroom).map_err(|error| {
+                        error.into_storage_error(StorageCapability::Sql, "execute_script_top_level")
+                    })?;
+                    lease
+                } else {
+                    None
+                };
+                execute_top_level_maintenance(&pool, &handle.conn, maintenance).map_err(|error| {
+                    crate::timeout_sink::maybe_emit_busy(
+                        &db,
+                        crate::timeout_sink::Site::StandaloneSqlBridge,
+                        &error,
+                    );
+                    map_rusqlite_err(error, "execute_script_top_level")
+                })
+            })();
             (handle, res)
         })
         .await
@@ -3312,7 +3353,11 @@ pub struct SqlBridge {
 
 impl SqlBridge {
     /// Create a new bridge wrapping the given pool.
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, _is_file_backed: bool) -> Self {
+        // The legacy hint is not an authority for choosing an unguarded
+        // in-memory writer. A caller cannot route a file-backed pool through
+        // PoolBackedWriter by supplying `false`.
+        let is_file_backed = pool.canonical_path().is_some();
         Self {
             pool,
             is_file_backed,
@@ -3619,6 +3664,20 @@ mod tests {
     use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::{SqlAccess as _, SqlReader as _};
 
+    #[test]
+    fn file_backed_pool_cannot_take_in_memory_writer_route_from_legacy_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("hint-mismatch.db")),
+                ..PoolConfig::for_test()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(pool, false);
+        assert!(bridge.is_file_backed);
+    }
+
     #[tokio::test]
     async fn top_level_wal_checkpoint_ends_the_active_pin_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -3658,294 +3717,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn in_memory_atomic_unit_pending_future_rolls_back_and_remains_usable() {
-        let pool = Arc::new(
-            ConnectionPool::new(PoolConfig {
-                path: None,
-                write_queue_enabled: Some(false),
-                ..PoolConfig::default()
-            })
-            .unwrap(),
-        );
-        pool.writer()
-            .unwrap()
-            .conn()
-            .execute_batch("CREATE TABLE atomic_pending (id INTEGER PRIMARY KEY)")
-            .unwrap();
-        let bridge = SqlBridge::new(Arc::clone(&pool), false);
-        let inserted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let op_inserted = Arc::clone(&inserted);
-        let op: AtomicUnitOp = Box::new(move |writer| {
-            Box::pin(async move {
-                writer
-                    .execute(SqlStatement {
-                        sql: "INSERT INTO atomic_pending VALUES (1)".into(),
-                        params: vec![],
-                        label: None,
-                    })
-                    .await?;
-                op_inserted.store(true, std::sync::atomic::Ordering::SeqCst);
-                std::future::pending::<khive_storage::types::StorageResult<Box<dyn Any + Send>>>()
-                    .await
-            })
-        });
-        let result =
-            tokio::time::timeout(std::time::Duration::from_secs(10), bridge.atomic_unit(op)).await;
-        assert!(inserted.load(std::sync::atomic::Ordering::SeqCst));
-        let error = result
-            .expect("in-memory atomic_unit must reject Pending promptly, not await it forever")
-            .expect_err("a suspending atomic unit must fail");
-        assert!(error.to_string().contains("future suspended"), "{error}");
-        {
-            let guard = pool.writer().unwrap();
-            assert!(guard.conn().is_autocommit());
-            let count: i64 = guard
-                .conn()
-                .query_row("SELECT COUNT(*) FROM atomic_pending", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(count, 0, "SQL before Pending must roll back");
-        }
-        let next: AtomicUnitOp = Box::new(|writer| {
-            Box::pin(async move {
-                writer
-                    .execute(SqlStatement {
-                        sql: "INSERT INTO atomic_pending VALUES (2)".into(),
-                        params: vec![],
-                        label: None,
-                    })
-                    .await?;
-                Ok(Box::new(()) as Box<dyn Any + Send>)
-            })
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(10), bridge.atomic_unit(next))
-            .await
-            .expect("unit admission must remain usable")
-            .unwrap();
-        let sum: i64 = pool
-            .writer()
-            .unwrap()
-            .conn()
-            .query_row("SELECT SUM(id) FROM atomic_pending", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(sum, 2);
-    }
-
-    // Pause SQLite itself during the first INSERT preparation so tests can
-    // arrange contention without putting an async wait in an AtomicUnitOp.
-    fn pause_first_insert(
-        pool: &ConnectionPool,
-        table: &'static str,
-    ) -> (
-        tokio::sync::oneshot::Receiver<()>,
-        std::sync::mpsc::Sender<()>,
-    ) {
-        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-
-        let (entered, in_statement) = tokio::sync::oneshot::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        let mut entered = Some(entered);
-        pool.writer()
-            .unwrap()
-            .conn()
-            .authorizer(Some(move |ctx: AuthContext<'_>| {
-                if matches!(ctx.action, AuthAction::Insert { table_name } if table_name == table) {
-                    if let Some(entered) = entered.take() {
-                        entered.send(()).unwrap();
-                        released
-                            .recv_timeout(std::time::Duration::from_secs(5))
-                            .expect("test must release the SQLite statement");
-                    }
-                }
-                Authorization::Allow
-            }))
-            .unwrap();
-        (in_statement, release)
-    }
-
-    #[tokio::test]
-    async fn in_memory_atomic_units_serialize_across_bridges() {
-        let pool = Arc::new(
-            ConnectionPool::new(PoolConfig {
-                path: None,
-                write_queue_enabled: Some(false),
-                ..PoolConfig::default()
-            })
-            .unwrap(),
-        );
-        pool.writer()
-            .unwrap()
-            .conn()
-            .execute_batch("CREATE TABLE atomic_in_memory (id INTEGER PRIMARY KEY)")
-            .unwrap();
-
-        let (in_statement, release) = pause_first_insert(&pool, "atomic_in_memory");
-        let ready = Arc::new(tokio::sync::Barrier::new(8));
-        let mut jobs = Vec::new();
-        for unit in 0..8_i64 {
-            let pool = Arc::clone(&pool);
-            let ready = Arc::clone(&ready);
-            jobs.push(tokio::spawn(async move {
-                // Separate bridges must share the pool's transaction budget.
-                let bridge = SqlBridge::new(pool, false);
-                ready.wait().await;
-                let op: AtomicUnitOp = Box::new(move |writer| {
-                    Box::pin(async move {
-                        for row in 0..2 {
-                            writer
-                                .execute(SqlStatement {
-                                    sql: "INSERT INTO atomic_in_memory (id) VALUES (?1)".into(),
-                                    params: vec![SqlValue::Integer(unit * 2 + row)],
-                                    label: None,
-                                })
-                                .await?;
-                        }
-                        Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
-                    })
-                });
-                bridge.atomic_unit(op).await.map(|_| ())
-            }));
-        }
-        let entered = tokio::time::timeout(std::time::Duration::from_secs(10), in_statement).await;
-        if !matches!(&entered, Ok(Ok(()))) {
-            drop(release);
-            for job in jobs {
-                let _ = job.await;
-            }
-            panic!("atomic unit did not reach its first INSERT: {entered:?}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        release.send(()).unwrap();
-        let mut errors = Vec::new();
-        for job in jobs {
-            if let Err(error) = job.await.unwrap() {
-                errors.push(error.to_string());
-            }
-        }
-        assert!(
-            errors.is_empty(),
-            "atomic units failed: {}",
-            errors.join("; ")
-        );
-        let count: i64 = pool
-            .writer()
-            .unwrap()
-            .conn()
-            .query_row("SELECT COUNT(*) FROM atomic_in_memory", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 16, "all eight two-row units must commit");
-    }
-
-    #[tokio::test]
-    async fn in_memory_atomic_unit_serializes_with_event_writes() {
-        use khive_storage::EventStore as _;
-
-        // Each ordinary event entry point opens a transaction through with_writer.
-        for mode in 0..3 {
-            let pool = Arc::new(
-                ConnectionPool::new(PoolConfig {
-                    path: None,
-                    write_queue_enabled: Some(false),
-                    ..PoolConfig::default()
-                })
-                .unwrap(),
-            );
-            {
-                let writer = pool.writer().unwrap();
-                crate::stores::event::ensure_events_schema(writer.conn()).unwrap();
-                writer
-                    .conn()
-                    .execute_batch("CREATE TABLE atomic_event_overlap (id INTEGER PRIMARY KEY)")
-                    .unwrap();
-            }
-            let (in_unit, release) = pause_first_insert(&pool, "atomic_event_overlap");
-            let bridge = SqlBridge::new(Arc::clone(&pool), false);
-            let unit = tokio::spawn(async move {
-                let op: AtomicUnitOp = Box::new(move |writer| {
-                    Box::pin(async move {
-                        writer
-                            .execute(SqlStatement {
-                                sql: "INSERT INTO atomic_event_overlap VALUES (1)".into(),
-                                params: vec![],
-                                label: None,
-                            })
-                            .await?;
-                        writer
-                            .execute(SqlStatement {
-                                sql: "INSERT INTO atomic_event_overlap VALUES (2)".into(),
-                                params: vec![],
-                                label: None,
-                            })
-                            .await?;
-                        Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
-                    })
-                });
-                bridge.atomic_unit(op).await.map(|_| ())
-            });
-            let entered = tokio::time::timeout(std::time::Duration::from_secs(10), in_unit).await;
-            if !matches!(&entered, Ok(Ok(()))) {
-                drop(release);
-                let result = unit.await;
-                panic!("atomic unit did not reach its first INSERT: {entered:?}; {result:?}");
-            }
-            let store = Arc::new(crate::stores::event::SqlEventStore::new_scoped(
-                Arc::clone(&pool),
-                false,
-                "atomic-event",
-            ));
-            let event = khive_storage::event::Event::new(
-                "atomic-event",
-                "search",
-                khive_types::EventKind::SearchExecuted,
-                khive_types::SubstrateKind::Note,
-                "agent:test",
-            )
-            .with_payload(serde_json::json!({"result_kind": "note"}));
-            let event_id = event.id;
-            let event_store = Arc::clone(&store);
-            let mut event_job = tokio::spawn(async move {
-                match mode {
-                    0 => event_store.append_event(event).await,
-                    1 => event_store.append_events(vec![event]).await.map(|_| ()),
-                    _ => event_store
-                        .append_events_idempotent(vec![event])
-                        .await
-                        .map(|_| ()),
-                }
-            });
-            let early =
-                tokio::time::timeout(std::time::Duration::from_millis(20), &mut event_job).await;
-            let finished_inside_unit = early.is_ok();
-            // Release and join both tasks before asserting, including in the RED control.
-            release.send(()).unwrap();
-            unit.await.unwrap().expect("atomic unit commits both rows");
-            let event_result = match early {
-                Ok(joined) => joined,
-                Err(_) => event_job.await,
-            }
-            .expect("event task joins");
-            assert!(
-                event_result.is_ok(),
-                "event write mode {mode} overlapped the atomic transaction: {event_result:?}"
-            );
-            assert!(
-                !finished_inside_unit,
-                "event write mode {mode} must wait until the atomic unit ends"
-            );
-            assert!(store.get_event(event_id).await.unwrap().is_some());
-            let rows: i64 = pool
-                .writer()
-                .unwrap()
-                .conn()
-                .query_row("SELECT COUNT(*) FROM atomic_event_overlap", [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(rows, 2);
-        }
-    }
+    include!("sql_bridge_atomic_serialization_tests.rs");
 
     fn database_tx_view(pool: &ConnectionPool) -> khive_storage::tx_registry::TxOriginFilter {
         match pool.origin() {
@@ -9372,7 +9144,6 @@ mod tests {
             "execute_batch",
             "execute_script",
             "top_level_vacuum",
-            "top_level_checkpoint",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut pool = ConnectionPool::new(PoolConfig {
@@ -9385,8 +9156,8 @@ mod tests {
             let observed = Arc::clone(&samples);
             pool.set_test_write_admission(100, move |_| {
                 match observed.fetch_add(1, Ordering::SeqCst) {
-                    0 | 1 => Ok(101), // Handle open, then first operation.
-                    2 => Ok(100),     // The same handle's next operation.
+                    0 => Ok(101), // First operation; handle open does not sample.
+                    1 => Ok(100), // The same handle's next operation.
                     extra => panic!("unexpected capacity sample {extra}"),
                 }
             });
@@ -9419,11 +9190,6 @@ mod tests {
                         .execute_script_top_level(TopLevelMaintenance::Vacuum)
                         .await
                 }
-                "top_level_checkpoint" => {
-                    writer
-                        .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
-                        .await
-                }
                 _ => unreachable!(),
             }
             .expect_err("the second operation must see the new reserve sample");
@@ -9438,7 +9204,7 @@ mod tests {
                 ),
                 "{operation} must retain typed capacity-floor classification: {error:?}"
             );
-            assert_eq!(samples.load(Ordering::SeqCst), 3, "{operation}");
+            assert_eq!(samples.load(Ordering::SeqCst), 2, "{operation}");
             assert!(
                 matches!(
                     writer
@@ -9454,6 +9220,84 @@ mod tests {
                 "{operation} must not write after the reserve refusal"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn caller_checkpoint_bypasses_reserve_on_an_open_standalone_handle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("checkpoint-bypass.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        let samples = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&samples);
+        pool.set_test_write_admission(100, move |_| {
+            match observed.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(101), // First ordinary write; handle open does not sample.
+                extra => panic!("checkpoint attempted capacity sample {extra}"),
+            }
+        });
+        let bridge = SqlBridge::new(Arc::new(pool), true);
+        let mut writer = bridge.writer().await.unwrap();
+        writer
+            .execute(SqlStatement {
+                sql: "CREATE TABLE checkpoint_bypass (id INTEGER PRIMARY KEY)".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        writer
+            .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
+            .await
+            .expect("checkpoint must remain available without a capacity sample");
+        assert_eq!(samples.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_standalone_writer_handle_can_checkpoint_below_reserve() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("cold-checkpoint-bypass.db")),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.set_test_write_admission(100, |_| {
+            panic!("cold checkpoint must not sample the logical-write reserve")
+        });
+        let bridge = SqlBridge::new(Arc::new(pool), true);
+        let mut writer = bridge.writer().await.expect("cold writer handle opens");
+        writer
+            .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
+            .await
+            .expect("checkpoint is a recovery bypass on a cold handle");
+    }
+
+    #[tokio::test]
+    async fn queued_caller_checkpoint_never_samples_the_capacity_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("queued-checkpoint-bypass.db")),
+            write_queue_enabled: Some(true),
+            ..PoolConfig::for_test()
+        })
+        .unwrap();
+        pool.set_test_write_admission(u64::MAX, |_| {
+            panic!("queued checkpoint attempted a capacity sample")
+        });
+        let bridge = SqlBridge::new(Arc::new(pool), true);
+        bridge
+            .writer()
+            .await
+            .unwrap()
+            .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
+            .await
+            .expect("queued checkpoint must remain available below the reserve");
     }
 
     #[tokio::test]

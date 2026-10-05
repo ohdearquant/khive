@@ -1,8 +1,37 @@
 use khive_db::{ConnectionPool, PoolConfig};
+use khive_storage::CapacityUnavailablePhase;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 const ALLOW_HOME_STORE_ENV: &str = "KHIVE_ALLOW_HOME_STORE";
+
+#[test]
+fn dependency_default_requires_explicit_volume_lock_directory() {
+    assert!(
+        PoolConfig::default().volume_lock_dir.is_none(),
+        "the dependency's production Default must not infer a test lock directory"
+    );
+    assert!(PoolConfig::for_test().volume_lock_dir.is_some());
+
+    let fixture = tempfile::tempdir().unwrap();
+    let database = fixture.path().join("without-lock-dir.db");
+    let error = match ConnectionPool::new(PoolConfig {
+        path: Some(database.clone()),
+        volume_lock_dir: None,
+        ..PoolConfig::default()
+    }) {
+        Ok(_) => panic!("file pool opened without a volume-lock namespace"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        khive_db::SqliteError::CapacityUnavailable {
+            phase: CapacityUnavailablePhase::Lock,
+            ..
+        }
+    ));
+    assert!(!database.exists(), "refusal must precede SQLite open");
+}
 
 struct HomeGuard {
     home: Option<OsString>,

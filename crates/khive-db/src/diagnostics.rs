@@ -1404,6 +1404,70 @@ fn request_census_budget() -> Option<Duration> {
     }
 }
 
+/// The configured write-admission reserve and the volume metadata used to
+/// sample it. The reserve is an admission floor, not reserved disk capacity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiskGuardDiagnostics {
+    pub enabled: bool,
+    pub effective_reserve_bytes: Option<u64>,
+    pub reserve_source: Option<String>,
+    pub guard_deadline_ms: Option<u64>,
+    pub deadline_source: Option<String>,
+    pub probe_path: Option<String>,
+    pub volume_identity: Option<String>,
+    pub volume_root: Option<String>,
+    pub unavailable_reason: Option<String>,
+}
+
+impl DiskGuardDiagnostics {
+    fn snapshot(pool: &ConnectionPool) -> Self {
+        let Some(policy) = pool.effective_disk_guard_config() else {
+            return Self {
+                enabled: false,
+                effective_reserve_bytes: None,
+                reserve_source: None,
+                guard_deadline_ms: None,
+                deadline_source: None,
+                probe_path: None,
+                volume_identity: None,
+                volume_root: None,
+                unavailable_reason: Some(if pool.config().read_only {
+                    "read-only backend: no disk-write admission".to_string()
+                } else {
+                    "in-memory backend: no filesystem volume to guard".to_string()
+                }),
+            };
+        };
+        let identity = pool.write_admission().volume_identity();
+        let (probe_path, volume_identity, volume_root, unavailable_reason) = match identity {
+            Ok(Some(volume)) => (
+                Some(volume.probe_path().display().to_string()),
+                Some(volume.diagnostic_key()),
+                volume.volume_root().map(|path| path.display().to_string()),
+                None,
+            ),
+            Ok(None) => (
+                None,
+                None,
+                None,
+                Some("writable disk guard has no canonical database path".to_string()),
+            ),
+            Err(error) => (None, None, None, Some(error.to_string())),
+        };
+        Self {
+            enabled: true,
+            effective_reserve_bytes: Some(policy.reserve_bytes),
+            reserve_source: Some(policy.reserve_source.as_str().to_string()),
+            guard_deadline_ms: Some(policy.guard_deadline_ms),
+            deadline_source: Some(policy.deadline_source.as_str().to_string()),
+            probe_path,
+            volume_identity,
+            volume_root,
+            unavailable_reason,
+        }
+    }
+}
+
 /// The full database-integrity, reader/writer-contention, and WAL/checkpoint
 /// payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1455,6 +1519,7 @@ pub struct DbDiagnostics {
     pub db_path: Option<String>,
     /// Explicit WAL ceiling policy for this already-open database.
     pub wal_ceiling: WalCeilingDiagnostics,
+    pub disk_guard: DiskGuardDiagnostics,
     pub wal_file: Option<WalFileState>,
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
@@ -1737,6 +1802,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
+            disk_guard: DiskGuardDiagnostics::snapshot(&pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1794,6 +1860,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
+        disk_guard: DiskGuardDiagnostics::snapshot(&pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -1865,6 +1932,7 @@ fn collect_inner(
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
+            disk_guard: DiskGuardDiagnostics::snapshot(pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1917,6 +1985,7 @@ fn collect_inner(
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
+        disk_guard: DiskGuardDiagnostics::snapshot(pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -2301,7 +2370,57 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+    use crate::disk_guard::VolumeIdentity;
     use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy, WalCeilingSource};
+
+    #[test]
+    fn disk_guard_diagnostics_report_effective_policy_and_stable_volume() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("disk-guard-diagnostics.db");
+        let captured_volume = VolumeIdentity::resolve(&path).expect("initial volume identity");
+        let pool = ConnectionPool::new(PoolConfig {
+            path: Some(path),
+            disk_guard_config: Some(
+                crate::DiskGuardEnvironment::default()
+                    .resolve(Some(123), Some(500))
+                    .unwrap(),
+            ),
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .expect("writable pool");
+        let diagnostics = DiskGuardDiagnostics::snapshot(&pool);
+        assert!(diagnostics.enabled);
+        assert_eq!(diagnostics.effective_reserve_bytes, Some(123));
+        assert_eq!(diagnostics.reserve_source.as_deref(), Some("backend"));
+        assert_eq!(diagnostics.guard_deadline_ms, Some(500));
+        assert_eq!(diagnostics.deadline_source.as_deref(), Some("backend"));
+        assert_eq!(
+            diagnostics.volume_identity,
+            Some(captured_volume.diagnostic_key())
+        );
+        let probe_path = captured_volume.probe_path().display().to_string();
+        assert_eq!(diagnostics.probe_path.as_deref(), Some(probe_path.as_str()));
+        assert!(diagnostics.unavailable_reason.is_none());
+        let json = serde_json::to_value(&diagnostics).unwrap();
+        assert_eq!(json["effective_reserve_bytes"], 123);
+        assert_eq!(json["reserve_source"], "backend");
+        #[cfg(any(unix, windows))]
+        {
+            pool.write_admission()
+                .set_test_current_volume(Some(captured_volume.different_volume_for_test()));
+            let unavailable = DiskGuardDiagnostics::snapshot(&pool);
+            assert!(unavailable.volume_identity.is_none());
+            assert!(unavailable.probe_path.is_none());
+            assert!(unavailable
+                .unavailable_reason
+                .as_deref()
+                .unwrap()
+                .contains("database volume changed"));
+            pool.write_admission().set_test_current_volume(None);
+            assert_eq!(DiskGuardDiagnostics::snapshot(&pool), diagnostics);
+        }
+    }
 
     #[test]
     fn default_wal_ceiling_is_explicitly_disabled_in_diagnostics() {
@@ -2362,189 +2481,7 @@ mod tests {
         );
     }
 
-    /// The budget knob is read per request, so a wrong read is a wrong bound
-    /// on every call. `0` has to mean unbounded rather than "spend nothing",
-    /// because a zero-millisecond budget would truncate every census on the
-    /// first process and report a holder list of nothing at all.
-    #[test]
-    #[serial_test::serial(khive_walpin_census_budget_env)]
-    fn census_budget_reads_zero_as_unbounded_and_survives_a_malformed_value() {
-        let _guard = crate::walpin::EnvVarGuard::capture(CENSUS_BUDGET_ENV);
-
-        std::env::remove_var(CENSUS_BUDGET_ENV);
-        assert_eq!(
-            request_census_budget(),
-            Some(DEFAULT_CENSUS_BUDGET),
-            "an unset variable takes the default bound"
-        );
-
-        std::env::set_var(CENSUS_BUDGET_ENV, "0");
-        assert_eq!(
-            request_census_budget(),
-            None,
-            "0 restores the unbounded full-machine walk"
-        );
-
-        std::env::set_var(CENSUS_BUDGET_ENV, " 750 ");
-        assert_eq!(
-            request_census_budget(),
-            Some(Duration::from_millis(750)),
-            "a surrounding-whitespace value is still a number"
-        );
-
-        std::env::set_var(CENSUS_BUDGET_ENV, "soon");
-        assert_eq!(
-            request_census_budget(),
-            Some(DEFAULT_CENSUS_BUDGET),
-            "a malformed budget must not fail the request; the report states \
-             which budget was actually used"
-        );
-    }
-
-    /// A budget stop and an enumeration failure both set `truncated`, and an
-    /// operator reads one sentence. If that sentence is the same for both,
-    /// the bound makes the report cry wolf on every busy box.
-    #[test]
-    fn a_budget_stop_and_an_enumeration_failure_do_not_share_a_reason() {
-        let budget = census_truncation_cause(true);
-        let failure = census_truncation_cause(false);
-        assert_ne!(budget, failure);
-        assert!(
-            budget.contains("budget"),
-            "the budget reason must name the budget: {budget}"
-        );
-        assert!(
-            budget.contains("wal_pin_census_budget_ms"),
-            "and must point at the field carrying the value: {budget}"
-        );
-        assert!(
-            !failure.contains("budget"),
-            "an enumeration failure must not be described as a budget stop: {failure}"
-        );
-    }
-
-    /// `wal_pin_census_budget_ms` is an `Option` precisely so that a producer
-    /// which failed to record the budget cannot write the value that means
-    /// "unbounded". This pins the wire shape of both states.
-    #[test]
-    fn collection_cost_distinguishes_an_unbounded_census_from_a_zero_cost_one() {
-        let unbounded = CollectionCost {
-            total_ms: 9,
-            sqlite_ms: 4,
-            wal_file_stat_ms: 0,
-            wal_pin_census_ms: 5,
-            wal_pin_sidecar_ms: 0,
-            wal_pin_census_budget_ms: None,
-            wal_pin_census_budget_exhausted: false,
-        };
-        let bounded = CollectionCost {
-            wal_pin_census_budget_ms: Some(2000),
-            wal_pin_census_budget_exhausted: true,
-            ..unbounded
-        };
-
-        let unbounded = serde_json::to_value(unbounded).unwrap();
-        let bounded = serde_json::to_value(bounded).unwrap();
-        assert_eq!(
-            unbounded["wal_pin_census_budget_ms"],
-            serde_json::Value::Null
-        );
-        assert_eq!(bounded["wal_pin_census_budget_ms"], 2000);
-        assert_eq!(unbounded["wal_pin_census_budget_exhausted"], false);
-        assert_eq!(bounded["wal_pin_census_budget_exhausted"], true);
-    }
-
-    #[test]
-    fn process_identity_serializes_os_start_time_or_explicit_unavailability() {
-        let known = ProcessIdentity::from_start_time(42, Some(1_000_000_000), 3);
-        assert_eq!(
-            serde_json::to_value(known).unwrap(),
-            serde_json::json!({
-                "pid": 42,
-                "started_at": 1_000_000_000,
-                "started_at_unavailable_reason": null,
-                "pool_generation": 3
-            }),
-            "preserve the OS timestamp, not request time or a derived uptime"
-        );
-
-        let unknown = ProcessIdentity::from_start_time(42, None, 3);
-        let json = serde_json::to_value(unknown).unwrap();
-        assert_eq!(json["pid"], 42);
-        assert!(json["started_at"].is_null(), "never invent a start time");
-        let reason = json["started_at_unavailable_reason"].as_str().unwrap();
-        assert!(!reason.is_empty());
-        assert!(reason.contains(std::env::consts::OS));
-        assert_eq!(json["pool_generation"], 3);
-    }
-
-    #[tokio::test]
-    async fn process_identity_is_present_in_every_collector_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (file_pool, _) = seeded_pool(&dir);
-        let memory_pool = ConnectionPool::new(PoolConfig::default()).expect("in-memory pool");
-        for pool in [file_pool, memory_pool] {
-            let pool = Arc::new(pool);
-            let expected = ProcessIdentity::current(&pool);
-            let writer_before = pool.writer_acquisition_snapshot();
-            let sync = collect(
-                &pool,
-                BuildIdentity::from_env("test", None),
-                Duration::from_secs(30),
-            );
-            let asynchronous = collect_with_runtime_audit_metrics_interruptibly(
-                Arc::clone(&pool),
-                BuildIdentity::from_env("test", None),
-                Duration::from_secs(30),
-                0,
-                None,
-            )
-            .await
-            .expect("diagnostics");
-            for report in [sync, asynchronous] {
-                assert_eq!(report.process, expected);
-                let json = serde_json::to_value(report).unwrap();
-                assert_eq!(json["process"], serde_json::to_value(&expected).unwrap());
-                assert_eq!(json["build"]["version"], "test");
-            }
-            assert_eq!(
-                pool.writer_acquisition_snapshot(),
-                writer_before,
-                "diagnostics must not count its probes as write traffic"
-            );
-        }
-    }
-
-    #[test]
-    fn process_identity_survives_pool_reconstruction_with_reset_counters() {
-        let pool = ConnectionPool::new(PoolConfig::default()).expect("first pool");
-        drop(pool.try_writer().expect("writer acquisition"));
-        drop(pool.reader().expect("reader acquisition"));
-        let before = collect(
-            &pool,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        assert!(before.writer_contention.writer_acquisitions > 0);
-        assert!(before.reader_contention.reader_acquisitions > 0);
-        drop(pool);
-
-        let replacement = ConnectionPool::new(PoolConfig::default()).expect("replacement pool");
-        let after = collect(
-            &replacement,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        assert_eq!(after.process.pid, before.process.pid);
-        assert_eq!(after.process.started_at, before.process.started_at);
-        assert_eq!(
-            after.process.started_at_unavailable_reason,
-            before.process.started_at_unavailable_reason
-        );
-        assert!(after.process.pool_generation > before.process.pool_generation);
-        assert_eq!(after.writer_contention.writer_acquisitions, 0);
-        assert_eq!(after.reader_contention.reader_acquisitions, 0);
-    }
+    include!("diagnostics_census_evidence_tests.rs");
 
     fn seeded_pool(dir: &tempfile::TempDir) -> (ConnectionPool, PathBuf) {
         let path = dir.path().join("diag.db");

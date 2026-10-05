@@ -159,6 +159,7 @@ impl UploadContext {
                 volume: self.root.display().to_string(),
                 available_bytes: available,
                 floor_bytes: self.floor_bytes,
+                required_headroom_bytes: bytes,
             });
         }
         Ok(())

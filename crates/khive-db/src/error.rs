@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use khive_storage::{StorageCapability, StorageError};
+use khive_storage::{StorageCapability, StorageError, WriterTaskRequestState};
 use thiserror::Error;
 
 /// Stable ADR-194 capacity stages. The refusal stage is reserved for the WAL
@@ -25,6 +25,15 @@ pub enum SqliteError {
     #[error("invalid data: {0}")]
     InvalidData(String),
 
+    /// A pooled connection contained a transaction from an earlier owner.
+    /// Its prior side effects cannot be attributed to the new request.
+    #[error("pooled writer contains an inherited transaction; prior side effects are unknown")]
+    InheritedWriterTransaction,
+
+    /// The writer could not prove transaction settlement before retirement.
+    #[error("writer transaction settlement is unknown; connection retired")]
+    WriterSettlementUnknown,
+
     /// The process-local writer mutex was not acquired within the pool's
     /// configured finite checkout deadline. This stage happens before SQLite
     /// executes, so callers must not conflate it with SQLite busy/locked or
@@ -43,12 +52,22 @@ pub enum SqliteError {
     /// because the volume's free space had reached its configured reserve.
     #[error(
         "refusing sqlite write on {volume}: {available_bytes} bytes available, \
-         at or below the {floor_bytes}-byte free-space floor"
+         at or below the {floor_bytes}-byte free-space floor plus \
+         {required_headroom_bytes} bytes of operation headroom"
     )]
     CapacityFloor {
         volume: String,
         available_bytes: u64,
         floor_bytes: u64,
+        required_headroom_bytes: u64,
+    },
+
+    /// A new logical write could not resolve its volume, acquire its lease,
+    /// or sample available space.
+    #[error("sqlite capacity admission unavailable in {phase} phase: {message}")]
+    CapacityUnavailable {
+        phase: khive_storage::CapacityUnavailablePhase,
+        message: String,
     },
 
     /// A configured WAL ceiling cannot be represented by SQLite's signed
@@ -123,12 +142,24 @@ impl SqliteError {
                 volume,
                 available_bytes,
                 floor_bytes,
+                required_headroom_bytes,
             } => StorageError::CapacityFloor {
                 capability,
                 volume,
                 available_bytes,
                 floor_bytes,
+                required_headroom_bytes,
             },
+            Self::CapacityUnavailable { phase, message } => StorageError::CapacityUnavailable {
+                capability,
+                phase,
+                message,
+            },
+            Self::InheritedWriterTransaction | Self::WriterSettlementUnknown => {
+                StorageError::WriterTaskTerminated {
+                    request_state: WriterTaskRequestState::SideEffectsUnknown,
+                }
+            }
             other => StorageError::driver(capability, operation, other),
         }
     }

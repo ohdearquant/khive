@@ -74,6 +74,15 @@ pub enum ConfigError {
     #[error("backend {name:?}: `served_kinds` must not be empty when declared")]
     EmptyBackendServedKinds { name: String },
 
+    #[error("backend {name:?}: invalid disk guard configuration: {reason}")]
+    InvalidBackendDiskGuard { name: String, reason: String },
+
+    #[error("backends {first_backend:?} and {second_backend:?} name the same database but resolve different disk reserve/deadline policies")]
+    DiskGuardAliasConflict {
+        first_backend: String,
+        second_backend: String,
+    },
+
     #[error("KHIVE_SQLITE_WAL_CEILING_BYTES must be an unsigned decimal byte count")]
     InvalidWalCeilingEnvironment { value: String },
 
@@ -471,6 +480,45 @@ pub struct BackendConfig {
     /// zero disables the ceiling. Read-only backends retain the configured
     /// value for reporting but enforce no writer policy.
     pub wal_ceiling_bytes: Option<u64>,
+    /// SQLite disk reserve, in bytes. Zero explicitly disables the floor.
+    #[serde(default)]
+    pub disk_reserve_bytes: Option<u64>,
+    /// Volume-guard acquisition deadline, in milliseconds (100..=10000).
+    #[serde(default)]
+    pub disk_guard_deadline_ms: Option<u64>,
+}
+
+impl BackendConfig {
+    /// Resolve from the host's captured environment; never sample live environment here.
+    pub fn resolve_disk_guard(
+        &self,
+        environment: &khive_db::DiskGuardEnvironment,
+    ) -> Result<Option<khive_db::EffectiveDiskGuardConfig>, ConfigError> {
+        let invalid = |reason: String| ConfigError::InvalidBackendDiskGuard {
+            name: self.name.clone(),
+            reason,
+        };
+        if self.kind == BackendKind::Memory && self.disk_reserve_bytes.is_some_and(|n| n != 0) {
+            return Err(invalid(
+                "nonzero disk_reserve_bytes requires a file-backed SQLite backend".into(),
+            ));
+        }
+        if self
+            .disk_guard_deadline_ms
+            .is_some_and(|n| !(100..=10_000).contains(&n))
+        {
+            return Err(invalid(
+                "disk_guard_deadline_ms must be between 100 and 10000".into(),
+            ));
+        }
+        if self.kind == BackendKind::Memory || self.read_only {
+            return Ok(None);
+        }
+        environment
+            .resolve(self.disk_reserve_bytes, self.disk_guard_deadline_ms)
+            .map(Some)
+            .map_err(|e| invalid(e.to_string()))
+    }
 }
 
 /// Per-pack backend assignment.
@@ -1837,6 +1885,8 @@ impl KhiveConfig {
                     )?;
                 }
 
+                backend.resolve_disk_guard(&khive_db::DiskGuardEnvironment::default())?;
+
                 // Reject fields that are parsed but not yet implemented: silently
                 // accepting them would let misconfiguration slip past startup.
                 if backend.cache_mb.is_some() {
@@ -2081,112 +2131,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exec_timeouts_validate_effective_values_and_deadlines() {
-        let mut config = KhiveConfig::default();
-        config.exec.timeout_default_s = Some(900.0);
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
-        ));
-
-        config.exec.timeout_default_s = None;
-        config.exec.timeout_max_s = Some(1.0);
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
-        ));
-
-        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX] {
-            config.exec.timeout_max_s = None;
-            config.exec.timeout_default_s = Some(invalid);
+    fn disk_guard_backend_configuration_validates_memory_and_deadline() {
+        let parse = |fields: &str| {
+            toml::from_str::<KhiveConfig>(&format!("[[backends]]\nname='main'\n{fields}")).unwrap()
+        };
+        for deadline in [0, 99, 10_001] {
+            let config = parse(&format!(
+                "kind='sqlite'\npath='main.db'\ndisk_guard_deadline_ms={deadline}\n"
+            ));
             assert!(matches!(
                 config.validate(),
-                Err(ConfigError::InvalidExecConfig { key, .. }) if key == "timeout_default_s"
+                Err(ConfigError::InvalidBackendDiskGuard { .. })
             ));
         }
-
-        config.exec.timeout_default_s = None;
-        config.exec.timeout_max_s = Some(600.0);
-        config.validate().expect("valid resolved exec bounds");
-    }
-
-    #[test]
-    fn exec_binary_digest_timeout_is_bounded_at_load() {
-        let mut config = KhiveConfig::default();
+        let memory = parse("kind='memory'\ndisk_reserve_bytes=1\n");
+        assert!(matches!(
+            memory.validate(),
+            Err(ConfigError::InvalidBackendDiskGuard { .. })
+        ));
+        let zero = parse("kind='memory'\ndisk_reserve_bytes=0\n");
+        zero.validate().unwrap();
+        let file = parse("kind='sqlite'\npath='main.db'\ndisk_reserve_bytes=4294967296\ndisk_guard_deadline_ms=250\n");
+        file.validate().unwrap();
+        let policy = file.backends[0]
+            .resolve_disk_guard(&khive_db::DiskGuardEnvironment::default())
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            config
-                .exec
-                .binary_digest_timeout_s
-                .unwrap_or(DEFAULT_EXEC_BINARY_DIGEST_TIMEOUT_S),
-            10
+            (policy.reserve_bytes, policy.guard_deadline_ms),
+            (4_294_967_296, 250)
         );
-        for invalid in [0, MAX_EXEC_BINARY_DIGEST_TIMEOUT_S + 1] {
-            config.exec.binary_digest_timeout_s = Some(invalid);
-            assert!(matches!(
-                config.validate(),
-                Err(ConfigError::InvalidExecConfig { key, .. }) if key == "binary_digest_timeout_s"
-            ));
-        }
-        config.exec.binary_digest_timeout_s = Some(20);
-        config.validate().expect("bounded digest timeout override");
     }
 
-    #[test]
-    fn web_partial_ceiling_config_rejects_incoherent_effective_bounds_at_load() {
-        let dir = tempfile::tempdir().unwrap();
-        for (default_key, max_key, default, maximum) in [
-            ("timeout_default_s", "timeout_max_s", 30_u64, 120_u64),
-            (
-                "max_bytes_default",
-                "max_bytes_max",
-                5 * 1024 * 1024,
-                50 * 1024 * 1024,
-            ),
-            ("search_limit_default", "search_limit_max", 10, 50),
-        ] {
-            for invalid in [
-                format!("{max_key}=1"),
-                format!("{max_key}=0"),
-                format!("{default_key}=0"),
-                format!("{default_key}={}", maximum + 1),
-                format!("{default_key}=2\n{max_key}=1"),
-            ] {
-                let path = write_toml(&dir, &format!("[web]\n{invalid}\n"));
-                let error = KhiveConfig::load(Some(&path)).unwrap_err();
-                assert!(
-                    error.to_string().contains(default_key),
-                    "{invalid}: {error}"
-                );
-            }
-            for valid in [
-                String::new(),
-                format!("{max_key}={default}"),
-                format!("{default_key}={maximum}"),
-                format!("{default_key}=1\n{max_key}=1"),
-            ] {
-                let path = write_toml(&dir, &format!("[web]\n{valid}\n"));
-                let config = KhiveConfig::load(Some(&path)).unwrap().unwrap();
-                config.web.validate().unwrap();
-            }
-        }
-    }
-
-    #[test]
-    fn web_ceiling_programmatic_validation_rejects_unrepresentable_deadlines() {
-        let config = WebSectionConfig {
-            timeout_max_s: Some(u64::MAX),
-            ..Default::default()
-        };
-        assert!(
-            matches!(config.resolved_ceilings(), Err(ConfigError::InvalidWebConfig { key, .. }) if key == "timeout_max_s")
-        );
-        assert!(config.validate().is_err());
-        let config = WebSectionConfig {
-            max_bytes_max: Some(1),
-            ..Default::default()
-        };
-        assert!(config.resolved_ceilings().is_err());
-    }
+    include!("engine_config_deadline_tests.rs");
 
     fn write_toml(dir: &tempfile::TempDir, content: &str) -> PathBuf {
         let path = dir.path().join("config.toml");

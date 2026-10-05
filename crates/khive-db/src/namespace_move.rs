@@ -1439,7 +1439,7 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations::run_migrations;
+    use crate::migrations::run_migrations_for_test as run_migrations;
     use rusqlite::Connection;
 
     pub(super) fn migrated() -> Connection {

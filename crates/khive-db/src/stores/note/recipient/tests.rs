@@ -10,7 +10,7 @@ mod acknowledgement_journal_tests;
 
 fn fixture() -> (StorageBackend, RecipientCommit) {
     let backend = StorageBackend::memory().unwrap();
-    crate::run_migrations(backend.pool().writer().unwrap().conn_mut()).unwrap();
+    backend.pool().run_migrations().unwrap();
     let sender = Uuid::new_v4().to_string();
     let logical = Uuid::new_v4();
     let attempt = Uuid::new_v4();
@@ -351,7 +351,7 @@ async fn correlation_lookup_uses_reader_before_writer_transaction() {
         })
         .unwrap(),
     );
-    crate::run_migrations(pool.writer().unwrap().conn_mut()).unwrap();
+    pool.run_migrations().unwrap();
     let sender = input.note.as_ref().unwrap().properties.as_ref().unwrap()["from_actor"]
         .as_str()
         .unwrap()

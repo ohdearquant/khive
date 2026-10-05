@@ -565,10 +565,28 @@ fn entity_type_backfill_routes_only_to_the_configured_kg_backend() {
         let untouched_before = files(untouched.root.path());
         let discovery_parent = main.root.path().join(".khive");
         let discovery_events = discovery_parent.join("khive.db.events.db");
+        let discovery_volume_locks = discovery_parent.join("sqlite-volume-locks");
         assert!(!discovery_parent.exists());
+        let dry_run = isolated_command(main.root.path())
+            .env("KHIVE_WRITER_TIMEOUT_SINK_DIR", logs.path())
+            .env_remove("KHIVE_EVENTS_SPLIT")
+            .args(["entity-type-backfill", "--dry-run", "--config"])
+            .arg(&config)
+            .args(["--namespace", NAMESPACE])
+            .output()
+            .expect("run configured-backend discovery without a writer");
+        let dry_report = report(&dry_run);
+        assert_classification(&dry_report, "dry_run");
+        assert!(
+            !discovery_volume_locks.exists() && !discovery_parent.exists(),
+            "read-only target discovery must not create a volume-lock namespace ({route})"
+        );
         let output = isolated_command(main.root.path())
             // Process diagnostics are not discovery or backend database writes.
             .env("KHIVE_WRITER_TIMEOUT_SINK_DIR", logs.path())
+            // This apply writes the selected backend. Keep its per-user lock
+            // namespace outside the unopened discovery store being checked.
+            .env("KHIVE_VOLUME_LOCK_DIR", logs.path().join("volume-locks"))
             .env_remove("KHIVE_EVENTS_SPLIT")
             .args(["entity-type-backfill", "--apply", "--config"])
             .arg(&config)

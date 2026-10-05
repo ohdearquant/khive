@@ -75,12 +75,9 @@ fn config(root: &Path, backend: &str) -> RuntimeConfig {
 }
 
 fn migrated_backend(path: &Path) -> Arc<StorageBackend> {
-    let backend = StorageBackend::sqlite_with_max_readers(path, Some(2)).unwrap();
+    let backend = StorageBackend::sqlite_for_test(path).unwrap();
     assert_eq!(backend.pool().max_readers(), 2);
-    {
-        let mut writer = backend.pool().try_writer().unwrap();
-        khive_db::run_migrations(writer.conn_mut()).unwrap();
-    }
+    backend.pool().run_migrations().unwrap();
     Arc::new(backend)
 }
 

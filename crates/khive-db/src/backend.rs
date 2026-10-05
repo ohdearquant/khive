@@ -89,6 +89,7 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
 fn ensure_fts_rowid_map_backfilled(
     conn: &rusqlite::Connection,
     table: &str,
+    admission: &crate::pool::WriteAdmission,
 ) -> Result<(), SqliteError> {
     let map = text::rowid_map_table(table);
     let state = text::rowid_map_state_table(table);
@@ -110,6 +111,14 @@ fn ensure_fts_rowid_map_backfilled(
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
+    if let Err(error) = admission.check() {
+        return Err(crate::migrations::capacity_refusal_after_rollback(
+            conn,
+            conn.execute_batch("ROLLBACK"),
+            error,
+            "FTS rowid-map backfill",
+        ));
+    }
     let result: Result<(), SqliteError> = (|| {
         conn.execute_batch(&format!(
             "DELETE FROM {map} WHERE NOT EXISTS ( \
@@ -299,6 +308,20 @@ impl StorageBackend {
         Self::sqlite_with_pool_config(path, PoolConfig::default(), None)
     }
 
+    pub fn sqlite_with_volume_lock_dir(
+        path: impl AsRef<Path>,
+        volume_lock_dir: std::path::PathBuf,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(
+            path,
+            PoolConfig {
+                volume_lock_dir: Some(volume_lock_dir),
+                ..PoolConfig::default()
+            },
+            None,
+        )
+    }
+
     /// A private test database with a small, explicitly sized reader pool.
     #[cfg(any(test, feature = "test-support"))]
     pub fn sqlite_for_test(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
@@ -347,6 +370,43 @@ impl StorageBackend {
                 ..PoolConfig::default()
             },
             max_readers,
+        )
+    }
+
+    /// The host supplies the same captured policies used for daemon identity.
+    pub fn sqlite_with_max_readers_and_policies(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+        wal_ceiling: WalCeilingPolicy,
+        disk_guard_config: crate::EffectiveDiskGuardConfig,
+        volume_lock_dir: std::path::PathBuf,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(
+            path,
+            PoolConfig {
+                wal_ceiling,
+                disk_guard_config: Some(disk_guard_config),
+                volume_lock_dir: Some(volume_lock_dir),
+                ..PoolConfig::default()
+            },
+            max_readers,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sqlite_for_test_with_policies(
+        path: impl AsRef<Path>,
+        wal_ceiling: WalCeilingPolicy,
+        disk_guard_config: crate::EffectiveDiskGuardConfig,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(
+            path,
+            PoolConfig {
+                wal_ceiling,
+                disk_guard_config: Some(disk_guard_config),
+                ..PoolConfig::for_test()
+            },
+            Some(2),
         )
     }
 
@@ -497,8 +557,15 @@ impl StorageBackend {
         &self,
         plan: &crate::migrations::ServiceSchemaPlan,
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.try_writer()?;
-        crate::migrations::apply_schema_plan(writer.conn(), plan)
+        let writer = self.pool.writer_for_admitted_operation()?;
+        let admission = self.pool.write_admission();
+        let result =
+            crate::migrations::apply_schema_plan_with_admission(writer.conn(), plan, &admission);
+        if !writer.conn().is_autocommit() {
+            self.pool.retire_pooled_writer(writer.conn());
+            return Err(SqliteError::WriterSettlementUnknown);
+        }
+        result
     }
 
     /// Apply pack-auxiliary DDL statements.
@@ -534,7 +601,7 @@ impl StorageBackend {
         statements: &[&'static str],
         additions: &[khive_types::PackColumnAddition],
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.try_writer()?;
+        let writer = self.pool.writer_for_admitted_operation()?;
         writer.transaction(|conn| {
             pack_schema::add_missing_columns(conn, additions)?;
             for &stmt in statements {
@@ -591,7 +658,7 @@ impl StorageBackend {
                     "failed to acquire database GC owner before schema preparation: {error}"
                 ))
             })?;
-            let mut writer = self.pool.try_writer()?;
+            let mut writer = self.pool.writer_for_admitted_operation()?;
             self.run_core_migrations(writer.conn_mut(), &owner)
         }
     }
@@ -603,26 +670,16 @@ impl StorageBackend {
     /// snapshot connection, so it tolerates a WAL sidecar left by this same
     /// backend's own recent writes.
     pub fn schema_version(&self) -> Result<u32, SqliteError> {
-        if self.is_read_only() {
-            let reader = self.pool.reader()?;
-            crate::migrations::read_schema_version(reader.conn())
-        } else {
-            let writer = self.pool.try_writer()?;
-            crate::migrations::read_schema_version(writer.conn())
-        }
+        let reader = self.pool.reader()?;
+        crate::migrations::read_schema_version(reader.conn())
     }
 
     /// Inspect the coordinated V21 attachment cutover state.
     pub fn attachment_cutover_status(
         &self,
     ) -> Result<crate::migrations::AttachmentCutoverStatus, SqliteError> {
-        if self.is_read_only() {
-            let reader = self.pool.reader()?;
-            crate::migrations::attachment_cutover_status(reader.conn())
-        } else {
-            let writer = self.pool.try_writer()?;
-            crate::migrations::attachment_cutover_status(writer.conn())
-        }
+        let reader = self.pool.reader()?;
+        crate::migrations::attachment_cutover_status(reader.conn())
     }
 
     fn require_attachment_cutover_owner(
@@ -654,8 +711,9 @@ impl StorageBackend {
                 "cannot stage attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.try_writer()?;
-        crate::migrations::stage_attachment_cutover(writer.conn_mut())
+        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let admission = self.pool.write_admission();
+        crate::migrations::stage_attachment_cutover_with_admission(writer.conn_mut(), &admission)
     }
 
     /// Atomically publish a verified batch of pack-owned attachment roles.
@@ -670,10 +728,20 @@ impl StorageBackend {
                 "cannot apply verified attachments on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.try_writer()?;
+        let mut writer = self.pool.writer_for_admitted_operation()?;
         let tx = writer
             .conn_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let admission = self.pool.write_admission();
+        if let Err(error) = admission.check() {
+            let rollback = tx.rollback();
+            return Err(crate::migrations::capacity_refusal_after_rollback(
+                writer.conn(),
+                rollback,
+                error,
+                "verified attachment publication",
+            ));
+        }
         for attachment in attachments {
             attachment
                 .validate()
@@ -705,8 +773,9 @@ impl StorageBackend {
                 "cannot finalize attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.try_writer()?;
-        crate::migrations::finalize_attachment_cutover(writer.conn_mut())
+        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let admission = self.pool.write_admission();
+        crate::migrations::finalize_attachment_cutover_with_admission(writer.conn_mut(), &admission)
     }
 
     /// Get an EntityStore. Applies the entities DDL if not already present.
@@ -804,18 +873,22 @@ impl StorageBackend {
         Ok(())
     }
 
-    fn constructor_writer(&self) -> Result<crate::pool::WriterGuard<'_>, SqliteError> {
+    fn constructor_writer(
+        &self,
+    ) -> Result<crate::pool::PooledAutocommitWriteUnit<'_>, SqliteError> {
         let context = khive_storage::capture_request_read_context();
         let Some(operation) = context.store_acquisition_operation() else {
-            return self.pool.try_writer();
+            return self.pool.autocommit_write_unit();
         };
-        self.pool
-            .writer_until(|| context.blocking_stop_reason().is_some())?
+        let writer = self
+            .pool
+            .writer_until_for_admitted_operation(|| context.blocking_stop_reason().is_some())?
             .ok_or_else(|| {
                 SqliteError::RequestReadStopped(khive_storage::StorageError::Timeout {
                     operation: operation.into(),
                 })
-            })
+            })?;
+        writer.admit_autocommit()
     }
 
     /// Get a NoteStore. Applies the notes DDL if not already present.
@@ -1102,7 +1175,7 @@ impl StorageBackend {
         key_version: &str,
         dimensions: u32,
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.try_writer()?;
+        let writer = self.pool.autocommit_write_unit()?;
         writer
             .conn()
             .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
@@ -1177,7 +1250,7 @@ impl StorageBackend {
                 )));
             }
         } else {
-            let writer = self.pool.try_writer()?;
+            let writer = self.pool.autocommit_write_unit()?;
             sparse::ensure_sparse_schema(writer.conn(), model_key)
                 .map_err(SqliteError::Rusqlite)?;
         }
@@ -1314,10 +1387,10 @@ impl StorageBackend {
                 )));
             }
         } else {
-            let writer = self.pool.try_writer()?;
+            let writer = self.pool.autocommit_write_unit()?;
             writer.conn().execute_batch(&ddl)?;
             writer.conn().execute_batch(&text::rowid_map_ddl(&table))?;
-            ensure_fts_rowid_map_backfilled(writer.conn(), &table)?;
+            ensure_fts_rowid_map_backfilled(writer.conn(), &table, &self.pool.write_admission())?;
         }
 
         Ok(Arc::new(text::Fts5TextSearch::new(
@@ -1437,146 +1510,7 @@ mod tests {
     use khive_storage::types::{EdgeFilter, SqlStatement, SqlValue};
     use khive_storage::{EntityFilter, EventFilter};
 
-    #[tokio::test]
-    async fn ordinary_store_accessors_ignore_request_read_cancellation() {
-        let backend = StorageBackend::memory().unwrap();
-        let (_sender, receiver) = tokio::sync::watch::channel(true);
-        khive_storage::scope_request_read_cancellation(receiver, async {
-            backend.notes().expect("ordinary notes accessor");
-            backend.events().expect("ordinary events accessor");
-            #[cfg(feature = "vectors")]
-            backend
-                .vectors("ordinary_store", "ordinary-store", 8)
-                .expect("ordinary vectors accessor");
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn admitted_store_constructor_finishes_ddl_after_cancellation() {
-        let backend = StorageBackend::memory().unwrap();
-        let (sender, receiver) = tokio::sync::watch::channel(false);
-        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            let writer = backend.pool.writer().unwrap();
-            let fired = fired.clone();
-            writer
-                .conn()
-                .authorizer(Some(move |_: rusqlite::hooks::AuthContext<'_>| {
-                    fired.store(true, Ordering::SeqCst);
-                    sender.send_replace(true);
-                    rusqlite::hooks::Authorization::Allow
-                }))
-                .unwrap();
-        }
-        let result = khive_storage::scope_request_read_cancellation(receiver, async {
-            khive_storage::capture_request_read_context()
-                .scope_store_acquisition("admitted_notes_store", || backend.notes())
-        })
-        .await;
-        let writer = backend.pool.writer().unwrap();
-        writer
-            .conn()
-            .authorizer(
-                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
-            )
-            .unwrap();
-        result.expect("request cancellation must not interrupt admitted constructor DDL");
-        assert!(
-            fired.load(Ordering::SeqCst),
-            "cancellation must fire inside actual SQLite work"
-        );
-        assert_eq!(
-            backend.notes_seq_repair_run_count(),
-            1,
-            "constructor must finish schema repair"
-        );
-        assert!(sqlite_table_exists(writer.conn(), "notes_seq").unwrap());
-    }
-
-    #[cfg(unix)]
-    use khive_storage::test_support::freeze_snapshot_sidecars;
-
-    #[tokio::test]
-    async fn hot_path_guard_g2_file_backed_read_suite_uses_only_pooled_readers() {
-        let dir = tempfile::tempdir().unwrap();
-        let backend = StorageBackend::sqlite_for_test(dir.path().join("hot_path_g2.db")).unwrap();
-        backend.prepare_core_schema().unwrap();
-
-        // Construct every store named by ADR-165 Slice 2 before the counter
-        // baseline. Accessor-time DDL/validation is not request read traffic.
-        let entities = backend.entities().unwrap();
-        let notes = backend.notes().unwrap();
-        let graph = backend.graph().unwrap();
-        let events = backend.events().unwrap();
-        let text = backend
-            .text_with_tokenizer("hot_path_g2", "unicode61")
-            .unwrap();
-        let agents = backend.agents().unwrap();
-        let attachments = backend.attachments().unwrap();
-        let sparse = backend.sparse("hot_path_g2").unwrap();
-        #[cfg(feature = "vectors")]
-        let vectors = backend.vectors("hot_path_g2", "test-model", 2).unwrap();
-        let sql = backend.sql();
-
-        let before = backend.pool().reader_acquisition_snapshot();
-        assert_eq!(
-            entities
-                .count_entities("local", EntityFilter::default())
-                .await
-                .unwrap(),
-            0
-        );
-        assert_eq!(notes.count_notes("local", None).await.unwrap(), 0);
-        assert_eq!(graph.count_edges(EdgeFilter::default()).await.unwrap(), 0);
-        assert_eq!(
-            events.count_events(EventFilter::default()).await.unwrap(),
-            0
-        );
-        assert!(text
-            .get_document("local", uuid::Uuid::new_v4())
-            .await
-            .unwrap()
-            .is_none());
-        assert!(agents.get("no-such-agent").await.unwrap().is_none());
-        assert!(attachments
-            .get_attachment(uuid::Uuid::new_v4(), "primary")
-            .await
-            .unwrap()
-            .is_none());
-        assert_eq!(sparse.count().await.unwrap(), 0);
-        #[cfg(feature = "vectors")]
-        assert_eq!(vectors.count().await.unwrap(), 0);
-
-        let mut raw = sql.reader().await.unwrap();
-        assert!(matches!(
-            raw.query_scalar(SqlStatement {
-                sql: "SELECT 1".into(),
-                params: Vec::new(),
-                label: None,
-            })
-            .await
-            .unwrap(),
-            Some(SqlValue::Integer(1))
-        ));
-
-        let after = backend.pool().reader_acquisition_snapshot();
-        let expected_pooled_delta = 9 + u64::from(cfg!(feature = "vectors"));
-        assert_eq!(
-            after.pooled_checkouts - before.pooled_checkouts,
-            expected_pooled_delta,
-            "each ordinary file-backed read must check out exactly one pooled reader"
-        );
-        assert_eq!(
-            after.standalone_opens, before.standalone_opens,
-            "ADR-166 G2: ordinary file-backed read verbs must not open standalone readers"
-        );
-        assert_eq!(after.active_pooled_checkouts, 0);
-        assert_eq!(
-            after.completed_pooled_checkouts - before.completed_pooled_checkouts,
-            expected_pooled_delta
-        );
-    }
+    include!("backend_read_admission_tests.rs");
 
     #[cfg(unix)]
     #[tokio::test]
@@ -3799,3 +3733,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "backend_admission_tests.rs"]
+mod admission_tests;

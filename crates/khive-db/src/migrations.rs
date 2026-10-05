@@ -5,13 +5,77 @@
 //!   used by pack-scoped schemas.
 //! - **Versioned migrations** (`MIGRATIONS` / `run_migrations`): the forward-only
 //!   migration pipeline for the core tables.
+//!
+//! Raw migration entry points require an owned connection opened by rusqlite;
+//! externally owned handles wrapped with `Connection::from_handle` are unsupported.
+//! They reject an inherited transaction. A failure that cannot roll back retires
+//! the original connection before releasing its volume lease and leaves the
+//! caller with an inert replacement. Discard that connection on
+//! [`SqliteError::WriterSettlementUnknown`].
 
 use khive_storage::blob::ContentRef;
 use rusqlite::{Connection, OptionalExtension};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::SqliteError;
+use crate::pool::WriteAdmission;
 use crate::stores::blob::{try_acquire_database_gc_owner_for_path, DatabaseGcOwnerGuard};
+
+#[path = "raw_migration_settlement.rs"]
+mod raw_migration_settlement;
+use raw_migration_settlement::RawMigrationWriteUnit;
+
+/// Captured admission policy for a caller-owned raw SQLite connection.
+///
+/// Construction validates configuration without reading or writing a database.
+/// Cooperating callers must choose the same absolute volume-lock directory.
+/// A pooled caller should use its pool/backend migration methods instead of
+/// acquiring a second volume lease while holding a writer guard.
+#[derive(Clone, Debug)]
+pub struct MigrationWritePolicy {
+    disk_guard: crate::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
+}
+
+impl MigrationWritePolicy {
+    pub fn new(
+        disk_guard: crate::EffectiveDiskGuardConfig,
+        volume_lock_dir: impl Into<PathBuf>,
+    ) -> Result<Self, SqliteError> {
+        disk_guard.validate()?;
+        let volume_lock_dir = volume_lock_dir.into();
+        if !volume_lock_dir.is_absolute() {
+            return Err(SqliteError::InvalidConfig(
+                "migration volume-lock directory must be absolute".to_string(),
+            ));
+        }
+        Ok(Self {
+            disk_guard,
+            volume_lock_dir,
+        })
+    }
+
+    /// Resolve only explicit caller environment. This never discovers HOME or
+    /// chooses a private fallback namespace that other writers cannot share.
+    pub fn from_environment() -> Result<Self, SqliteError> {
+        let disk_guard = crate::DiskGuardEnvironment::capture().resolve(None, None)?;
+        let volume_lock_dir = std::env::var_os("KHIVE_VOLUME_LOCK_DIR").ok_or_else(|| {
+            SqliteError::CapacityUnavailable {
+                phase: khive_storage::CapacityUnavailablePhase::Lock,
+                message: "raw file-backed migration requires KHIVE_VOLUME_LOCK_DIR or MigrationWritePolicy".to_string(),
+            }
+        })?;
+        Self::new(disk_guard, PathBuf::from(volume_lock_dir))
+    }
+
+    pub fn disk_guard_config(&self) -> crate::EffectiveDiskGuardConfig {
+        self.disk_guard
+    }
+
+    pub fn volume_lock_dir(&self) -> &Path {
+        &self.volume_lock_dir
+    }
+}
 
 #[path = "session_identity_migration.rs"]
 mod session_identity_migration;
@@ -47,8 +111,49 @@ pub struct ServiceSchemaPlan {
 const SCHEMA_VERSION_TABLE: &str = include_str!("../sql/schema-version-table.sql");
 
 /// Apply a pack-scoped schema plan, tracking each migration in `_schema_versions`.
-pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<(), SqliteError> {
+/// The mutable borrow permits retiring an unsettled connection on failure;
+/// external callers must pass `&mut Connection` rather than `&Connection`.
+///
+/// # Aborts
+/// For an owned connection, if a retired original cannot return to autocommit
+/// after cleanup ROLLBACK and cannot close, aborts the process after reporting
+/// the database path, volume key, and both errors to stderr and tracing.
+pub fn apply_schema_plan(
+    conn: &mut Connection,
+    plan: &ServiceSchemaPlan,
+) -> Result<(), SqliteError> {
+    let admission = WriteAdmission::for_canonical_path(canonical_connection_database_path(conn)?)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| apply_schema_plan_with_admission(conn, plan, &admission))
+}
+
+/// Apply a raw connection's schema plan with a captured policy and lock namespace.
+/// This has the same mutable-borrow and owned-connection contract as [`apply_schema_plan`].
+///
+/// # Aborts
+/// Has the same terminal settlement abort condition as [`apply_schema_plan`].
+pub fn apply_schema_plan_with_policy(
+    conn: &mut Connection,
+    plan: &ServiceSchemaPlan,
+    policy: &MigrationWritePolicy,
+) -> Result<(), SqliteError> {
+    let admission =
+        WriteAdmission::for_migration_policy(canonical_connection_database_path(conn)?, policy)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| apply_schema_plan_with_admission(conn, plan, &admission))
+}
+
+/// The pooled caller owns a `WriterGuard`, which holds this admission's volume
+/// lease before acquiring the SQLite writer mutex. Raw callers use the public
+/// wrapper above to acquire the same lease themselves.
+pub(crate) fn apply_schema_plan_with_admission(
+    conn: &Connection,
+    plan: &ServiceSchemaPlan,
+    admission: &WriteAdmission,
+) -> Result<(), SqliteError> {
+    admission.check()?;
     conn.execute_batch(SCHEMA_VERSION_TABLE)?;
+    require_autocommit(conn, "schema-version bootstrap")?;
 
     for migration in plan.sqlite {
         // Serialize the admission decision with other writers. Checking the
@@ -56,6 +161,15 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
         // stale state and replay a migration after the first one commits.
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        if let Err(error) = admission.check() {
+            let rollback = tx.rollback();
+            return Err(capacity_refusal_after_rollback(
+                conn,
+                rollback,
+                error,
+                "service schema migration",
+            ));
+        }
 
         // Check if custom predicate says it's already applied
         if let Some(check) = migration.is_already_applied {
@@ -89,6 +203,35 @@ pub fn apply_schema_plan(conn: &Connection, plan: &ServiceSchemaPlan) -> Result<
     }
 
     Ok(())
+}
+
+fn require_autocommit(conn: &Connection, operation: &str) -> Result<(), SqliteError> {
+    if conn.is_autocommit() {
+        Ok(())
+    } else {
+        Err(SqliteError::InvalidData(format!(
+            "{operation} did not return the SQLite connection to autocommit"
+        )))
+    }
+}
+
+pub(crate) fn capacity_refusal_after_rollback(
+    conn: &Connection,
+    rollback: rusqlite::Result<()>,
+    refusal: SqliteError,
+    operation: &str,
+) -> SqliteError {
+    if let Err(error) = rollback {
+        return SqliteError::InvalidData(format!(
+            "{operation} capacity refusal could not roll back: {error}; initial refusal: {refusal}"
+        ));
+    }
+    if !conn.is_autocommit() {
+        return SqliteError::InvalidData(format!(
+            "{operation} capacity refusal rolled back without restoring autocommit; initial refusal: {refusal}"
+        ));
+    }
+    refusal
 }
 
 // =============================================================================
@@ -923,7 +1066,35 @@ fn stage_attachment_cutover_on_connection(conn: &Connection, now: i64) -> Result
 /// canonical database before entering this function and retain it through
 /// application backfill and finalization. This function owns one IMMEDIATE
 /// SQLite transaction; a failure leaves neither its DDL nor marker visible.
+///
+/// # Aborts
+/// Has the same owned-connection terminal settlement abort condition as [`apply_schema_plan`].
 pub fn stage_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteError> {
+    let admission = WriteAdmission::for_canonical_path(canonical_connection_database_path(conn)?)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| stage_attachment_cutover_with_admission(conn, &admission))
+}
+
+/// Stage raw attachment cutover with explicit admission configuration.
+/// The caller retains the database GC owner as required by [`stage_attachment_cutover`].
+///
+/// # Aborts
+/// Has the same terminal settlement abort condition as [`apply_schema_plan`].
+pub fn stage_attachment_cutover_with_policy(
+    conn: &mut Connection,
+    policy: &MigrationWritePolicy,
+) -> Result<(), SqliteError> {
+    let admission =
+        WriteAdmission::for_migration_policy(canonical_connection_database_path(conn)?, policy)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| stage_attachment_cutover_with_admission(conn, &admission))
+}
+
+/// Called with a pooled writer guard that already holds the volume lease.
+pub(crate) fn stage_attachment_cutover_with_admission(
+    conn: &mut Connection,
+    admission: &WriteAdmission,
+) -> Result<(), SqliteError> {
     match attachment_cutover_status(conn)? {
         AttachmentCutoverStatus::Complete => return Ok(()),
         AttachmentCutoverStatus::Pending | AttachmentCutoverStatus::Incomplete => {}
@@ -936,6 +1107,15 @@ pub fn stage_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteError
     }
 
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Err(error) = admission.check() {
+        let rollback = tx.rollback();
+        return Err(capacity_refusal_after_rollback(
+            conn,
+            rollback,
+            error,
+            "attachment cutover stage",
+        ));
+    }
     let status = attachment_cutover_status(&tx)?;
     if status == AttachmentCutoverStatus::Complete {
         return Ok(());
@@ -1107,11 +1287,48 @@ fn record_attachment_cutover_migration(conn: &Connection, now: i64) -> Result<()
 /// transition revalidates every legacy and attachment reference, verifies
 /// moodboard model role coverage, replaces the claim fences, removes the old
 /// column, marks the cutover complete, and records V21 in one transaction.
+///
+/// # Aborts
+/// Has the same owned-connection terminal settlement abort condition as [`apply_schema_plan`].
 pub fn finalize_attachment_cutover(conn: &mut Connection) -> Result<(), SqliteError> {
+    let admission = WriteAdmission::for_canonical_path(canonical_connection_database_path(conn)?)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| finalize_attachment_cutover_with_admission(conn, &admission))
+}
+
+/// Finalize raw attachment cutover with explicit admission configuration.
+/// The caller retains the database GC owner as required by [`finalize_attachment_cutover`].
+///
+/// # Aborts
+/// Has the same terminal settlement abort condition as [`apply_schema_plan`].
+pub fn finalize_attachment_cutover_with_policy(
+    conn: &mut Connection,
+    policy: &MigrationWritePolicy,
+) -> Result<(), SqliteError> {
+    let admission =
+        WriteAdmission::for_migration_policy(canonical_connection_database_path(conn)?, policy)?;
+    RawMigrationWriteUnit::new(conn, &admission)?
+        .run(|conn| finalize_attachment_cutover_with_admission(conn, &admission))
+}
+
+/// Called with a pooled writer guard that already holds the volume lease.
+pub(crate) fn finalize_attachment_cutover_with_admission(
+    conn: &mut Connection,
+    admission: &WriteAdmission,
+) -> Result<(), SqliteError> {
     if attachment_cutover_status(conn)? == AttachmentCutoverStatus::Complete {
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
+    if let Err(error) = admission.check() {
+        let rollback = tx.rollback();
+        return Err(capacity_refusal_after_rollback(
+            conn,
+            rollback,
+            error,
+            "attachment cutover finalization",
+        ));
+    }
     match attachment_cutover_status(&tx)? {
         AttachmentCutoverStatus::Complete => return Ok(()),
         AttachmentCutoverStatus::Pending => {
@@ -1388,9 +1605,10 @@ fn canonical_connection_database_path(conn: &Connection) -> Result<Option<PathBu
     if raw_path.is_empty() {
         return Ok(None);
     }
-    std::fs::canonicalize(&raw_path)
-        .map(Some)
-        .map_err(SqliteError::Io)
+    let canonical = std::fs::canonicalize(&raw_path)?;
+    #[cfg(any(unix, windows))]
+    crate::pool::opened_sqlite_file_identity(conn, &canonical)?;
+    Ok(Some(canonical))
 }
 
 fn validate_database_gc_owner(
@@ -1408,8 +1626,35 @@ fn validate_database_gc_owner(
     Ok(())
 }
 
+/// Run core migrations on an owned raw connection with explicit environment policy.
+///
+/// # Aborts
+/// Has the same terminal settlement abort condition as [`apply_schema_plan`].
 pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
     let database_path = canonical_connection_database_path(conn)?;
+    let admission = WriteAdmission::for_canonical_path(database_path.clone())?;
+    run_raw_migrations_with_admission(conn, database_path, &admission)
+}
+
+/// Run raw connection migrations with a captured policy and lock namespace.
+/// Do not call while holding a pooled writer; use [`crate::ConnectionPool::run_migrations`].
+///
+/// # Aborts
+/// Has the same terminal settlement abort condition as [`apply_schema_plan`].
+pub fn run_migrations_with_policy(
+    conn: &mut Connection,
+    policy: &MigrationWritePolicy,
+) -> Result<u32, SqliteError> {
+    let database_path = canonical_connection_database_path(conn)?;
+    let admission = WriteAdmission::for_migration_policy(database_path.clone(), policy)?;
+    run_raw_migrations_with_admission(conn, database_path, &admission)
+}
+
+fn run_raw_migrations_with_admission(
+    conn: &mut Connection,
+    database_path: Option<PathBuf>,
+    admission: &WriteAdmission,
+) -> Result<u32, SqliteError> {
     if let Some(database_path) = database_path {
         // This raw API may have been handed a connection behind an opaque pool
         // writer guard. Never wait here and invert the canonical
@@ -1420,23 +1665,32 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, SqliteError> {
                 "failed to acquire database GC owner before schema migration: {error}"
             ))
         })?;
-        return run_migrations_with_database_gc_owner(conn, &owner);
+        return RawMigrationWriteUnit::new(conn, admission)?
+            .run(|conn| run_migrations_with_database_gc_owner(conn, &owner, admission));
     }
 
     // A raw in-memory connection has no durable/cross-process GC domain. The
     // production in-memory backend still uses the owner-aware path below.
-    run_migrations_with_busy_timeout(conn)
+    RawMigrationWriteUnit::new(conn, admission)?
+        .run(|conn| run_migrations_with_busy_timeout(conn, admission))
 }
 
+/// The caller must hold this admission's volume lease before it obtains a
+/// pooled writer, and retain the lease through this call. `run_migrations`
+/// acquires its own lease for raw connections.
 pub(crate) fn run_migrations_with_database_gc_owner(
     conn: &mut Connection,
     owner: &DatabaseGcOwnerGuard,
+    admission: &WriteAdmission,
 ) -> Result<u32, SqliteError> {
     validate_database_gc_owner(conn, owner)?;
-    run_migrations_with_busy_timeout(conn)
+    run_migrations_with_busy_timeout(conn, admission)
 }
 
-fn run_migrations_with_busy_timeout(conn: &mut Connection) -> Result<u32, SqliteError> {
+fn run_migrations_with_busy_timeout(
+    conn: &mut Connection,
+    admission: &WriteAdmission,
+) -> Result<u32, SqliteError> {
     // Concurrent boots (multiple processes migrating the same file) contend on
     // the write lock below; a short hot-path busy_timeout cannot wait out a
     // sibling's migration. Raise-only to a 5s floor — never reduce a caller
@@ -1446,15 +1700,20 @@ fn run_migrations_with_busy_timeout(conn: &mut Connection) -> Result<u32, Sqlite
     if raised {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
     }
-    let result = run_migrations_locked(conn);
+    let result = run_migrations_locked(conn, admission);
     if raised {
         let _ = conn.busy_timeout(std::time::Duration::from_millis(prior_busy_ms.max(0) as u64));
     }
     result
 }
 
-fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
+fn run_migrations_locked(
+    conn: &mut Connection,
+    admission: &WriteAdmission,
+) -> Result<u32, SqliteError> {
+    admission.check()?;
     conn.execute_batch(MIGRATION_TRACKING_TABLE)?;
+    require_autocommit(conn, "migration-tracking bootstrap")?;
 
     let current_version: u32 = read_schema_version(conn)?;
 
@@ -1525,6 +1784,15 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 version: migration.version,
                 error: e.to_string(),
             })?;
+        if let Err(error) = admission.check() {
+            let rollback = tx.rollback();
+            return Err(capacity_refusal_after_rollback(
+                conn,
+                rollback,
+                error,
+                "versioned schema migration",
+            ));
+        }
 
         // Re-check under the write lock: a sibling process may have applied
         // this migration (and possibly later ones) while we waited. Running
@@ -1813,6 +2081,44 @@ pub(crate) fn query_embedding_models_conn(
 // Tests
 // =============================================================================
 
+// Explicit fixture entry points use the same validated public policy APIs.
+// Production compatibility names never get a cfg(test) admission bypass.
+#[cfg(test)]
+pub(crate) fn migration_test_policy() -> MigrationWritePolicy {
+    MigrationWritePolicy::new(
+        crate::DiskGuardEnvironment::capture()
+            .resolve(None, None)
+            .expect("test disk policy"),
+        crate::PoolConfig::for_test()
+            .volume_lock_dir
+            .expect("test lock namespace"),
+    )
+    .expect("valid test migration policy")
+}
+
+#[cfg(test)]
+pub(crate) fn run_migrations_for_test(conn: &mut Connection) -> Result<u32, SqliteError> {
+    run_migrations_with_policy(conn, &migration_test_policy())
+}
+
+#[cfg(test)]
+fn apply_schema_plan_for_test(
+    conn: &mut Connection,
+    plan: &ServiceSchemaPlan,
+) -> Result<(), SqliteError> {
+    apply_schema_plan_with_policy(conn, plan, &migration_test_policy())
+}
+
+#[cfg(test)]
+fn stage_attachment_cutover_for_test(conn: &mut Connection) -> Result<(), SqliteError> {
+    stage_attachment_cutover_with_policy(conn, &migration_test_policy())
+}
+
+#[cfg(test)]
+fn finalize_attachment_cutover_for_test(conn: &mut Connection) -> Result<(), SqliteError> {
+    finalize_attachment_cutover_with_policy(conn, &migration_test_policy())
+}
+
 #[cfg(test)]
 #[path = "entity_version_migration_measurement.rs"]
 mod entity_version_measurement;
@@ -1820,6 +2126,10 @@ mod entity_version_measurement;
 #[cfg(test)]
 #[path = "migrations_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "raw_migration_settlement_tests.rs"]
+mod raw_settlement_tests;
 
 #[cfg(test)]
 #[path = "git_note_index_migration_tests.rs"]

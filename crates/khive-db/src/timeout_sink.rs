@@ -1229,6 +1229,31 @@ pub(crate) fn maybe_emit_busy(db: &str, site: Site, err: &rusqlite::Error) {
     }
 }
 
+/// A typed direct transaction can fail at `BEGIN IMMEDIATE`, before its DML
+/// closure runs. Follow the driver source chain at the completed operation
+/// boundary so that busy errors from both BEGIN and the body reach the same
+/// standalone timeout site exactly once. `execute_direct_transaction` owns
+/// SQLITE_FULL escalation, so this helper emits only busy/locked rows.
+pub(crate) fn maybe_emit_busy_storage_error(
+    db: &str,
+    site: Site,
+    error: &khive_storage::StorageError,
+) {
+    let mut cause: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(sqlite_error) = cause.downcast_ref::<rusqlite::Error>() {
+            if is_busy_or_locked(sqlite_error) {
+                emit_timeout(db, site, &sqlite_error.to_string(), None);
+            }
+            return;
+        }
+        let Some(source) = cause.source() else {
+            return;
+        };
+        cause = source;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

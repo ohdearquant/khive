@@ -148,7 +148,7 @@ impl SqlAttachmentStore {
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool
-                .try_writer()
+                .autocommit_write_unit()
                 .map_err(|error| map_sqlite_err(error, operation))?;
             f(guard.conn())
                 .map_err(|error| map_err(error, operation))

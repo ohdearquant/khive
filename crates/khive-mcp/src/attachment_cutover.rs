@@ -432,7 +432,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("legacy.db");
         let (entity_id, content_ref) = create_v20_database_fixture(&db_path, "visual_asset", None);
-        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        let backend = Arc::new(StorageBackend::sqlite_for_test(&db_path).unwrap());
 
         assert_eq!(
             backend.prepare_core_schema().unwrap(),
@@ -488,7 +488,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("legacy-model.db");
         create_v20_database_fixture(&db_path, "moodboard_model", None);
-        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        let backend = Arc::new(StorageBackend::sqlite_for_test(&db_path).unwrap());
         assert_eq!(
             backend.prepare_core_schema().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1
@@ -530,7 +530,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("legacy-model.db");
         create_v20_database_fixture(&db_path, "moodboard_model", None);
-        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        let backend = Arc::new(StorageBackend::sqlite_for_test(&db_path).unwrap());
         assert_eq!(
             backend.prepare_core_schema().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1
@@ -561,7 +561,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("secondary.db");
         create_v20_database_fixture(&db_path, "visual_asset", Some(2));
-        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        let backend = Arc::new(StorageBackend::sqlite_for_test(&db_path).unwrap());
         assert_eq!(
             backend.prepare_core_schema().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1
@@ -579,7 +579,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("concurrent-boot.db");
         create_v20_database_fixture(&db_path, "visual_asset", None);
-        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        let backend = Arc::new(StorageBackend::sqlite_for_test(&db_path).unwrap());
         assert_eq!(
             backend.prepare_core_schema().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1
@@ -623,7 +623,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("secondary-race.db");
         create_v20_database_fixture(&db_path, "visual_asset", None);
-        let backend = Arc::new(StorageBackend::sqlite(&db_path).unwrap());
+        let backend = Arc::new(StorageBackend::sqlite_for_test(&db_path).unwrap());
         assert_eq!(
             backend.prepare_core_schema().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1

@@ -301,6 +301,16 @@ fn khive_root_from(home: Option<String>, userprofile: Option<String>) -> PathBuf
         .join(".khive")
 }
 
+/// The db layer receives this path and never resolves the operator's HOME.
+pub fn volume_lock_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("KHIVE_VOLUME_LOCK_DIR") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+    khive_dir().join("sqlite-volume-locks")
+}
+
 /// See [`khive_dir`] for why the two arms differ.
 #[cfg(unix)]
 fn last_resort_root() -> PathBuf {
@@ -3864,53 +3874,7 @@ pub fn env_truthy(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(test)]
-mod khive_root_tests {
-    use super::khive_root_from;
-    use std::path::PathBuf;
-
-    #[test]
-    fn home_wins_when_set() {
-        assert_eq!(
-            khive_root_from(Some("/base/home".into()), Some("/other".into())),
-            PathBuf::from("/base/home/.khive")
-        );
-    }
-
-    #[test]
-    fn userprofile_backfills_missing_home() {
-        assert_eq!(
-            khive_root_from(None, Some("/profile/home".into())),
-            PathBuf::from("/profile/home/.khive")
-        );
-    }
-
-    #[test]
-    fn blank_values_are_skipped() {
-        assert_eq!(
-            khive_root_from(Some("  ".into()), Some("/profile/home".into())),
-            PathBuf::from("/profile/home/.khive")
-        );
-    }
-
-    #[cfg(not(unix))]
-    #[test]
-    fn fallback_is_never_cwd_relative() {
-        // On non-unix the lock anchor must not depend on the caller's working
-        // directory even when no home variable is set — a relative path here
-        // would give the same database different lock files per cwd.
-        assert!(khive_root_from(None, None).is_absolute());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_fallback_stays_historical_not_shared_tmp() {
-        // On unix the no-HOME last resort deliberately stays "./.khive"
-        // rather than a shared world-writable anchor like /tmp, which a
-        // local attacker could pre-claim to intercept the daemon socket.
-        assert_eq!(khive_root_from(None, None), PathBuf::from("./.khive"));
-    }
-}
+include!("daemon_khive_root_tests.rs");
 
 /// Serve one already-admitted test connection through the production frame handler.
 ///
@@ -4657,6 +4621,7 @@ mod tests {
                 std::env::vars_os().filter(|(key, _)| !key.to_string_lossy().starts_with("KHIVE_")),
             )
             .env("HOME", &child_home)
+            .env("KHIVE_VOLUME_LOCK_DIR", dir.path().join("volume-locks"))
             .env_remove("LATTICE_MODEL_CACHE")
             .env("KHIVE_TEST_HARNESS", "1")
             .env("KHIVE_DRAIN_TEST_CHILD", "1")

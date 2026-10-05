@@ -393,17 +393,56 @@ pub(crate) fn direct_backend_with_max_readers(
         ..crate::RuntimeConfig::no_embeddings()
     };
     let wal_ceiling = config.resolve_wal_ceiling_policy(read_only)?;
-    direct_backend_with_max_readers_and_wal_ceiling(db_path, read_only, max_readers, wal_ceiling)
+    let disk_guard = config.resolve_disk_guard_policy(read_only)?;
+    direct_backend_with_policies(
+        db_path,
+        read_only,
+        max_readers,
+        wal_ceiling,
+        disk_guard,
+        config.volume_lock_dir,
+    )
 }
 
 /// Open the direct event lane with the policy already resolved for its main backend.
-pub(crate) fn direct_backend_with_max_readers_and_wal_ceiling(
+#[cfg(test)]
+fn direct_backend_with_max_readers_and_wal_ceiling(
     db_path: &Path,
     read_only: bool,
     max_readers: Option<usize>,
     wal_ceiling: WalCeilingPolicy,
 ) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
+    let mut config = crate::RuntimeConfig {
+        db_path: Some(db_path.to_path_buf()),
+        ..crate::RuntimeConfig::no_embeddings()
+    };
+    let disk_guard = config.resolve_disk_guard_policy(read_only)?;
+    direct_backend_with_policies(
+        db_path,
+        read_only,
+        max_readers,
+        wal_ceiling,
+        disk_guard,
+        config.volume_lock_dir,
+    )
+}
+
+pub(crate) fn direct_backend_with_policies(
+    db_path: &Path,
+    read_only: bool,
+    max_readers: Option<usize>,
+    wal_ceiling: WalCeilingPolicy,
+    disk_guard: Option<khive_db::EffectiveDiskGuardConfig>,
+    volume_lock_dir: PathBuf,
+) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
     wal_ceiling.validate_static(true, true, read_only)?;
+    if !read_only {
+        disk_guard
+            .ok_or_else(|| {
+                crate::error::RuntimeError::Internal("missing events disk policy".into())
+            })?
+            .validate()?;
+    }
     let mut registry = direct_backend_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -454,6 +493,15 @@ pub(crate) fn direct_backend_with_max_readers_and_wal_ceiling(
                 key.display()
             )));
         }
+        let numbers = |p: Option<khive_db::EffectiveDiskGuardConfig>| {
+            p.map(|p| (p.reserve_bytes, p.guard_deadline_ms))
+        };
+        if numbers(existing.pool().effective_disk_guard_config()) != numbers(disk_guard) {
+            return Err(crate::error::RuntimeError::Internal(
+                "events database is already open with a different disk reserve/deadline policy"
+                    .into(),
+            ));
+        }
         let existing_bytes = existing.pool().config().wal_ceiling.bytes;
         if existing_bytes != wal_ceiling.bytes {
             return Err(khive_db::SqliteError::InvalidConfig(format!(
@@ -492,7 +540,15 @@ pub(crate) fn direct_backend_with_max_readers_and_wal_ceiling(
             wal_ceiling,
         )?
     } else {
-        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(db_path, max_readers, wal_ceiling)?
+        StorageBackend::sqlite_with_max_readers_and_policies(
+            db_path,
+            max_readers,
+            wal_ceiling,
+            disk_guard.ok_or_else(|| {
+                crate::error::RuntimeError::Internal("missing events disk policy".into())
+            })?,
+            volume_lock_dir,
+        )?
     });
     registry.insert(key, (read_only, Arc::clone(&backend)));
     Ok(backend)
@@ -1038,9 +1094,22 @@ pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
         ..crate::RuntimeConfig::no_embeddings()
     };
     match config.resolve_wal_ceiling_policy(false) {
-        Ok(wal_ceiling) => {
-            supervise_events_daemon_with_wal_ceiling(db_path, socket_path, wal_ceiling).await;
-        }
+        Ok(wal_ceiling) => match config.resolve_disk_guard_policy(false) {
+            Ok(Some(policy)) => {
+                supervise_events_daemon_with_policies(
+                    db_path,
+                    socket_path,
+                    wal_ceiling,
+                    policy,
+                    config.volume_lock_dir,
+                )
+                .await
+            }
+            Ok(None) => unreachable!("file-backed event daemon"),
+            Err(error) => {
+                tracing::warn!(%error, "invalid disk policy; events supervisor not started")
+            }
+        },
         Err(error) => {
             tracing::warn!(error = %error, "invalid WAL ceiling; events supervisor not started");
         }
@@ -1054,6 +1123,37 @@ pub async fn supervise_events_daemon_with_wal_ceiling(
     socket_path: PathBuf,
     wal_ceiling: WalCeilingPolicy,
 ) {
+    let config = crate::RuntimeConfig::no_embeddings();
+    let disk_guard = match config.disk_guard_environment.resolve(None, None) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!(%error, "invalid disk policy; events supervisor not started");
+            return;
+        }
+    };
+    supervise_events_daemon_with_policies(
+        db_path,
+        socket_path,
+        wal_ceiling,
+        disk_guard,
+        config.volume_lock_dir,
+    )
+    .await;
+}
+
+/// Supervise using the main pool's captured writer policies and lock directory.
+#[cfg(unix)]
+pub async fn supervise_events_daemon_with_policies(
+    db_path: PathBuf,
+    socket_path: PathBuf,
+    wal_ceiling: WalCeilingPolicy,
+    disk_guard: khive_db::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
+) {
+    if let Err(error) = disk_guard.validate() {
+        tracing::warn!(%error, "invalid disk policy; events supervisor not started");
+        return;
+    }
     if let Err(error) = wal_ceiling.validate_static(true, true, false) {
         tracing::warn!(error = %error, "invalid WAL ceiling; events supervisor not started");
         return;
@@ -1095,8 +1195,15 @@ pub async fn supervise_events_daemon_with_wal_ceiling(
         if !reachable && child.is_none() {
             match std::env::current_exe() {
                 Ok(exe) => {
-                    let spawned =
-                        events_daemon_command(&exe, &db_path, &socket_path, wal_ceiling).spawn();
+                    let spawned = events_daemon_command_with_policies(
+                        &exe,
+                        &db_path,
+                        &socket_path,
+                        wal_ceiling,
+                        disk_guard,
+                        &volume_lock_dir,
+                    )
+                    .spawn();
                     match spawned {
                         Ok(spawned_child) => {
                             respawns += 1;
@@ -1133,12 +1240,31 @@ pub async fn supervise_events_daemon_with_wal_ceiling(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn events_daemon_command(
     executable: &Path,
     db_path: &Path,
     socket_path: &Path,
     wal_ceiling: WalCeilingPolicy,
+) -> std::process::Command {
+    events_daemon_command_with_policies(
+        executable,
+        db_path,
+        socket_path,
+        wal_ceiling,
+        khive_db::EffectiveDiskGuardConfig::default(),
+        &crate::daemon::volume_lock_dir(),
+    )
+}
+
+#[cfg(unix)]
+fn events_daemon_command_with_policies(
+    executable: &Path,
+    db_path: &Path,
+    socket_path: &Path,
+    wal_ceiling: WalCeilingPolicy,
+    disk_guard: khive_db::EffectiveDiskGuardConfig,
+    volume_lock_dir: &Path,
 ) -> std::process::Command {
     let source = match wal_ceiling.source {
         khive_db::WalCeilingSource::BackendField => "backend_field",
@@ -1156,6 +1282,18 @@ fn events_daemon_command(
         .arg(wal_ceiling.bytes.to_string())
         .arg("--wal-ceiling-source")
         .arg(source)
+        .arg("--disk-reserve-bytes")
+        .arg(disk_guard.reserve_bytes.to_string())
+        .arg("--disk-guard-deadline-ms")
+        .arg(disk_guard.guard_deadline_ms.to_string())
+        .arg("--disk-reserve-source")
+        .arg(disk_guard.reserve_source.as_str())
+        .arg("--disk-deadline-source")
+        .arg(disk_guard.deadline_source.as_str())
+        .arg("--disk-legacy-environment-present")
+        .arg(disk_guard.legacy_environment_present.to_string())
+        .arg("--volume-lock-dir")
+        .arg(volume_lock_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1187,7 +1325,17 @@ pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Re
         ..crate::RuntimeConfig::no_embeddings()
     };
     let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
-    run_events_daemon_with_wal_ceiling(db_path, socket_path, wal_ceiling).await
+    let disk_guard = config
+        .resolve_disk_guard_policy(false)?
+        .expect("file-backed event daemon");
+    run_events_daemon_with_policies(
+        db_path,
+        socket_path,
+        wal_ceiling,
+        disk_guard,
+        config.volume_lock_dir,
+    )
+    .await
 }
 
 /// Serve the events daemon with a policy already resolved by its host.
@@ -1197,6 +1345,28 @@ pub async fn run_events_daemon_with_wal_ceiling(
     socket_path: &Path,
     wal_ceiling: WalCeilingPolicy,
 ) -> anyhow::Result<()> {
+    let config = crate::RuntimeConfig::no_embeddings();
+    let disk_guard = config.disk_guard_environment.resolve(None, None)?;
+    run_events_daemon_with_policies(
+        db_path,
+        socket_path,
+        wal_ceiling,
+        disk_guard,
+        config.volume_lock_dir,
+    )
+    .await
+}
+
+/// Serve using the exact policies inherited from the opened main backend.
+#[cfg(unix)]
+pub async fn run_events_daemon_with_policies(
+    db_path: &Path,
+    socket_path: &Path,
+    wal_ceiling: WalCeilingPolicy,
+    disk_guard: khive_db::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
+) -> anyhow::Result<()> {
+    disk_guard.validate()?;
     wal_ceiling
         .validate_static(true, true, false)
         .map_err(crate::error::RuntimeError::from)?;
@@ -1237,8 +1407,14 @@ pub async fn run_events_daemon_with_wal_ceiling(
     // file's mode; the check after the open below opens nothing.
     let before_open = harden_events_db_sidecars(db_path)?;
     let backend = Arc::new(
-        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(db_path, None, wal_ceiling)
-            .map_err(crate::error::RuntimeError::from)?,
+        StorageBackend::sqlite_with_max_readers_and_policies(
+            db_path,
+            None,
+            wal_ceiling,
+            disk_guard,
+            volume_lock_dir,
+        )
+        .map_err(crate::error::RuntimeError::from)?,
     );
     // Ensure the schema once, loudly, before accepting traffic.
     backend.events()?;
@@ -2595,132 +2771,7 @@ mod tests {
     // final slice of this series; these tests cover the naming and
     // classification contracts the module itself defines.
 
-    #[test]
-    fn sidecar_name_derives_from_the_full_file_name() {
-        let path = events_db_path_beside(Path::new("/data/khive.db"));
-        assert!(path.ends_with("khive.db.events.db"), "got {path:?}");
-    }
-
-    #[test]
-    fn databases_sharing_a_stem_get_distinct_sidecars() {
-        let a = events_db_path_beside(Path::new("/data/a.db"));
-        let b = events_db_path_beside(Path::new("/data/a.sqlite"));
-        assert_ne!(a, b, "a.db and a.sqlite must not share an event plane");
-        assert!(a.ends_with("a.db.events.db"), "got {a:?}");
-        assert!(b.ends_with("a.sqlite.events.db"), "got {b:?}");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn directory_aliases_resolve_to_one_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real");
-        std::fs::create_dir(&real).unwrap();
-        let alias = dir.path().join("alias");
-        std::os::unix::fs::symlink(&real, &alias).unwrap();
-        assert_eq!(
-            events_db_path_beside(&real.join("khive.db")),
-            events_db_path_beside(&alias.join("khive.db")),
-            "a symlinked spelling of one directory must not mint a second sidecar"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn final_component_aliases_of_one_database_share_one_sidecar() {
-        // Backend identity canonicalizes the whole database path, so a
-        // final-component symlink alias is the same database; its sidecar
-        // and socket must be the same too, or a process opening one spelling
-        // writes event rows a process opening the other never reads.
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real.db");
-        std::fs::write(&real, b"").unwrap();
-        let alias = dir.path().join("alias.db");
-        std::os::unix::fs::symlink(&real, &alias).unwrap();
-        let real_sidecar = events_db_path_beside(&real);
-        let alias_sidecar = events_db_path_beside(&alias);
-        assert_eq!(
-            real_sidecar, alias_sidecar,
-            "a symlink alias of one database file must not mint a second event store"
-        );
-        assert_eq!(
-            events_socket_path_beside(&real_sidecar),
-            events_socket_path_beside(&alias_sidecar),
-        );
-        // Control: a genuinely distinct database in the same directory keeps
-        // its own sidecar — resolution must not collapse different files.
-        let other = dir.path().join("other.db");
-        std::fs::write(&other, b"").unwrap();
-        assert_ne!(events_db_path_beside(&other), real_sidecar);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dangling_alias_derives_the_target_sidecar_on_cold_start() {
-        // Event-path derivation runs before backend creation, so the alias
-        // can be consulted while its target does not exist yet — the first
-        // open through the alias is what creates the target. A dangling
-        // link must therefore already derive the TARGET's sidecar, or an
-        // alias-first cold start and a later target-spelled process split
-        // the event store between them.
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real.db");
-        let alias = dir.path().join("alias.db");
-        std::os::unix::fs::symlink(&real, &alias).unwrap();
-        // Neither real.db nor its sidecar exists at this point.
-        assert_eq!(
-            events_db_path_beside(&alias),
-            events_db_path_beside(&real),
-            "a dangling alias must derive the same sidecar its target will use"
-        );
-        // Chain: a link to a link resolves all the way down.
-        let chain = dir.path().join("chain.db");
-        std::os::unix::fs::symlink(&alias, &chain).unwrap();
-        assert_eq!(events_db_path_beside(&chain), events_db_path_beside(&real));
-        // Control: a distinct nonexistent file still gets its own sidecar.
-        assert_ne!(
-            events_db_path_beside(&dir.path().join("unrelated.db")),
-            events_db_path_beside(&real)
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn planted_symlink_at_the_sidecar_path_is_refused() {
-        // The sidecar path is derived, never user-chosen, so a pre-existing
-        // symlink there is a planted redirect: following it would tighten
-        // permissions on and write event rows into the link's target.
-        let dir = tempfile::tempdir().unwrap();
-        let _registry_guard = TestRegistryGuard::new(dir.path());
-        let victim = dir.path().join("victim.txt");
-        std::fs::write(&victim, b"victim-bytes").unwrap();
-        let mode_before = victim.metadata().unwrap().permissions();
-        let sidecar = dir.path().join("khive.db.events.db");
-        std::os::unix::fs::symlink(&victim, &sidecar).unwrap();
-        let err = match direct_backend_for(&sidecar) {
-            Ok(_) => panic!("a planted symlink at the sidecar path must be refused"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("symlink"), "got: {err}");
-        // The link's target is untouched: content intact, mode not tightened.
-        assert_eq!(std::fs::read(&victim).unwrap(), b"victim-bytes");
-        assert_eq!(victim.metadata().unwrap().permissions(), mode_before);
-        // A dangling link is refused too, and nothing is created at its
-        // target — without the refusal, the open itself would mint the
-        // redirect target.
-        let ghost_target = dir.path().join("ghost.db");
-        let dangling = dir.path().join("other.db.events.db");
-        std::os::unix::fs::symlink(&ghost_target, &dangling).unwrap();
-        assert!(direct_backend_for(&dangling).is_err());
-        assert!(
-            !ghost_target.exists(),
-            "refusal must not create the redirect target"
-        );
-        // Control: a regular path proceeds and the backend opens.
-        let regular = dir.path().join("plain.db.events.db");
-        direct_backend_for(&regular).expect("regular sidecar path must open");
-        assert!(regular.exists());
-    }
+    include!("events_sidecar_path_tests.rs");
 
     #[cfg(unix)]
     #[test]

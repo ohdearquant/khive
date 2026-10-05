@@ -580,14 +580,11 @@ mod tests {
             khive_db::ConnectionPool::new(khive_db::PoolConfig {
                 path: Some(db_path),
                 write_queue_enabled: Some(false),
-                ..khive_db::PoolConfig::default()
+                ..khive_db::PoolConfig::for_test()
             })
             .expect("pool"),
         );
-        {
-            let mut writer = pool.writer().expect("writer");
-            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-        }
+        pool.run_migrations().expect("migrations");
         let sql: Arc<dyn SqlAccess> = Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
 
         record_serve(
@@ -679,13 +676,10 @@ mod tests {
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
             write_queue_enabled: Some(true),
-            ..khive_db::PoolConfig::default()
+            ..khive_db::PoolConfig::for_test()
         };
         let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
-        {
-            let mut writer = pool.writer().expect("writer");
-            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-        }
+        pool.run_migrations().expect("migrations");
         let sql: std::sync::Arc<dyn SqlAccess> =
             std::sync::Arc::new(khive_db::SqlBridge::new(std::sync::Arc::clone(&pool), true));
 

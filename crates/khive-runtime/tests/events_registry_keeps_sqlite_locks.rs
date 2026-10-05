@@ -112,7 +112,8 @@ fn run_lock_order(read_only_first: bool) {
     // The scrub above must not turn off the database test-harness guards.
     command
         .env("KHIVE_TEST_HARNESS", "1")
-        .env("HOME", &child_home);
+        .env("HOME", &child_home)
+        .env("KHIVE_VOLUME_LOCK_DIR", dir.path().join("volume-locks"));
     command.env(
         CHILD_MODE,
         if read_only_first {

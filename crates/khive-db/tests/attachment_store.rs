@@ -23,7 +23,7 @@ fn setup() -> (Arc<ConnectionPool>, SqlAttachmentStore) {
     let pool = Arc::new(
         ConnectionPool::new(PoolConfig {
             path: None,
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("pool"),
     );

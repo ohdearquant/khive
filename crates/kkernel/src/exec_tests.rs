@@ -1315,6 +1315,8 @@ fn exec_config_id_matches_serve_config_id_for_multi_backend_topology() {
                 served_kinds: None,
                 read_only: false,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
             },
             BackendConfig {
                 name: "sessions".to_string(),
@@ -1325,6 +1327,8 @@ fn exec_config_id_matches_serve_config_id_for_multi_backend_topology() {
                 served_kinds: None,
                 read_only: false,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
             },
         ],
         packs: {
@@ -1440,6 +1444,8 @@ async fn build_local_fallback_server_routes_through_multi_backend_when_backends_
                 served_kinds: None,
                 read_only: false,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
             },
             BackendConfig {
                 name: "secondary".to_string(),
@@ -1450,6 +1456,8 @@ async fn build_local_fallback_server_routes_through_multi_backend_when_backends_
                 served_kinds: None,
                 read_only: false,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
             },
         ],
         packs: {
@@ -1576,6 +1584,8 @@ async fn build_local_fallback_server_uses_captured_anchor_after_home_changes() {
             served_kinds: None,
             read_only: false,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
         }],
         ..KhiveConfig::default()
     };

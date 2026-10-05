@@ -28,6 +28,7 @@ use khive_types::SubstrateKind;
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::sql_bridge::bind_params;
+use crate::writer_task::execute_wrapped_transaction;
 
 /// The exact `DELETE` this store's `delete` issues, for a given vector table
 /// (ADR-099 B3 r6 structural cut — see `stores::entity`'s sibling block).
@@ -294,9 +295,9 @@ impl SqliteVecStore {
         self.with_writer_unmanaged(op, f).await
     }
 
-    /// Legacy pool-mutex write path; bypasses the WriterTask channel
-    /// unconditionally. Reserved for closures that manage their own
-    /// transaction. See
+    /// Direct pool-mutex write path; bypasses the WriterTask channel
+    /// unconditionally. Owns one admitted transaction around the closure.
+    /// The closure must contain DML only. See
     /// crates/khive-db/docs/api/vectors.md#with_writer--with_writer_unmanaged--writertask-routing-adr-067-component-a-fork-c-slice-2
     async fn with_writer_unmanaged<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
@@ -305,16 +306,26 @@ impl SqliteVecStore {
     {
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-            f(guard.conn())
-                .map_err(|e| {
-                    crate::timeout_sink::maybe_emit_sqlite_full(
-                        &crate::timeout_sink::db_label(&pool),
-                        &e,
-                    );
+            let guard = pool
+                .transaction_write_unit()
+                .map_err(|e| map_sqlite_err(e, op))
+                .inspect_err(|error| pool.record_direct_writer_error(error))?;
+            let conn = guard.conn();
+            let _tx_handle = khive_storage::tx_registry::register_scoped(
+                Some(format!("{op}_tx")),
+                pool.origin(),
+            );
+            let db_label = crate::timeout_sink::db_label(&pool);
+            let (result, terminal_state) = execute_wrapped_transaction(conn, op, move |conn| {
+                f(conn).map_err(|e| {
+                    crate::timeout_sink::maybe_emit_sqlite_full(&db_label, &e);
                     map_err(e, op)
                 })
-                .inspect_err(|error| pool.record_direct_writer_error(error))
+            });
+            if terminal_state.is_some() {
+                pool.retire_pooled_writer(conn);
+            }
+            result.inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Vectors, op, e))?
@@ -396,15 +407,9 @@ impl SqliteVecStore {
                 .await;
         }
 
-        let origin = self.pool.origin();
         self.with_writer(operation, move |connection| {
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some(format!("{operation}_tx")),
-                origin,
-            );
-            let transaction = connection.unchecked_transaction()?;
             replace_vector_row_dml(
-                &transaction,
+                connection,
                 &table,
                 dims,
                 VectorRowRef {
@@ -419,8 +424,7 @@ impl SqliteVecStore {
                 },
                 record_ann_delta,
                 failpoint_flag,
-            )?;
-            transaction.commit()
+            )
         })
         .await
     }
@@ -1076,17 +1080,10 @@ impl VectorStore for SqliteVecStore {
                 .await;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
-        let origin = self.pool.origin();
+        // The direct pooled fallback opens and admits one transaction before
+        // this DML body, then settles it after the complete batch.
         self.with_writer("vec_insert_batch", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("vector_insert_batch".to_string()),
-                origin,
-            );
-
-            let summary = batch_insert_vectors_dml(
+            batch_insert_vectors_dml(
                 conn,
                 &table,
                 dims,
@@ -1094,11 +1091,7 @@ impl VectorStore for SqliteVecStore {
                 &records,
                 attempted,
                 failpoint_flag,
-            )?;
-
-            conn.execute_batch("COMMIT")?;
-
-            Ok(summary)
+            )
         })
         .await
     }
@@ -1241,21 +1234,11 @@ impl VectorStore for SqliteVecStore {
                 .await;
         }
 
-        // Explicitly disabled or degraded fallback path: the closure owns its own transaction via
-        // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
-        // shared helper the WriterTask/batch paths use (#546).
-        let origin = self.pool.origin();
+        // The direct pooled fallback owns the admitted transaction. The
+        // DELETE+INSERT body is shared with the WriterTask/batch paths (#546).
         self.with_writer("vec_update", move |conn| {
-            // ADR-091 Plank 0: registered before the transaction is opened — see
-            // the matching note in `insert()` above for the drop-order rationale.
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("vec_update_tx".to_string()),
-                origin,
-            );
-            let tx = conn.unchecked_transaction()?;
-
             replace_vector_row_dml(
-                &tx,
+                conn,
                 &table,
                 dims,
                 VectorRowRef {
@@ -1270,9 +1253,7 @@ impl VectorStore for SqliteVecStore {
                 },
                 true,
                 failpoint_flag,
-            )?;
-
-            tx.commit()
+            )
         })
         .await
     }
@@ -1499,26 +1480,13 @@ impl VectorStore for SqliteVecStore {
                 });
         }
 
-        // The unmanaged path must own an RAII transaction rather than use an
-        // outermost SAVEPOINT. `Transaction` rolls back on early DML errors and
-        // also when COMMIT fails while SQLite leaves the transaction open,
-        // preventing a poisoned transaction from returning to the pool.
+        // The direct pooled path owns an admitted transaction around all
+        // chunks and verifies rollback/autocommit before returning the writer.
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteVecDeleteSubjects);
         let table_for_error = table.clone();
-        let origin = self.pool.origin();
         self.with_writer_unmanaged("vec_delete_subjects", move |conn| {
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("vec_delete_subjects".to_string()),
-                origin,
-            );
-            let tx = rusqlite::Transaction::new_unchecked(
-                conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-            let deleted = delete_vector_subjects_dml(conn, &table, &id_strings)?;
-            tx.commit()?;
-            Ok(deleted)
+            delete_vector_subjects_dml(conn, &table, &id_strings)
         })
         .await
         .map_err(|e| {
@@ -1689,39 +1657,12 @@ impl VectorStore for SqliteVecStore {
                 .await;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own transaction via
-        // `Transaction::new_unchecked`.
+        // The direct pooled fallback owns the admitted transaction around
+        // this DML body and verifies rollback/autocommit on every outcome.
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteOrphanSweep);
-        let origin = self.pool.origin();
         self.with_writer_unmanaged("orphan_sweep", move |conn| {
-            // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
-            // rollback via its Drop impl: it checks `conn.is_autocommit()` and issues
-            // ROLLBACK when the connection still has an open transaction — covering both
-            // early-`?` errors AND a COMMIT that fails with SQLITE_BUSY (BUSY leaves
-            // the transaction open, so autocommit is false, and Drop rolls back).
-            // The hand-rolled guard used previously set `done = true` before COMMIT,
-            // which would have skipped the Drop-ROLLBACK on a BUSY COMMIT and re-poisoned
-            // the pool.  Using the native primitive avoids that class of bug entirely.
-            //
-            // `with_writer_unmanaged` serialises all callers through the pool mutex — at
-            // most one writer closure executes on this connection at a time, so no nested
-            // transactions can exist when this line runs.
-            //
-            // ADR-091 Plank 0: registered before the transaction is opened — see the
-            // matching note in `insert()` for the drop-order rationale (the handle,
-            // declared first, drops after `tx`'s own Drop/rollback runs).
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("vec_orphan_sweep".to_string()),
-                origin,
-            );
-            let tx = rusqlite::Transaction::new_unchecked(
-                conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-
-            let result = orphan_sweep_dml(
+            orphan_sweep_dml(
                 conn,
                 &table,
                 ns_json.as_deref(),
@@ -1729,11 +1670,7 @@ impl VectorStore for SqliteVecStore {
                 allow_json.as_deref(),
                 max_delete,
                 dry_run,
-            )?;
-
-            tx.commit()?;
-
-            Ok(result)
+            )
         })
         .await
     }

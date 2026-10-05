@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::PoolConfig;
+use khive_storage::WriterTaskRequestState;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
 use serial_test::serial;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2627,12 +2628,10 @@ async fn pooled_transaction_rollback_failure_reports_unknown_and_retires_writer(
         "a connection with an unverified rollback must never be checked out again"
     );
 
-    let legacy = store.pool.legacy_conn();
-    let legacy_guard = legacy.lock();
-    let direct_probe = legacy_guard.query_row("SELECT 1", [], |row| row.get::<_, i64>(0));
+    let direct_probe = store.pool.probe_retired_pooled_writer_for_test();
     assert!(
         direct_probe.is_err(),
-        "the compatibility raw-connection handle must not bypass retirement quarantine"
+        "the retired pooled connection's authorizer must still quarantine raw SQL"
     );
 }
 
@@ -2674,10 +2673,10 @@ async fn pooled_transaction_panic_with_failed_rollback_reports_unknown_and_retir
 #[tokio::test]
 async fn pooled_transaction_refuses_preexisting_non_autocommit_connection() {
     let store = setup_memory_store();
-    {
-        let writer = store.pool.try_writer().unwrap();
-        writer.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
-    }
+    store
+        .pool
+        .leave_pooled_writer_transaction_open_for_test()
+        .unwrap();
     let operation_ran = Arc::new(AtomicBool::new(false));
     let operation_ran_in_closure = Arc::clone(&operation_ran);
 

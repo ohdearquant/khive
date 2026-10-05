@@ -787,7 +787,7 @@ mod tests {
         }
         let root = tempfile::tempdir().unwrap();
         let db = root.path().join("source.db");
-        let seed = StorageBackend::sqlite(&db).unwrap();
+        let seed = StorageBackend::sqlite_for_test(&db).unwrap();
         seed.prepare_core_schema().unwrap();
         drop(seed);
         let before = std::fs::read(&db).unwrap();
@@ -1164,7 +1164,7 @@ mod tests {
     /// Resolves through [`resolve_runtime_config`] exactly like the ingest
     /// path itself rather than opening `db` directly: ADR-170 routes event
     /// persistence to a sidecar database beside the main store, so a raw
-    /// `StorageBackend::sqlite(db).events()` read (the main store's own,
+    /// `StorageBackend::sqlite_for_test(db).events()` read (the main store's own,
     /// pre-ADR-170 event table) silently finds nothing.
     async fn only_findings_ingest_event(db: &Path, config: &Path) -> khive_storage::Event {
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
@@ -1307,7 +1307,7 @@ mod tests {
             assert_eq!(request.args["record_counts"]["edges"], 1);
         }
 
-        let backend = StorageBackend::sqlite(&db).expect("open denied-ingest database");
+        let backend = StorageBackend::sqlite_for_test(&db).expect("open denied-ingest database");
         let sql = backend.sql();
         let mut reader = sql.reader().await.expect("acquire denied-ingest reader");
         for table in ["entities", "notes", "graph_edges"] {
@@ -1401,7 +1401,7 @@ mod tests {
             "gate error must occur before the direct-write section begins"
         );
 
-        let backend = StorageBackend::sqlite(&db).expect("open errored-ingest database");
+        let backend = StorageBackend::sqlite_for_test(&db).expect("open errored-ingest database");
         let sql = backend.sql();
         let mut reader = sql.reader().await.expect("acquire errored-ingest reader");
         for table in ["entities", "notes", "graph_edges"] {
@@ -1441,7 +1441,7 @@ mod tests {
     }
 
     async fn soft_delete_mapped_batch(db: &Path, batch: &CodeIngestBatch) {
-        let backend = StorageBackend::sqlite(db).expect("open tombstone writer");
+        let backend = StorageBackend::sqlite_for_test(db).expect("open tombstone writer");
         let sql = backend.sql();
         let mut writer = sql.writer().await.expect("acquire tombstone writer");
 
@@ -1490,7 +1490,7 @@ mod tests {
     /// satisfies that guard by snapshot-copying and freezing sidecars; this
     /// assertion needs only three scalar reads on the live fixture file.
     async fn assert_mapped_batch_remains_tombstoned(db: &Path, batch: &CodeIngestBatch) {
-        let backend = StorageBackend::sqlite(db).expect("open tombstone reader");
+        let backend = StorageBackend::sqlite_for_test(db).expect("open tombstone reader");
         let sql = backend.sql();
         let mut reader = sql.reader().await.expect("acquire tombstone reader");
 
@@ -1826,7 +1826,7 @@ mod tests {
         // Dry run of the "existing WAL database" scenario
         // reproduced against (e.g. a live daemon holding the db open while
         // an admin separately runs `code-ingest --dry-run`).
-        let pin = StorageBackend::sqlite(&db).expect("open pin backend");
+        let pin = StorageBackend::sqlite_for_test(&db).expect("open pin backend");
         {
             let sql = pin.sql();
             let mut writer = sql.writer().await.expect("pin writer");

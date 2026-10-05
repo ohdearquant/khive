@@ -3,7 +3,7 @@
 //! Transport nesting limits and removal of a nested operation's domain result
 //! belong to the transport boundary, not to this lossless shared projection.
 
-use khive_storage::StorageCapability;
+use khive_storage::{StorageCapability, StorageError};
 use serde_json::{json, Value};
 
 use crate::{DomainDisposition, RuntimeError};
@@ -198,7 +198,14 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         | RuntimeError::CrossNamespaceWrite { .. }
         | RuntimeError::WriteBudgetExceeded { .. }
         | RuntimeError::DeadlineExceeded { .. }) => {
-            if let Some(context) = other.writer_task_failure_context() {
+            if let Some(capacity) = sqlite_capacity_failure(&other) {
+                let mut value = capacity.into_value(other.to_string());
+                if let Some(context) = other.writer_task_failure_context() {
+                    value["request_state"] = json!(context.request_state.to_string());
+                    value["task_terminated"] = json!(context.task_terminated);
+                }
+                value
+            } else if let Some(context) = other.writer_task_failure_context() {
                 json!({"kind":"storage", "code":context.stage, "stage":context.stage,
                     "message":other.to_string(), "retryable":context.retryable,
                     "request_state":context.request_state.to_string(), "task_terminated":context.task_terminated})
@@ -225,6 +232,150 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
     value
 }
 
+enum SqliteCapacityFailure {
+    Refused {
+        volume: String,
+        available_bytes: u64,
+        reserve_bytes: u64,
+        required_headroom_bytes: u64,
+    },
+    Unavailable {
+        phase: khive_storage::CapacityUnavailablePhase,
+    },
+    NativeFull {
+        primary_code: i32,
+        extended_code: i32,
+    },
+}
+
+impl SqliteCapacityFailure {
+    fn into_value(self, message: String) -> Value {
+        match self {
+            Self::Refused {
+                volume,
+                available_bytes,
+                reserve_bytes,
+                required_headroom_bytes,
+            } => json!({
+                "kind": "storage",
+                "code": "sqlite_capacity_refused",
+                "stage": "sqlite_capacity_refused",
+                "message": message,
+                "retryable": false,
+                "capability": "sql",
+                "volume": volume,
+                "available_bytes": available_bytes,
+                "reserve_bytes": reserve_bytes,
+                "required_headroom_bytes": required_headroom_bytes,
+            }),
+            Self::Unavailable { phase } => json!({
+                "kind": "storage",
+                "code": "sqlite_capacity_unavailable",
+                "stage": "sqlite_capacity_unavailable",
+                "message": message,
+                "retryable": false,
+                "capability": "sql",
+                "phase": phase.as_str(),
+            }),
+            Self::NativeFull {
+                primary_code,
+                extended_code,
+            } => json!({
+                "kind": "storage",
+                "code": "sqlite_disk_full",
+                "stage": "sqlite_disk_full",
+                "message": message,
+                "retryable": false,
+                "capability": "sql",
+                "sqlite_primary_code": primary_code,
+                "sqlite_extended_code": extended_code,
+            }),
+        }
+    }
+}
+
+fn sqlite_capacity_failure(error: &RuntimeError) -> Option<SqliteCapacityFailure> {
+    match error {
+        RuntimeError::Storage(storage) => sqlite_capacity_failure_from_storage(storage),
+        RuntimeError::Sqlite(sqlite) => sqlite_capacity_failure_from_sqlite(sqlite),
+        _ => None,
+    }
+}
+
+fn sqlite_capacity_failure_from_storage(error: &StorageError) -> Option<SqliteCapacityFailure> {
+    match error {
+        StorageError::CapacityFloor {
+            capability: StorageCapability::Sql,
+            volume,
+            available_bytes,
+            floor_bytes,
+            required_headroom_bytes,
+        } => Some(SqliteCapacityFailure::Refused {
+            volume: volume.clone(),
+            available_bytes: *available_bytes,
+            reserve_bytes: *floor_bytes,
+            required_headroom_bytes: *required_headroom_bytes,
+        }),
+        StorageError::CapacityUnavailable {
+            capability: StorageCapability::Sql,
+            phase,
+            ..
+        } => Some(SqliteCapacityFailure::Unavailable { phase: *phase }),
+        StorageError::WriterTaskRequestFailed { source, .. } => {
+            sqlite_capacity_failure_from_storage(source)
+        }
+        StorageError::Driver { source, .. } => {
+            if let Some(sqlite) = source.downcast_ref::<khive_db::SqliteError>() {
+                sqlite_capacity_failure_from_sqlite(sqlite)
+            } else {
+                native_sqlite_full(source.as_ref())
+            }
+        }
+        _ => None,
+    }
+}
+
+fn sqlite_capacity_failure_from_sqlite(
+    error: &khive_db::SqliteError,
+) -> Option<SqliteCapacityFailure> {
+    match error {
+        khive_db::SqliteError::CapacityFloor {
+            volume,
+            available_bytes,
+            floor_bytes,
+            required_headroom_bytes,
+        } => Some(SqliteCapacityFailure::Refused {
+            volume: volume.clone(),
+            available_bytes: *available_bytes,
+            reserve_bytes: *floor_bytes,
+            required_headroom_bytes: *required_headroom_bytes,
+        }),
+        khive_db::SqliteError::CapacityUnavailable { phase, .. } => {
+            Some(SqliteCapacityFailure::Unavailable { phase: *phase })
+        }
+        khive_db::SqliteError::Rusqlite(sqlite) => native_sqlite_full(sqlite),
+        _ => None,
+    }
+}
+
+fn native_sqlite_full(error: &(dyn std::error::Error + 'static)) -> Option<SqliteCapacityFailure> {
+    let mut source = Some(error);
+    while let Some(current) = source {
+        if let Some(rusqlite::Error::SqliteFailure(code, _)) =
+            current.downcast_ref::<rusqlite::Error>()
+        {
+            if code.code == rusqlite::ErrorCode::DiskFull {
+                return Some(SqliteCapacityFailure::NativeFull {
+                    primary_code: code.extended_code & 0xff,
+                    extended_code: code.extended_code,
+                });
+            }
+        }
+        source = current.source();
+    }
+    None
+}
+
 fn storage_capability_wire_name(capability: StorageCapability) -> &'static str {
     match capability {
         StorageCapability::Sql => "sql",
@@ -246,9 +397,81 @@ mod tests {
     use crate::{
         AuditObligationFailure, DenialAuditOutcome, DenialReceipt, DomainDisposition, RuntimeError,
     };
-    use khive_storage::StorageCapability;
+    use khive_storage::{CapacityUnavailablePhase, StorageCapability, StorageError};
     use khive_types::{Details, ErrorCode, ErrorDomain, KhiveError};
     use serde_json::json;
+
+    #[test]
+    fn capacity_phase_projection_preserves_writer_request_settlement() {
+        for phase in [
+            CapacityUnavailablePhase::Identity,
+            CapacityUnavailablePhase::Lock,
+            CapacityUnavailablePhase::Probe,
+        ] {
+            let value = runtime_error_value(
+                RuntimeError::Storage(StorageError::WriterTaskRequestFailed {
+                    request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+                    source: Box::new(StorageError::CapacityUnavailable {
+                        capability: StorageCapability::Sql,
+                        phase,
+                        message: "unavailable".into(),
+                    }),
+                }),
+                DomainDisposition::Unknown,
+            );
+            assert_eq!(value["code"], "sqlite_capacity_unavailable");
+            assert_eq!(value["phase"], phase.as_str());
+            assert_eq!(value["request_state"], "transaction_rolled_back");
+            assert_eq!(value["task_terminated"], false);
+            assert_eq!(value["retryable"], false);
+        }
+    }
+
+    #[test]
+    fn sqlite_capacity_stages_preserve_typed_evidence_and_do_not_retry() {
+        let refused = runtime_error_value(
+            RuntimeError::Storage(StorageError::CapacityFloor {
+                capability: StorageCapability::Sql,
+                volume: "/volume".to_string(),
+                available_bytes: 99,
+                floor_bytes: 100,
+                required_headroom_bytes: 12,
+            }),
+            DomainDisposition::Unknown,
+        );
+        assert_eq!(refused["stage"], "sqlite_capacity_refused");
+        assert_eq!(refused["available_bytes"], 99);
+        assert_eq!(refused["reserve_bytes"], 100);
+        assert_eq!(refused["required_headroom_bytes"], 12);
+        assert_eq!(refused["retryable"], false);
+
+        let unavailable = runtime_error_value(
+            RuntimeError::Storage(StorageError::CapacityUnavailable {
+                capability: StorageCapability::Sql,
+                phase: CapacityUnavailablePhase::Lock,
+                message: "bounded lease timed out".to_string(),
+            }),
+            DomainDisposition::Unknown,
+        );
+        assert_eq!(unavailable["stage"], "sqlite_capacity_unavailable");
+        assert_eq!(unavailable["phase"], "lock");
+        assert_eq!(unavailable["retryable"], false);
+
+        let full = runtime_error_value(
+            RuntimeError::Storage(StorageError::driver(
+                StorageCapability::Sql,
+                "write",
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                    None,
+                ),
+            )),
+            DomainDisposition::Unknown,
+        );
+        assert_eq!(full["stage"], "sqlite_disk_full");
+        assert_eq!(full["sqlite_primary_code"], rusqlite::ffi::SQLITE_FULL);
+        assert_eq!(full["retryable"], false);
+    }
 
     #[test]
     fn missing_subject_projection_is_typed_without_matching_error_text() {

@@ -495,17 +495,20 @@ fn start_daemon_components_if_daemon(
     #[cfg(unix)]
     if server.default_runtime_is_read_only() {
         tracing::info!("read-only deployment: events daemon supervision skipped");
-    } else if let (Some(split), Some(wal_ceiling)) = (
+    } else if let (Some(split), Some(wal_ceiling), Some((disk_guard, volume_lock_dir))) = (
         server.events_split_config(),
         server.events_wal_ceiling_policy(),
+        server.events_disk_policy(),
     ) {
         if let Some(socket) = split.socket_path.clone() {
             khive_runtime::daemon::track_named_background_task(
                 "events_daemon_supervision",
-                khive_runtime::events_split::supervise_events_daemon_with_wal_ceiling(
+                khive_runtime::events_split::supervise_events_daemon_with_policies(
                     split.db_path.clone(),
                     socket,
                     wal_ceiling,
+                    disk_guard,
+                    volume_lock_dir,
                 ),
             );
         }
@@ -2516,6 +2519,8 @@ fn effective_backend_configs(backends: &[BackendConfig], force_memory: bool) -> 
                     kind: BackendKind::Memory,
                     path: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     ..backend.clone()
                 }
             } else {
@@ -2662,7 +2667,7 @@ fn verify_reused_backend_alias_identity(
 
 /// Open the entire declared topology against one pre-open snapshot. The
 /// injectable opener makes the snapshot→SQLite-open race executable without a
-/// scheduler or global hook; production passes `open_backend_with_wal_ceiling`.
+/// scheduler or global hook; production captures both writer policies in `open_backend_with_policies`.
 fn open_effective_backends_with<F>(
     config: &RuntimeConfig,
     effective_backends: &[BackendConfig],
@@ -2712,6 +2717,17 @@ where
                         path: canon.clone(),
                         first_bytes: *first_bytes,
                         second_bytes: effective_bytes,
+                    }
+                    .into());
+                }
+                if disk_guard_numbers(existing.pool().effective_disk_guard_config())
+                    != disk_guard_numbers(
+                        backend_cfg.resolve_disk_guard(&config.disk_guard_environment)?,
+                    )
+                {
+                    return Err(khive_runtime::ConfigError::DiskGuardAliasConflict {
+                        first_backend: first_name.clone(),
+                        second_backend: backend_cfg.name.clone(),
                     }
                     .into());
                 }
@@ -2810,6 +2826,7 @@ pub fn validate_wal_ceiling_topology(
     backends: &[BackendConfig],
     force_memory: bool,
 ) -> anyhow::Result<()> {
+    validate_disk_guard_topology(config, backends, force_memory)?;
     let effective = effective_backend_configs(backends, force_memory);
     let mut by_identity: HashMap<BackendAliasIdentity, (&str, u64)> = HashMap::new();
     for backend in &effective {
@@ -2832,6 +2849,39 @@ pub fn validate_wal_ceiling_topology(
             }
         } else {
             by_identity.insert(identity, (&backend.name, effective_bytes));
+        }
+    }
+    Ok(())
+}
+
+fn disk_guard_numbers(policy: Option<khive_db::EffectiveDiskGuardConfig>) -> Option<(u64, u64)> {
+    policy.map(|p| (p.reserve_bytes, p.guard_deadline_ms))
+}
+
+/// Validate every disk policy from the same captured snapshot before any open.
+fn validate_disk_guard_topology(
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<()> {
+    let mut policies: HashMap<BackendAliasIdentity, (String, Option<(u64, u64)>)> = HashMap::new();
+    for backend in effective_backend_configs(backends, force_memory) {
+        let policy = backend.resolve_disk_guard(&config.disk_guard_environment)?;
+        let Some(path) = canonical_backend_path(&backend)? else {
+            continue;
+        };
+        let identity = backend_alias_identity(&backend.name, &path)?;
+        let numbers = disk_guard_numbers(policy);
+        if let Some((first_name, first_policy)) = policies.get(&identity) {
+            if *first_policy != numbers {
+                return Err(khive_runtime::ConfigError::DiskGuardAliasConflict {
+                    first_backend: first_name.clone(),
+                    second_backend: backend.name.clone(),
+                }
+                .into());
+            }
+        } else {
+            policies.insert(identity, (backend.name, numbers));
         }
     }
     Ok(())
@@ -3000,7 +3050,15 @@ pub async fn migrate_configured_storage_topology(
                 &base_config,
                 &plan.effective_backends,
                 &selected,
-                open_backend_with_wal_ceiling,
+                |cfg, max_readers, wal| {
+                    open_backend_with_policies(
+                        cfg,
+                        max_readers,
+                        wal,
+                        cfg.resolve_disk_guard(&base_config.disk_guard_environment)?,
+                        &base_config.volume_lock_dir,
+                    )
+                },
             )
             .await?,
         ]);
@@ -3524,7 +3582,15 @@ async fn prepare_configured_storage_topology(
         &base_config,
         &effective_backends,
         max_readers,
-        open_backend_with_wal_ceiling,
+        |cfg, max_readers, wal| {
+            open_backend_with_policies(
+                cfg,
+                max_readers,
+                wal,
+                cfg.resolve_disk_guard(&base_config.disk_guard_environment)?,
+                &base_config.volume_lock_dir,
+            )
+        },
     )?;
 
     let main_backend = backends
@@ -4659,6 +4725,7 @@ fn open_single_backend(
     max_readers: Option<usize>,
 ) -> anyhow::Result<StorageBackend> {
     let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
+    let disk_guard = config.resolve_disk_guard_policy(false)?;
     let backend = match &config.db_path {
         Some(path) => {
             if let Some(parent) = path.parent() {
@@ -4669,11 +4736,17 @@ fn open_single_backend(
                     )
                 })?;
             }
-            StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, max_readers, wal_ceiling)
-                .map_err(|error| {
-                    let context = format!("open single SQLite backend: {error}");
-                    anyhow::Error::new(error).context(context)
-                })?
+            StorageBackend::sqlite_with_max_readers_and_policies(
+                path,
+                max_readers,
+                wal_ceiling,
+                disk_guard.expect("file-backed policy"),
+                config.volume_lock_dir.clone(),
+            )
+            .map_err(|error| {
+                let context = format!("open single SQLite backend: {error}");
+                anyhow::Error::new(error).context(context)
+            })?
         }
         None => StorageBackend::memory()
             .map_err(|error| anyhow::anyhow!("open single in-memory backend: {error}"))?,
@@ -4820,10 +4893,34 @@ fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Resu
     open_backend_with_wal_ceiling(cfg, max_readers, khive_db::WalCeilingPolicy::default())
 }
 
+#[cfg(test)]
 fn open_backend_with_wal_ceiling(
     cfg: &BackendConfig,
     max_readers: Option<usize>,
     wal_ceiling: khive_db::WalCeilingPolicy,
+) -> anyhow::Result<StorageBackend> {
+    let config = RuntimeConfig::no_embeddings();
+    let lock_dir = cfg
+        .path
+        .as_ref()
+        .map(|path| khive_runtime::expand_tilde(path))
+        .and_then(|path| path.parent().map(|parent| parent.join("volume-locks")))
+        .unwrap_or_else(|| config.volume_lock_dir.clone());
+    open_backend_with_policies(
+        cfg,
+        max_readers,
+        wal_ceiling,
+        cfg.resolve_disk_guard(&config.disk_guard_environment)?,
+        &lock_dir,
+    )
+}
+
+fn open_backend_with_policies(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    wal_ceiling: khive_db::WalCeilingPolicy,
+    disk_guard: Option<khive_db::EffectiveDiskGuardConfig>,
+    volume_lock_dir: &std::path::Path,
 ) -> anyhow::Result<StorageBackend> {
     match cfg.kind {
         BackendKind::Memory => StorageBackend::memory()
@@ -4858,10 +4955,12 @@ fn open_backend_with_wal_ceiling(
                     anyhow::Error::new(error).context(context)
                 })
             } else {
-                let backend = StorageBackend::sqlite_with_max_readers_and_wal_ceiling(
+                let backend = StorageBackend::sqlite_with_max_readers_and_policies(
                     &expanded,
                     max_readers,
                     wal_ceiling,
+                    disk_guard.expect("validated writable SQLite disk policy"),
+                    volume_lock_dir.to_path_buf(),
                 )
                 .map_err(|error| {
                     let context = format!("backend {}: sqlite open: {error}", cfg.name);
@@ -5394,7 +5493,11 @@ fn resolve_runtime_wal_ceiling(
     backends: &[BackendConfig],
     force_memory: bool,
 ) -> anyhow::Result<()> {
+    if backends.is_empty() && !force_memory {
+        config.resolve_disk_guard_policy(false)?;
+    }
     if force_memory {
+        config.disk_guard_config = None;
         config.wal_ceiling_bytes = 0;
         config.wal_ceiling_configured_bytes = 0;
         config.wal_ceiling_source = khive_runtime::WalCeilingSource::Default;
@@ -5670,6 +5773,8 @@ mod tests {
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: Some(8192),
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: true,
         };
@@ -5693,6 +5798,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             };
@@ -5743,6 +5850,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             };
@@ -5782,6 +5891,8 @@ mod tests {
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: false,
         };
@@ -5894,6 +6005,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             },
@@ -5906,6 +6019,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             },
@@ -5938,6 +6053,8 @@ mod tests {
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: false,
         }];
@@ -7107,6 +7224,8 @@ id = "lambda:project-actor"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7117,6 +7236,8 @@ id = "lambda:project-actor"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7196,6 +7317,8 @@ id = "lambda:project-actor"
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: false,
         };
@@ -7303,6 +7426,8 @@ id = "lambda:project-actor"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7313,6 +7438,8 @@ id = "lambda:project-actor"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7364,6 +7491,8 @@ id = "lambda:project-actor"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7374,6 +7503,8 @@ id = "lambda:project-actor"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -7506,6 +7637,8 @@ id = "lambda:project-actor"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 })
@@ -7581,6 +7714,8 @@ id = "lambda:project-actor"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7724,6 +7859,8 @@ id = "lambda:project-actor"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7841,6 +7978,8 @@ id = "lambda:project-actor"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7925,6 +8064,8 @@ id = "lambda:project-actor"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -7960,6 +8101,8 @@ id = "lambda:project-actor"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -8062,6 +8205,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -8342,6 +8487,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -8387,6 +8534,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -8599,6 +8748,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: true,
             }],
@@ -8666,6 +8817,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: true,
             }],
@@ -8723,6 +8876,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8733,6 +8888,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -8790,6 +8947,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -8800,6 +8959,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8859,6 +9020,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8869,6 +9032,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8946,6 +9111,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8956,6 +9123,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -8966,6 +9135,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9051,6 +9222,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9061,6 +9234,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9113,6 +9288,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9123,6 +9300,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9164,6 +9343,8 @@ region = "us-east-1"
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: false,
         });
@@ -9664,6 +9845,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9674,6 +9857,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9750,6 +9935,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9760,6 +9947,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -9853,6 +10042,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9896,6 +10087,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -9958,6 +10151,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -10044,6 +10239,8 @@ region = "us-east-1"
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: true,
         };
@@ -10092,6 +10289,8 @@ region = "us-east-1"
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: false,
         };
@@ -10122,6 +10321,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -10132,6 +10333,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only,
                 },
@@ -10240,6 +10443,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: main_read_only,
                 },
@@ -10250,6 +10455,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: comm_read_only,
                 },
@@ -10362,6 +10569,8 @@ region = "us-east-1"
                     served_kinds: None,
                     read_only: false,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                 },
                 BackendConfig {
                     name: "blob-store".to_string(),
@@ -10372,6 +10581,8 @@ region = "us-east-1"
                     served_kinds: None,
                     read_only: blob_read_only,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                 },
             ],
             packs: HashMap::from([(
@@ -10443,273 +10654,7 @@ region = "us-east-1"
         }
     }
 
-    fn duplicate_sqlite_path_config(db_path: &std::path::Path) -> KhiveConfig {
-        use khive_runtime::PackConfig;
-
-        KhiveConfig {
-            backends: vec![
-                BackendConfig {
-                    name: "main".to_string(),
-                    kind: BackendKind::Sqlite,
-                    path: Some(db_path.to_path_buf()),
-                    cache_mb: None,
-                    journal_mode: None,
-                    wal_ceiling_bytes: None,
-                    served_kinds: None,
-                    read_only: false,
-                },
-                BackendConfig {
-                    name: "alias".to_string(),
-                    kind: BackendKind::Sqlite,
-                    path: Some(db_path.to_path_buf()),
-                    cache_mb: None,
-                    journal_mode: None,
-                    wal_ceiling_bytes: None,
-                    served_kinds: None,
-                    read_only: false,
-                },
-            ],
-            packs: {
-                let mut packs = std::collections::HashMap::new();
-                packs.insert(
-                    "comm".to_string(),
-                    PackConfig {
-                        backend: "alias".to_string(),
-                        no_embed: false,
-                    },
-                );
-                packs
-            },
-            ..KhiveConfig::default()
-        }
-    }
-
-    #[test]
-    fn wal_disclosure_memory_main_does_not_disable_file_secondary() {
-        let config = RuntimeConfig {
-            db_path: None,
-            wal_ceiling_configured_bytes: 8192,
-            wal_ceiling_bytes: 8192,
-            wal_ceiling_source: khive_runtime::WalCeilingSource::Environment,
-            wal_ceiling_env_raw: Some("8192".into()),
-            ..RuntimeConfig::no_embeddings()
-        };
-        let mut topology =
-            duplicate_sqlite_path_config(std::path::Path::new("unused-secondary.db"));
-        topology.backends[0].kind = BackendKind::Memory;
-        topology.backends[0].path = None;
-        let line = resolved_wal_ceiling_disclosure(&config, &topology.backends, false);
-        assert!(line.contains("alias: configured_bytes=8192 effective_bytes=8192 source=environment enabled=true status=enforced"), "SECONDARY_FILE_POLICY_DISCLOSURE: {line}");
-        assert!(line.contains("main: configured_bytes=0 effective_bytes=0 source=default enabled=false status=disabled"));
-        let forced = resolved_wal_ceiling_disclosure(&config, &topology.backends, true);
-        assert_eq!(
-            forced
-                .matches("effective_bytes=0 source=default enabled=false")
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn wal_ceiling_aliases_reject_unequal_effective_limits_before_open() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("not-created.db");
-        let mut topology = duplicate_sqlite_path_config(&path);
-        topology.backends[0].wal_ceiling_bytes = Some(8192);
-        topology.backends[1].wal_ceiling_bytes = Some(16384);
-        let runtime = RuntimeConfig::default();
-
-        let error = validate_wal_ceiling_topology(&runtime, &topology.backends, false)
-            .expect_err("one physical writer cannot have two limits");
-        assert!(matches!(
-            error.downcast_ref::<khive_runtime::ConfigError>(),
-            Some(khive_runtime::ConfigError::WalCeilingAliasConflict { .. })
-        ));
-        assert!(!path.exists(), "static validation must not open a database");
-
-        topology.backends[0].read_only = true;
-        topology.backends[1].read_only = true;
-        validate_wal_ceiling_topology(&runtime, &topology.backends, false)
-            .expect("read-only aliases both enforce zero");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wal_ceiling_missing_paths_share_identity_through_symlink_parent() {
-        let cwd = std::env::current_dir().unwrap();
-        let dir = tempfile::Builder::new()
-            .prefix("wal-alias-")
-            .tempdir_in(&cwd)
-            .unwrap();
-        let real = dir.path().join("real");
-        let link = dir.path().join("link");
-        std::fs::create_dir(&real).unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let database = real.join("not-created/deeper/database.db");
-        let relative = link
-            .strip_prefix(&cwd)
-            .unwrap()
-            .join("not-created/deeper/database.db");
-        for alias in [link.join("not-created/deeper/database.db"), relative] {
-            let mut topology = duplicate_sqlite_path_config(&database);
-            topology.backends[1].path = Some(alias);
-            topology.backends[0].wal_ceiling_bytes = Some(8192);
-            topology.backends[1].wal_ceiling_bytes = Some(16384);
-            let error = validate_wal_ceiling_topology(
-                &RuntimeConfig::no_embeddings(),
-                &topology.backends,
-                false,
-            )
-            .expect_err("MISSING_ALIAS_POLICY_CONFLICT");
-            assert!(matches!(
-                error.downcast_ref::<khive_runtime::ConfigError>(),
-                Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
-                    first_bytes: 8192,
-                    second_bytes: 16384,
-                    ..
-                })
-            ));
-            assert!(
-                !database.parent().unwrap().exists(),
-                "validation must not create missing path components"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wal_ceiling_hard_link_aliases_reject_conflicting_policy_before_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("main.db");
-        let alias = dir.path().join("alias.db");
-        std::fs::write(&main, b"").unwrap();
-        std::fs::hard_link(&main, &alias).unwrap();
-        let mut topology = duplicate_sqlite_path_config(&main);
-        topology.backends[1].path = Some(alias);
-        topology.backends[0].wal_ceiling_bytes = Some(8192);
-        topology.backends[1].wal_ceiling_bytes = Some(16384);
-
-        let error =
-            validate_wal_ceiling_topology(&RuntimeConfig::default(), &topology.backends, false)
-                .expect_err("hard-linked aliases must enforce the same writer ceiling");
-        assert!(matches!(
-            error.downcast_ref::<khive_runtime::ConfigError>(),
-            Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
-                first_bytes: 8192,
-                second_bytes: 16384,
-                ..
-            })
-        ));
-        assert_eq!(std::fs::metadata(&main).unwrap().len(), 0);
-
-        for backend in &mut topology.backends {
-            backend.read_only = true;
-        }
-        validate_wal_ceiling_topology(&RuntimeConfig::default(), &topology.backends, false)
-            .expect("read-only hard-linked aliases enforce zero despite configured values");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wal_ceiling_cached_hard_link_alias_rejects_conflicting_policy() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("main.db");
-        let alias = dir.path().join("alias.db");
-        drop(rusqlite::Connection::open(&main).unwrap());
-        std::fs::hard_link(&main, &alias).unwrap();
-        let mut topology = duplicate_sqlite_path_config(&main);
-        topology.backends[1].path = Some(alias);
-        topology.backends[0].wal_ceiling_bytes = Some(0);
-        topology.backends[1].wal_ceiling_bytes = Some(8192);
-        let mut opened = Vec::new();
-
-        let error = open_effective_backends_with(
-            &RuntimeConfig::default(),
-            &topology.backends,
-            None,
-            |cfg, max_readers, policy| {
-                opened.push(cfg.name.clone());
-                assert_eq!(policy.bytes, 0, "only the disabled main should be opened");
-                assert_eq!(policy.source, khive_db::WalCeilingSource::BackendField);
-                open_backend_with_wal_ceiling(cfg, max_readers, policy)
-            },
-        )
-        .err()
-        .expect("cached physical aliases must not silently inherit another writer policy");
-        assert_eq!(opened, ["main"]);
-        assert!(matches!(
-            error.downcast_ref::<khive_runtime::ConfigError>(),
-            Some(khive_runtime::ConfigError::WalCeilingAliasConflict {
-                first_backend,
-                second_backend,
-                first_bytes: 0,
-                second_bytes: 8192,
-                ..
-            }) if first_backend == "main" && second_backend == "alias"
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn wal_ceiling_opener_forwards_each_backend_policy() {
-        let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().join("main.db");
-        let alias = dir.path().join("alias.db");
-        let secondary = dir.path().join("secondary.db");
-        for path in [&main, &secondary] {
-            let conn = rusqlite::Connection::open(path).unwrap();
-            conn.execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
-                .unwrap();
-        }
-        std::fs::hard_link(&main, &alias).unwrap();
-        let mut topology = duplicate_sqlite_path_config(&main);
-        topology.backends[0].wal_ceiling_bytes = Some(8192);
-        topology.backends[1].path = Some(alias);
-        topology.backends[1].wal_ceiling_bytes = Some(16384);
-        topology.backends.push(BackendConfig {
-            name: "secondary".to_string(),
-            path: Some(secondary),
-            wal_ceiling_bytes: None,
-            ..topology.backends[0].clone()
-        });
-        for backend in &mut topology.backends {
-            backend.read_only = true;
-        }
-        let runtime = RuntimeConfig {
-            wal_ceiling_env_raw: Some("32768".to_string()),
-            ..RuntimeConfig::default()
-        };
-        let mut opened = Vec::new();
-        let backends = open_effective_backends_with(
-            &runtime,
-            &topology.backends,
-            None,
-            |cfg, max_readers, policy| {
-                opened.push((cfg.name.clone(), policy));
-                open_backend_with_wal_ceiling(cfg, max_readers, policy)
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            opened.len(),
-            2,
-            "the physical alias must reuse the main pool"
-        );
-        assert_eq!(opened[0].0, "main");
-        assert_eq!(opened[0].1.bytes, 8192);
-        assert_eq!(opened[0].1.source, khive_db::WalCeilingSource::BackendField);
-        assert_eq!(opened[1].0, "secondary");
-        assert_eq!(opened[1].1.bytes, 32768);
-        assert_eq!(opened[1].1.source, khive_db::WalCeilingSource::Environment);
-        assert!(Arc::ptr_eq(&backends["main"], &backends["alias"]));
-        assert!(!Arc::ptr_eq(&backends["main"], &backends["secondary"]));
-        for (name, policy) in opened {
-            let pool = backends[&name].pool_arc();
-            assert_eq!(pool.config().wal_ceiling, policy);
-            assert_eq!(policy.effective_bytes(pool.config().read_only), 0);
-        }
-    }
+    include!("serve_wal_policy_alias_tests.rs");
 
     #[tokio::test]
     async fn targeted_secondary_rejects_conflicting_physical_alias_modes_before_open() {
@@ -10724,6 +10669,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10734,6 +10681,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: true,
                 },
@@ -10744,6 +10693,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10780,6 +10731,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10790,6 +10743,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10800,6 +10755,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -10890,6 +10847,8 @@ region = "us-east-1"
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -11513,6 +11472,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -11523,6 +11484,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -11584,6 +11547,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -11594,6 +11559,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -11695,6 +11662,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -11705,6 +11674,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -11768,6 +11739,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -11778,6 +11751,8 @@ region = "us-east-1"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -14476,6 +14451,8 @@ backend = "kg-backend"
                         cache_mb: None,
                         journal_mode: None,
                         wal_ceiling_bytes: None,
+                        disk_reserve_bytes: None,
+                        disk_guard_deadline_ms: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -14486,6 +14463,8 @@ backend = "kg-backend"
                         cache_mb: None,
                         journal_mode: None,
                         wal_ceiling_bytes: None,
+                        disk_reserve_bytes: None,
+                        disk_guard_deadline_ms: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -14619,6 +14598,8 @@ backend = "kg-backend"
                         cache_mb: None,
                         journal_mode: None,
                         wal_ceiling_bytes: None,
+                        disk_reserve_bytes: None,
+                        disk_guard_deadline_ms: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -14629,6 +14610,8 @@ backend = "kg-backend"
                         cache_mb: None,
                         journal_mode: None,
                         wal_ceiling_bytes: None,
+                        disk_reserve_bytes: None,
+                        disk_guard_deadline_ms: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -14732,6 +14715,8 @@ backend = "kg-backend"
                         cache_mb: None,
                         journal_mode: None,
                         wal_ceiling_bytes: None,
+                        disk_reserve_bytes: None,
+                        disk_guard_deadline_ms: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -14742,6 +14727,8 @@ backend = "kg-backend"
                         cache_mb: None,
                         journal_mode: None,
                         wal_ceiling_bytes: None,
+                        disk_reserve_bytes: None,
+                        disk_guard_deadline_ms: None,
                         served_kinds: None,
                         read_only: false,
                     },
@@ -18427,6 +18414,8 @@ backend = "kg-backend"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -18437,6 +18426,8 @@ backend = "kg-backend"
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: tool_read_only,
                 },
@@ -18652,3 +18643,7 @@ mod outbox_slug_tests;
 #[cfg(all(test, unix))]
 #[path = "serve_reader_pool_tests.rs"]
 mod reader_pool_tests;
+
+#[cfg(test)]
+#[path = "serve_disk_guard_tests.rs"]
+mod disk_guard_tests;
