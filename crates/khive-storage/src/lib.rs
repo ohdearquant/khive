@@ -36,7 +36,7 @@ pub use blob::{
 pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};
 pub use env::read_env_number;
-pub use error::{StorageError, WriterTaskRequestState};
+pub use error::{CapacityUnavailablePhase, StorageError, WriterTaskRequestState};
 
 pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,

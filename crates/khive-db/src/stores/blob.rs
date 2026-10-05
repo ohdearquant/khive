@@ -904,6 +904,7 @@ where
             volume: root.display().to_string(),
             available_bytes: available,
             floor_bytes,
+            required_headroom_bytes: required_write_bytes,
         });
     }
 
@@ -1128,6 +1129,7 @@ fn put_blocking_from_root_handle(
             volume: root.display().to_string(),
             available_bytes: available,
             floor_bytes,
+            required_headroom_bytes: required_write_bytes,
         });
     }
 
