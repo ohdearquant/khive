@@ -73,10 +73,6 @@ exists to deliver. A message leaves pending only through a successful send
 or a genuinely permanent classification (configuration, authentication,
 allowlist), never through attempt count.
 
-Messages written while no delivery component was running match the pending predicate and
-are delivered when the component starts. That backlog is wanted mail; there is no age
-cutoff.
-
 Messages written while no delivery component was running (including the
 window this ADR closes) match the pending predicate and are delivered when
 the component starts. That backlog is wanted mail; there is no age cutoff.
