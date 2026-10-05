@@ -2330,25 +2330,171 @@ fn live_workspace_sources() -> Vec<(String, String)> {
     sources
 }
 
-fn live_migration_sources() -> Vec<(String, String)> {
-    let sql_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates directory")
-        .join("khive-db/sql");
-    let mut sources = Vec::new();
-    for entry in
-        std::fs::read_dir(&sql_dir).unwrap_or_else(|error| panic!("{}: {error}", sql_dir.display()))
-    {
-        let path = entry.expect("SQL source entry").path();
-        if path.extension().is_some_and(|extension| extension == "sql") {
-            let name = path.file_name().expect("SQL source name").to_string_lossy();
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            sources.push((format!("khive-db/sql/{name}"), source));
+fn registered_migration_paths(source: &str) -> Result<BTreeSet<String>, String> {
+    let file = syn::parse_file(source).map_err(|error| format!("migrations.rs: {error}"))?;
+    let mut constants = BTreeMap::new();
+    for item in &file.items {
+        if let syn::Item::Const(item) = item {
+            if constants.insert(item.ident.to_string(), item).is_some() {
+                return Err(format!("duplicate migration constant {}", item.ident));
+            }
         }
     }
-    sources.sort_by(|a, b| a.0.cmp(&b.0));
-    sources
+    let registry = constants.get("MIGRATIONS").ok_or("missing MIGRATIONS")?;
+    let Expr::Reference(reference) = registry.expr.as_ref() else {
+        return Err("MIGRATIONS must reference a literal array".into());
+    };
+    let Expr::Array(array) = reference.expr.as_ref() else {
+        return Err("MIGRATIONS must reference a literal array".into());
+    };
+    if array.elems.is_empty() {
+        return Err("MIGRATIONS must not be empty".into());
+    }
+    let mut paths = BTreeSet::new();
+    for entry in &array.elems {
+        let Expr::Struct(entry) = entry else {
+            return Err("unrecognized VersionedMigration registration".into());
+        };
+        if !entry.path.is_ident("VersionedMigration")
+            || entry.qself.is_some()
+            || entry.rest.is_some()
+        {
+            return Err("unrecognized VersionedMigration registration".into());
+        }
+        let fields = entry
+            .fields
+            .iter()
+            .filter(|field| matches!(&field.member, syn::Member::Named(name) if name == "up"))
+            .collect::<Vec<_>>();
+        let [field] = fields.as_slice() else {
+            return Err("migration must have one up field".into());
+        };
+        let Expr::Path(up) = &field.expr else {
+            return Err("migration up must name one include constant".into());
+        };
+        if up.qself.is_some() {
+            return Err("unresolved migration up path".into());
+        }
+        let name = up.path.get_ident().ok_or("unresolved migration up path")?;
+        let constant = constants
+            .get(&name.to_string())
+            .ok_or_else(|| format!("missing migration constant {name}"))?;
+        let Expr::Macro(include) = constant.expr.as_ref() else {
+            return Err(format!("unresolved migration include {name}"));
+        };
+        if !include.mac.path.is_ident("include_str") {
+            return Err(format!("unresolved migration include {name}"));
+        }
+        let literal = syn::parse2::<syn::LitStr>(include.mac.tokens.clone())
+            .map_err(|error| format!("migration include {name}: {error}"))?;
+        let value = literal.value();
+        let filename = value
+            .strip_prefix("../sql/")
+            .filter(|filename| {
+                filename
+                    .strip_suffix(".sql")
+                    .is_some_and(|stem| !stem.is_empty())
+                    && filename
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte))
+            })
+            .ok_or_else(|| format!("migration include {name} must name a file in ../sql"))?;
+        paths.insert(format!("khive-db/sql/{filename}"));
+    }
+    Ok(paths)
+}
+
+fn registered_migration_sources(
+    source: &str,
+    mut read: impl FnMut(&str) -> Result<String, String>,
+) -> Result<Vec<(String, String)>, String> {
+    registered_migration_paths(source)?
+        .into_iter()
+        .map(|path| read(&path).map(|source| (path, source)))
+        .collect()
+}
+
+fn live_migration_sources() -> Vec<(String, String)> {
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory")
+        .to_path_buf();
+    let source = std::fs::read_to_string(crates.join("khive-db/src/migrations.rs"))
+        .expect("read migration registrations");
+    registered_migration_sources(&source, |path| {
+        std::fs::read_to_string(crates.join(path)).map_err(|error| format!("{path}: {error}"))
+    })
+    .expect("resolve registered migration SQL")
+}
+
+#[test]
+fn migration_population_follows_registrations_instead_of_neighboring_queries() {
+    let registry = r#"
+        const RECONCILE_VERSION: u32 = 5;
+        const RECONCILE: &str = include_str!("../sql/reconcile.sql");
+        const APPLICATION: &str = include_str!("../sql/application.sql");
+        const MIGRATIONS: &[VersionedMigration] = &[
+            VersionedMigration { version: RECONCILE_VERSION, name: "reconcile", up: RECONCILE },
+        ];
+    "#;
+    let sql = BTreeMap::from([
+        (
+            "khive-db/sql/reconcile.sql",
+            "UPDATE notes SET properties = '{}' WHERE id = 'old'; CREATE INDEX after_reconciliation ON notes(id);",
+        ),
+        (
+            "khive-db/sql/application.sql",
+            "INSERT INTO notes (id, properties) VALUES (?1, ?2);",
+        ),
+    ]);
+    let read = |path: &str| {
+        sql.get(path)
+            .map(|source| (*source).to_owned())
+            .ok_or_else(|| format!("missing {path}"))
+    };
+    let sources = registered_migration_sources(registry, read).unwrap();
+    assert_eq!(sources.len(), 1);
+    let sites = scan_migration_sources(&sources);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].key, "khive-db/sql/reconcile.sql::statement_1");
+    assert_eq!(sites[0].route_class, RouteClass::Migration);
+    let registered_application = registry.replace("up: RECONCILE", "up: APPLICATION");
+    let sources = registered_migration_sources(&registered_application, read).unwrap();
+    let sites = scan_migration_sources(&sources);
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].key, "khive-db/sql/application.sql::statement_1");
+    assert_eq!(sites[0].route_class, RouteClass::Migration);
+}
+
+#[test]
+fn migration_population_refuses_unresolved_or_missing_registrations() {
+    let registry = r#"
+        const UP: &str = include_str!("../sql/migration.sql");
+        const MIGRATIONS: &[VersionedMigration] = &[
+            VersionedMigration { version: 1, name: "fixture", up: UP },
+        ];
+    "#;
+    assert!(registered_migration_paths(&registry.replace("up: UP", "up: UNKNOWN")).is_err());
+    assert!(registered_migration_paths(&registry.replace("../sql/", "../../")).is_err());
+    assert!(registered_migration_sources(registry, |_| Err("missing SQL".into())).is_err());
+}
+
+#[test]
+fn registered_migration_property_writer_inventory_is_unchanged() {
+    let sites = scan_migration_sources(&live_migration_sources());
+    let inventory = sites
+        .into_iter()
+        .map(|site| (site.key, site.target, site.write_count, site.route_class))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        inventory,
+        vec![(
+            "khive-db/sql/005-unique-comm-external-id.sql::statement_1".into(),
+            Substrate::Note,
+            1,
+            RouteClass::Migration
+        )]
+    );
 }
 
 #[cfg(test)]
