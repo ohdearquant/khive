@@ -17,6 +17,7 @@ pub mod engine;
 pub mod entity_type_backfill;
 pub mod exec;
 pub mod git_annotation_repair;
+pub mod git_dedup;
 pub mod git_ingest;
 pub mod kg;
 pub mod mount;

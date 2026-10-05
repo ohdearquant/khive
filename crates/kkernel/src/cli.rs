@@ -17,8 +17,8 @@ use clap::{Parser, Subcommand};
 use crate::{
     blob, code_audit, code_ingest,
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, git_annotation_repair, git_ingest, kg, pack_introspect, reindex, repo, sync,
-    vector,
+    engine, exec, git_annotation_repair, git_dedup, git_ingest, kg, pack_introspect, reindex, repo,
+    sync, vector,
 };
 use khive_runtime::{
     runtime_config_from_khive_config, BackendId, BackendKind, KhiveConfig, KhiveRuntime,
@@ -130,6 +130,9 @@ enum Command {
 
     /// Preview or apply one project's historical commit annotations (ADR-088).
     GitAnnotationRepair(git_annotation_repair::GitAnnotationRepairArgs),
+
+    /// Preview or apply duplicate issue/PR note merges for one canonical project.
+    GitDedup(git_dedup::GitDedupArgs),
 
     /// Validate and ingest a `findings.json` audit sweep into the graph as
     /// `finding` notes (ADR-085 Amendment 3).
@@ -561,6 +564,7 @@ pub async fn cli_main() -> Result<()> {
         Command::CodeAudit(a) => code_audit::run_code_audit(a).await,
         Command::GitIngest(a) => git_ingest::run_git_ingest(a).await,
         Command::GitAnnotationRepair(a) => git_annotation_repair::run(a).await,
+        Command::GitDedup(a) => git_dedup::run(a).await,
         Command::CodeIngest(a) => code_ingest::run_code_ingest(a).await,
     }
 }

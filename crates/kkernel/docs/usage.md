@@ -29,12 +29,20 @@ kkernel <command> [flags]
   supervisor Launch a supervised daemon or release its startup marker
   backend   Inspect registered backends (list, info <name>)
   git-annotation-repair  Preview/apply historical commit→project links
+  git-dedup              Preview/apply duplicate issue/PR note merges
 ```
 
 The default database is `~/.khive/khive.db`. Override per-command with `--db`
 (or `KHIVE_DB` for `mcp`/`exec`). Use `:memory:` for an ephemeral database.
 
 ---
+
+## `kkernel git-dedup` — duplicate issue and pull-request notes
+
+Preview one canonical project with `kkernel git-dedup --project <full-uuid>
+--namespace local`; add `--apply` for guarded per-pair merges. `--db` and
+`KHIVE_DB` select the store. The report identifies exact note IDs and incomplete
+census or partial-apply refusals. See the [repair contract and limits](../../khive-pack-git/docs/git-note-dedup.md).
 
 ## `kkernel git-annotation-repair` — historical project links
 
