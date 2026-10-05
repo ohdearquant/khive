@@ -38,6 +38,8 @@ mod fence_identity;
 pub mod file_policy;
 pub mod fusion;
 pub mod graph_traversal;
+mod index_repair;
+pub use index_repair::IndexRepairReport;
 pub mod input_schema;
 pub mod keyed_memory;
 #[cfg(test)]
