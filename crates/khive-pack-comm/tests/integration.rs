@@ -16822,6 +16822,77 @@ mod transport_status_tests {
 
     #[tokio::test]
     #[serial_test::serial(config_ledger)]
+    async fn email_admission_keeps_all_five_transport_status_wire_values() {
+        let (registry, runtime) = build_registry();
+        let token = runtime.authorize(Namespace::local()).unwrap();
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            registry
+                .dispatch("comm.transport_status", json!({"id":unknown}))
+                .await
+                .unwrap(),
+            json!({"id":unknown,"status":"unknown"})
+        );
+        for (state, disposition, expected) in [
+            (
+                TransportState::RecipientStored,
+                "stored",
+                "recipient_stored",
+            ),
+            (
+                TransportState::RecipientQuarantined,
+                "quarantined",
+                "recipient_quarantined",
+            ),
+        ] {
+            let e = envelope(Uuid::new_v4());
+            runtime
+                .create_sender_transport(&token, e.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.transport_status", json!({"id":e.outbound_note_id}))
+                    .await
+                    .unwrap(),
+                json!({"id":e.outbound_note_id,"status":"pending"})
+            );
+            runtime
+                .record_sender_transport_failure(e.key(), FailureClass::Permanent, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.transport_status", json!({"id":e.outbound_note_id}))
+                    .await
+                    .unwrap(),
+                json!({"id":e.outbound_note_id,"status":"failed"})
+            );
+            // Receipt verification stays covered by the runtime's signed-receipt
+            // matrix; this fixture pins the actual wire projection independently.
+            khive_db::stores::note::transport::SenderTransportStore::new(runtime.backend().pool_arc())
+                .accept_receipt(e.key(), state, json!({
+                    "binding": {
+                        "protocol_version":e.protocol_version,"logical_message_id":e.logical_message_id,
+                        "sender_agent_id":e.sender_agent_id,"recipient_agent_id":e.recipient_agent_id,
+                        "recipient_device_id":e.recipient_device_id,"recipient_key_epoch":e.recipient_key_epoch,
+                        "contact_generation":e.contact_generation,"delivery_attempt_id":Uuid::new_v4(),
+                    }, "disposition":disposition,"signature":[1],
+                })).await.unwrap();
+            let before = runtime.sender_transport(e.key()).await.unwrap();
+            assert_eq!(
+                registry
+                    .dispatch("comm.transport_status", json!({"id":e.outbound_note_id}))
+                    .await
+                    .unwrap(),
+                json!({"id":e.outbound_note_id,"status":expected})
+            );
+            assert_eq!(runtime.sender_transport(e.key()).await.unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(config_ledger)]
     async fn dispatch_refuses_short_uuid_and_normalizes_complete_spellings() {
         let (registry, _) = build_registry();
         let id = Uuid::new_v4();

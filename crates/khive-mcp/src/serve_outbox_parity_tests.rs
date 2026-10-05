@@ -79,7 +79,9 @@ mod outbox_parity_tests {
     }
 
     pub(super) fn fixture() -> (KhiveRuntime, NamespaceToken) {
-        let runtime = KhiveRuntime::memory().unwrap();
+        let runtime = KhiveRuntime::memory().unwrap().with_outbound_email_policy(
+            khive_runtime::OutboundEmailPolicy::configured(vec!["recipient@example.com".into()]).unwrap(),
+        );
         runtime.install_pack_owned_note_kinds(vec!["message".into()]);
         let token = runtime.authorize(Namespace::local()).unwrap();
         (runtime, token)
@@ -158,7 +160,6 @@ mod outbox_parity_tests {
             outbox::OutboxPolicy::Email {
                 mailbox: domains.mailbox(),
                 domains,
-                allowlist: &["recipient@example.com".into()],
             },
             runtime,
             &Namespace::local(),
@@ -503,6 +504,9 @@ mod outbox_parity_tests {
                 .upsert_note(note)
                 .await
                 .unwrap();
+            let runtime = runtime.with_outbound_email_policy(khive_runtime::OutboundEmailPolicy::configured(
+                vec!["someone-else@example.com".into()],
+            ).unwrap());
             let channel = RecordingChannel::new("email", "sender@example.com", Outcome::Success);
             let mut pause_until = None;
             outbox::outbox_once(
@@ -510,7 +514,6 @@ mod outbox_parity_tests {
                 outbox::OutboxPolicy::Email {
                     mailbox: domains.mailbox(),
                     domains: &domains,
-                    allowlist: &["someone-else@example.com".into()],
                 },
                 &runtime,
                 &Namespace::local(),
@@ -568,7 +571,6 @@ mod outbox_parity_tests {
             outbox::OutboxPolicy::Email {
                 mailbox: domains.mailbox(),
                 domains: &domains,
-                allowlist: &["recipient@example.com".into()],
             },
             &runtime,
             &Namespace::local(),

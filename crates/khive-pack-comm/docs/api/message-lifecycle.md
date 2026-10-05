@@ -174,6 +174,23 @@ encodes `[write_namespace, sending_actor, client_key]` as compact JSON after
 `comm-v1:`. The outbound copy alone holds this physical `notes.key`; both
 copies carry the logical key in properties, with reciprocal pair UUIDs.
 
+Email-addressed sends and replies consult the serving runtime's immutable
+recipient policy before a fresh pair is prepared. A configured denial returns
+a typed permission refusal without a pair, key claim, attachment owner,
+message index publication or inbox wake. Configured entries and requested
+recipients share the existing maintainer-address normalization; stored recipient
+spelling and exact keyed payload identity stay unchanged. Refusals name the
+normalized denied recipient without exposing the configured set. An absent
+policy permits queuing without promising delivery; delivery itself requires a
+configured policy. Other validation and authorization still apply.
+
+For a keyed email request, the existing indexed live-holder lookup precedes
+fresh admission. An intact exact replay returns its receipt even after policy
+revocation, preserving delivery state and producing no new write or wake.
+A denied request with no holder linearizes at its final no-holder observation:
+a competing holder committed afterward can be retrieved by a later retry.
+Allowed creators retain the atomic claim and winner reconciliation below.
+
 `khive_runtime::keyed_message::create_keyed_message_pair` uses the existing
 atomic-note preparation, preserving validation, secret checks, FTS and vector
 writes. It appends the outbound key claim as the final statement guarded by

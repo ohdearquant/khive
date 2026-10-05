@@ -278,6 +278,7 @@ pub(crate) async fn dual_write_message(
     let result = dual_write_message_with_identity(
         runtime,
         caller_token,
+        "comm.send",
         from,
         to,
         subject,
@@ -307,6 +308,7 @@ pub(crate) struct MessageWrite {
 pub(crate) async fn dual_write_message_with_identity(
     runtime: &KhiveRuntime,
     caller_token: &NamespaceToken,
+    verb: &str,
     from: &str,
     to: &str,
     subject: Option<&str>,
@@ -358,6 +360,45 @@ pub(crate) async fn dual_write_message_with_identity(
                 });
             }
             // 3. Allowlist hit: fall through to outbound note creation.
+        }
+    }
+
+    if let Some(recipient) = to_actor.and_then(|actor| actor.strip_prefix("email:")) {
+        if let Some(identity) = identity {
+            #[cfg(test)]
+            crate::email_admission_tests::pause(
+                crate::email_admission_tests::Boundary::BeforeHolderLookup,
+            )
+            .await;
+            let holder = khive_runtime::keyed_message::find_keyed_message_holder(
+                runtime,
+                caller_token.namespace().as_str(),
+                &identity.physical_key(caller_token),
+            )
+            .await?;
+            #[cfg(test)]
+            crate::email_admission_tests::pause(
+                crate::email_admission_tests::Boundary::AfterHolderLookup,
+            )
+            .await;
+            if let Some(holder) = holder {
+                return Ok(MessageWrite {
+                    outbound: identity
+                        .replay(runtime, caller_token, holder, attachments)
+                        .await?,
+                    embedding_truncation: Default::default(),
+                    replayed: true,
+                });
+            }
+        }
+        // For a denied keyed request, the lookup above is the final no-holder
+        // observation. A later competing commit is available to the next retry.
+        if !runtime.outbound_email_policy().allows(recipient) {
+            let reason = match khive_types::email_address::normalize_email_address(recipient) {
+                Some(recipient) => format!("email recipient '{recipient}' is not permitted by the configured outbound policy; no message was committed by this request"),
+                None => "invalid email recipient is not permitted by the configured outbound policy; no message was committed by this request".to_string(),
+            };
+            return Err(RuntimeError::permission_denied(verb, reason));
         }
     }
 

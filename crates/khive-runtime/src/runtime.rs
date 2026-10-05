@@ -307,6 +307,7 @@ pub struct KhiveRuntime {
     /// `None` when this runtime is already bound to the main backend.
     core_backend: Option<Arc<StorageBackend>>,
     config: RuntimeConfig,
+    outbound_email_policy: crate::OutboundEmailPolicy,
     /// All SQLite backends declared by the host process, including those
     /// assigned to other packs. The code pack fences these from ingest.
     declared_backend_db_paths: Arc<[PathBuf]>,
@@ -598,6 +599,7 @@ impl KhiveRuntime {
             core_named_vector_stores: None,
             core_backend: None,
             config,
+            outbound_email_policy: Default::default(),
             declared_backend_db_paths: Vec::new().into(),
             diagnostic_backends: Vec::new().into(),
             late_diagnostic_backends: Arc::new(Mutex::new(Vec::new())),
@@ -746,6 +748,7 @@ impl KhiveRuntime {
                     core_named_vector_stores: None,
                     core_backend: None,
                     config: core_config,
+                    outbound_email_policy: self.outbound_email_policy.clone(),
                     declared_backend_db_paths: self.declared_backend_db_paths.clone(),
                     diagnostic_backends: self.diagnostic_backends.clone(),
                     late_diagnostic_backends: self.late_diagnostic_backends.clone(),
@@ -942,6 +945,16 @@ impl KhiveRuntime {
     /// this runtime was constructed.
     pub fn ann_fresh_tail_enabled(&self) -> bool {
         self.ann_fresh_tail_enabled
+    }
+
+    /// Install before registering or cloning serving handles; no request-time mutation.
+    pub fn with_outbound_email_policy(mut self, policy: crate::OutboundEmailPolicy) -> Self {
+        self.outbound_email_policy = policy;
+        self
+    }
+
+    pub fn outbound_email_policy(&self) -> &crate::OutboundEmailPolicy {
+        &self.outbound_email_policy
     }
 
     /// Override ADR-118's fresh-tail serving policy for this runtime instance.

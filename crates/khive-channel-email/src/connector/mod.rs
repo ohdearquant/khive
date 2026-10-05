@@ -22,22 +22,7 @@ impl MailAddress {
     /// Strips display names and angle brackets; lowercases the result.
     /// Returns `None` if no valid addr-spec can be extracted.
     pub fn parse(raw: &str) -> Option<Self> {
-        let trimmed = raw.trim();
-        // Handle "Display Name <addr@example.com>" form.
-        if let Some(start) = trimmed.rfind('<') {
-            if let Some(end) = trimmed[start..].find('>') {
-                let addr = trimmed[start + 1..start + end].trim().to_lowercase();
-                if addr.contains('@') {
-                    return Some(Self(addr));
-                }
-            }
-        }
-        // Plain addr-spec.
-        let lower = trimmed.to_lowercase();
-        if lower.contains('@') {
-            return Some(Self(lower));
-        }
-        None
+        khive_types::email_address::normalize_email_address(raw).map(Self)
     }
 
     /// Return the normalized addr-spec string.

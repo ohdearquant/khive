@@ -104,39 +104,17 @@ pub async fn create_keyed_message_pair_with_attachments(
                 },
             ..
         }) if statement_label.as_deref() == Some(KEY_CLAIM) => {
-            let holder = runtime
-                .sql()
-                .reader()
+            find_keyed_message_holder(runtime, &namespace, physical_key)
                 .await?
-                .query_scalar(SqlStatement {
-                    sql: "SELECT id FROM notes WHERE namespace = ?1 AND kind = 'message' \
-                      AND key = ?2 AND deleted_at IS NULL LIMIT 1"
-                        .into(),
-                    params: vec![
-                        SqlValue::Text(namespace),
-                        SqlValue::Text(physical_key.to_owned()),
-                    ],
-                    label: Some("message-key-holder".into()),
+                .map(KeyedMessageWrite::Existing)
+                .ok_or_else(|| {
+                    KhiveError::unavailable("message key holder disappeared during reconciliation")
+                        .with_details(Details::new_owned([(
+                            "reason",
+                            "key_holder_unresolved".into(),
+                        )]))
+                        .into()
                 })
-                .await?;
-            match holder {
-                Some(SqlValue::Text(id)) => Uuid::parse_str(&id)
-                    .map(KeyedMessageWrite::Existing)
-                    .map_err(|error| {
-                        RuntimeError::Internal(format!("invalid message holder id: {error}"))
-                    }),
-                None => Err(KhiveError::unavailable(
-                    "message key holder disappeared during reconciliation",
-                )
-                .with_details(Details::new_owned([(
-                    "reason",
-                    "key_holder_unresolved".into(),
-                )]))
-                .into()),
-                Some(_) => Err(RuntimeError::Internal(
-                    "message holder id is not text".into(),
-                )),
-            }
         }
         Ok(AtomicRunOutcome::RolledBack {
             failed_op_index,
@@ -145,5 +123,38 @@ pub async fn create_keyed_message_pair_with_attachments(
             "atomic message pair rolled back at op {failed_op_index}: {failure:?}"
         ))),
         Err(error) => Err(RuntimeError::Storage(error.0)),
+    }
+}
+
+/// Look up the live outbound holder without preparing or attempting a write.
+/// The comm layer must validate the request and intact pair before returning it.
+pub async fn find_keyed_message_holder(
+    runtime: &KhiveRuntime,
+    namespace: &str,
+    physical_key: &str,
+) -> RuntimeResult<Option<Uuid>> {
+    let holder = runtime
+        .sql()
+        .reader()
+        .await?
+        .query_scalar(SqlStatement {
+            sql: "SELECT id FROM notes WHERE namespace = ?1 AND kind = 'message' \
+              AND key = ?2 AND deleted_at IS NULL LIMIT 1"
+                .into(),
+            params: vec![
+                SqlValue::Text(namespace.to_owned()),
+                SqlValue::Text(physical_key.to_owned()),
+            ],
+            label: Some("message-key-holder".into()),
+        })
+        .await?;
+    match holder {
+        Some(SqlValue::Text(id)) => Uuid::parse_str(&id)
+            .map(Some)
+            .map_err(|error| RuntimeError::Internal(format!("invalid message holder id: {error}"))),
+        None => Ok(None),
+        Some(_) => Err(RuntimeError::Internal(
+            "message holder id is not text".into(),
+        )),
     }
 }

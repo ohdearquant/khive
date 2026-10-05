@@ -146,6 +146,7 @@ pub(crate) async fn handle_send(
     } = dual_write_message_with_identity(
         runtime,
         token,
+        "comm.send",
         &caller_ns,
         &caller_ns,
         p.subject.as_deref(),
@@ -1610,6 +1611,7 @@ pub(crate) async fn handle_reply(
     } = dual_write_message_with_identity(
         runtime,
         token,
+        "comm.reply",
         &caller_ns,
         &caller_ns,
         reply_subject_opt,
