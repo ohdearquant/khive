@@ -17,6 +17,7 @@ pub mod audit_batch;
 pub mod blob;
 pub mod bounded_read;
 pub mod build_info;
+mod code_map_runtime;
 pub mod comm_recipient;
 pub mod comm_transport;
 pub mod config;

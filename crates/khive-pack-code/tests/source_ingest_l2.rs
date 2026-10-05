@@ -30,6 +30,13 @@ use uuid::Uuid;
 // Shared harness (mirrors tests/source_ingest.rs's conventions).
 // ---------------------------------------------------------------------------
 
+// Wire tests that open explicit maps need a physical parent on macOS;
+// /var/folders is a symlinked alias and must remain a VFS refusal.
+fn physical_tempdir() -> std::io::Result<TempDir> {
+    let physical_temp = std::env::temp_dir().canonicalize()?;
+    tempfile::tempdir_in(physical_temp)
+}
+
 fn rust_only() -> BTreeSet<&'static str> {
     ["rust"].into_iter().collect()
 }
@@ -685,7 +692,7 @@ async fn dispatch(registry: &VerbRegistry, verb: &str, args: Value) -> Result<Va
 /// Omitted `tiers` on the wire selects L1 + L1.5 with L2 disabled.
 #[tokio::test]
 async fn wire_omitted_tiers_defaults_to_l1_and_l1_5() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_default");
     let db = root.path().join("default.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
@@ -751,7 +758,7 @@ async fn wire_unknown_arguments_are_rejected_before_db_open() {
 
 #[tokio::test]
 async fn wire_report_languages_describe_observed_sources() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_observed_language");
     let db = root.path().join("observed-language.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
@@ -774,7 +781,7 @@ async fn wire_report_languages_describe_observed_sources() {
 /// Explicit `null` tiers behaves identically to omitted.
 #[tokio::test]
 async fn wire_null_tiers_defaults_to_l1_and_l1_5() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_null");
     let db = root.path().join("null.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
@@ -825,7 +832,7 @@ async fn direct_empty_tier_selection_writes_nothing() {
 
 #[tokio::test]
 async fn wire_empty_tiers_write_no_map_rows() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_wire_empty");
     let db = root.path().join("wire-empty.db");
     std::fs::File::create(&db).expect("pre-create explicit ingest target");
@@ -900,7 +907,7 @@ async fn wire_malformed_tiers_rejected_before_db_open() {
 /// Duplicate tier entries dedupe to the same flags as the deduplicated set.
 #[tokio::test]
 async fn wire_duplicate_tiers_canonicalize() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_dup");
     let db_dup = root.path().join("dup.db");
     std::fs::File::create(&db_dup).expect("pre-create explicit ingest target");
@@ -936,7 +943,7 @@ async fn wire_duplicate_tiers_canonicalize() {
 /// L1.5 then L2 always, regardless of `["l2","l1"]` vs `["l1","l2"]`.
 #[tokio::test]
 async fn wire_tier_order_is_caller_independent() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_order");
     let rt = KhiveRuntime::memory().expect("memory runtime");
     let reg = registry(rt);
@@ -977,7 +984,7 @@ async fn wire_tier_order_is_caller_independent() {
 /// sweeps (one on each path) still compare equal.
 #[tokio::test]
 async fn default_and_explicit_l1_l1_5_are_report_byte_equivalent() {
-    let root = TempDir::new().expect("tempdir");
+    let root = physical_tempdir().expect("tempdir");
     write_l2_symbol_fixture(root.path(), "pkg_bytes");
     let pkg = root.path().join("pkg_bytes");
 

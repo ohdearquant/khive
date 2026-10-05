@@ -3,6 +3,7 @@
 //! the storage fixture boundary; reingest must not carry its unverified stamp.
 
 use std::path::PathBuf;
+use std::process::Command;
 
 use khive_pack_code::{CodePack, CODE_INGEST_NAMESPACE};
 use khive_pack_kg::KgPack;
@@ -18,6 +19,37 @@ use uuid::Uuid;
 
 const PROJECT: &str = "reservation_fixture";
 
+/// Keep the host's production database outside the code-map fixture. A
+/// symlinked HOME parent must remain a refusal for the production VFS guard.
+fn run_with_private_home_in_child() -> bool {
+    const CHILD_TEST: &str = "KHIVE_RESERVED_PROPERTIES_CHILD";
+    let thread = std::thread::current();
+    let name = thread.name().expect("libtest names its test threads");
+    if std::env::var(CHILD_TEST).ok().as_deref() == Some(name) {
+        return false;
+    }
+    let physical_temp = std::env::temp_dir()
+        .canonicalize()
+        .expect("physical temporary directory");
+    let home = tempfile::tempdir_in(physical_temp).expect("private child HOME");
+    let output = Command::new(std::env::current_exe().expect("integration test executable"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(CHILD_TEST, name)
+        .env("HOME", home.path())
+        .env("KHIVE_DB", "")
+        .output()
+        .expect("spawn isolated reservation test");
+    assert!(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .contains("test result: ok. 1 passed; 0 failed;"),
+        "isolated reservation test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 struct Fixture {
     _root: TempDir,
     source: PathBuf,
@@ -30,7 +62,12 @@ struct Fixture {
 
 impl Fixture {
     async fn new(properties: Value) -> Self {
-        let root = tempfile::tempdir().expect("isolated reservation fixture");
+        // The code-map VFS requires plain parent components. macOS's default
+        // temporary path can traverse /var -> /private/var.
+        let physical_temp = std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temporary directory");
+        let root = tempfile::tempdir_in(physical_temp).expect("isolated reservation fixture");
         let source = root.path().join("source");
         std::fs::create_dir(&source).unwrap();
         std::fs::write(
@@ -39,12 +76,18 @@ impl Fixture {
         )
         .unwrap();
         let target = root.path().join("map.db");
-        let map = KhiveRuntime::new(RuntimeConfig {
-            db_path: Some(target.clone()),
-            actor_id: Some("test:code-reservation-map".into()),
-            packs: vec![],
-            ..RuntimeConfig::no_embeddings()
-        })
+        // Keep the retained fixture runtime in rollback DELETE mode so the
+        // later ingest does not need a quiescent transition from its live pool.
+        let map = KhiveRuntime::new_code_map(
+            RuntimeConfig {
+                db_path: Some(target.clone()),
+                actor_id: Some("test:code-reservation-map".into()),
+                packs: vec![],
+                ..RuntimeConfig::no_embeddings()
+            },
+            vec![],
+            vec![],
+        )
         .unwrap();
         let token = map.authorize(Namespace::local()).unwrap();
         let id = Uuid::new_v5(
@@ -138,6 +181,9 @@ impl Fixture {
 // real handler to refresh this preimage (including FTS) instead of refusing.
 #[tokio::test]
 async fn code_ingest_refuses_reserved_preimage_without_mutating_map() {
+    if run_with_private_home_in_child() {
+        return;
+    }
     for stamp in [json!("forged"), Value::Null, json!({"copied": true})] {
         let fixture =
             Fixture::new(json!({"khive:secret_gate": stamp, "ordinary": "retained"})).await;
@@ -158,6 +204,9 @@ async fn code_ingest_refuses_reserved_preimage_without_mutating_map() {
 // MUST-FAIL: recursively reserving nested keys breaks the second positive arm.
 #[tokio::test]
 async fn code_ingest_preserves_ordinary_and_nested_reserved_data() {
+    if run_with_private_home_in_child() {
+        return;
+    }
     for properties in [
         json!({"ordinary": "retained"}),
         json!({"ordinary": {"khive:secret_gate": "ordinary nested data"}}),
