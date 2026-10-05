@@ -1817,6 +1817,8 @@ pub(crate) async fn handle_thread(
             page.items.iter().map(|note| note.id).collect(),
         ))
         .await;
+        #[cfg(test)]
+        let rendered_before = rows.len();
         for n in &page.items {
             if seen_row_ids.insert(n.id) {
                 rows.push(ThreadRow {
@@ -1826,6 +1828,17 @@ pub(crate) async fn handle_thread(
                 });
             }
         }
+        #[cfg(test)]
+        read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRendered(
+            rows.len() - rendered_before,
+        ))
+        .await;
+        #[cfg(test)]
+        read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
+            stage: "physical",
+            rows: rows.len(),
+        })
+        .await;
         if fetched < PAGE_SIZE {
             break;
         }
@@ -1840,7 +1853,15 @@ pub(crate) async fn handle_thread(
             full_id: root_note.id,
             json: note_to_message_json(&root_note),
         });
+        #[cfg(test)]
+        read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRendered(1)).await;
     }
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
+        stage: "with_selected_root",
+        rows: rows.len(),
+    })
+    .await;
 
     // Exclude pool/malformed physical rows before pair deduplication and read
     // folding. Named own views retain participation only on addressed rows.
@@ -1864,6 +1885,12 @@ pub(crate) async fn handle_thread(
             }) || (caller_inherits_legacy_pool(token) && legacy_recipient(props))
         }
     });
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
+        stage: "visible",
+        rows: rows.len(),
+    })
+    .await;
 
     // #94 fix 2/2 — collapse the ADR-057 dual-write pair (outbound copy +
     // inbound copy) of one logical message into a single thread entry. The
@@ -1935,6 +1962,12 @@ pub(crate) async fn handle_thread(
         .into_iter()
         .filter_map(|lid| canonical.remove(&lid))
         .collect();
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
+        stage: "folded",
+        rows: rows.len(),
+    })
+    .await;
 
     // #494: `after` cursor — message id or RFC 3339 timestamp; a hard error if
     // neither. See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread
@@ -1991,6 +2024,12 @@ pub(crate) async fn handle_thread(
             },
         });
     }
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
+        stage: "after_cursor",
+        rows: rows.len(),
+    })
+    .await;
 
     // Total order: sort by `(created_at, full_id)`, not timestamp alone, so ties
     // are stable across pages/backends (matches the cursor filter's key above).
@@ -2003,6 +2042,17 @@ pub(crate) async fn handle_thread(
         }
     });
     rows.truncate(limit);
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadRetained {
+        stage: "limited",
+        rows: rows.len(),
+    })
+    .await;
+    #[cfg(test)]
+    read_cluster_tests::observe_phase(read_cluster_tests::Phase::ThreadOwners(
+        rows.iter().map(|row| row.full_id).collect(),
+    ))
+    .await;
     crate::file_attachments::enrich_many(
         runtime,
         rows.iter_mut().map(|row| &mut row.json).collect(),
