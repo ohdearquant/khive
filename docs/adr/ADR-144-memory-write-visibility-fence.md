@@ -528,3 +528,338 @@ These database fixtures establish row placement and durable fence values. They d
 not replace Amendment 2's session-recall and keyed-replay acceptance or the warmed
 consumer acceptance in ADR-189 Amendment 1. Seeding a covering watermark does not
 establish an actual consumer's session proof.
+
+## Amendment 4 (2026-10-04): unknown write epochs at the sealed-receipt cutover
+
+**Status**: Proposed. Refs #3619. Acceptance is required before the dependent
+sealed-receipt implementation merges.
+
+### Deployed state and scope
+
+The joint rollout required by Amendment 2 did not occur: [#3549](https://github.com/ohdearquant/khive/pull/3549)
+merged as `83886c71b82486fbb0299fd752312bd0886960ef` on 2026-10-02 UTC while
+issuing clear version-1 receipts. At that commit,
+`crates/khive-db/sql/046-memory-visibility-receipts.sql` creates receipt headers
+and model fences, but no independent write-epoch marker. The exact keyed replay
+path in `crates/khive-runtime/src/keyed_memory.rs` cannot distinguish a pre-V46
+note from a V46-or-later note whose receipt was lost. The existing
+`keyed_memory_replay_refuses_when_original_receipt_is_missing` fixture in
+`keyed_memory_tests.rs` demonstrates the latter possible state by removing a
+receipt after a successful keyed write; it does not establish that production
+data has suffered that loss.
+
+This amendment covers keyed memory notes present when the sealed-receipt
+cutover runs, including soft-deleted notes that could later be restored. A note
+is identified by its immutable ID and memory kind, with its current namespace
+carried as attribution; a mutable key string alone is not provenance. The
+ambiguous cohort consists of notes for which neither independent durable
+write-epoch evidence nor a complete original receipt is available at cutover.
+It can contain both old notes and notes written after V46. No claim is made
+about its size in any deployed database.
+
+On acceptance, this amendment replaces Amendment 2's unrealized joint-landing
+requirement with a coordinated upgrade to v2-only issuance and validation. It
+extends the missing-receipt rule with an explicit unknown cohort and defines
+how the independent marker is established during that upgrade. Amendment 2's
+cryptography, key custody, v1 rejection, zero-model distinction, replay without
+new vector or log writes, and one-snapshot proof remain required. Amendment 3
+and its Proposed status are unchanged; this amendment decides no move-routing
+policy.
+
+### Establishing durable provenance
+
+The cutover persists one of `legacy`, `modern`, or `unknown` for every existing
+keyed memory note in the same consistent migration transaction. The marker is
+stored independently of the receipt and its model fences, so removing either
+cannot erase or reclassify the epoch. Use an append-only schema migration;
+do not modify already-shipped V46 or allocate a migration number in this ADR.
+
+- `legacy` requires durable evidence that the exact note already existed
+  before V46. An upgrade beginning below V46 may capture the exact keyed-memory
+  IDs from its coherent pre-V46 snapshot, before V46 is applied, and retain
+  that inventory transactionally as the evidence. Merely observing an old
+  schema version without that identity-bound inventory is insufficient.
+- `modern` requires an existing independent marker for the original write,
+  or a complete original receipt verified at cutover. The latter verification
+  must bind the header and fences to the same note and namespace in one
+  snapshot, check the expected model count and valid unique per-model fences,
+  and preserve the explicit zero-model case. Persist the resulting marker in
+  that transaction before serving the upgraded database. This records the
+  witnessed receipt; it does not reconstruct a missing receipt or fence.
+- Every remaining note is `unknown`, including absent or incomplete receipts
+  with no independent epoch evidence. Contradictory evidence must not be
+  silently overwritten or used to issue a token; it takes the same unknown
+  refusal below. Receipt absence, `created_at`, the current database version,
+  ANN log contents, and a later `MAX(seq)` cannot classify these notes.
+
+New keyed notes written after cutover record `modern` atomically with the note,
+receipt header, and vector fences. A rollback leaves none of them committed.
+New code must not serve a database until its cutover has completed, and old
+writers must not keep writing after that point. An interrupted migration either
+rolls back or resumes from its durable provenance without substituting the
+database's now-current version for the captured historical population.
+
+The cutover reports what it classified, per database, in its own output. The
+migration runner returns only the schema version it reached, so the cutover
+change adds that output: for each database it upgrades, the number of keyed
+memory notes classified `legacy`, `modern`, and `unknown`, and the `unknown`
+count for each namespace that has one. The counts are read from the persisted
+markers after classification, inside the cutover transaction, so a resumed
+cutover reports its final population once rather than adding to an earlier
+partial count. The report goes to the operator log of the process that applied
+the migration and is never part of an error returned to a caller; no verb
+exposes it.
+
+The marker follows its note across namespace moves in the same transaction,
+survives soft delete and restore, and is removed with hard deletion. Reusing a
+key for another note ID cannot inherit the deleted note's epoch. Missing or
+unreadable provenance at replay never defaults to `modern` or `legacy`.
+
+### Replay disposition
+
+Exact replay reads the epoch and receipt coherently and applies these rules:
+
+| Durable provenance and receipt                             | Result                                                                                     |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `modern`, complete receipt                                 | Reseal the stored fences as v2, including a genuine zero-model receipt, under Amendment 2. |
+| `modern`, absent or incomplete receipt                     | `freshness_unmet`, reason `receipt_temporarily_unavailable`, `retryable: true`.            |
+| `legacy`, absent receipt                                   | `freshness_unmet`, reason `legacy_receipt_absent`, `retryable: false`.                     |
+| `unknown`, missing provenance, or contradictory provenance | `freshness_unmet`, reason `receipt_epoch_unknown`, `retryable: false`.                     |
+
+An unreadable provenance store is an availability failure, not proof of an
+unknown epoch: return a retryable unavailable error without a token and without
+changing the persisted classification. A legacy marker paired with a receipt
+is contradictory evidence and takes `receipt_epoch_unknown`.
+
+**What the caller holds after a refusal.** Every refusal in the table is
+raised on the exact-replay path: the key claim found a live holder whose
+content is identical, and the attempt's atomic unit rolled back without
+writing. Each refusal therefore carries the holder's ID as `memory_id` in its
+details, as the version 1 missing-receipt refusal in `keyed_memory.rs` already
+does, and carries `domain_disposition: "not_committed"`. That is the
+pack-raised class ADR-133 Amendment 3 (A3.1) opens with `key_conflict`: the
+attempt wrote nothing and the error names the existing record. Today the
+refusal has no named disposition, so it surfaces as `unknown`, and ADR-179 D5
+resolves an `unknown` replay by replaying again; for a terminal reason that
+loop never ends. In ADR-179's terms the replay has reconciled: the caller holds
+the ID of the one memory it intended, and that memory's write committed
+earlier. What it does not hold is a freshness token for that write. After
+`legacy_receipt_absent` or `receipt_epoch_unknown` the caller reads `memory_id`
+and is done, as after `key_conflict`; resending returns the same refusal and
+the same ID, because replay never changes the marker. Such a caller has no
+token to present for that memory and relies on eventual recall. After
+`receipt_temporarily_unavailable` the same ID is returned, and the caller may
+retry for a token knowing the write exists. A receipt found missing right after
+the same attempt's own write committed is outside this rule: that attempt did
+write, so its error keeps the `unknown` disposition and the caller reconciles
+it by replay.
+
+The terminal unknown refusal means repeating the same call or waiting cannot
+establish the original fence. It does not authorize deletion, re-embedding,
+recreating a note under its existing key, or copying a later log sequence into
+its receipt. Replay never changes the marker, emits a new vector or log row,
+or issues a token in a refusal case. An operator repair protocol is outside
+this amendment and requires its own evidence and contract; restoring a receipt
+alone cannot silently promote an unknown marker. Eventual recall remains
+available under its existing contract. Errors disclose neither fence values
+nor a database-wide cohort count.
+
+### Settled points for the implementation
+
+These four points close questions the text above leaves open. The first two
+clarify sentences of Amendment 2 without changing its security properties.
+
+- **Bytes after the nonce.** The version 2 envelope carries no ciphertext
+  length, so every byte after the nonce belongs to the ciphertext and its tag.
+  Amendment 2's rule to reject extra bytes before key lookup therefore applies
+  to what the envelope delimits: canonical unpadded base64url, the version
+  byte, the key-ID length and alphabet, the 24-byte nonce, a ciphertext no
+  shorter than its 16-byte tag, and the 64 KiB bound. Bytes appended to the
+  ciphertext cannot be told apart from ciphertext before authentication; they
+  fail authentication. Trailing bytes inside the authenticated plaintext fail
+  strict decoding. No length field is added to the envelope.
+- **Effective namespace.** The decrypted namespace must be a member of the
+  recall's effective read set: the one namespace an explicit request names,
+  once authorized, or otherwise every namespace the caller's visibility admits
+  for that recall. The set is computed from authorization before the token is
+  opened, so a token cannot widen it. A default recall that reads the caller's
+  local and actor namespaces accepts a receipt from either; an explicit request
+  for one namespace refuses a receipt from another. This is the behaviour the
+  clear version 1 path already has.
+- **Which writers establish `modern`.** Only the runtime unit that creates a
+  keyed memory note together with its receipt header and fences writes the
+  `modern` marker. That covers the specialized memory writer, generic keyed
+  note creation with kind `memory`, and new keyed members of a stream batch.
+  Lower-level storage constructors that accept a caller-supplied note, the
+  exported note statement builders, and transport commits have no model or
+  fence context; they write no marker. A keyed memory note they create has
+  missing provenance and takes the terminal unknown refusal on exact replay,
+  while eventual recall is unchanged. No caller can assert `modern` through a
+  note field, and a current binary performing an insert is not evidence of an
+  original write.
+- **Where the pre-V46 inventory is captured.** Capture runs inside the
+  transaction that applies V46, after the runner's under-lock version checks
+  and before the unchanged V46 SQL executes. The inventory and the V46 ledger
+  row commit together, and the write lock that transaction holds excludes
+  other writers while the population is read. A database that already records
+  V46 skips capture: its keyed notes without a complete receipt become
+  `unknown`. The V46 SQL bytes and ledger identity stay unchanged; the
+  transaction gains one effect, defined by a new SQL file that the cutover
+  change owns. A separate pre-upgrade capture transaction was rejected: it is
+  sound only if every old writer stays stopped across all later version steps,
+  and it adds a preparation journal with its own lifecycle.
+
+### Production callers of the routes that write no marker
+
+The routes that write no marker are the storage constructors `upsert_note`,
+`insert_note_if_absent`, `try_insert_note`, `try_insert_note_with_attachments`,
+`upsert_notes` and `batch_upsert_notes` in `crates/khive-db/src/stores/note.rs`
+(also reached through the policy wrapper that `runtime.notes(token)` returns,
+in `crates/khive-runtime/src/note_store_guard.rs`), the insert statement
+builders `note_upsert_statement`, `note_insert_if_absent_statement` and
+`note_insert_keyed_statement` in the same file, and
+`RecipientTransportStore::commit` in
+`crates/khive-db/src/stores/note/recipient/mod.rs`. Every production caller of
+these at `e59b98b99bbafc09f6590b442ec165eff7b0d925`, outside test modules, is
+listed below with its disposition.
+
+| Caller (path, function)                                                                                                                                         | What it writes                                                        | Disposition                                                                                                                            |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/khive-runtime/src/operations.rs`, `create_note_inner` (generic note creation)                                                                           | A new note built with `Note::new`; the function takes no key          | Cannot create keyed memory                                                                                                             |
+| `crates/khive-runtime/src/operations.rs`, `try_create_note_impl` (trusted channel ingest)                                                                       | A new note built with `Note::new`, no key                             | Cannot create keyed memory                                                                                                             |
+| `crates/khive-pack-comm/src/handlers.rs`, `handle_heartbeat`                                                                                                    | Kind `channel_health`, no key                                         | Cannot create keyed memory                                                                                                             |
+| `crates/kkernel/src/code_ingest.rs`, `persist_ingest_note` (code findings ingest)                                                                               | Kind `finding`, no key                                                | Cannot create keyed memory                                                                                                             |
+| `crates/khive-runtime/src/atomic_prepare.rs`, `prepare_add_note` (proposal apply)                                                                               | A new note built with `Note::new`, no key                             | Cannot create keyed memory                                                                                                             |
+| `crates/khive-runtime/src/keyed_message.rs`, `create_keyed_message_pair_with_attachments`                                                                       | Kind restricted to `message`                                          | Cannot create keyed memory                                                                                                             |
+| `crates/khive-runtime/src/atomic_message.rs`, `prepare_atomic_note_requests`, and `crates/khive-runtime/src/note_create.rs`, `prepare_note_create`              | New notes of any kind, keyed or not, prepared inside the runtime unit | The runtime unit. No marker exists anywhere at this commit; after the cutover change a keyed memory note created here records `modern` |
+| `crates/khive-runtime/src/comm_recipient.rs`, `ingest_verified_recipient` (recipient transport commit; called only from tests and a doc example at this commit) | Kind `message`, no key                                                | Cannot create keyed memory                                                                                                             |
+
+The six other exported statement builders in the same file change or remove an
+existing row and create no identity. Each is listed with every function that
+calls it at that commit:
+
+- `note_replace_if_unchanged_statement`: `prepare_versioned_note_update` in
+  `crates/khive-runtime/src/note_write.rs`; the metadata builder below, which
+  starts from it; and the store method `replace_note_if_unchanged`. Among that
+  method's production callers, the comm heartbeat handler reaches it through
+  the policy wrapper and curation's outbound message updates reach it through
+  the runtime's internal unwrapped store.
+- `note_metadata_replace_if_unchanged_statement`:
+  `prepare_versioned_note_update`. It starts from the replace statement's
+  parameters and replaces its SQL with one that holds `kind` as a predicate and
+  does not set it.
+- `note_update_properties_statement` and `note_set_property_statement`: the
+  store methods `update_note_properties` and `set_note_property`. Both write
+  `properties`, `updated_at` and the due columns derived from the properties;
+  neither sets `kind`.
+- `note_soft_delete_statement`: `prepare_delete` in
+  `crates/khive-runtime/src/atomic_prepare.rs` and the store method
+  `delete_note`, which `delete_note_with_post_commit_report` in
+  `crates/khive-runtime/src/operations.rs` calls for a soft delete.
+- `note_hard_delete_statement`: `prepare_delete`,
+  `delete_note_with_post_commit_report`, and `delete_note`.
+
+Hard deletion removes the marker with its note. The replace statement and the
+upsert statement's conflict branch both set `kind`, so a route could turn an
+existing keyed row into kind `memory`. Such a row is not an original memory
+write: it carries no marker and takes the unknown refusal on exact replay. That
+disposition holds for every caller of these builders, so it does not depend on
+the caller list above being complete.
+
+The routes that move or revive an existing note create no identity and keep
+its marker: `move_kinded_subject` in `crates/khive-db/src/namespace_move.rs`
+(namespace move target), `restore_note` in
+`crates/khive-runtime/src/operations.rs` (undelete), and `merge_note_sql` in
+`crates/khive-runtime/src/curation.rs`, which writes onto a destination ID that
+`read_merge_note` has already read and does not transfer the source's marker.
+Import does not reach these routes for memory: `import_kg` in
+`crates/khive-runtime/src/portability.rs` reads archives of entities and edges
+only. The tree has no database restore-from-backup operation; a copy of the
+database file carries the marker table with its notes, so every note keeps its
+class.
+
+So at this commit no production caller creates a new keyed memory note through
+a route that writes no marker. The disposition for the routes themselves is
+unknown forever, by intent: they have no model or fence context, and a library
+caller that hands them a `Note` with kind `memory` and a key gets a note that
+refuses as `receipt_epoch_unknown` on exact replay. A production route that
+needs to create keyed memory, including a hosted ingest service that embeds
+this runtime outside this repository, goes through the runtime unit.
+
+Inside the runtime unit, three routes create keyed notes today without the
+receipt flag: `create_note_with_options` and
+`create_note_with_options_resolving_annotations` in
+`crates/khive-runtime/src/note_write.rs`, and new keyed members of
+`stream.batch` in `crates/khive-runtime/src/streams.rs`. When the memory pack
+is registered, its creation hook in `crates/khive-pack-memory/src/hook.rs`
+refuses kind `memory` on the shared `create` handler, which runs the hook
+before it calls `create_note_with_options_resolving_annotations`, and on
+`stream.batch`. The two other production callers of `create_note_with_options`
+create fixed kinds: `handle_assign` in `crates/khive-pack-gtd/src/handlers.rs`
+creates `task`, and `record_outbound_external_id_diagnostic` in
+`crates/khive-runtime/src/curation.rs` creates `observation`. So in a served
+daemon only `memory.remember` creates keyed memory. A library caller of
+`create_note_with_options` is not behind the hook, which is why these routes
+are among the writers that must write `modern`, as the settled point above
+says.
+
+### Acceptance before implementation merge
+
+- Upgrade actual pre-V46 data and actual already-V46 data through the migration
+  runner. Capture the former population before V46 is applied. In the latter,
+  include a keyed write whose receipt is deliberately removed before cutover:
+  it must become `unknown`, never inferred legacy or modern. Include an
+  incomplete receipt, a complete positive-model receipt, and an explicit
+  zero-model receipt. Preserve all note, vector, and ANN log rows and values.
+- A known modern marker with a subsequently removed header or model fence
+  remains modern and produces the retryable missing-receipt result. The
+  otherwise identical unknown cohort produces the terminal unknown result.
+  Removing only the independent-marker discrimination must fail this test.
+- A captured legacy note stays legacy after upgrade and restart. Restarting
+  an interrupted upgrade must neither broaden the captured population nor
+  overwrite an unknown marker. A control that classifies missing receipts
+  from current schema version or note age must fail the unknown-cohort case.
+- Known modern complete receipts reseal without changing original fences,
+  model counts, vectors, log counts, or markers. Zero-model receipts remain
+  distinct from incomplete ones. An unknown marker with a later restored
+  receipt still refuses; removing only that refusal must fail the fixture.
+- Namespace move, soft delete/restore, hard delete, and key reuse preserve the
+  identity-bound provenance rules. An unreadable provenance store must refuse
+  without persisting `unknown`; test it separately from a missing marker.
+- A crash after the V46 transaction commits and before the cutover leaves the
+  captured inventory intact, and resuming classifies exactly that population;
+  holding the captured identities only in process memory must fail this test.
+  A failure injected after capture and before the V46 ledger row commits leaves
+  neither the inventory nor V46 committed; committing the capture in its own
+  earlier transaction must fail that test.
+- A keyed memory note created through a lower-level storage constructor has
+  no marker and refuses as `receipt_epoch_unknown` on exact replay. The same
+  note created through the runtime keyed writer is `modern` and reseals. A
+  keyed note of another kind that is replaced in place with kind `memory` also
+  refuses as `receipt_epoch_unknown`.
+- Exact replay through the request envelope of an `unknown` keyed memory, and
+  separately of a `legacy` one without a receipt, returns its refusal with the
+  holder's ID as `memory_id` and `domain_disposition: "not_committed"`. A
+  second identical replay returns the same refusal and ID, and note, vector,
+  ANN log, edge, receipt and marker rows are unchanged across both. Removing
+  the named disposition, so that the refusal surfaces as `unknown`, must fail
+  this test.
+- Upgrading a database seeded with a known mix of `legacy`, `modern` and
+  `unknown` keyed memories across two namespaces reports exactly those three
+  counts and the per-namespace `unknown` counts. An interrupted and resumed
+  cutover reports the same values once. No replay refusal carries any of them.
+- A source census of production callers of the routes that write no marker
+  reproduces the caller table above, and a new production caller fails it
+  until the table and that caller's disposition are updated. The census
+  asserts a non-empty caller set, so a pattern that silently matches nothing
+  fails instead of passing. It extends an existing source census in the tree
+  rather than adding a new mechanism.
+- A default recall accepts a token whose namespace is in its visible set and
+  refuses one outside it; an explicit one-namespace request refuses a token
+  from another visible namespace. A byte appended to a valid envelope fails
+  authentication, and a valid envelope whose plaintext carries a trailing byte
+  fails strict decoding.
+- Run the inherited v2-only confidentiality, tampering, key rotation, expiry,
+  keyed replay, and session proof acceptance from Amendment 2. A clear v1 token
+  must still be denied. These outputs and the unknown-cohort controls are
+  required evidence for sign-off; a docs-only proposal does not execute them.
