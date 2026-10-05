@@ -22,7 +22,10 @@ use super::declaration::{
 
 #[path = "route_census_parsed_sources.rs"]
 mod parsed_sources;
+#[path = "../../tests/support/static_sql_source.rs"]
+mod static_sql_source;
 use parsed_sources::{index_module_bindings, parse_production_sources, scan_source};
+use static_sql_source::{CanonicalBindings, StaticSqlSources};
 
 const STORE_WRITES: &[&str] = &[
     "upsert_entity",
@@ -172,6 +175,7 @@ struct SqlConstantReference {
 }
 
 struct ScannedSource {
+    sql_errors: Vec<String>,
     sites: Vec<Site>,
     runtime_tables: Vec<RuntimeTableSite>,
     /// Every expression path has an ordinal, whether or not it resolves. Both
@@ -1126,6 +1130,9 @@ fn shadow_bindings<'a>(patterns: impl Iterator<Item = &'a Pat>) -> SqlBindings {
 }
 
 struct SourceCollector<'modules> {
+    sql_sources: &'modules StaticSqlSources,
+    loader_bindings: CanonicalBindings,
+    sql_errors: Vec<String>,
     path: String,
     scope: Vec<String>,
     sites: BTreeMap<String, Site>,
@@ -1259,6 +1266,8 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
         if test_only(&item.attrs) {
             return;
         }
+        let nested = static_sql_source::module_bindings(item, &self.loader_bindings, test_only);
+        let outer_loaders = std::mem::replace(&mut self.loader_bindings, nested);
         let mut parents = self.parent_module_bindings.clone();
         parents.push(self.bindings.first().cloned().unwrap_or_default());
         let mut child_module = self.module_id.clone();
@@ -1290,6 +1299,15 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
         self.parent_module_bindings.pop();
         self.bindings = outer_bindings;
         self.module_id = outer_module;
+        self.loader_bindings = outer_loaders;
+        self.loader_bindings.observe_module(item);
+    }
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if !test_only(&item.attrs) {
+            self.loader_bindings.observe_macro(item);
+            syn::visit::visit_item_macro(self, item);
+        }
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
@@ -1339,6 +1357,8 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
     }
 
     fn visit_block(&mut self, block: &'ast Block) {
+        let nested = static_sql_source::block_bindings(block, &self.loader_bindings, test_only);
+        let outer_loaders = std::mem::replace(&mut self.loader_bindings, nested);
         let mut block_bindings = use_bindings(
             block.stmts.iter().filter_map(|stmt| {
                 if let Stmt::Item(syn::Item::Use(item)) = stmt {
@@ -1363,6 +1383,7 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
         self.bindings.push(block_bindings);
         syn::visit::visit_block(self, block);
         self.bindings.pop();
+        self.loader_bindings = outer_loaders;
     }
 
     fn visit_local(&mut self, local: &'ast Local) {
@@ -1516,6 +1537,27 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
+        match static_sql_source::resolve_static_sql(
+            &self.path,
+            mac,
+            self.sql_sources,
+            &self.loader_bindings,
+        ) {
+            Ok(Some(sql)) => {
+                self.record_sql(&sql.produced_text, (0, 0));
+                return;
+            }
+            Err(error) => {
+                self.sql_errors.push(error);
+                return;
+            }
+            Ok(None) => {}
+        }
+        if static_sql_source::opaque_sql_loader(mac) {
+            self.sql_errors
+                .push(format!("{}: uninspectable nested SQL loader", self.path));
+            return;
+        }
         // Visit vec! through its parsed expressions once. A preceding token
         // literal pass would count the same SQL literal a second time.
         if mac.path.is_ident("vec") {
@@ -1885,8 +1927,16 @@ fn test_module_files(
 }
 
 fn scan_source_population(sources: &[(String, String)]) -> Result<SourcePopulation, String> {
+    scan_source_population_with_sql(sources, &StaticSqlSources::new())
+}
+
+fn scan_source_population_with_sql(
+    sources: &[(String, String)],
+    sql_sources: &StaticSqlSources,
+) -> Result<SourcePopulation, String> {
     let (skipped, roots) = test_module_files(sources).map_err(|error| error.to_string())?;
     let parsed = parse_production_sources(sources, &skipped)?;
+    let loader_bindings = static_sql_source::canonical_bindings(&parsed, test_only);
     // The census resolves every path twice. The strict resolution stops at a
     // name that it cannot classify as a module, and the lenient one looks past
     // it. A path that only the lenient resolution takes to a note SQL constant
@@ -1903,7 +1953,18 @@ fn scan_source_population(sources: &[(String, String)]) -> Result<SourcePopulati
                 .get(path)
                 .cloned()
                 .expect("indexed production source");
-            let scanned = scan_source(path, file, module_id, &modules, is_strict);
+            let scanned = scan_source(
+                path,
+                file,
+                module_id,
+                &modules,
+                is_strict,
+                sql_sources,
+                loader_bindings[path].clone(),
+            );
+            if !scanned.sql_errors.is_empty() {
+                return Err(scanned.sql_errors.join("\n"));
+            }
             if is_strict {
                 runtime_tables.extend(
                     scanned
@@ -2275,7 +2336,7 @@ fn check_store_trait_methods(sources: &[(String, String)]) -> Result<(), String>
     }
 }
 
-fn source_files(dir: &Path, root: &Path, output: &mut Vec<(String, String)>) {
+fn source_files(dir: &Path, root: &Path, extension: &str, output: &mut Vec<(String, String)>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
     {
         let entry = entry.expect("source entry");
@@ -2287,8 +2348,8 @@ fn source_files(dir: &Path, root: &Path, output: &mut Vec<(String, String)>) {
             {
                 continue;
             }
-            source_files(&path, root, output);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            source_files(&path, root, extension, output);
+        } else if path.extension().is_some_and(|actual| actual == extension) {
             let relative = path
                 .strip_prefix(root)
                 .expect("workspace-relative path")
@@ -2299,6 +2360,21 @@ fn source_files(dir: &Path, root: &Path, output: &mut Vec<(String, String)>) {
             output.push((relative, source));
         }
     }
+}
+
+fn live_workspace_sql() -> StaticSqlSources {
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory")
+        .to_path_buf();
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("crates directory") {
+        let sql = entry.expect("crate directory").path().join("sql");
+        if sql.is_dir() {
+            source_files(&sql, &crates, "sql", &mut sources);
+        }
+    }
+    sources.into_iter().collect()
 }
 
 fn live_workspace_sources() -> Vec<(String, String)> {
@@ -2323,7 +2399,7 @@ fn live_workspace_sources() -> Vec<(String, String)> {
         }
         let src = crates.join(member).join("src");
         if src.exists() {
-            source_files(&src, &crates, &mut sources);
+            source_files(&src, &crates, "rs", &mut sources);
         }
     }
     sources.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2367,7 +2443,9 @@ mod parsed_sources_tests;
 fn source_census_matches_closed_route_inventory() {
     let sources = live_workspace_sources();
     check_store_trait_methods(&sources).expect("store method surface drifted");
-    let mut population = scan_source_population(&sources).expect("parse workspace sources");
+    let sql_sources = live_workspace_sql();
+    let mut population =
+        scan_source_population_with_sql(&sources, &sql_sources).expect("parse workspace sources");
     population
         .properties
         .extend(scan_migration_sources(&live_migration_sources()));
@@ -3929,4 +4007,235 @@ fn synthetic_census_controls() {
     assert!(check_store_trait_methods(&trait_sources)
         .unwrap_err()
         .contains("unclassified store method write_note_properties"));
+}
+
+#[test]
+fn static_sql_keeps_named_route_guard_class_and_occurrences() {
+    let route = *ROUTE_INVENTORY
+        .iter()
+        .find(|route| route.id == "gtd.transition.statement")
+        .unwrap();
+    let path = "khive-pack-gtd/src/handlers.rs";
+    let sql = "UPDATE notes SET properties=?1 WHERE id=?2";
+    let assets =
+        StaticSqlSources::from([("khive-pack-gtd/sql/fixture.sql".into(), format!("{sql}\n"))]);
+    let inline = format!("fn gtd_transition_statement() {{ reject_reserved_secret_gate_property(properties); call({sql:?}); }}");
+    let original = scan_source_population(&[(path.into(), inline)]).unwrap();
+    for loader in [
+        "khive_runtime::sql!(\"fixture\")",
+        "include_str!(\"../sql/fixture.sql\")",
+    ] {
+        let source = format!("fn gtd_transition_statement() {{ reject_reserved_secret_gate_property(properties); call({loader}); }}");
+        let population =
+            scan_source_population_with_sql(&[(path.into(), source.clone())], &assets).unwrap();
+        let before = &original.properties[0];
+        let after = &population.properties[0];
+        assert_eq!(
+            (
+                &after.key,
+                after.target,
+                after.route_class,
+                &after.class,
+                after.write_count,
+                &after.calls
+            ),
+            (
+                &before.key,
+                before.target,
+                before.route_class,
+                &before.class,
+                before.write_count,
+                &before.calls
+            )
+        );
+        assert!(check_inventory(&population.properties, &[route], 0).is_ok());
+        let unchecked = source.replace("reject_reserved_secret_gate_property(properties);", "");
+        let population =
+            scan_source_population_with_sql(&[(path.into(), unchecked)], &assets).unwrap();
+        assert!(check_inventory(&population.properties, &[route], 0).is_err());
+        let doubled = source.replace(
+            &format!("call({loader});"),
+            &format!("call({loader}); call({loader});"),
+        );
+        let population =
+            scan_source_population_with_sql(&[(path.into(), doubled)], &assets).unwrap();
+        assert_eq!(population.properties[0].write_count, 2);
+        assert!(check_inventory(&population.properties, &[route], 0).is_err());
+    }
+}
+
+#[test]
+fn static_sql_refuses_shadowed_loaders_without_poisoning_sibling_scopes() {
+    let assets = StaticSqlSources::from([(
+        "sample/sql/query.sql".into(),
+        "UPDATE notes SET properties='{}'".into(),
+    )]);
+    for source in [
+        "mod khive_runtime {} fn writer() { khive_runtime::sql!(\"query\"); }",
+        "fn writer() { use other as khive_runtime; khive_runtime::sql!(\"query\"); }",
+        "fn writer() { use unknown::*; khive_runtime::sql!(\"query\"); }",
+        "macro_rules! include_str { () => {}; } fn writer() { include_str!(\"../sql/query.sql\"); }",
+    ] {
+        assert!(scan_source_population_with_sql(&[("sample/src/lib.rs".into(), source.into())], &assets).is_err(), "{source}");
+    }
+    let sources = vec![
+        (
+            "sample/src/lib.rs".into(),
+            "mod unrelated; mod writer;".into(),
+        ),
+        ("sample/src/unrelated.rs".into(), "use unknown::*;".into()),
+        (
+            "sample/src/writer.rs".into(),
+            "fn writer() { khive_runtime::sql!(\"query\"); }".into(),
+        ),
+    ];
+    assert_eq!(
+        scan_source_population_with_sql(&sources, &assets)
+            .unwrap()
+            .properties
+            .len(),
+        1
+    );
+    let sources = vec![
+        (
+            "sample/src/lib.rs".into(),
+            "macro_rules! include_str { () => {}; } mod writer;".into(),
+        ),
+        (
+            "sample/src/writer.rs".into(),
+            "fn writer() { include_str!(\"../sql/query.sql\"); }".into(),
+        ),
+    ];
+    assert!(scan_source_population_with_sql(&sources, &assets).is_err());
+}
+
+#[test]
+fn static_sql_keeps_backend_and_test_exclusions_and_fixed_key_classes() {
+    let assets = StaticSqlSources::from([
+        ("sample/sql/query.sql".into(), "UPDATE notes SET properties=json_set(properties,'$.channel_slug',?1,'$.quarantine_content_ref',?2)".into()),
+        ("khive-db/sql/query.sql".into(), "INSERT INTO notes (properties) VALUES (?1)".into()),
+    ]);
+    let sources = vec![
+        ("sample/src/lib.rs".into(), "#[cfg(test)] mod hidden { fn writer() { khive_runtime::sql!(\"missing\"); } } fn writer() { let _ = vec![khive_runtime::sql!(\"query\")]; }".into()),
+        ("khive-db/src/lib.rs".into(), "const QUERY: &str = include_str!(\"../sql/query.sql\");".into()),
+    ];
+    let population = scan_source_population_with_sql(&sources, &assets).unwrap();
+    assert_eq!(population.properties.len(), 1);
+    assert_eq!(population.properties[0].write_count, 1);
+    assert_eq!(
+        population.properties[0].route_class,
+        RouteClass::Application
+    );
+    assert_eq!(
+        population.properties[0].class,
+        DetectedClass::FixedKeySet(BTreeSet::from([
+            "$.channel_slug".into(),
+            "$.quarantine_content_ref".into()
+        ]))
+    );
+}
+
+#[test]
+fn static_sql_distinguishes_module_item_scope_from_textual_macro_scope() {
+    let assets = StaticSqlSources::from([(
+        "sample/sql/query.sql".into(),
+        "UPDATE notes SET properties='{}'".into(),
+    )]);
+    let writer = "fn writer() { khive_runtime::sql!(\"query\"); }";
+    for parent in [
+        "use other as khive_runtime; mod child;",
+        "mod unrelated { use unknown::*; } mod child;",
+    ] {
+        let sources = vec![
+            ("sample/src/lib.rs".into(), parent.into()),
+            ("sample/src/child.rs".into(), writer.into()),
+        ];
+        assert_eq!(
+            scan_source_population_with_sql(&sources, &assets)
+                .unwrap()
+                .properties
+                .len(),
+            1
+        );
+    }
+    let included = "fn writer() { include_str!(\"../sql/query.sql\"); }";
+    for (parent, accepted) in [
+        ("mod child; macro_rules! include_str { () => {}; }", true),
+        ("macro_rules! include_str { () => {}; } mod child;", false),
+    ] {
+        let sources = vec![
+            ("sample/src/lib.rs".into(), parent.into()),
+            ("sample/src/child.rs".into(), included.into()),
+        ];
+        assert_eq!(
+            scan_source_population_with_sql(&sources, &assets).is_ok(),
+            accepted,
+            "{parent}"
+        );
+    }
+    for (source, accepted) in [
+        ("fn writer() { include_str!(\"../sql/query.sql\"); } macro_rules! include_str { () => {}; }", true),
+        ("macro_rules! include_str { () => {}; } fn writer() { include_str!(\"../sql/query.sql\"); }", false),
+        ("use other as khive_runtime; mod child { fn writer() { khive_runtime::sql!(\"query\"); } }", true),
+        ("#![no_implicit_prelude] fn writer() { khive_runtime::sql!(\"query\"); }", false),
+        ("extern crate other as khive_runtime; mod child { fn writer() { khive_runtime::sql!(\"query\"); } }", false),
+        ("extern crate self as khive_runtime; mod child { fn writer() { khive_runtime::sql!(\"query\"); } }", false),
+        ("use other as khive_runtime; fn writer() { ::khive_runtime::sql!(\"query\"); }", true),
+    ] {
+        assert_eq!(scan_source_population_with_sql(&[("sample/src/lib.rs".into(), source.into())], &assets).is_ok(), accepted, "{source}");
+    }
+    let sources = vec![
+        (
+            "sample/src/lib.rs".into(),
+            "use other as khive_runtime; include!(\"included.rs\");".into(),
+        ),
+        ("sample/src/included.rs".into(), writer.into()),
+    ];
+    assert!(scan_source_population_with_sql(&sources, &assets).is_err());
+}
+
+#[test]
+fn static_sql_loader_guard_ignores_quoted_spelling_but_refuses_opaque_calls() {
+    let assets = StaticSqlSources::from([(
+        "sample/sql/query.sql".into(),
+        "UPDATE notes SET properties='{}'".into(),
+    )]);
+    let harmless = "fn writer() { format!(\"khive_runtime :: sql !\"); format!(\"include_str ! (query.sql)\"); }";
+    assert!(scan_source_population_with_sql(
+        &[("sample/src/lib.rs".into(), harmless.into())],
+        &assets
+    )
+    .unwrap()
+    .properties
+    .is_empty());
+    for source in [
+        "fn writer() { format!(\"{}\", khive_runtime::sql!(\"query\")); }",
+        "fn writer() { opaque! { label => include_str!(\"../sql/query.sql\") } }",
+    ] {
+        assert!(scan_source_population_with_sql(
+            &[("sample/src/lib.rs".into(), source.into())],
+            &assets
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn static_sql_macro_scope_follows_inline_path_attributes() {
+    for (outer, child_path) in [
+        ("macro_rules! include_str { () => {}; } mod nested { #[path=\"leaf.rs\"] mod leaf; }", "sample/src/outer/nested/leaf.rs"),
+        ("macro_rules! include_str { () => {}; } #[path=\"custom_dir\"] mod nested { #[path=\"leaf.rs\"] mod leaf; }", "sample/src/custom_dir/leaf.rs"),
+    ] {
+        let sources = vec![
+            ("sample/src/lib.rs".into(), "mod outer;".into()),
+            ("sample/src/outer.rs".into(), outer.into()),
+            (child_path.into(), "const SQL: &str = include_str!(\"query.sql\");".into()),
+        ];
+        let asset = format!("{}/query.sql", Path::new(child_path).parent().unwrap().display());
+        let assets = StaticSqlSources::from([(asset, "UPDATE notes SET properties='{}'".into())]);
+        assert!(scan_source_population_with_sql(&sources, &assets).is_err(), "{child_path}");
+        let mut unshadowed = sources.clone();
+        unshadowed[1].1 = outer.replace("macro_rules! include_str { () => {}; }", "");
+        assert_eq!(scan_source_population_with_sql(&unshadowed, &assets).unwrap().properties.len(), 1);
+    }
 }

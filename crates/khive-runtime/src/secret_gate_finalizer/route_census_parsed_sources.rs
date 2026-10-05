@@ -25,6 +25,8 @@ pub(super) fn scan_source(
     module_id: ModuleId,
     modules: &ModuleBindings,
     strict: bool,
+    sql_sources: &StaticSqlSources,
+    loader_bindings: CanonicalBindings,
 ) -> ScannedSource {
     let parents = module_parents(&module_id, modules);
     let bindings = use_bindings(
@@ -40,6 +42,9 @@ pub(super) fn scan_source(
     );
     let bindings = with_declared_types(bindings, &module_id, modules);
     let mut collector = SourceCollector {
+        sql_sources,
+        loader_bindings,
+        sql_errors: Vec::new(),
         path: path.to_owned(),
         scope: Vec::new(),
         sites: BTreeMap::new(),
@@ -55,6 +60,7 @@ pub(super) fn scan_source(
     };
     collector.visit_file(file);
     ScannedSource {
+        sql_errors: collector.sql_errors,
         sites: collector.sites.into_values().collect(),
         runtime_tables: collector.runtime_tables.into_values().collect(),
         constant_references: collector.constant_references,
