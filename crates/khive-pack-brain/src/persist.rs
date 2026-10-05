@@ -1245,10 +1245,10 @@ async fn load_events_since_with_window(
         }
         // Semantic validation: a brain.feedback row with an invalid section_signals
         // payload must be quarantined whole — before any posterior state mutation.
-        // This is the shared contract with the live brain.feedback handler.
+        // Same contract as the live handler, once retired section keys are dropped.
         if event.verb == "brain.feedback" {
             if let Some(ss) = event.payload.get("section_signals") {
-                if let Err(e) = crate::validate_section_signals(ss) {
+                if let Err(e) = crate::validate_replayed_section_signals(ss) {
                     push_quarantine(
                         ReplaySkipCategory::Quarantine,
                         format!("semantically invalid section_signals: {e}"),

@@ -323,7 +323,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events.rs::tests::whole_object_dispatch_writes_refuse_carried_reserved_property" },
+        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events_tests.rs::whole_object_dispatch_writes_refuse_carried_reserved_property" },
     },
     RouteInventoryEntry {
         id: "pending.corrupt",
@@ -336,7 +336,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events.rs::tests::whole_object_dispatch_writes_refuse_carried_reserved_property" },
+        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events_tests.rs::whole_object_dispatch_writes_refuse_carried_reserved_property" },
     },
     RouteInventoryEntry {
         id: "pending.finalize",
@@ -349,7 +349,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events.rs::tests::whole_object_dispatch_writes_refuse_carried_reserved_property" },
+        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events_tests.rs::whole_object_dispatch_writes_refuse_carried_reserved_property" },
     },
     RouteInventoryEntry {
         id: "pending.invoking",
@@ -362,7 +362,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events.rs::tests::whole_object_dispatch_writes_refuse_carried_reserved_property" },
+        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events_tests.rs::whole_object_dispatch_writes_refuse_carried_reserved_property" },
     },
     RouteInventoryEntry {
         id: "pending.outcome",
@@ -375,7 +375,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events.rs::tests::whole_object_dispatch_writes_refuse_carried_reserved_property" },
+        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events_tests.rs::whole_object_dispatch_writes_refuse_carried_reserved_property" },
     },
     RouteInventoryEntry {
         id: "pending.requeue",
@@ -388,7 +388,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events.rs::tests::whole_object_dispatch_writes_refuse_carried_reserved_property" },
+        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events_tests.rs::whole_object_dispatch_writes_refuse_carried_reserved_property" },
     },
     RouteInventoryEntry {
         id: "pending.lease",
@@ -401,7 +401,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events.rs::tests::renewable_lease_prevents_live_overrun_reclaim_and_double_dispatch" },
+        acceptance: Acceptance::Test { path: "khive-mcp/src/pending_events_tests.rs::renewable_lease_prevents_live_overrun_reclaim_and_double_dispatch" },
     },
     RouteInventoryEntry {
         id: "code.source.mutate",

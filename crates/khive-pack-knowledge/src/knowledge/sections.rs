@@ -37,16 +37,24 @@ fn parse_section_type(s: &str) -> Result<SectionType, RuntimeError> {
 }
 
 /// Deserialise a `knowledge_sections` SQL row into a [`Section`].
-/// Returns `None` when the row carries an invalid UUID or unknown `section_type`.
+/// Returns `None` when the row carries an invalid UUID or a `section_type` that is
+/// neither a current type nor a retired name. A row typed with a retired name
+/// (ADR-048, 2026-10-04 amendment) keeps its stored type string and is marked retired.
 pub(super) fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Section> {
     let id: Uuid = row_str(row, "id")?.parse().ok()?;
     let st_str = row_str(row, "section_type")?;
-    let section_type = SectionType::from_str_loose(&st_str)?;
+    let retired = SectionType::is_retired_name(&st_str);
+    let section_type = if retired {
+        st_str
+    } else {
+        SectionType::from_str_loose(&st_str)?.as_str().to_owned()
+    };
     Some(Section {
         id,
         atom_id: row_str(row, "atom_id")?,
         namespace: row_str(row, "namespace")?,
         section_type,
+        retired,
         heading: row_str(row, "heading").unwrap_or_default(),
         content: row_str(row, "content").unwrap_or_default(),
         content_hash: row_str(row, "content_hash").unwrap_or_default(),
@@ -60,13 +68,14 @@ pub(super) fn section_from_row(row: &khive_storage::types::SqlRow) -> Option<Sec
 
 /// Serialise a [`Section`] to its wire JSON shape for `knowledge.get` responses.
 /// Fields: `id`, `atom_id`, `namespace`, `section_type`, `heading`, `content`,
-/// `content_hash`, `status`, `tokens`, `sort_order`, `created_at`, `updated_at`.
+/// `content_hash`, `status`, `tokens`, `sort_order`, `created_at`, `updated_at`; a
+/// section typed with a retired name also carries `"retired": true`.
 pub(super) fn section_to_json(s: &Section) -> Value {
-    json!({
+    let mut out = json!({
         "id": s.id.to_string(),
         "atom_id": s.atom_id,
         "namespace": s.namespace,
-        "section_type": s.section_type.as_str(),
+        "section_type": s.section_type,
         "heading": s.heading,
         "content": s.content,
         "content_hash": s.content_hash,
@@ -75,7 +84,11 @@ pub(super) fn section_to_json(s: &Section) -> Value {
         "sort_order": s.sort_order,
         "created_at": s.created_at,
         "updated_at": s.updated_at,
-    })
+    });
+    if s.retired {
+        out["retired"] = json!(true);
+    }
+    out
 }
 
 // ─── markdown parsing helpers ─────────────────────────────────────────────────
@@ -651,20 +664,11 @@ fn prepare_import_file(
     };
     validate_atom_content(&atom_content)?;
 
-    let citation_count = parsed_sections
-        .iter()
-        .filter(|(section_type, _, _)| *section_type == Some(SectionType::References))
-        .map(|(_, _, body)| body.lines().filter(|line| !line.trim().is_empty()).count())
-        .sum::<usize>();
     let source_uri = atlas_id
         .as_ref()
         .map(|id| format!("atlas:{id}"))
         .unwrap_or_else(|| format!("file:{}", identity.source_path));
-    let source_type = if citation_count > 0 {
-        "paper"
-    } else {
-        "imported"
-    };
+    let source_type = "imported";
     let mut properties = frontmatter.properties;
     properties.insert(
         "source_path".to_string(),
@@ -685,7 +689,7 @@ fn prepare_import_file(
                 tracing::warn!(
                     source_path = %identity.source_path,
                     heading = %heading,
-                    "knowledge.import refused a section whose {{type}} marker names no section type"
+                    "knowledge.import refused a section whose heading names no section type"
                 );
                 unknown_type = unknown_type.saturating_add(1);
                 continue;
@@ -872,7 +876,8 @@ fn extract_atlas_id(content: &str) -> Option<String> {
 }
 
 /// A `## ` section parsed from markdown: its type, display heading and body. The type is
-/// `None` when the heading declares a `{type}` marker that names no [`SectionType`].
+/// `None` when the heading resolves to no [`SectionType`]: its `{type}` marker names no
+/// section type, or it has no marker and no alias recognises the heading.
 type ParsedSection = (Option<SectionType>, String, String);
 
 /// Split a trailing `{type}` marker off a section heading. The marker is a lowercase
@@ -895,15 +900,13 @@ fn split_type_marker(heading: &str) -> Option<(&str, &str)> {
 
 /// Resolve a section heading to its type and display heading. A trailing `{type}` marker
 /// must name a canonical [`SectionType`] value (no aliases) and is removed from the
-/// heading; without a marker the whole heading goes through the alias lookup, and a
-/// heading it does not recognise is typed `other`.
+/// heading; without a marker the whole heading goes through the alias lookup. A heading
+/// that resolves to no type is never guessed: its type is `None` and the import refuses
+/// and counts the section.
 fn section_heading_type(heading: &str) -> (Option<SectionType>, String) {
     match split_type_marker(heading) {
         Some((display, marker)) => (marker.parse().ok(), display.to_string()),
-        None => (
-            Some(SectionType::from_str_loose(heading).unwrap_or(SectionType::Other)),
-            heading.to_string(),
-        ),
+        None => (SectionType::from_str_loose(heading), heading.to_string()),
     }
 }
 

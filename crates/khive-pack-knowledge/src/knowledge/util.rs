@@ -57,6 +57,12 @@ pub(super) const MIN_SECTION_CONTENT_LEN: usize = 80;
 /// Minimum atom content length in words.
 pub(super) const MIN_ATOM_CONTENT_WORDS: usize = 20;
 
+/// SQL predicate on `knowledge_sections.section_type` that leaves out rows typed with a
+/// retired section type (ADR-048, 2026-10-04 amendment). Stored rows keep their retired
+/// type unchanged, so every query that reads sections for serving appends this predicate.
+/// A unit test pins it to `SectionType::RETIRED_NAMES`.
+pub(super) const SERVABLE_SECTION: &str = "section_type NOT IN ('references', 'other')";
+
 /// Compute sha256(content)[:16] as a hex string for dedup keying.
 pub(super) fn content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
@@ -439,5 +445,15 @@ mod tests {
             }
             other => panic!("expected RuntimeError::Internal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn servable_section_predicate_excludes_exactly_the_retired_names() {
+        let names = khive_brain_core::SectionType::RETIRED_NAMES
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(SERVABLE_SECTION, format!("section_type NOT IN ({names})"));
     }
 }

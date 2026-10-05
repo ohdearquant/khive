@@ -133,11 +133,14 @@ The parser (`parse_atlas_md`) reads the `# Title` line as the atom name, collect
 the first `##` heading as the atom body, and maps each `##` heading to a `SectionType`. A heading
 that ends in a `{type}` marker declares its type: the marker must be a canonical snake_case
 `SectionType` value (`## Why memoization terminates {core_model}`), aliases are not accepted inside
-the braces, and the marker is removed from the stored heading. A section whose marker names no
-section type is not imported; it is counted in `sections_unknown_type` and logged with its file
-and heading. Brace text that is not a trailing lowercase token stays part of the heading. Headings
-without a marker go through `SectionType::from_str_loose` (which accepts common heading aliases),
-and headings that match no canonical type are classified as `Other`.
+the braces, and the marker is removed from the stored heading. Brace text that is not a trailing
+lowercase token stays part of the heading. Headings without a marker go through
+`SectionType::from_str_loose` (which accepts common heading aliases for the eight section types).
+A section whose heading resolves to no type, whether its marker names no section type or no alias
+matches, is never guessed: it is not imported, it is counted in `sections_unknown_type` and logged
+with its file and heading. The retired `references` and `other` types are not section types, so a
+`## References` heading is refused this way, and an imported atom always carries
+`source_type = "imported"`.
 
 Optional delimiter-bounded YAML frontmatter is removed before markdown parsing and content
 storage. `id`, `atlas_id`, and `atlas-id` are agreeing aliases for canonical identity; when

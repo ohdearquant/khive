@@ -71,16 +71,21 @@ pub fn interpret(event: &Event) -> BrainSignal {
             // Parse section_signals through the shared validator so that semantically
             // poisoned entries (empty map, unknown section, out-of-contract signal value)
             // produce None — identical treatment during both live handler and replay.
-            let section_signals = event.payload.get("section_signals").and_then(|v| {
-                // Reject anything the shared validator would have rejected up front.
-                // This is the replay path: invalid entries yield None (→ Irrelevant for
-                // the section fold), and the caller (persist.rs) quarantines the whole
-                // event before calling apply_signal.
-                if crate::validate_section_signals(v).is_err() {
-                    return None;
-                }
-                serde_json::from_value::<HashMap<SectionType, FeedbackSignal>>(v.clone()).ok()
-            });
+            let section_signals = event
+                .payload
+                .get("section_signals")
+                .and_then(crate::replay_section_signals)
+                .and_then(|v| {
+                    // Reject anything the shared validator would have rejected up front.
+                    // This is the replay path: invalid entries yield None (→ Irrelevant for
+                    // the section fold), and the caller (persist.rs) quarantines the whole
+                    // event before calling apply_signal. Entries keyed by a retired section
+                    // type were dropped above, so the remaining signals still apply.
+                    if crate::validate_section_signals(&v).is_err() {
+                        return None;
+                    }
+                    serde_json::from_value::<HashMap<SectionType, FeedbackSignal>>(v).ok()
+                });
 
             // Try semantic event kind names first, then fall back to
             // legacy FeedbackSignal (useful / not_useful / wrong).

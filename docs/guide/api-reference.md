@@ -2501,10 +2501,10 @@ The response combines the inline section and atom refresh outcomes in `truncatio
 includes the standard `warnings` advisory when any model bounded an embedding input. Stored section
 and atom content remains complete.
 
-| Param      | Type            | Required | Notes                                                                                                                                                                                                                                                                             |
-| ---------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `id`       | string          | yes      | Atom UUID or slug.                                                                                                                                                                                                                                                                |
-| `sections` | array\<object\> | yes      | `[{section_type, content, heading?, sort_order?}]`. `section_type` is a closed enum: `overview`\|`core_model`\|`boundary_conditions`\|`formalism`\|`operational_guidance`\|`examples`\|`failure_modes`\|`expert_lens`\|`references`\|`other`. `content` must be >= 80 characters. |
+| Param      | Type            | Required | Notes                                                                                                                                                                                                                                                      |
+| ---------- | --------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`       | string          | yes      | Atom UUID or slug.                                                                                                                                                                                                                                         |
+| `sections` | array\<object\> | yes      | `[{section_type, content, heading?, sort_order?}]`. `section_type` is a closed enum: `overview`\|`core_model`\|`boundary_conditions`\|`formalism`\|`operational_guidance`\|`examples`\|`failure_modes`\|`expert_lens`. `content` must be >= 80 characters. |
 
 ```
 request(ops="[{\"tool\":\"knowledge.edit\",\"args\":{\"id\":\"rope\",\"sections\":[{\"section_type\":\"overview\",\"content\":\"Rotary position embedding rotates query/key vectors by an angle proportional to position...\"}]}}]")

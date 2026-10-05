@@ -40,13 +40,14 @@ let state = SectionPosteriorState::new(); // seeded from SectionType::default_pr
 let weights = derive_deterministic_weights(&state); // HashMap<SectionType, f64>, posterior means
 
 assert_eq!(SectionType::Overview.as_str(), "overview");
-assert_eq!(SectionType::ALL.len(), 10);
+assert_eq!(SectionType::ALL.len(), 8);
 ```
 
-`SectionType` is a closed 10-value taxonomy (`Overview`, `CoreModel`,
+`SectionType` is a closed 8-value taxonomy (`Overview`, `CoreModel`,
 `BoundaryConditions`, `Formalism`, `OperationalGuidance`, `Examples`, `FailureModes`,
-`ExpertLens`, `References`, `Other`) used to weight knowledge-atom sections during
-composition. `SectionPosteriorState::weights` samples via Thompson sampling while
+`ExpertLens`) used to weight knowledge-atom sections during composition. The names
+`references` and `other` were retired: `SectionType::RETIRED_NAMES` lists them, and a persisted
+posterior map that still carries them loads with those entries dropped. `SectionPosteriorState::weights` samples via Thompson sampling while
 `exploration_epoch > 0` (early life, more exploration) and falls back to
 `derive_deterministic_weights` (posterior means) once the epoch is exhausted, so
 composition converges from exploratory to exploitative without a separate code path.

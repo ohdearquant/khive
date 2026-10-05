@@ -1,11 +1,15 @@
-//! Closed 10-value section type taxonomy (ADR-048).
+//! Closed 8-value section type taxonomy (ADR-048).
 
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-/// Closed 10-value taxonomy of knowledge-atom section categories.
+/// Closed 8-value taxonomy of knowledge-atom section categories.
+///
+/// `references` and `other` were retired by the 2026-10-04 amendment to ADR-048.
+/// They are not variants; [`SectionType::RETIRED_NAMES`] lists them so that code
+/// tolerating data written before the retirement recognises them in one place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SectionType {
@@ -17,12 +21,10 @@ pub enum SectionType {
     Examples,
     FailureModes,
     ExpertLens,
-    References,
-    Other,
 }
 
 impl SectionType {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 8] = [
         Self::Overview,
         Self::CoreModel,
         Self::BoundaryConditions,
@@ -31,8 +33,6 @@ impl SectionType {
         Self::Examples,
         Self::FailureModes,
         Self::ExpertLens,
-        Self::References,
-        Self::Other,
     ];
 
     pub const NAMES: &'static [&'static str] = &[
@@ -44,9 +44,14 @@ impl SectionType {
         "examples",
         "failure_modes",
         "expert_lens",
-        "references",
-        "other",
     ];
+
+    /// Section type names retired by the 2026-10-04 amendment to ADR-048.
+    ///
+    /// Stored rows and recorded events written before the retirement may still
+    /// carry these names. Read and replay paths drop or mark them; write paths
+    /// refuse them as unknown, because they are not in [`SectionType::NAMES`].
+    pub const RETIRED_NAMES: &'static [&'static str] = &["references", "other"];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -58,13 +63,16 @@ impl SectionType {
             Self::Examples => "examples",
             Self::FailureModes => "failure_modes",
             Self::ExpertLens => "expert_lens",
-            Self::References => "references",
-            Self::Other => "other",
         }
     }
 
     pub fn all() -> &'static [SectionType] {
         &Self::ALL
+    }
+
+    /// True when `name` is exactly one of [`SectionType::RETIRED_NAMES`].
+    pub fn is_retired_name(name: &str) -> bool {
+        Self::RETIRED_NAMES.contains(&name)
     }
 
     /// Parse from canonical snake_case or common heading aliases.
@@ -106,9 +114,6 @@ impl SectionType {
             | "edge_cases" | "warnings" | "cautions" => Some(Self::FailureModes),
             "expert_lens" | "trade_offs" | "tradeoffs" | "advanced" | "nuances" | "insights"
             | "discussion" => Some(Self::ExpertLens),
-            "references" | "reference" | "bibliography" | "related" | "see_also"
-            | "further_reading" | "citations" | "links" => Some(Self::References),
-            "other" | "misc" | "miscellaneous" | "notes" | "appendix" => Some(Self::Other),
             _ => None,
         }
     }
@@ -133,8 +138,6 @@ impl FromStr for SectionType {
             "examples" => Ok(Self::Examples),
             "failure_modes" => Ok(Self::FailureModes),
             "expert_lens" => Ok(Self::ExpertLens),
-            "references" => Ok(Self::References),
-            "other" => Ok(Self::Other),
             _ => Err(format!("unknown SectionType: {s:?}")),
         }
     }

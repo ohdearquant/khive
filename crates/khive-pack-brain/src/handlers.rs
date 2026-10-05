@@ -3469,17 +3469,17 @@ fn event_cost_unit(payload: &Value) -> Option<i64> {
 ///   [0..2]  = relevance  {mean, ess}
 ///   [2..4]  = salience   {mean, ess}
 ///   [4..6]  = temporal   {mean, ess}
-///   [6..16] = 10 section posterior means in `SectionType::all()` order
+///   [6..]   = one section posterior mean per type in `SectionType::all()` order
 #[cfg(feature = "lattice-router")]
-const ROUTER_CONTEXT_DIM: usize = 16;
+const ROUTER_CONTEXT_DIM: usize = 6 + SectionType::ALL.len();
 
-/// Build a 16-element context vector from live brain posteriors.
+/// Build a `ROUTER_CONTEXT_DIM`-element context vector from live brain posteriors.
 ///
 /// ESS values are stored as raw f32 casts.  Normalization is deferred to the
 /// engine `route()` seam (#343) once the network is trained; documenting the
 /// omission here so it is not forgotten.
 ///
-/// When `sections` is `None` the 10 section slots are filled from
+/// When `sections` is `None` the section slots are filled from
 /// `SectionPosteriorState::default_priors()` means — deterministically neutral,
 /// never arbitrary zeros.
 #[cfg(feature = "lattice-router")]
@@ -3760,7 +3760,7 @@ mod router_tests {
             "context vectors must differ for different posteriors"
         );
 
-        // Dimension must be 16.
+        // Dimension is 6 scalar slots plus one slot per section type.
         assert_eq!(v_high.len(), ROUTER_CONTEXT_DIM);
         assert_eq!(v_low.len(), ROUTER_CONTEXT_DIM);
 
@@ -3789,7 +3789,7 @@ mod router_tests {
             v_low[0]
         );
 
-        // Section slots [6..16] filled from default priors when sections=None — never zero.
+        // Every section slot [6..] is filled from default priors when sections=None — never zero.
         for (i, &val) in v_high.iter().enumerate().skip(6) {
             assert!(
                 val > 0.0,

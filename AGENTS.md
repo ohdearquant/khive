@@ -324,9 +324,9 @@ alias. `knowledge.list` accepts the same `kind=`/`type=` discriminant.
 
 `knowledge.edit` takes `sections=[{section_type, content, heading?, sort_order?}]`. `section_type`
 is a **closed enum** — valid values: `overview` | `core_model` | `boundary_conditions` |
-`formalism` | `operational_guidance` | `examples` | `failure_modes` | `expert_lens` |
-`references` | `other`. Content must be **at least 80 characters**. Shorter content or an
-unrecognized `section_type` returns a validation error listing the valid values.
+`formalism` | `operational_guidance` | `examples` | `failure_modes` | `expert_lens`. Content
+must be **at least 80 characters**. Shorter content or an unrecognized `section_type` (including
+the retired `references` and `other`) returns a validation error listing the valid values.
 
 ### Session pack — 7 verbs (`session.` prefix)
 
