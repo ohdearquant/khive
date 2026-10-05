@@ -35,6 +35,70 @@ statement; its SessionStore design was not carried forward\
 by the 2026-07-09 amendment), #1499 (inbox long poll -- resolved by the 2026-08-01 amendment),
 #1383 (quarantine health and recovery -- resolved by the 2026-08-09 amendment)
 
+## Amendment 2026-10-05 -- Disclose committed ingest indexing failures
+
+**Status**: Accepted 2026-10-05.
+
+**Context.** Conditional note insertion commits the note, and any original-byte attachment owner,
+before indexing. The ingest path currently logs indexing failures and returns an unqualified success.
+Turning that outcome into an ordinary ingest error would instead suppress the inbox wake and cause
+channel callers to retry a write that already committed.
+
+**Decision.** Direct Rust conditional-note methods keep their existing return types.
+A failed FTS acquisition or upsert, embedding, vector-store acquisition or vector insertion after a
+new insert returns the existing structured `post_commit_degraded` error with
+`operation="try_create_note"`, `committed=true`, `retryable=false`, the canonical `record_id`, and
+`post_commit_degradations`. Each diagnostic has `stage` and `error`; model-specific errors name the
+model. Healthy models still run. The note and its attachment remain committed. No indexing work is
+attempted for a deduplicated insert.
+
+The trusted `comm.ingest` handler recognizes only this typed committed outcome. It publishes its
+normal inbox wake exactly once and returns the existing committed acknowledgement (`id`, `full_id`,
+`thread_id`, `external_id`, `deduplicated=false`) with an additive `post_commit_degradations` array.
+The stage labels are `fts_acquisition`, `fts_upsert`, `embedding`, `vector_acquisition` and
+`vector_insert`. The runtime exports them as `ConditionalInsertStage`, records a stage only through
+that type, and the handler accepts a stage only when it is one of its labels. The field is absent
+on a healthy acknowledgement and on an ordinary dedup reply.
+This reuses the committed-result report convention of the KG mutation handlers; it does not add a
+new durable receipt, repair queue or index watermark. Precommit refusals and errors without the exact
+typed committed identity and valid diagnostic array remain errors.
+
+**Callers.** The tree has three conditional-note methods: `try_create_note`,
+`try_create_note_as_trusted_ingest` and `try_create_note_as_trusted_ingest_with_attachment`. Their
+one production caller is the trusted `comm.ingest` handler, which calls both trusted variants and
+surfaces the committed outcome as above. `try_create_note` has no production caller. The remaining
+callers are tests, which treat any error as a failure. No caller retries the committed outcome or
+maps it to a generic failure.
+
+**Limit and repair.** The committed outcome is reported once, to the call that made the insert. No
+indexing is attempted for a deduplicated insert, so a repeat of a degraded write, for example after
+a lost acknowledgement, returns a clean dedup acknowledgement with no diagnostics for a record that
+is still missing from FTS or a vector store, and nothing durable records the degradation. The
+existing repair is `kkernel reindex --namespace <namespace> --no-knowledge --keep-existing` against
+the database that holds the record (where `[[backends]]` is declared, `--db` must name that
+backend). It upserts the FTS document of every entity and note in the namespace and embeds every
+record that lacks a vector. It takes no record id, and no verb or command repairs the indexes of a
+single named record.
+
+A caller must reconcile the named record and failed indexing stages rather than repeat its mutation.
+The acknowledgement remains a successful durable ingest for both ordinary messages and quarantine
+placeholders, preserving existing cursor and retry behavior. Runtime warnings remain available to
+unattended channel operators. This does not change attribution, admission, dedup scope, original-byte
+retention, attachment atomicity, legacy note reindex behavior or asynchronous ANN freshness.
+
+**Acceptance.** A real FTS write refusal and a failing model beside a healthy model retain the
+committed note and expose the actual failure. Trusted ordinary and attachment ingestion return the
+committed ID plus diagnostics and publish one wake; a duplicate returns its existing receipt without
+another note insert, indexing attempt or wake. A degraded insert repeated with the same write
+returns the existing receipt with no diagnostics and no second wake, and the record's FTS document
+is found again after the namespace reindex. Existing quarantine retention and attachment repair
+still run when applicable. Malformed or unrelated error shapes remain refused.
+Removing runtime failure collection, handler report projection or the committed wake must each break
+its corresponding durable-write regression.
+
+**Refs.** #1461 (conditional-ingest increment only); #4151 (the next increment: a repair that takes
+a single record id).
+
 ## Amendment 2026-09-27 -- Channel-scoped external-ID deduplication
 
 An email adapter lowercases the mailbox address in its account-scoped IMAP UID key,

@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use khive_retrieval::ann::corpus::{CorpusScope, LiveRowJoin};
+use khive_retrieval::ann::corpus::{CorpusScope, LiveRowJoin, WatermarkCapture};
 use khive_retrieval::ann::registry::{self as ann_registry, WatermarkAuthority, PENDING_WATERMARK};
 use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{
@@ -1964,17 +1964,7 @@ async fn compute_memory_fingerprint(
     let sql = rt.sql();
     let mut reader = sql.reader().await.ok()?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT COUNT(*) AS n FROM {table_name} v \
-                 JOIN notes n ON n.id = v.subject_id \
-                 WHERE v.embedding_model = ?1 \
-                   AND v.kind = 'note' AND v.field = 'note.content' \
-                   AND n.deleted_at IS NULL"
-            ),
-            params: vec![SqlValue::Text(model.to_owned())],
-            label: Some("memory_ann_fingerprint".into()),
-        })
+        .query_all(memory_corpus().fingerprint(&table_name, model, "memory_ann_fingerprint"))
         .await
         .ok()?;
     let vector_count = match rows.first()?.get("n")? {
@@ -2021,32 +2011,7 @@ async fn load_and_build_from_vector_store(
     let mut reader = sql.reader().await?;
 
     let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT v.subject_id, v.embedding, n.namespace, \
-                        MAX( \
-                          (SELECT COALESCE(MAX(seq), 0) FROM ann_write_log \
-                            WHERE embedding_model = ?1 \
-                              AND kind = 'note' AND field = 'note.content'), \
-                          (SELECT COALESCE(MAX(watermark), 0) \
-                             FROM ann_consumer_watermark \
-                            WHERE consumer = ?2 AND namespace = ?3 \
-                              AND embedding_model = ?1 AND watermark >= 0) \
-                        ) AS log_s \
-                 FROM {table_name} v \
-                 JOIN notes n ON n.id = v.subject_id \
-                 WHERE v.embedding_model = ?1 \
-                   AND v.kind = 'note' AND v.field = 'note.content' \
-                   AND n.deleted_at IS NULL \
-                 ORDER BY v.subject_id"
-            ),
-            params: vec![
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Text(ANN_CONSUMER.into()),
-                SqlValue::Text(ANN_WILDCARD_NS.into()),
-            ],
-            label: Some("memory_ann_corpus_scan".into()),
-        })
+        .query_all(memory_corpus().corpus_scan(&table_name, model, "memory_ann_corpus_scan"))
         .await?;
 
     if rows.is_empty() {
@@ -2340,6 +2305,10 @@ fn memory_corpus() -> CorpusScope<'static> {
         record_kind: Some("note"),
         field: "note.content",
         live_join: Some(LiveRowJoin::Notes),
+        watermark_capture: WatermarkCapture::ScopedMaximumWithOwnFloor {
+            consumer: ANN_CONSUMER,
+            registry_namespace: ANN_WILDCARD_NS,
+        },
     }
 }
 
@@ -8874,3 +8843,7 @@ mod bridge_incremental_tests;
 #[cfg(test)]
 #[path = "ann/corpus_statement_tests.rs"]
 mod corpus_statement_tests;
+
+#[cfg(test)]
+#[path = "ann/corpus_capture_tests.rs"]
+mod corpus_capture_tests;

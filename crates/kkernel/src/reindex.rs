@@ -1446,6 +1446,9 @@ mod tests {
     use khive_storage::types::{SqlStatement, SqlValue};
     use serial_test::serial;
 
+    mod cross_process_epoch_tests;
+    use cross_process_epoch_tests::FixedReindexEmbedder;
+
     // Empty TOML retains the normal default engine. FTS-only fixtures must
     // explicitly remove every configured engine before the validated open.
     async fn run_reindex_without_embeddings(args: ReindexArgs) -> Result<()> {
@@ -1465,52 +1468,6 @@ mod tests {
             },
         )
         .await
-    }
-
-    struct FixedReindexEmbedder {
-        name: String,
-        dimensions: usize,
-    }
-
-    #[async_trait::async_trait]
-    impl khive_runtime::EmbedderProvider for FixedReindexEmbedder {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn dimensions(&self) -> usize {
-            self.dimensions
-        }
-
-        async fn build(
-            &self,
-        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
-        {
-            Ok(std::sync::Arc::new(FixedReindexEmbeddingService(
-                self.dimensions,
-            )))
-        }
-    }
-
-    struct FixedReindexEmbeddingService(usize);
-
-    #[async_trait::async_trait]
-    impl lattice_embed::EmbeddingService for FixedReindexEmbeddingService {
-        async fn embed(
-            &self,
-            texts: &[String],
-            _model: lattice_embed::EmbeddingModel,
-        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
-            Ok(texts.iter().map(|_| vec![1.0_f32; self.0]).collect())
-        }
-
-        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
-            true
-        }
-
-        fn name(&self) -> &'static str {
-            "reindex-test"
-        }
     }
 
     async fn run_reindex_offline(args: ReindexArgs) -> Result<()> {
@@ -4492,4 +4449,6 @@ default = false
             2
         );
     }
+
+    mod degraded_ingest_repair_tests;
 }

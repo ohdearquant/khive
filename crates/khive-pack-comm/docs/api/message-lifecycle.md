@@ -402,8 +402,9 @@ visible before that query takes its storage snapshot; a commit that lands after
 the snapshot is left to the caller's next request.
 
 `comm.send` and `comm.reply` publish after their dual-write has committed.
-`comm.ingest` publishes only after `try_create_note` returns a newly committed
-note; the deduplicated path does not publish. The signal carries no message or
+`comm.ingest` publishes only after the trusted conditional insert commits a new
+note, including a commit whose indexing then failed; the deduplicated path does
+not publish. The signal carries no message or
 identity data and is not a delivery or authorization boundary. It is intentionally
 not cross-process pubsub: direct writes through another registry/process become
 visible on the timeout-edge final query or a subsequent call, while normal daemon
@@ -698,6 +699,15 @@ verify-after-insert check on the durable unique index over the external ID
 and exact `(channel_kind, channel_slug)` provenance. Missing channel fields
 occupy the empty index partition. A confirmed duplicate returns `Ok(None)`
 without error; other constraint violations surface as errors.
+
+Committed indexing failures (ADR-056, amendment 2026-10-05): when the insert
+commits but FTS or embedding work then fails, the handler returns the normal
+committed acknowledgement (`deduplicated=false`) with an added
+`post_commit_degradations` array of `{stage, error}` entries and publishes the
+inbox wake once. The field is absent on a healthy acknowledgement and on a dedup
+reply. A caller must not repeat the write to repair it: the repeat is
+deduplicated and attempts no indexing. The repair is the namespace reindex
+(`kkernel reindex`).
 For the #3228 IMAP account-key migration, an email poll also supplies its
 pre-account `legacy_external_id`. During one release window, `comm.ingest`
 reads that key before writing, restricted to an existing inbound email row

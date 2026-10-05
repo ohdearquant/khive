@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use khive_retrieval::ann::corpus::CorpusScope;
+use khive_retrieval::ann::corpus::{CorpusScope, WatermarkCapture};
 use khive_retrieval::ann::registry::{self as ann_registry, WatermarkAuthority};
 use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
@@ -1339,6 +1339,7 @@ fn knowledge_corpus(ns: &str) -> CorpusScope<'_> {
         record_kind: None,
         field: "knowledge.atom",
         live_join: None,
+        watermark_capture: WatermarkCapture::LogHighWater,
     }
 }
 
@@ -2539,20 +2540,7 @@ async fn scan_corpus_raw(
     // segment it replaces. Future writes have a strictly larger global seq;
     // rows from sibling scopes below S are irrelevant to this corpus.
     let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT subject_id, embedding, \
-                        (SELECT COALESCE(\
-                           (SELECT seq FROM sqlite_sequence \
-                            WHERE name = 'ann_write_log'), 0)) AS log_s \
-                 FROM {table_name} \
-                 WHERE namespace = ?1 AND embedding_model = ?2 \
-                   AND field = 'knowledge.atom' \
-                 ORDER BY subject_id"
-            ),
-            params: vec![SqlValue::Text(ns), SqlValue::Text(model_str)],
-            label: Some("vamana_corpus_scan".into()),
-        })
+        .query_all(knowledge_corpus(&ns).corpus_scan(&table_name, &model_str, "vamana_corpus_scan"))
         .await
         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
 
@@ -3484,3 +3472,7 @@ mod tests;
 #[cfg(test)]
 #[path = "vamana_corpus_statement_tests.rs"]
 mod corpus_statement_tests;
+
+#[cfg(test)]
+#[path = "vamana_corpus_capture_tests.rs"]
+mod corpus_capture_tests;

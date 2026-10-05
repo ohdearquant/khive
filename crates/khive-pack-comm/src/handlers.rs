@@ -33,6 +33,8 @@ use crate::params::{
     SendParams, ThreadParams, TransportStatusParams, UnreadParams,
 };
 
+#[cfg(test)]
+mod ingest_degradation_tests;
 mod parameter_aliases;
 mod validation;
 
@@ -2749,7 +2751,7 @@ pub(crate) async fn handle_ingest(
                 attachment,
                 is_quarantined.then_some(quarantine_retention),
             )
-            .await?
+            .await
     } else {
         runtime
             .try_create_note_as_trusted_ingest(
@@ -2761,11 +2763,15 @@ pub(crate) async fn handle_ingest(
                 Some(props),
                 is_quarantined.then_some(quarantine_retention),
             )
-            .await?
+            .await
     };
-    let note = match created {
-        Some(n) => n,
-        None => {
+    let (note_id, degradations) = match created {
+        Ok(Some(note)) => (note.id, None),
+        Err(error) => match committed_ingest_degradations(&error) {
+            Some((id, report)) => (id, Some(report)),
+            None => return Err(error),
+        },
+        Ok(None) => {
             tracing::debug!(
                 external_id = ?p.external_id,
                 "comm.ingest: duplicate message skipped"
@@ -2811,13 +2817,61 @@ pub(crate) async fn handle_ingest(
     };
     inbox_signal.publish();
 
-    Ok(json!({
-        "id": short_id(note.id),
-        "full_id": note.id.as_hyphenated().to_string(),
+    let mut response = json!({
+        "id": short_id(note_id),
+        "full_id": note_id.as_hyphenated().to_string(),
         "thread_id": thread_id,
         "external_id": p.external_id,
         "deduplicated": false,
-    }))
+    });
+    if let Some(report) = degradations {
+        response["post_commit_degradations"] = report;
+    }
+    Ok(response)
+}
+
+fn committed_ingest_degradations(error: &RuntimeError) -> Option<(Uuid, Value)> {
+    let RuntimeError::Khive(domain) = error.refusal_source() else {
+        return None;
+    };
+    if domain.kind() != khive_types::ErrorKind::Internal {
+        return None;
+    }
+    let details = domain.details()?;
+    if details.get("reason") != Some("post_commit_degraded")
+        || details.get("operation") != Some("try_create_note")
+        || details.get("committed") != Some("true")
+        || details.get("retryable") != Some("false")
+    {
+        return None;
+    }
+    let raw_id = details.get("record_id")?;
+    let id = Uuid::parse_str(raw_id).ok()?;
+    if id.as_hyphenated().to_string() != raw_id {
+        return None;
+    }
+    let report: Value = serde_json::from_str(details.get("post_commit_degradations")?).ok()?;
+    let failures = report.as_array()?;
+    if failures.is_empty()
+        || !failures.iter().all(|failure| {
+            failure.as_object().is_some_and(|entry| {
+                entry.len() == 2
+                    && entry
+                        .get("stage")
+                        .and_then(Value::as_str)
+                        .is_some_and(|stage| {
+                            khive_runtime::ConditionalInsertStage::from_label(stage).is_some()
+                        })
+                    && entry
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .is_some_and(|error| !error.is_empty())
+            })
+        })
+    {
+        return None;
+    }
+    Some((id, report))
 }
 
 /// Detach only the main-backend original owned by this already hard-deleted
@@ -4571,93 +4625,6 @@ mod tests {
         assert_eq!(
             response["messages"][0]["content"],
             json!("visible at the timeout edge")
-        );
-    }
-
-    #[tokio::test]
-    async fn ingest_dedup_hit_does_not_publish() {
-        use khive_runtime::{AllowAllGate, BackendId, Namespace, RuntimeConfig};
-        use uuid::Uuid;
-
-        let ns = format!("ingest-dedup-{}", Uuid::new_v4().simple());
-        let runtime = super::KhiveRuntime::new(RuntimeConfig {
-            wal_ceiling_bytes: 0,
-            wal_ceiling_configured_bytes: 0,
-            wal_ceiling_source: Default::default(),
-            wal_ceiling_env_raw: None,
-            web: Default::default(),
-            telemetry: Default::default(),
-            mounts: Vec::new(),
-            brain: Default::default(),
-            git_write: Default::default(),
-            display_timezone: khive_runtime::config::resolve_default_display_timezone(),
-            events_split: None,
-            db_path: None,
-            blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
-            default_namespace: Namespace::parse(&ns).unwrap(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            gate: std::sync::Arc::new(AllowAllGate),
-            packs: vec!["kg".to_string(), "comm".to_string()],
-            backend_id: BackendId::main(),
-            brain_profile: None,
-            visible_namespaces: vec![],
-            allowed_outbound_namespaces: vec![],
-            actor_id: None,
-            exec: Default::default(),
-            ..khive_runtime::RuntimeConfig::no_embeddings()
-        })
-        .expect("in-memory runtime");
-        let token = runtime
-            .authorize(Namespace::parse(&ns).unwrap())
-            .expect("authorize");
-        let signal = InboxSignal::new();
-
-        // handle_ingest fails closed without a channel-ingest grant; mint one
-        // directly rather than routing through a full pack registration.
-        let capability = khive_runtime::ChannelIngestCapability::grant_for_direct_composition();
-
-        let body = json!({
-            "from": "email:sender@example.com",
-            "to": "local",
-            "content": "dedup probe",
-            "external_id": "imap:long-poll:dedup:1",
-        });
-
-        let first = super::handle_ingest(
-            &runtime,
-            &signal,
-            Some(&capability),
-            &Ok(None),
-            &token,
-            body.clone(),
-            std::time::Duration::from_secs(14 * 24 * 60 * 60),
-        )
-        .await
-        .expect("first ingest succeeds");
-        assert_eq!(first["deduplicated"].as_bool(), Some(false));
-        let generation_after_commit = signal.snapshot();
-        assert_ne!(
-            generation_after_commit, 0,
-            "a newly committed ingest must publish a wake"
-        );
-
-        let second = super::handle_ingest(
-            &runtime,
-            &signal,
-            Some(&capability),
-            &Ok(None),
-            &token,
-            body,
-            std::time::Duration::from_secs(14 * 24 * 60 * 60),
-        )
-        .await
-        .expect("deduplicated ingest succeeds");
-        assert_eq!(second["deduplicated"].as_bool(), Some(true));
-        assert_eq!(
-            signal.snapshot(),
-            generation_after_commit,
-            "a deduplicated ingest must not publish a wake"
         );
     }
 

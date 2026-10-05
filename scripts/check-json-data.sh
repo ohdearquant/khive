@@ -38,12 +38,15 @@
 #   line is a configuration error, not a pass: the guard exits 2 naming the file
 #   and the line, so a typo can never read as permission.
 #
-#   SCOPE, stated so it can be argued with: exemptions reach the .json SIZE arm
-#   ONLY. They do not exempt .jsonl/.ndjson, because that arm blocks a file
-#   FORMAT regardless of size and a size ceiling cannot express it. What would
-#   falsify this choice is a consumer that legitimately tracks a small JSONL
-#   fixture outside a benchmark path; today no such case is known, and such a
-#   consumer should get its own arm rather than a size number that means nothing.
+#   SCOPE, stated so it can be argued with: exemptions reach the .json size arm
+#   and the .jsonl/.ndjson format arm. In the format arm a matching line admits
+#   that one file up to its ceiling; a JSONL file no line names is still blocked
+#   at any size, so the format rule holds for every path a repository did not
+#   name. The case that made this arm necessary is a repository whose own
+#   append-only ledger is a tracked JSONL file. What would falsify the choice is
+#   an exemption line used to admit a data export rather than a file the
+#   repository maintains by design; the anchored regex and the ceiling are what
+#   keep one line from covering more than the file it names.
 
 set -uo pipefail
 
@@ -154,10 +157,24 @@ check_file() {
 
   case "$base" in
     *.jsonl|*.ndjson)
-      if ! printf '%s' "$lower" | grep -qE "$BENCH_RE"; then
-        echo "BLOCKED: $f — JSONL/NDJSON staged outside a benchmark-results path." >&2
-        fail=1
+      printf '%s' "$lower" | grep -qE "$BENCH_RE" && return 0
+      # A consumer-declared exemption admits this one file up to its ceiling,
+      # matched as tracked exactly as in the .json arm below.
+      if ceiling_kb=$(exempt_ceiling_for "$f"); then
+        if ! bytes=$(object_bytes "$f") || [ -z "$bytes" ]; then
+          echo "BLOCKED: $f — staged JSONL could not be read from the index." >&2
+          fail=1
+          return 0
+        fi
+        size_kb=$(( (bytes + 1023) / 1024 ))
+        if [ "$size_kb" -gt "$ceiling_kb" ]; then
+          echo "BLOCKED: $f — ${size_kb}KB exceeds the ${ceiling_kb}KB ceiling declared for it in ${EXEMPTION_FILE_NAME}." >&2
+          fail=1
+        fi
+        return 0
       fi
+      echo "BLOCKED: $f — JSONL/NDJSON staged outside a benchmark-results path." >&2
+      fail=1
       ;;
     *.json)
       printf '%s' "$base" | grep -qE "^(${LOCKFILES})$" && return 0

@@ -23,7 +23,7 @@ unconsumed injection.
 
 ## Concurrency and correctness notes
 
-### Legacy create/delete post-commit results
+### Legacy create/delete and conditional-ingest post-commit results
 
 The report-returning runtime create/delete methods return the committed record or
 delete result together with every failed post-commit stage. Older methods keep
@@ -35,6 +35,15 @@ and a JSON array in `post_commit_degradations` (each entry has `stage` and
 reconcile that ID and failed stage rather than repeat the create/delete. The
 report-returning methods remain the preferred API when a caller can handle the
 committed value and diagnostics in one successful result.
+
+Conditional note ingestion uses the same existing typed error after a newly inserted
+note encounters FTS acquisition/upsert, embedding, vector-store acquisition or vector
+insertion failures. `operation=try_create_note` identifies all three conditional-note
+entry points. Healthy models continue, and a duplicate returns `None` without indexing.
+The trusted `comm.ingest` handler preserves its committed acknowledgement and one inbox
+wake while adding `post_commit_degradations`; precommit and unrelated errors still
+propagate. This additive ingest response is specified in the 2026-10-05
+amendment to [ADR-056](../../../docs/adr/ADR-056-channel-transport-layer.md).
 
 ### atomic_hard_delete_with_edge_purge
 
