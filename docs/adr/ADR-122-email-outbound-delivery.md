@@ -291,7 +291,7 @@ The current behavior may have already delivered or correlated legacy rows. A3 do
 
 ## Amendment 4 (2026-10-05): refuse boot-known recipient policy violations before message creation
 
-**Status: Proposed.**
+**Status: Accepted (2026-10-05).**
 
 ### Scope
 
