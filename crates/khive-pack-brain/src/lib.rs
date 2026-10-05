@@ -57,7 +57,9 @@ pub(crate) fn ensure_section_state_seeded<'a>(
 /// be empty (an empty map carries no evidence and must not advance posterior state).
 ///
 /// Used by both `brain.feedback` live handler and replay to ensure a single,
-/// consistent contract.
+/// consistent contract. A retired section type (`SectionType::RETIRED_NAMES`) is not
+/// in `SectionType::NAMES`, so a live write naming one is refused as unknown; replay
+/// reaches this validator only after `replay_section_signals` has dropped such keys.
 pub(crate) fn validate_section_signals(
     ss: &serde_json::Value,
 ) -> Result<(), khive_runtime::RuntimeError> {
@@ -101,8 +103,53 @@ pub(crate) fn validate_section_signals(
     Ok(())
 }
 
+/// Replay-only view of a recorded `section_signals` map: entries keyed by a retired
+/// section type are dropped so the remaining signals apply and the event is not
+/// quarantined for carrying them (ADR-048, 2026-10-04 amendment). Every other key,
+/// and every value, is left for `validate_section_signals` to judge, so any other
+/// invalid entry keeps its quarantine behaviour.
+///
+/// Returns `None` when the map held only retired entries: no section evidence is
+/// left, and the event's other signals still apply. A value that is not an object,
+/// or an object that was empty to begin with, is returned unchanged for the
+/// validator to refuse.
+///
+/// Live writes never route through this function; they call
+/// `validate_section_signals` directly and refuse a retired name as unknown.
+pub(crate) fn replay_section_signals(ss: &serde_json::Value) -> Option<serde_json::Value> {
+    let Some(obj) = ss.as_object() else {
+        return Some(ss.clone());
+    };
+    let kept: serde_json::Map<String, serde_json::Value> = obj
+        .iter()
+        .filter(|(key, _)| !SectionType::is_retired_name(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if kept.is_empty() && !obj.is_empty() {
+        None
+    } else {
+        Some(serde_json::Value::Object(kept))
+    }
+}
+
+/// Replay-time check of a recorded `section_signals` value: the live contract of
+/// `validate_section_signals`, applied after `replay_section_signals` dropped any
+/// retired section keys. A map that held only retired entries has nothing left to
+/// refuse.
+pub(crate) fn validate_replayed_section_signals(
+    ss: &serde_json::Value,
+) -> Result<(), khive_runtime::RuntimeError> {
+    match replay_section_signals(ss) {
+        Some(kept) => validate_section_signals(&kept),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod retired_section_tests;
 
 #[cfg(test)]
 mod event_counts_group_tests;

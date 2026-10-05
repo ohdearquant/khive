@@ -68,7 +68,9 @@ impl Fold<Event, SectionPosteriorState> for SectionPosteriorFold {
     ) -> SectionPosteriorState {
         if event.verb == "brain.section_feedback" {
             if let Ok((_, signals)) = crate::section_feedback::decode_event(event) {
-                state.apply_section_signals(&signals);
+                if !signals.is_empty() {
+                    state.apply_section_signals(&signals);
+                }
             }
             return state;
         }

@@ -30,7 +30,7 @@ use super::util::{
     atom_embed_text, atom_embed_text_fields, atom_from_row, deser, domain_from_row,
     estimate_compose_item_tokens, explicitly_requested_status, is_stop, row_bool, row_i64, row_str,
     sql_err, status_multiplier, status_sql_clause, status_values, CANDIDATE_POOL, CHARS_PER_TOKEN,
-    D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN,
+    D_SUGGEST_RERANK_ALPHA, MIN_TERM_LEN, SERVABLE_SECTION,
 };
 use super::vamana;
 use super::KnowledgeHandlers;
@@ -2982,7 +2982,7 @@ async fn load_atom_body_line_counts(
                                               THEN 0 ELSE 1 END) \
                             END) AS body_lines \
                  FROM knowledge_sections \
-                 WHERE namespace = ?1 AND atom_id IN ({placeholders}) \
+                 WHERE namespace = ?1 AND atom_id IN ({placeholders}) AND {SERVABLE_SECTION} \
                  GROUP BY atom_id"
             ),
             params,

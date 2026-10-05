@@ -72,8 +72,6 @@ impl SectionPosteriorState {
         m.insert(SectionType::Examples, BetaPosterior::new(5.0, 2.0));
         m.insert(SectionType::FailureModes, BetaPosterior::new(3.0, 2.0));
         m.insert(SectionType::ExpertLens, BetaPosterior::new(3.0, 2.0));
-        m.insert(SectionType::References, BetaPosterior::new(2.0, 2.0));
-        m.insert(SectionType::Other, BetaPosterior::new(2.0, 2.0));
         m
     }
 
@@ -242,10 +240,37 @@ pub fn derive_deterministic_weights(state: &SectionPosteriorState) -> HashMap<Se
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SectionPosteriorSnapshot {
+    #[serde(deserialize_with = "deserialize_section_posterior_map")]
     pub posteriors: HashMap<SectionType, BetaPosterior>,
+    #[serde(deserialize_with = "deserialize_section_posterior_map")]
     pub priors: HashMap<SectionType, BetaPosterior>,
     pub total_events: u64,
     pub exploration_epoch: u64,
+}
+
+/// Load a persisted section posterior map, dropping entries keyed by a retired
+/// section type (ADR-048, 2026-10-04 amendment). Snapshots written before the
+/// retirement carry those keys; the remaining entries load unchanged. Any other
+/// key that is not a current section type is still a load error, so this does
+/// not loosen `SectionType` itself.
+fn deserialize_section_posterior_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<SectionType, BetaPosterior>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = HashMap::<String, BetaPosterior>::deserialize(deserializer)?;
+    let mut kept = HashMap::with_capacity(raw.len());
+    for (key, posterior) in raw {
+        if SectionType::is_retired_name(&key) {
+            continue;
+        }
+        let section = key
+            .parse::<SectionType>()
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+        kept.insert(section, posterior);
+    }
+    Ok(kept)
 }
 
 /// Count-aware pessimistic estimate of a section's posterior: the mean minus
@@ -379,7 +404,7 @@ mod tests {
     /// the map happens to iterate in.
     #[test]
     fn renormalization_does_not_depend_on_map_iteration_order() {
-        let raw = [0.1, 0.2, 0.3, 0.7, 0.11, 0.13, 0.17, 0.19, 0.23, 0.29];
+        let raw = [0.1, 0.2, 0.3, 0.7, 0.11, 0.13, 0.17, 0.19];
         let normalize = |order: &[usize]| {
             let mut weights: HashMap<SectionType, f64> = order
                 .iter()
@@ -404,7 +429,7 @@ mod tests {
     fn deterministic_weights_sum_to_one() {
         let state = SectionPosteriorState::new();
         let weights = derive_deterministic_weights(&state);
-        assert_eq!(weights.len(), 10);
+        assert_eq!(weights.len(), 8);
         let sum: f64 = weights.values().sum();
         assert!(
             (sum - 1.0).abs() < 1e-9,

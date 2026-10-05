@@ -58,9 +58,11 @@ automatic wrapper stamps `brain.auto_feedback`, and the deprecated alias stamps 
 ### Section Posteriors (ADR-048)
 
 Section posteriors track per-section relevance weights within a knowledge atom. Each profile
-maintains a `SectionPosteriorState` keyed by `SectionType` (10 canonical types: Overview,
+maintains a `SectionPosteriorState` keyed by `SectionType` (8 canonical types: Overview,
 CoreModel, BoundaryConditions, Formalism, OperationalGuidance, Examples, FailureModes,
-ExpertLens, References, Other).
+ExpertLens). A persisted map written before the 2026-10-04 amendment to ADR-048 may still carry
+`references` and `other`; it loads with those entries dropped, and a recorded feedback event
+naming them replays its remaining signals. Live writes refuse both names as unknown.
 
 **Default priors per section type**:
 
@@ -74,8 +76,6 @@ ExpertLens, References, Other).
 | Examples            | 5        | 2       | 0.71 |
 | FailureModes        | 3        | 2       | 0.60 |
 | ExpertLens          | 3        | 2       | 0.60 |
-| References          | 2        | 2       | 0.50 |
-| Other               | 2        | 2       | 0.50 |
 
 **Thompson sampling** (explore mode, `exploration_epoch > 0`):
 

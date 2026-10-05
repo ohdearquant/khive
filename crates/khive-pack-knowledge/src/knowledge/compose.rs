@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 
-use super::util::{row_str, sql_err};
+use super::util::{row_str, sql_err, SERVABLE_SECTION};
 
 // ─── section record (load result) ────────────────────────────────────────────
 
@@ -94,7 +94,8 @@ pub(super) async fn load_sections(
                 "SELECT id, atom_id, section_type, heading, content, embedding \
                  FROM knowledge_sections \
                  WHERE namespace = ?1 \
-                   AND atom_id IN ({placeholders})"
+                   AND atom_id IN ({placeholders}) \
+                   AND {SERVABLE_SECTION}"
             ),
             params,
             label: None,

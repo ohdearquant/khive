@@ -13,7 +13,11 @@ pub(crate) struct Section {
     pub id: uuid::Uuid,
     pub atom_id: String,
     pub namespace: String,
-    pub section_type: SectionType,
+    /// The stored `section_type` text: a current [`SectionType`] value, or a retired
+    /// name (see `retired`) kept unchanged on rows written before the retirement.
+    pub section_type: String,
+    /// True when `section_type` is one of [`SectionType::RETIRED_NAMES`].
+    pub retired: bool,
     pub heading: String,
     pub content: String,
     pub content_hash: String,

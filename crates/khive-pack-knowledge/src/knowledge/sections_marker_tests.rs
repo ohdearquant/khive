@@ -25,18 +25,42 @@ fn marker_accepts_canonical_values_only() {
 }
 
 #[test]
-fn heading_without_marker_keeps_the_alias_lookup_and_other_fallback() {
+fn heading_without_marker_goes_through_the_alias_lookup_only() {
     assert_eq!(
         section_heading_type("Mechanism"),
         (Some(SectionType::CoreModel), "Mechanism".to_string())
     );
+    // A heading no alias recognises is never guessed: it has no type.
     assert_eq!(
         section_heading_type("A descriptive heading"),
-        (
-            Some(SectionType::Other),
-            "A descriptive heading".to_string()
-        )
+        (None, "A descriptive heading".to_string())
     );
+}
+
+#[test]
+fn headings_that_named_a_retired_type_resolve_to_no_type() {
+    for heading in [
+        "References",
+        "Bibliography",
+        "Further Reading",
+        "Citations",
+        "Other",
+        "Miscellaneous",
+        "Notes",
+        "Appendix",
+    ] {
+        assert_eq!(
+            section_heading_type(heading),
+            (None, heading.to_string()),
+            "{heading:?} must not resolve to a type"
+        );
+    }
+    // The marker form names canonical types only, so a retired name is refused there too.
+    for marker in ["references", "other"] {
+        let (section_type, display) = section_heading_type(&format!("Sources {{{marker}}}"));
+        assert_eq!(section_type, None, "{{{marker}}}");
+        assert_eq!(display, "Sources");
+    }
 }
 
 #[test]
@@ -52,7 +76,7 @@ fn brace_text_that_is_not_a_trailing_token_stays_in_the_heading() {
         assert_eq!(display, heading, "{heading:?} must keep its braces");
         assert_eq!(
             section_type,
-            Some(SectionType::from_str_loose(heading).unwrap_or(SectionType::Other)),
+            SectionType::from_str_loose(heading),
             "{heading:?} must go through the alias lookup"
         );
     }
@@ -63,7 +87,8 @@ fn parser_carries_the_declared_type_per_section() {
     let markdown = "# Atom\n\npreamble\n\n\
         ## First reason {core_model}\n\nbody one\n\n\
         ## Second reason {core_model}\n\nbody two\n\n\
-        ## Unknown kind {made_up}\n\nbody three\n";
+        ## Unknown kind {made_up}\n\nbody three\n\n\
+        ## Related Work\n\nbody four\n";
     let (name, _, sections) = parse_atlas_md(markdown);
     assert_eq!(name, "Atom");
     let typed = sections
@@ -76,6 +101,7 @@ fn parser_carries_the_declared_type_per_section() {
             (Some(SectionType::CoreModel), "First reason", "body one"),
             (Some(SectionType::CoreModel), "Second reason", "body two"),
             (None, "Unknown kind", "body three"),
+            (None, "Related Work", "body four"),
         ]
     );
 }

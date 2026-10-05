@@ -6,9 +6,8 @@
 
 - **Corpus tier** — slug-keyed atoms and domain groupings stored in dedicated SQL tables
   (`knowledge_atoms`, `knowledge_domains` — V19 migration)
-- **Section tier** — structured subsections per atom (10-value closed enum: overview, core_model,
-  boundary_conditions, formalism, operational_guidance, examples, failure_modes, expert_lens,
-  references, other)
+- **Section tier** — structured subsections per atom (8-value closed enum: overview, core_model,
+  boundary_conditions, formalism, operational_guidance, examples, failure_modes, expert_lens)
 - **Evaluation tier** — operator-triggered, draft-inclusive retrieval evaluation with summaries
   stored in the pack-owned `knowledge_eval_runs` table
 - **KG concept tier** — `learn` / `cite` / `topic` verbs as sugar over the KG entity layer
@@ -25,8 +24,9 @@
 
 ### Section Profiles and Vamana ANN Integration (ADR-048)
 
-- The `SectionType` enum is a closed 10-value set. Headings in atlas markdown files are mapped
-  to canonical section types via `from_str_loose`, which accepts common heading aliases.
+- The `SectionType` enum is a closed 8-value set. Headings in atlas markdown files are mapped
+  to canonical section types via `from_str_loose`, which accepts common heading aliases; a
+  heading that matches no type is not imported and is counted in `sections_unknown_type`.
 - The section-read verb surface (Phase 3) is not yet wired. Forward-deployed helpers
   (`section_from_row`, `section_to_json`) are retained so Phase 3 can land without structural
   changes.

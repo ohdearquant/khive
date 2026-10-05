@@ -510,7 +510,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
                 param_type: "array of object",
                 required: true,
                 description: "Sections to upsert: [{section_type, content, heading?, sort_order?}]. \
-                    section_type is a closed enum — valid values: overview | core_model | boundary_conditions | formalism | operational_guidance | examples | failure_modes | expert_lens | references | other. \
+                    section_type is a closed enum — valid values: overview | core_model | boundary_conditions | formalism | operational_guidance | examples | failure_modes | expert_lens. \
                     content must be ≥80 characters. Resubmitting the same content for an atom updates that section's stored section_type and heading.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
@@ -759,7 +759,7 @@ mod tests {
             .unwrap_or_else(|| panic!("handler {name:?} not found in KNOWLEDGE_HANDLERS"))
     }
 
-    /// knowledge.edit sections param must document the closed section_type enum (10 values) and
+    /// knowledge.edit sections param must document the closed section_type enum (8 values) and
     /// the 80-character content minimum (#160).
     #[test]
     fn knowledge_edit_sections_documents_enum_and_content_minimum() {
@@ -773,15 +773,19 @@ mod tests {
             sections.description.contains("80"),
             "knowledge.edit sections description must document the 80-character content minimum"
         );
-        // Spot-check the first and last members of the closed enum.
-        assert!(
-            sections.description.contains("overview"),
-            "knowledge.edit sections description must list 'overview' as a valid section_type"
-        );
-        assert!(
-            sections.description.contains("other"),
-            "knowledge.edit sections description must list 'other' as a valid section_type"
-        );
+        // Every member of the closed enum is listed, and the retired names are not.
+        for name in khive_brain_core::SectionType::NAMES {
+            assert!(
+                sections.description.contains(name),
+                "knowledge.edit sections description must list '{name}' as a valid section_type"
+            );
+        }
+        for retired in khive_brain_core::SectionType::RETIRED_NAMES {
+            assert!(
+                !sections.description.contains(retired),
+                "knowledge.edit sections description must not list the retired '{retired}'"
+            );
+        }
         // Verify the description calls out the closed-enum nature so callers know unrecognized
         // values are rejected (not silently coerced).
         assert!(

@@ -4,6 +4,55 @@
 **Date**: 2026-05-27
 **Authors**: khive maintainers
 
+## Amendment (2026-10-04): eight section types
+
+**Status: Accepted (2026-10-04).** Acceptance of the text is not implementation
+acceptance; the dependent implementation lands on its own gates.
+
+Maintainer direction, 2026-10-04, verbatim: "knowledge只存atlas文档，这个是为了atlas做的"
+(the knowledge pack stores atlas documents only; it exists for atlas). The
+decisions below implement that direction; read them against it, not against
+the earlier text of this ADR.
+
+The section type vocabulary is the eight types a canonical atom uses:
+`overview`, `core_model`, `boundary_conditions`, `formalism`,
+`operational_guidance`, `examples`, `failure_modes` and `expert_lens`. The
+types `references` and `other` are retired. Citations belong to the atom's
+source metadata, not to a section, so a reference list served as a section
+spends compose budget on text that carries no knowledge; `other` was the
+fallback for headings nothing recognised, not a type.
+
+**Import.** A heading's trailing `{type}` marker decides its type when present;
+the marker accepts the canonical names only. A heading without a marker goes
+through the heading alias table, which resolves to the eight types only; the
+aliases that resolved to a retired type are removed. A heading that resolves to
+no type is never guessed: its section is not imported, it is counted in the
+import report's `sections_unknown_type`, and a warning names the file and the
+heading. Import no longer derives `source_type = "paper"` from a references
+section; an imported atom carries `source_type = "imported"`.
+
+**Writes.** `knowledge.edit`, `knowledge.challenge`, `knowledge.adjudicate`,
+`knowledge.feedback`, `brain.feedback`, `brain.section_feedback` and
+`brain.create_profile` seed priors accept the eight types only; a retired type
+is refused as an unknown section type, with the valid values listed.
+
+**Stored sections typed with a retired type** are kept unchanged: no rewrite
+and no deletion. Reads tolerate them. A sectioned atom read returns them with
+their stored type and marked retired, where a single such row previously
+failed the whole read. Compose, search and suggest do not serve them, and they
+cannot be challenged or adjudicated. Re-submitting a retired row's content
+under a current type through `knowledge.edit` retypes it in place, because
+sections are keyed by content.
+
+**Profile state.** A persisted section posterior map that carries a retired
+type loads with that entry dropped and the eight remaining entries unchanged.
+A recorded feedback event whose section signals name a retired type replays
+its remaining signals; the retired entries are dropped rather than the whole
+event being set aside. Section weights are normalised over the eight types, so
+existing profiles' weights shift once and are re-learned from feedback. Any
+other unknown key in persisted state remains a load error. The routing context
+carries one section slot per type.
+
 ## Amendment (2026-09-14): properties-only atom updates
 
 **Status: Accepted (2026-09-14).** Acceptance of the text is not implementation
@@ -25,7 +74,7 @@ compose/suggest, hooks, lint, export, and observability phases.
 
 | Area                                                          | Status   | Shipped behavior                                                                                                                                                                                                                                                                                                                                           |
 | ------------------------------------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `knowledge_sections`                                          | shipped  | Dedicated section rows with 10-value `SectionType`, `content_hash` + `UNIQUE(atom_id, content_hash)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers. 80-char minimum content.                                                                                                                                                   |
+| `knowledge_sections`                                          | shipped  | Dedicated section rows with 8-value `SectionType`, `content_hash` + `UNIQUE(atom_id, content_hash)`, nullable `embedding`, section indexes, `fts_sections`, and FTS5 triggers. 80-char minimum content.                                                                                                                                                    |
 | Section write-side embedding backfill                         | shipped  | `kkernel reindex` and `knowledge.edit` (inline atom-scoped re-embed) populate `knowledge_sections.embedding` via breadcrumb-enriched embed text (ADR-051 phase 1). Direct section-cosine scoring in `knowledge.search` and `knowledge.compose` is shipped (ADR-051 phase 2). Profile-weighted compose and the Vamana section ANN snapshot remain deferred. |
 | V22 lifecycle/source fields                                   | shipped  | Status/source columns on atoms, status columns on sections/domains, status indexes, and finalized atom backfill to `reviewed`.                                                                                                                                                                                                                             |
 | `knowledge.edit`                                              | shipped  | Upserts sections content-addressed by `content_hash`; identical content is idempotent, distinct content inserts a sibling row, and existing siblings (including verified ones) are left untouched.                                                                                                                                                         |
@@ -163,7 +212,7 @@ V22 adds the `status` column and `idx_knowledge_sections_status`.
 
 Section_type is a closed enum matching the atlas schema v1: `overview`, `core_model`,
 `boundary_conditions`, `formalism`, `operational_guidance`, `examples`, `failure_modes`,
-`expert_lens`, `references`, `other`.
+`expert_lens`. The types `references` and `other` were retired by the 2026-10-04 amendment.
 
 **Editing a section does not touch other sections.** `knowledge.edit(slug, sections=[...])`
 updates only the named section rows. Each section has a nullable `embedding` column.
@@ -361,7 +410,7 @@ profile.
 
 ### 1. Section-typed atom content
 
-Atom content is structured into sections with a closed 10-value `SectionType` enum:
+Atom content is structured into sections with a closed 8-value `SectionType` enum:
 
 | SectionType            | Semantic role                                              |
 | ---------------------- | ---------------------------------------------------------- |
@@ -373,8 +422,9 @@ Atom content is structured into sections with a closed 10-value `SectionType` en
 | `examples`             | Concrete cases, worked examples, counterexamples           |
 | `failure_modes`        | How it breaks, edge cases, anti-patterns, silent failures  |
 | `expert_lens`          | Trade-offs, hidden assumptions, non-obvious connections    |
-| `references`           | Related atoms, bibliography, version history               |
-| `other`                | Topic-specific content not matching a canonical type       |
+
+`references` and `other` were part of the original ten-value enum and are retired by the
+2026-10-04 amendment.
 
 This enum is stored in the atom's `properties` JSON as a section manifest:
 

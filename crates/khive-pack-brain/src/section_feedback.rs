@@ -48,7 +48,14 @@ pub(crate) fn decode_event(event: &Event) -> Result<(&str, SectionSignals), Runt
     let signals = event.payload.get("section_signals").ok_or_else(|| {
         RuntimeError::InvalidInput("section feedback requires section_signals".into())
     })?;
-    Ok((profile, parse_signals(signals)?))
+    // Replay-only: entries keyed by a retired section type are dropped and the rest
+    // apply. A map that held only retired entries decodes to no signals. Live writes
+    // call `parse_signals` directly and refuse a retired name as unknown.
+    let signals = match crate::replay_section_signals(signals) {
+        Some(kept) => parse_signals(&kept)?,
+        None => SectionSignals::new(),
+    };
+    Ok((profile, signals))
 }
 
 pub(crate) fn replay(state: &mut BrainState, event: &Event) -> Result<(), RuntimeError> {
@@ -65,6 +72,11 @@ pub(crate) fn replay(state: &mut BrainState, event: &Event) -> Result<(), Runtim
             )));
         }
         Some(_) => {}
+    }
+    // An event whose signals were all retired carries no evidence left to apply; applying
+    // an empty map would still advance the event count and the exploration epoch.
+    if signals.is_empty() {
+        return Ok(());
     }
     crate::ensure_section_state_seeded(&mut state.section_states, profile)
         .apply_section_signals(&signals);

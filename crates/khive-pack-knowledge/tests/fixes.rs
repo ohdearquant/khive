@@ -1043,7 +1043,7 @@ async fn w10_import_with_atlas_id_sets_source_uri() {
 }
 
 #[tokio::test]
-async fn w10_import_with_references_section_sets_source_type_paper() {
+async fn w10_import_with_references_section_refuses_it_and_sets_source_type_imported() {
     let f = pack(rt());
     let dir = std::env::temp_dir().join("khive_fixes_test_w10b");
     std::fs::create_dir_all(&dir).ok();
@@ -1065,16 +1065,15 @@ async fn w10_import_with_references_section_sets_source_type_paper() {
         resp["imported_atoms"].as_i64().unwrap_or(0) > 0,
         "expected at least 1 imported"
     );
-
+    // `references` is retired: the section is refused and counted, and sets no source type.
+    assert_eq!(resp["sections_unknown_type"], 1);
+    assert_eq!(resp["imported_sections"], 0);
     let atom = f
         .dispatch("knowledge.get", json!({ "id": "paper-doc" }))
         .await
         .expect("get");
     let source_type = atom["source_type"].as_str().unwrap_or("");
-    assert_eq!(
-        source_type, "paper",
-        "import with references section (citation_count>0) must set source_type='paper'"
-    );
+    assert_eq!(source_type, "imported");
 }
 
 #[tokio::test]
