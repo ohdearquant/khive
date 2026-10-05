@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig, RuntimeError};
 
-use crate::db_target::{resolve_target_db, validate_explicit_db_path};
+use crate::db_target::{configured_production_bases, resolve_target_db, validate_explicit_db_path};
 use crate::manifest::LANGUAGES;
 use crate::source_ingest::{run_code_ingest, CodeSourceIngestOptions};
 use crate::CodePack;
@@ -122,15 +122,36 @@ impl CodePack {
             self.runtime.declared_backend_db_paths(),
         )
         .map_err(RuntimeError::InvalidInput)?;
+        if db.is_none() {
+            let parent = db_path.parent().ok_or_else(|| {
+                RuntimeError::InvalidInput("default code-map target has no parent".into())
+            })?;
+            std::fs::create_dir_all(parent).map_err(|error| {
+                RuntimeError::InvalidInput(format!(
+                    "creating default code-map directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let protected_main = configured_production_bases(
+            runtime_db_path.as_deref(),
+            self.runtime.declared_backend_db_paths(),
+        )
+        .map_err(RuntimeError::InvalidInput)?;
+        let protected_events = protected_main
+            .iter()
+            .map(|path| khive_runtime::events_split::events_db_path_beside(path))
+            .collect();
 
         let config = RuntimeConfig {
             db_path: Some(db_path.clone()),
             packs: vec!["kg".to_string(), "code".to_string()],
             ..RuntimeConfig::no_embeddings()
         };
-        let target_rt = KhiveRuntime::new(config).map_err(|e| {
-            RuntimeError::InvalidInput(format!("opening target db {db_path:?}: {e}"))
-        })?;
+        let target_rt = KhiveRuntime::new_code_map(config, protected_main, protected_events)
+            .map_err(|e| {
+                RuntimeError::InvalidInput(format!("opening target db {db_path:?}: {e}"))
+            })?;
         let token = target_rt
             .authorize(Namespace::local())
             .map_err(|e| RuntimeError::InvalidInput(format!("authorizing target db: {e}")))?;
