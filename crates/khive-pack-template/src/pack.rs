@@ -29,12 +29,7 @@ pub(crate) static TEMPLATE_HANDLERS: [HandlerDef; 1] = [HandlerDef {
 struct TemplatePackFactory;
 
 impl khive_runtime::PackFactory for TemplatePackFactory {
-    fn name(&self) -> &'static str {
-        PACK_NAME
-    }
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(TemplatePack);
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(TemplatePack::new(runtime))
     }
@@ -44,21 +39,7 @@ inventory::submit! { khive_runtime::PackRegistration(&TemplatePackFactory) }
 
 #[async_trait]
 impl PackRuntime for TemplatePack {
-    fn name(&self) -> &str {
-        <TemplatePack as khive_types::Pack>::NAME
-    }
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <TemplatePack as khive_types::Pack>::NOTE_KINDS
-    }
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <TemplatePack as khive_types::Pack>::ENTITY_KINDS
-    }
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &TEMPLATE_HANDLERS
-    }
-    fn requires(&self) -> &'static [&'static str] {
-        <TemplatePack as khive_types::Pack>::REQUIRES
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     /// Dispatch a declared verb or return invalid-input for an unknown name.
     async fn dispatch(

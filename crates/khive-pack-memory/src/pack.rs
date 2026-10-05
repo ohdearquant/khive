@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, PackSchemaPlan, RuntimeError, SchemaPlan, VerbRegistry,
+    KhiveRuntime, KindHook, NamespaceToken, PackSchemaPlan, RuntimeError, VerbRegistry,
 };
 use khive_types::{HandlerDef, IdResolutionMode, Pack, ParamDef, VerbCategory, Visibility};
 
@@ -461,13 +461,7 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
 struct MemoryPackFactory;
 
 impl khive_runtime::PackFactory for MemoryPackFactory {
-    fn name(&self) -> &'static str {
-        "memory"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(MemoryPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(MemoryPack::new_with_index_role(
@@ -481,41 +475,12 @@ inventory::submit! { khive_runtime::PackRegistration(&MemoryPackFactory) }
 
 #[async_trait]
 impl PackRuntime for MemoryPack {
-    fn name(&self) -> &str {
-        <MemoryPack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <MemoryPack as Pack>::NOTE_KINDS
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
         match kind {
             "memory" => Some(Arc::new(crate::hook::MemoryHook)),
             _ => None,
-        }
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <MemoryPack as Pack>::ENTITY_KINDS
-    }
-
-    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
-        <MemoryPack as Pack>::BRAIN_CONSUMER_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &MEMORY_HANDLERS
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <MemoryPack as Pack>::REQUIRES
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "memory",
-            statements: &MEMORY_SCHEMA_PLAN_STMTS,
         }
     }
 
