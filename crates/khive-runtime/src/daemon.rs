@@ -464,8 +464,8 @@ pub fn recoverer_lock_path() -> PathBuf {
 /// bounded by its caller deadline, rather than racing normal supervisor
 /// startup. Reading and acting on this file is the client's decision
 /// (`khive-mcp`); this module
-/// only resolves where it lives, matching the [`lock_path`] /
-/// [`recoverer_lock_path`] pattern.
+/// only resolves where it lives. The default socket keeps `khived.supervisor`;
+/// a private socket appends `.supervisor-marker` to its complete pathname.
 ///
 /// Overridable via the `KHIVE_SUPERVISOR_MARKER` env var (for tests).
 #[cfg(unix)]
@@ -475,7 +475,14 @@ pub fn supervisor_marker_path() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    khive_dir().join("khived.supervisor")
+    let socket = socket_path();
+    if socket.as_os_str() == default_socket_path().as_os_str() {
+        khive_dir().join("khived.supervisor")
+    } else {
+        let mut marker = socket.into_os_string();
+        marker.push(".supervisor-marker");
+        PathBuf::from(marker)
+    }
 }
 
 #[cfg(unix)]

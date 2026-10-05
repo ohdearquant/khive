@@ -450,3 +450,38 @@ The proposed implementation is in `crates/kkernel/src/supervisor.rs`
 `crates/khive-runtime/src/daemon.rs` (claim echo and daemon self-shutdown).
 The process-level acceptance tests are in
 `crates/kkernel/tests/supervisor_lifecycle.rs`.
+
+## Amendment 4 (2026-10-05): implicit markers belong to one socket
+
+An implicit global marker made a private socket inherit the default supervisor's
+startup wait and ownership lock. The declaration and all its consumers must
+instead select the same marker for the rendezvous they operate on (#4214).
+
+1. A nonempty `KHIVE_SUPERVISOR_MARKER` remains the first choice; empty is unset.
+   Without it, the resolved default socket keeps `~/.khive/khived.supervisor`,
+   including an explicit `KHIVE_SOCKET` with that exact default pathname spelling.
+   A nondefault socket appends `.supervisor-marker` to its complete pathname.
+   This preserves distinct extensions and keeps an extensionless private socket
+   named `~/.khive/khived` distinct from the default marker.
+2. Launcher publication/release, client admission, daemon claim checks and the
+   local installer use the same rule. Comparison is by pathname spelling, without
+   filesystem canonicalization. The installer derives its default socket once
+   with the same separator join as the runtime, including a trailing slash in
+   HOME, and uses it for both the socket fallback and the default comparison.
+3. Marker contents and the prior bounded wait, UUID claim, ownership, cleanup,
+   handover and lock protocols are unchanged. An unrelated marker does not delay
+   a private client; the marker for its own socket retains the existing bounded
+   suppression and degraded-bootstrap behavior.
+
+Existing default and explicit-marker deployments retain their files. An older
+private supervisor using the implicit global marker needs a controlled stop and
+upgrade: release the old marker only with its exact label and an explicit old-path
+override, then restart the upgraded participants. Never infer ownership of or
+automatically remove a global marker. An agreed explicit marker path supports a
+mixed-version private deployment during upgrade.
+
+Acceptance covers a private client's real bootstrap while the default marker
+exists, continued default-socket suppression, distinct private marker/lock paths,
+and launcher publication/release that leaves another socket's marker untouched.
+Mocked installer controls cover the same selection and explicit-override rules,
+plus trailing-slash HOME with unset, empty and explicitly default socket values.
