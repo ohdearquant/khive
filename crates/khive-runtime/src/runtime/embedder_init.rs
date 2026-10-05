@@ -32,12 +32,11 @@ impl KhiveRuntime {
         let runtime = self.clone();
         let token = token.cloned();
         let operation = khive_storage::operation_context::current_operation_attribution();
-        let usage = crate::usage::current();
         // Cold construction and its one-shot event belong to the shared entry,
         // rather than the lifetime of the request that first encounters it.
-        // Preserve model exclusions, event provenance and usage accounting, but
-        // do not inherit the request's read deadline/cancellation. Query
-        // embedding stays inline.
+        // Preserve model exclusions and event provenance, but not request usage
+        // or read deadline/cancellation: this work can outlive its caller. Query
+        // embedding stays inline and retains its issued-work accounting.
         let initialization = inherit_request_embedder_scope(async move {
             let initialize = async move {
                 let (service, init_duration_us) = entry.resolve().await?;
@@ -66,14 +65,7 @@ impl KhiveRuntime {
                 None => initialize.await,
             }
         });
-        tokio::spawn(async move {
-            match usage {
-                Some(usage) => crate::usage::scope(usage, initialization).await,
-                None => initialization.await,
-            }
-        })
-        .await
-        .map_err(|error| {
+        tokio::spawn(initialization).await.map_err(|error| {
             RuntimeError::Internal(format!(
                 "embedder '{name}' initialization task failed: {error}"
             ))
@@ -112,3 +104,6 @@ impl KhiveRuntime {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
