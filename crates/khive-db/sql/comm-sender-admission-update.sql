@@ -1,0 +1,1 @@
+UPDATE comm_sender_transport SET admitted_at=?4,next_retry_at=?5,updated_at=?6 WHERE logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3 AND state='pending' AND hold_reason IS NULL

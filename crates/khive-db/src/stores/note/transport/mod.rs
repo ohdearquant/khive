@@ -312,31 +312,17 @@ const LOAD_SQL: &str = concat!(
     "recipient_device_id=?2 AND recipient_key_epoch=?3",
 );
 
-const TERMINAL_SQL: &str = concat!(
-    "SELECT EXISTS(SELECT 1 FROM comm_sender_transport WHERE logical_message_id=?1 ",
-    "AND receipt IS NOT NULL)",
-);
+const TERMINAL_SQL: &str = include_str!("../../../../sql/comm-sender-receipt-exists.sql");
 
 const PRIOR_SQL: &str = concat!(
     "SELECT {COLUMNS} FROM comm_sender_transport WHERE logical_message_id=?1 ORDER BY ",
     "envelope_seq DESC LIMIT 1",
 );
 
-const DEVICE_EPOCH_SQL: &str = concat!(
-    "SELECT MAX(recipient_key_epoch) FROM comm_sender_transport WHERE ",
-    "logical_message_id=?1 AND recipient_device_id=?2",
-);
+const DEVICE_EPOCH_SQL: &str =
+    include_str!("../../../../sql/comm-sender-device-key-epoch-max-select.sql");
 
-const INSERT_SQL: &str = concat!(
-    "INSERT INTO comm_sender_transport (namespace, logical_message_id, ",
-    "outbound_note_id, kind, slug, credential_ref, recipient_address, ",
-    "protocol_version, sender_agent_id, recipient_agent_id, recipient_device_id, ",
-    "recipient_key_epoch, contact_generation, sender_key_epoch, ",
-    "recipient_key_fingerprint, enc, ",
-    "ciphertext,state,created_at,updated_at,envelope_seq,sender_assurance) VALUES ",
-    "(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17, ",
-    "'pending',?18,?18,?19,?20)",
-);
+const INSERT_SQL: &str = include_str!("../../../../sql/comm-sender-envelope-insert.sql");
 
 const PENDING_SQL: &str = concat!(
     "SELECT {COLUMNS} FROM comm_sender_transport AS t WHERE namespace=?1 AND kind=?2 ",
@@ -348,34 +334,13 @@ const PENDING_SQL: &str = concat!(
     "created_at,logical_message_id LIMIT ?5",
 );
 
-const FAILURE_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET ",
-    "state=?4,attempt_count=?5,next_retry_at=?6,last_failure_class=?7,updated_at=?8,",
-    "hold_reason=CASE WHEN ?4='pending' THEN hold_reason ELSE NULL END,",
-    "policy_mode=CASE WHEN ?4='pending' THEN policy_mode ELSE NULL END,",
-    "policy_revision=CASE WHEN ?4='pending' THEN policy_revision ELSE NULL END ",
-    "WHERE logical_message_id=?1 AND recipient_device_id=?2 AND ",
-    "recipient_key_epoch=?3",
-);
+const FAILURE_SQL: &str = include_str!("../../../../sql/comm-sender-failure-update.sql");
 
-const ADMISSION_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET admitted_at=?4,next_retry_at=?5,updated_at=?6 ",
-    "WHERE logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3 ",
-    "AND state='pending' AND hold_reason IS NULL",
-);
+const ADMISSION_SQL: &str = include_str!("../../../../sql/comm-sender-admission-update.sql");
 
-const HOLD_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET hold_reason=?4,updated_at=?5,",
-    "policy_mode=?6,policy_revision=?7 WHERE ",
-    "logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3",
-);
+const HOLD_SQL: &str = include_str!("../../../../sql/comm-sender-hold-update.sql");
 
-const RECEIPT_SQL: &str = concat!(
-    "UPDATE comm_sender_transport SET ",
-    "state=?4,receipt=?5,next_retry_at=NULL,hold_reason=NULL,",
-    "policy_mode=NULL,policy_revision=NULL,updated_at=?6 WHERE ",
-    "logical_message_id=?1 AND recipient_device_id=?2 AND recipient_key_epoch=?3",
-);
+const RECEIPT_SQL: &str = include_str!("../../../../sql/comm-sender-receipt-update.sql");
 
 /// Store uses the note writer's transaction/queue routing and bounded pooled readers.
 pub struct SenderTransportStore {
