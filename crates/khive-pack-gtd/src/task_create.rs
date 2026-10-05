@@ -299,6 +299,15 @@ pub(crate) async fn prepare_task_create(
     let obj = props
         .as_object_mut()
         .expect("props is object after replacement");
+    // Only a cancellation can record a duplicate judgment, so a new task never carries one.
+    if obj.contains_key("duplicate_of") {
+        return Err(RuntimeError::InvalidInput(
+            "properties.duplicate_of cannot be set when creating a task; record a duplicate \
+             by cancelling the task with gtd.transition or gtd.complete and a duplicate_of \
+             argument"
+                .into(),
+        ));
+    }
 
     let priority = input.priority.clone().or_else(|| {
         obj.get("priority")
