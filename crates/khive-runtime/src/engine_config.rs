@@ -444,6 +444,7 @@ pub fn resolve_wal_ceiling(
 /// read_only = false
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     /// Unique backend name. Referenced by `[packs.<name>].backend`.
     pub name: String,
@@ -568,8 +569,10 @@ pub struct BlobSectionConfig {
 }
 
 /// `[storage]` section in `khive.toml`. Holds storage-layer config not
-/// already covered by `[[backends]]` (ADR-028).
+/// already covered by `[[backends]]` (ADR-028). Unknown fields are rejected
+/// so an unsupported database selector cannot silently select the default store.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StorageSectionConfig {
     /// Blob store backend selector (ADR-111 Amendment 2). Absent means
     /// `FsBlobStore` at the existing root-resolution precedence, unchanged
@@ -912,6 +915,7 @@ pub struct ExecLimitsConfig {
 /// file_size = 104857600
 /// ```
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExecSectionConfig {
     #[serde(default)]
     pub root: Option<String>,
@@ -1269,6 +1273,8 @@ impl WebSectionConfig {
 /// Unknown top-level keys are silently ignored by serde for forward
 /// compatibility. The `[actor]`, `[gate]`, `[brain]`, `[blob]`, and `[telemetry]` tables are closed
 /// with `deny_unknown_fields` so a misspelled policy key always fails startup.
+/// `[storage]`, `[[backends]]` entries and `[exec]` are also closed so unknown
+/// destination keys cannot be silently dropped, as are `[web]` and `[[mounts]]` entries.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
     #[serde(default)]
@@ -4691,164 +4697,6 @@ merge_refusal = ["opener"]"#
         ));
     }
 
-    // ── [storage.blob] section (ADR-111 Amendment 2) ─────────────────────────
-
-    // No [storage] section at all -> fs default, existing configurations
-    // keep behaving exactly as they did before this section existed.
-    #[test]
-    fn test_no_storage_section_defaults_to_fs() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_toml(&dir, "# no storage section\n");
-        let cfg = KhiveConfig::load(Some(&path))
-            .expect("no error")
-            .expect("file found");
-        assert!(cfg.storage.blob.is_none());
-    }
-
-    #[test]
-    fn test_storage_blob_fs_selection_parses() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_toml(
-            &dir,
-            r#"
-[storage.blob]
-backend = "fs"
-root = "/var/lib/khive/blobs"
-floor_bytes = 100000000000
-"#,
-        );
-        let cfg = KhiveConfig::load(Some(&path))
-            .expect("no error")
-            .expect("file found");
-        match cfg.storage.blob {
-            Some(BlobConfig::Fs { root, floor_bytes }) => {
-                assert_eq!(root.as_deref(), Some("/var/lib/khive/blobs"));
-                assert_eq!(floor_bytes, Some(100_000_000_000));
-            }
-            other => panic!("expected BlobConfig::Fs, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_storage_blob_s3_selection_parses() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_toml(
-            &dir,
-            r#"
-[storage.blob]
-backend = "s3"
-bucket = "khive-blobs"
-region = "us-east-1"
-endpoint = "https://objects.example.invalid"
-prefix = "blobs"
-"#,
-        );
-        let cfg = KhiveConfig::load(Some(&path))
-            .expect("no error")
-            .expect("file found");
-        match cfg.storage.blob {
-            Some(BlobConfig::S3 {
-                bucket,
-                region,
-                endpoint,
-                prefix,
-                allow_http,
-            }) => {
-                assert_eq!(bucket, "khive-blobs");
-                assert_eq!(region, "us-east-1");
-                assert_eq!(endpoint.as_deref(), Some("https://objects.example.invalid"));
-                assert_eq!(prefix.as_deref(), Some("blobs"));
-                assert_eq!(allow_http, None);
-            }
-            other => panic!("expected BlobConfig::S3, got {other:?}"),
-        }
-    }
-
-    // An unknown field under [storage.blob] must be a startup error, not
-    // silently ignored -- unlike the rest of KhiveConfig, this section is
-    // strict (deny_unknown_fields).
-    #[test]
-    fn test_storage_blob_unknown_field_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_toml(
-            &dir,
-            r#"
-[storage.blob]
-backend = "fs"
-made_up_field = "x"
-"#,
-        );
-        let err = KhiveConfig::load(Some(&path)).expect_err("unknown field must be rejected");
-        assert!(
-            matches!(config_error_root(&err), ConfigError::Parse { .. }),
-            "got {err:?}"
-        );
-    }
-
-    // An s3-only field (bucket) under backend = "fs" must be rejected: the
-    // internally tagged enum's Fs variant doesn't declare it, so it is an
-    // unknown field for that variant.
-    #[test]
-    fn test_storage_blob_other_backend_field_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_toml(
-            &dir,
-            r#"
-[storage.blob]
-backend = "fs"
-bucket = "khive-blobs"
-"#,
-        );
-        let err = KhiveConfig::load(Some(&path)).expect_err("s3 field under fs must be rejected");
-        assert!(
-            matches!(config_error_root(&err), ConfigError::Parse { .. }),
-            "got {err:?}"
-        );
-    }
-
-    // Credentials are never accepted in TOML (ADR-111 Amendment 2): an
-    // access-key field under backend = "s3" is unknown to that variant and
-    // must be rejected, the same way an other-backend field is.
-    #[test]
-    fn test_storage_blob_credential_field_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_toml(
-            &dir,
-            r#"
-[storage.blob]
-backend = "s3"
-bucket = "khive-blobs"
-region = "us-east-1"
-access_key_id = "AKIAEXAMPLE"
-"#,
-        );
-        let err = KhiveConfig::load(Some(&path))
-            .expect_err("a credential field in TOML must be rejected");
-        assert!(
-            matches!(config_error_root(&err), ConfigError::Parse { .. }),
-            "got {err:?}"
-        );
-    }
-
-    // An unrecognized backend value is rejected by the internally tagged
-    // enum's own tag matching, same mechanism as an unknown field.
-    #[test]
-    fn test_storage_blob_unknown_backend_value_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = write_toml(
-            &dir,
-            r#"
-[storage.blob]
-backend = "gcs"
-"#,
-        );
-        let err = KhiveConfig::load(Some(&path)).expect_err("unknown backend must be rejected");
-        assert!(
-            matches!(config_error_root(&err), ConfigError::Parse { .. }),
-            "got {err:?}"
-        );
-    }
-
     // ── [display] section (ADR-169) ──────────────────────────────────────────
 
     // No [display] section at all -> None, resolved to the host zone downstream.
@@ -4938,4 +4786,5 @@ timezone = ""
         assert!(text.contains("resolve different WAL ceilings (0 and 8192 bytes)"));
     }
     include!("engine_config_backend_batch_tests.rs");
+    include!("engine_config_storage_tests.rs");
 }
