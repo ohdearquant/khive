@@ -316,31 +316,44 @@ comm runtime and its outbox use that same immutable policy. Requests,
 runtime clones and outbox cycles must not independently reread environment
 configuration. A forwarded request uses the serving process's policy.
 
-Policy resolution preserves the existing recipient selection rules:
+Policy resolution keeps the existing selection order:
 
-1. Split `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` on commas, trim each value,
-   and discard empty values. A nonempty result is the configured recipient
+1. If `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` is set, split it on commas, trim
+   each value and discard empty values. Each remaining value must parse
+   under the existing maintainer-address rules; a value that does not parse
+   is a configuration error. A nonempty result is the configured recipient
    set.
-2. Otherwise, use the first configured `KHIVE_EMAIL_MAINTAINER_ADDRESS`
-   address, parsed by the existing maintainer-address rules, as the default
-   recipient. Additional maintainer addresses do not implicitly become
-   allowed outbound recipients.
-3. With neither an explicit recipient set nor a configured default
-   recipient, the policy is **absent**. Unreadable or invalid configured
-   policy is a configuration error; it must not become an unrestricted
-   policy by being treated as absent.
+2. Otherwise, if `KHIVE_EMAIL_MAINTAINER_ADDRESS` is set, its first address,
+   parsed by the same rules, is the default recipient. Additional maintainer
+   addresses do not implicitly become allowed outbound recipients.
+3. The policy is **absent** only when neither variable is set. A variable
+   that is set but yields no address, with no recipient from the other, is a
+   configuration error, and so is a value that cannot be read. Neither may
+   become an unrestricted policy by being treated as absent. What this
+   prevents is admission and queueing of mail the operator meant to
+   restrict; delivery would not follow from the same process, because the
+   delivery component requires a configured policy.
 
-Recipient comparison remains exact and case-sensitive after configuration
-trimming. This amendment adds no domain wildcard or address case folding.
-The policy distinguishes **configured** from **absent**; an absent policy
-is not an assertion that every recipient is deliverable.
+Explicit entries, the default recipient and the requested recipient (the
+address after `email:`) are compared in one normalized form: the addr-spec
+produced by the maintainer-address parser, without any display name or
+angle brackets and lowercased. A recipient is allowed when its normalized
+form equals a normalized entry; a recipient that does not parse matches no
+entry. The policy stores its entries in this normalized form, and refusals
+and log lines name addresses in it. The message's stored recipient is
+unchanged; normalization applies to comparison only. Compared with the
+earlier exact match on explicit entries, this admits case variants of a
+listed address and never a different address. This amendment adds no domain
+wildcard. The policy distinguishes **configured** from **absent**; an absent
+policy is not an assertion that every recipient is deliverable.
 
 The host must resolve these public policy inputs independently of SMTP/IMAP
 credentials and connector startup. A configured policy still applies when
 delivery or polling is disabled, credentials are unavailable, or the outbox
 has not started. Single-backend and routed multi-backend hosts install the
 same policy on the comm runtime and the outbox that serves it. An embedder
-can supply a policy at construction; without one, it uses the absent state.
+constructing the comm runtime can supply a policy; without one, admission
+uses the absent state.
 Other authorization and read-only restrictions continue to apply.
 
 When policy is absent, send/reply retain the existing ability to queue mail
@@ -378,14 +391,27 @@ not fresh delivery admission. Its precedence is:
    validated and reconciled instead of being described as uncommitted. A
    competing holder committed afterward does not retroactively turn the
    denied request into a writer; a later retry can retrieve that receipt.
-   The denied request itself never claims the key.
+   The denied request itself never claims the key. The implementation
+   provides a test-only seam at this observation, so a test can commit a
+   competing holder immediately before or immediately after it.
 
 ### Defensive delivery checks and observable outcomes
 
 The outbox retains its recipient check for historic queued rows and rows
-created through other authorized writers. With configured policy, a denied
-queued recipient still receives §2's permanent `delivery="failed"` outcome
-and an explanatory `last_error`, without SMTP.
+created through other authorized writers. A denied queued recipient still
+receives §2's permanent `delivery="failed"` outcome and an explanatory
+`last_error`, without SMTP.
+
+The delivery component requires a configured policy. Constructing it with
+absent policy is a configuration error: the component fails with a
+permanent component error, is not restarted, and no message leaves. This
+removes the reading in which an empty recipient list means no recipient
+check. Today the delivery component is constructed only by the host, which
+always has a configured policy because the email connector requires a
+maintainer address, so no current host configuration changes behavior. Any
+constructor that later lets an embedder start delivery directly returns the
+same configuration error when no policy is supplied; for such a caller this
+is a breaking change from the empty-list meaning.
 
 Amendment 3's stored Message-ID verification precedes this defensive
 allowlist classification. An unverifiable nonempty `external_id` remains a
@@ -415,14 +441,14 @@ record for email nor maps SMTP acceptance to `recipient_stored`.
 The following cases use the real request and outbox paths with a mock
 transport; no real email is required.
 
-| Case                            | Required behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| E1 — fresh refusal              | Both send and reply to a configured denied recipient refuse synchronously. Neither message copy, key claim, attachment owner, message index publication nor inbox wake is produced; the transport is untouched. The same request to an allowed recipient retains the original pair receipt and one wake.                                                                                                                                                               |
-| E2 — shared policy              | Single-backend, routed multi-backend and forwarded requests use the serving comm runtime's policy. Disabled polling, unavailable credentials and an unstarted outbox do not remove a configured refusal. Changing environment values after construction cannot change admission and delivery independently.                                                                                                                                                            |
-| E3 — configured versus absent   | Explicit recipients take precedence over the primary-maintainer fallback; trimming, exact case-sensitive matching and first-maintainer selection remain stable. Absent policy preserves the wanted backlog. Invalid configured policy causes a configuration error rather than unrestricted admission. Refusal output exposes neither credentials nor the complete recipient set.                                                                                      |
-| E4 — replay and races           | An exact committed keyed replay after policy revocation returns the original receipt without writes, wake or retransmission. Altered payload, broken pair and attachment mismatch retain conflicts. A competing holder committed immediately before the final no-holder observation is reconciled; one committed immediately afterward leaves the denied request uncommitted and is available to a later retry. Allowed competing creators still commit only one pair. |
-| D1 — sender-visible state       | Read the original outbound ID through the sender's sent view after successful delivery, historic-row policy failure, transient failure and an unverifiable-ID hold. Verify the corresponding existing properties and mailbox visibility. Separately exercise ADR-105 `pending`, `recipient_stored`, `recipient_quarantined`, `failed` and `unknown` results; SMTP success must not be reported as verified recipient storage.                                          |
-| D2 — retained delivery behavior | Preserve single send across two ordinary poll cycles; a failure after SMTP acceptance but before the stamp may redeliver with the same verified claimed Message-ID. Post-auth permanent rejection fails only its message, retryable AUTH failures retain their restart behavior, cancellation retains in-flight settlement, and the configured comm backend receives the delivery updates.                                                                             |
+| Case                            | Required behavior                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| E1 — fresh refusal              | Both send and reply to a configured denied recipient refuse synchronously. Neither message copy, key claim, attachment owner, message index publication nor inbox wake is produced; the transport is untouched. The same request to an allowed recipient retains the original pair receipt and one wake.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| E2 — shared policy              | Single-backend, routed multi-backend and forwarded requests use the serving comm runtime's policy. Disabled polling, unavailable credentials and an unstarted outbox do not remove a configured refusal. Changing environment values after construction cannot change admission and delivery independently.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| E3 — configured versus absent   | Explicit recipients take precedence over the primary-maintainer fallback; trimming and first-maintainer selection remain stable. A mixed-case configured maintainer default admits a send to that address in any case, a case variant of an explicit entry is admitted, and a different address is refused. A set variable that yields no address with no recipient from the other, an explicit entry that does not parse, and an unreadable value each cause a configuration error rather than unrestricted admission. Absent policy (neither variable set) preserves the wanted backlog. A delivery component constructed with absent policy refuses to start and no message leaves. Refusal output names the recipient in normalized form and exposes neither credentials nor the complete recipient set. |
+| E4 — replay and races           | An exact committed keyed replay after policy revocation returns the original receipt without writes, wake or retransmission. Altered payload, broken pair and attachment mismatch retain conflicts. Using the test-only seam at the final no-holder observation, a competing holder committed immediately before it is reconciled; one committed immediately afterward leaves the denied request uncommitted and is available to a later retry. Allowed competing creators still commit only one pair.                                                                                                                                                                                                                                                                                                       |
+| D1 — sender-visible state       | Read the original outbound ID through the sender's sent view after successful delivery, historic-row policy failure, transient failure and an unverifiable-ID hold. Verify the corresponding existing properties and mailbox visibility. Separately exercise ADR-105 `pending`, `recipient_stored`, `recipient_quarantined`, `failed` and `unknown` results; SMTP success must not be reported as verified recipient storage.                                                                                                                                                                                                                                                                                                                                                                                |
+| D2 — retained delivery behavior | Preserve single send across two ordinary poll cycles; a failure after SMTP acceptance but before the stamp may redeliver with the same verified claimed Message-ID. Post-auth permanent rejection fails only its message, retryable AUTH failures retain their restart behavior, cancellation retains in-flight settlement, and the configured comm backend receives the delivery updates.                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 This amendment addresses the email-admission portion of #1760. It does not
 change thread retrieval, queue-page selection or the semantics of other
