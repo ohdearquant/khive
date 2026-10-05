@@ -131,3 +131,11 @@ No filters preserves the current behavior: default limit 50, limits clamped to
 1–200, stable `created_at DESC, id ASC` order, ordinary array responses, and the
 existing special empty `tasks`/`filter_excluded` object only when a matching
 excluded task exists. Dependency diagnostics and timestamps are unchanged.
+
+## Duplicate judgments
+
+`gtd.tasks(duplicate_of="<kept task>")` returns reverse references from
+`properties.duplicate_of`. This new filter defaults to cancelled tasks; an
+explicit status overrides that default. Ordinary visibility, filters and
+pagination still apply. See [duplicate cancellation](duplicate-cancellation.md)
+for partner validation, no-op semantics and retained-reference reads.
