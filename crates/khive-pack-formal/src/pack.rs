@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, RuntimeError, SchemaPlan, VerbRegistry,
+    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, RuntimeError, VerbRegistry,
 };
 use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 
@@ -29,7 +29,11 @@ impl Pack for FormalPack {
     const EDGE_RULES: &'static [EdgeEndpointRule] = &FORMAL_EDGE_RULES;
     const REQUIRES: &'static [&'static str] = &["kg"];
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &[];
-    const SCHEMA_PLAN: Option<khive_runtime::PackSchemaPlan> = None;
+    const SCHEMA_PLAN: Option<khive_runtime::PackSchemaPlan> =
+        Some(khive_runtime::PackSchemaPlan {
+            pack: "formal",
+            statements: &[],
+        });
 }
 
 impl FormalPack {
@@ -42,13 +46,7 @@ impl FormalPack {
 struct FormalPackFactory;
 
 impl khive_runtime::PackFactory for FormalPackFactory {
-    fn name(&self) -> &'static str {
-        "formal"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(FormalPack);
 
     fn intentionally_verbless(&self) -> bool {
         true
@@ -63,40 +61,7 @@ inventory::submit! { khive_runtime::PackRegistration(&FormalPackFactory) }
 
 #[async_trait]
 impl PackRuntime for FormalPack {
-    fn name(&self) -> &str {
-        <FormalPack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <FormalPack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <FormalPack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <FormalPack as Pack>::HANDLERS
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        <FormalPack as Pack>::EDGE_RULES
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <FormalPack as Pack>::REQUIRES
-    }
-
-    fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
-        <FormalPack as Pack>::NOTE_KIND_SPECS
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "formal",
-            statements: &[],
-        }
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn kind_hook(&self, _kind: &str) -> Option<Arc<dyn KindHook>> {
         None
