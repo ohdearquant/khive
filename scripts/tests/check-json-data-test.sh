@@ -115,12 +115,38 @@ printf '%s\n' 'manifest\.json 2048' >"$R/.check-json-data-exemptions"
 git -C "$R" add data/manifest.json .check-json-data-exemptions
 [ "$(run_guard "$R" --all)" = 2 ] && grep -q 'must start with' "$ERR" && pass || fail "an unanchored pattern was accepted"
 
-echo "--- case 13: exemptions do not reach the JSONL arm ---"
+# The JSONL cases reuse case 1 and case 6 as their control: with no exemption
+# file a staged or untracked JSONL file is refused, so a pass below is
+# attributable to the line that names the file.
+echo "--- case 13: an exemption line admits the JSONL file it names, staged and --all ---"
 R=$(fresh_repo c13)
-mkdir -p "$R/data"; printf '{"a":1}\n' >"$R/data/feed.jsonl"
-printf '%s\n' '^data/feed\.jsonl$ 2048' >"$R/.check-json-data-exemptions"
-git -C "$R" add data/feed.jsonl .check-json-data-exemptions
-[ "$(run_guard "$R" --all)" = 1 ] && grep -q 'feed.jsonl' "$ERR" && pass || fail "a size exemption silently covered the JSONL format arm"
+mkdir -p "$R/atoms"; printf '{"a":1}\n' >"$R/atoms/LEDGER.jsonl"
+printf '%s\n' '^atoms/LEDGER\.jsonl$ 128' >"$R/.check-json-data-exemptions"
+git -C "$R" add atoms/LEDGER.jsonl .check-json-data-exemptions
+[ "$(run_guard "$R")" = 0 ] || fail "a staged JSONL file named by an exemption line was refused"
+[ "$(run_guard "$R" --all)" = 0 ] && pass || fail "--all refused a JSONL file named by an exemption line"
+
+echo "--- case 13b: an exempt JSONL file over its ceiling is refused, measured from the index ---"
+R=$(fresh_repo c13b)
+big_json "$R" atoms/LEDGER.jsonl 300
+printf '%s\n' '^atoms/LEDGER\.jsonl$ 128' >"$R/.check-json-data-exemptions"
+git -C "$R" add atoms/LEDGER.jsonl .check-json-data-exemptions
+printf 'x' >"$R/atoms/LEDGER.jsonl"
+[ "$(run_guard "$R")" = 1 ] && grep -q '300KB exceeds the 128KB ceiling' "$ERR" && pass || fail "an exempt JSONL file over its ceiling passed"
+
+echo "--- case 13c: an unlisted JSONL file beside an exempt one is still refused ---"
+R=$(fresh_repo c13c)
+mkdir -p "$R/atoms"; printf '{"a":1}\n' >"$R/atoms/LEDGER.jsonl"; printf '{"a":1}\n' >"$R/atoms/export.jsonl"
+printf '%s\n' '^atoms/LEDGER\.jsonl$ 128' >"$R/.check-json-data-exemptions"
+git -C "$R" add atoms/LEDGER.jsonl atoms/export.jsonl .check-json-data-exemptions
+[ "$(run_guard "$R")" = 1 ] && grep -q 'atoms/export.jsonl' "$ERR" && ! grep -q 'atoms/LEDGER.jsonl' "$ERR" && pass || fail "the JSONL exemption did not stay scoped to the path it names"
+
+echo "--- case 13d: the JSONL exemption matches the path as tracked, not case-folded ---"
+R=$(fresh_repo c13d)
+mkdir -p "$R/atoms"; printf '{"a":1}\n' >"$R/atoms/ledger.jsonl"
+printf '%s\n' '^atoms/LEDGER\.jsonl$ 128' >"$R/.check-json-data-exemptions"
+git -C "$R" add atoms/ledger.jsonl .check-json-data-exemptions
+[ "$(run_guard "$R")" = 1 ] && grep -q 'atoms/ledger.jsonl' "$ERR" && pass || fail "a case-folded path was covered by an exemption written for another spelling"
 
 echo "--- case 14: comments and blank lines are ignored ---"
 R=$(fresh_repo c14)
