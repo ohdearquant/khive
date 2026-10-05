@@ -1,0 +1,4 @@
+CREATE TABLE IF NOT EXISTS memory_ann_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    epoch INTEGER NOT NULL DEFAULT 0
+)
