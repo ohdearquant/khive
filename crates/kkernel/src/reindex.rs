@@ -4492,4 +4492,6 @@ default = false
             2
         );
     }
+
+    mod degraded_ingest_repair_tests;
 }
