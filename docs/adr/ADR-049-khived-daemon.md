@@ -1586,8 +1586,11 @@ For a regular file present at claim, record `(device, inode)`. For a
 missing writable target, keep a Missing claim state, create/open the frozen
 path under the held lock, and bind its newly observed `(device, inode)`.
 Missing read-only targets refuse without creation, and a read-only claim never
-creates a missing parent directory. A created writable database takes SQLite's
-default mode (0644 before the umask). Re-stat each canonical path
+creates a missing parent directory. A created writable database has mode 0600
+before the umask; opening a pre-existing database preserves its permissions.
+SQLite's Unix VFS gives newly created WAL and SHM files the database's mode.
+The store-claim layer does not change permissions of existing databases or
+sidecars. Re-stat each canonical path
 immediately after its SQLite backend opens and before schema preparation, then
 again before serving; observed identity drift fails boot. Pass the bound file
 identity into both implicit and declared-backend pool construction. On verified
