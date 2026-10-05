@@ -40,6 +40,11 @@ claim — see ADR-191 D2 for the rationale and the ADR-076 certificate dispositi
 pair, `Concept located_in Concept`, expanding the closed set from 18 → 19. Location — a finding
 in an organ, a device in a region — is neither constitution nor reference, and no existing
 relation expresses it without a false claim.
+**Amended 2026-10-05**: base endpoint contract gains two organization pairs:
+`Org located_in Concept` (an organization in the jurisdiction it is registered in or operates
+from) and `Org competes_with Org` (two organizations that name each other as competitors). See
+"Base endpoint contract" below and "Why the 2026-10-05 organization amendment?" in Rationale.
+This also amends ADR-196 D1, which kept `located_in` to one base row.
 
 ## Context
 
@@ -410,6 +415,7 @@ allowlist but cannot remove base rules.
 | `Service`  | `instance_of` | `Project`  |
 | `Document` | `links_to`    | `Document` |
 | `Concept`  | `located_in`  | `Concept`  |
+| `Org`      | `located_in`  | `Concept`  |
 
 > **Amended 2026-09-20 ([ADR-191](ADR-191-web-pack-ontology-and-operations.md))**: added
 > `Document links_to Document` for the web's hyperlink. Deliberately one row: a link's target is
@@ -422,6 +428,12 @@ allowlist but cannot remove base rules.
 > for location. Deliberately one row: rows for other base kinds are left to the first pack that
 > emits them, through the additive `EDGE_RULES` mechanism, and a domain pack narrows the meaning
 > with typed endpoint rules for its own subtypes.
+
+> **Amended 2026-10-05**: added `Org located_in Concept`. Organization is a base kind, and a
+> registry of companies and subsidiaries needs jurisdiction as an edge so that "every subsidiary
+> registered in X" is a graph query rather than a property scan. The target is the jurisdiction
+> as a concept entity. `instance_of` is not used for this, because an organization is not an
+> instance of a place.
 
 #### Derivation relations
 
@@ -523,6 +535,7 @@ Those are better modeled with `extends`, `variant_of`, `supersedes`, or metadata
 | `Concept` | `competes_with` | `Concept` |
 | `Project` | `competes_with` | `Project` |
 | `Service` | `competes_with` | `Service` |
+| `Org`     | `competes_with` | `Org`     |
 | `Concept` | `composed_with` | `Concept` |
 | `Project` | `composed_with` | `Project` |
 
@@ -760,6 +773,10 @@ The audit disposition for the current set is:
   directly, not by the ratified list. An identical
   signature is a signal to run Er analysis, not by itself proof of redundancy; relations with the
   same legal endpoint kinds can still answer different questions.
+  Amended 2026-10-05: with the `Org located_in Concept` base row, the base signature of
+  `located_in` is {`Concept -> Concept`, `Org -> Concept`} and no longer equals that of `extends`,
+  so the audit finds only the ratified pair. The Er fixture still tests `located_in` against
+  `extends` on the pair they share.
 
 Accordingly, the audit does not replace the stored vocabulary with a smaller inferred generating
 set. The only demonstrated algebraic collapse is retained by a declared system role, and khive
@@ -842,6 +859,31 @@ weight 1.0, and an annotating note on the edge records what transformation produ
 indistinguishable.
 
 This pair is strictly additive; no existing rule is removed or narrowed.
+
+### Why the 2026-10-05 organization amendment?
+
+An organization graph built from public filings has two facts that the base contract could not
+state as edges:
+
+- **Competitors.** A filing names the organizations it competes with. `competes_with` already
+  carries this meaning for concepts, projects and services. Organizations are the most common
+  competitors in such a corpus, and storing them as notes hides the relation from traversal.
+  The pair is symmetric, and stored and canonicalized like the other `competes_with` pairs.
+- **Jurisdiction.** An organization is registered in, or operates from, a jurisdiction. Kept as
+  a property, "every subsidiary registered in X" is a scan over all organizations. `located_in`
+  (ADR-196) already means "the source occupies, or is manifested in, the target without being a
+  constituent of it", which is exactly this fact. `part_of` would claim that the organization is
+  a constituent of the jurisdiction, and `instance_of` that it is a kind of place. Both are false.
+
+ADR-196 D1 left rows for other base kinds to the first pack that emits them. That route needs a
+pack linked into the binary. A store that uses only the base `kg` pack cannot take it, and
+runtime Subjects (ADR-072) are still proposed. Organization is a base kind, so its row belongs
+in the base contract. No other base kind is added.
+
+The change removes the endpoint-signature collision between `located_in` and `extends`, which
+had shared the single pair `Concept -> Concept`. The `located_in` certificate's Er fixture still
+stands on that shared pair. The collision exemption in the signature tripwire is withdrawn
+rather than left stale.
 
 ### Why 9 categories?
 
