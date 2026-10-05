@@ -900,7 +900,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "source_id",
                 param_type: "uuid",
                 required: false,
-                description: "Required in singleton mode. Source node complete UUID or globally \
+                description: "`source` is accepted as an alias for `source_id`; supply only one spelling, even when the values agree. Required in singleton mode. Source node complete UUID or globally \
                               unique 8+ hex prefix. UUID \
                               and prefix lookup apply no namespace filter at all, which is a \
                               wider reach than the caller's visible set; entity-name fallback \
@@ -912,7 +912,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "target_id",
                 param_type: "uuid",
                 required: false,
-                description: "Required in singleton mode. Target node complete UUID or globally \
+                description: "`target` is accepted as an alias for `target_id`; supply only one spelling, even when the values agree. Required in singleton mode. Target node complete UUID or globally \
                               unique 8+ hex prefix. UUID \
                               and prefix lookup apply no namespace filter at all, which is a \
                               wider reach than the caller's visible set; entity-name fallback \
@@ -932,7 +932,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 // drift and only that test will say so. Pack extensions come from
                 // `KG_EDGE_RULES` in this crate's `pack.rs`. A crate path and an issue
                 // number cannot be acted on by the caller this text is published to.
-                description: "Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | links_to | located_in | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
+                description: "`kind` is accepted as an alias for `relation`; supply only one spelling, even when the values agree. Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | links_to | located_in | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
                     Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair between two otherwise-valid endpoints is rejected with InvalidInput, and a missing endpoint returns NotFound — never silently accepted. \
                     Base entity->entity allowlist: \
                     contains: concept->concept, project->project, project->artifact, org->project, org->service. \

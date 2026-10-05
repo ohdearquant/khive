@@ -30,7 +30,7 @@ pub(crate) use common::{
 /// SAME canonical param structs the handlers deserialize, reproducing
 /// `#[serde(deny_unknown_fields)]` rejection with no duplicated key list. See
 /// `docs/api/entity-kind-validation.md` for the full ADR-099 B3 rationale.
-pub use params::{DeleteParams, LinkParams, UpdateParams};
+pub use params::{normalize_link_params, DeleteParams, LinkParams, UpdateParams};
 
 /// ADR-099 B3 (findings 1, 3, 4): real `pub` re-export so kkernel's `--atomic` seam
 /// resolves kinds/ids and renders results through the exact canonical logic the

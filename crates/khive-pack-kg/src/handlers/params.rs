@@ -268,6 +268,30 @@ pub struct LinkParams {
     pub(crate) atomic: Option<bool>,
 }
 
+/// Normalize the singleton link spellings before strict canonical validation,
+/// shared with the CLI atomic preparation path.
+pub fn normalize_link_params(params: &mut Value) -> Result<(), khive_runtime::RuntimeError> {
+    let Some(map) = params.as_object_mut() else {
+        return Ok(());
+    };
+    for (canonical, alias) in [
+        ("source_id", "source"),
+        ("target_id", "target"),
+        ("relation", "kind"),
+    ] {
+        if map.contains_key(canonical) && map.contains_key(alias) {
+            return Err(khive_runtime::RuntimeError::InvalidInput(format!(
+                "`{alias}` is an alias for `{canonical}`; supply only one of the two, \
+                 even when the values agree"
+            )));
+        }
+        if let Some(value) = map.remove(alias) {
+            map.insert(canonical.to_owned(), value);
+        }
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NeighborsParams {

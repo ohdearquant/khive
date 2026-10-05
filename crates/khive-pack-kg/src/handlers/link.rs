@@ -14,9 +14,10 @@ impl KgPack {
     pub(crate) async fn handle_link(
         &self,
         token: &NamespaceToken,
-        params: Value,
+        mut params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
+        super::normalize_link_params(&mut params)?;
         let p: LinkParams = deser(params)?;
         let verbose = p.verbose.unwrap_or(false);
 

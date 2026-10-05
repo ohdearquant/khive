@@ -5113,8 +5113,11 @@ impl PackRegistry {
     }
 }
 
-fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
+/// Audit target in the submitted args; only `link` also accepts `target` for `target_id`.
+fn target_id_from_args(verb: &str, args: &serde_json::Value) -> Option<uuid::Uuid> {
+    let alias = args.get("target").filter(|_| verb == "link");
     args.get("target_id")
+        .or(alias)
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
 }
@@ -5179,7 +5182,7 @@ fn build_audit_storage_event(
     .with_payload(audit_data);
     storage_event.op_index = audit.op_index;
     storage_event.ref_resolution = audit.ref_resolution;
-    if let Some(target_id) = target_id_from_args(&gate_req.args) {
+    if let Some(target_id) = target_id_from_args(&gate_req.verb, &gate_req.args) {
         storage_event = storage_event.with_target(target_id);
     }
     storage_event
@@ -5816,6 +5819,10 @@ pub(crate) mod tests {
 
     mod disposition {
         include!("pack_disposition_tests.rs");
+    }
+
+    mod link_audit_alias {
+        include!("link_audit_alias_tests.rs");
     }
 
     #[tokio::test]
@@ -13812,53 +13819,6 @@ pub(crate) mod tests {
         );
         let _: khive_gate::AuditEvent = serde_json::from_value(ev.payload.clone())
             .expect("v1 fallback payload must deserialize as AuditEvent");
-    }
-
-    #[tokio::test]
-    #[serial(config_ledger)]
-    async fn link_audit_falls_back_to_v1_when_result_missing_edge_fields() {
-        let store = Arc::new(MemoryEventStore::default());
-        let target_arg = uuid::Uuid::new_v4();
-        let mut builder = VerbRegistryBuilder::new();
-        builder.register(LinkResultPack::ok(serde_json::json!({"ok": true})));
-        builder.with_event_store(store.clone());
-        builder.with_default_namespace("test-ns");
-        let reg = builder.build().expect("registry builds");
-
-        reg.dispatch(
-            "link",
-            serde_json::json!({
-                "source_id": uuid::Uuid::new_v4(),
-                "target_id": target_arg,
-                "relation": "depends_on",
-            }),
-        )
-        .await
-        .unwrap();
-
-        let page = store
-            .query_events(
-                EventFilter::default(),
-                PageRequest {
-                    limit: 10,
-                    offset: 0,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(page.items.len(), 1);
-        let ev = &page.items[0];
-        assert_eq!(
-            ev.payload_schema_version, 1,
-            "an unparsable success result falls back to v1 rather than dropping the audit row"
-        );
-        assert_eq!(ev.outcome, EventOutcome::Success);
-        assert_eq!(
-            ev.target_id,
-            Some(target_arg),
-            "v1 fallback still extracts target_id from the raw dispatch args"
-        );
-        assert!(ev.payload.get("edge_id").is_none());
     }
 
     #[tokio::test]

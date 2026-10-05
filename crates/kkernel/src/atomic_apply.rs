@@ -30,6 +30,8 @@ use khive_types::RefusalReason;
 
 use crate::exec::OpsFileEntry;
 
+mod arg_validation;
+use arg_validation::{normalize_atomic_args, validate_atomic_args};
 mod reindex_report;
 use reindex_report::{add_post_commit_embedding_warning, model_degradations};
 
@@ -680,33 +682,7 @@ fn describe_failure(failure: &AtomicOpFailure) -> String {
     }
 }
 
-/// ADR-099 B3 parity fix: reject unknown/typo'd arg keys on the five v1
-/// atomic-admissible write verbs, BEFORE building any plan — by reusing each
-/// canonical handler's own `#[serde(deny_unknown_fields)]` param struct. See
-/// `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`
-/// for why this exists and why it reuses rather than reimplements.
-fn validate_atomic_args(tool: &str, args: &Value) -> anyhow::Result<()> {
-    fn reject<T: serde::de::DeserializeOwned>(args: &Value) -> anyhow::Result<()> {
-        serde_json::from_value::<T>(args.clone())
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("bad params: {e}"))
-    }
-
-    match tool {
-        // kg substrate verbs — `UpdateParams` covers both update-entity and
-        // update-note (the canonical handler resolves which from `id`, not
-        // from a separate struct); same struct, so one branch covers both.
-        "update" => reject::<khive_pack_kg::handlers::UpdateParams>(args),
-        "delete" => reject::<khive_pack_kg::handlers::DeleteParams>(args),
-        "link" => reject::<khive_pack_kg::handlers::LinkParams>(args),
-        // gtd verbs.
-        "gtd.transition" => reject::<khive_pack_gtd::handlers::TransitionParams>(args),
-        "gtd.complete" => reject::<khive_pack_gtd::handlers::CompleteParams>(args),
-        _ => Ok(()),
-    }
-}
-
-/// Returns `(plan, resolved_args)` — `resolved_args` is `args` for
+/// Returns `(plan, resolved_args)` — `resolved_args` uses canonical alias spellings for
 /// `gtd.transition`/`gtd.complete` (their own prepare fns resolve `id`
 /// internally via the canonical gtd resolver) and for any tool
 /// with no id-bearing fields; for `update`/`delete`/`link` it is the
@@ -720,6 +696,8 @@ async fn prepare_one(
     tool: &str,
     args: &Value,
 ) -> anyhow::Result<(AtomicOpPlan, Value)> {
+    let normalized = normalize_atomic_args(tool, args)?;
+    let args = &normalized;
     validate_atomic_args(tool, args)?;
     match tool {
         "gtd.transition" => {
@@ -1018,9 +996,9 @@ fn gtd_audit_from_to(effect: &PostCommitEffect) -> Option<(String, String)> {
 /// commit pass — safe for the same reason the post-commit reindex pass is.
 ///
 /// `original_args`: the op's args exactly as the caller supplied them
-/// (needed for delete's `id`/`kind` echo, and gtd.transition's raw
-/// `status`). `resolved_args`: the id-rewritten form `resolve_kg_ids_in_args`
-/// produced for update/delete/link (`== original_args` for gtd ops, whose
+/// (needed for delete's `id`/`kind` echo). `resolved_args`: the normalized,
+/// id-rewritten form `resolve_kg_ids_in_args`
+/// produced for update/delete/link (canonical alias spellings for gtd ops, whose
 /// own prepare fns resolve `id` internally).
 async fn build_op_result(
     runtime: &KhiveRuntime,
@@ -1202,7 +1180,7 @@ async fn build_op_result(
                 })?;
             let task = khive_pack_gtd::handlers::render_task(&note);
             if p.is_idempotent_noop() {
-                let raw_status = original_args
+                let raw_status = resolved_args
                     .as_object()
                     .and_then(|o| o.get("status"))
                     .and_then(|v| v.as_str())
@@ -3375,4 +3353,5 @@ mod tests {
     }
 
     include!("atomic_project_origin_tests.rs");
+    include!("atomic_apply/parameter_alias_tests.rs");
 }
