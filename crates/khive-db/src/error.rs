@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use khive_storage::{StorageCapability, StorageError};
+use khive_storage::{StorageCapability, StorageError, WriterTaskRequestState};
 use thiserror::Error;
 
 /// Stable ADR-194 capacity stages. The refusal stage is reserved for the WAL
@@ -25,6 +25,15 @@ pub enum SqliteError {
     #[error("invalid data: {0}")]
     InvalidData(String),
 
+    /// A pooled connection contained a transaction from an earlier owner.
+    /// Its prior side effects cannot be attributed to the new request.
+    #[error("pooled writer contains an inherited transaction; prior side effects are unknown")]
+    InheritedWriterTransaction,
+
+    /// The writer could not prove transaction settlement before retirement.
+    #[error("writer transaction settlement is unknown; connection retired")]
+    WriterSettlementUnknown,
+
     /// The process-local writer mutex was not acquired within the pool's
     /// configured finite checkout deadline. This stage happens before SQLite
     /// executes, so callers must not conflate it with SQLite busy/locked or
@@ -43,12 +52,22 @@ pub enum SqliteError {
     /// because the volume's free space had reached its configured reserve.
     #[error(
         "refusing sqlite write on {volume}: {available_bytes} bytes available, \
-         at or below the {floor_bytes}-byte free-space floor"
+         at or below the {floor_bytes}-byte free-space floor plus \
+         {required_headroom_bytes} bytes of operation headroom"
     )]
     CapacityFloor {
         volume: String,
         available_bytes: u64,
         floor_bytes: u64,
+        required_headroom_bytes: u64,
+    },
+
+    /// A new logical write could not resolve its volume, acquire its lease,
+    /// or sample available space.
+    #[error("sqlite capacity admission unavailable in {phase} phase: {message}")]
+    CapacityUnavailable {
+        phase: khive_storage::CapacityUnavailablePhase,
+        message: String,
     },
 
     /// A configured WAL ceiling cannot be represented by SQLite's signed
@@ -113,6 +132,8 @@ impl SqliteError {
         }
     }
 
+    /// Capacity admission is a property of the SQLite file, so its refusals
+    /// carry `StorageCapability::Sql` whichever store requested the write.
     pub(crate) fn into_storage_error(
         self,
         capability: StorageCapability,
@@ -123,13 +144,90 @@ impl SqliteError {
                 volume,
                 available_bytes,
                 floor_bytes,
+                required_headroom_bytes,
             } => StorageError::CapacityFloor {
-                capability,
+                capability: StorageCapability::Sql,
                 volume,
                 available_bytes,
                 floor_bytes,
+                required_headroom_bytes,
             },
+            Self::CapacityUnavailable { phase, message } => StorageError::CapacityUnavailable {
+                capability: StorageCapability::Sql,
+                phase,
+                message,
+            },
+            Self::InheritedWriterTransaction | Self::WriterSettlementUnknown => {
+                StorageError::WriterTaskTerminated {
+                    request_state: WriterTaskRequestState::SideEffectsUnknown,
+                }
+            }
             other => StorageError::driver(capability, operation, other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use khive_storage::CapacityUnavailablePhase;
+
+    #[test]
+    fn capacity_and_settlement_errors_keep_their_meaning_from_any_store() {
+        for capability in [StorageCapability::Entities, StorageCapability::Sql] {
+            let refused = SqliteError::CapacityFloor {
+                volume: "/volume".to_string(),
+                available_bytes: 99,
+                floor_bytes: 100,
+                required_headroom_bytes: 12,
+            }
+            .into_storage_error(capability, "write");
+            assert!(
+                matches!(
+                    refused,
+                    StorageError::CapacityFloor {
+                        capability: StorageCapability::Sql,
+                        available_bytes: 99,
+                        floor_bytes: 100,
+                        required_headroom_bytes: 12,
+                        ..
+                    }
+                ),
+                "{capability:?}: {refused:?}"
+            );
+
+            let unavailable = SqliteError::CapacityUnavailable {
+                phase: CapacityUnavailablePhase::Lock,
+                message: "lease timed out".to_string(),
+            }
+            .into_storage_error(capability, "write");
+            assert!(
+                matches!(
+                    unavailable,
+                    StorageError::CapacityUnavailable {
+                        capability: StorageCapability::Sql,
+                        phase: CapacityUnavailablePhase::Lock,
+                        ..
+                    }
+                ),
+                "{capability:?}: {unavailable:?}"
+            );
+
+            for unsettled in [
+                SqliteError::InheritedWriterTransaction,
+                SqliteError::WriterSettlementUnknown,
+            ] {
+                let mapped = unsettled.into_storage_error(capability, "write");
+                assert!(
+                    matches!(
+                        mapped,
+                        StorageError::WriterTaskTerminated {
+                            request_state: WriterTaskRequestState::SideEffectsUnknown,
+                        }
+                    ),
+                    "{capability:?}: {mapped:?}"
+                );
+            }
         }
     }
 }

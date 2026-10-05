@@ -41,6 +41,30 @@ impl fmt::Display for WriterTaskRequestState {
     }
 }
 
+/// Which pre-write disk-admission step could not establish safety.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityUnavailablePhase {
+    Identity,
+    Lock,
+    Probe,
+}
+
+impl CapacityUnavailablePhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Lock => "lock",
+            Self::Probe => "probe",
+        }
+    }
+}
+
+impl fmt::Display for CapacityUnavailablePhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Unified error type for all storage operations.
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -261,13 +285,23 @@ pub enum StorageError {
     /// SQLite admission cannot know the next transaction's size.
     #[error(
         "refusing write on {capability:?} at {volume}: {available_bytes} bytes available, \
-         the {floor_bytes}-byte free-space floor would be violated"
+         the {floor_bytes}-byte free-space floor plus {required_headroom_bytes} bytes of \
+         operation headroom would be violated"
     )]
     CapacityFloor {
         capability: StorageCapability,
         volume: String,
         available_bytes: u64,
         floor_bytes: u64,
+        required_headroom_bytes: u64,
+    },
+
+    /// A new logical write could not establish disk-admission safety.
+    #[error("capacity admission unavailable for {capability:?} in {phase} phase: {message}")]
+    CapacityUnavailable {
+        capability: StorageCapability,
+        phase: CapacityUnavailablePhase,
+        message: String,
     },
 }
 
@@ -296,7 +330,8 @@ impl StorageError {
             | Self::Serialization { capability, .. }
             | Self::IndexMaintenance { capability, .. }
             | Self::Driver { capability, .. }
-            | Self::CapacityFloor { capability, .. } => Some(*capability),
+            | Self::CapacityFloor { capability, .. }
+            | Self::CapacityUnavailable { capability, .. } => Some(*capability),
             Self::BlobTooLarge { .. }
             | Self::BlobSizeMismatch { .. }
             | Self::BlobDigestMismatch { .. } => Some(StorageCapability::Blob),

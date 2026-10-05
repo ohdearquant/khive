@@ -44,7 +44,7 @@ pub use claimed_file_observer::initialize as initialize_claimed_file_observer;
 #[path = "pool/claimed_file_identity_tests.rs"]
 mod claimed_file_identity_tests;
 
-const CACHE_SIZE_KIB: &str = "-65536";
+pub(crate) const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
 const DEFAULT_READER_CAP: usize = 8;
 
@@ -143,6 +143,7 @@ impl WriteAdmission {
                 volume: volume.display().to_string(),
                 available_bytes: available,
                 floor_bytes: self.floor_bytes,
+                required_headroom_bytes: 0,
             });
         }
         Ok(())

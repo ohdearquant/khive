@@ -14,6 +14,12 @@ mod code_map_vfs;
 pub mod database_owner_identity;
 /// Read-only-by-intent database-integrity and WAL/checkpoint diagnostics.
 pub mod diagnostics;
+/// Physical-volume identity and bounded cooperative SQLite admission lease.
+// Kept internal until execution-time write admission takes the lease.
+#[allow(dead_code)]
+mod disk_guard;
+#[allow(dead_code)]
+mod disk_guard_config;
 /// Error types for the SQLite layer.
 pub mod error;
 /// SQLite extension registration (sqlite-vec auto-extension).
@@ -45,6 +51,9 @@ mod statement_observer;
 pub mod stores;
 /// Append-only NDJSON writer-timeout event sink (crate-internal).
 mod timeout_sink;
+/// Metadata-only copy-size estimate for guarded VACUUM admission.
+#[allow(dead_code)]
+mod vacuum_capacity;
 /// Cross-process WAL-pin attribution sidecar (ADR-091 Amendment 2 Plank B).
 /// The sidecar write path (heartbeat/beacon) and identity primitives are
 /// portable; directory collection (`enumerate_live`/`housekeep_live`) is
