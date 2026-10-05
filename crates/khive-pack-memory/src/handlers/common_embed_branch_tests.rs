@@ -204,7 +204,7 @@ async fn every_recall_embed_branch_counts_one_embed_call_per_model() {
 }
 
 #[tokio::test]
-async fn cold_embedder_initialization_event_counts_toward_the_triggering_operation() {
+async fn cold_embedder_initialization_event_is_not_counted_by_the_triggering_operation() {
     let rt = KhiveRuntime::memory().unwrap();
     rt.register_embedder(healthy("embed-usage-cold".to_owned()));
     let ctx = UsageContext::new();
@@ -221,8 +221,9 @@ async fn cold_embedder_initialization_event_counts_toward_the_triggering_operati
     .unwrap();
     let snapshot = ctx.snapshot();
     assert_eq!(snapshot["embed_calls"], 1u64);
-    assert_eq!(
-        snapshot["event_rows"], 1u64,
-        "the initialization event row belongs to the operation that started the build"
+    assert!(
+        snapshot.get("event_rows").is_none(),
+        "the shared initialization can outlive the operation that started it, so its event row \
+         is not counted in that operation's usage: {snapshot}"
     );
 }
