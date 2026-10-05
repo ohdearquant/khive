@@ -116,9 +116,8 @@ payload runs under the immutable creator identity and inside the namespace
 bound to the scheduled event. Both authority dimensions are preserved, so
 delaying a payload cannot grant daemon authority or cross a namespace boundary.
 
-**Pack-auxiliary indexes.** The `idx_schedule_trigger` index is declared via
-`SchemaPlan` as idempotent DDL (`CREATE INDEX IF NOT EXISTS`) outside the core
-versioned migration chain. It uses `WHERE deleted_at IS NULL` rather than
+**Core-table indexes.** Migration V51 creates `idx_schedule_trigger` with
+idempotent DDL (`CREATE INDEX IF NOT EXISTS`), independently of which packs load. It uses `WHERE deleted_at IS NULL` rather than
 `WHERE kind = 'scheduled_event'` so that the parameterized `kind = ?N` predicate
 in `build_note_filter_where` can use this index. A literal-value partial condition
 on `kind` is invisible to the SQLite planner when the query uses a bound parameter.
@@ -134,9 +133,10 @@ Creator replay additionally uses `idx_schedule_creator_provenance` on
 `events(namespace, verb, target_id, outcome)` so the immutable binding lookup is
 bounded by the scheduled note rather than scanning the event history per fire.
 
-Pack-auxiliary DDL (the schedule indexes) uses idempotent
-`CREATE INDEX IF NOT EXISTS` and is NOT part of the core versioned migration
-chain. It is declared via `schema_plan()` on `PackRuntime`.
+Both indexes are on core tables and belong to numbered migration V51
+(`schedule_core_indexes`). Existing installations retain their index names,
+definitions and btrees; databases without the schedule pack gain the same indexes
+when migrated. Schedule has no auxiliary tables, so its pack schema plan is empty.
 
 ### ADR-016: Request DSL
 
@@ -165,11 +165,10 @@ persisting a reminder; the other three schedule verbs do not require `comm`.
   fetching all pending events and sorting. This is correct behavior (efficiency
   at large scale) but is not explicitly specified in ADR-040 — it is an
   implementation detail.
-- The `idx_schedule_trigger` index in ADR-040's `schema_plan` example uses
-  `WHERE kind = 'scheduled_event'` as the partial condition. The implementation
-  uses `WHERE deleted_at IS NULL` instead for SQLite planner compatibility with
-  parameterized queries. The ADR example is illustrative; the implementation is
-  correct.
+- The `idx_schedule_trigger` core index uses `WHERE deleted_at IS NULL` for
+  SQLite planner compatibility with parameterized `kind` predicates. Migration
+  V51 preserves this definition when moving ownership from the pack to the core
+  migration chain (ADR-015 / ADR-017).
 - `cancel` enforces a namespace check (`note.namespace != token.namespace()`)
   before modifying the event. This is the standard namespace isolation gate and
   is consistent with the pattern in other packs.

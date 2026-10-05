@@ -75,61 +75,30 @@ async fn schedule_pack_registry_with_comm_dispatches_remind() {
 }
 
 #[tokio::test]
-async fn schedule_pack_exposes_non_empty_schema_plan() {
+async fn schedule_pack_has_no_auxiliary_schema() {
     use khive_runtime::PackRuntime;
-    let runtime = support::memory_runtime();
-    let pack = SchedulePack::new(runtime);
-    let plan = pack.schema_plan();
-
+    let pack = SchedulePack::new(support::memory_runtime());
     assert!(
-        !plan.is_empty(),
-        "SchedulePack must return a non-empty SchemaPlan (ADR-040 \u{00a7}283)"
+        pack.schema_plan().is_empty(),
+        "schedule indexes on core tables belong to migration V51"
     );
-    assert_eq!(plan.pack, "schedule", "SchemaPlan.pack must be 'schedule'");
-    assert!(
-        !plan.statements.is_empty(),
-        "schema plan must have at least one DDL statement"
-    );
-
-    let combined = plan.statements.join(" ");
-    assert!(
-        combined.contains("idx_schedule_trigger"),
-        "schema plan must declare idx_schedule_trigger index; got: {combined}"
-    );
-    assert!(
-        combined.contains("idx_schedule_creator_provenance"),
-        "schema plan must index target-bound creator lookup; got: {combined}"
-    );
-    assert!(
-        combined.contains("CREATE INDEX IF NOT EXISTS"),
-        "schema plan DDL must be idempotent (CREATE INDEX IF NOT EXISTS); got: {combined}"
-    );
-    assert!(
-        combined.contains("deleted_at IS NULL"),
-        "schema plan index must use WHERE deleted_at IS NULL partial condition; got: {combined}"
-    );
+    assert!(<SchedulePack as Pack>::SCHEMA_PLAN.is_none());
 }
 
 #[tokio::test]
-async fn verb_registry_aggregates_schedule_schema_plan() {
+async fn registry_includes_schedule_without_core_table_ddl() {
     let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
-    builder.register(SchedulePack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime));
     let registry = builder.build().expect("registry builds");
-
+    let mut names = registry.pack_names();
+    names.sort_unstable();
+    assert_eq!(names, ["kg", "schedule"]);
     let plans = registry.all_schema_plans();
+    assert_eq!(plans.len(), 2, "both registered packs contribute a plan");
     assert!(
-        plans.iter().any(|p| p.pack == "schedule"),
-        "registry must expose schedule schema plan; got packs: {:?}",
-        plans.iter().map(|p| p.pack).collect::<Vec<_>>()
-    );
-    let sched_plan = plans
-        .iter()
-        .find(|p| p.pack == "schedule")
-        .expect("schedule plan present");
-    assert!(
-        !sched_plan.is_empty(),
-        "schedule schema plan must have DDL statements"
+        plans.iter().all(|plan| plan.is_empty()),
+        "kg and schedule need no auxiliary DDL; core indexes come from migrations"
     );
 }
