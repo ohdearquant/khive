@@ -43,13 +43,7 @@ impl WorkspacePack {
 struct WorkspacePackFactory;
 
 impl khive_runtime::PackFactory for WorkspacePackFactory {
-    fn name(&self) -> &'static str {
-        "workspace"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg", "git", "gtd", "session"]
-    }
+    khive_runtime::pack_factory_metadata!(WorkspacePack);
 
     fn intentionally_verbless(&self) -> bool {
         true
@@ -64,29 +58,7 @@ inventory::submit! { khive_runtime::PackRegistration(&WorkspacePackFactory) }
 
 #[async_trait]
 impl PackRuntime for WorkspacePack {
-    fn name(&self) -> &str {
-        <WorkspacePack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <WorkspacePack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <WorkspacePack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <WorkspacePack as Pack>::HANDLERS
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        <WorkspacePack as Pack>::EDGE_RULES
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <WorkspacePack as Pack>::REQUIRES
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
         match kind {

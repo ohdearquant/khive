@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, PackSchemaPlan, RuntimeError, SchemaPlan,
+    KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, PackSchemaPlan, RuntimeError,
     VerbRegistry,
 };
 use khive_types::{EdgeEndpointRule, EntityTypeDef, HandlerDef, Pack};
@@ -80,13 +80,7 @@ impl GitPack {
 struct GitPackFactory;
 
 impl khive_runtime::PackFactory for GitPackFactory {
-    fn name(&self) -> &'static str {
-        "git"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(GitPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(GitPack::new(runtime))
@@ -97,47 +91,10 @@ inventory::submit! { khive_runtime::PackRegistration(&GitPackFactory) }
 
 #[async_trait]
 impl PackRuntime for GitPack {
-    fn name(&self) -> &str {
-        <GitPack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <GitPack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <GitPack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        <GitPack as Pack>::HANDLERS
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     fn input_schema(&self, verb: &str) -> Option<Value> {
         crate::input_schema::for_verb(verb)
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        <GitPack as Pack>::EDGE_RULES
-    }
-
-    fn entity_types(&self) -> &'static [EntityTypeDef] {
-        <GitPack as Pack>::ENTITY_TYPES
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <GitPack as Pack>::REQUIRES
-    }
-
-    fn note_kind_specs(&self) -> &'static [NoteKindSpec] {
-        <GitPack as Pack>::NOTE_KIND_SPECS
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "git",
-            statements: &GIT_SCHEMA_PLAN_STMTS,
-        }
     }
 
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
