@@ -736,12 +736,14 @@ listed below with its disposition.
 
 The six other exported statement builders in the same file change or remove an
 existing row and create no identity. Each is listed with every function that
-issues it at that commit:
+calls it at that commit:
 
 - `note_replace_if_unchanged_statement`: `prepare_versioned_note_update` in
-  `crates/khive-runtime/src/note_write.rs`, and the store method
-  `replace_note_if_unchanged`, which packs and runtime code reach through the
-  policy wrapper (for example the comm handlers and curation).
+  `crates/khive-runtime/src/note_write.rs`; the metadata builder below, which
+  starts from it; and the store method `replace_note_if_unchanged`. Among that
+  method's production callers, the comm heartbeat handler reaches it through
+  the policy wrapper and curation's outbound message updates reach it through
+  the runtime's internal unwrapped store.
 - `note_metadata_replace_if_unchanged_statement`:
   `prepare_versioned_note_update`. It starts from the replace statement's
   parameters and replaces its SQL with one that holds `kind` as a predicate and
