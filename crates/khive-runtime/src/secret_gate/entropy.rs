@@ -81,7 +81,7 @@ fn floor_char_boundary(s: &str, i: usize) -> usize {
 
 /// Tokenize the full input once for the entropy detector. The returned offsets
 /// are absolute offsets into `text` and remain valid for every scan cursor.
-fn tokenize_entropy_tokens(text: &str) -> Vec<(usize, &str)> {
+pub(super) fn tokenize_entropy_tokens(text: &str) -> Vec<(usize, &str)> {
     #[cfg(test)]
     ENTROPY_TOKENIZATION_COUNT.with(|count| count.set(count.get() + 1));
 
