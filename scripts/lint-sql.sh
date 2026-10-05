@@ -21,7 +21,8 @@
 #                   here rather than in a test run. Positional binds are filled
 #                   with NULL and the statement runs under EXPLAIN, so nothing is
 #                   evaluated and no row is touched. A file is classified by its
-#                   first keyword, not by its name or its directory.
+#                   first keyword, except for actual registered core migrations,
+#                   which may begin with data reconciliation before their DDL.
 #   2. hygiene    — no trailing whitespace, no tabs.
 #   3. format     — multi-column CREATE TABLE must be one column per line
 #                   (catches comma-jammed single-line tables).
@@ -40,7 +41,7 @@ if [ -z "$SQL_FILES" ]; then
     exit 0
 fi
 
-python3 - "$SQL_FILES" <<'PY'
+python3 - "$SQL_FILES" "$ROOT" <<'PY'
 import os
 import re
 import sqlite3
@@ -49,6 +50,129 @@ import sys
 files = sys.argv[1].split("\n") if len(sys.argv) > 1 else []
 files = [f for f in files if f.strip()]
 failed = 0
+
+def rust_tokens(source):
+    """Read registration syntax without mistaking comments or strings for Rust."""
+    tokens = []
+    at = 0
+    while at < len(source):
+        if source[at].isspace():
+            at += 1
+        elif source.startswith("//", at):
+            end = source.find("\n", at)
+            at = len(source) if end < 0 else end
+        elif source.startswith("/*", at):
+            depth = 1
+            at += 2
+            while depth and at < len(source):
+                if source.startswith("/*", at):
+                    depth += 1
+                    at += 2
+                elif source.startswith("*/", at):
+                    depth -= 1
+                    at += 2
+                else:
+                    at += 1
+            if depth:
+                raise ValueError("unterminated Rust comment")
+        elif raw := re.match(r'r(#+)?"', source[at:]):
+            end_marker = '"' + (raw.group(1) or "")
+            end = source.find(end_marker, at + raw.end())
+            if end < 0:
+                raise ValueError("unterminated Rust raw string")
+            end += len(end_marker)
+            tokens.append(source[at:end])
+            at = end
+        elif source[at] == '"':
+            end = at + 1
+            while end < len(source) and source[end] != '"':
+                end += 2 if source[end] == "\\" else 1
+            if end >= len(source):
+                raise ValueError("unterminated Rust string")
+            tokens.append(source[at:end + 1])
+            at = end + 1
+        elif char := re.match(r"'(?:\\(?:u\{[0-9A-Fa-f_]+\}|x[0-9A-Fa-f]{2}|.)|[^'\\])'", source[at:]):
+            tokens.append(char.group())
+            at += char.end()
+        elif word := re.match(r"[A-Za-z_][A-Za-z_0-9]*", source[at:]):
+            tokens.append(word.group())
+            at += word.end()
+        else:
+            tokens.append(source[at])
+            at += 1
+    return tokens
+
+def split_rust_fields(tokens):
+    fields, field, stack = [], [], []
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    for token in tokens:
+        if token == "," and not stack:
+            if field:
+                fields.append(field)
+                field = []
+            continue
+        if token in pairs:
+            stack.append(pairs[token])
+        elif token in pairs.values():
+            if not stack or stack.pop() != token:
+                raise ValueError("unbalanced Rust registration")
+        field.append(token)
+    if stack:
+        raise ValueError("unbalanced Rust registration")
+    if field:
+        fields.append(field)
+    return fields
+
+def registered_migration_files(root):
+    core_sql = os.path.join(root, "crates/khive-db/sql") + os.sep
+    if not any(path.startswith(core_sql) for path in files):
+        return set()
+    source = os.path.join(root, "crates/khive-db/src/migrations.rs")
+    with open(source) as fh:
+        tokens = rust_tokens(fh.read())
+
+    def constant(name):
+        starts = [i for i in range(len(tokens) - 1)
+                  if tokens[i:i + 2] == ["const", name]]
+        if len(starts) != 1:
+            raise ValueError(f"expected one migration constant {name}")
+        at = starts[0] + 2
+        end = tokens.index(";", at)
+        equals = tokens.index("=", at, end)
+        return tokens[equals + 1:end]
+
+    registry = constant("MIGRATIONS")
+    if registry[:2] != ["&", "["] or registry[-1:] != ["]"]:
+        raise ValueError("MIGRATIONS must be a literal VersionedMigration array")
+    registered = set()
+    entries = split_rust_fields(registry[2:-1])
+    if not entries:
+        raise ValueError("MIGRATIONS must not be empty")
+    for entry in entries:
+        if entry[:2] != ["VersionedMigration", "{"] or entry[-1:] != ["}"]:
+            raise ValueError("unrecognized VersionedMigration registration")
+        fields = split_rust_fields(entry[2:-1])
+        up = [field[2:] for field in fields if field[:2] == ["up", ":"]]
+        if len(up) != 1 or len(up[0]) != 1:
+            raise ValueError("migration up must name one include constant")
+        expression = constant(up[0][0])
+        if (expression[:3] != ["include_str", "!", "("]
+                or expression[-1:] != [")"] or len(expression) != 5):
+            raise ValueError(f"unresolved migration include {up[0][0]}")
+        target = re.fullmatch(r'"\.\./sql/([A-Za-z0-9_.-]+\.sql)"', expression[3])
+        if not target:
+            raise ValueError(f"migration include must name a file in ../sql: {up[0][0]}")
+        path = os.path.join(root, "crates/khive-db/sql", target.group(1))
+        if path not in files:
+            raise ValueError(f"registered migration is missing: {path}")
+        registered.add(path)
+    return registered
+
+try:
+    registered = registered_migration_files(sys.argv[2])
+except (OSError, ValueError) as error:
+    print(f"SQL lint: cannot resolve registered migrations: {error}")
+    sys.exit(1)
 
 # ── Hygiene + format (file-local, every file) ──────────────────────────────
 create_re = re.compile(r"^\s*CREATE\s+(VIRTUAL\s+)?TABLE\b", re.IGNORECASE)
@@ -95,10 +219,11 @@ def is_ddl(path):
             return bool(ddl_re.match(line))
     return True  # an empty file has nothing to prepare
 
-chain = sorted([f for f in files if in_db_chain(f)], key=chain_order)
-others = [f for f in files if not in_db_chain(f)]
-ddl_files = [f for f in others if is_ddl(f)]
-query_files = [f for f in others if not is_ddl(f)]
+ddl = {f for f in files if is_ddl(f)}
+chain = sorted([f for f in files if f in registered or (in_db_chain(f) and f in ddl)],
+               key=chain_order)
+ddl_files = [f for f in files if f in ddl and f not in chain]
+query_files = [f for f in files if f not in ddl and f not in registered]
 
 # Replay the migration chain cumulatively in one database so a forward migration
 # (e.g. ALTER TABLE / CREATE INDEX on a baseline table) sees prior schema.
@@ -142,8 +267,8 @@ for directory in sorted(fragment_groups):
 
 # ── Preparation (query files) ──────────────────────────────────────────────
 # Statements extracted out of Rust are queries, not DDL. Executing one is both
-# wrong and impossible (executescript refuses bound parameters), so they are
-# PREPARED instead, against a database holding every table this tree declares.
+# wrong: unbound parameters act as NULL and can mutate rows or fail constraints.
+# PREPARE instead against a database holding every table this tree declares.
 if query_files:
     con = sqlite3.connect(":memory:")
     try:
