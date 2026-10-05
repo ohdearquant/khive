@@ -6,7 +6,7 @@ use serde_json::Value;
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
     EmailMessageIdDomains, KhiveRuntime, KindHook, NamespaceToken, NoteEmbeddingPolicy,
-    NoteEmbeddingPolicySpec, RuntimeError, SchemaPlan, VerbRegistry,
+    NoteEmbeddingPolicySpec, RuntimeError, VerbRegistry,
 };
 use khive_types::{HandlerDef, Pack};
 
@@ -46,6 +46,11 @@ impl Pack for CommPack {
             kind: "message",
             policy: NoteEmbeddingPolicy::DefaultModel,
         }];
+    const SCHEMA_PLAN: Option<khive_runtime::PackSchemaPlan> =
+        Some(khive_runtime::PackSchemaPlan {
+            pack: "comm",
+            statements: &COMM_SCHEMA_PLAN_STMTS,
+        });
 }
 
 impl CommPack {
@@ -327,12 +332,7 @@ pub(crate) fn derive_message_identity(
 struct CommPackFactory;
 
 impl khive_runtime::PackFactory for CommPackFactory {
-    fn name(&self) -> &'static str {
-        "comm"
-    }
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(CommPack);
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(CommPack::new(runtime))
     }
@@ -342,21 +342,7 @@ inventory::submit! { khive_runtime::PackRegistration(&CommPackFactory) }
 
 #[async_trait]
 impl PackRuntime for CommPack {
-    fn name(&self) -> &str {
-        <CommPack as Pack>::NAME
-    }
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <CommPack as Pack>::NOTE_KINDS
-    }
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <CommPack as Pack>::ENTITY_KINDS
-    }
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &COMM_HANDLERS
-    }
-    fn note_embedding_policies(&self) -> &'static [NoteEmbeddingPolicySpec] {
-        <CommPack as Pack>::NOTE_EMBEDDING_POLICIES
-    }
+    khive_runtime::pack_runtime_metadata!();
     fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn KindHook>> {
         match kind {
             "message" => Some(std::sync::Arc::new(MessageHook)),
@@ -370,17 +356,6 @@ impl PackRuntime for CommPack {
     fn accept_channel_ingest_capability(&self, capability: khive_runtime::ChannelIngestCapability) {
         let _ = self.channel_ingest.set(capability);
     }
-    fn requires(&self) -> &'static [&'static str] {
-        <CommPack as Pack>::REQUIRES
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "comm",
-            statements: &COMM_SCHEMA_PLAN_STMTS,
-        }
-    }
-
     async fn dispatch(
         &self,
         verb: &str,
