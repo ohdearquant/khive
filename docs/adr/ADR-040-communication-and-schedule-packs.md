@@ -438,22 +438,18 @@ impl PackRuntime for SchedulePack {
         }
     }
 
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "schedule",
-            statements: &[
-                // Index on trigger_at for schedule.agenda() efficiency.
-                "CREATE INDEX IF NOT EXISTS idx_schedule_trigger
-                    ON notes(json_extract(properties, '$.trigger_at'))
-                    WHERE kind = 'scheduled_event'",
-            ],
-        }
-    }
+    // No auxiliary tables: use the default empty schema plan.
 }
 ```
 
-The partial index on `trigger_at` makes `schedule.agenda()` scans efficient without a new table.
-Per ADR-015, pack-auxiliary DDL uses idempotent `CREATE ... IF NOT EXISTS`.
+The core index `idx_schedule_trigger` covers
+`notes(namespace, kind, json_extract(properties, '$.trigger_at'))` with the partial
+condition `deleted_at IS NULL`, allowing parameterized kind predicates to use it.
+Migration V51 also owns `idx_schedule_creator_provenance` on
+`events(namespace, verb, target_id, outcome)`. Both use idempotent
+`CREATE INDEX IF NOT EXISTS`, preserving previously installed definitions and
+btrees. Per ADR-015 and ADR-017, indexes on these core tables belong to numbered
+core migrations; pack schema plans remain auxiliary-only.
 
 ---
 
@@ -632,10 +628,9 @@ standard `delete(id)` path.
 ### Neutral
 
 - No new edge endpoint rules required. Both packs use `annotates` from the base contract.
-- No schema migration needed for either pack. `scheduled_event` and `message` are new values
-  in `note.kind`; no DDL change to the notes table.
-- The schedule pack's auxiliary index (`idx_schedule_trigger`) is a pack-auxiliary DDL item
-  per ADR-015 — idempotent, non-evolving in v1.
+- The `scheduled_event` and `message` note kinds require no new table columns.
+- Schedule's indexes on `notes` and `events` are core DDL. Migration V51 owns them
+  per ADR-015 / ADR-017, independently of schedule pack loading.
 - Both packs are additive. Existing kg, gtd, and memory data are unaffected.
 
 ## Open Questions
@@ -670,7 +665,7 @@ standard `delete(id)` path.
   impls.
 - `crates/khive-pack-schedule/src/handlers.rs`: `remind`, `schedule`, `agenda`, `cancel`
   handlers; executable recurrence validation; trigger-time payload storage.
-- `crates/khive-pack-schedule/src/vocab.rs`: `idx_schedule_trigger` DDL.
+- `crates/khive-db/sql/051-schedule-core-indexes.sql`: trigger and creator-provenance indexes on core tables.
 - `crates/khive-mcp/src/serve.rs` (pack registration in `build_registry_for_multi_backend*`): conditional `CommPack` and
   `SchedulePack` registration from `RuntimeConfig::packs`.
 
