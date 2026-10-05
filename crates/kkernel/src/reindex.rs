@@ -1115,7 +1115,7 @@ async fn distinct_base_namespaces(rt: &KhiveRuntime) -> HashSet<String> {
 /// Drop per-namespace FTS5 partition tables (`fts_entities_*`, `fts_notes_*`) that
 /// may exist in databases that were not yet migrated or were created before V4.
 /// Canonical tables (`fts_entities`, `fts_notes`, `fts_knowledge`, `fts_sections`)
-/// and their FTS5 shadow tables are never dropped.
+/// and their FTS5 shadow tables and canonical rowid companions are never dropped.
 /// Safe to run repeatedly; a no-op on fresh databases.
 ///
 /// **Sweep guard**: only drops partition tables when every distinct namespace
@@ -1124,6 +1124,7 @@ async fn distinct_base_namespaces(rt: &KhiveRuntime) -> HashSet<String> {
 /// base). If uncovered namespaces exist, the sweep is skipped and a warning is
 /// emitted so operators know a manual or multi-namespace reindex is needed.
 async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
+    use khive_db::stores::text::{rowid_map_state_table, rowid_map_table};
     use khive_storage::types::{SqlStatement, SqlValue};
 
     // Guard: only sweep when every distinct namespace present in base
@@ -1151,6 +1152,10 @@ async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
 
     // Canonical base names that must never be dropped.
     let canonical: &[&str] = &["fts_entities", "fts_notes", "fts_knowledge", "fts_sections"];
+    let canonical_companions = ["fts_entities", "fts_notes"]
+        .into_iter()
+        .flat_map(|table| [rowid_map_table(table), rowid_map_state_table(table)])
+        .collect::<HashSet<_>>();
 
     // FTS5 shadow table suffixes that must never be dropped (the extension drops
     // them automatically when the virtual table itself is dropped; we only drop
@@ -1185,8 +1190,8 @@ async fn sweep_stale_fts_partitions(rt: &KhiveRuntime, covered_ns: &str) {
             Some(SqlValue::Text(s)) => s.clone(),
             _ => continue,
         };
-        // Skip canonical tables.
-        if canonical.contains(&name.as_str()) {
+        // The prefix discovery also finds the live rowid maps and their state.
+        if canonical.contains(&name.as_str()) || canonical_companions.contains(&name) {
             continue;
         }
         // Skip FTS5 shadow tables (they are dropped automatically with the virtual table).
@@ -1356,6 +1361,7 @@ fn print_report(report: &ReindexReport, human: bool) {
 
 #[cfg(test)]
 mod tests {
+    mod fts_partition_sweep_tests;
     mod record_repair_tests;
 
     use super::*;
