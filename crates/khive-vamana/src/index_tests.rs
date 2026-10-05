@@ -1195,6 +1195,12 @@ fn sq8_ood_fallback_deterministic_ranking_flip() {
         "index.search() OOD fallback must return gt_top1=n{gt_top1}, got n{fallback_top1}; \
              removing the is_in_distribution→f32 branch at search() makes this test RED"
     );
+
+    let allocating_top1 = index.search_allocating(&query, 1).expect("search failed")[0].0;
+    assert_eq!(
+        allocating_top1, gt_top1,
+        "search_allocating() OOD fallback must return gt_top1=n{gt_top1}, got n{allocating_top1}"
+    );
 }
 
 /// When two vectors collide to the same SQ8 code, greedy search and RobustPrune must
