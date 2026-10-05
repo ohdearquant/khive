@@ -255,6 +255,8 @@ pub struct CompleteParams {
     status: Option<String>,
     #[serde(default)]
     ignore_dependencies: bool,
+    #[serde(default)]
+    duplicate_of: Option<String>,
 }
 
 /// Validates the target terminal status for `complete()`.
@@ -288,6 +290,8 @@ struct TasksParams {
     limit: Option<u32>,
     #[serde(default)]
     offset: Option<u32>,
+    #[serde(default)]
+    duplicate_of: Option<String>,
 }
 
 /// ADR-099 B3: `pub` for the same reason as `CompleteParams` above —
@@ -301,7 +305,12 @@ pub struct TransitionParams {
     note: Option<String>,
     #[serde(default)]
     ignore_dependencies: bool,
+    #[serde(default)]
+    duplicate_of: Option<String>,
 }
+
+#[path = "duplicate.rs"]
+pub mod duplicate;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -977,6 +986,7 @@ async fn atomic_gtd_transition(
     target: &str,
     new_props: &serde_json::Value,
     updated_at: i64,
+    duplicate_of: Option<Uuid>,
 ) -> Result<u64, RuntimeError> {
     // The conditional UPDATE runs as a single SQLite statement, which is atomic
     // on its own — no explicit transaction is needed because the decision
@@ -988,8 +998,14 @@ async fn atomic_gtd_transition(
     // semantic status, or soft-deleted the row by the time the predicate is
     // evaluated, it fails with rows_affected = 0. The caller distinguishes
     // that loser path from the pre-load errors returned by `load_task`.
-    let statement =
-        gtd_transition_statement(snapshot, expected_current, target, new_props, updated_at)?;
+    let statement = duplicate::transition_statement(
+        snapshot,
+        expected_current,
+        target,
+        new_props,
+        updated_at,
+        duplicate_of,
+    )?;
     let sql = runtime.sql();
     let mut writer = sql
         .writer()
@@ -1617,7 +1633,7 @@ impl GtdPack {
         // the terminal/lifecycle guards, and computes the patched
         // `properties` value — the SAME function the ADR-099 `--atomic`
         // `gtd.complete` prepare path in `kkernel` calls.
-        let decision = prepare_complete(
+        let (decision, duplicate_of) = duplicate::prepare_complete(
             self.runtime(),
             token,
             &p.id,
@@ -1626,6 +1642,7 @@ impl GtdPack {
             DependencyOptions {
                 ignore_dependencies: p.ignore_dependencies,
             },
+            p.duplicate_of.as_deref(),
         )
         .await?;
         let CompleteDecision {
@@ -1642,9 +1659,16 @@ impl GtdPack {
         // may leave status unchanged while changing description/content or
         // other task properties; replacing its property document would lose
         // that write and can break the task-body mirror invariant.
-        let rows_affected =
-            atomic_gtd_transition(self.runtime(), &note, &current, target, &props, updated_at)
-                .await?;
+        let rows_affected = atomic_gtd_transition(
+            self.runtime(),
+            &note,
+            &current,
+            target,
+            &props,
+            updated_at,
+            duplicate_of,
+        )
+        .await?;
 
         if rows_affected == 0 {
             // Re-read status for a precise conflict class. The snapshot guard
@@ -1700,7 +1724,11 @@ impl GtdPack {
         let offset = p.offset.unwrap_or(0);
 
         // Normalize status filter once.
-        let status_filter: Option<String> = match p.status.as_deref() {
+        let status_filter: Option<String> = match p
+            .status
+            .as_deref()
+            .or_else(|| p.duplicate_of.as_ref().map(|_| "cancelled"))
+        {
             None => None,
             Some(s) => {
                 let normalized = normalize_status(s);
@@ -1776,6 +1804,14 @@ impl GtdPack {
                 value: SqlValue::Null,
             },
         }];
+        if let Some(raw) = p.duplicate_of.as_deref() {
+            let id = resolve_lifecycle_uuid(raw, self.runtime()).await?;
+            property_filters.push(PropertyFilter {
+                json_path: "$.duplicate_of".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(id.to_string()),
+            });
+        }
         if let Some(want) = p.assignee.as_deref() {
             property_filters.push(PropertyFilter {
                 json_path: "$.assignee".to_string(),
@@ -1920,7 +1956,7 @@ impl GtdPack {
         // and either returns the idempotent no-op case or the fully computed
         // patch — the SAME function the ADR-099 `--atomic` `gtd.transition`
         // prepare path in `kkernel` calls.
-        let decision = prepare_transition(
+        let (decision, duplicate_of) = duplicate::prepare_transition(
             self.runtime(),
             token,
             &p.id,
@@ -1929,6 +1965,7 @@ impl GtdPack {
             DependencyOptions {
                 ignore_dependencies: p.ignore_dependencies,
             },
+            p.duplicate_of.as_deref(),
         )
         .await?;
 
@@ -1938,6 +1975,7 @@ impl GtdPack {
                 current,
                 target,
             } => {
+                duplicate::assert_noop(self.runtime(), &note, &current, duplicate_of).await?;
                 // Same-status is a read assertion, not a lifecycle event, so
                 // nothing is persisted. The explanation is returned under
                 // `reason`: it is not the caller's note, and returning it under
@@ -1975,6 +2013,7 @@ impl GtdPack {
                     &target,
                     &props,
                     updated_at,
+                    duplicate_of,
                 )
                 .await?;
 
@@ -2141,10 +2180,11 @@ mod lifecycle_snapshot_tests {
 
         let concurrent_revision =
             install_concurrent_mirrored_update(&runtime, &token, &snapshot).await;
-        let affected =
-            atomic_gtd_transition(&runtime, &snapshot, &current, &target, &props, updated_at)
-                .await
-                .expect("execute guarded transition");
+        let affected = atomic_gtd_transition(
+            &runtime, &snapshot, &current, &target, &props, updated_at, None,
+        )
+        .await
+        .expect("execute guarded transition");
         assert_eq!(affected, 0, "stale transition snapshot must lose its CAS");
         assert_concurrent_update_survived(&runtime, &token, task.id, concurrent_revision).await;
     }
@@ -2193,10 +2233,11 @@ mod lifecycle_snapshot_tests {
         );
         assert!(tombstone.deleted_at.is_some());
 
-        let affected =
-            atomic_gtd_transition(&runtime, &snapshot, &current, &target, &props, updated_at)
-                .await
-                .expect("execute guarded transition");
+        let affected = atomic_gtd_transition(
+            &runtime, &snapshot, &current, &target, &props, updated_at, None,
+        )
+        .await
+        .expect("execute guarded transition");
         assert_eq!(affected, 0, "soft-deleted snapshot must lose its CAS");
     }
 
@@ -2224,6 +2265,7 @@ mod lifecycle_snapshot_tests {
             decision.target,
             &decision.props,
             decision.updated_at,
+            None,
         )
         .await
         .expect("execute guarded complete");

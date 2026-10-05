@@ -284,6 +284,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
         category: VerbCategory::Declaration,
         params: &[
             ParamDef {
+                name: "duplicate_of",
+                param_type: "uuid",
+                required: false,
+                description: "Full UUID or unique 8+ hex prefix of the kept task. Only valid with status=cancelled; any live task status is accepted. Stores properties.duplicate_of; no cycle check.",
+                resolution_mode: IdResolutionMode::UnscopedById,
+            },
+            ParamDef {
                 name: "id",
                 param_type: "uuid",
                 required: true,
@@ -323,7 +330,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
     // signal and the default-filter rule are khive #96.
     HandlerDef {
         name: "gtd.tasks",
-        description: "List tasks filtered by status, assignee, priority, tags and context. DEFAULT (no `status` \
+        description: "List tasks filtered by status, assignee, priority, tags, context and duplicate reference. DEFAULT (no `duplicate_of` or `status` \
                        given): includes canonical open states and the legacy missing/non-text \
                        inbox fallback; excludes terminal and unrecognized stored statuses so the default \
                        listing shows only active work. Pass status=\"done\" or \
@@ -335,6 +342,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
+            ParamDef {
+                name: "duplicate_of",
+                param_type: "uuid",
+                required: false,
+                description: "Filter stored duplicate judgments by kept task UUID or unique 8+ hex prefix. Defaults this filter to status=cancelled when status is omitted; explicit status, visibility and pagination still apply.",
+                resolution_mode: IdResolutionMode::UnscopedById,
+            },
             ParamDef {
                 name: "status",
                 param_type: "string",
@@ -411,6 +425,13 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 7] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Declaration,
         params: &[
+            ParamDef {
+                name: "duplicate_of",
+                param_type: "uuid",
+                required: false,
+                description: "Full UUID or unique 8+ hex prefix of the kept task. Only valid with status=cancelled; any live task status is accepted. Stores properties.duplicate_of; no cycle check.",
+                resolution_mode: IdResolutionMode::UnscopedById,
+            },
             ParamDef {
                 name: "id",
                 param_type: "uuid",

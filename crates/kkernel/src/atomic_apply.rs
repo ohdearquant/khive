@@ -1313,7 +1313,7 @@ async fn prepare_gtd_transition(
         .get("ignore_dependencies")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let decision = khive_pack_gtd::handlers::prepare_transition(
+    let (decision, duplicate_of) = khive_pack_gtd::handlers::duplicate::prepare_transition(
         runtime,
         token,
         raw_id,
@@ -1322,14 +1322,19 @@ async fn prepare_gtd_transition(
         khive_pack_gtd::handlers::DependencyOptions {
             ignore_dependencies,
         },
+        args.get("duplicate_of").and_then(Value::as_str),
     )
     .await
     .map_err(anyhow::Error::new)?;
 
     match decision {
         khive_pack_gtd::handlers::TransitionDecision::NoOp { note, current, .. } => {
-            let statement = khive_pack_gtd::handlers::gtd_noop_assertion_statement(&note, &current)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let statement = khive_pack_gtd::handlers::duplicate::noop_assertion_statement(
+                &note,
+                &current,
+                duplicate_of,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan::new(
                 note.id,
                 vec![PlanStatement {
@@ -1348,8 +1353,13 @@ async fn prepare_gtd_transition(
             updated_at,
             transition_note,
         } => {
-            let statement = khive_pack_gtd::handlers::gtd_transition_statement(
-                &note, &current, &target, &props, updated_at,
+            let statement = khive_pack_gtd::handlers::duplicate::transition_statement(
+                &note,
+                &current,
+                &target,
+                &props,
+                updated_at,
+                duplicate_of,
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -1395,7 +1405,7 @@ async fn prepare_gtd_complete(
         .get("ignore_dependencies")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let decision = khive_pack_gtd::handlers::prepare_complete(
+    let (decision, duplicate_of) = khive_pack_gtd::handlers::duplicate::prepare_complete(
         runtime,
         token,
         raw_id,
@@ -1404,16 +1414,18 @@ async fn prepare_gtd_complete(
         khive_pack_gtd::handlers::DependencyOptions {
             ignore_dependencies,
         },
+        args.get("duplicate_of").and_then(Value::as_str),
     )
     .await
     .map_err(anyhow::Error::new)?;
 
-    let statement = khive_pack_gtd::handlers::gtd_transition_statement(
+    let statement = khive_pack_gtd::handlers::duplicate::transition_statement(
         &decision.note,
         &decision.current,
         decision.target,
         &decision.props,
         decision.updated_at,
+        duplicate_of,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
