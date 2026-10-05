@@ -23,6 +23,7 @@ pub mod comm_transport;
 pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
+pub mod credentials;
 pub mod curation;
 pub mod daemon;
 pub mod email_message_id;

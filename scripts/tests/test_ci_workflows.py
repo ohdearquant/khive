@@ -588,6 +588,73 @@ class CiConcurrencyWorkflowTests(unittest.TestCase):
         )
 
 
+class CiMatrixWorkflowTests(unittest.TestCase):
+    """Evaluates the `ci` job's matrix expression for each event shape.
+
+    The expression uses only `&&`, `||`, `==`, `startsWith` and string literals,
+    which map onto Python's short-circuit operators with the same operand-returning
+    semantics, so the test runs the expression itself rather than matching its text.
+    """
+
+    UBUNTU = [{"os": "ubuntu-latest", "shard": 1}, {"os": "ubuntu-latest", "shard": 2}]
+
+    def matrix_for(self, event_name, head_ref="", head_repo=None, repository="ohdearquant/khive"):
+        text = workflow_text("ci.yml")
+        match = re.search(r"include: \$\{\{ fromJSON\((.*?)\) \}\}", text, re.S)
+        self.assertIsNotNone(match, "the ci job's matrix include expression was not found")
+        expression = " ".join(match.group(1).split())
+        names = {
+            "github.event.pull_request.head.repo.full_name": "head_repo",
+            "github.event_name": "event_name",
+            "github.head_ref": "head_ref",
+            "github.repository": "repository",
+        }
+        for name, local in names.items():
+            expression = expression.replace(name, local)
+        expression = expression.replace("startsWith(", "starts_with(")
+        expression = expression.replace("&&", " and ").replace("||", " or ")
+        self.assertNotRegex(expression, r"github\.", "an unmapped context name is left in the expression")
+
+        def starts_with(value, prefix):
+            # GitHub's startsWith is case-insensitive and treats null as "".
+            return (value or "").lower().startswith(prefix.lower())
+
+        scope = {
+            "starts_with": starts_with,
+            "event_name": event_name,
+            "head_ref": head_ref,
+            "head_repo": head_repo,
+            "repository": repository,
+        }
+        return json.loads(eval(expression, {"__builtins__": {}}, scope))
+
+    def test_own_codex_branch_pull_requests_run_the_linux_shards_only(self):
+        self.assertEqual(
+            self.matrix_for("pull_request", "codex/some-change", "ohdearquant/khive"),
+            self.UBUNTU,
+        )
+
+    def test_other_pull_requests_keep_the_macos_lane(self):
+        expected = self.UBUNTU + [{"os": "macos-latest", "shard": 1}]
+        for head_ref, head_repo in [
+            ("batch/125", "ohdearquant/khive"),
+            ("feature/codex/x", "ohdearquant/khive"),
+            ("codex/some-change", "contributor/khive"),
+            ("codex/some-change", None),
+        ]:
+            with self.subTest(head_ref=head_ref, head_repo=head_repo):
+                self.assertEqual(self.matrix_for("pull_request", head_ref, head_repo), expected)
+
+    def test_push_schedule_and_dispatch_runs_keep_all_four_jobs(self):
+        expected = self.UBUNTU + [
+            {"os": "macos-latest", "shard": 1},
+            {"os": "macos-latest", "shard": 2},
+        ]
+        for event_name in ["push", "schedule", "workflow_dispatch"]:
+            with self.subTest(event_name=event_name):
+                self.assertEqual(self.matrix_for(event_name), expected)
+
+
 class WasmtimeParityWorkflowTests(unittest.TestCase):
     def test_pinned_runtime_is_cached_retried_and_verified(self):
         workflow = workflow_text("ci.yml")

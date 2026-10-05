@@ -69,6 +69,16 @@ fn synchronize_description(note: &Note, args: &mut Value) -> Result<(), RuntimeE
                 )));
             }
         }
+        // A duplicate judgment is only valid beside the cancellation it justifies, and
+        // the lifecycle verbs validate and write the pair together.
+        if properties.contains_key("duplicate_of") {
+            return Err(RuntimeError::InvalidInput(
+                "properties.duplicate_of is lifecycle-owned and cannot be patched on a task; \
+                 record it with gtd.transition(status=\"cancelled\", duplicate_of=...) or \
+                 gtd.complete(status=\"cancelled\", duplicate_of=...)"
+                    .into(),
+            ));
+        }
         for field in ["blocked_by", "dependency_state", "actionable"] {
             if properties.contains_key(field) {
                 return Err(RuntimeError::InvalidInput(format!(

@@ -210,10 +210,23 @@ jobs:
       # dispatched runs are CI_SUITE == 'full', where macOS shard 2 does carry
       # a real partition, so they keep all four.
       #
+      # Pull requests opened from this repository's own `codex/` branches run
+      # the two Linux shards only. Their changes are integrated through a later
+      # pull request that runs the three-job matrix above, so the macOS lane
+      # runs there, and the many draft pull requests on that prefix no longer
+      # hold macOS slots that integration runs wait for.
+      # The head-repository check keeps the rule to branches of this
+      # repository: a pull request from a fork runs the three-job matrix
+      # whatever its branch is called.
+      #
       # Written as an explicit include list rather than an `exclude` expression
-      # so both branches name every job they produce.
+      # so every branch names every job it produces.
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request'
+          && startsWith(github.head_ref, 'codex/')
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2}]'
+          || github.event_name == 'pull_request'
           && '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1}]'
           || '[{"os":"ubuntu-latest","shard":1},{"os":"ubuntu-latest","shard":2},{"os":"macos-latest","shard":1},{"os":"macos-latest","shard":2}]') }}
     defaults:
