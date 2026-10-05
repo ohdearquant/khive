@@ -1,8 +1,11 @@
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(checkpoint_skip_metrics, khive_walpin_census_budget_env)]
 async fn db_diagnostics_commit_churn_without_readers_does_not_report_a_pin() {
-    let _budget_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_CENSUS_BUDGET_MS");
-    std::env::set_var("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+    if crate::test_process::run_in_child(|command| {
+        command.env("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+    }) {
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("diagnostic_commit_churn.db");
@@ -84,8 +87,11 @@ async fn db_diagnostics_commit_churn_without_readers_does_not_report_a_pin() {
 #[test]
 #[serial(checkpoint_skip_metrics, khive_walpin_census_budget_env)]
 fn live_multi_writer_churn_has_no_pin_at_tight_or_default_cadence() {
-    let _budget_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_CENSUS_BUDGET_MS");
-    std::env::set_var("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+    if crate::test_process::run_in_child(|command| {
+        command.env("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+    }) {
+        return;
+    }
 
     for interval in [Duration::from_millis(10), Duration::from_millis(500)] {
         let dir = tempfile::tempdir().unwrap();

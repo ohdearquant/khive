@@ -3423,12 +3423,10 @@ fn enumerate_live_bounded(
     })
 }
 
-/// Restores a possibly-unset env var on drop, including on panic — so an
-/// assertion failure mid-test can never leak a mutated `KHIVE_WALPIN_SIDECAR`
-/// into a sibling test (minor, ADR-091 Amendment 2: env-mutating
-/// tests must serialize with cleanup on panic). Shared with the checkpoint
-/// session-sweep test, which mutates the same variable and must serialize
-/// under the same `khive_walpin_sidecar_env` key.
+/// Restore an environment setting within its exact isolated test child,
+/// including when an assertion panics. Worker-owning fixtures instead set
+/// their fixed configuration before child startup, so this guard is only
+/// used by configuration fixtures that do not create background workers.
 #[cfg(test)]
 pub(crate) struct EnvVarGuard {
     key: &'static str,
@@ -3447,8 +3445,8 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match &self.saved {
-            Some(v) => std::env::set_var(self.key, v),
-            None => std::env::remove_var(self.key),
+            Some(v) => crate::test_process::set_var(self.key, v),
+            None => crate::test_process::remove_var(self.key),
         }
     }
 }

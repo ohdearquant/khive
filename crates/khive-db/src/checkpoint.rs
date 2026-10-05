@@ -3936,6 +3936,8 @@ mod tests {
             .checkpoint_interval_ms
     }
 
+    include!("checkpoint/environment_tests.rs");
+
     #[test]
     fn pr3409_retiring_fast_owner_restores_live_interval() {
         let dir = tempfile::tempdir().unwrap();
@@ -4221,8 +4223,11 @@ mod tests {
         checkpoint_live_busy
     )]
     fn live_concurrent_busy_checkpoints_preserve_a_reader_pin_run() {
-        let _budget_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_CENSUS_BUDGET_MS");
-        std::env::set_var("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+        }) {
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("live_concurrent_busy_pin.db");
@@ -4457,8 +4462,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial(checkpoint_skip_metrics, khive_walpin_census_budget_env)]
     async fn db_diagnostics_reports_a_reader_pin_after_one_second_and_clears_after_backfill() {
-        let _budget_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_CENSUS_BUDGET_MS");
-        std::env::set_var("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_CENSUS_BUDGET_MS", "10");
+        }) {
+            return;
+        }
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("diagnostic_pin_run.db");
@@ -5188,8 +5196,12 @@ mod tests {
     #[cfg(unix)]
     #[serial(khive_walpin_sidecar_env)]
     async fn diagnostic_legacy_forecast_matches_housekeeping_with_distinct_cadences() {
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let root = tempfile::tempdir().unwrap();
         let pool = file_pool(&root.path().join("forecast.db"));
         let path = pool.canonical_path().unwrap();
@@ -5344,8 +5356,12 @@ mod tests {
     #[cfg(unix)]
     #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
     async fn progressing_truncate_releases_full_scan_reservation_to_housekeeping() {
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("walpin-progress-reservation.db");
         let pool = file_pool(&path);
@@ -5387,8 +5403,12 @@ mod tests {
     #[cfg(unix)]
     #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
     async fn erroring_truncate_releases_full_scan_reservation_to_housekeeping() {
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("walpin-error-reservation.db");
         let pool = file_pool(&path);
@@ -5641,8 +5661,12 @@ mod tests {
         walpin_report_seam
     )]
     async fn no_progress_report_keeps_holder_released_after_truncate_timeout() {
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("transient-reader.db");
         let pool = file_pool(&path);
@@ -6239,13 +6263,17 @@ mod tests {
     #[tokio::test]
     #[serial(checkpoint_skip_metrics, khive_walpin_sidecar_env)]
     async fn healthy_checkpoint_tick_reaps_a_dead_walpin_beacon_without_truncate() {
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("healthy_sidecar_reap.db");
         let pool = file_pool(&path);
         let sidecar_dir =
             crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed pool"));
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let dead_pid = 2_000_000_000;
         let dead_beacon = crate::walpin::WalpinBeacon {
@@ -6339,77 +6367,6 @@ mod tests {
             .expect("checkpoint task panicked");
     }
 
-    #[test]
-    #[serial]
-    fn checkpoint_config_env_override() {
-        std::env::set_var("KHIVE_CHECKPOINT_INTERVAL_MS", "250");
-        std::env::set_var("KHIVE_WAL_WARN_PAGES", "1500");
-        std::env::set_var("KHIVE_WAL_HIGH_WATER_PAGES", "8000");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES", "12000");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS", "60");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_BUSY_MS", "500");
-        std::env::set_var("KHIVE_TX_WARN_SECS", "15");
-        std::env::set_var("KHIVE_TX_MAX_AGE_SECS", "90");
-
-        let cfg = CheckpointConfig::from_env();
-
-        std::env::remove_var("KHIVE_CHECKPOINT_INTERVAL_MS");
-        std::env::remove_var("KHIVE_WAL_WARN_PAGES");
-        std::env::remove_var("KHIVE_WAL_HIGH_WATER_PAGES");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_BUSY_MS");
-        std::env::remove_var("KHIVE_TX_WARN_SECS");
-        std::env::remove_var("KHIVE_TX_MAX_AGE_SECS");
-
-        assert_eq!(cfg.interval, Duration::from_millis(250));
-        assert_eq!(cfg.warn_pages, 1500);
-        assert_eq!(cfg.high_water_pages, 8000);
-        assert_eq!(cfg.truncate_high_water_pages, 12000);
-        assert_eq!(cfg.truncate_min_interval, Duration::from_secs(60));
-        assert_eq!(cfg.truncate_busy_timeout, Duration::from_millis(500));
-        assert_eq!(cfg.tx_warn_secs, Duration::from_secs(15));
-        assert_eq!(cfg.tx_max_age_secs, Duration::from_secs(90));
-    }
-
-    #[test]
-    #[serial]
-    fn checkpoint_config_defaults_on_invalid_env() {
-        let default = CheckpointConfig::default();
-
-        std::env::set_var("KHIVE_CHECKPOINT_INTERVAL_MS", "not_a_number");
-        std::env::set_var("KHIVE_WAL_WARN_PAGES", "");
-        std::env::set_var("KHIVE_WAL_HIGH_WATER_PAGES", "0");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES", "not_a_number");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS", "");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_BUSY_MS", "0");
-        std::env::set_var("KHIVE_TX_WARN_SECS", "not_a_number");
-        std::env::set_var("KHIVE_TX_MAX_AGE_SECS", "0");
-
-        let cfg = CheckpointConfig::from_env();
-
-        std::env::remove_var("KHIVE_CHECKPOINT_INTERVAL_MS");
-        std::env::remove_var("KHIVE_WAL_WARN_PAGES");
-        std::env::remove_var("KHIVE_WAL_HIGH_WATER_PAGES");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_BUSY_MS");
-        std::env::remove_var("KHIVE_TX_WARN_SECS");
-        std::env::remove_var("KHIVE_TX_MAX_AGE_SECS");
-
-        assert_eq!(cfg.interval, default.interval);
-        assert_eq!(cfg.warn_pages, default.warn_pages);
-        assert_eq!(cfg.high_water_pages, default.high_water_pages);
-        assert_eq!(
-            cfg.truncate_high_water_pages,
-            default.truncate_high_water_pages
-        );
-        assert_eq!(cfg.truncate_min_interval, default.truncate_min_interval);
-        assert_eq!(cfg.truncate_busy_timeout, default.truncate_busy_timeout);
-        assert_eq!(cfg.tx_warn_secs, default.tx_warn_secs);
-        assert_eq!(cfg.tx_max_age_secs, default.tx_max_age_secs);
-    }
-
     /// Regression: a high-water tick must NOT block behind an active read
     /// transaction (isomorphism guarantee — fails if `checkpoint_once`
     /// regresses to TRUNCATE). See
@@ -6491,116 +6448,6 @@ mod tests {
             elapsed,
             max_elapsed,
             checkpoint_config.truncate_busy_timeout
-        );
-    }
-
-    #[test]
-    #[serial]
-    fn checkpoint_config_rejects_zero_for_all_fields() {
-        let default = CheckpointConfig::default();
-        std::env::set_var("KHIVE_CHECKPOINT_INTERVAL_MS", "0");
-        std::env::set_var("KHIVE_WAL_WARN_PAGES", "0");
-        std::env::set_var("KHIVE_WAL_HIGH_WATER_PAGES", "0");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES", "0");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS", "0");
-        std::env::set_var("KHIVE_WAL_TRUNCATE_BUSY_MS", "0");
-        std::env::set_var("KHIVE_TX_WARN_SECS", "0");
-        std::env::set_var("KHIVE_TX_MAX_AGE_SECS", "0");
-
-        let cfg = CheckpointConfig::from_env();
-
-        std::env::remove_var("KHIVE_CHECKPOINT_INTERVAL_MS");
-        std::env::remove_var("KHIVE_WAL_WARN_PAGES");
-        std::env::remove_var("KHIVE_WAL_HIGH_WATER_PAGES");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS");
-        std::env::remove_var("KHIVE_WAL_TRUNCATE_BUSY_MS");
-        std::env::remove_var("KHIVE_TX_WARN_SECS");
-        std::env::remove_var("KHIVE_TX_MAX_AGE_SECS");
-
-        assert_eq!(
-            cfg.interval, default.interval,
-            "zero interval must fall back to default"
-        );
-        assert_eq!(
-            cfg.warn_pages, default.warn_pages,
-            "zero warn_pages must fall back to default"
-        );
-        assert_eq!(
-            cfg.high_water_pages, default.high_water_pages,
-            "zero high_water_pages must fall back to default"
-        );
-        assert_eq!(
-            cfg.truncate_high_water_pages, default.truncate_high_water_pages,
-            "zero truncate_high_water_pages must fall back to default"
-        );
-        assert_eq!(
-            cfg.truncate_min_interval, default.truncate_min_interval,
-            "zero truncate_min_interval must fall back to default"
-        );
-        assert_eq!(
-            cfg.truncate_busy_timeout, default.truncate_busy_timeout,
-            "zero truncate_busy_timeout must fall back to default"
-        );
-        assert_eq!(
-            cfg.tx_warn_secs, default.tx_warn_secs,
-            "zero tx_warn_secs must fall back to default"
-        );
-        assert_eq!(
-            cfg.tx_max_age_secs, default.tx_max_age_secs,
-            "zero tx_max_age_secs must fall back to default"
-        );
-    }
-
-    /// Fix: a reversed threshold pair must not be honored independently. See
-    /// crates/khive-db/docs/api/checkpoint.md#checkpoint_config_rejects_reversed_tx_thresholds
-    #[test]
-    #[serial]
-    fn checkpoint_config_rejects_reversed_tx_thresholds() {
-        let default = CheckpointConfig::default();
-        std::env::set_var("KHIVE_TX_WARN_SECS", "120");
-        std::env::set_var("KHIVE_TX_MAX_AGE_SECS", "30");
-
-        let cfg = CheckpointConfig::from_env();
-
-        std::env::remove_var("KHIVE_TX_WARN_SECS");
-        std::env::remove_var("KHIVE_TX_MAX_AGE_SECS");
-
-        assert_eq!(
-            cfg.tx_warn_secs, default.tx_warn_secs,
-            "a reversed pair must fall back tx_warn_secs to its default, got: {:?}",
-            cfg.tx_warn_secs
-        );
-        assert_eq!(
-            cfg.tx_max_age_secs, default.tx_max_age_secs,
-            "a reversed pair must fall back tx_max_age_secs to its default, got: {:?}",
-            cfg.tx_max_age_secs
-        );
-    }
-
-    /// Degenerate equal-thresholds case; see
-    /// crates/khive-db/docs/api/checkpoint.md#checkpoint_config_rejects_equal_tx_thresholds
-    #[test]
-    #[serial]
-    fn checkpoint_config_rejects_equal_tx_thresholds() {
-        let default = CheckpointConfig::default();
-        std::env::set_var("KHIVE_TX_WARN_SECS", "60");
-        std::env::set_var("KHIVE_TX_MAX_AGE_SECS", "60");
-
-        let cfg = CheckpointConfig::from_env();
-
-        std::env::remove_var("KHIVE_TX_WARN_SECS");
-        std::env::remove_var("KHIVE_TX_MAX_AGE_SECS");
-
-        assert_eq!(
-            cfg.tx_warn_secs, default.tx_warn_secs,
-            "an equal pair must fall back tx_warn_secs to its default, got: {:?}",
-            cfg.tx_warn_secs
-        );
-        assert_eq!(
-            cfg.tx_max_age_secs, default.tx_max_age_secs,
-            "an equal pair must fall back tx_max_age_secs to its default, got: {:?}",
-            cfg.tx_max_age_secs
         );
     }
 
@@ -7682,35 +7529,6 @@ mod tests {
                     && e.label.as_deref() == Some("this_test_own_span")),
             "expected a Stale emission naming this test's own span despite an older, \
              unrelated concurrent registration, got: {emissions:?}"
-        );
-    }
-
-    /// `KHIVE_WAL_WARN_SUSTAINED_CYCLES` overrides the default and rejects 0.
-    #[test]
-    #[serial]
-    fn checkpoint_config_warn_sustained_cycles_env_override() {
-        let default = CheckpointConfig::default();
-        assert_eq!(default.warn_sustained_cycles, DEFAULT_WARN_SUSTAINED_CYCLES);
-
-        std::env::set_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES", "5");
-        let cfg = CheckpointConfig::from_env();
-        std::env::remove_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES");
-        assert_eq!(cfg.warn_sustained_cycles, 5);
-
-        std::env::set_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES", "0");
-        let cfg_zero = CheckpointConfig::from_env();
-        std::env::remove_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES");
-        assert_eq!(
-            cfg_zero.warn_sustained_cycles, DEFAULT_WARN_SUSTAINED_CYCLES,
-            "zero must fall back to the default"
-        );
-
-        std::env::set_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES", "not_a_number");
-        let cfg_invalid = CheckpointConfig::from_env();
-        std::env::remove_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES");
-        assert_eq!(
-            cfg_invalid.warn_sustained_cycles,
-            DEFAULT_WARN_SUSTAINED_CYCLES
         );
     }
 
@@ -8917,11 +8735,15 @@ mod tests {
     #[tokio::test]
     #[serial(khive_walpin_sidecar_env)]
     async fn walpin_observe_drops_beacon_when_heartbeat_write_fails() {
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("observe_gate.db");
         let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let mut state = WalpinSidecarState::new(
             Some(db_path.as_path()),
@@ -8986,11 +8808,15 @@ mod tests {
     #[tokio::test]
     #[serial(khive_walpin_sidecar_env)]
     async fn walpin_observe_touches_mtime_without_rewriting_body_when_content_unchanged() {
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("observe_touch.db");
         let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let mut state = WalpinSidecarState::new(
             Some(db_path.as_path()),
@@ -9051,11 +8877,15 @@ mod tests {
     #[tokio::test]
     #[serial(khive_walpin_sidecar_env)]
     async fn walpin_observe_recreates_heartbeat_after_it_is_deleted_while_span_still_live() {
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("observe_recreate.db");
         let sidecar_dir = crate::walpin::sidecar_dir_for(&db_path);
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let mut state = WalpinSidecarState::new(
             Some(db_path.as_path()),
@@ -9101,13 +8931,17 @@ mod tests {
     #[tokio::test]
     #[serial(tx_registry, khive_walpin_sidecar_env)]
     async fn session_sweep_task_writes_and_clears_walpin_heartbeat() {
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("session_sweep.db");
         let pool = file_pool(&db_path);
         let sidecar_dir =
             crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed pool"));
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let cfg = SessionSweepConfig {
             interval: Duration::from_millis(10),
@@ -9190,6 +9024,12 @@ mod tests {
     #[tokio::test]
     #[serial(tx_registry, khive_walpin_sidecar_env)]
     async fn session_sweep_fan_out_scopes_secondary_span_to_secondary_sidecar_only() {
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let main_dir = tempfile::tempdir().unwrap();
         let secondary_dir = tempfile::tempdir().unwrap();
         let main_pool = file_pool(&main_dir.path().join("main.db"));
@@ -9198,8 +9038,6 @@ mod tests {
             crate::walpin::sidecar_dir_for(main_pool.canonical_path().expect("file-backed"));
         let secondary_sidecar =
             crate::walpin::sidecar_dir_for(secondary_pool.canonical_path().expect("file-backed"));
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let cfg = SessionSweepConfig {
             interval: Duration::from_millis(10),
@@ -9277,6 +9115,12 @@ mod tests {
     #[tokio::test]
     #[serial(tx_registry, checkpoint_skip_metrics, khive_walpin_sidecar_env)]
     async fn checkpoint_task_ignores_span_registered_against_other_backend_origin_and_unscoped() {
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let pool_a = file_pool(&dir_a.path().join("backend_a.db"));
@@ -9285,8 +9129,6 @@ mod tests {
         let pool_b = file_pool(&dir_b.path().join("backend_b.db"));
         let sidecar_a =
             crate::walpin::sidecar_dir_for(pool_a.canonical_path().expect("file-backed"));
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber {
@@ -9355,12 +9197,16 @@ mod tests {
     #[tokio::test]
     #[serial(tx_registry, checkpoint_skip_metrics, khive_walpin_sidecar_env)]
     async fn checkpoint_task_detects_and_enumerates_secondary_backend_stall() {
+        if crate::test_process::run_in_child(|command| {
+            command.env("KHIVE_WALPIN_SIDECAR", "1");
+        }) {
+            return;
+        }
+
         let dir = tempfile::tempdir().unwrap();
         let pool = file_pool(&dir.path().join("secondary_stall.db"));
         let sidecar_dir =
             crate::walpin::sidecar_dir_for(pool.canonical_path().expect("file-backed"));
-        let _env_guard = crate::walpin::EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-        std::env::set_var("KHIVE_WALPIN_SIDECAR", "1");
 
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber {

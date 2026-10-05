@@ -29,33 +29,7 @@ fn sidecar_dir_is_db_scoped_sibling() {
     assert_eq!(sidecar_dir_for(&db), dir.path().join("khive.db.walpin"));
 }
 
-#[test]
-#[serial_test::serial(khive_walpin_sidecar_env)]
-fn sidecar_enabled_defaults_to_file_backed() {
-    // Deterministic regardless of the ambient environment (minor,
-    // ADR-091 Amendment 2: the prior version was vacuously true
-    // whenever `KHIVE_WALPIN_SIDECAR` happened to be set already).
-    let _guard = EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-    std::env::remove_var("KHIVE_WALPIN_SIDECAR");
-    assert!(sidecar_enabled(true), "file-backed must default on");
-    assert!(!sidecar_enabled(false), "in-memory must default off");
-}
-
-#[test]
-#[serial_test::serial(khive_walpin_sidecar_env)]
-fn sidecar_enabled_env_override_wins_either_way() {
-    let _guard = EnvVarGuard::capture("KHIVE_WALPIN_SIDECAR");
-    std::env::set_var("KHIVE_WALPIN_SIDECAR", "off");
-    assert!(
-        !sidecar_enabled(true),
-        "explicit off must override file-backed default"
-    );
-    std::env::set_var("KHIVE_WALPIN_SIDECAR", "on");
-    assert!(
-        sidecar_enabled(false),
-        "explicit on must override in-memory default"
-    );
-}
+include!("walpin/environment_tests.rs");
 
 #[test]
 fn windows_handle_kind_requires_expected_type_without_reparse_data() {
