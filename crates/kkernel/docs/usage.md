@@ -403,6 +403,7 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 | `--no-knowledge`   | only entities/notes (skip knowledge)                                                |
 | `--no-sections`    | within the knowledge pass, embed atoms but skip section embeddings (ADR-051)        |
 | `--sections-only`  | embed only knowledge sections (skip entities/notes and atoms)                       |
+| `--id <UUID>`      | repair only one live entity or note; retain healthy indexes                         |
 | `--model <name>`   | entities/notes use this single engine instead of fanning out                        |
 | `--keep-existing`  | skip records already embedded (incremental top-up) instead of replacing them        |
 | `--batch-size <n>` | records per embedding batch (default 128, max 500)                                  |
@@ -412,6 +413,28 @@ kkernel reindex --db ~/.khive/khive.db --sections-only      # backfill only sect
 
 There is no `--embeds-only`, `--ids`, or `--dry-run` mode. `--keep-existing` narrows
 vector work to missing records, but the selected graph pass still backfills FTS.
+
+**Single-record repair.** `kkernel reindex --id <UUID>` repairs one live entity or
+note in the selected namespace. It restores a missing or stale FTS document and
+fills only missing vectors selected by the record kind's configured embedding
+policy. Healthy model vectors and other records' indexes are preserved. It does
+not scan the namespace or process the knowledge corpus. Unknown, deleted, or
+out-of-scope IDs are refused.
+
+```bash
+kkernel reindex --db ~/.khive/khive.db --namespace local --id <full-record-uuid>
+```
+
+The report identifies `id`, `substrate`, and `namespace`, lists completed stages
+in `repaired` (`fts` or `vector:<model>`), and lists remaining `failures` as
+`{stage, error}` objects. An empty repaired list with no failures means nothing
+needed repair. Successful stages stay committed if a later stage fails; retrying
+fills the remaining gaps. Partial repair exits nonzero unless `--best-effort` is
+explicitly selected. `--human` prints the same outcomes in readable form.
+
+`--id` cannot be combined with `--model`, `--batch-size`, `--knowledge-only`,
+`--no-sections`, `--sections-only`, or `--rebuild-fts`. `--keep-existing` and
+`--no-knowledge` are accepted but redundant for this mode.
 
 **Config resolution.** Engines, db path, and config file are resolved with the
 **same precedence as `kkernel mcp`** — config-file `[[engines]]` (via `--config`

@@ -1862,7 +1862,7 @@ impl KhiveRuntime {
             .map_err(|_| RuntimeError::Internal("invalid entity index outcome".into()))
     }
 
-    fn entity_vector_insert_statements(
+    pub(crate) fn entity_vector_insert_statements(
         table: &str,
         entity: &Entity,
         model_name: &str,

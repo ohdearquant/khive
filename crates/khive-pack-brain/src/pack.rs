@@ -418,13 +418,7 @@ impl BrainPack {
 struct BrainPackFactory;
 
 impl khive_runtime::PackFactory for BrainPackFactory {
-    fn name(&self) -> &'static str {
-        "brain"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(BrainPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::pack::PackRuntime> {
         Box::new(BrainPack::new(runtime))

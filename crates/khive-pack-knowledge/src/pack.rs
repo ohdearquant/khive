@@ -10,8 +10,7 @@ use uuid::Uuid;
 use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::{PackByIdResolver, PackRuntime};
 use khive_runtime::{
-    KhiveRuntime, Namespace, NamespaceToken, PackSchemaPlan, Resolved, RuntimeError, SchemaPlan,
-    VerbRegistry,
+    KhiveRuntime, Namespace, NamespaceToken, PackSchemaPlan, Resolved, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
@@ -78,13 +77,7 @@ impl KnowledgePack {
 struct KnowledgePackFactory;
 
 impl khive_runtime::PackFactory for KnowledgePackFactory {
-    fn name(&self) -> &'static str {
-        "knowledge"
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
-    }
+    khive_runtime::pack_factory_metadata!(KnowledgePack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(KnowledgePack::new_with_index_role(
@@ -105,36 +98,7 @@ inventory::submit! { khive_runtime::PackRegistration(&KnowledgePackFactory) }
 
 #[async_trait]
 impl PackRuntime for KnowledgePack {
-    fn name(&self) -> &str {
-        <KnowledgePack as Pack>::NAME
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        <KnowledgePack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        <KnowledgePack as Pack>::ENTITY_KINDS
-    }
-
-    fn brain_consumer_kinds(&self) -> &'static [&'static str] {
-        <KnowledgePack as Pack>::BRAIN_CONSUMER_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &KNOWLEDGE_HANDLERS
-    }
-
-    fn requires(&self) -> &'static [&'static str] {
-        <KnowledgePack as Pack>::REQUIRES
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "knowledge",
-            statements: &KNOWLEDGE_SCHEMA_PLAN_STMTS,
-        }
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     async fn warm(&self) {
         // Vamana warm may register a missing ANN consumer or publish a rebuilt

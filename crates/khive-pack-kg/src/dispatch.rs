@@ -10,17 +10,15 @@ use khive_runtime::{
     EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
 };
 use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
-use khive_types::{EdgeEndpointRule, EventKind, HandlerDef};
+use khive_types::EventKind;
 
-use crate::handler_defs::{handle_verbs, KG_HANDLERS};
-use crate::pack::{KgPack, KG_EDGE_RULES};
+use crate::handler_defs::handle_verbs;
+use crate::pack::KgPack;
 
 struct KgPackFactory;
 
 impl khive_runtime::PackFactory for KgPackFactory {
-    fn name(&self) -> &'static str {
-        "kg"
-    }
+    khive_runtime::pack_factory_metadata!(KgPack);
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
         Box::new(KgPack::new(runtime))
@@ -31,27 +29,7 @@ inventory::submit! { khive_runtime::PackRegistration(&KgPackFactory) }
 
 #[async_trait]
 impl PackRuntime for KgPack {
-    fn name(&self) -> &str {
-        "kg"
-    }
-
-    fn note_kinds(&self) -> &'static [&'static str] {
-        use khive_types::Pack;
-        <KgPack as Pack>::NOTE_KINDS
-    }
-
-    fn entity_kinds(&self) -> &'static [&'static str] {
-        use khive_types::Pack;
-        <KgPack as Pack>::ENTITY_KINDS
-    }
-
-    fn handlers(&self) -> &'static [HandlerDef] {
-        &KG_HANDLERS
-    }
-
-    fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
-        &KG_EDGE_RULES
-    }
+    khive_runtime::pack_runtime_metadata!();
 
     async fn warm(&self) {
         // ADR-103 Amendment 1 Part 2: mint an attribution token for daemon-startup
