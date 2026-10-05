@@ -442,6 +442,11 @@ impl PackRuntime for SchedulePack {
 }
 ```
 
+_Corrected in place on 2026-10-05 (#4011):_ this section and the Neutral note below described the schedule
+indexes as pack-auxiliary DDL. That contradicted ADR-015 and ADR-017, which keep pack schema plans
+auxiliary-only, and the example also showed an older index definition. Both indexes now belong to core
+migration V51 with the definitions the pack already used.
+
 The core index `idx_schedule_trigger` covers
 `notes(namespace, kind, json_extract(properties, '$.trigger_at'))` with the partial
 condition `deleted_at IS NULL`, allowing parameterized kind predicates to use it.
