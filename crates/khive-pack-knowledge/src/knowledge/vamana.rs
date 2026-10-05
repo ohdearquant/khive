@@ -20,7 +20,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use khive_retrieval::ann::registry::{self as ann_registry, CompactionScope, WatermarkAuthority};
+use khive_retrieval::ann::corpus::CorpusScope;
+use khive_retrieval::ann::registry::{self as ann_registry, WatermarkAuthority};
 use khive_runtime::config::ann_rebuild_threshold_from_env as ann_rebuild_threshold;
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -1332,6 +1333,15 @@ async fn raise_watermark(
     Ok(())
 }
 
+fn knowledge_corpus(ns: &str) -> CorpusScope<'_> {
+    CorpusScope {
+        namespace: Some(ns),
+        record_kind: None,
+        field: "knowledge.atom",
+        live_join: None,
+    }
+}
+
 /// Compact the write log through the pair-wide registry minimum ONLY (ADR-079
 /// Amendment 1 §A step 3, universal wildcard-inclusive form). Wildcard rows
 /// (`namespace = '*'`) are global-scope consumers whose corpus spans every
@@ -1345,7 +1355,7 @@ async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), Str
         writer
             .execute(ann_registry::pathless_compact_log(
                 "knowledge_",
-                CompactionScope::Namespace(ns.to_owned()),
+                knowledge_corpus(ns).compaction_scope(),
                 model,
             ))
             .await
@@ -1353,14 +1363,10 @@ async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), Str
             .map_err(|error| error.to_string())?;
         return Ok(());
     }
-    ann_registry::compact_write_log(
-        sql.as_ref(),
-        CompactionScope::Namespace(ns.to_owned()),
-        model,
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+    ann_registry::compact_write_log(sql.as_ref(), knowledge_corpus(ns).compaction_scope(), model)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Whether any tail row exists above `s` for this consumer's scope. A pure
@@ -1371,18 +1377,7 @@ async fn tail_exists(rt: &KhiveRuntime, ns: &str, model: &str, s: u64) -> Result
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT EXISTS(SELECT 1 FROM ann_write_log \
-                  WHERE namespace = ?1 AND embedding_model = ?2 \
-                    AND field = 'knowledge.atom' AND seq > ?3) AS has_tail"
-                .into(),
-            params: vec![
-                SqlValue::Text(ns.to_owned()),
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Integer(s as i64),
-            ],
-            label: Some("ann_tail_probe".into()),
-        })
+        .query_all(knowledge_corpus(ns).tail_exists(model, s, "ann_tail_probe"))
         .await
         .map_err(|e| e.to_string())?;
     match rows.first().and_then(|r| r.get("has_tail")) {
@@ -1404,23 +1399,7 @@ async fn scope_counts(
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "SELECT \
-                   (SELECT COUNT(*) FROM {table_name} \
-                     WHERE namespace = ?1 AND embedding_model = ?2 \
-                       AND field = 'knowledge.atom') AS live, \
-                   (SELECT COUNT(*) FROM ann_write_log \
-                     WHERE namespace = ?1 AND embedding_model = ?2 \
-                       AND field = 'knowledge.atom' AND seq > ?3) AS tail"
-            ),
-            params: vec![
-                SqlValue::Text(ns.to_owned()),
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Integer(s as i64),
-            ],
-            label: Some("ann_scope_counts".into()),
-        })
+        .query_all(knowledge_corpus(ns).scope_counts(&table_name, model, s, "ann_scope_counts"))
         .await
         .map_err(|e| e.to_string())?;
     let row = rows
@@ -1468,37 +1447,13 @@ async fn classification_scope_counts(
     let sql = rt.sql();
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
-        .query_all(SqlStatement {
-            sql: format!(
-                "WITH tail AS MATERIALIZED (\
-                   SELECT COUNT(*) AS tail_rows FROM ann_write_log \
-                   WHERE namespace = ?1 AND embedding_model = ?2 \
-                     AND field = 'knowledge.atom' AND seq > ?3\
-                 ), cap AS MATERIALIZED (\
-                   SELECT CASE \
-                     WHEN tail_rows = 1 THEN 1 \
-                     WHEN tail_rows = 0 OR ?4 IS NULL \
-                       OR tail_rows > 9223372036854775807 / ?4 THEN -1 \
-                     ELSE tail_rows * ?4 END AS max_rows FROM tail\
-                 ), live AS (\
-                   SELECT COUNT(*) AS live_rows FROM (\
-                     SELECT 1 FROM {table_name} \
-                     WHERE namespace = ?1 AND embedding_model = ?2 \
-                       AND field = 'knowledge.atom' \
-                     LIMIT (SELECT max_rows FROM cap)\
-                   )\
-                 ) \
-                 SELECT live.live_rows AS live, tail.tail_rows AS tail, \
-                        cap.max_rows AS cap FROM live CROSS JOIN tail CROSS JOIN cap"
-            ),
-            params: vec![
-                SqlValue::Text(ns.to_owned()),
-                SqlValue::Text(model.to_owned()),
-                SqlValue::Integer(s as i64),
-                multiplier,
-            ],
-            label: Some("ann_classification_scope_counts".into()),
-        })
+        .query_all(knowledge_corpus(ns).classification_scope_counts(
+            &table_name,
+            model,
+            s,
+            multiplier,
+            "ann_classification_scope_counts",
+        ))
         .await
         .map_err(|e| e.to_string())?;
     let row = rows
@@ -3525,3 +3480,7 @@ mod owned_build_tests;
 #[cfg(test)]
 #[path = "vamana_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "vamana_corpus_statement_tests.rs"]
+mod corpus_statement_tests;

@@ -4,11 +4,11 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, Pack};
 
 use crate::handlers;
-use crate::vocab::{SCHEDULE_HANDLERS, SCHEDULE_SCHEMA_PLAN_STMTS};
+use crate::vocab::SCHEDULE_HANDLERS;
 
 /// Schedule pack — stores time-triggered reminders and verb dispatches.
 ///
@@ -76,13 +76,6 @@ impl PackRuntime for SchedulePack {
 
     fn requires(&self) -> &'static [&'static str] {
         <SchedulePack as Pack>::REQUIRES
-    }
-
-    fn schema_plan(&self) -> SchemaPlan {
-        SchemaPlan {
-            pack: "schedule",
-            statements: &SCHEDULE_SCHEMA_PLAN_STMTS,
-        }
     }
 
     async fn dispatch(
