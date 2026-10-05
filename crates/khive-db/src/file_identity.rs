@@ -33,6 +33,18 @@ pub fn database_file_identity(path: &Path) -> io::Result<DatabaseFileIdentity> {
     })
 }
 
+/// Identity of a file held open by an external owner, without resolving its path.
+#[cfg(unix)]
+pub fn database_file_identity_from_file(file: &std::fs::File) -> io::Result<DatabaseFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = file.metadata()?;
+    Ok(DatabaseFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
 #[cfg(windows)]
 pub fn database_file_identity(path: &Path) -> io::Result<DatabaseFileIdentity> {
     use std::os::windows::fs::OpenOptionsExt as _;

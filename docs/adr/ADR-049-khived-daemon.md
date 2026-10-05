@@ -1531,3 +1531,159 @@ auto/table formats preserve the full `bridge_instance_id`. A replaced bridge exe
 does not mask this memory-only read. A real in-place re-exec leaves PID continuity possible
 but changes `bridge_instance_id` and restarts all counts. A daemon-side frame counter or log
 proves that the diagnostics operation, including help and formatted reads, was never forwarded.
+
+## Amendment 13 (2026-09-27): daemon ownership follows claimed stores
+
+**Status**: Accepted.
+
+### Context
+
+ADR-049's accepted daemon singleton is scoped to one socket/PID rendezvous. Its
+HOME-derived socket path and the matching boot/recovery lock do not identify a
+SQLite store (§4 Socket protocol and Amendment 3 of this document).
+Two serving processes with different HOME values can therefore open the same
+absolute `[[backends]].path`. ADR-028 already deduplicates configured SQLite
+backends by canonical pathname (`docs/adr/ADR-028-pack-scoped-backends.md`,
+§Why deduplication by canonical path); that pathname is the ownership key for this amendment.
+
+### Decision
+
+An OSS serving daemon claims every distinct file-backed SQLite pathname in its
+effective topology before opening SQLite or running migrations. The claim is
+independent of HOME, socket, PID file, and recovery lock. A declared backend
+topology supplies its effective SQLite paths; an implicit single backend
+supplies the resolved database path. An in-memory target supplies none. Sort
+and deduplicate canonical paths before claiming. If a claim's derived lock
+sidecar pathname is itself a configured database pathname, refuse the whole
+boot before opening any sidecar for writing; after opening each sidecar but
+before locking or truncating it, refuse when the opened descriptor's
+`(device, inode)` matches any configured database identity observed at claim
+time or its hard-link count exceeds one (a configured database missing at
+claim time remains covered by the pathname preflight). A database whose own file
+name has the sidecar form (`.<name>.khived.lock`) refuses the boot at the same
+preflight. An existing sidecar longer than the 64-byte pid record, or starting
+with the SQLite header, is refused before truncation and left untouched. If one claim is unavailable
+or contended, abort the entire boot and release earlier claims. Hold all
+claims through serving and shutdown. Never unlink a lock sidecar. A contender
+refuses even when the holder PID is temporarily unavailable; PID text is only
+best-effort diagnostic evidence. Ordinary non-daemon stdio/local writers
+retain their existing coordination and are outside this daemon singleton
+guarantee. With the HOME boot lock held, an identified daemon already serving
+the same socket retains ADR-049's socket-owner refusal before store claims are
+attempted. This bounded, read-only protocol probe neither opens SQLite nor
+changes the rendezvous. An absent or unidentified socket proceeds to the store
+claims; those claims still precede every SQLite open and migration. The normal
+socket/PID boot fence remains authoritative after construction.
+
+Each claim uses a persistent `.DATABASE.khived.lock` sibling of the canonical
+database pathname. After the sidecar lock is held, freeze that canonical path
+as the _only_ path passed to SQLite. Re-resolve the configured spelling once
+for validation before opening; if a symlink now targets another path, refuse
+and name both the claimed and current paths. Validation must not replace the
+frozen open target.
+
+For a regular file present at claim, record `(device, inode)`. For a
+missing writable target, keep a Missing claim state, create/open the frozen
+path under the held lock, and bind its newly observed `(device, inode)`.
+Missing read-only targets refuse without creation, and a read-only claim never
+creates a missing parent directory. A created writable database takes SQLite's
+default mode (0644 before the umask). Re-stat each canonical path
+immediately after its SQLite backend opens and before schema preparation, then
+again before serving; observed identity drift fails boot. Pass the bound file
+identity into both implicit and declared-backend pool construction. On verified
+64-bit Linux and macOS, the binary installs an immutable forwarding observer for
+the bundled Unix VFS `fstat` syscall at process startup, before any SQLite file
+I/O. A claimed writer open must observe the actual descriptor identity and match
+every successful observation to the held claim before any SQL, identity-row
+initialization, or WAL setup. No observations or any mismatch refuse boot,
+including when the original pathname is restored after a foreign file opens.
+The daemon's claim step, not SQLite, creates a missing writable database: after the sidecar
+claim it opens the file with create relative to the claimed parent directory and binds that
+descriptor's identity, and claimed SQLite opens then disable `SQLITE_OPEN_CREATE`, so SQLite
+opens only a file the claim created or found.
+Library hosts must call the unsafe startup initializer under its documented
+precondition; claimed opens never install it lazily. Other Unix ABIs and
+unverified VFS implementations refuse claimed opens. The forwarding callback
+neither closes nor denies SQLite's descriptors, preserving native POSIX lock
+handling. The final path checks remain additional startup guards.
+
+This check precedes pool SQL and WAL changes, not all native open-time I/O.
+SQLite's macOS msdos/exfat path can write to an empty file during native open;
+trusted nonmutating autoextensions must remain in place. The observer does not
+promise protection from that filesystem-specific raw write, mutating
+third-party autoextensions, or later replacement of the VFS syscall table.
+
+The guarantee is **per stable canonical pathname among participating daemon
+boots**, not per physical inode across distinct hardlink names. Symlink
+spellings that resolve to one stable pathname converge. A hardlink's distinct
+pathname gets a distinct sidecar, so another daemon can claim it even while
+the first daemon serves the same inode; hardlink aliases are unsupported. The repository test
+`store_guard_hardlink_names_remain_independent_unsupported_aliases` in
+`crates/khive-runtime/src/daemon.rs` demonstrates the separate claims. This
+is a property of the sidecar scheme, not a claim about SQLite's support for
+multi-link database files. A sidecar hardlinked to any file is refused before
+lock or truncation. Replacing a database at the same canonical pathname does not erase its
+persistent sidecar claim.
+
+For operators, the sidecar belongs to the store's directory, not to its data. Copying a store
+copies the database by SQLite's own rules and never the sidecar; the destination's first daemon
+creates its own. A copy that hard-links the sidecar (`cp -l`, a hard-link backup) is refused at
+boot by the link-count check. Restoring or replacing a store at the same path is done with every
+daemon on that store stopped, and leaves the sidecar in place; the next boot binds the new file.
+Never delete a sidecar while a daemon may be serving the store, because a second boot would then
+lock a new sidecar while the first still holds the old one. With every daemon stopped, deleting it
+is harmless: the next boot recreates it.
+
+### Acceptance and controls
+
+1. Distinct HOME rendezvous with one absolute SQLite store: the second daemon
+   refuses before constructing SQLite and names the contended store.
+2. Multiple declared backends with one shared secondary canonical path: the
+   second daemon refuses the full topology and drops any earlier claims.
+3. A configured symlink retargeted after claim is refused before open, with
+   both paths named; mutation of alias revalidation turns its named test red.
+4. A canonical file replaced after claim/binding is refused on the post-open
+   `(device, inode)` check; a no-op post-open assertion turns its named test red.
+5. A fresh writable database is created and identity-bound only after its
+   sidecar claim; a missing read-only target is not created. A serving daemon
+   retains every claim until shutdown.
+6. A second claim through a distinct hardlink name succeeds in the fixture,
+   documenting the excluded alias rather than accidentally promising safety.
+7. A claim set whose derived lock sidecar is another configured database
+   refuses the whole boot before any sidecar is opened for writing; an opened
+   sidecar whose descriptor identity matches a configured database or whose
+   hard-link count exceeds one refuses before lock or truncation.
+   `store_guard_refuses_a_database_at_another_stores_lock_sidecar` goes red if
+   the pathname preflight is dropped;
+   `store_guard_names_a_configured_database_matching_the_opened_sidecar` and
+   `store_guard_refuses_hardlinked_sidecar_before_lock_or_truncate` cover the
+   descriptor-identity and hard-link arms, respectively.
+8. A database named like a sidecar, or an existing sidecar holding a SQLite
+   header or more than 64 bytes, refuses before truncation, while a short
+   pid-only sidecar is reused. A read-only claim whose parent directory is
+   missing creates nothing.
+   `store_guard_refuses_to_truncate_a_sidecar_path_that_holds_other_data`,
+   `store_guard_reuses_a_short_pid_only_sidecar_after_a_restart`,
+   `store_guard_refuses_a_database_named_like_a_lock_sidecar` and
+   `store_guard_read_only_claim_refuses_a_missing_parent_without_creating_anything`
+   cover them.
+9. The descriptor observer. A writer, a standalone reader and a later pooled reader whose open
+   observes a foreign file refuse before any SQL
+   (`standalone_writer_refuses_foreign_descriptor_before_sql`,
+   `standalone_reader_refuses_foreign_descriptor_before_sql`,
+   `later_pooled_reader_refuses_foreign_descriptor_before_sql`); opening without the held identity
+   turns each red. A daemon claim refuses a foreign pool before identity-row or WAL setup
+   (`daemon_claim_blocks_foreign_pool_before_identity_or_wal_initialization`); dropping the claims
+   from the claimed backend open turns it red. An open with no successful observation refuses
+   (`observation_without_native_descriptor_evidence_refuses`); accepting a zero observation count
+   turns it red. A mismatch refuses even after the original pathname is restored
+   (`descriptor_claim_refuses_foreign_open_even_after_pathname_is_restored`); skipping the mismatch
+   record in the observer turns it red. An observer that did not install, which is how an
+   unverified ABI or VFS presents, refuses every claimed open
+   (`claimed_pool_without_process_startup_observer_refuses`); removing the initialization check
+   turns it red. No test forces the individual VFS, library-version or replaced-`fstat` detections
+   on a supported host, and on other targets only the refusing installer is compiled.
+
+The HOME boot/recovery lock still serializes startup and client recovery for
+one rendezvous. This amendment adds a separate store claim; it does not
+replace that lock or extend daemon ownership to non-daemon writers.

@@ -56,6 +56,60 @@ for the daemon's own boot sequence where waiting until quiescence IS the desired
 caller only trying to _detect_ whether a lock is currently free — without committing to wait
 forever for a possibly-wedged holder — needs a deadline instead.
 
+## Store-bound daemon ownership
+
+The HOME-bound socket, PID file, and boot/recovery lock coordinate one client
+rendezvous. They do not identify a SQLite store: two clients with different
+`HOME` values may discover the same absolute `[[backends]]` paths. Both
+`kkernel mcp --daemon` boot paths therefore claim a separate exclusive
+`.DATABASE.khived.lock` sidecar beside
+each canonical file-backed database path before runtime construction opens
+stores or runs migrations. Under the HOME boot lock, a bounded protocol
+probe first refuses an identified daemon already serving the same socket.
+The claims are sorted and deduplicated across the configured topology, held
+until serving and shutdown finish, and never unlinked. A store contender
+refuses immediately; it names the holder PID when that PID has been written,
+or reports an unknown holder during the narrow
+post-lock/pre-PID window. In-memory backends take no store lock. The guard is
+daemon-only; ordinary local/stdio writers keep their existing coordination.
+
+Each daemon freezes the canonical pathname used for its actual SQLite open.
+It revalidates a configured symlink spelling after claiming and refuses a
+retarget, naming both the claimed and current paths; it never opens the
+re-resolved spelling. For an existing database, the guard records `(dev, ino)`
+at claim and checks it while binding an open file under the lock. For a new
+writable database, it claims the sidecar first, creates the canonical file
+under that lock, then binds its new identity. A missing read-only database, or
+a missing parent directory of one, refuses without creating anything. The daemon re-stats every canonical pathname
+after SQLite construction and refuses startup on an observed identity change.
+Each daemon backend passes the bound descriptor's identity into pool construction.
+The pool compares that identity with the path before SQLite open. On verified
+64-bit Linux and macOS, a forwarding observer records the bundled Unix VFS's
+actual descriptor `fstat` identities during the synchronous writer open. Every
+observation must match the held claim, and at least one must exist, before the
+pool executes any SQL or enables WAL. Restoring the original pathname does not
+hide a different opened descriptor. Claimed opens also disable file creation.
+The `kkernel` binary installs this observer before CLI or Tokio startup; library
+hosts must call `khive_db::pool::initialize_claimed_file_observer` before any
+SQLite file I/O, following its unsafe API contract. Uninitialized or unsupported
+VFS/ABI paths fail closed for claimed construction. Ordinary unclaimed pools
+retain their existing API.
+
+The callback preserves native descriptor ownership and POSIX lock handling.
+Its check does not precede all native open-time I/O: SQLite can write to an empty
+file on macOS msdos/exfat during open, and the startup contract requires trusted
+nonmutating autoextensions and an unchanged syscall table. Post-open path checks
+remain ahead of schema preparation and serving.
+
+Distinct hardlink names for the same SQLite inode have different sidecars:
+a second daemon can claim the other name. Hardlink aliases are unsupported.
+A database replaced at the same canonical pathname still uses the same
+persistent sidecar. An existing sidecar that is not a short pid record (longer
+than 64 bytes, or a SQLite database) is refused rather than truncated, and a
+database may not be named like a sidecar (`.<name>.khived.lock`). The database directory must permit sidecar creation,
+including when the database itself is opened read-only, or daemon boot fails
+closed.
+
 ## build_metrics_snapshot
 
 `tx_registry` (ADR-091 Plank 0) is a process-global singleton reachable directly, with no plumbing
@@ -93,7 +147,6 @@ unless a writer task exists. The `write_last_*_micros` fields expose that task's
 queue-wait, transaction-acquisition, body, commit, and total stages, plus the observation time.
 All new fields are additive `serde(default)` metrics-only fields; older peers can omit them without
 changing request dispatch or the canonical verb result.
-
 
 ## Demand lifetime and voluntary retirement
 

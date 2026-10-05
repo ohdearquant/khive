@@ -20,6 +20,9 @@ use crate::stores::{agents, attachment, blob, entity, event, graph, note, sparse
 mod code_map;
 mod pack_schema;
 
+#[cfg(any(unix, windows))]
+mod claimed_file_identity;
+
 fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool, SqliteError> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",

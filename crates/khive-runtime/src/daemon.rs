@@ -10,6 +10,16 @@
 
 use std::sync::Arc;
 
+mod store_guard;
+mod store_identity;
+#[cfg(unix)]
+use store_guard::ensure_claimed_parent_identity;
+#[cfg(unix)]
+pub use store_guard::{acquire_daemon_store_guards, bind_daemon_store_files, claim_stores};
+pub use store_guard::{assert_daemon_store_identities, DaemonStoreGuard};
+#[cfg(unix)]
+pub use store_identity::claimed_daemon_store_identity;
+
 #[cfg(unix)]
 use std::io::Write as _;
 #[cfg(unix)]
@@ -7277,6 +7287,8 @@ mod tests {
             "both daemon lock producers must leave the child HOME empty"
         );
     }
+
+    include!("daemon/store_guard_tests.rs");
 
     // ── the recovery lock actually serializes two boot sequences ─────────────
     //

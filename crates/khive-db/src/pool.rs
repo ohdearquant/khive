@@ -32,6 +32,18 @@ use khive_storage::error::StorageError;
 use khive_storage::tx_registry::{DbIdentity, TxOrigin};
 use khive_storage::StorageCapability;
 
+mod claimed_file_identity;
+
+#[cfg(unix)]
+mod claimed_file_observer;
+
+#[cfg(unix)]
+pub use claimed_file_observer::initialize as initialize_claimed_file_observer;
+
+#[cfg(all(test, unix))]
+#[path = "pool/claimed_file_identity_tests.rs"]
+mod claimed_file_identity_tests;
+
 const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
 const DEFAULT_READER_CAP: usize = 8;
@@ -519,6 +531,10 @@ pub struct PoolConfig {
     pub path: Option<PathBuf>,
     /// Registered native code-map VFS name; set only by the code-map constructor.
     pub code_map_vfs: Option<String>,
+    /// File identity pinned by the caller before this pool opens SQLite.
+    /// A mismatch is refused before identity initialization or WAL setup.
+    #[cfg(any(unix, windows))]
+    pub expected_file_identity: Option<DatabaseFileIdentity>,
     /// Number of reader connections (default: min(num_cpus, 8)).
     pub max_readers: usize,
     /// WAL mode (must be true for pooling to work; default: true).
@@ -627,6 +643,8 @@ impl Default for PoolConfig {
         Self {
             path: None,
             code_map_vfs: None,
+            #[cfg(any(unix, windows))]
+            expected_file_identity: None,
             max_readers: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
@@ -1766,6 +1784,8 @@ impl ConnectionPool {
             .map(database_file_identity_if_exists)
             .transpose()?
             .flatten();
+        #[cfg(any(unix, windows))]
+        claimed_file_identity::verify_before_open(&config, identity_before_open)?;
         let mut writer = open_writer_connection(
             &config,
             read_only_open_target.as_deref(),
@@ -2911,11 +2931,13 @@ impl ConnectionPool {
         #[cfg(test)]
         run_identity_open_hook(path, IdentityOpenStage::BeforeStandaloneOpen, None);
 
-        let conn = self.config.open_file_connection(
+        let conn = claimed_file_identity::open_connection(
+            &self.config,
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
+            self.identity_path.as_deref(),
         )?;
         #[cfg(test)]
         run_identity_open_hook(path, IdentityOpenStage::AfterStandaloneOpen, Some(&conn));
@@ -3087,11 +3109,13 @@ impl ConnectionPool {
             self.verify_opened_file_identity(identity_path)?;
         }
 
-        let conn = self.config.open_file_connection(
+        let conn = claimed_file_identity::open_connection(
+            &self.config,
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_URI,
+            self.identity_path.as_deref(),
         )?;
         #[cfg(any(unix, windows))]
         if let Some(identity_path) = self.identity_path.as_deref() {
@@ -3407,30 +3431,7 @@ fn open_writer_connection(
     read_only_open_target: Option<&Path>,
     identity_path: Option<&Path>,
 ) -> Result<Connection, SqliteError> {
-    match config.path.as_ref() {
-        Some(_) => {
-            let flags = if config.read_only {
-                writer_read_only_open_flags()
-            } else {
-                writer_open_flags()
-            };
-            let target = if config.read_only {
-                read_only_open_target.ok_or_else(|| {
-                    SqliteError::InvalidData(
-                        "file-backed read-only pool has no canonical open target".to_string(),
-                    )
-                })?
-            } else {
-                identity_path.ok_or_else(|| {
-                    SqliteError::InvalidData(
-                        "file-backed writable pool has no canonical open target".to_string(),
-                    )
-                })?
-            };
-            config.open_file_connection(target, flags)
-        }
-        None => Connection::open_in_memory().map_err(Into::into),
-    }
+    claimed_file_identity::open_writer(config, read_only_open_target, identity_path)
 }
 
 /// Validate the one-frame reset floor using this backend connection's own
@@ -3625,7 +3626,12 @@ fn push_sqlite_uri_path(uri: &mut String, bytes: &[u8]) {
 }
 
 fn open_reader_connection(path: &Path, config: &PoolConfig) -> Result<Connection, SqliteError> {
-    let conn = config.open_file_connection(path, reader_open_flags())?;
+    let conn = claimed_file_identity::open_connection(
+        config,
+        path,
+        reader_open_flags(),
+        config.path.as_deref(),
+    )?;
     configure_reader_connection(&conn, config)?;
     Ok(conn)
 }

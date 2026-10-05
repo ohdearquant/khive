@@ -39,19 +39,20 @@ ADR-172 later finds the column in place rather than a fork of it.
 ### D1. `memory.remember` accepts `key`
 
 `memory.remember(content, key=K, ...)` creates the memory note or, when a live note of kind `memory`
-in the write namespace already holds `K`, writes nothing and fails with `KhiveError::conflict`,
-`details: {"reason": "key_conflict", "key": K, "existing_id": <uuid>}`. `K` is a caller-chosen
-string, at most 512 bytes, without U+0000; a longer or ill-formed key is refused as invalid input and
+in the write namespace already holds `K` with the same content, returns its id with `replayed: true`
+without another write. A holder with different content fails with `KhiveError::conflict`,
+`details: {"reason": "idempotency_key_conflict", "key": K, "existing_id": <uuid>}`. `K` is a
+caller-chosen string, at most 512 bytes, without U+0000; a longer or ill-formed key is refused as invalid input and
 nothing is written. The write namespace is the one the handler already resolves: an explicit
 `namespace=`, else the actor namespace for episodic memories, else `local` for semantic ones. The
 same `K` may be held by one live memory in each namespace.
 
-The unique index is what refuses, so two writers racing on one key get exactly one success and one
-`key_conflict` naming the same `existing_id`. A replay of the identical request after a lost
-acknowledgement is therefore the reconciliation: its answer is either the new id or the existing one,
-and either way the caller holds the id of the one memory it intended.
+The unique index is what selects one creator, so two writers racing on one key get one retained row.
+With matching content the loser returns that row's id as a replay; with different content it returns
+`idempotency_key_conflict` naming the holder. Repeating an identical request after a lost
+acknowledgement therefore returns the id of the one memory the caller intended.
 
-A `key_conflict` is a refusal raised before any domain write; on the wire it carries
+An `idempotency_key_conflict` is a refusal raised before any domain write; on the wire it carries
 `domain_disposition: "not_committed"` (ADR-133 Amendment 3, A3.1).
 
 ### D2. Storage: ADR-172 §3's column and index, verbatim
@@ -88,22 +89,24 @@ hiding it.
 
 ### D4. `key` composes with `source_id`, and constrains nothing else
 
-The `annotates` edge to `source_id` is created only on the successful create; a `key_conflict`
-creates no edge and no note. Two memories with different keys may annotate the same source; the
-key constrains the memory, never the source. A request without `key` behaves exactly as today.
+The `annotates` edge to `source_id` is created only on the successful create; an
+`idempotency_key_conflict` creates no edge and no note. Two memories with different keys may
+annotate the same source; the key constrains the memory, never the source. A request without `key`
+behaves exactly as today.
 
 ### D5. What the replay answer may be used for
 
-The caller may treat `key_conflict.existing_id` as the id of its own earlier write, because the key
-is the caller's and the namespace is the caller's. It may not treat the absence of a conflict as
-proof that no other memory annotates the same source; that is D4's point. An `unknown` disposition
+The caller may treat `idempotency_key_conflict.existing_id` as the id of its own earlier write,
+because the key and namespace are the caller's. It may not treat the absence of a conflict as proof
+that no other memory annotates the same source; that is D4's point. An `unknown` disposition
 on the replay itself (ADR-133 Amendment 3) is resolved by replaying again; the key makes that safe.
 
-On a `key_conflict` the reconciliation terminates at `existing_id`. Its
-`domain_disposition: "not_committed"` describes this attempt only, never the keyed subject, whose
+On a content-mismatched `idempotency_key_conflict` the reconciliation terminates at `existing_id`.
+Its `domain_disposition: "not_committed"` describes this attempt only, never the keyed subject, whose
 earlier write did commit; a consumer that applied ADR-133 A3.2 mechanically would resend forever.
-The rule is therefore: a keyed request that returned `key_conflict` is never resent; the caller
-reads `existing_id` and is done.
+The rule is therefore: a keyed request that returned `idempotency_key_conflict` is never resent;
+the caller reads `existing_id` and is done. The changed content is not written; a caller that wants it
+stored uses a new key.
 
 ### D6. A key is an identity only within a pinned namespace
 
@@ -128,15 +131,16 @@ outcome so no one mistakes it for a defect of the index.
 ## Acceptance
 
 1. **Lost acknowledgement.** `memory.remember(content, key=K, source_id=S)` commits; the identical
-   request is sent again. The second call fails with `key_conflict` naming the first id; exactly one
+   request is sent again. The second call returns the first id with `replayed: true`; exactly one
    note and exactly one `annotates` edge exist. Control: the same pair without `key` produces two notes.
-2. **Concurrent recovery.** Two processes send the same keyed request at once against two daemons
-   over one store; exactly one succeeds, the other gets `key_conflict` with the same id; one row
-   exists. The partial unique index is the mechanism and the claim; the daemon count is not.
+2. **Concurrent recovery.** Two writer processes race on the same key over one store, with at most
+   one of them a daemon. Exactly one creates; the other returns the same id as a replay
+   (`replayed: true`) when content matches, or `idempotency_key_conflict` when content differs.
+   One row exists. The live partial unique index is the mechanism and the claim.
 3. **Decoy annotation.** A different memory with a different key annotating the same `S` coexists with
    the keyed one; the keyed replay still names its own id, not the decoy's.
 4. **Unchanged without a key.** The existing `memory.remember` tests pass unmodified; a request
-   without `key` never produces `key_conflict`.
+   without `key` never produces `idempotency_key_conflict`.
 5. **Release on delete.** After `memory.prune` soft-deletes the keyed memory, the same key creates a
    new memory; after a hard delete, likewise.
 6. **Key validation.** A 513-byte key and a key containing U+0000 are refused as invalid input with
@@ -144,14 +148,15 @@ outcome so no one mistakes it for a defect of the index.
 7. **Namespace scope.** Two actors writing episodic memories with the same key hold two rows; one
    actor writing the same key twice holds one.
 8. **Disposition interplay.** Under a forced obligation failure the first keyed write returns
-   `domain_disposition: "committed"` with the id; a replay returns `key_conflict` with that id and
-   `domain_disposition: "not_committed"`, and the reconciliation ends there: the reference client
-   surfaces `existing_id` and issues no third call.
+   `domain_disposition: "committed"` with the id; an equal-content replay returns that id with
+   `replayed: true` and issues no third call. A changed-content attempt returns
+   `idempotency_key_conflict` with `domain_disposition: "not_committed"` for that attempt.
 9. **Three surfaces.** The MCP `request` tool, `kkernel exec` and the Python client return the same
-   `key_conflict` object for the same replay; `Session.remember(key=)` passes the field through.
+   replay result for equal content and the same `idempotency_key_conflict` for changed content;
+   `Session.remember(key=)` passes the field through.
 10. **Namespace pin.** The same keyed request replayed from a process that resolves a different
     actor namespace, without an explicit `namespace`, produces two rows; replayed with the original's
-    explicit `namespace` it returns `key_conflict`. Both outcomes are asserted.
+    explicit `namespace` it returns the holder id with `replayed: true`. Both outcomes are asserted.
 11. **Prune race.** A replay concurrent with `memory.prune` of the same key ends in one of two
     states, one row when the replay won or two rows when the prune committed first, and never a
     third; the test runs the race repeatedly and asserts the row count is 1 or 2 on every run.
@@ -228,3 +233,22 @@ repair; ordinary read/delivery changes must allow replay. Deleting the outbound 
 the stated release limit. Removing the final physical key claim must make the duplicate-population
 test fail; restore it and rerun. The amendment requires independent review and acceptance before
 dependent implementation merges.
+
+## Amendment 2 (2026-09-27): keyed-memory replay and daemon store ownership
+
+**Status**: Accepted.
+
+#2694 changed the implemented equal-content keyed-memory outcome to a mutation-free replay, but
+the original D1 and acceptance text above still described a conflict. This amendment records the
+implemented outcome in those clauses: one creator, equal content returning the same id with
+`replayed: true`, different content returning `idempotency_key_conflict`, and one retained row.
+The replay response is built from the stored memory; a changed `memory_type` or `source_id` in a
+same-content retry does not rewrite the holder or its annotation. The live partial unique index
+remains the cross-process identity authority. Amendment 1's keyed message refusal keeps the comm
+pack's own reason string, `key_conflict`; this amendment does not change it.
+
+#3069 adds a serving-daemon claim for each SQLite store, so the concurrent recovery fixture now
+races one daemon-served writer with one explicit local writer rather than starting two daemons on
+the same store. Its acceptance checks both equal-content replay and different-content refusal,
+and a control dropping `idx_notes_namespace_kind_key` must turn the proof red. The writer-process
+and unique-index claims survive; the old two-daemon fixture shape does not.
