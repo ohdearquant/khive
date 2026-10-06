@@ -8,11 +8,14 @@ fn list_items(response: &serde_json::Value) -> &[serde_json::Value] {
 }
 
 // F009 (CRIT): error text must be derived from EdgeRelation::ALL, not a hardcoded list.
-// Error text must include derived_from and precedes (all 15 relations must appear).
+// Error text must include derived_from and precedes (all 20 relations must appear).
 #[test]
 fn parse_relation_error_lists_all_relations() {
     let err = parse_relation("not_a_relation").unwrap_err();
     let msg = format!("{err}");
+    for relation in khive_types::EdgeRelation::ALL {
+        assert!(msg.contains(relation.as_str()), "missing {relation}: {msg}");
+    }
     assert!(
         msg.contains("derived_from"),
         "F009: parse_relation error must list derived_from; got: {msg}"
