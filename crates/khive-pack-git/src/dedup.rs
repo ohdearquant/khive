@@ -194,6 +194,14 @@ impl DedupReport {
                 group.kind, group.number, group.reason
             ));
         }
+        for merge in &self.applied {
+            if let Some(error) = &merge.summary.post_commit_reindex_error {
+                lines.push(format!(
+                    "note {}: merge committed; post-commit reindex failed: {}",
+                    merge.into_id, error
+                ));
+            }
+        }
         lines
     }
 }
@@ -648,7 +656,12 @@ pub async fn apply_dedup(
             }
         }
     }
-    plan.report.success = plan.report.refused_merges.is_empty();
+    plan.report.success = plan.report.refused_merges.is_empty()
+        && plan
+            .report
+            .applied
+            .iter()
+            .all(|merge| merge.summary.post_commit_reindex_error.is_none());
     Ok(plan.report)
 }
 
