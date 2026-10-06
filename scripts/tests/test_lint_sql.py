@@ -1,10 +1,15 @@
 """SQL fragment dependencies and isolation in the repository lint."""
+import ast
+import os
 import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -32,13 +37,13 @@ class SqlLintTests(unittest.TestCase):
         (self.root / "crates").mkdir()
         shutil.copy2(ROOT / "scripts/lint-sql.sh", self.root / "scripts/lint-sql.sh")
 
-    def run_lint(self):
+    def run_lint(self, env=None):
         if ((self.root / "crates/khive-db/sql").exists()
                 and not (self.root / "crates/khive-db/src/migrations.rs").exists()):
             self.write_registry(["schema.sql"])
         return subprocess.run(
             ["sh", str(self.root / "scripts/lint-sql.sh")],
-            text=True, capture_output=True, timeout=20, check=False,
+            text=True, capture_output=True, timeout=20, check=False, env=env,
         )
 
     def write_registry(self, names):
@@ -62,6 +67,78 @@ class SqlLintTests(unittest.TestCase):
         (core / "schema.sql").write_text(schema)
         self.write_registry(["schema.sql"])
         return core
+
+    def run_with_dqs_enabled(self, option):
+        """Flip just one guard in the copied entrypoint, independent of build defaults."""
+        script = self.root / "scripts/lint-sql.sh"
+        original = script.read_text()
+        disabled = f"con.setconfig(sqlite3.{option}, False)"
+        enabled = f"con.setconfig(sqlite3.{option}, True)"
+        self.assertEqual(original.count(disabled), 1)
+        script.write_text(original.replace(disabled, enabled))
+        try:
+            return self.run_lint()
+        finally:
+            script.write_text(original)
+
+    def test_double_quoted_query_names_must_resolve(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        query = core / "message-select.sql"
+        query.write_text('SELECT "message" FROM deliveries WHERE "message" = ?1;\n')
+        positive = self.run_lint()
+        self.assertEqual(positive.returncode, 0, positive.stdout + positive.stderr)
+        self.assertIn("2 file(s) OK (1 prepared, 1 executed)", positive.stdout)
+
+        query.write_text('SELECT "message" FROM deliveries WHERE "message_typo" = ?1;\n')
+        negative = self.run_lint()
+        self.assertNotEqual(negative.returncode, 0)
+        self.assertIn("message-select.sql: FAILED to prepare", negative.stdout)
+        self.assertIn("no such column", negative.stdout)
+        self.assertIn("message_typo", negative.stdout)
+
+        # DDL remains strict; only the DML flag is changed in this control.
+        permissive = self.run_with_dqs_enabled("SQLITE_DBCONFIG_DQS_DML")
+        self.assertEqual(permissive.returncode, 0, permissive.stdout + permissive.stderr)
+        self.assertIn("2 file(s) OK (1 prepared, 1 executed)", permissive.stdout)
+
+    def assert_ddl_quoted_names_must_resolve(self, in_core):
+        schema = (
+            "CREATE TABLE deliveries (\n"
+            "    message TEXT,\n"
+            '    CHECK ("message" <> \'\')\n'
+            ");\n"
+        )
+        if in_core:
+            directory = self.core_fixture(schema)
+            table = directory / "schema.sql"
+            failure = "schema.sql: FAILED to apply on the migration chain"
+        else:
+            directory = self.root / "crates/reader/sql"
+            directory.mkdir(parents=True)
+            table = directory / "table.sql"
+            table.write_text(schema)
+            failure = "table.sql: FAILED to load"
+        positive = self.run_lint()
+        self.assertEqual(positive.returncode, 0, positive.stdout + positive.stderr)
+        self.assertIn("1 file(s) OK (0 prepared, 1 executed)", positive.stdout)
+
+        table.write_text(schema.replace('"message"', '"message_typo"'))
+        negative = self.run_lint()
+        self.assertNotEqual(negative.returncode, 0)
+        self.assertIn(failure, negative.stdout)
+        self.assertIn("no such column", negative.stdout)
+        self.assertIn("message_typo", negative.stdout)
+
+        # DML remains strict; a multiline table avoids an unrelated format error.
+        permissive = self.run_with_dqs_enabled("SQLITE_DBCONFIG_DQS_DDL")
+        self.assertEqual(permissive.returncode, 0, permissive.stdout + permissive.stderr)
+        self.assertIn("1 file(s) OK (0 prepared, 1 executed)", permissive.stdout)
+
+    def test_double_quoted_migration_check_names_must_resolve(self):
+        self.assert_ddl_quoted_names_must_resolve(in_core=True)
+
+    def test_double_quoted_fragment_check_names_must_resolve(self):
+        self.assert_ddl_quoted_names_must_resolve(in_core=False)
 
     def test_core_parameterized_insert_is_prepared_without_null_execution(self):
         core = self.core_fixture("CREATE TABLE deliveries (message TEXT NOT NULL);\n")
@@ -302,6 +379,24 @@ class SqlLintTests(unittest.TestCase):
         self.assertIn("unexpected_core_visibility.sql: FAILED to load", result.stdout)
         self.assertIn("no such table", result.stdout)
 
+    def test_lint_runs_the_interpreter_named_by_the_environment(self):
+        # Hosts whose plain python3 predates Connection.setconfig can still run the
+        # lint through a newer interpreter; only the SQL phase (stdin "-") marks it.
+        marker = self.root / "named-interpreter-ran"
+        wrapper = self.root / "named-python"
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            f'if [ "$1" = "-" ]; then touch "{marker}"; fi\n'
+            f'exec "{sys.executable}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
+        directory = self.root / "crates/single/sql"
+        directory.mkdir(parents=True)
+        (directory / "table.sql").write_text("CREATE TABLE shared (id INTEGER);\n")
+        result = self.run_lint(env={**os.environ, "KHIVE_SQL_LINT_PYTHON": str(wrapper)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(marker.exists(), "the named interpreter did not run the SQL phase")
+
     def test_each_directory_has_an_independent_database(self):
         for name in ["first", "second"]:
             directory = self.root / "crates" / name / "sql"
@@ -315,6 +410,67 @@ class SqlLintTests(unittest.TestCase):
         result = self.run_lint()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("5 file(s) OK", result.stdout)
+
+
+class SqlLintConnectionTests(unittest.TestCase):
+    def factory(self, sqlite_module):
+        # Compile only the actual constructor, so capability failures can be
+        # exercised without opening SQLite or running the script's SQL phases.
+        script = (ROOT / "scripts/lint-sql.sh").read_text()
+        embedded = script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        functions = [node for node in ast.parse(embedded).body
+                     if isinstance(node, ast.FunctionDef) and node.name == "lint_connection"]
+        self.assertEqual(len(functions), 1)
+        module = ast.Module(body=functions, type_ignores=[])
+        namespace = {"sqlite3": sqlite_module}
+        exec(compile(module, str(ROOT / "scripts/lint-sql.sh"), "exec"), namespace)
+        return namespace["lint_connection"]
+
+    def sqlite_stub(self):
+        connection = mock.Mock(spec=["setconfig", "close", "execute", "executescript"])
+        sqlite_module = types.SimpleNamespace(
+            Connection=types.SimpleNamespace(setconfig=lambda *_: None),
+            SQLITE_DBCONFIG_DQS_DML=1013,
+            SQLITE_DBCONFIG_DQS_DDL=1014,
+            Error=RuntimeError,
+            connect=mock.Mock(return_value=connection),
+        )
+        return sqlite_module, connection
+
+    def test_missing_configuration_capability_fails_before_connect(self):
+        for missing in ["Connection.setconfig", "SQLITE_DBCONFIG_DQS_DML",
+                        "SQLITE_DBCONFIG_DQS_DDL"]:
+            with self.subTest(missing=missing):
+                sqlite_module, connection = self.sqlite_stub()
+                if missing == "Connection.setconfig":
+                    del sqlite_module.Connection.setconfig
+                else:
+                    delattr(sqlite_module, missing)
+                with self.assertRaises(SystemExit) as refused:
+                    self.factory(sqlite_module)()
+                self.assertIn("Python 3.12+", str(refused.exception))
+                self.assertIn(missing, str(refused.exception))
+                sqlite_module.connect.assert_not_called()
+                connection.execute.assert_not_called()
+                connection.executescript.assert_not_called()
+
+    def test_configuration_failure_closes_connection_before_sql(self):
+        for failing_option in [1013, 1014]:
+            with self.subTest(failing_option=failing_option):
+                sqlite_module, connection = self.sqlite_stub()
+
+                def configure(option, enabled):
+                    if option == failing_option:
+                        raise sqlite_module.Error("unsupported DQS option")
+
+                connection.setconfig.side_effect = configure
+                with self.assertRaises(SystemExit) as refused:
+                    self.factory(sqlite_module)()
+                self.assertIn("cannot disable SQLite DQS", str(refused.exception))
+                self.assertIn("unsupported DQS option", str(refused.exception))
+                connection.close.assert_called_once_with()
+                connection.execute.assert_not_called()
+                connection.executescript.assert_not_called()
 
 
 if __name__ == "__main__":
