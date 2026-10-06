@@ -37,7 +37,7 @@ use khive_runtime::pack::{
     HandlerDef, PackRuntime, VerbRegistryBuilder,
 };
 use khive_runtime::runtime::NamespaceToken;
-use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_runtime::{AuditObligationReason, KhiveRuntime, RuntimeError};
 use khive_storage::types::{BatchWriteSummary, Page, PageRequest};
 use khive_storage::{Event, EventFilter, EventStore, StorageResult};
 use khive_types::pack::{Pack, Visibility};
@@ -366,6 +366,45 @@ impl PackRuntime for CrossPackCensusProbe {
 /// effect has landed before the audit generation resolves.
 struct RecordingWritePack {
     effects: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+// These successful stand-ins exercise the registry's audit classification.
+// Actual ToolPack decision persistence remains covered by its receipt tests.
+struct PolicyDecisionProbe {
+    name: &'static str,
+    handlers: &'static [HandlerDef],
+}
+
+impl Pack for PolicyDecisionProbe {
+    const NAME: &'static str = "policy-decision-probe";
+    const NOTE_KINDS: &'static [&'static str] = &[];
+    const ENTITY_KINDS: &'static [&'static str] = &[];
+    const HANDLERS: &'static [HandlerDef] = &[];
+}
+
+#[async_trait]
+impl PackRuntime for PolicyDecisionProbe {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn note_kinds(&self) -> &'static [&'static str] {
+        Self::NOTE_KINDS
+    }
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        Self::ENTITY_KINDS
+    }
+    fn handlers(&self) -> &'static [HandlerDef] {
+        self.handlers
+    }
+    async fn dispatch(
+        &self,
+        verb: &str,
+        _params: Value,
+        _registry: &khive_runtime::pack::VerbRegistry,
+        _token: &NamespaceToken,
+    ) -> Result<Value, RuntimeError> {
+        Ok(serde_json::json!({"pack": self.name, "verb": verb}))
+    }
 }
 
 impl Pack for RecordingWritePack {
@@ -1170,6 +1209,151 @@ async fn read_verb_dispatch_survives_audit_lane_admission_exhaustion_disposition
 
     drop(occupant);
     drop(filler);
+}
+
+#[serial]
+#[tokio::test]
+#[serial(config_ledger)]
+async fn policy_decision_receipts_stay_strict_under_audit_admission_exhaustion() {
+    const fn handler(name: &'static str) -> HandlerDef {
+        HandlerDef {
+            name,
+            description: "policy decision admission probe",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }
+    }
+    static TOOL_HANDLERS: [HandlerDef; 2] = [handler("tool.check"), handler("tool.describe")];
+    static GIT_HANDLERS: [HandlerDef; 4] = [
+        handler("git.receipts"),
+        handler("git.gates"),
+        handler("git.status"),
+        handler("git.log"),
+    ];
+
+    let store = Arc::new(MemoryEventStore::default());
+    let mut builder = VerbRegistryBuilder::new();
+    for (name, handlers) in [
+        ("tool", TOOL_HANDLERS.as_slice()),
+        ("git", GIT_HANDLERS.as_slice()),
+    ] {
+        builder.register_trusted(PolicyDecisionProbe { name, handlers });
+    }
+    builder.with_event_store(store.clone());
+    builder.with_audit_batch_config(AuditBatchConfig {
+        max_pending_rows: std::num::NonZeroUsize::new(1).unwrap(),
+        ..AuditBatchConfig::default()
+    });
+    let registry = builder.build().expect("trusted tool and git registry");
+    assert!(registry.admission_degrade_safe_probe("tool.describe"));
+    let audit_batch = registry
+        .audit_batch_handle()
+        .expect("audit batch configured");
+
+    fault_injection::arm_supervisor_sleep_before_spawn();
+    let occupant_batch = audit_batch.clone();
+    let occupant = tokio::spawn(async move {
+        occupant_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("policy.occupant"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        let snapshot = audit_batch.test_snapshot();
+        snapshot.pending_rows == 0 && snapshot.in_flight_generation.is_some()
+    })
+    .await;
+    let filler_batch = audit_batch.clone();
+    let filler = tokio::spawn(async move {
+        filler_batch
+            .submit(PreparedAuditRow {
+                event: mk_event("policy.filler"),
+                producer: AuditProducer::ConfigLocked,
+            })
+            .await
+    });
+    wait_until(std::time::Duration::from_secs(5), || {
+        audit_batch.test_snapshot().pending_rows == 1
+    })
+    .await;
+
+    let before_refused = audit_admission_refused_obligation_count();
+    let before_unresolved = audit_admission_unresolved_obligation_count();
+    for (owner, verb) in [
+        ("tool", "tool.check"),
+        ("git", "git.receipts"),
+        ("git", "git.gates"),
+        ("git", "git.status"),
+        ("git", "git.log"),
+    ] {
+        assert_eq!(audit_batch.test_snapshot().pending_rows, 1);
+        let error = registry
+            .dispatch(verb, Value::Null)
+            .await
+            .expect_err("a policy decision writer must retain its audit obligation");
+        let RuntimeError::AuditObligation {
+            failure,
+            domain_result,
+        } = error
+        else {
+            panic!("{verb} must fail after its successful handler result: {error}");
+        };
+        assert_eq!(failure.verb, verb);
+        assert_eq!(
+            failure.reason,
+            AuditObligationReason::Terminal(AuditTerminalReason::QueueAdmissionExhausted),
+            "{verb} must fail because the audit queue refused its row"
+        );
+        assert_eq!(
+            domain_result,
+            serde_json::json!({"pack": owner, "verb": verb}),
+            "the correctly owned handler must have succeeded before the audit refusal"
+        );
+        assert_eq!(audit_admission_refused_obligation_count(), before_refused);
+        assert_eq!(
+            audit_admission_unresolved_obligation_count(),
+            before_unresolved
+        );
+    }
+
+    assert_eq!(audit_batch.test_snapshot().pending_rows, 1);
+    let result = registry
+        .dispatch("tool.describe", Value::Null)
+        .await
+        .expect("the policy read control must survive the same saturated queue");
+    assert_eq!(
+        result,
+        serde_json::json!({"pack": "tool", "verb": "tool.describe"})
+    );
+    assert_eq!(
+        audit_admission_refused_obligation_count(),
+        before_refused + 1
+    );
+    assert_eq!(
+        audit_admission_unresolved_obligation_count(),
+        before_unresolved
+    );
+    assert!(store.events.lock().expect("events lock").is_empty());
+
+    assert!(audit_batch.test_abort_supervisor());
+    wait_until(std::time::Duration::from_secs(5), || {
+        audit_batch.test_snapshot().is_idle()
+    })
+    .await;
+    for submission in [occupant, filler] {
+        assert!(matches!(
+            submission.await.expect("saturation submission joins"),
+            Err(AuditTerminalReason::DriverCancelled
+                | AuditTerminalReason::AdmissionDeadlineExpired)
+        ));
+    }
+    assert_eq!(
+        audit_batch.close_and_drain().await,
+        Err(AuditTerminalReason::DriverCancelled)
+    );
 }
 
 /// khive-oss#2311: `pack.name()` is a value the `PackRuntime` trait object
