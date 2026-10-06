@@ -494,6 +494,7 @@ async fn assert_missing_list_fallback(
             "each read uses one existing reader checkout"
         );
     }
+    assert_missing_count_free_kind_fallback(store, pool, external, capture).await;
 }
 
 #[tokio::test]
@@ -520,7 +521,9 @@ async fn backend_entity_reads_fallback_without_repair_and_reopen_initializes() {
     );
     assert!(INDEXES
         .iter()
-        .all(|index| catalog(&external).iter().any(|entry| entry.0 == *index)));
+        .copied()
+        .chain(std::iter::once(KIND_ORDER_INDEX))
+        .all(|index| catalog(&external).iter().any(|entry| entry.0 == index)));
     assert!(
         capture.events.lock().unwrap().is_empty(),
         "open-time DDL restores hints without read fallback"
@@ -561,7 +564,9 @@ async fn readonly_entity_reads_fallback_without_repair_after_reopen() {
     capture.assert_one(INDEXES[0], "count_entities");
     assert!(INDEXES
         .iter()
-        .all(|index| !catalog(&external).iter().any(|entry| entry.0 == *index)));
+        .copied()
+        .chain(std::iter::once(KIND_ORDER_INDEX))
+        .all(|index| !catalog(&external).iter().any(|entry| entry.0 == index)));
 }
 
 #[tokio::test]
@@ -659,5 +664,961 @@ async fn list_fallback_retries_once_and_preserves_unrecognized_sqlite_errors() {
         } else {
             assert!(capture.events.lock().unwrap().is_empty());
         }
+    }
+}
+
+const KIND_ORDER_INDEX: &str = "idx_entities_live_namespace_kind_order";
+
+type BoundEntitySql = (String, Vec<Box<dyn rusqlite::ToSql>>);
+
+fn ordered_page_sql(
+    filter: &EntityFilter,
+    limit: i64,
+    offset: i64,
+    streaming: bool,
+) -> BoundEntitySql {
+    let (clause, mut params) = if streaming {
+        build_entity_streaming_where("local", filter)
+    } else {
+        build_entity_where("local", filter)
+    };
+    let order = if let Some(prefix) = &filter.name_prefix {
+        params.push(Box::new(prefix.to_ascii_lowercase()));
+        format!(
+            "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC, id DESC",
+            params.len()
+        )
+    } else {
+        "created_at DESC, id DESC".into()
+    };
+    params.push(Box::new(limit));
+    params.push(Box::new(offset));
+    let builder = if streaming {
+        build_entity_count_free_page_query
+    } else {
+        build_entity_page_query
+    };
+    (
+        builder(
+            ENTITY_SELECT_COLUMNS,
+            filter,
+            &clause,
+            &order,
+            params.len() - 1,
+            params.len(),
+        ),
+        params,
+    )
+}
+
+fn assert_streamed_order(plan: &[String]) {
+    assert!(
+        !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        "unexpected full-match sort: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("LIST SUBQUERY")),
+        "unexpected type-ID materialization: {plan:?}"
+    );
+}
+
+fn ordered_backlog_fixture(older: usize) -> Connection {
+    let conn = fixture(0);
+    for (id, created) in (1..=96)
+        .map(|i| (i, 10_000 + (i / 3) as i64))
+        .chain((1..=older).map(|i| (100_000 + i, -(i as i64))))
+    {
+        conn.execute(
+            "INSERT INTO entities(id,namespace,kind,entity_type,name,description,properties,tags,\
+                created_at,updated_at) VALUES(?1,'local',?2,?3,?4,'projection',?5,'[\"Tag\"]',?6,\
+                ?6)",
+            rusqlite::params![
+                Uuid::from_u128(id as u128).to_string(),
+                if id % 17 == 0 { "document" } else { "concept" },
+                if id % 5 == 0 {
+                    None
+                } else {
+                    Some(if id % 2 == 0 { "a" } else { "b" })
+                },
+                format!("row{id}"),
+                if id % 2 == 0 {
+                    "{\"type\":\"a\"}"
+                } else {
+                    "{\"type\":\"b\"}"
+                },
+                created
+            ],
+        )
+        .unwrap();
+    }
+    conn
+}
+
+#[test]
+fn kind_filtered_offset_pages_stream_order() {
+    let cases = [
+        (EntityFilter::default(), INDEXES[0]),
+        (
+            EntityFilter {
+                kinds: vec!["concept".into()],
+                ..Default::default()
+            },
+            KIND_ORDER_INDEX,
+        ),
+        (
+            EntityFilter {
+                kinds: vec!["document".into()],
+                ..Default::default()
+            },
+            KIND_ORDER_INDEX,
+        ),
+        (
+            EntityFilter {
+                kinds: vec!["concept".into(), "document".into()],
+                ..Default::default()
+            },
+            INDEXES[0],
+        ),
+        (
+            EntityFilter {
+                kinds: vec!["concept".into()],
+                entity_types: vec!["a".into(), "b".into()],
+                legacy_entity_type_fallback: true,
+                tags_any: vec!["tag".into()],
+                ..Default::default()
+            },
+            KIND_ORDER_INDEX,
+        ),
+        (
+            EntityFilter {
+                entity_types_by_kind: [("document".into(), vec!["a".into(), "b".into()])].into(),
+                legacy_entity_type_fallback: true,
+                ..Default::default()
+            },
+            KIND_ORDER_INDEX,
+        ),
+        (
+            EntityFilter {
+                namespaces: vec!["local".into(), "local".into()],
+                entity_types: vec!["a".into(), "a".into()],
+                ..Default::default()
+            },
+            INDEXES[1],
+        ),
+        (
+            EntityFilter {
+                entity_types: vec!["a".into(), "b".into()],
+                ..Default::default()
+            },
+            INDEXES[0],
+        ),
+    ];
+    for analyzed in [false, true] {
+        let mut work = Vec::new();
+        for older in [200, 2_000] {
+            let conn = ordered_backlog_fixture(older);
+            if analyzed {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            let mut first_page_work = Vec::new();
+            for (filter, index) in &cases {
+                for limit in [3, 7] {
+                    for offset in [0, 5] {
+                        let (sql, params) = ordered_page_sql(filter, limit, offset, true);
+                        let (oracle, oracle_params) =
+                            ordered_page_sql(filter, limit, offset, false);
+                        assert_eq!(
+                            values(&conn, &sql, &params),
+                            values(&conn, &oracle, &oracle_params),
+                            "complete rows: {filter:?}, {limit}, {offset}"
+                        );
+                        let (plan, steps) = plan_work(&conn, &sql, &params);
+                        assert_streamed_order(&plan);
+                        assert!(
+                            plan.iter().any(|line| line.contains(*index)),
+                            "{index}: {plan:?}"
+                        );
+                        if offset == 0 {
+                            first_page_work.push(steps);
+                        }
+                    }
+                    // Concatenated pages must preserve the oracle's complete ordering.
+                    let (oracle, params) = ordered_page_sql(filter, 31, 0, false);
+                    let expected = values(&conn, &oracle, &params);
+                    let mut joined = Vec::new();
+                    while joined.len() < expected.len() {
+                        let (sql, params) =
+                            ordered_page_sql(filter, limit, joined.len() as i64, true);
+                        let page = values(&conn, &sql, &params);
+                        assert!(!page.is_empty());
+                        joined.extend(page);
+                    }
+                    joined.truncate(expected.len());
+                    assert_eq!(joined, expected);
+                }
+            }
+            // The former multi-type type-order route really sorts, even with the new index present.
+            let filter = &cases[7].0;
+            let (old, params) = ordered_page_sql(filter, 7, 0, false);
+            let (old_plan, _) = plan_work(&conn, &old, &params);
+            assert!(
+                old_plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "two distinct type prefixes must expose the former sorter: {old_plan:?}"
+            );
+            // Keep the pre-index kind access shape as a query-plan negative control.
+            let filter = &cases[1].0;
+            let (sql, params) = ordered_page_sql(filter, 7, 0, true);
+            let old = sql.replace(
+                entity_count_free_source(filter),
+                "entities INDEXED BY idx_entities_kind_entity_type",
+            );
+            let (old_plan, _) = plan_work(&conn, &old, &params);
+            assert!(
+                old_plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "pre-kind-order shape must sort: {old_plan:?}"
+            );
+            assert_eq!(values(&conn, &sql, &params), values(&conn, &old, &params));
+            work.push(first_page_work);
+        }
+        for (small, large) in work[0].iter().zip(&work[1]) {
+            assert!(
+                *large < *small * 2,
+                "older matching backlog must not scale first-page work: \
+                {small} -> {large}, analyzed={analyzed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn streaming_type_predicate_preserves_filter_semantics() {
+    let conn = fixture(0);
+    // Expected membership is an independent fixture annotation, not derived by the new predicate.
+    let cases = [
+        (Some("a"), Some("invalid JSON"), true),
+        (Some("b"), Some("{\"type\":\"a\"}"), false),
+        (Some(""), Some("{\"type\":\"a\"}"), false),
+        (None, Some("{\"type\":\"a\"}"), true),
+        (None, Some("{\"type\":\"alias\"}"), true),
+        (None, None, false),
+        (None, Some("{}"), false),
+        (None, Some("{\"type\":null}"), false),
+        (None, Some("{\"type\":3}"), false),
+        (None, Some("{\"type\":[\"a\"]}"), false),
+        (None, Some("{\"type\":true}"), false),
+        (None, Some("{type:'a'}"), false),
+        (None, Some("invalid JSON"), false),
+        (None, Some("{\"type\":\"A\"}"), false),
+        (Some("alias"), Some("{\"type\":\"b\"}"), true),
+    ];
+    let mut expected = Vec::new();
+    for (i, (canonical, properties, matches)) in cases.into_iter().enumerate() {
+        let id = Uuid::from_u128((i + 1) as u128).to_string();
+        conn.execute(
+            "INSERT INTO entities(id,namespace,kind,entity_type,name,properties,tags,\
+            created_at,updated_at) VALUES(?1,'local','concept',?2,'fixture',?3,'[\"Tag\"]',?4,?4)",
+            rusqlite::params![id, canonical, properties, i as i64],
+        )
+        .unwrap();
+        if matches {
+            expected.push(id);
+        }
+    }
+    for (id, ns, kind, deleted) in [
+        (100, "foreign", "concept", false),
+        (101, "local", "concept", true),
+        (102, "local", "document", false),
+    ] {
+        conn.execute(
+            "INSERT INTO entities(id,namespace,kind,entity_type,name,tags,created_at,\
+            updated_at,deleted_at) VALUES(?1,?2,?3,'a','fixture','[\"Tag\"]',100,100,?4)",
+            rusqlite::params![
+                Uuid::from_u128(id).to_string(),
+                ns,
+                kind,
+                if deleted { Some(1) } else { None }
+            ],
+        )
+        .unwrap();
+    }
+    let filter = EntityFilter {
+        kinds: vec!["concept".into()],
+        entity_types: vec!["a".into(), "alias".into()],
+        legacy_entity_type_fallback: true,
+        tags_any: vec!["TAG".into()],
+        ..Default::default()
+    };
+    let (sql, params) = ordered_page_sql(&filter, 100, 0, true);
+    let rows = values(&conn, &sql, &params);
+    expected.reverse();
+    assert_eq!(
+        rows.iter()
+            .map(|row| match &row[0] {
+                rusqlite::types::Value::Text(id) => id.clone(),
+                value => panic!("{value:?}"),
+            })
+            .collect::<Vec<_>>(),
+        expected
+    );
+    let filters = [
+        filter.clone(),
+        EntityFilter {
+            entity_types_by_kind: [
+                ("concept".into(), vec!["a".into()]),
+                ("document".into(), vec!["alias".into()]),
+            ]
+            .into(),
+            ..filter.clone()
+        },
+        EntityFilter {
+            kinds: vec![],
+            entity_types_by_kind: [
+                ("concept".into(), vec!["alias".into()]),
+                ("document".into(), vec!["a".into()]),
+            ]
+            .into(),
+            ..filter.clone()
+        },
+        EntityFilter {
+            entity_types_by_kind: [("concept".into(), vec![])].into(),
+            ..filter.clone()
+        },
+        EntityFilter {
+            entity_types_by_kind: [
+                ("empty".into(), vec![]),
+                ("concept".into(), vec!["a".into()]),
+            ]
+            .into(),
+            ..filter.clone()
+        },
+        EntityFilter {
+            ids: vec![Uuid::from_u128(1), Uuid::from_u128(4), Uuid::from_u128(100)],
+            ..filter.clone()
+        },
+        EntityFilter {
+            namespaces: vec!["local".into(), "foreign".into()],
+            name_exact: Some("fixture".into()),
+            ..filter
+        },
+    ];
+    for filter in filters {
+        for offset in [0, 2, 100] {
+            let (sql, params) = ordered_page_sql(&filter, 5, offset, true);
+            let (old, old_params) = ordered_page_sql(&filter, 5, offset, false);
+            assert_eq!(
+                values(&conn, &sql, &params),
+                values(&conn, &old, &old_params),
+                "{filter:?}, offset={offset}"
+            );
+            let (plan, _) = plan_work(&conn, &sql, &params);
+            assert!(
+                !plan.iter().any(|line| line.contains("LIST SUBQUERY")),
+                "row-local predicate must not materialize IDs: {plan:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_type_materialization_control_detects_older_backlog() {
+    let filter = EntityFilter {
+        kinds: vec!["concept".into()],
+        entity_types: vec!["a".into(), "b".into()],
+        legacy_entity_type_fallback: true,
+        ..Default::default()
+    };
+    for analyzed in [false, true] {
+        let mut work = Vec::new();
+        for older in [200, 2_000] {
+            let conn = ordered_backlog_fixture(older);
+            if analyzed {
+                conn.execute_batch("ANALYZE").unwrap();
+            }
+            let (new_sql, new_params) = ordered_page_sql(&filter, 5, 0, true);
+            let (old_where, mut old_params) = build_entity_where("local", &filter);
+            old_params.push(Box::new(5_i64));
+            old_params.push(Box::new(0_i64));
+            let old_sql = build_entity_count_free_page_query(
+                ENTITY_SELECT_COLUMNS,
+                &filter,
+                &old_where,
+                "created_at DESC, id DESC",
+                old_params.len() - 1,
+                old_params.len(),
+            );
+            assert_eq!(
+                values(&conn, &new_sql, &new_params),
+                values(&conn, &old_sql, &old_params)
+            );
+            let (new_plan, new_steps) = plan_work(&conn, &new_sql, &new_params);
+            let (old_plan, old_steps) = plan_work(&conn, &old_sql, &old_params);
+            assert_streamed_order(&new_plan);
+            assert!(
+                old_plan.iter().any(|line| line.contains("LIST SUBQUERY")),
+                "negative arm must expose the original type-ID materialization: {old_plan:?}"
+            );
+            work.push((new_steps, old_steps));
+        }
+        assert!(work[1].0 < work[0].0 * 2, "streaming work: {work:?}");
+        assert!(
+            work[1].1 > work[0].1 * 2,
+            "negative materialization arm must grow: {work:?}"
+        );
+    }
+}
+
+fn seed_kind_cursor_rows(
+    conn: &Connection,
+    prefix: usize,
+    matching_prefix: bool,
+) -> (SeekCursor, Vec<Uuid>) {
+    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(include_str!("../../sql/021-attachments-a-stage.sql"))
+        .unwrap();
+    for i in 1..=prefix {
+        // By default keep the selected kind rare in both actual rows and
+        // ANALYZE's average rows-per-kind estimate; all prefix rows are
+        // nonmatches. A matching prefix satisfies every predicate instead, but
+        // sits behind the cursor boundary, so no page returns it.
+        let (kind, entity_type, tags) = if matching_prefix {
+            ("concept".to_string(), Some("a"), "[\"Tag\"]")
+        } else {
+            (format!("irrelevant{}", i % 16), None, "[]")
+        };
+        conn.execute(
+            "INSERT INTO entities(id,namespace,kind,entity_type,name,tags,created_at,\
+            updated_at) VALUES(?1,'local',?2,?3,'prefix',?4,1,1)",
+            rusqlite::params![
+                Uuid::from_u128(i as u128).to_string(),
+                kind,
+                entity_type,
+                tags
+            ],
+        )
+        .unwrap();
+    }
+    let boundary = SeekCursor {
+        sequence: conn
+            .query_row("SELECT MAX(seq) FROM entities_seq", [], |row| row.get(0))
+            .unwrap(),
+        id: Uuid::from_u128(prefix as u128),
+    };
+    let mut expected = Vec::new();
+    for i in 1..=81 {
+        let id = Uuid::from_u128(100_000 + i);
+        let matches = i.is_multiple_of(3);
+        conn.execute(
+            "INSERT INTO entities(id,namespace,kind,entity_type,name,properties,tags,\
+            created_at,updated_at) VALUES(?1,'local',?2,?3,?4,?5,'[\"Tag\"]',?6,?6)",
+            rusqlite::params![
+                id.to_string(),
+                if matches { "concept" } else { "irrelevant" },
+                if i % 2 == 0 { Some("a") } else { None },
+                format!("tail{i}"),
+                if i % 2 == 0 {
+                    "{}"
+                } else {
+                    "{\"type\":\"alias\"}"
+                },
+                (100 - i) as i64
+            ],
+        )
+        .unwrap();
+        if matches {
+            expected.push(id);
+        }
+    }
+    (boundary, expected)
+}
+
+fn kind_cursor_filter() -> EntityFilter {
+    EntityFilter {
+        kinds: vec!["concept".into()],
+        entity_types_by_kind: [("concept".into(), vec!["a".into(), "alias".into()])].into(),
+        legacy_entity_type_fallback: true,
+        tags_any: vec!["tag".into()],
+        ..Default::default()
+    }
+}
+
+/// The production sequence-first cursor query, or the entity-first form that
+/// walks the kind index over every matching-kind row and sorts by sequence.
+fn kind_cursor_page_sql(filter: &EntityFilter, after: i64, entity_first: bool) -> BoundEntitySql {
+    let (mut clause, mut params) = build_entity_streaming_where("local", filter);
+    params.push(Box::new(after));
+    clause.push_str(&format!(" AND entities_seq.seq > ?{}", params.len()));
+    params.push(Box::new(6_i64));
+    let limit = params.len();
+    let sql = if entity_first {
+        format!(
+            "SELECT {ENTITY_SELECT_COLUMNS}, entities_seq.seq FROM entities INDEXED BY \
+            {KIND_ORDER_INDEX} CROSS JOIN entities_seq ON entities.id = \
+            entities_seq.entity_id{clause} ORDER BY entities_seq.seq ASC LIMIT ?{limit}"
+        )
+    } else {
+        build_entity_cursor_query(ENTITY_SELECT_COLUMNS, filter, &clause, limit)
+    };
+    (sql, params)
+}
+
+#[tokio::test]
+async fn kind_filtered_cursor_pages_seek_in_sequence_order() {
+    for analyzed in [false, true] {
+        let mut work = Vec::new();
+        let (mut behind_work, mut adverse_work) = (Vec::new(), Vec::new());
+        for prefix in [200, 2_000] {
+            let pool = Arc::new(ConnectionPool::new(crate::pool::PoolConfig::for_test()).unwrap());
+            let (boundary, expected) = {
+                let writer = pool.writer().unwrap();
+                let result = seed_kind_cursor_rows(writer.conn(), prefix, false);
+                if analyzed {
+                    writer.conn().execute_batch("ANALYZE").unwrap();
+                }
+                result
+            };
+            let filter = kind_cursor_filter();
+            {
+                let reader = pool.reader().unwrap();
+                let conn = reader.conn();
+                let (mut clause, mut params) = build_entity_streaming_where("local", &filter);
+                params.push(Box::new(boundary.sequence));
+                clause.push_str(&format!(" AND entities_seq.seq > ?{}", params.len()));
+                params.push(Box::new(6_i64));
+                let sql = build_entity_cursor_query(
+                    ENTITY_SELECT_COLUMNS,
+                    &filter,
+                    &clause,
+                    params.len(),
+                );
+                let (plan, steps) = plan_work(conn, &sql, &params);
+                assert_streamed_order(&plan);
+                let sequence = plan
+                    .iter()
+                    .position(|line| {
+                        line.contains("SEARCH entities_seq")
+                            && line.contains("INTEGER PRIMARY KEY")
+                            && line.contains("rowid>?")
+                    })
+                    .expect("real sequence range seek");
+                let entity = plan
+                    .iter()
+                    .position(|line| {
+                        line.contains("SEARCH entities USING INDEX sqlite_autoindex_entities_1")
+                            && line.contains("id=?")
+                    })
+                    .expect("one entity primary-key probe per sequence");
+                assert!(
+                    sequence < entity,
+                    "sequence must drive entity probes: {plan:?}"
+                );
+                let rows = values(conn, &sql, &params);
+                assert_eq!(rows.len(), 6, "limit+1 probe");
+                for (row, id) in rows.iter().zip(&expected) {
+                    assert_eq!(row[0], rusqlite::types::Value::Text(id.to_string()));
+                }
+                // The literal pre-fix JOIN is a row-parity control only: SQLite may
+                // order its loops either way depending on table statistics.
+                let old_unforced = format!(
+                    "SELECT {ENTITY_SELECT_COLUMNS}, entities_seq.seq FROM \
+                    entities_seq JOIN entities ON entities.id = entities_seq.entity_id{clause} \
+                    ORDER BY entities_seq.seq ASC LIMIT ?{}",
+                    params.len()
+                );
+                // Report the plan SQLite chose; it may legitimately seek by sequence.
+                let (old_plan, old_steps) = plan_work(conn, &old_unforced, &params);
+                eprintln!(
+                    "unforced pre-fix JOIN analyzed={analyzed} prefix={prefix} \
+                    vm_steps={old_steps} plan={old_plan:?}"
+                );
+                assert_eq!(
+                    values(conn, &old_unforced, &params),
+                    rows,
+                    "unforced pre-fix arm must retain complete rows"
+                );
+                work.push(steps);
+            }
+            // Population whose rows behind the cursor satisfy every predicate. The
+            // production walk seeks past them by sequence; an entity-first walk
+            // over the kind index visits every one of them and sorts afterwards.
+            let behind = Connection::open_in_memory().unwrap();
+            let (behind_boundary, behind_expected) = seed_kind_cursor_rows(&behind, prefix, true);
+            if analyzed {
+                behind.execute_batch("ANALYZE").unwrap();
+            }
+            let (sql, params) = kind_cursor_page_sql(&filter, behind_boundary.sequence, false);
+            let (plan, steps) = plan_work(&behind, &sql, &params);
+            assert_streamed_order(&plan);
+            assert!(
+                plan.iter().any(|line| line.contains("SEARCH entities_seq")
+                    && line.contains("INTEGER PRIMARY KEY")
+                    && line.contains("rowid>?")),
+                "production walk must seek the sequence range: {plan:?}"
+            );
+            let rows = values(&behind, &sql, &params);
+            assert_eq!(rows.len(), 6, "limit+1 probe");
+            for (row, id) in rows.iter().zip(&behind_expected) {
+                assert_eq!(row[0], rusqlite::types::Value::Text(id.to_string()));
+            }
+            behind_work.push(steps);
+            let (adverse, adverse_params) =
+                kind_cursor_page_sql(&filter, behind_boundary.sequence, true);
+            let (adverse_plan, adverse_steps) = plan_work(&behind, &adverse, &adverse_params);
+            assert!(
+                adverse_plan
+                    .iter()
+                    .any(|line| line.contains(KIND_ORDER_INDEX))
+                    && adverse_plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "entity-first control must walk the kind index and sort: {adverse_plan:?}"
+            );
+            assert_eq!(
+                values(&behind, &adverse, &adverse_params),
+                rows,
+                "entity-first control must retain complete rows"
+            );
+            adverse_work.push(adverse_steps);
+            let store = SqlEntityStore::new(Arc::clone(&pool), false);
+            for limit in [1, 5] {
+                let mut after = Some(boundary);
+                let mut walked = Vec::new();
+                for _ in 0..=expected.len() {
+                    let page = store
+                        .query_entities_after("local", filter.clone(), after, limit)
+                        .await
+                        .unwrap();
+                    for entity in &page.items {
+                        let direct = store.get_entity(entity.id).await.unwrap().unwrap();
+                        assert_eq!(
+                            serde_json::to_value(entity).unwrap(),
+                            serde_json::to_value(direct).unwrap()
+                        );
+                    }
+                    if let Some(next) = &page.next_after {
+                        assert_eq!(
+                            next.id,
+                            page.items.last().unwrap().id,
+                            "cursor UUID must match page boundary"
+                        );
+                        assert!(
+                            next.sequence > after.as_ref().unwrap().sequence,
+                            "cursor must advance"
+                        );
+                        let actual_seq: i64 = pool
+                            .reader()
+                            .unwrap()
+                            .conn()
+                            .query_row(
+                                "SELECT seq FROM entities_seq WHERE entity_id=?1",
+                                [next.id.to_string()],
+                                |row| row.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            next.sequence, actual_seq,
+                            "cursor sequence/UUID pair must match ledger"
+                        );
+                    }
+                    walked.extend(page.items.into_iter().map(|entity| entity.id));
+                    after = page.next_after;
+                    if after.is_none() {
+                        break;
+                    }
+                }
+                assert!(after.is_none(), "full walk must terminate");
+                assert_eq!(
+                    walked, expected,
+                    "full sequence order, including interspersed nonmatches"
+                );
+            }
+            let empty = store
+                .query_entities_after("local", filter, Some(boundary), 0)
+                .await
+                .unwrap();
+            assert!(empty.items.is_empty() && empty.next_after.is_none());
+        }
+        assert!(
+            work[1] < work[0] * 2,
+            "only the older prefix grew, subsequent page must seek past it: {work:?}"
+        );
+        assert!(
+            behind_work[1] < behind_work[0] * 2,
+            "matching-kind rows behind the cursor must not scale production work: {behind_work:?}"
+        );
+        assert!(
+            adverse_work[1] > adverse_work[0] * 2,
+            "entity-first control must scale with matching-kind rows behind the cursor: \
+                {adverse_work:?}"
+        );
+    }
+}
+
+async fn assert_missing_count_free_kind_fallback(
+    store: &dyn EntityStore,
+    pool: &ConnectionPool,
+    external: &Connection,
+    capture: &ListDiagnosticCapture,
+) {
+    let filter = EntityFilter {
+        kinds: vec!["concept".into()],
+        ..Default::default()
+    };
+    let request = PageRequest {
+        limit: 2,
+        offset: 1,
+    };
+    let catalog_before = catalog(external);
+    let writers = pool.writer_acquisition_snapshot().pooled_acquisitions;
+    let expected = store
+        .query_entities_count_free("local", filter.clone(), request.clone())
+        .await
+        .unwrap();
+    assert_eq!(expected.total, None);
+    assert_eq!(expected.items.len(), 2);
+    assert_eq!(
+        catalog(external),
+        catalog_before,
+        "ordinary count-free read changes no schema"
+    );
+    assert_eq!(
+        pool.writer_acquisition_snapshot().pooled_acquisitions,
+        writers
+    );
+    assert!(capture.events.lock().unwrap().is_empty());
+    external
+        .execute_batch(&format!("DROP INDEX {KIND_ORDER_INDEX}"))
+        .unwrap();
+    let missing_catalog = catalog(external);
+    let writers = pool.writer_acquisition_snapshot().pooled_acquisitions;
+    let readers = pool.reader_acquisition_snapshot().pooled_checkouts;
+    let actual = store
+        .query_entities_count_free("local", filter, request)
+        .await
+        .unwrap();
+    assert_eq!(actual.total, None);
+    assert_eq!(
+        serde_json::to_value(actual.items).unwrap(),
+        serde_json::to_value(expected.items).unwrap()
+    );
+    capture.assert_one(KIND_ORDER_INDEX, "query_entities_count_free");
+    assert_eq!(
+        catalog(external),
+        missing_catalog,
+        "retry must not repair the missing index"
+    );
+    assert_eq!(
+        pool.writer_acquisition_snapshot().pooled_acquisitions,
+        writers
+    );
+    assert_eq!(
+        pool.reader_acquisition_snapshot().pooled_checkouts,
+        readers + 1,
+        "retry reuses its reader"
+    );
+}
+
+#[tokio::test]
+async fn count_free_kind_fallback_preserves_unrelated_errors_and_retries_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pool = Arc::new(ConnectionPool::new(crate::pool::PoolConfig::for_test()).unwrap());
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(ENTITIES_DDL)
+        .unwrap();
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch(&format!("DROP INDEX {KIND_ORDER_INDEX}"))
+        .unwrap();
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let capture = ListDiagnosticCapture::default();
+    let _guard = tracing::subscriber::set_default(capture.clone());
+    let before = catalog(pool.reader().unwrap().conn());
+    for (sql, attempts, cause) in [
+        (
+            format!("SELECT id FROM entities INDEXED BY {KIND_ORDER_INDEX}"),
+            2,
+            format!("no such index: {KIND_ORDER_INDEX}"),
+        ),
+        (
+            "SELECT id FROM entities INDEXED BY missing_unrelated_index".into(),
+            1,
+            "no such index: missing_unrelated_index".into(),
+        ),
+        (
+            "SELECT missing_column FROM entities".into(),
+            1,
+            "no such column: missing_column".into(),
+        ),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let error = store
+            .with_list_reader(
+                "count_free_fallback_cause",
+                Some(KIND_ORDER_INDEX),
+                move |conn, _| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    conn.query_row(&sql, [], |row| row.get::<_, String>(0))
+                },
+            )
+            .await
+            .unwrap_err();
+        let StorageError::Driver {
+            capability,
+            operation,
+            source,
+        } = error
+        else {
+            panic!("{error}")
+        };
+        assert_eq!(capability, StorageCapability::Entities);
+        assert_eq!(operation.as_ref(), "count_free_fallback_cause");
+        assert!(source
+            .downcast_ref::<rusqlite::Error>()
+            .unwrap()
+            .to_string()
+            .contains(&cause));
+        assert_eq!(observed.load(Ordering::Relaxed), attempts);
+        if attempts == 2 {
+            capture.assert_one(KIND_ORDER_INDEX, "count_free_fallback_cause");
+        } else {
+            assert!(capture.events.lock().unwrap().is_empty());
+        }
+        assert_eq!(catalog(pool.reader().unwrap().conn()), before);
+    }
+}
+
+fn seed_type_group_rows(conn: &Connection) {
+    conn.execute_batch(ENTITIES_DDL).unwrap();
+    conn.execute_batch(include_str!("../../sql/021-attachments-a-stage.sql"))
+        .unwrap();
+    // Rows 3, 6 and 9 are concepts; row 6 carries the column type, rows 3 and 9
+    // only the legacy property. Every other local row is a document.
+    for i in 1..=9_u128 {
+        conn.execute(
+            "INSERT INTO entities(id,namespace,kind,entity_type,name,properties,created_at,\
+                updated_at) VALUES(?1,'local',?2,?3,?4,'{\"type\":\"a\"}',?5,?5)",
+            rusqlite::params![
+                Uuid::from_u128(i).to_string(),
+                if i % 3 == 0 { "concept" } else { "document" },
+                if i == 6 { Some("a") } else { None },
+                format!("row{i}"),
+                i as i64
+            ],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO entities(id,namespace,kind,entity_type,name,created_at,updated_at) \
+        VALUES(?1,'foreign','document','a','foreign',1,1)",
+        rusqlite::params![Uuid::from_u128(100).to_string()],
+    )
+    .unwrap();
+}
+
+fn type_group_store() -> (Arc<ConnectionPool>, SqlEntityStore) {
+    let pool = Arc::new(ConnectionPool::new(crate::pool::PoolConfig::for_test()).unwrap());
+    seed_type_group_rows(pool.writer().unwrap().conn());
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    (pool, store)
+}
+
+#[tokio::test]
+async fn count_free_pages_with_only_empty_type_groups_are_empty() {
+    let (_pool, store) = type_group_store();
+    let all_empty = [
+        std::collections::BTreeMap::from([("document".to_string(), Vec::<String>::new())]),
+        std::collections::BTreeMap::from([
+            ("document".to_string(), Vec::<String>::new()),
+            ("concept".to_string(), Vec::<String>::new()),
+        ]),
+    ];
+    let mut failures = Vec::new();
+    for entity_types_by_kind in all_empty {
+        for kinds in [Vec::new(), vec!["document".to_string()]] {
+            for namespaces in [Vec::new(), vec!["local".to_string()]] {
+                for legacy_entity_type_fallback in [false, true] {
+                    let filter = EntityFilter {
+                        entity_types_by_kind: entity_types_by_kind.clone(),
+                        kinds: kinds.clone(),
+                        namespaces: namespaces.clone(),
+                        legacy_entity_type_fallback,
+                        ..Default::default()
+                    };
+                    let source = entity_count_free_source(&filter);
+                    if source != "entities" {
+                        failures.push(format!("{filter:?}: forced source {source}"));
+                    }
+                    for offset in [0, 3, 50] {
+                        let request = PageRequest { limit: 5, offset };
+                        match store
+                            .query_entities_count_free("local", filter.clone(), request.clone())
+                            .await
+                        {
+                            Ok(page) if page.items.is_empty() && page.total.is_none() => {}
+                            Ok(page) => failures.push(format!(
+                                "{filter:?}, offset {offset}: {} rows, total {:?}",
+                                page.items.len(),
+                                page.total
+                            )),
+                            Err(error) => {
+                                failures.push(format!("{filter:?}, offset {offset}: {error}"))
+                            }
+                        }
+                        let exact = store
+                            .query_entities("local", filter.clone(), request)
+                            .await
+                            .unwrap();
+                        assert!(exact.items.is_empty());
+                        assert_eq!(exact.total, Some(0));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} empty-group arm(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn count_free_empty_sibling_type_group_keeps_the_ordered_kind_walk() {
+    let (_pool, store) = type_group_store();
+    for (legacy_entity_type_fallback, expected) in [(false, vec![6]), (true, vec![9, 6, 3])] {
+        let filter = EntityFilter {
+            entity_types_by_kind: [
+                ("document".to_string(), Vec::new()),
+                ("concept".to_string(), vec!["a".to_string()]),
+            ]
+            .into(),
+            legacy_entity_type_fallback,
+            ..Default::default()
+        };
+        assert_eq!(
+            entity_count_free_source(&filter),
+            "entities INDEXED BY idx_entities_live_namespace_kind_order"
+        );
+        let page = store
+            .query_entities_count_free(
+                "local",
+                filter.clone(),
+                PageRequest {
+                    limit: 5,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.iter().map(|row| row.id).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|i| Uuid::from_u128(*i))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(page.total, None);
     }
 }

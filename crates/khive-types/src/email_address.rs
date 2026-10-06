@@ -1,14 +1,8 @@
 use alloc::string::String;
 
-/// Extract the email connector's normalized addr-spec from a configured address.
-/// Preserves its existing display-name stripping and lowercase comparison rules.
-pub fn normalize_email_address(raw: &str) -> Option<String> {
-    addr_spec(raw).map(str::to_lowercase)
-}
-
-/// Normalize an outbound recipient or allowlist entry: the addr-spec that
-/// [`normalize_email_address`] extracts, with ASCII letters lowercased; every
-/// other character compares exactly. Unicode lowercasing can turn a different
+/// Normalize an email address for comparison: the addr-spec inside angle
+/// brackets when they enclose one, else the trimmed value, with ASCII letters
+/// lowercased; every other character compares exactly. Unicode lowercasing can turn a different
 /// character into an ASCII letter (U+212A KELVIN SIGN lowercases to `k`), so a
 /// comparison that must never admit a different address folds ASCII case only.
 pub fn normalize_email_recipient(raw: &str) -> Option<String> {
@@ -35,17 +29,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preserves_connector_address_normalization() {
+    fn strips_display_names_and_surrounding_whitespace() {
         assert_eq!(
-            normalize_email_address("  A@Example.COM ").as_deref(),
+            normalize_email_recipient("  A@Example.COM ").as_deref(),
             Some("a@example.com")
         );
         assert_eq!(
-            normalize_email_address("Name < A@Example.COM >").as_deref(),
+            normalize_email_recipient("Name < A@Example.COM >").as_deref(),
             Some("a@example.com")
         );
-        assert_eq!(normalize_email_address("not-an-address"), None);
-        assert_eq!(normalize_email_address(""), None);
     }
 
     #[test]

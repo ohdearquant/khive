@@ -886,3 +886,88 @@ consistent with the current migration chain before adoption:
 | Version | Owning ADR / issue | Migration name    | Status   |
 | ------: | ------------------ | ----------------- | -------- |
 |     V50 | ADR-015 / #3689    | entity_list_plans | proposed |
+
+## Proposed amendment: count-free ordered entity lists (2026-10-05)
+
+**Status: Proposed.**
+
+V53, `entity_kind_list_order`, is allocated to #3688 after the reserved V52
+`comm_core_indexes` migration. Its adoption must compose the actual preceding
+migration and retain the contiguous, append-only registry; the allocation must
+be reconciled if another migration changes that chain. This amendment neither
+supplies a placeholder V52 nor changes the runner or ledger validation.
+
+V53 adds `idx_entities_live_namespace_kind_order` on
+`(namespace, kind, created_at DESC, id DESC) WHERE deleted_at IS NULL`.
+`053-entity-kind-list-order.sql` contains its idempotent creation, and the
+entity-store DDL declares the identical index for direct stores. The migration
+records its canonical version/name only after its transaction commits. Existing
+V50 indexes, V1, sequence-ledger triggers, row versions and V21 attachment/GC
+admission remain unchanged. The index adds one construction scan, live-row key
+storage and maintenance on writes and live/deleted transitions.
+
+ADR-005's proposed count-free entity operation omits the exact matching count.
+The existing exact-total/selective query and count paths retain their contracts.
+For ordinary creation-order pages in one effective namespace, a single directly
+constrained kind, including a sole nonempty kind-qualified type group, can fix
+the kind-order index prefix. The complete predicate must still preserve all
+filter intersections. Queries admitting multiple kinds use namespace-order
+with residual membership. A canonical-only type path uses the type-order index only when one
+distinct type fixes its equality prefix; multiple distinct types use
+namespace-order or the applicable single-kind order. Legacy fallback must not
+be reduced to canonical-type equality. IDs retain primary-key lookup; candidate
+names and name-ranked queries retain their existing access paths.
+
+The ordered page and non-ID cursor paths evaluate type membership on the current
+row rather than materializing a full matching ID UNION. A non-NULL canonical
+type, including an empty or nonmatching string, suppresses legacy fallback.
+Only a SQL-NULL canonical type may use a valid JSON object's text-valued `type`
+member. Nest JSON validity and text-type checks so malformed, JSON5-only,
+missing, NULL and non-string properties do not introduce matches or JSON
+errors. Preserve exact case-sensitive alias membership, global-type AND
+kind-qualified-group intersections, group OR semantics and all-empty-group
+no-match behavior; visibility, liveness, IDs, names and tags remain ANDed
+outside that predicate. The existing indexed UNION path remains available for selective
+lookup/count operations.
+
+Non-ID insertion-sequence pages drive `entities_seq` through a sequence-range
+seek as the outer CROSS JOIN source and look up entities by their primary key.
+Explicit-ID cursor pages retain their bounded ID-driven route. Preserve the
+limit-plus-one probe, sequence/UUID pairing, final-page cursor omission,
+limit-zero and candidate-name validation, and ADR-023's soft/hard-deleted and
+hidden-cursor behavior. No sequence fields, allocation rules or public cursor
+representation change.
+
+An eligible read whose forced index is missing retries once without that index,
+with the existing missing-index diagnostic. Unrelated errors retain their
+operation and SQLite cause. Neither a normal query nor the fallback creates or
+repairs schema; a legacy or read-only store may retain slower plans until a
+writable migration/open supplies the index.
+
+Single-namespace ordinary kind/type pages must stream creation order without a
+whole-match sorter, including kindless queries spanning multiple canonical
+types. Non-ID sequence pages must advance from their boundary without a
+whole-match sorter or type-ID materialization. These guarantees do not bound
+all work: offsets visit skipped entries; sparse residual predicates and terminal
+sequence pages may inspect many nonmatches. Multi-namespace and name-ranked
+offset queries may still sort. No constant-work, MVCC, counter-maintenance,
+ANALYZE/optimize lifecycle or reader/writer-policy change is claimed. The
+historical V50 amendment retains its Proposed status and describes its original
+access paths rather than this new operation.
+
+Acceptance requires actual production-query row and order parity, COUNT-denying
+reader controls, ordered offset and sequence plan/VM-work controls, and a
+sensitive restoration of legacy type-ID materialization. Include a kindless,
+single-namespace two-type fixture with interleaved timestamps and ties; restoring
+the old multi-type type-index choice must expose the ordering/work regression.
+Test with and without ANALYZE. Retain exact-total, alias/group, candidate-name,
+visibility, cursor and multi-namespace behavior oracles. Migration acceptance
+requires identical fresh/direct index definitions, actual historical upgrades
+through the reconciled predecessor chain, unchanged entity rows/versions and
+sequence rows, retained existing btrees, repeat/reopen idempotence and read-only
+catalog immutability. Existing contiguous-version assertions remain intact.
+No performance or migration-compatibility measurement follows from source alone.
+
+| Version | Owning ADR / issue | Migration name         | Status   |
+| ------: | ------------------ | ---------------------- | -------- |
+|     V53 | ADR-015 / #3688    | entity_kind_list_order | proposed |
