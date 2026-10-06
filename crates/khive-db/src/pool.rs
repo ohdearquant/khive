@@ -1,7 +1,12 @@
 //! Connection pool for SQLite: one exclusive writer, N concurrent readers.
 mod code_map;
+#[path = "pool/identity_registry.rs"]
+mod identity_registry;
 #[path = "pool/writer_acquisition.rs"]
 mod writer_acquisition;
+#[cfg(test)]
+use identity_registry::pool_identity_suffix;
+use identity_registry::PoolIdentityRegistration;
 
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
@@ -22,6 +27,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use crate::database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
+use crate::disk_guard_config::{resolve_disk_guard_config, EffectiveDiskGuardConfig};
 use crate::error::SqliteError;
 #[cfg(windows)]
 use crate::file_identity::sqlite_opened_file_identity;
@@ -50,10 +56,24 @@ const DEFAULT_READER_CAP: usize = 8;
 
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
-const DB_FREE_SPACE_FLOOR_ENV: &str = "KHIVE_DB_FREE_SPACE_FLOOR_BYTES";
-const DEFAULT_DB_FREE_SPACE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 const DATABASE_ID_TABLE: &str = "_khive_database_identity";
 static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Explicit test-only lock namespace, shared by every fixture pool in this
+/// process. `PoolConfig::default()` in an ordinary build never calls this.
+#[cfg(any(test, feature = "test-support"))]
+fn test_volume_lock_dir() -> PathBuf {
+    static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
+    DIRECTORY
+        .get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("khive-db-volume-lock-test-")
+                .tempdir()
+                .expect("private test volume-lock directory")
+                .keep()
+        })
+        .clone()
+}
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -155,118 +175,6 @@ impl WriteAdmission {
         probe: impl Fn(&Path) -> std::io::Result<u64> + Send + Sync + 'static,
     ) {
         *self.space_probe.lock() = Some(Arc::new(probe));
-    }
-}
-
-fn db_free_space_floor_from_env() -> Result<u64, SqliteError> {
-    let Some(value) = std::env::var_os(DB_FREE_SPACE_FLOOR_ENV) else {
-        return Ok(DEFAULT_DB_FREE_SPACE_FLOOR_BYTES);
-    };
-    let parsed = value
-        .to_str()
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or_else(|| {
-            SqliteError::InvalidConfig(format!(
-                "{DB_FREE_SPACE_FLOOR_ENV} must be a nonnegative byte count"
-            ))
-        })?;
-    Ok(parsed)
-}
-
-struct OpenPoolIdentity {
-    count: usize,
-    basename: String,
-    suffix: String,
-}
-
-/// Only final file names and the first eight SHA-256 hex digits enter errors.
-/// Canonical paths remain internal to the live-pool registry.
-#[derive(Default)]
-struct PoolIdentityRegistry {
-    paths: HashMap<PathBuf, OpenPoolIdentity>,
-}
-
-fn pool_identity_registry() -> &'static Mutex<PoolIdentityRegistry> {
-    static REGISTRY: OnceLock<Mutex<PoolIdentityRegistry>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(PoolIdentityRegistry::default()))
-}
-
-/// SHA-256 over raw Unix path bytes, or Windows UTF-16 code units in little
-/// endian order. Encoding and digest are explicit so toolchain upgrades and
-/// process restarts cannot change a given canonical path's suffix.
-fn pool_identity_suffix(path: &Path) -> String {
-    #[cfg(unix)]
-    let bytes = {
-        use std::os::unix::ffi::OsStrExt;
-        path.as_os_str().as_bytes().to_vec()
-    };
-    #[cfg(windows)]
-    let bytes = {
-        use std::os::windows::ffi::OsStrExt;
-        path.as_os_str()
-            .encode_wide()
-            .flat_map(u16::to_le_bytes)
-            .collect::<Vec<_>>()
-    };
-    #[cfg(not(any(unix, windows)))]
-    let bytes = path.to_string_lossy().as_bytes().to_vec();
-    let digest = Sha256::digest(&bytes);
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3]
-    )
-}
-
-struct PoolIdentityRegistration(PathBuf);
-
-impl PoolIdentityRegistration {
-    fn new(path: &Path) -> Self {
-        let mut registry = pool_identity_registry().lock();
-        if let Some(entry) = registry.paths.get_mut(path) {
-            entry.count += 1;
-        } else {
-            let basename = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            let suffix = pool_identity_suffix(path);
-            registry.paths.insert(
-                path.to_path_buf(),
-                OpenPoolIdentity {
-                    count: 1,
-                    basename,
-                    suffix,
-                },
-            );
-        }
-        Self(path.to_path_buf())
-    }
-
-    fn label(&self) -> String {
-        let registry = pool_identity_registry().lock();
-        let entry = &registry.paths[&self.0];
-        let collides = registry
-            .paths
-            .iter()
-            .any(|(path, other)| path != &self.0 && other.basename == entry.basename);
-        if collides {
-            format!("{}#{}", entry.basename, entry.suffix)
-        } else {
-            entry.basename.clone()
-        }
-    }
-}
-
-impl Drop for PoolIdentityRegistration {
-    fn drop(&mut self) {
-        let mut registry = pool_identity_registry().lock();
-        if let Some(entry) = registry.paths.get_mut(&self.0) {
-            entry.count -= 1;
-            if entry.count == 0 {
-                registry.paths.remove(&self.0);
-            }
-        }
     }
 }
 
@@ -623,6 +531,13 @@ pub struct PoolConfig {
     ///
     /// Overridable via `KHIVE_WRITE_ADMISSION_DEADLINE_MS`.
     pub write_admission_deadline_ms: u64,
+    /// SQLite disk-reserve and guard-deadline policy for this pool. `None`
+    /// resolves the process environment when the pool opens.
+    pub disk_guard_config: Option<EffectiveDiskGuardConfig>,
+    /// Shared per-user directory for the volume advisory lock files.
+    /// [`PoolConfig::default`] resolves it with [`crate::default_volume_lock_dir`]
+    /// and leaves `None` when no directory can be resolved.
+    pub volume_lock_dir: Option<PathBuf>,
     /// Maximum age an explicit cached-reader read transaction
     /// (`sql_bridge`'s `BEGIN`-then-reuse path) may reach before its next use
     /// is refused and it is rolled back instead of extending its WAL
@@ -689,6 +604,11 @@ impl Default for PoolConfig {
                 .ok()
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(DEFAULT_WRITE_ADMISSION_DEADLINE_MS),
+            disk_guard_config: None,
+            #[cfg(test)]
+            volume_lock_dir: Some(test_volume_lock_dir()),
+            #[cfg(not(test))]
+            volume_lock_dir: crate::default_volume_lock_dir().ok(),
             read_tx_max_age: crate::checkpoint::tx_age_thresholds_from_env(
                 Duration::from_secs(30),
                 Duration::from_secs(120),
@@ -707,6 +627,7 @@ impl PoolConfig {
     pub fn for_test() -> Self {
         Self {
             max_readers: 2,
+            volume_lock_dir: Some(test_volume_lock_dir()),
             ..Self::default()
         }
     }
@@ -870,6 +791,9 @@ pub struct ConnectionPool {
     /// Shared with the long-lived writer task so it can resample at every
     /// dequeued request rather than only when its connection is opened.
     write_admission: Arc<WriteAdmission>,
+    /// Effective source and values captured at open for diagnostic reporting;
+    /// the live volume identifier is deliberately resolved separately.
+    disk_guard_config: Option<EffectiveDiskGuardConfig>,
     /// Pool-scoped reader route, saturation, and hold-lifecycle counters.
     /// Instrumentation lives at the acquisition boundary so every typed
     /// store and raw-SQL caller inherits it without per-verb bookkeeping
@@ -1732,6 +1656,9 @@ impl ConnectionPool {
     pub fn new(config: PoolConfig) -> Result<Self, SqliteError> {
         refuse_home_data_store_in_tests(&config)?;
         validate_write_admission_deadline(config.write_admission_deadline_ms)?;
+        if let Some(policy) = config.disk_guard_config {
+            policy.validate()?;
+        }
         config.wal_ceiling.validate_static(
             config.path.is_some(),
             config.wal_mode,
@@ -1766,17 +1693,37 @@ impl ConnectionPool {
             }
             None => (TxOrigin::Memory, None),
         };
-        let write_admission = if !config.read_only {
+        let (write_admission, disk_guard_config) = if !config.read_only {
             if let Some(volume) = identity_path.as_deref().and_then(Path::parent) {
-                Arc::new(WriteAdmission::new(
-                    Some(volume.to_path_buf()),
-                    db_free_space_floor_from_env()?,
-                ))
+                let disk_guard = match config.disk_guard_config {
+                    Some(policy) => policy,
+                    None => resolve_disk_guard_config(None, None)?,
+                };
+                disk_guard.validate()?;
+                if disk_guard.legacy_environment_present {
+                    tracing::warn!(
+                        "legacy SQLite reserve setting is deprecated; \
+                         use KHIVE_SQLITE_DISK_RESERVE_BYTES"
+                    );
+                }
+                if disk_guard.reserve_bytes == 0 {
+                    tracing::warn!(
+                        "SQLite disk reserve is explicitly zero; \
+                         new logical writes will not be floor-refused"
+                    );
+                }
+                (
+                    Arc::new(WriteAdmission::new(
+                        Some(volume.to_path_buf()),
+                        disk_guard.reserve_bytes,
+                    )),
+                    Some(disk_guard),
+                )
             } else {
-                Arc::new(WriteAdmission::new(None, 0))
+                (Arc::new(WriteAdmission::new(None, 0)), None)
             }
         } else {
-            Arc::new(WriteAdmission::new(None, 0))
+            (Arc::new(WriteAdmission::new(None, 0)), None)
         };
         let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
         #[cfg(any(unix, windows))]
@@ -1883,6 +1830,7 @@ impl ConnectionPool {
             pooled_writer_retired: AtomicBool::new(false),
             writer_acquisition_counters: Arc::new(WriterAcquisitionCounters::default()),
             write_admission,
+            disk_guard_config,
             reader_acquisition_counters: ReaderAcquisitionCounters::default(),
             search_dispatches: Mutex::new(BTreeMap::new()),
             note_candidate_hydration_rows: AtomicU64::new(0),
@@ -2394,6 +2342,10 @@ impl ConnectionPool {
 
     pub(crate) fn write_admission(&self) -> Arc<WriteAdmission> {
         Arc::clone(&self.write_admission)
+    }
+
+    pub fn effective_disk_guard_config(&self) -> Option<EffectiveDiskGuardConfig> {
+        self.disk_guard_config
     }
 
     #[cfg(test)]

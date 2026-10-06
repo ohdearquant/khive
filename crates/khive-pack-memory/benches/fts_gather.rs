@@ -376,7 +376,11 @@ async fn main() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{}", db_path.display(), suffix));
     }
-    let backend = StorageBackend::sqlite(&db_path).expect("open file-backed backend");
+    let backend = StorageBackend::sqlite_with_volume_lock_dir(
+        &db_path,
+        db_path.parent().unwrap().join("volume-locks"),
+    )
+    .expect("open file-backed backend");
     let searcher = backend.text("notes_local").expect("text store");
 
     let total_docs = docs.len();

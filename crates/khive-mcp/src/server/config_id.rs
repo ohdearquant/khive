@@ -197,5 +197,6 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     } else {
         ""
     };
-    format!("{base}{topology}{blob_file_transfers}")
+    let disk_guard = disk_guard_policy_fingerprint(config, khive_cfg, storage_read_only);
+    format!("{base}{topology}{blob_file_transfers}{disk_guard}")
 }

@@ -18,6 +18,7 @@ fn run_case(constructor: &str, raw: Option<&str>) {
         ])
         .env_clear()
         .env("HOME", root.path().join("home"))
+        .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
         .env(CHILD_CASE, constructor)
         .env(CHILD_ROOT, root.path());
     if let Some(raw) = raw {

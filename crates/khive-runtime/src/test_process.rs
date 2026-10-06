@@ -22,6 +22,7 @@ pub(crate) fn run_in_child() -> bool {
             .env("HOME", &home)
             .env_remove("LATTICE_MODEL_CACHE")
             .env("KHIVE_TEST_HARNESS", "1")
+            .env("KHIVE_VOLUME_LOCK_DIR", fixture.path().join("volume-locks"))
             .env("KHIVE_LOCK", fixture.path().join("boot.lock"))
             .env(
                 "KHIVE_RECOVERER_LOCK",

@@ -393,17 +393,37 @@ pub(crate) fn direct_backend_with_max_readers(
         ..crate::RuntimeConfig::no_embeddings()
     };
     let wal_ceiling = config.resolve_wal_ceiling_policy(read_only)?;
-    direct_backend_with_max_readers_and_wal_ceiling(db_path, read_only, max_readers, wal_ceiling)
+    let disk_guard = config.resolve_disk_guard_policy(read_only)?;
+    direct_backend_with_policies(
+        db_path,
+        read_only,
+        max_readers,
+        wal_ceiling,
+        disk_guard,
+        config.volume_lock_dir,
+    )
 }
 
-/// Open the direct event lane with the policy already resolved for its main backend.
-pub(crate) fn direct_backend_with_max_readers_and_wal_ceiling(
+/// Open the direct event lane with the policies already resolved for its main
+/// backend. A writable open also needs the disk policy and the volume lock
+/// directory; a read-only open uses neither.
+pub(crate) fn direct_backend_with_policies(
     db_path: &Path,
     read_only: bool,
     max_readers: Option<usize>,
     wal_ceiling: WalCeilingPolicy,
+    disk_guard: Option<khive_db::EffectiveDiskGuardConfig>,
+    volume_lock_dir: Option<PathBuf>,
 ) -> crate::error::RuntimeResult<Arc<StorageBackend>> {
     wal_ceiling.validate_static(true, true, read_only)?;
+    if !read_only {
+        disk_guard
+            .ok_or_else(|| {
+                crate::error::RuntimeError::Internal("missing events disk policy".into())
+            })?
+            .validate()?;
+        khive_db::require_volume_lock_dir(volume_lock_dir.clone())?;
+    }
     let mut registry = direct_backend_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -454,6 +474,20 @@ pub(crate) fn direct_backend_with_max_readers_and_wal_ceiling(
                 key.display()
             )));
         }
+        let numbers = |p: Option<khive_db::EffectiveDiskGuardConfig>| {
+            p.map(|p| (p.reserve_bytes, p.guard_deadline_ms))
+        };
+        if numbers(existing.pool().effective_disk_guard_config()) != numbers(disk_guard) {
+            return Err(crate::error::RuntimeError::Internal(
+                "events database is already open with a different disk reserve/deadline policy"
+                    .into(),
+            ));
+        }
+        if !read_only && existing.pool().config().volume_lock_dir != volume_lock_dir {
+            return Err(crate::error::RuntimeError::Internal(
+                "events database is already open with a different volume-lock directory".into(),
+            ));
+        }
         let existing_bytes = existing.pool().config().wal_ceiling.bytes;
         if existing_bytes != wal_ceiling.bytes {
             return Err(khive_db::SqliteError::InvalidConfig(format!(
@@ -492,7 +526,15 @@ pub(crate) fn direct_backend_with_max_readers_and_wal_ceiling(
             wal_ceiling,
         )?
     } else {
-        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(db_path, max_readers, wal_ceiling)?
+        StorageBackend::sqlite_with_max_readers_and_policies(
+            db_path,
+            max_readers,
+            wal_ceiling,
+            disk_guard.ok_or_else(|| {
+                crate::error::RuntimeError::Internal("missing events disk policy".into())
+            })?,
+            khive_db::require_volume_lock_dir(volume_lock_dir)?,
+        )?
     });
     registry.insert(key, (read_only, Arc::clone(&backend)));
     Ok(backend)
@@ -1041,31 +1083,40 @@ fn verify_events_db_owner_only_unopened(
 /// reported healthy.
 ///
 /// This standalone entry resolves its environment once before supervision.
-/// Hosts with an opened main backend pass its resolved policy through
-/// [`supervise_events_daemon_with_wal_ceiling`].
+/// Hosts with an opened main backend pass its resolved policies through
+/// [`supervise_events_daemon_with_policies`].
 #[cfg(unix)]
 pub async fn supervise_events_daemon(db_path: PathBuf, socket_path: PathBuf) {
-    let mut config = crate::RuntimeConfig {
-        db_path: Some(db_path.clone()),
-        ..crate::RuntimeConfig::no_embeddings()
-    };
-    match config.resolve_wal_ceiling_policy(false) {
-        Ok(wal_ceiling) => {
-            supervise_events_daemon_with_wal_ceiling(db_path, socket_path, wal_ceiling).await;
+    match standalone_daemon_policies(&db_path) {
+        Ok((wal_ceiling, disk_guard, volume_lock_dir)) => {
+            supervise_events_daemon_with_policies(
+                db_path,
+                socket_path,
+                wal_ceiling,
+                disk_guard,
+                volume_lock_dir,
+            )
+            .await;
         }
         Err(error) => {
-            tracing::warn!(error = %error, "invalid WAL ceiling; events supervisor not started");
+            tracing::warn!(%error, "invalid events daemon policy; events supervisor not started");
         }
     }
 }
 
-/// Supervise every events-daemon child with the main backend's resolved policy.
+/// Supervise using the main pool's captured writer policies and lock directory.
 #[cfg(unix)]
-pub async fn supervise_events_daemon_with_wal_ceiling(
+pub async fn supervise_events_daemon_with_policies(
     db_path: PathBuf,
     socket_path: PathBuf,
     wal_ceiling: WalCeilingPolicy,
+    disk_guard: khive_db::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
 ) {
+    if let Err(error) = disk_guard.validate() {
+        tracing::warn!(%error, "invalid disk policy; events supervisor not started");
+        return;
+    }
     if let Err(error) = wal_ceiling.validate_static(true, true, false) {
         tracing::warn!(error = %error, "invalid WAL ceiling; events supervisor not started");
         return;
@@ -1107,8 +1158,15 @@ pub async fn supervise_events_daemon_with_wal_ceiling(
         if !reachable && child.is_none() {
             match std::env::current_exe() {
                 Ok(exe) => {
-                    let spawned =
-                        events_daemon_command(&exe, &db_path, &socket_path, wal_ceiling).spawn();
+                    let spawned = events_daemon_command(
+                        &exe,
+                        &db_path,
+                        &socket_path,
+                        wal_ceiling,
+                        disk_guard,
+                        &volume_lock_dir,
+                    )
+                    .spawn();
                     match spawned {
                         Ok(spawned_child) => {
                             respawns += 1;
@@ -1151,6 +1209,8 @@ fn events_daemon_command(
     db_path: &Path,
     socket_path: &Path,
     wal_ceiling: WalCeilingPolicy,
+    disk_guard: khive_db::EffectiveDiskGuardConfig,
+    volume_lock_dir: &Path,
 ) -> std::process::Command {
     let source = match wal_ceiling.source {
         khive_db::WalCeilingSource::BackendField => "backend_field",
@@ -1168,6 +1228,18 @@ fn events_daemon_command(
         .arg(wal_ceiling.bytes.to_string())
         .arg("--wal-ceiling-source")
         .arg(source)
+        .arg("--disk-reserve-bytes")
+        .arg(disk_guard.reserve_bytes.to_string())
+        .arg("--disk-guard-deadline-ms")
+        .arg(disk_guard.guard_deadline_ms.to_string())
+        .arg("--disk-reserve-source")
+        .arg(disk_guard.reserve_source.as_str())
+        .arg("--disk-deadline-source")
+        .arg(disk_guard.deadline_source.as_str())
+        .arg("--disk-legacy-environment-present")
+        .arg(disk_guard.legacy_environment_present.to_string())
+        .arg("--volume-lock-dir")
+        .arg(volume_lock_dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1191,24 +1263,30 @@ fn events_daemon_command(
 /// user's hands.
 ///
 /// This standalone entry resolves its environment once before opening the
-/// daemon. Hosts with a resolved policy use [`run_events_daemon_with_wal_ceiling`].
+/// daemon. Hosts with resolved policies use [`run_events_daemon_with_policies`].
 #[cfg(unix)]
 pub async fn run_events_daemon(db_path: &Path, socket_path: &Path) -> anyhow::Result<()> {
-    let mut config = crate::RuntimeConfig {
-        db_path: Some(db_path.to_path_buf()),
-        ..crate::RuntimeConfig::no_embeddings()
-    };
-    let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
-    run_events_daemon_with_wal_ceiling(db_path, socket_path, wal_ceiling).await
+    let (wal_ceiling, disk_guard, volume_lock_dir) = standalone_daemon_policies(db_path)?;
+    run_events_daemon_with_policies(
+        db_path,
+        socket_path,
+        wal_ceiling,
+        disk_guard,
+        volume_lock_dir,
+    )
+    .await
 }
 
-/// Serve the events daemon with a policy already resolved by its host.
+/// Serve using the exact policies inherited from the opened main backend.
 #[cfg(unix)]
-pub async fn run_events_daemon_with_wal_ceiling(
+pub async fn run_events_daemon_with_policies(
     db_path: &Path,
     socket_path: &Path,
     wal_ceiling: WalCeilingPolicy,
+    disk_guard: khive_db::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
 ) -> anyhow::Result<()> {
+    disk_guard.validate()?;
     wal_ceiling
         .validate_static(true, true, false)
         .map_err(crate::error::RuntimeError::from)?;
@@ -1249,8 +1327,14 @@ pub async fn run_events_daemon_with_wal_ceiling(
     // file's mode; the check after the open below opens nothing.
     let before_open = harden_events_db_sidecars(db_path)?;
     let backend = Arc::new(
-        StorageBackend::sqlite_with_max_readers_and_wal_ceiling(db_path, None, wal_ceiling)
-            .map_err(crate::error::RuntimeError::from)?,
+        StorageBackend::sqlite_with_max_readers_and_policies(
+            db_path,
+            None,
+            wal_ceiling,
+            disk_guard,
+            volume_lock_dir,
+        )
+        .map_err(crate::error::RuntimeError::from)?,
     );
     // Ensure the schema once, loudly, before accepting traffic.
     backend.events()?;
@@ -1335,6 +1419,16 @@ pub async fn run_events_daemon_with_wal_ceiling(
         });
     }
 }
+
+#[cfg(unix)]
+#[path = "events_split_policy_entries.rs"]
+mod policy_entries;
+#[cfg(unix)]
+use policy_entries::standalone_daemon_policies;
+#[cfg(unix)]
+pub use policy_entries::{
+    run_events_daemon_with_wal_ceiling, supervise_events_daemon_with_wal_ceiling,
+};
 
 #[cfg(all(test, unix))]
 #[path = "events_wal_policy_tests.rs"]
@@ -2668,177 +2762,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn untrusted_parent_directory_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-        // SQLite's open is path-based: the only sound defense against a
-        // component swapped after validation is refusing directories other
-        // local users can write. A group/other-writable parent is refused
-        // before any open; an owner-only parent proceeds.
-        let dir = tempfile::tempdir().unwrap();
-        let _registry_guard = TestRegistryGuard::new(dir.path());
-        let open_dir = dir.path().join("shared");
-        std::fs::create_dir(&open_dir).unwrap();
-        std::fs::set_permissions(&open_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let refused = direct_backend_for(&open_dir.join("khive.db.events.db"));
-        match refused {
-            Ok(_) => panic!("a world-writable events directory must be refused"),
-            Err(e) => assert!(
-                e.to_string().contains("untrusted directory"),
-                "refusal must name the directory trust rule: {e}"
-            ),
-        }
-        // Control: an owner-only sibling directory passes the same gate.
-        let safe_dir = dir.path().join("owned");
-        std::fs::create_dir(&safe_dir).unwrap();
-        std::fs::set_permissions(&safe_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        direct_backend_for(&safe_dir.join("khive.db.events.db"))
-            .expect("an owner-only events directory must open");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn harden_refuses_a_sidecar_symlink_at_use_time() {
-        use std::os::unix::fs::PermissionsExt;
-        // The hardening step must be coupled to its validation: it opens
-        // each target with O_NOFOLLOW and chmods the returned handle, so a
-        // symlink present AT USE TIME is refused by the open itself — no
-        // lstat-then-chmod window — and the link's target keeps its mode.
-        let dir = tempfile::tempdir().unwrap();
-        let victim = dir.path().join("victim.txt");
-        std::fs::write(&victim, b"v").unwrap();
-        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let db = dir.path().join("db.events.db");
-        std::fs::write(&db, b"").unwrap();
-        let mut wal = db.as_os_str().to_os_string();
-        wal.push("-wal");
-        std::os::unix::fs::symlink(&victim, PathBuf::from(&wal)).unwrap();
-        let result = harden_events_db_sidecars(&db);
-        assert!(
-            result.is_err(),
-            "a symlinked -wal must be refused at hardening time"
-        );
-        let mode = victim.metadata().unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o644, "the link's target must keep its mode");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn lock_symlink_is_refused_and_target_untouched() {
-        use std::os::unix::fs::PermissionsExt;
-        // The daemon lock open is pinned with O_NOFOLLOW and chmods its own
-        // handle: a symlink planted at the lock name must refuse the guard,
-        // and the link's target must keep its inode content and mode. A
-        // plain lock in the same directory must still acquire — the control
-        // that proves the refusal is the symlink, not a broken guard.
-        let dir = tempfile::tempdir().unwrap();
-        let victim = dir.path().join("victim.txt");
-        std::fs::write(&victim, b"v").unwrap();
-        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let socket = dir.path().join("events.sock");
-        std::os::unix::fs::symlink(&victim, socket.with_extension("lock")).unwrap();
-        assert!(
-            matches!(
-                acquire_events_daemon_guard_outcome(&socket),
-                EventsDaemonGuardAcquisition::HardeningRefused(_)
-            ),
-            "a symlinked lock entry must report a hardening refusal"
-        );
-        let mode = victim.metadata().unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o644, "the symlink's target must keep its mode");
-        assert_eq!(std::fs::read(&victim).unwrap(), b"v");
-        let clean = dir.path().join("clean.sock");
-        assert!(
-            matches!(
-                acquire_events_daemon_guard_outcome(&clean),
-                EventsDaemonGuardAcquisition::Held(_)
-            ),
-            "a plain lock path in the same directory must still acquire"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn planted_wal_symlink_is_refused_before_open() {
-        // SQLite creates `-wal` without O_EXCL, so a planted `-wal` symlink
-        // would redirect WAL writes; admission checks the sidecar suffixes
-        // before the database is ever created or opened.
-        let dir = tempfile::tempdir().unwrap();
-        let _registry_guard = TestRegistryGuard::new(dir.path());
-        let victim = dir.path().join("victim.txt");
-        std::fs::write(&victim, b"w").unwrap();
-        let sidecar = dir.path().join("db.events.db");
-        let mut wal = sidecar.as_os_str().to_os_string();
-        wal.push("-wal");
-        std::os::unix::fs::symlink(&victim, PathBuf::from(&wal)).unwrap();
-        assert!(direct_backend_for(&sidecar).is_err());
-        assert!(
-            !sidecar.exists(),
-            "refusal must precede creation of the events database"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn hardening_refuses_a_directory_at_the_database_path_without_touching_it() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("events.db");
-        std::fs::create_dir(&db).unwrap();
-        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let err = harden_events_db_sidecars(&db).unwrap_err().to_string();
-        assert!(err.contains("not a regular file"), "{err}");
-        let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "the directory keeps its mode");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unopened_check_refuses_a_loosened_or_replaced_sidecar() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let db = dir.path().join("events.db");
-        let wal = PathBuf::from(format!("{}-wal", db.display()));
-        let shm = PathBuf::from(format!("{}-shm", db.display()));
-        for path in [&db, &wal] {
-            std::fs::write(path, b"").unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let before_open = harden_events_db_sidecars(&db).unwrap();
-        // Owner-only regular files, an absent `-shm`: nothing to refuse.
-        verify_events_db_owner_only_unopened(&db, &before_open).unwrap();
-
-        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let err = verify_events_db_owner_only_unopened(&db, &before_open)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("events.db-wal") && err.contains("644"),
-            "{err}"
-        );
-        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
-        verify_events_db_owner_only_unopened(&db, &before_open).unwrap();
-
-        // A link planted at the `-shm` name is refused as not a regular file,
-        // and the check never followed it: the target keeps its mode.
-        let victim = dir.path().join("victim");
-        std::fs::write(&victim, b"").unwrap();
-        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
-        std::os::unix::fs::symlink(&victim, &shm).unwrap();
-        let err = verify_events_db_owner_only_unopened(&db, &before_open)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("events.db-shm") && err.contains("regular file"),
-            "{err}"
-        );
-        assert_eq!(
-            std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
-            0o644
-        );
-    }
+    include!("events_sidecar_hardening_tests.rs");
 
     #[cfg(unix)]
     fn write_owner_only_test_file(path: &Path) {

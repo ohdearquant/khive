@@ -29,4 +29,24 @@ impl StorageBackend {
             Self::sqlite_with_pool_config(path, config, max_readers)
         }
     }
+
+    /// Writable [`Self::sqlite_with_claimed_file_identity`] that carries the
+    /// host's captured disk policy and shared volume-lock directory.
+    pub fn sqlite_with_claimed_file_identity_and_policies(
+        path: impl AsRef<Path>,
+        max_readers: Option<usize>,
+        wal_ceiling: WalCeilingPolicy,
+        expected: DatabaseFileIdentity,
+        disk_guard_config: crate::EffectiveDiskGuardConfig,
+        volume_lock_dir: std::path::PathBuf,
+    ) -> Result<Self, SqliteError> {
+        let config = PoolConfig {
+            expected_file_identity: Some(expected),
+            wal_ceiling,
+            disk_guard_config: Some(disk_guard_config),
+            volume_lock_dir: Some(volume_lock_dir),
+            ..PoolConfig::default()
+        };
+        Self::sqlite_with_pool_config(path, config, max_readers)
+    }
 }

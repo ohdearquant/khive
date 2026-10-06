@@ -30,6 +30,7 @@ use crate::pack::KindHook;
 #[path = "runtime/config_access.rs"]
 mod config_access;
 mod embedder_init;
+mod events_disk_policy;
 mod serving_policy;
 
 #[cfg(all(test, target_os = "macos"))]
@@ -437,8 +438,23 @@ impl KhiveRuntime {
     /// already-prepared backend.
     pub fn new(mut config: RuntimeConfig) -> RuntimeResult<Self> {
         let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
+        let disk_guard = config.resolve_disk_guard_policy(false)?;
+        // Refuse a missing lock directory before the constructor below creates
+        // the database's parent directory.
+        let volume_lock_dir = if config.db_path.is_some() {
+            let configured = config.volume_lock_dir.clone();
+            Some(khive_db::require_volume_lock_dir(configured)?)
+        } else {
+            None
+        };
         Self::new_with_file_backend(config, true, |path| {
-            StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, None, wal_ceiling)
+            StorageBackend::sqlite_with_max_readers_and_policies(
+                path,
+                None,
+                wal_ceiling,
+                disk_guard.expect("file-backed disk policy"),
+                volume_lock_dir.expect("file-backed volume-lock directory"),
+            )
         })
     }
 
@@ -446,8 +462,13 @@ impl KhiveRuntime {
     #[cfg(any(test, feature = "test-internals"))]
     pub fn new_for_test(mut config: RuntimeConfig) -> RuntimeResult<Self> {
         let wal_ceiling = config.resolve_wal_ceiling_policy(false)?;
+        let disk_guard = config.resolve_disk_guard_policy(false)?;
         Self::new_with_file_backend(config, true, |path| {
-            StorageBackend::sqlite_with_max_readers_and_wal_ceiling(path, Some(2), wal_ceiling)
+            StorageBackend::sqlite_for_test_with_policies(
+                path,
+                wal_ceiling,
+                disk_guard.expect("file-backed disk policy"),
+            )
         })
     }
 
@@ -1185,13 +1206,14 @@ impl KhiveRuntime {
                     if !split.db_path.exists() {
                         return Ok(legacy);
                     }
-                    let lane_backend =
-                        crate::events_split::direct_backend_with_max_readers_and_wal_ceiling(
-                            &split.db_path,
-                            true,
-                            Some(self.backend.pool().config().max_readers),
-                            self.events_wal_ceiling_policy(),
-                        )?;
+                    let lane_backend = crate::events_split::direct_backend_with_policies(
+                        &split.db_path,
+                        true,
+                        Some(self.backend.pool().config().max_readers),
+                        self.events_wal_ceiling_policy(),
+                        None,
+                        self.events_volume_lock_dir(),
+                    )?;
                     self.register_late_diagnostic_pool("events", &lane_backend.pool_arc());
                     let lane = lane_backend.events_for_namespace(namespace)?;
                     return Ok(Arc::new(crate::events_split::SplitEventStore::new(
@@ -1215,13 +1237,14 @@ impl KhiveRuntime {
                         ));
                     }
                     None => {
-                        let lane_backend =
-                            crate::events_split::direct_backend_with_max_readers_and_wal_ceiling(
-                                &split.db_path,
-                                false,
-                                Some(self.backend.pool().config().max_readers),
-                                self.events_wal_ceiling_policy(),
-                            )?;
+                        let lane_backend = crate::events_split::direct_backend_with_policies(
+                            &split.db_path,
+                            false,
+                            Some(self.backend.pool().config().max_readers),
+                            self.events_wal_ceiling_policy(),
+                            Some(self.events_disk_guard_policy()?),
+                            self.events_volume_lock_dir(),
+                        )?;
                         self.register_late_diagnostic_pool("events", &lane_backend.pool_arc());
                         lane_backend.events_for_namespace(namespace)?
                     }
@@ -1263,18 +1286,22 @@ impl KhiveRuntime {
                     return Ok(None);
                 }
                 let backend = if self.backend.is_read_only() {
-                    crate::events_split::direct_backend_with_max_readers_and_wal_ceiling(
+                    crate::events_split::direct_backend_with_policies(
                         &split.db_path,
                         true,
                         Some(self.backend.pool().config().max_readers),
                         self.events_wal_ceiling_policy(),
+                        None,
+                        self.events_volume_lock_dir(),
                     )?
                 } else {
-                    crate::events_split::direct_backend_with_max_readers_and_wal_ceiling(
+                    crate::events_split::direct_backend_with_policies(
                         &split.db_path,
                         false,
                         Some(self.backend.pool().config().max_readers),
                         self.events_wal_ceiling_policy(),
+                        Some(self.events_disk_guard_policy()?),
+                        self.events_volume_lock_dir(),
                     )?
                 };
                 self.register_late_diagnostic_pool("events", &backend.pool_arc());
@@ -2634,6 +2661,7 @@ mod tests {
     }
 
     include!("runtime_blob_hydrator_tests.rs");
+    include!("runtime_volume_lock_dir_tests.rs");
 
     #[test]
     fn fresh_tail_policy_is_instance_scoped_and_clone_stable() {
@@ -2650,52 +2678,7 @@ mod tests {
         assert!(!disabled.clone().ann_fresh_tail_enabled());
     }
 
-    #[tokio::test]
-    async fn runtime_db_diagnostics_supplies_both_contention_counter_sources() {
-        let dir = tempfile::tempdir().expect("diagnostics database directory");
-        let mut config = RuntimeConfig::no_embeddings();
-        config.db_path = Some(dir.path().join("runtime-diagnostics.db"));
-        let rt = KhiveRuntime::new_for_test(config).expect("file-backed runtime should create");
-
-        let report = rt.db_diagnostics().await.expect("diagnostics succeed");
-
-        #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
-        assert_eq!(
-            report.wal_pin.reporting_process_is_holder,
-            Some(true),
-            "the runtime report identifies its own process as a database holder"
-        );
-
-        assert!(
-            report.writer_contention.writer_acquisitions >= 1,
-            "runtime construction runs migrations through the finite-wait pooled writer"
-        );
-        assert_eq!(
-            report.writer_contention.writer_acquisitions,
-            report
-                .writer_contention
-                .pooled_writer_acquisitions
-                .saturating_add(report.writer_contention.standalone_writer_acquisitions)
-                .saturating_add(report.writer_contention.writer_task_acquisitions),
-            "the public aggregate must equal the class-specific snapshot"
-        );
-        assert!(
-            report.writer_contention.audit_append_failures.is_some(),
-            "the runtime path must supply its process-wide swallowed-audit counter"
-        );
-        assert!(report
-            .writer_contention
-            .audit_obligation_append_failures
-            .is_some());
-        assert!(report
-            .writer_contention
-            .audit_obligation_append_failures_unavailable_reason
-            .is_none());
-        assert!(report
-            .writer_contention
-            .audit_append_failures_unavailable_reason
-            .is_none());
-    }
+    include!("runtime_db_diagnostics_counter_tests.rs");
 
     #[test]
     fn diagnostics_tracks_late_events_sidecar_without_retaining_its_pool() {
@@ -2984,10 +2967,19 @@ mod tests {
             "control: prefix must miss before the lane row exists"
         );
 
-        let lane = crate::events_split::direct_backend_for(&sidecar_path)
-            .expect("lane backend")
-            .events_for_namespace("local")
-            .expect("lane store");
+        // One process opens the lane with one set of policies: the test
+        // runtime's pool carries the test lock directory, so the lane uses it.
+        let lane = crate::events_split::direct_backend_with_policies(
+            &sidecar_path,
+            false,
+            None,
+            rt.events_wal_ceiling_policy(),
+            Some(rt.events_disk_guard_policy().expect("events disk policy")),
+            rt.events_volume_lock_dir(),
+        )
+        .expect("lane backend")
+        .events_for_namespace("local")
+        .expect("lane store");
         lane.append_event(event).await.expect("lane append");
 
         assert_eq!(

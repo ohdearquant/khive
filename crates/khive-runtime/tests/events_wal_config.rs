@@ -40,6 +40,7 @@ fn run_case(case: &str, raw: Option<&str>) {
         .args(["--exact", "events_wal_child", "--ignored", "--nocapture"])
         .env_clear()
         .env("HOME", root.path().join("home"))
+        .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
         .env(TIMEOUT_SINK_ENV, root.path().join("writer-timeouts"))
         .env(CHILD_CASE, case)
         .env(CHILD_ROOT, root.path());

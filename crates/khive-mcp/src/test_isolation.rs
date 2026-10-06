@@ -49,6 +49,7 @@ pub(crate) fn rerun_with_private_home() -> bool {
     command
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env("HOME", home.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", home.path().join("volume-locks"))
         .env("USERPROFILE", home.path())
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_CACHE_HOME", home.path().join("cache"))

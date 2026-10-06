@@ -341,6 +341,15 @@ pub struct RuntimeConfig {
     /// this same value to resolve every named backend before forwarding or
     /// opening it, without rereading mutable process environment.
     pub wal_ceiling_env_raw: Option<String>,
+    /// One snapshot for named backend resolution and daemon compatibility.
+    pub disk_guard_environment: khive_db::DiskGuardEnvironment,
+    /// Captured implicit-main policy, or an explicit caller-supplied policy.
+    pub disk_guard_config: Option<khive_db::EffectiveDiskGuardConfig>,
+    /// Directory for the SQLite volume lock files, captured with the rest of
+    /// boot configuration from [`crate::daemon::volume_lock_dir`]. `None` means
+    /// no directory could be resolved; every writable file-backed open then
+    /// fails with a configuration error naming `KHIVE_VOLUME_LOCK_DIR`.
+    pub volume_lock_dir: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
     /// Local embedding model. `None` alone does not disable embedding: setting
@@ -555,6 +564,9 @@ impl Default for RuntimeConfig {
             wal_ceiling_source: WalCeilingSource::Default,
             wal_ceiling_env_raw: std::env::var_os("KHIVE_SQLITE_WAL_CEILING_BYTES")
                 .map(|value| value.to_string_lossy().into_owned()),
+            disk_guard_environment: khive_db::DiskGuardEnvironment::capture(),
+            disk_guard_config: None,
+            volume_lock_dir: crate::daemon::volume_lock_dir().ok(),
             default_namespace: Namespace::local(),
             embedding_model,
             additional_embedding_models,
@@ -634,12 +646,46 @@ impl RuntimeConfig {
         Ok(self.wal_ceiling_policy())
     }
 
+    /// Resolve the implicit backend's disk reserve and guard deadline from the
+    /// config's captured environment, unless a caller already supplied a policy.
+    /// Read-only and in-memory backends have no writer to guard.
+    pub fn resolve_disk_guard_policy(
+        &mut self,
+        read_only: bool,
+    ) -> RuntimeResult<Option<khive_db::EffectiveDiskGuardConfig>> {
+        if self.db_path.is_none() {
+            if self
+                .disk_guard_config
+                .is_some_and(|policy| policy.reserve_bytes != 0)
+            {
+                return Err(khive_db::SqliteError::InvalidConfig(
+                    "nonzero disk_reserve_bytes requires a file-backed SQLite backend".into(),
+                )
+                .into());
+            }
+            return Ok(None);
+        }
+        if read_only {
+            return Ok(None);
+        }
+        let policy = match self.disk_guard_config {
+            Some(policy) => {
+                policy.validate()?;
+                policy
+            }
+            None => self.disk_guard_environment.resolve(None, None)?,
+        };
+        self.disk_guard_config = Some(policy);
+        Ok(Some(policy))
+    }
+
     /// Pack-registry discovery has no file-backed writer to govern.
     pub fn for_metadata_registry(mut self) -> Self {
         self.db_path = None;
         self.wal_ceiling_bytes = 0;
         self.wal_ceiling_configured_bytes = 0;
         self.wal_ceiling_source = WalCeilingSource::BackendField;
+        self.disk_guard_config = None;
         self.embedding_model = None;
         self.additional_embedding_models.clear();
         self

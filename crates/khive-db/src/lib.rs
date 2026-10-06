@@ -76,6 +76,10 @@ pub use checkpoint::{
 };
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
+pub use disk_guard_config::{
+    default_volume_lock_dir, require_volume_lock_dir, resolve_disk_guard_config,
+    DiskGuardConfigSource, DiskGuardEnvironment, EffectiveDiskGuardConfig,
+};
 pub use error::{
     SqliteError, SQLITE_WAL_CAPACITY_REFUSED_STAGE, SQLITE_WAL_CAPACITY_UNAVAILABLE_STAGE,
 };
@@ -92,8 +96,8 @@ pub use khive_storage::{
 };
 pub use migrations::{
     inspect_schema_is_current, inspect_schema_version, query_embedding_models, read_schema_version,
-    run_migrations, EmbeddingModelRegistryRecord, Migration, ServiceSchemaPlan, VersionedMigration,
-    MIGRATIONS,
+    run_migrations, EmbeddingModelRegistryRecord, Migration, MigrationWritePolicy,
+    ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{
     CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,

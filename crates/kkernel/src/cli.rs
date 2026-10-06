@@ -164,6 +164,49 @@ struct EventsDaemonArgs {
     /// Configuration source of the resolved main-backend WAL ceiling.
     #[arg(long, value_enum, requires = "wal_ceiling_bytes")]
     wal_ceiling_source: Option<EventsWalCeilingSource>,
+
+    /// Exact disk admission policy captured by the supervising main backend.
+    #[arg(
+        long,
+        requires_all = [
+            "disk_guard_deadline_ms",
+            "disk_reserve_source",
+            "disk_deadline_source",
+            "disk_legacy_environment_present",
+            "volume_lock_dir",
+        ]
+    )]
+    disk_reserve_bytes: Option<u64>,
+    #[arg(long, requires = "disk_reserve_bytes")]
+    disk_guard_deadline_ms: Option<u64>,
+    #[arg(long, value_enum, requires = "disk_reserve_bytes")]
+    disk_reserve_source: Option<EventsDiskGuardSource>,
+    #[arg(long, value_enum, requires = "disk_reserve_bytes")]
+    disk_deadline_source: Option<EventsDiskGuardSource>,
+    #[arg(long, requires = "disk_reserve_bytes")]
+    disk_legacy_environment_present: Option<bool>,
+    #[arg(long, requires = "disk_reserve_bytes")]
+    volume_lock_dir: Option<PathBuf>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum EventsDiskGuardSource {
+    Backend,
+    Environment,
+    #[value(name = "legacy_environment")]
+    LegacyEnvironment,
+    Default,
+}
+
+impl From<EventsDiskGuardSource> for khive_db::DiskGuardConfigSource {
+    fn from(source: EventsDiskGuardSource) -> Self {
+        match source {
+            EventsDiskGuardSource::Backend => Self::Backend,
+            EventsDiskGuardSource::Environment => Self::Environment,
+            EventsDiskGuardSource::LegacyEnvironment => Self::LegacyEnvironment,
+            EventsDiskGuardSource::Default => Self::Default,
+        }
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,6 +221,45 @@ enum EventsWalCeilingSource {
 
 #[cfg(any(unix, test))]
 impl EventsDaemonArgs {
+    fn disk_guard_policy(&self) -> Result<Option<(khive_db::EffectiveDiskGuardConfig, PathBuf)>> {
+        match (
+            self.disk_reserve_bytes,
+            self.disk_guard_deadline_ms,
+            self.disk_reserve_source,
+            self.disk_deadline_source,
+            self.disk_legacy_environment_present,
+            self.volume_lock_dir.as_ref(),
+        ) {
+            (None, None, None, None, None, None) => Ok(None),
+            (
+                Some(reserve_bytes),
+                Some(guard_deadline_ms),
+                Some(reserve_source),
+                Some(deadline_source),
+                Some(legacy_environment_present),
+                Some(directory),
+            ) => {
+                let policy = khive_db::EffectiveDiskGuardConfig {
+                    reserve_bytes,
+                    guard_deadline_ms,
+                    reserve_source: reserve_source.into(),
+                    deadline_source: deadline_source.into(),
+                    legacy_environment_present,
+                };
+                policy.validate()?;
+                anyhow::ensure!(
+                    directory.is_absolute(),
+                    "events-daemon: volume lock directory must be absolute"
+                );
+                Ok(Some((policy, directory.clone())))
+            }
+            _ => anyhow::bail!(
+                "events-daemon: supply the complete captured disk policy and volume lock \
+                 directory"
+            ),
+        }
+    }
+
     fn wal_ceiling_policy(&self) -> Result<Option<khive_db::WalCeilingPolicy>> {
         match (self.wal_ceiling_bytes, self.wal_ceiling_source) {
             (None, None) => Ok(None),
@@ -392,6 +474,7 @@ pub async fn cli_main() -> Result<()> {
         #[cfg(unix)]
         Command::EventsDaemon(a) => {
             let wal_ceiling = a.wal_ceiling_policy()?;
+            let disk_guard = a.disk_guard_policy()?;
             let db = match a.db {
                 Some(db) => db,
                 None => {
@@ -407,6 +490,26 @@ pub async fn cli_main() -> Result<()> {
             let socket = a
                 .socket
                 .unwrap_or_else(|| khive_runtime::events_split::events_socket_path_beside(&db));
+            if let Some((disk_guard, volume_lock_dir)) = disk_guard {
+                let wal_ceiling = match wal_ceiling {
+                    Some(policy) => policy,
+                    None => {
+                        let mut config = RuntimeConfig {
+                            db_path: Some(db.clone()),
+                            ..RuntimeConfig::no_embeddings()
+                        };
+                        config.resolve_wal_ceiling_policy(false)?
+                    }
+                };
+                return khive_runtime::events_split::run_events_daemon_with_policies(
+                    &db,
+                    &socket,
+                    wal_ceiling,
+                    disk_guard,
+                    volume_lock_dir,
+                )
+                .await;
+            }
             match wal_ceiling {
                 Some(policy) => {
                     khive_runtime::events_split::run_events_daemon_with_wal_ceiling(
@@ -1230,6 +1333,56 @@ mod events_wal_policy_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn events_daemon_disk_policy_round_trips_and_rejects_partial_or_invalid_input() {
+        let argv = [
+            "events-daemon",
+            "--disk-reserve-bytes",
+            "0",
+            "--disk-guard-deadline-ms",
+            "321",
+            "--disk-reserve-source",
+            "backend",
+            "--disk-deadline-source",
+            "environment",
+            "--disk-legacy-environment-present",
+            "true",
+            "--volume-lock-dir",
+            "/fixture/with spaces/locks",
+        ];
+        let args = <super::EventsDaemonArgs as clap::Parser>::try_parse_from(argv).unwrap();
+        let (policy, directory) = args.disk_guard_policy().unwrap().unwrap();
+        assert_eq!((policy.reserve_bytes, policy.guard_deadline_ms), (0, 321));
+        assert_eq!(
+            policy.reserve_source,
+            khive_db::DiskGuardConfigSource::Backend
+        );
+        assert_eq!(
+            policy.deadline_source,
+            khive_db::DiskGuardConfigSource::Environment
+        );
+        assert!(policy.legacy_environment_present);
+        assert_eq!(
+            directory,
+            std::path::Path::new("/fixture/with spaces/locks")
+        );
+        for start in [1, 3, 5, 7, 9, 11] {
+            let mut partial = argv.to_vec();
+            partial.drain(start..start + 2);
+            assert!(<super::EventsDaemonArgs as clap::Parser>::try_parse_from(partial).is_err());
+        }
+        for invalid in ["0", "99", "10001"] {
+            let mut args = argv;
+            args[4] = invalid;
+            assert!(
+                <super::EventsDaemonArgs as clap::Parser>::try_parse_from(args)
+                    .unwrap()
+                    .disk_guard_policy()
+                    .is_err()
+            );
+        }
+    }
+
     use super::*;
     use clap::CommandFactory;
     use serial_test::serial;
@@ -1247,7 +1400,8 @@ mod tests {
     ) -> Option<khive_storage::ContentRef> {
         use khive_db::migrations::{ATTACHMENT_CUTOVER_VERSION, MIGRATIONS};
 
-        let backend = khive_db::StorageBackend::sqlite(path).expect("open V20 fixture backend");
+        let backend =
+            khive_db::StorageBackend::sqlite_for_test(path).expect("open V20 fixture backend");
         let mut writer = backend
             .pool()
             .try_writer()
@@ -1494,7 +1648,8 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let path = tmp.path().join("corrupt-v21.db");
         let config = write_empty_config(tmp.path());
-        let backend = khive_db::StorageBackend::sqlite(&path).expect("open fixture backend");
+        let backend =
+            khive_db::StorageBackend::sqlite_for_test(&path).expect("open fixture backend");
         backend
             .prepare_core_schema()
             .expect("prepare canonical V21");
@@ -1551,7 +1706,8 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let main = tmp.path().join("main.db");
         let secondary = tmp.path().join("secondary.db");
-        let main_backend = khive_db::StorageBackend::sqlite(&main).expect("open main fixture");
+        let main_backend =
+            khive_db::StorageBackend::sqlite_for_test(&main).expect("open main fixture");
         main_backend
             .prepare_core_schema()
             .expect("prepare current main fixture");
@@ -1603,7 +1759,7 @@ mod tests {
         let entity_id = uuid::Uuid::new_v4();
         let content_ref = ContentRef::from_hex("a".repeat(64)).expect("canonical fixture ref");
 
-        let backend = StorageBackend::sqlite(&path).expect("open V20 fixture backend");
+        let backend = StorageBackend::sqlite_for_test(&path).expect("open V20 fixture backend");
         {
             let mut writer = backend.pool().try_writer().expect("V20 fixture writer");
             let conn = writer.conn_mut();
@@ -1657,7 +1813,7 @@ mod tests {
         .await
         .expect("admin migrate must coordinate V21 rather than stop at V20");
 
-        let migrated = StorageBackend::sqlite(&path).expect("reopen migrated database");
+        let migrated = StorageBackend::sqlite_for_test(&path).expect("reopen migrated database");
         assert_eq!(
             migrated.prepare_core_schema().unwrap(),
             khive_db::migrations::latest_schema_version()
@@ -1698,7 +1854,7 @@ mod tests {
         assert!(rendered.contains("secondary"), "{rendered}");
 
         let main_backend =
-            khive_db::StorageBackend::sqlite(&main).expect("inspect blocked main backend");
+            khive_db::StorageBackend::sqlite_for_test(&main).expect("inspect blocked main backend");
         assert_eq!(
             main_backend.schema_version().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1,
@@ -1710,8 +1866,8 @@ mod tests {
         );
         drop(main_backend);
 
-        let secondary_backend =
-            khive_db::StorageBackend::sqlite(&secondary).expect("curate blocked secondary");
+        let secondary_backend = khive_db::StorageBackend::sqlite_for_test(&secondary)
+            .expect("curate blocked secondary");
         secondary_backend
             .pool()
             .try_writer()
@@ -1732,8 +1888,8 @@ mod tests {
         .await
         .expect("curated topology must complete secondary then main");
         for path in [&secondary, &main] {
-            let backend =
-                khive_db::StorageBackend::sqlite(path).expect("inspect completed topology backend");
+            let backend = khive_db::StorageBackend::sqlite_for_test(path)
+                .expect("inspect completed topology backend");
             assert_eq!(
                 backend.schema_version().unwrap(),
                 khive_db::migrations::latest_schema_version()
@@ -1768,8 +1924,8 @@ mod tests {
         .await
         .expect("named empty secondary migration");
 
-        let main_backend = khive_db::StorageBackend::sqlite(&main).unwrap();
-        let secondary_backend = khive_db::StorageBackend::sqlite(&secondary).unwrap();
+        let main_backend = khive_db::StorageBackend::sqlite_for_test(&main).unwrap();
+        let secondary_backend = khive_db::StorageBackend::sqlite_for_test(&secondary).unwrap();
         assert_eq!(
             main_backend.schema_version().unwrap(),
             ATTACHMENT_CUTOVER_VERSION - 1
@@ -1821,7 +1977,7 @@ mod tests {
         })
         .await
         .expect("one declared main must use topology path");
-        let backend = khive_db::StorageBackend::sqlite(&main).unwrap();
+        let backend = khive_db::StorageBackend::sqlite_for_test(&main).unwrap();
         assert_eq!(
             backend.schema_version().unwrap(),
             khive_db::migrations::latest_schema_version()
@@ -2013,6 +2169,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -2502,6 +2660,8 @@ no_embed = true
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: false,
         });
@@ -2542,6 +2702,8 @@ no_embed = true
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
@@ -2552,6 +2714,8 @@ no_embed = true
                     cache_mb: None,
                     journal_mode: None,
                     wal_ceiling_bytes: None,
+                    disk_reserve_bytes: None,
+                    disk_guard_deadline_ms: None,
                     served_kinds: None,
                     read_only: false,
                 },
