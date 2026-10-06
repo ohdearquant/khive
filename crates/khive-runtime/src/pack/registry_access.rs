@@ -327,6 +327,9 @@ impl VerbRegistry {
     /// - `git.checkout`, `git.diff` and `git.reconcile` persist a durable
     ///   receipt on every dispatch (checkout and diff also write a manifest
     ///   or diff blob), so their accounting row is not droppable.
+    /// - `tool.check` persists a policy decision receipt. `git.receipts`,
+    ///   `git.gates`, `git.status` and `git.log` dispatch that same check,
+    ///   so their read results also carry a required decision write.
     ///
     /// What membership here means, precisely: the verb performs no domain
     /// mutation, so its OWN per-dispatch audit/accounting row may be dropped
@@ -371,12 +374,7 @@ impl VerbRegistry {
         ("exec", "exec.runs"),
         ("exec", "exec.events"),
         ("exec", "exec.identity"),
-        // git (receipt list, allowlist, working-tree and history reads;
-        // checkout, diff and reconcile persist receipts and are excluded)
-        ("git", "git.receipts"),
-        ("git", "git.gates"),
-        ("git", "git.status"),
-        ("git", "git.log"),
+        // git
         // Canonical get project check plus bounded cursor SELECT; no domain writes.
         ("git", "git.ingest_cursor"),
         // blob
@@ -441,7 +439,6 @@ impl VerbRegistry {
         ("tool", "tool.suggest"),
         ("tool", "tool.describe"),
         ("tool", "tool.list"),
-        ("tool", "tool.check"),
         ("tool", "tool.requests"),
         ("tool", "tool.policies"),
     ];
