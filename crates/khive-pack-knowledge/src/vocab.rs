@@ -9,8 +9,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibili
 /// assigned backend. Both statements are idempotent for repeated startup.
 pub(crate) static KNOWLEDGE_SCHEMA_PLAN_STMTS: [&str; 2] = [
     khive_runtime::sql!("knowledge_eval_runs_create"),
-    "CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_ns_run_at \
-        ON knowledge_eval_runs(namespace, run_at DESC)",
+    khive_runtime::sql!("knowledge_eval_runs_ns_run_at_index"),
 ];
 
 pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 20] = [
