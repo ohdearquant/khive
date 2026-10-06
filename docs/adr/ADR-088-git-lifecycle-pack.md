@@ -126,7 +126,7 @@ conservatively, not less.
 
 ### Why `annotates` and not a new relation
 
-The 17-relation edge ontology (ADR-002, extended by ADR-055) is closed by design; adding a
+The edge ontology defined by ADR-002, as amended, is closed by design; adding a
 relation requires demonstrating that no existing relation fits. `annotates` was designed
 for exactly this shape — a note commenting on, or providing evidence about, an entity or
 another note — and `finding` already uses it for the identical purpose (annotating
