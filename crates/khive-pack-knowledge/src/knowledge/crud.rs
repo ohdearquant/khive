@@ -885,7 +885,7 @@ impl KnowledgeHandlers {
             // its own mirror atom instead of the canonical domain record.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_get_id").into(),
                     params: vec![SqlValue::Text(resolved_id.clone())],
                     label: Some("knowledge.get.domain_by_id".into()),
                 })
@@ -898,9 +898,7 @@ impl KnowledgeHandlers {
             }
             let row = reader
                 .query_row(SqlStatement {
-                    sql:
-                        "SELECT * FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                            .into(),
+                    sql: khive_runtime::sql!("knowledge_atom_get_id").into(),
                     params: vec![SqlValue::Text(resolved_id)],
                     label: Some("knowledge.get.atom_by_id".into()),
                 })
@@ -974,10 +972,10 @@ impl KnowledgeHandlers {
         let cursor_key = if let Some(after_id) = after_id {
             let cursor_sql = match kind {
                 KnowledgeListKind::Atom => {
-                    "SELECT created_at, id FROM knowledge_atoms WHERE namespace = ?1 AND id = ?2 AND tags NOT LIKE '%type:domain%' LIMIT 1"
+                    khive_runtime::sql!("knowledge_atom_cursor_key")
                 }
                 KnowledgeListKind::Domain => {
-                    "SELECT created_at, id FROM knowledge_domains WHERE namespace = ?1 AND id = ?2 LIMIT 1"
+                    khive_runtime::sql!("knowledge_domain_cursor_key")
                 }
             };
             let row = reader
