@@ -3657,6 +3657,7 @@ fn converted_crates_keep_their_sql_out_of_rust() {
     const CONVERTED: &[&str] = &[
         "khive-pack-brain",
         "khive-pack-git",
+        "khive-pack-gtd",
         "khive-pack-kg",
         "kkernel",
     ];

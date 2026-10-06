@@ -22,7 +22,10 @@ use super::declaration::{
 
 #[path = "route_census_parsed_sources.rs"]
 mod parsed_sources;
+#[path = "../../tests/support/static_sql_source.rs"]
+mod static_sql_source;
 use parsed_sources::{index_module_bindings, parse_production_sources, scan_source};
+use static_sql_source::{CanonicalBindings, StaticSqlSources};
 
 const STORE_WRITES: &[&str] = &[
     "upsert_entity",
@@ -163,6 +166,8 @@ struct RuntimeTableSite {
 struct SourcePopulation {
     properties: Vec<Site>,
     runtime_tables: Vec<RuntimeTableSite>,
+    /// SQL assets that a followed loader resolved, for the asset-side reach check.
+    resolved_sql: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +177,8 @@ struct SqlConstantReference {
 }
 
 struct ScannedSource {
+    sql_errors: Vec<String>,
+    resolved_sql: BTreeSet<String>,
     sites: Vec<Site>,
     runtime_tables: Vec<RuntimeTableSite>,
     /// Every expression path has an ordinal, whether or not it resolves. Both
@@ -1126,6 +1133,10 @@ fn shadow_bindings<'a>(patterns: impl Iterator<Item = &'a Pat>) -> SqlBindings {
 }
 
 struct SourceCollector<'modules> {
+    sql_sources: &'modules StaticSqlSources,
+    loader_bindings: CanonicalBindings,
+    sql_errors: Vec<String>,
+    resolved_sql: BTreeSet<String>,
     path: String,
     scope: Vec<String>,
     sites: BTreeMap<String, Site>,
@@ -1259,6 +1270,8 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
         if test_only(&item.attrs) {
             return;
         }
+        let nested = static_sql_source::module_bindings(item, &self.loader_bindings, test_only);
+        let outer_loaders = std::mem::replace(&mut self.loader_bindings, nested);
         let mut parents = self.parent_module_bindings.clone();
         parents.push(self.bindings.first().cloned().unwrap_or_default());
         let mut child_module = self.module_id.clone();
@@ -1290,6 +1303,15 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
         self.parent_module_bindings.pop();
         self.bindings = outer_bindings;
         self.module_id = outer_module;
+        self.loader_bindings = outer_loaders;
+        self.loader_bindings.observe_module(item);
+    }
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if !test_only(&item.attrs) {
+            self.loader_bindings.observe_macro(item);
+            syn::visit::visit_item_macro(self, item);
+        }
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
@@ -1339,6 +1361,8 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
     }
 
     fn visit_block(&mut self, block: &'ast Block) {
+        let nested = static_sql_source::block_bindings(block, &self.loader_bindings, test_only);
+        let outer_loaders = std::mem::replace(&mut self.loader_bindings, nested);
         let mut block_bindings = use_bindings(
             block.stmts.iter().filter_map(|stmt| {
                 if let Stmt::Item(syn::Item::Use(item)) = stmt {
@@ -1363,6 +1387,7 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
         self.bindings.push(block_bindings);
         syn::visit::visit_block(self, block);
         self.bindings.pop();
+        self.loader_bindings = outer_loaders;
     }
 
     fn visit_local(&mut self, local: &'ast Local) {
@@ -1516,6 +1541,28 @@ impl<'ast, 'modules> Visit<'ast> for SourceCollector<'modules> {
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
+        match static_sql_source::resolve_static_sql(
+            &self.path,
+            mac,
+            self.sql_sources,
+            &self.loader_bindings,
+        ) {
+            Ok(Some(sql)) => {
+                self.resolved_sql.insert(sql.asset_path);
+                self.record_sql(&sql.produced_text, (0, 0));
+                return;
+            }
+            Err(error) => {
+                self.sql_errors.push(error);
+                return;
+            }
+            Ok(None) => {}
+        }
+        if static_sql_source::opaque_sql_loader(mac) {
+            self.sql_errors
+                .push(format!("{}: uninspectable nested SQL loader", self.path));
+            return;
+        }
         // Visit vec! through its parsed expressions once. A preceding token
         // literal pass would count the same SQL literal a second time.
         if mac.path.is_ident("vec") {
@@ -1885,8 +1932,16 @@ fn test_module_files(
 }
 
 fn scan_source_population(sources: &[(String, String)]) -> Result<SourcePopulation, String> {
+    scan_source_population_with_sql(sources, &StaticSqlSources::new())
+}
+
+fn scan_source_population_with_sql(
+    sources: &[(String, String)],
+    sql_sources: &StaticSqlSources,
+) -> Result<SourcePopulation, String> {
     let (skipped, roots) = test_module_files(sources).map_err(|error| error.to_string())?;
     let parsed = parse_production_sources(sources, &skipped)?;
+    let loader_bindings = static_sql_source::canonical_bindings(&parsed, test_only);
     // The census resolves every path twice. The strict resolution stops at a
     // name that it cannot classify as a module, and the lenient one looks past
     // it. A path that only the lenient resolution takes to a note SQL constant
@@ -1896,6 +1951,7 @@ fn scan_source_population(sources: &[(String, String)]) -> Result<SourcePopulati
     let mut strict_references = BTreeMap::new();
     let mut runtime_tables = BTreeMap::new();
     let mut lenient = Vec::new();
+    let mut resolved_sql = BTreeSet::new();
     for is_strict in [true, false] {
         let (modules, file_modules) = index_module_bindings(&parsed, &roots, is_strict);
         for (path, file) in &parsed {
@@ -1903,8 +1959,20 @@ fn scan_source_population(sources: &[(String, String)]) -> Result<SourcePopulati
                 .get(path)
                 .cloned()
                 .expect("indexed production source");
-            let scanned = scan_source(path, file, module_id, &modules, is_strict);
+            let scanned = scan_source(
+                path,
+                file,
+                module_id,
+                &modules,
+                is_strict,
+                sql_sources,
+                loader_bindings[path].clone(),
+            );
+            if !scanned.sql_errors.is_empty() {
+                return Err(scanned.sql_errors.join("\n"));
+            }
             if is_strict {
+                resolved_sql.extend(scanned.resolved_sql);
                 runtime_tables.extend(
                     scanned
                         .runtime_tables
@@ -1955,7 +2023,34 @@ fn scan_source_population(sources: &[(String, String)]) -> Result<SourcePopulati
     Ok(SourcePopulation {
         properties: strict.into_values().collect(),
         runtime_tables: runtime_tables.into_values().collect(),
+        resolved_sql,
     })
+}
+
+/// A guarded write in a SQL asset is a route only through the call site that
+/// loads it, and the census sees that site only when it follows the loader.
+/// An asset holding such a write that no followed loader reached (a re-exported
+/// or renamed `sql!`, `include_bytes!`, a `concat!` path, a wrapper macro) is
+/// refused here instead of passing unseen. Not covered: a second, unfollowed
+/// load of an asset that a followed loader also reaches.
+fn check_sql_asset_reach(
+    sql_sources: &StaticSqlSources,
+    resolved: &BTreeSet<String>,
+) -> Result<(), String> {
+    let unreached = sql_sources
+        .iter()
+        .filter(|(path, _)| !path.starts_with("khive-db/") && !resolved.contains(*path))
+        .filter(|(_, sql)| {
+            let (routes, unclassified) = sql_write_occurrences(sql);
+            !routes.is_empty() || !unclassified.is_empty() || runtime_table_write_count(sql) > 0
+        })
+        .map(|(path, _)| format!("{path}: guarded SQL write not reached by a followed loader"))
+        .collect::<Vec<_>>();
+    if unreached.is_empty() {
+        Ok(())
+    } else {
+        Err(unreached.join("\n"))
+    }
 }
 
 fn runtime_table_routes(
@@ -2275,7 +2370,7 @@ fn check_store_trait_methods(sources: &[(String, String)]) -> Result<(), String>
     }
 }
 
-fn source_files(dir: &Path, root: &Path, output: &mut Vec<(String, String)>) {
+fn source_files(dir: &Path, root: &Path, extension: &str, output: &mut Vec<(String, String)>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()))
     {
         let entry = entry.expect("source entry");
@@ -2287,8 +2382,8 @@ fn source_files(dir: &Path, root: &Path, output: &mut Vec<(String, String)>) {
             {
                 continue;
             }
-            source_files(&path, root, output);
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            source_files(&path, root, extension, output);
+        } else if path.extension().is_some_and(|actual| actual == extension) {
             let relative = path
                 .strip_prefix(root)
                 .expect("workspace-relative path")
@@ -2299,6 +2394,21 @@ fn source_files(dir: &Path, root: &Path, output: &mut Vec<(String, String)>) {
             output.push((relative, source));
         }
     }
+}
+
+fn live_workspace_sql() -> StaticSqlSources {
+    let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crates directory")
+        .to_path_buf();
+    let mut sources = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("crates directory") {
+        let sql = entry.expect("crate directory").path().join("sql");
+        if sql.is_dir() {
+            source_files(&sql, &crates, "sql", &mut sources);
+        }
+    }
+    sources.into_iter().collect()
 }
 
 fn live_workspace_sources() -> Vec<(String, String)> {
@@ -2323,7 +2433,7 @@ fn live_workspace_sources() -> Vec<(String, String)> {
         }
         let src = crates.join(member).join("src");
         if src.exists() {
-            source_files(&src, &crates, &mut sources);
+            source_files(&src, &crates, "rs", &mut sources);
         }
     }
     sources.sort_by(|a, b| a.0.cmp(&b.0));
@@ -2346,11 +2456,23 @@ mod route_census_declaration_tests;
 #[path = "route_census_parsed_sources_tests.rs"]
 mod parsed_sources_tests;
 
+#[cfg(test)]
+#[path = "route_census_synthetic_controls_tests.rs"]
+mod route_census_synthetic_controls_tests;
+
+#[cfg(test)]
+#[path = "route_census_static_sql_tests.rs"]
+mod route_census_static_sql_tests;
+
 #[test]
 fn source_census_matches_closed_route_inventory() {
     let sources = live_workspace_sources();
     check_store_trait_methods(&sources).expect("store method surface drifted");
-    let mut population = scan_source_population(&sources).expect("parse workspace sources");
+    let sql_sources = live_workspace_sql();
+    let mut population =
+        scan_source_population_with_sql(&sources, &sql_sources).expect("parse workspace sources");
+    check_sql_asset_reach(&sql_sources, &population.resolved_sql)
+        .unwrap_or_else(|failure| panic!("ADR-115 route census failed:\n{failure}"));
     population
         .properties
         .extend(scan_migration_sources(&live_migration_sources()));
@@ -3653,263 +3775,4 @@ fn an_update_that_names_properties_after_set_is_reported_even_when_it_only_reads
     let sql = "UPDATE other.notes SET updated_at = ?1 WHERE properties IS NULL";
     assert_eq!(sql_target(sql), None, "{sql}");
     assert_eq!(sql_unclassified_write(sql), Some(Substrate::Note), "{sql}");
-}
-
-#[test]
-fn synthetic_census_controls() {
-    let vector_sites = scan_sources(&[(
-        "sample/src/lib.rs".into(),
-        "fn entity() { let _ = vec![PlanStatement { statement: entity_upsert_statement(&value) }]; } fn note() { let _ = vec![note_upsert_statement(&value); 2]; }".into(),
-    )])
-    .unwrap();
-    assert_eq!(vector_sites.len(), 2);
-    assert!(vector_sites.iter().any(|site| {
-        site.key == "sample/src/lib.rs::entity"
-            && site.evidence.contains("builder.entity_upsert_statement")
-    }));
-    assert!(vector_sites.iter().any(|site| {
-        site.key == "sample/src/lib.rs::note"
-            && site.evidence.contains("builder.note_upsert_statement")
-    }));
-    assert!(check_inventory(&vector_sites, &[], 0)
-        .unwrap_err()
-        .contains("unmapped"));
-
-    let whole = scan_sources(&[(
-        "sample/src/lib.rs".into(),
-        "fn write(store: &dyn NoteStore, note: Note) { store.upsert_note(note); }".into(),
-    )])
-    .unwrap();
-    assert!(check_inventory(&whole, &[], 0)
-        .unwrap_err()
-        .contains("unmapped"));
-    assert!(check_inventory(&[], &ROUTE_INVENTORY[..1], 1)
-        .unwrap_err()
-        .contains("orphan"));
-
-    for path in [
-        "$.\"khive:secret_gate\"",
-        "$[\"khive:secret_gate\"]",
-        "$.khive:secret_gate",
-        "$",
-    ] {
-        let source = format!("fn write(store: &dyn NoteStore) {{ store.try_patch_note_property(id, ns, filter, {path:?}, value, now); }}");
-        let sites = scan_sources(&[("sample/src/lib.rs".into(), source)]).unwrap();
-        assert_eq!(sites[0].class, DetectedClass::WholeObject, "{path}");
-        let row = RouteInventoryEntry {
-            id: "synthetic.single-key",
-            site: "sample/src/lib.rs::write",
-            target: Substrate::Note,
-            write_class: WriteClass::SingleKey { key_path: "$.safe" },
-            reservation: Reservation::ByConstruction,
-            ..ROUTE_INVENTORY[0]
-        };
-        assert!(
-            check_inventory(&sites, &[row], 1)
-                .unwrap_err()
-                .contains("write class"),
-            "{path}"
-        );
-    }
-
-    let single_key_sql = [
-        "UPDATE",
-        "notes",
-        "SET",
-        "properties",
-        "=",
-        "json_set(properties,",
-        "'$.read',",
-        "1),",
-        "updated_at",
-        "=",
-        "2",
-        "WHERE",
-        "json_extract(properties,",
-        "'$.status')",
-        "=",
-        "'pending'",
-    ]
-    .join(" ");
-    assert_eq!(sql_target(&single_key_sql), Some(Substrate::Note));
-    assert_eq!(sql_single_key_path(&single_key_sql), Some("$.read".into()));
-    for prefix in [
-        vec!["INSERT", "INTO", "entities"],
-        vec!["INSERT", "OR", "IGNORE", "INTO", "entities"],
-        vec!["INSERT", "OR", "REPLACE", "INTO", "entities"],
-        vec!["REPLACE", "INTO", "entities"],
-    ] {
-        assert_eq!(sql_target(&prefix.join(" ")), Some(Substrate::Entity));
-    }
-    for (replace, target) in [
-        (
-            "REPLACE INTO notes (id, properties) VALUES (?1, ?2)",
-            Substrate::Note,
-        ),
-        (
-            "REPLACE INTO entities (id, properties) VALUES (?1, ?2)",
-            Substrate::Entity,
-        ),
-    ] {
-        assert_eq!(sql_target(replace), Some(target));
-        let replace_sites = scan_sources(&[(
-            "sample/src/lib.rs".into(),
-            format!("fn replace() {{ let _ = {replace:?}; }}"),
-        )])
-        .unwrap();
-        assert_eq!(replace_sites[0].target, target);
-        assert!(check_inventory(&replace_sites, &[], 0)
-            .unwrap_err()
-            .contains("unmapped sample/src/lib.rs::replace"));
-    }
-    assert_eq!(
-        sql_target(&["UPDATE", "entities", "SET", "properties", "=", "?1"].join(" ")),
-        Some(Substrate::Entity)
-    );
-    assert_eq!(
-        sql_target(&["UPDATE", "notes", "SET", "updated_at", "=", "?1"].join(" ")),
-        None
-    );
-    for sql in [
-        [
-            "UPDATE",
-            "notes",
-            "SET",
-            "properties",
-            "=",
-            "json_set(properties,",
-            "'$.status',",
-            "1,",
-            "'$.at',",
-            "2)",
-            "WHERE",
-            "id",
-            "=",
-            "1",
-        ]
-        .join(" "),
-        [
-            "UPDATE",
-            "notes",
-            "SET",
-            "properties",
-            "=",
-            "json_set(properties,",
-            "'$.nested.key',",
-            "1)",
-            "WHERE",
-            "id",
-            "=",
-            "1",
-        ]
-        .join(" "),
-        [
-            "UPDATE",
-            "notes",
-            "SET",
-            "properties",
-            "=",
-            "json_remove(json_set(properties,",
-            "'$.safe',",
-            "1),",
-            "'$.other')",
-            "WHERE",
-            "id",
-            "=",
-            "1",
-        ]
-        .join(" "),
-    ] {
-        assert_eq!(sql_single_key_path(&sql), None, "{sql}");
-    }
-
-    let excluded = scan_sources(&[("sample/src/lib.rs".into(),
-        "#[cfg(test)] mod tests { fn hidden(s: &dyn NoteStore, n: Note) { s.upsert_note(n); } } #[test] fn other(s: &dyn NoteStore, n: Note) { s.upsert_note(n); }".into())]).unwrap();
-    assert!(excluded.is_empty());
-    assert!(check_inventory(&excluded, &[], 0).is_ok());
-
-    let probe = (
-        "sample/src/probe.rs".into(),
-        "fn write(s: &dyn NoteStore, n: Note) { s.upsert_note(n); }".into(),
-    );
-    for declaration in [
-        "#[cfg(test)] #[path = \"probe.rs\"] mod tests;",
-        "#[cfg(all(test, feature = \"extra\"))] #[path = \"probe.rs\"] mod tests;",
-        "#[cfg(test)] mod probe;",
-    ] {
-        let sources = vec![
-            ("sample/src/lib.rs".into(), declaration.into()),
-            probe.clone(),
-        ];
-        let sites = scan_sources(&sources).unwrap();
-        assert!(sites.is_empty(), "{declaration}");
-        assert!(check_inventory(&sites, &[], 0).is_ok(), "{declaration}");
-    }
-    for declaration in [
-        "#[path = \"probe.rs\"] mod production;",
-        "#[cfg(any(test, feature = \"extra\"))] #[path = \"probe.rs\"] mod production;",
-        "#[cfg(test)] #[path = \"probe.rs\"] mod tests; #[path = \"probe.rs\"] mod production;",
-    ] {
-        let sources = vec![
-            ("sample/src/lib.rs".into(), declaration.into()),
-            probe.clone(),
-        ];
-        let sites = scan_sources(&sources).unwrap();
-        assert_eq!(sites.len(), 1, "{declaration}");
-        assert!(
-            check_inventory(&sites, &[], 0)
-                .unwrap_err()
-                .contains("unmapped"),
-            "{declaration}"
-        );
-    }
-
-    let transitive = scan_sources(&[
-        (
-            "sample/src/lib.rs".into(),
-            "#[cfg(test)] #[path = \"probe.rs\"] mod tests;".into(),
-        ),
-        ("sample/src/probe.rs".into(), "mod nested;".into()),
-        (
-            "sample/src/probe/nested.rs".into(),
-            "fn write(s: &dyn NoteStore, n: Note) { s.upsert_note(n); }".into(),
-        ),
-    ])
-    .unwrap();
-    assert!(transitive.is_empty());
-
-    let included_test_module = scan_sources(&[
-        (
-            "sample/src/lib.rs".into(),
-            "include!(\"included.rs\");".into(),
-        ),
-        (
-            "sample/src/included.rs".into(),
-            "#[cfg(all(test, feature = \"extra\"))] mod tests { fn hidden(s: &dyn NoteStore, n: Note) { s.upsert_note(n); } }".into(),
-        ),
-    ])
-    .unwrap();
-    assert!(included_test_module.is_empty());
-
-    let mut trait_sources = live_workspace_sources()
-        .into_iter()
-        .filter(|(path, _)| {
-            path == "khive-storage/src/entity.rs" || path == "khive-storage/src/note.rs"
-        })
-        .collect::<Vec<_>>();
-    assert!(check_store_trait_methods(&trait_sources).is_ok());
-    let note_trait = trait_sources
-        .iter_mut()
-        .find(|(path, _)| path == "khive-storage/src/note.rs")
-        .expect("note trait source");
-    let declaration = "pub trait NoteStore: Send + Sync + 'static {";
-    assert_eq!(note_trait.1.matches(declaration).count(), 1);
-    note_trait.1 = note_trait.1.replacen(
-        declaration,
-        "pub trait NoteStore: Send + Sync + 'static { fn write_note_properties(&self) {}",
-        1,
-    );
-    assert!(check_store_trait_methods(&trait_sources)
-        .unwrap_err()
-        .contains("unclassified store method write_note_properties"));
 }

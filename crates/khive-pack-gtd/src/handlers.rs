@@ -74,7 +74,7 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     // `INSERT ... namespace` doesn't silently fail on legacy schemas.
     let rows = match w
         .query_all(SqlStatement {
-            sql: "PRAGMA table_info(gtd_lifecycle_audit)".into(),
+            sql: khive_runtime::sql!("task-lifecycle-audit-table-info").into(),
             params: vec![],
             label: Some("gtd_audit_schema_info".into()),
         })
@@ -93,7 +93,7 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
 
     if !has_namespace {
         if let Err(e) = w
-            .execute_script("ALTER TABLE gtd_lifecycle_audit ADD COLUMN namespace TEXT".into())
+            .execute_script(khive_runtime::sql!("task-lifecycle-audit-add-namespace").into())
             .await
         {
             tracing::warn!(
@@ -137,10 +137,7 @@ pub async fn write_audit_record_with_status(
 ) -> bool {
     let now = Utc::now().timestamp_micros();
     let stmt = SqlStatement {
-        sql: "INSERT INTO gtd_lifecycle_audit \
-              (note_id, from_state, to_state, note, at, namespace) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-            .into(),
+        sql: khive_runtime::sql!("task-lifecycle-audit-insert").into(),
         params: vec![
             SqlValue::Text(note_id.as_hyphenated().to_string()),
             SqlValue::Text(from.to_string()),
@@ -1060,17 +1057,7 @@ pub fn gtd_transition_statement(
     let props_str = serde_json::to_string(new_props)
         .map_err(|e| RuntimeError::Internal(format!("serialize props: {e}")))?;
     Ok(SqlStatement {
-        sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
-              WHERE id = ?3 \
-              AND updated_at = ?4 \
-              AND deleted_at IS ?5 \
-              AND ?2 > updated_at \
-              AND CASE \
-                    WHEN json_type(properties, '$.status') = 'text' \
-                    THEN json_extract(properties, '$.status') \
-                    ELSE 'inbox' \
-                  END = ?6"
-            .to_string(),
+        sql: khive_runtime::sql!("task-transition-update").to_string(),
         params: vec![
             SqlValue::Text(props_str),
             SqlValue::Integer(updated_at),
@@ -1107,17 +1094,7 @@ pub fn gtd_noop_assertion_statement(
         )));
     }
     Ok(SqlStatement {
-        sql: "SELECT 1 FROM notes \
-              WHERE id = ?1 \
-              AND updated_at = ?2 \
-              AND deleted_at IS ?3 \
-              AND CASE \
-                    WHEN json_type(properties, '$.status') = 'text' \
-                    THEN json_extract(properties, '$.status') \
-                    ELSE 'inbox' \
-                  END = ?4 \
-              AND version = ?5"
-            .to_string(),
+        sql: khive_runtime::sql!("task-noop-assertion").to_string(),
         params: vec![
             SqlValue::Text(snapshot.id.as_hyphenated().to_string()),
             SqlValue::Integer(snapshot.updated_at),

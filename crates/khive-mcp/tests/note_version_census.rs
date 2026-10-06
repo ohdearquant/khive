@@ -6,6 +6,28 @@ use rusqlite::{params, Connection};
 use syn::parse::Parser;
 use syn::visit::Visit;
 
+#[path = "../../khive-runtime/tests/support/static_sql_source.rs"]
+mod static_sql_source;
+use static_sql_source::{CanonicalBindings, StaticSqlSources};
+
+const LEGACY_SQL_WRITERS: &[&str] = &[
+    "khive-db/sql/005-unique-comm-external-id.sql",
+    "khive-db/sql/031-note-versions.sql",
+    "khive-db/sql/notes-ddl.sql",
+];
+const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
+    (
+        "khive-pack-gtd/sql/task-transition-update.sql",
+        GTD,
+        "gtd_transition_statement",
+    ),
+    (
+        "khive-pack-gtd/sql/task-repair-update.sql",
+        GTD_REPAIR,
+        "checked_update_sql",
+    ),
+];
+
 const DB: &str = "khive-db/src/stores/note.rs";
 const MIGRATIONS: &str = "khive-db/src/migrations.rs";
 const EVENTS: &str = "khive-mcp/src/pending_events.rs";
@@ -254,12 +276,16 @@ fn test_only(attrs: &[syn::Attribute]) -> bool {
 }
 
 #[derive(Default)]
-struct Scanner {
+struct Scanner<'a> {
     owner: String,
     statements: Vec<(String, String)>,
+    source_path: String,
+    sql_sources: Option<&'a StaticSqlSources>,
+    loader_bindings: CanonicalBindings,
+    loaded_writers: Vec<(String, String)>,
 }
 
-impl<'ast> Visit<'ast> for Scanner {
+impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
@@ -288,8 +314,26 @@ impl<'ast> Visit<'ast> for Scanner {
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         if !test_only(&item.attrs) {
+            let nested = static_sql_source::module_bindings(item, &self.loader_bindings, test_only);
+            let old = std::mem::replace(&mut self.loader_bindings, nested);
             syn::visit::visit_item_mod(self, item);
+            self.loader_bindings = old;
+            self.loader_bindings.observe_module(item);
         }
+    }
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if !test_only(&item.attrs) {
+            self.loader_bindings.observe_macro(item);
+            syn::visit::visit_item_macro(self, item);
+        }
+    }
+
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let nested = static_sql_source::block_bindings(block, &self.loader_bindings, test_only);
+        let old = std::mem::replace(&mut self.loader_bindings, nested);
+        syn::visit::visit_block(self, block);
+        self.loader_bindings = old;
     }
 
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
@@ -305,6 +349,35 @@ impl<'ast> Visit<'ast> for Scanner {
     }
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        let empty = StaticSqlSources::new();
+        if let Some(sql) = static_sql_source::resolve_static_sql(
+            &self.source_path,
+            mac,
+            self.sql_sources.unwrap_or(&empty),
+            &self.loader_bindings,
+        )
+        .unwrap_or_else(|error| panic!("{error}"))
+        {
+            if !LEGACY_SQL_WRITERS.contains(&sql.asset_path.as_str()) {
+                if note_writer(&sql.produced_text) {
+                    self.loaded_writers
+                        .push((sql.asset_path, self.owner.clone()));
+                }
+                self.process_sql(sql.produced_text);
+            }
+            return;
+        }
+        if mac.path.is_ident("vec") {
+            let expression = syn::parse_str::<syn::Expr>(&format!("[{}]", mac.tokens))
+                .unwrap_or_else(|error| panic!("{}: invalid vec! body: {error}", self.source_path));
+            self.visit_expr(&expression);
+            return;
+        }
+        assert!(
+            !static_sql_source::opaque_sql_loader(mac),
+            "{}: uninspectable nested SQL loader",
+            self.source_path
+        );
         // SQL commonly lives inside format!/vec!, whose bodies Visit leaves opaque.
         let args = syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
             .parse2(mac.tokens.clone());
@@ -352,7 +425,12 @@ impl<'ast> Visit<'ast> for Scanner {
     }
 
     fn visit_lit_str(&mut self, literal: &'ast syn::LitStr) {
-        let sql = literal.value();
+        self.process_sql(literal.value());
+    }
+}
+
+impl Scanner<'_> {
+    fn process_sql(&mut self, sql: String) {
         let tokens = words(&sql);
         if tokens.first().is_some_and(|w| w == "UPDATE") && tokens.iter().any(|w| w == "SET") {
             let target = sql
@@ -401,34 +479,111 @@ fn files(dir: &Path, extension: &str, output: &mut Vec<PathBuf>) {
     }
 }
 
-fn census() -> BTreeMap<(String, String), String> {
+fn live_sql_sources() -> StaticSqlSources {
     let root = root();
-    let mut sources = Vec::new();
+    let mut paths = Vec::new();
     for entry in std::fs::read_dir(&root).unwrap() {
-        let src = entry.unwrap().path().join("src");
-        if src.is_dir() {
-            files(&src, "rs", &mut sources);
+        let sql = entry.unwrap().path().join("sql");
+        if sql.is_dir() {
+            files(&sql, "sql", &mut paths);
         }
     }
-    let mut found = BTreeMap::new();
-    for source in sources {
-        let mut scanner = Scanner::default();
-        scanner.visit_file(&syn::parse_file(&std::fs::read_to_string(&source).unwrap()).unwrap());
-        for (owner, sql) in scanner.statements {
-            let key = (
-                source
-                    .strip_prefix(&root)
+    paths
+        .into_iter()
+        .map(|path| {
+            (
+                path.strip_prefix(&root)
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned(),
-                owner,
-            );
+                    .replace('\\', "/"),
+                std::fs::read_to_string(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+type NamedSqlWriters = BTreeMap<(String, String), String>;
+type LoadedSqlWriters = BTreeSet<(String, String, String)>;
+
+fn scan_sources_with_sql(
+    sources: &[(String, String)],
+    sql_sources: &StaticSqlSources,
+) -> (NamedSqlWriters, LoadedSqlWriters) {
+    let parsed = sources
+        .iter()
+        .map(|(path, source)| (path.clone(), syn::parse_file(source).unwrap()))
+        .collect::<Vec<_>>();
+    let bindings = static_sql_source::canonical_bindings(&parsed, test_only);
+    let mut found = BTreeMap::new();
+    let mut loaded = BTreeSet::new();
+    for (path, file) in &parsed {
+        let mut scanner = Scanner {
+            source_path: path.clone(),
+            sql_sources: Some(sql_sources),
+            loader_bindings: bindings[path].clone(),
+            ..Scanner::default()
+        };
+        scanner.visit_file(file);
+        for (asset, owner) in scanner.loaded_writers {
+            loaded.insert((asset, path.clone(), owner));
+        }
+        for (owner, sql) in scanner.statements {
+            let key = (path.clone(), owner);
             assert!(
                 found.insert(key.clone(), sql).is_none(),
                 "multiple writer templates: {key:?}"
             );
         }
     }
+    (found, loaded)
+}
+
+fn assert_sql_ownership(
+    sql_sources: &StaticSqlSources,
+    loaded: &BTreeSet<(String, String, String)>,
+) {
+    let found = sql_sources
+        .iter()
+        .filter(|(_, text)| note_writer(text))
+        .map(|(path, _)| path.as_str())
+        .collect::<BTreeSet<_>>();
+    let expected = LEGACY_SQL_WRITERS
+        .iter()
+        .copied()
+        .chain(APPLICATION_SQL_WRITERS.iter().map(|(asset, _, _)| *asset))
+        .collect();
+    assert_eq!(found, expected, "SQL writer asset inventory");
+    let expected = APPLICATION_SQL_WRITERS
+        .iter()
+        .map(|(asset, path, owner)| (asset.to_string(), path.to_string(), owner.to_string()))
+        .collect();
+    assert_eq!(*loaded, expected, "SQL writer asset-to-caller ownership");
+}
+
+fn census() -> BTreeMap<(String, String), String> {
+    let root = root();
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(&root).unwrap() {
+        let src = entry.unwrap().path().join("src");
+        if src.is_dir() {
+            files(&src, "rs", &mut paths);
+        }
+    }
+    let sources = paths
+        .into_iter()
+        .map(|path| {
+            (
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                std::fs::read_to_string(path).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sql_sources = live_sql_sources();
+    let (found, loaded) = scan_sources_with_sql(&sources, &sql_sources);
+    assert_sql_ownership(&sql_sources, &loaded);
     let expected = [
         (DB, "NOTE_UPSERT_SQL"),
         (DB, "note_replace_if_unchanged_statement"),
@@ -809,14 +964,12 @@ fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
         .collect();
     assert_eq!(
         found,
-        [
-            "khive-db/sql/005-unique-comm-external-id.sql",
-            "khive-db/sql/031-note-versions.sql",
-            "khive-db/sql/notes-ddl.sql"
-        ]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+        LEGACY_SQL_WRITERS
+            .iter()
+            .copied()
+            .chain(APPLICATION_SQL_WRITERS.iter().map(|(asset, _, _)| *asset))
+            .map(str::to_owned)
+            .collect()
     );
 
     let historical = fixture("memory", "{}");
@@ -1096,4 +1249,120 @@ fn a_dynamic_update_setting_only_namespace_passes_the_scanner() {
     "#;
     let mut scanner = Scanner::default();
     scanner.visit_file(&syn::parse_file(source).unwrap());
+}
+
+#[test]
+fn static_sql_loaders_keep_named_writers_and_legacy_ownership() {
+    let update = "UPDATE notes SET properties=?1 WHERE id=?2";
+    let assets = StaticSqlSources::from([
+        ("sample/sql/update.sql".into(), format!("{update}\n")),
+        (
+            LEGACY_SQL_WRITERS[0].into(),
+            "UPDATE notes SET properties='{}'; CREATE INDEX fixture ON notes(id);".into(),
+        ),
+    ]);
+    let source = "fn writer() { call(khive_runtime::sql!(\"update\")); }";
+    let (loaded, links) =
+        scan_sources_with_sql(&[("sample/src/lib.rs".into(), source.into())], &assets);
+    let (inline, _) = scan_sources_with_sql(
+        &[(
+            "sample/src/lib.rs".into(),
+            format!("fn writer() {{ call({update:?}); }}"),
+        )],
+        &StaticSqlSources::new(),
+    );
+    assert_eq!(loaded, inline);
+    assert_eq!(
+        links,
+        BTreeSet::from([(
+            "sample/sql/update.sql".into(),
+            "sample/src/lib.rs".into(),
+            "writer".into()
+        )])
+    );
+    let (included, _) = scan_sources_with_sql(
+        &[(
+            "sample/src/lib.rs".into(),
+            "fn writer() { call(include_str!(\"../sql/update.sql\")); }".into(),
+        )],
+        &assets,
+    );
+    assert_eq!(
+        included[&("sample/src/lib.rs".into(), "writer".into())],
+        format!("{update}\n")
+    );
+    let (legacy, legacy_links) = scan_sources_with_sql(
+        &[(
+            "khive-db/src/migrations.rs".into(),
+            "const V5: &str = include_str!(\"../sql/005-unique-comm-external-id.sql\");".into(),
+        )],
+        &assets,
+    );
+    assert!(legacy.is_empty());
+    assert!(legacy_links.is_empty());
+}
+
+#[test]
+fn loaded_sql_cannot_hide_version_changes_duplicates_or_shadowing() {
+    let source = "fn writer() { call(khive_runtime::sql!(\"update\")); }";
+    for sql in [
+        "INSERT INTO notes (id, version) VALUES (?1, 8)",
+        "UPDATE {table} SET version=8",
+    ] {
+        let assets = StaticSqlSources::from([("sample/sql/update.sql".into(), sql.into())]);
+        assert!(std::panic::catch_unwind(|| scan_sources_with_sql(
+            &[("sample/src/lib.rs".into(), source.into())],
+            &assets
+        ))
+        .is_err());
+    }
+    let assets = StaticSqlSources::from([(
+        "sample/sql/update.sql".into(),
+        "UPDATE notes SET version=8".into(),
+    )]);
+    let (found, _) = scan_sources_with_sql(&[("sample/src/lib.rs".into(), source.into())], &assets);
+    assert!(!assignments_rule_out_version(
+        &found[&("sample/src/lib.rs".into(), "writer".into())]
+    ));
+    for source in [
+        "fn writer() { call(khive_runtime::sql!(\"update\")); call(khive_runtime::sql!(\"update\")); }",
+        "fn writer() { use other as khive_runtime; call(khive_runtime::sql!(\"update\")); }",
+        "mod khive_runtime {} fn writer() { call(khive_runtime::sql!(\"update\")); }",
+    ] {
+        assert!(std::panic::catch_unwind(|| scan_sources_with_sql(&[("sample/src/lib.rs".into(), source.into())], &assets)).is_err(), "{source}");
+    }
+    let positive = "mod unrelated { use unknown::*; } #[cfg(test)] mod hidden { use other as khive_runtime; } fn writer() { call(khive_runtime::sql!(\"update\")); }";
+    assert_eq!(
+        scan_sources_with_sql(&[("sample/src/lib.rs".into(), positive.into())], &assets)
+            .0
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn application_sql_inventory_rejects_orphans_and_wrong_callers() {
+    let mut assets = StaticSqlSources::new();
+    for asset in LEGACY_SQL_WRITERS
+        .iter()
+        .copied()
+        .chain(APPLICATION_SQL_WRITERS.iter().map(|(asset, _, _)| *asset))
+    {
+        assets.insert(asset.into(), "UPDATE notes SET content='fixture'".into());
+    }
+    let links = APPLICATION_SQL_WRITERS
+        .iter()
+        .map(|(asset, path, owner)| (asset.to_string(), path.to_string(), owner.to_string()))
+        .collect::<BTreeSet<_>>();
+    assert_sql_ownership(&assets, &links);
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &BTreeSet::new())).is_err());
+    let mut wrong = links.clone();
+    let first = wrong.pop_first().unwrap();
+    wrong.insert((first.0, first.1, "unrelated_writer".into()));
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &wrong)).is_err());
+    assets.insert(
+        "sample/sql/unreferenced.sql".into(),
+        "UPDATE notes SET content='rogue'".into(),
+    );
+    assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &links)).is_err());
 }
