@@ -557,6 +557,46 @@ async fn a_refused_anchor_keeps_its_notes_out_of_every_merge() {
 }
 
 #[tokio::test]
+async fn refusing_the_canonical_anchor_prevents_preview_and_apply() {
+    let f = Fixture::new().await;
+    let old = f.anchor().await;
+    let other = f.anchor().await;
+    let canonical_note = f.pr(f.canonical, Some("#8 t"), 8, "t", "body").await;
+    let old_note = f.pr(old, Some("#8 t"), 8, "t", "body").await;
+    let other_note = f.pr(other, Some("#8 t"), 8, "t", "body").await;
+    f.retire(old).await;
+    f.retire(other).await;
+    let ordinary = f.plan().await;
+    assert_eq!(ordinary.report().planned.len(), 1);
+    assert_eq!(ordinary.report().planned[0].survivor.id, canonical_note.id);
+    assert_eq!(ordinary.report().planned[0].donors.len(), 2);
+    let before = f.snapshot().await;
+
+    for apply in [false, true] {
+        let mut options = f.options();
+        options.refused_anchors.insert(f.canonical);
+        options.apply = apply;
+        let error = match run_dedup(&f.runtime, &f.token, options).await {
+            Ok(_) => panic!("canonical anchor must be refused before planning: apply={apply}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("cannot refuse canonical project anchor {}", f.canonical)
+        );
+        assert_eq!(f.snapshot().await, before, "apply={apply}");
+        let mut canonical_live = 0;
+        for id in [canonical_note.id, old_note.id, other_note.id] {
+            assert!(!f.is_deleted(id).await);
+            let current = f.current(id).await;
+            canonical_live +=
+                usize::from(property(&current, "project_id") == json!(f.canonical.to_string()));
+        }
+        assert_eq!(canonical_live, 1, "apply={apply}");
+    }
+}
+
+#[tokio::test]
 async fn notes_without_proof_or_a_number_are_left_alone() {
     let f = Fixture::new().await;
     let old = f.anchor().await;
