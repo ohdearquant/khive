@@ -1,11 +1,12 @@
 //! Exercise the real CLI route against an owned SQLite database.
 
 use super::*;
+use crate::reindex::record_repair::DEFAULT_REINDEX_BATCH_SIZE;
 
 fn repair_args(dir: &std::path::Path, id: Uuid) -> ReindexArgs {
     let mut args = snapshot_reindex_args(dir, false);
     args.id = Some(id);
-    args.batch_size = 128;
+    args.batch_size = DEFAULT_REINDEX_BATCH_SIZE;
     args
 }
 
@@ -27,9 +28,11 @@ fn record_selector_rejects_bulk_options_and_non_uuid_ids() {
     let parsed = ReindexArgs::try_parse_from(["reindex", "--id", &id])
         .expect("single record with ordinary defaults");
     assert_eq!(parsed.id.unwrap().to_string(), id);
+    assert_eq!(parsed.batch_size, DEFAULT_REINDEX_BATCH_SIZE);
+    let default_batch_size = DEFAULT_REINDEX_BATCH_SIZE.to_string();
     for tail in [
         vec!["--model", "model"],
-        vec!["--batch-size", "128"],
+        vec!["--batch-size", default_batch_size.as_str()],
         vec!["--knowledge-only"],
         vec!["--sections-only"],
         vec!["--no-sections"],
@@ -41,6 +44,44 @@ fn record_selector_rejects_bulk_options_and_non_uuid_ids() {
     }
     for invalid in ["deadbeef", "a note name"] {
         assert!(ReindexArgs::try_parse_from(["reindex", "--id", invalid]).is_err());
+    }
+}
+
+#[test]
+fn record_repair_validator_rejects_each_bulk_option() {
+    let id = Uuid::new_v4().to_string();
+    let defaults = ReindexArgs::try_parse_from(["reindex", "--id", &id]).unwrap();
+    record_repair::validate_args(&defaults).expect("ordinary --id defaults are valid");
+    for option in [
+        "model",
+        "batch-size",
+        "knowledge-only",
+        "no-sections",
+        "sections-only",
+        "rebuild-fts",
+    ] {
+        let mut args = ReindexArgs::try_parse_from(["reindex", "--id", &id]).unwrap();
+        match option {
+            "model" => args.model = Some("repair-model".into()),
+            "batch-size" => args.batch_size = DEFAULT_REINDEX_BATCH_SIZE + 1,
+            "knowledge-only" => args.knowledge_only = true,
+            "no-sections" => args.no_sections = true,
+            "sections-only" => args.sections_only = true,
+            "rebuild-fts" => args.rebuild_fts = true,
+            _ => unreachable!(),
+        }
+        let error = match record_repair::validate_args(&args) {
+            Ok(()) => panic!("direct validation must refuse --{option} with --id"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "--id cannot be combined with --model, --batch-size, --knowledge-only, --no-sections, \
+             --sections-only, or --rebuild-fts"
+        );
+        args.id = None;
+        record_repair::validate_args(&args)
+            .expect("single-record validation does not restrict bulk mode");
     }
 }
 
@@ -179,7 +220,8 @@ async fn record_selector_refuses_unknown_id_without_namespace_backfill() {
         return;
     }
     let dir = tempfile::tempdir().expect("owned directory");
-    let args = repair_args(dir.path(), Uuid::new_v4());
+    let missing_id = Uuid::new_v4();
+    let args = repair_args(dir.path(), missing_id);
     let runtime = snapshot_test_runtime(&args);
     let token = runtime.authorize(Namespace::local()).unwrap();
     let unrelated = Note::new("local", "observation", "unrelatedmissingindex");
@@ -189,10 +231,16 @@ async fn record_selector_refuses_unknown_id_without_namespace_backfill() {
         .upsert_note(unrelated.clone())
         .await
         .unwrap();
-    let failure = run_reindex_without_embeddings(args).await;
+    let failure = run_reindex_without_embeddings(args)
+        .await
+        .expect_err("unknown ID must refuse");
     assert!(
-        failure.is_err(),
-        "unknown ID must not become a successful empty run"
+        matches!(
+            failure.downcast_ref::<khive_runtime::RuntimeError>(),
+            Some(khive_runtime::RuntimeError::NotFound(message))
+                if message == &format!("live entity or note {missing_id} in namespace local")
+        ),
+        "expected the requested record's NotFound, got {failure:#}"
     );
     assert!(runtime
         .text_for_notes(&token)

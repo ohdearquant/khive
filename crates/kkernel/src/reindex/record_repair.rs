@@ -6,11 +6,14 @@ use uuid::Uuid;
 
 use super::ReindexArgs;
 
+/// The `--batch-size` default, and the only value a single-record run accepts.
+pub(super) const DEFAULT_REINDEX_BATCH_SIZE: u32 = 128;
+
 pub(super) fn validate_args(args: &ReindexArgs) -> Result<()> {
     if args.id.is_some() {
         ensure!(
             args.model.is_none()
-                && args.batch_size == 128
+                && args.batch_size == DEFAULT_REINDEX_BATCH_SIZE
                 && !args.knowledge_only
                 && !args.no_sections
                 && !args.sections_only
