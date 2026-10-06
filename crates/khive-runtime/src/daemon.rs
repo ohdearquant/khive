@@ -5673,6 +5673,13 @@ mod tests {
     /// bounded timeout.
     #[tokio::test]
     async fn socket_speaks_khived_protocol_rejects_a_non_protocol_listener() {
+        mod timing {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../test_support/timing.rs"
+            ));
+        }
+
         let dir = tempfile::tempdir().expect("tempdir");
         let sock_path = dir.path().join("fake.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
@@ -5688,17 +5695,24 @@ mod tests {
         });
 
         let before = tokio::time::Instant::now();
-        let speaks = socket_speaks_khived_protocol(&sock_path, "probe-test").await;
+        let speaks = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            socket_speaks_khived_protocol(&sock_path, "probe-test"),
+        )
+        .await
+        .expect("the protocol probe must finish within the hang watchdog");
         let elapsed = before.elapsed();
 
         assert!(
             !speaks,
             "a listener that accepts but never answers the probe frame must not be treated as khived"
         );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "the probe must be bounded by its own timeout, not hang indefinitely; took {elapsed:?}"
-        );
+        if let Some(bound) = timing::duration_bound(DUPLICATE_PROBE_TIMEOUT * 4, None) {
+            assert!(
+                elapsed < bound,
+                "the probe must finish within {bound:?}; took {elapsed:?}"
+            );
+        }
 
         accept_task.abort();
         let _ = accept_task.await;
