@@ -1012,3 +1012,35 @@ and the caller-retry identity rule (a retry is a new execution and a new audit o
 it reuses `request_id`) are unaffected. `op_index`/`ref_resolution` is an attribution pair riding an
 otherwise-unchanged row; it is not itself an obligation class, a domain disposition, or a basis for
 collapsing two attempts' obligations into one.
+
+## Amendment 8 (2026-10-06): Count-free event-page transport
+
+**Status**: Proposed. Acceptance is required before dependent implementation merges.
+
+The compound read in [ADR-005](ADR-005-storage-capability-traits.md) uses a new
+`QueryEventPage { protocol_version, namespace, query }` event IPC request and
+`EventPageWindow { window }` response. The current protocol version and old operations
+remain unchanged. The new operation participates in existing version validation,
+namespace checks, reader admission, cancellation, frame limits and error transport.
+An old peer that cannot decode the new operation must refuse explicitly. There is no
+fallback to `QueryEvents`, which cannot preserve the compound seek contract.
+
+`AttributedEventStore` forwards to its scoped inner store. `SplitEventStore` queries
+both legacy and event-lane stores with the same predicates, seek and bounded row
+request, merges in ascending physical-key order, and returns the requested prefix.
+Normal producers continue to route one identity to one plane; this introduces no
+cross-plane repair/deduplication. A read-only deployment without a lane must not
+create a sidecar to answer the query. Equal physical time/ID keys across the merged
+prefix cause an explicit refusal before truncation so a continuation cannot skip one.
+Bounds and explicit refusal semantics are
+defined in ADR-005; the response must also retain the transport's existing frame cap.
+
+The read handler performs no domain mutation. Normal dispatch audit of a read is
+unchanged; this amendment adds no lossy-audit exemption or audit suppression. Fixed
+window acceptance must keep subsequent reader audits outside its population, or
+select disjoint event kinds. Current GTD audit payloads remain unchanged.
+
+Acceptance requires direct/socket/mixed-plane parity, a controlled old-peer decode
+refusal proving no fallback, protocol-version rejection, namespace/row/frame guards,
+and read-only missing-lane behavior. Existing audit obligation, event count/debug
+and split-store tests remain applicable.
