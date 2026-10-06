@@ -314,7 +314,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "pending.claim",
-        site: "khive-mcp/src/pending_events.rs::claim_pending_event",
+        site: "khive-mcp/src/pending_events/receipt.rs::claim_pending_event",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -353,7 +353,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "pending.invoking",
-        site: "khive-mcp/src/pending_events.rs::mark_dispatch_invoking",
+        site: "khive-mcp/src/pending_events/receipt.rs::mark_dispatch_invoking",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -366,7 +366,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "pending.outcome",
-        site: "khive-mcp/src/pending_events.rs::persist_dispatch_outcome",
+        site: "khive-mcp/src/pending_events/receipt.rs::persist_dispatch_outcome",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -392,7 +392,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "pending.lease",
-        site: "khive-mcp/src/pending_events.rs::renew_dispatch_lease",
+        site: "khive-mcp/src/pending_events/receipt.rs::renew_dispatch_lease",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.lease_expires_at" },
