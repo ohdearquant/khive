@@ -310,7 +310,7 @@ The optional `box="sent"` path reverses the actor predicate: it requires
 `direction=outbound` and `from_actor=caller`, then optionally filters
 `to_actor`. The default remains the actor-scoped inbound behavior above.
 
-The `idx_comm_message_direction` index (vocab.rs:17) covers `(namespace, kind, direction,
+The `idx_comm_message_direction` index (core migration V52) covers `(namespace, kind, direction,
 read, created_at)`. When actor filtering is active, a separate index covering
 `(namespace, kind, to_actor, direction, read, created_at)` is needed for the `to_actor`
 property filter to use an index seek rather than a full scan.
@@ -387,7 +387,7 @@ path is removed from the local-send code path.
 `to_actor: Option<&str>` parameters that are merged into the properties JSON for both copies.
 Alternatively, callers merge these fields into the properties `Value` before the call.
 
-**`src/vocab.rs`**: add a third schema plan statement:
+**Core migration V52** installs the actor-recipient index:
 
 ```sql
 CREATE INDEX IF NOT EXISTS idx_comm_message_to_actor
@@ -402,8 +402,13 @@ CREATE INDEX IF NOT EXISTS idx_comm_message_to_actor
 Update the `comm.send` `ParamDef` for `to` to read "Actor label to send to (e.g.
 `\"lambda:leo\"`)." to reflect the reinterpretation.
 
-No numbered `VersionedMigration` (ADR-015) is required because `from_actor` and `to_actor` are
-JSON properties; index creation is idempotent via `CREATE INDEX IF NOT EXISTS` at pack startup.
+`from_actor` and `to_actor` are JSON properties, but the index changes the core `notes` schema.
+V52 installs it with `CREATE INDEX IF NOT EXISTS`, preserving an existing index unchanged.
+
+_Corrected in place on 2026-10-05 (#4011):_ this section and Q2 below formerly assigned the
+index to the pack startup plan. ADR-015 and ADR-017 reserve core-table indexes for numbered
+migrations. V52 preserves the six existing comm index definitions; the pack plan retains its
+auxiliary cursor table.
 
 ## Test Plan
 
@@ -476,10 +481,9 @@ non-conforming values. The tradeoff: strict validation improves type safety but 
 that future transport adapters (ADR-056) may need to express (e.g., email addresses or channel
 identifiers as actor labels in `comm.send`). Decision needed before implementation.
 
-**Q2. Index creation placement.** The new `idx_comm_message_to_actor` index is proposed to be
-added via `COMM_SCHEMA_PLAN_STMTS` (run idempotently at pack startup via `CREATE INDEX IF NOT
-EXISTS`). Maintainers should confirm this approach is acceptable, or specify that the index belongs
-in a numbered `VersionedMigration` (ADR-015) to keep startup behavior predictable.
+**Q2. Index creation placement (resolved 2026-10-05, #4011).** The
+`idx_comm_message_to_actor` index belongs to core migration V52 under ADR-015 and ADR-017.
+`COMM_SCHEMA_PLAN_STMTS` declares only the pack-owned cursor table.
 
 **Q3. Legacy message visibility (revised 2026-09-22, #1739).** Only the anonymous fallback
 inherits rows with missing/null `to_actor`; named actors require exact addressed recipients.

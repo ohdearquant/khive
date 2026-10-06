@@ -32,9 +32,10 @@ Key design decisions from ADR-040:
   - `comm.thread` — Assertive (queries state)
   - `comm.health` — Assertive (queries channel-poll health)
   - `comm.probe` — Assertive (polls inbound metadata without message payloads)
-- **Pack-auxiliary indexes**: partial indexes on the `notes` table, including
+- **Core-owned indexes**: migration V52 installs the six comm indexes on `notes`, including
   `idx_comm_message_direction`, `idx_comm_message_thread`, and
-  `idx_comm_message_outbound_ref`, are declared via `schema_plan()`. These use
+  `idx_comm_message_outbound_ref`, independently of pack loading. The pack's `schema_plan()`
+  retains only its auxiliary `comm_channel_cursor` table. The partial indexes use
   `WHERE deleted_at IS NULL` rather than `WHERE kind = 'message'` so that the SQLite query planner
   can match them when queries use a parameterized `kind = ?N` predicate.
 - **`read()` is a recipient-only action**: marking an outbound (sent) message as read is rejected.

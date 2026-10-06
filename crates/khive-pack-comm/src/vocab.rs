@@ -1,44 +1,9 @@
-//! Static vocabulary: handler definitions and schema indexes for the comm pack.
+//! Static vocabulary: handler definitions and auxiliary schema for the comm pack.
 
 use khive_types::{HandlerDef, IdResolutionMode, ParamDef, Visibility};
 
-/// Pack-auxiliary indexes for comm inbox and thread queries (idempotent).
-/// The builtins-only outbound-due index belongs to a numbered core migration.
-/// Supported writers maintain its strict stored deadline key. See
-/// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
-/// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
-/// and why `idx_comm_message_external_id` is deliberately absent from this list.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 7] = [
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
-        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
-        json_extract(properties, '$.read'), created_at DESC) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_thread \
-        ON notes(namespace, kind, json_extract(properties, '$.thread_id'), created_at DESC) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_to_actor \
-        ON notes(namespace, kind, \
-        json_extract(properties, '$.to_actor'), \
-        json_extract(properties, '$.direction'), \
-        json_extract(properties, '$.read'), \
-        created_at DESC) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_ref \
-        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
-        json_extract(properties, '$.from_actor'), \
-        json_extract(properties, '$.outbound_ref')) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_message_outbound_recipient \
-        ON notes(namespace, kind, json_extract(properties, '$.direction'), \
-        json_extract(properties, '$.to_actor'), \
-        created_at DESC, id ASC) \
-        WHERE deleted_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_comm_quarantine_expiry \
-        ON notes(namespace, kind, json_extract(properties, '$.channel_kind'), \
-        json_extract(properties, '$.channel_slug'), expires_at, id) \
-        WHERE deleted_at IS NULL AND expires_at IS NOT NULL",
-    COMM_CHANNEL_CURSOR_SCHEMA_STMT,
-];
+/// The cursor is pack-owned; indexes on notes belong to core migration V52.
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 1] = [COMM_CHANNEL_CURSOR_SCHEMA_STMT];
 
 /// Pack-owned auxiliary cursor table for durable channel poll progress (issue
 /// #449), idempotent (`CREATE TABLE IF NOT EXISTS`). See

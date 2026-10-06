@@ -2,11 +2,12 @@
 //! the daemon hardening slice (ADR-D5).
 //!
 //! INLINE TEST JUSTIFICATION: separate from `tests/integration.rs` because
-//! every test here needs the comm probe indexes actually created via
-//! `VerbRegistry::apply_schema_plans` (the probe SQL uses `INDEXED BY`, which
-//! errors loudly if the index is absent) — `integration.rs`'s shared
-//! `build_registry()` fixture intentionally does not apply schema plans, and
-//! changing it would be a behavior change for unrelated tests in that file.
+//! every test here applies the comm pack's schema plan through
+//! `VerbRegistry::apply_schema_plans`, which `integration.rs`'s shared
+//! `build_registry()` fixture intentionally does not do; changing it would be
+//! a behavior change for unrelated tests in that file. The indexes the probe
+//! SQL names with `INDEXED BY` come from core migrations, applied when the
+//! runtime prepares its schema.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,8 +23,8 @@ use khive_storage::types::{DeleteMode, SqlStatement, SqlValue};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// Build a registry with the comm pack's auxiliary schema plan actually
-/// applied, so the probe's history and partial unread indexes exist.
+/// Build a registry with the comm pack's auxiliary schema plan applied (its
+/// cursor table); the probe's indexes come from core migrations.
 fn build_registry(actor: Option<&str>) -> (VerbRegistry, KhiveRuntime) {
     build_registry_with_gate(actor, Arc::new(AllowAllGate))
 }
