@@ -427,7 +427,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::SingleStatement,
         stamp: StampCapability::ReservationOnly,
         family: None,
-        acceptance: Acceptance::Test { path: "khive-pack-comm/src/handlers.rs::tests::legacy_key_quarantine_replay_installs_a_deadline_that_cleanup_selects" },
+        acceptance: Acceptance::Test { path: "khive-pack-comm/src/handlers_tests.rs::legacy_key_quarantine_replay_installs_a_deadline_that_cleanup_selects" },
     },
     RouteInventoryEntry {
         id: "comm.reply.read",
