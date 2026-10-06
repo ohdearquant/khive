@@ -627,16 +627,23 @@ Budget refusals are typed and never silent. A storage leaf that would pass its 1
 raw-text budget stops before that row and names the row's order key (ADR-005). Rows
 ordered before the earliest such key across all leaves are servable; later rows are
 not, because a stopped leaf's later rows are unknown. If at least `limit` servable
-rows precede the key, the page is returned normally with `has_more: true`, because
-the stopped row proves that more rows exist. If the stopped row is the first row
-after the cursor, it alone exceeds the leaf budget and no limit can serve it: the
+rows precede the key, the page is returned normally with `has_more: true`, subject
+to the aggregate and response budgets, because the stopped row proves that more rows
+exist. If the aggregate budget permits the fetched windows and the stopped row is the
+first row after the cursor, it alone exceeds the leaf budget and no limit can serve it: the
 request fails with `row_exceeds_budget`, which carries that row's canonical event
 `id` and a server-issued `resume_after` cursor positioned at the row and bound to the
 same window, principal, kinds, actors, namespaces and exclusions. A one-row page whose
-serialized response exceeds 4 MiB fails the same way. Any other budget trip on a page
-of more than one row, including the 32 MiB aggregate and the 4 MiB response budget,
-fails with `page_budget_exceeded`, which carries no cursor and tells the caller to
-lower `limit`; a smaller limit reaches the same rows without skipping any. Continuing
+serialized response exceeds 4 MiB fails the same way. Other multi-row leaf or response
+budget failures, and any 32 MiB aggregate failure, return `page_budget_exceeded`
+without a cursor. The aggregate charges serialized rows from each namespace's fetched
+window, including peek rows, before the merged rows are truncated to `limit`, so it
+can refuse even at `limit=1`. Lower `limit` where possible, retaining the same filters
+and `after`. If the aggregate budget still refuses at `limit=1`, request fewer
+namespaces or a smaller time window in a fresh traversal without `after`. Page any
+remaining subsets separately if the original selection is still needed; smaller
+queries may still hit a budget. Preserve a known prior `until` by passing it
+explicitly. Omitting both `after` and `until` freezes a new server-time bound. Continuing
 from `resume_after` skips exactly that row, by the caller's own act, and the row stays
 readable by ID through the existing event get. This is the only place the page API
 omits a row. Neither refusal carries the row's payload or its raw order key. Whether
