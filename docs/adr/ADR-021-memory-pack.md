@@ -720,3 +720,43 @@ The pack's `StorageProfile` (from [ADR-003](ADR-003-system-architecture.md) /
 - [ADR-019](ADR-019-gtd-pack.md): GTD pack — the lifecycle-shape pack contrasting with
   the decay-shape pack defined here
 - `crates/khive-pack-memory/`: implementation
+
+## Amendment: declared recall-event correlation (2026-10-06)
+
+**Status**: Proposed\
+**Companion**: [ADR-081 Amendment 1](ADR-081-recall-retune-driver.md#amendment-1-2026-10-06-declared-recall-event-correlation)
+defines the feedback, validation, authority and acceptance contract. This section has
+its own Proposed status; it does not change the Accepted status of the preceding
+record or implement the new field.
+
+For each successful nonempty `memory.recall`, add one fresh canonical lowercase dashed
+UUIDv4 `recall_event_id` to every actual returned hit object. The value is shared within
+that invocation and differs between otherwise identical recalls. Preserve result
+order, profile stamps, bare arrays and existing verbose/degraded/truncated `results`
+envelopes. Diagnostic candidate lists are not returned hits. Human-oriented
+presentations may omit metadata; correlation consumers forward structured results.
+Empty responses retain their current shape with no top-level ID, and failed calls
+return no correlation identifier.
+
+Allocate the ID before response projection/background handoff. When the existing
+best-effort `RecallExecuted` append succeeds, its physical `Event.id` is that exact
+UUID. Existing zero-result telemetry may generate an unreturned ID. Task admission,
+timeouts and telemetry failures remain off the response path: the returned ID declares
+an intended event identity, not a committed receipt. Feedback may arrive before the
+event or refer to an event that never persists; a missing row is unknown. Duplicate
+physical event IDs refuse append, including identical replays, without overwriting
+the event or its projections or retrying with a replacement ID.
+
+Automatic feedback forwards only the uniquely selected result's optional correlation.
+The shared feedback handler also accepts it directly under the ADR-081 validation
+rules. Missing/null remains compatible; no-signal abstention does not validate
+correlation. The value is unverified caller context, never authority to read an event,
+change a namespace/profile, or bypass scorer/dedup/clamp rules. No recall lookup,
+synchronous durability, backfill or new storage schema is introduced.
+
+Both Proposed sections require formal acceptance before dependent implementation
+merges. Implementation and its acceptance use actual `main` after #4277 and #4279
+land, with their changes preserved. ADR-081's real-path acceptance includes physical
+event-ID equality across repeated recalls, selected-result forwarding, legacy and
+malformed inputs, namespace isolation, task/append failures and duplicate-ID refusal.
+No implementation or executed acceptance is claimed by this documentation change.
