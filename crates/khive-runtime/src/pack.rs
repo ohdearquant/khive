@@ -269,6 +269,12 @@ mod hook_tests;
 #[path = "pack/help_tests.rs"]
 mod help_tests;
 
+// ── ADR-103 allowlist copy ───────────────────────────────────────
+
+#[cfg(test)]
+#[path = "pack/admission_allowlist_adr_tests.rs"]
+mod admission_allowlist_adr_tests;
+
 #[cfg(test)]
 #[path = "gate_argument_contract_tests.rs"]
 mod gate_argument_contract_tests;

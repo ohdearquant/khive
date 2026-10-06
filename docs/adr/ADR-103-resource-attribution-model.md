@@ -917,27 +917,40 @@ refused before it could be enqueued) or `AuditTerminalReason::AdmissionDeadlineE
 caller's bounded wait for the row's commit elapsed while the row was still pending or in-flight) —
 the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` may be
 dropped best-effort instead of failing the dispatch. The caller still receives the read's
-successful result. The fixed, reviewed set currently contains 40 verbs, grouped by owning pack:
+successful result. The set is the constant `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
+(`crates/khive-runtime/src/pack/registry_access.rs`), and the list below is that constant grouped by
+owning pack. Its count is taken from the code: at this revision the constant holds 59 entries. A
+test fails when this list or this count differs from the constant, so an entry added on one side
+only cannot pass unnoticed.
 
 - agent: `agent.observe`;
 - blob: `blob.get`, `blob.stat`;
 - brain: `brain.event_counts`, `brain.event_page`, `brain.profiles`, `brain.profile`,
   `brain.resolve`, `brain.bindings`;
-- comm: `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.thread`, `comm.health`,
-  `comm.probe`;
-- gtd: `gtd.next`, `gtd.tasks`;
+- comm: `comm.delivered`, `comm.transport_status`, `comm.inbox`, `comm.unread`, `comm.thread`,
+  `comm.health`, `comm.probe`;
+- exec: `exec.tree_get`, `exec.tree_diff`, `exec.receipt`, `exec.runs`, `exec.events`,
+  `exec.identity`;
+- git: `git.ingest_cursor`;
+- gtd: `gtd.census`, `gtd.next`, `gtd.tasks`;
 - kg: `get`, `list`, `stats`, `search`, `neighbors`, `traverse`, `context`, `query`,
-  `resolve`, `whoami`, `verbs`;
+  `resolve`, `whoami`, `scan`, `verbs`, `stream.read`, `stream.stat`;
 - knowledge: `knowledge.get`, `knowledge.list`, `knowledge.stats`, `knowledge.fold`,
   `knowledge.topic`;
 - moodboard: `moodboard.model`, `moodboard.search`, `moodboard.preference`;
 - schedule: `schedule.agenda`;
-- session: `session.list`, `session.resume`, `session.export`.
+- session: `session.list`, `session.resume`, `session.export`, `session.search`, `session.stats`;
+- tool: `tool.suggest`, `tool.describe`, `tool.list`, `tool.requests`, `tool.policies`.
 
 The cross-pack source census classifies every current public Assertive handler exactly once.
-`memory.recall` (serve-ledger/accounting writes), `db_diagnostics` (PASSIVE checkpoint I/O), and
+`memory.recall` (serve-ledger/accounting writes), `db_diagnostics` (PASSIVE checkpoint I/O),
 `knowledge.search` / `knowledge.suggest` / `knowledge.compose` (persistent ANN
-consumer/checkpoint maintenance) remain explicitly fail-closed. A new Assertive handler is not
+consumer/checkpoint maintenance), `git.checkout` / `git.diff` / `git.reconcile` (a durable receipt
+on every dispatch), `tool.check` (a required policy decision receipt), `git.receipts` /
+`git.gates` / `git.status` / `git.log` (each runs that policy check first, so it carries the
+same receipt write) and `telemetry.channels` / `telemetry.counts` / `telemetry.emit` /
+`telemetry.read` (telemetry answers that must refuse when their audit cannot be recorded) remain
+explicitly fail-closed. A new Assertive handler is not
 eligible until its side effects are reviewed and the closed census is updated.
 
 Eligibility is bound to the owning pack and verb together, not the verb name alone: each entry on
@@ -1140,6 +1153,123 @@ superseded, and the allowlist is the census-tested set. Requirement 2's named ce
 live guard is `admission_degrade_safe_assertive_census_matches_live_pack_sources`
 (`pack.rs:6064`), which checks every Assertive verb's declared category and its reviewed
 safe-versus-incidental classification against the live pack sources.
+
+### Additional admission-path evidence (2026-10-06, #4319)
+
+This record checks the sixteen entries added in #2481 at revision
+`2caa23ef66693bb7ebd788e1355612f0fc8415a2`. The last two rows extend the same
+receipt-producing helper finding to `git.status` and `git.log`. Every row is
+**Assertive** in the named owning pack's vocabulary. The category column gives
+that declaration's line; the handler column covers the complete body. Named
+helpers and their method calls were inspected as well as write-shaped tokens.
+These are source findings, not executed runtime or fault-injection results.
+
+For this table, `E`, `G`, `K`, `T`, and `R` mean, respectively,
+`crates/khive-pack-exec/src/`, `crates/khive-pack-git/src/`,
+`crates/khive-pack-kg/src/`, `crates/khive-pack-tool/src/`, and
+`crates/khive-runtime/src/`. All line references are inclusive and pinned to the
+revision above. “Retain” still requires trusted registration, the exact owning
+pack, a successful dispatch and the existing transient admission conditions.
+
+| Verb                         | Assertive declaration | Complete handler and checked helpers                                                                                                                                                                                                                                     | Dispatch-path finding and classification                                                                                                                                                                           |
+| ---------------------------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `exec.events`                | E`vocab.rs:140`       | E`handlers.rs:309–318`; `opt_str:51–59`; T`policy.rs::opt_u32:18–28`; E`receipts.rs::events:169–204`, `text:13–19`, `int:21–26`; R`presentation.rs::micros_to_iso:595–599`                                                                                               | Reader `query_all` SELECT and JSON rendering. The plural `events` helper does not call the singular event writer. **Retain**.                                                                                      |
+| `exec.identity`              | E`vocab.rs:151`       | E`handlers.rs:320–343`; E`sandbox.rs::read_roots_digest:161–163`, `read_roots_serialization:153–159`, `template_digest:237–239`, `render_profile:168–233`, `quote:60–63`, `Limits::to_json:89–104`; E`tree.rs::digest_hex:778–780`                                       | Hashes and renders already-resolved configuration. Sandbox permissions are rendered string content; no profile installation or process launch. **Retain**.                                                         |
+| `exec.receipt`               | E`vocab.rs:117`       | E`handlers.rs:279–286`; `req_str:61–66`, `opt_str:51–59`; E`receipts.rs::get:89–104`, `decode:82–87`, `text:13–19`, `int:21–26`                                                                                                                                          | Reader `query_all` SELECT, then decode and local JSON assignment. No receipt insert or event append. **Retain**.                                                                                                   |
+| `exec.runs`                  | E`vocab.rs:127`       | E`handlers.rs:288–307`; `req_str:61–66`, `opt_str:51–59`; T`policy.rs::opt_u32:18–28`; E`receipts.rs::list:106–142`, `decode:82–87`, `text:13–19`, `int:21–26`                                                                                                           | Builds a SELECT with parameters, calls reader `query_all`, then decodes. **Retain**.                                                                                                                               |
+| `exec.tree_diff`             | E`vocab.rs:88`        | E`handlers.rs:265–275`; `req_str:61–66`, `opt_str:51–59`; E`tree.rs::load:666–693`, `diff:741–775`, `Change::to_json:730–737`; hydration chain below                                                                                                                     | Two verified manifest reads and an in-memory diff. No blob put, tree store or receipt write. **Retain**.                                                                                                           |
+| `exec.tree_get`              | E`vocab.rs:70`        | E`handlers.rs:259–263`; `req_str:61–66`, `opt_str:51–59`; E`tree.rs::load:666–693`, `entries_json:711–718`; hydration chain below                                                                                                                                        | Verified manifest read and local JSON rendering; no materialization or blob put. **Retain**.                                                                                                                       |
+| `git.gates`                  | G`local_vocab.rs:82`  | G`local_handlers.rs:1099–1133`; `checked_policy:272–307`, `required:74–81`, `validate_keys:91–99`, `gate_reason:254–260`; G`params.rs::parse:170–198`, `write_policy.rs::from_config:205–215`, `match_entry:120–152`, `remote_handlers.rs::remote_repository:228–289`    | `checked_policy` dispatches `tool.check`, which appends a required decision receipt. Config/path projection afterward does not remove that effect. **Exclude**.                                                    |
+| `git.receipts`               | G`local_vocab.rs:69`  | G`local_handlers.rs:936–988`; `checked_policy:272–307`, `optional:83–89`, `validate_keys:91–99`; G`params.rs::parse:170–198`, `receipts.rs::list_owned:340–388`, `ReceiptPage::to_value:150–155`; T`policy.rs::actor_label:35–37`                                        | The existing-receipt SELECT is read-only, but the preceding `tool.check` dispatch writes a new decision receipt. **Exclude**.                                                                                      |
+| `stream.read`                | K`handler_defs.rs:39` | K`handlers/stream.rs:261–275`; `deser` alias K`handlers/common.rs:1094` to R`params.rs::deser_params:16–19`; R`streams.rs::stream_read:1436–1485`, `validate_stream:48–55`, `statement:40–46`; R`presentation.rs::micros_to_iso:595–599`                                 | Reader `query_all` WITH/SELECT snapshot; local validation, JSON parsing and rendering. No stream append or schema ensure. **Retain**.                                                                              |
+| `stream.stat`                | K`handler_defs.rs:51` | K`handlers/stream.rs:277–284`; same `deser` helper; R`streams.rs::stream_stat:1488–1497`, `validate_stream:48–55`, `statement:40–46`                                                                                                                                     | Reader `query_row` COUNT/MAX SELECT and local rendering. **Retain**.                                                                                                                                               |
+| `tool.check`                 | T`vocab.rs:219`       | T`handlers.rs:894–909`; `req_str:55–57`, `opt_str:42–53`, `decision_for:831–892`; T`policy.rs::actor_label:35–37`, `decide_with_receipt:798–841`, `Decision::to_json:760–769`; policy chain below                                                                        | Both registered and missing-tool decision branches select `Receipt::Record`; `append_event(ToolCheckDecided).await?` at T`policy.rs:839` is required. **Exclude**.                                                 |
+| `tool.describe`              | T`vocab.rs:200`       | T`handlers.rs:765–790`; `resolve_tool:225–245`, `capabilities_of:378–396`, `full:132–140`, shared tool helpers below; T`pin.rs::RegistryPin::from_entity`; T`policy.rs::decide:846–889`                                                                                  | Registry/entity/graph reads and SELECT-based policy/grant evaluation. Calls receipt-free `decide`, not `decide_with_receipt`. **Retain**.                                                                          |
+| `tool.list`                  | T`vocab.rs:207`       | T`handlers.rs:792–820`; `registry_entities:146–163`, `summary:116–130`, shared tool helpers below; R`operations.rs::list_entities_filtered:2599–2623`                                                                                                                    | `query_entities_count_free`, validation and local summary rendering. **Retain**.                                                                                                                                   |
+| `tool.policies`              | T`vocab.rs:312`       | T`handlers.rs:1091–1105`; shared tool helpers below; T`policy.rs::list_policies:213–242`, `PolicyRow::from_row/to_json`                                                                                                                                                  | Reader `query_all` SELECT from `tool_policy`; local decode/render. **Retain**.                                                                                                                                     |
+| `tool.requests`              | T`vocab.rs:274`       | T`handlers.rs:1016–1043`; shared tool helpers below; T`policy.rs::list_grants:507–543`, `GrantRow::from_row/to_json`                                                                                                                                                     | Reader `query_all` SELECT from `tool_grants`; status filtering does not update grants. **Retain**.                                                                                                                 |
+| `tool.suggest`               | T`vocab.rs:187`       | T`handlers.rs:632–763`; shared tool helpers, `RegistryPin::from_entity`, receipt-free `policy::decide`; R`retrieval.rs::embed_query:346–352`, `hybrid_search:711–734`, `hybrid_search_with_text_mode:738–767`, `hybrid_search_inner:921–1056`; query/graph chain below   | No domain mutation; cold shared initialization can append best-effort `EmbedderInitialized`. **Retain under the existing independent-telemetry qualification**, detailed below; not a universally write-free path. |
+| `git.status` (supplementary) | G`local_vocab.rs:97`  | G`local_handlers.rs:1012–1054`; `read_gate:994–1010`, `checked_policy:272–307`, `required:74–81`, `optional:83–89`, `validate_keys:91–99`, `read_refusal:50–52`; G`params.rs::parse:170–198`, `local_git.rs::status:1417–1447`; R`engine_config.rs::git_program:710–712` | `read_gate` reaches receipt-producing `tool.check` before the native status read. **Exclude**.                                                                                                                     |
+| `git.log` (supplementary)    | G`local_vocab.rs:108` | G`local_handlers.rs:1056–1097`; same `read_gate`, `checked_policy`, argument/refusal helpers; G`params.rs::parse:170–198`, `local_git.rs::log:1635–1684`; R`engine_config.rs::git_program:710–712`                                                                       | `read_gate` reaches receipt-producing `tool.check` before reading history. **Exclude**.                                                                                                                            |
+
+**Tree read helper chain.** E`tree.rs::load` obtains an installed store through
+`blob_store:643–647`, parses `ContentRef::from_hex`, checks `exists`, and calls
+R`blob.rs::BlobHydrator::hydrate_verified:212–256`. It validates the decoded
+manifest using E`tree.rs::validate_entries:283–298`,
+`validate_relative_path:44–66`, `insert_entry:564–595` and the local prefix/index
+helpers. Their insert/remove operations change local maps and arenas. Hydration
+acquires process-local permits and tracks a read task through
+R`daemon.rs::track_named_background_task:1809–1814` and
+`spawn_named_tracked_task:1779–1794`. The shipped filesystem backend's
+`get_bounded_verified`/`exists` (`crates/khive-db/src/stores/blob.rs:2732–2844`)
+read verified file handles; the S3 counterparts
+(`crates/khive-db/src/stores/blob_s3.rs:465–570`) use GET/HEAD. Neither fills a
+persistent cache or puts a blob. This describes the shipped read capability,
+not arbitrary third-party implementations or incidental OS access metadata.
+
+**Shared tool read helpers.** T`handlers.rs` parameter and presentation helpers
+`opt_str:42–53`, `req_str:55–57`, `one_of:91–100`, `entity_uuid:104–106`,
+`props_json:108–110`, `prop_str:112–114`, `summary:116–130`, `full:132–140` and
+`side_effect_of:142–144` inspect or render local values. T`policy.rs::opt_u32:18–28`, `actor_label:35–37`,
+`PolicyRow::from_row:100–129` / `to_json:131–146`,
+`GrantRow::from_row:169–187` / `to_json:189–207`, and
+`Decision::to_json:760–769` likewise validate or render local values.
+`resolve_tool` calls `get_entity`/`resolve_prefix` or
+`find_visible_by_name:214–223` and T`pin.rs::visible_registration:149–167` /
+`registration_snapshot:91–145`; the latter uses a reader SELECT.
+T`pin.rs::RegistryPin::from_entity:36–38`, `from_inputs:40–44`, and
+`from_canonical_bytes:48–54` canonicalize and hash existing fields. Runtime
+entity/prefix helpers (`operations.rs:2425–2438`, `5979–5987`, `6041–6186`)
+use entity reads and reader SELECTs, including the read-only sidecar path.
+`capabilities_of` calls runtime `neighbors`, whose helpers
+(`operations.rs:3694–3856`, `4094–4255`) perform graph/entity/note reads, sort,
+deduplicate and filter. They do not repair or create graph records.
+
+**Required policy receipt chain.** `tool.check` always chooses `Receipt::Record`.
+The pure T`policy.rs::decide:846–889` uses
+`select_active_grant:345–387` and `select_deciding_policy:288–324`, both reader
+SELECTs. `decide_with_receipt:798–841` additionally creates `ToolCheckDecided`
+and awaits `rt.events(token)?.append_event(event).await?`; append failure
+propagates. G`local_handlers.rs::checked_policy:272–307` calls
+G`lib.rs::dispatch_from_token:98–116` with the literal `tool.check`, preserving
+caller identity and namespace. `read_gate:994–1010` also calls that helper.
+Early validation failures can precede the write, but do not make any of these
+five verbs safe to degrade. The correction preserves policy decisions and
+receipt writes; it removes their dispatch-audit exception.
+
+**Query embedding qualification.** `tool.suggest` calls `embed_query`, which
+reaches R`retrieval.rs::embed_query_with_model_inner:278–306` and
+`runtime/embedder_init.rs::embedder_inner:4–73`. A warm service returns directly;
+a cold shared entry can emit `EmbedderInitialized` through
+`emit_embedder_initialized:75–105`, with `append_event` at line 102. That emitter
+returns before event-store resolution on read-only snapshots; writable-runtime
+append failure is logged and swallowed at line 103. This is independent
+best-effort initialization telemetry, consistent with the existing
+`pack/registry_access.rs:331–340` qualification for search/config telemetry,
+not a required tool decision receipt. Query inference and
+`hybrid_vector_stage:1061–1099` / `vector_search:588–628` perform retrieval,
+visibility filtering and local fusion, not document indexing or persistent ANN
+maintenance. `usage::count` changes task-local atomic counters, not a durable
+ledger. This retained classification expressly records the event-plane write.
+
+**Controls and scope.** G`ingest_cursor.rs::handle_ingest_cursor:38–108` remains
+an eligible Git read: it dispatches canonical `get` under the original caller
+identity, then reader `query_all` executes `ingest_cursor_snapshot_select.sql`.
+It does not call `checked_policy` or mutate a cursor. Conversely,
+E`receipts.rs::event:144–167` and `insert:36–78` acquire a writer and INSERT;
+E`tree.rs::store:656–662` calls `BlobStore::put` even though the older lexical
+pattern misses it. These source controls demonstrate why category/keyword
+counts alone are insufficient; they are not executed mutation tests.
+
+The census now classifies the five required decision-receipt writers as known
+unsafe. Trusted owning-pack probes and a deterministic saturated-audit-queue
+regression cover those five negatives with `tool.describe` as a positive
+control. The saturation test isolates registry/audit routing with successful
+stand-in handlers; the actual ToolPack decision-receipt tests remain unchanged.
+Refusal before enqueue (`QueueAdmissionExhausted`) must fail for the five unsafe
+verbs without incrementing the degraded-read refusal counter. Successful strict
+operations already enqueued still use `submit_until_resolved`; this correction
+does not turn every admission deadline into a failure.
 
 ## Amendment 5 (2026-09-10): Caller-Scoped Brain Reads
 

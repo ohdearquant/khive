@@ -92,7 +92,11 @@ const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
     "db_diagnostics",
     "git.checkout",
     "git.diff",
+    "git.gates",
+    "git.log",
+    "git.receipts",
     "git.reconcile",
+    "git.status",
     "knowledge.compose",
     "knowledge.search",
     "knowledge.suggest",
@@ -101,6 +105,7 @@ const KNOWN_ADMISSION_UNSAFE_VERBS: &[&str] = &[
     "telemetry.counts",
     "telemetry.emit",
     "telemetry.read",
+    "tool.check",
 ];
 
 /// Classification outcome for one `HandlerDef {` occurrence in pack
@@ -662,6 +667,55 @@ fn admission_degrade_safe_is_a_build_time_lookup_with_no_per_call_pack_scan() {
         after_build,
         "a miss must not re-scan any pack's handlers() either"
     );
+}
+
+#[test]
+fn policy_decision_receipts_are_admission_unsafe_under_trusted_owners() {
+    const fn handler(name: &'static str) -> HandlerDef {
+        HandlerDef {
+            name,
+            description: "policy decision admission probe",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }
+    }
+    static TOOL_HANDLERS: [HandlerDef; 2] = [handler("tool.check"), handler("tool.describe")];
+    static GIT_HANDLERS: [HandlerDef; 4] = [
+        handler("git.receipts"),
+        handler("git.gates"),
+        handler("git.status"),
+        handler("git.log"),
+    ];
+
+    let mut builder = VerbRegistryBuilder::new();
+    for (name, handlers) in [
+        ("tool", TOOL_HANDLERS.as_slice()),
+        ("git", GIT_HANDLERS.as_slice()),
+    ] {
+        builder.register_trusted(CountingHandlersPack {
+            name,
+            handlers,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+    }
+    let registry = builder.build().expect("trusted tool and git registry");
+    assert!(
+        registry.admission_degrade_safe_probe("tool.describe"),
+        "the read control must qualify under its trusted canonical owner"
+    );
+    for verb in [
+        "tool.check",
+        "git.receipts",
+        "git.gates",
+        "git.status",
+        "git.log",
+    ] {
+        assert!(
+            !registry.admission_degrade_safe_probe(verb),
+            "{verb} persists a policy decision receipt even under its trusted canonical owner"
+        );
+    }
 }
 
 #[test]
