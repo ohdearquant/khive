@@ -193,7 +193,7 @@ ordering the prune pool):
 
 ## Wolverine 2-hop repair
 
-`wolverine_repair` (`index.rs`, ADR-052 §2 steps 3-8) is the core soft-delete repair
+`wolverine_repair` (`index/repair.rs`, ADR-052 §2 steps 3-8) is the core soft-delete repair
 step, called from `VamanaIndex::tombstone` and `tombstone_batch`. For each live
 in-neighbor `p` of the deleted node, it rewires `p`'s adjacency by running RobustPrune
 over the union of the deleted node's out-neighbors and `p`'s current neighbors (minus

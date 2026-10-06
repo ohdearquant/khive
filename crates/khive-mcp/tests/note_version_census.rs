@@ -30,7 +30,8 @@ const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
 
 const DB: &str = "khive-db/src/stores/note.rs";
 const MIGRATIONS: &str = "khive-db/src/migrations.rs";
-const EVENTS: &str = "khive-mcp/src/pending_events.rs";
+const RECLAIM: &str = "khive-mcp/src/pending_events/reclaim.rs";
+const RECEIPTS: &str = "khive-mcp/src/pending_events/receipt.rs";
 const GTD: &str = "khive-pack-gtd/src/handlers.rs";
 const GTD_REPAIR: &str = "khive-pack-gtd/src/repair.rs";
 const SCHEDULE: &str = "khive-pack-schedule/src/handlers.rs";
@@ -593,13 +594,13 @@ fn census() -> BTreeMap<(String, String), String> {
         (DB, "note_soft_delete_statement"),
         (DB, "execute_filtered_note_property_patch"),
         (MIGRATIONS, "migrate_outbound_due_key"),
-        (EVENTS, "claim_pending_event"),
-        (EVENTS, "mark_dispatch_invoking"),
-        (EVENTS, "renew_dispatch_lease"),
-        (EVENTS, "persist_dispatch_outcome"),
-        (EVENTS, "requeue_legacy_claim"),
-        (EVENTS, "finalize_corrupt_receipt"),
-        (EVENTS, "finalize_firing_event"),
+        (RECEIPTS, "claim_pending_event"),
+        (RECEIPTS, "mark_dispatch_invoking"),
+        (RECEIPTS, "renew_dispatch_lease"),
+        (RECEIPTS, "persist_dispatch_outcome"),
+        (RECLAIM, "requeue_legacy_claim"),
+        (RECLAIM, "finalize_corrupt_receipt"),
+        (RECLAIM, "finalize_firing_event"),
         (GTD, "gtd_transition_statement"),
         (GTD_REPAIR, "checked_update_sql"),
         (SCHEDULE, "cancel_pending_event"),
@@ -714,10 +715,16 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
         (DB, "note_update_properties_statement", "memory", "{}"),
         (MIGRATIONS, "migrate_outbound_due_key", "memory", "{}"),
         (
-            EVENTS,
+            RECLAIM,
             "requeue_legacy_claim",
             "scheduled_event",
             r#"{"status":"firing"}"#,
+        ),
+        (
+            RECEIPTS,
+            "renew_dispatch_lease",
+            "scheduled_event",
+            r#"{"status":"firing","firing_at":100,"dispatch_receipt":{"invocation_id":"00000000-0000-4000-8000-000000000002","state":"invoking"}}"#,
         ),
         (
             GTD,
@@ -783,7 +790,18 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                 ],
             ),
             MIGRATIONS => conn.execute(sql, params![vec![0_u8; 12], "2020-01-01T00:00:00Z", ID]),
-            EVENTS => conn.execute(sql, params![200_i64, ID, "local", 100_i64, properties]),
+            RECLAIM => conn.execute(sql, params![200_i64, ID, "local", 100_i64, properties]),
+            RECEIPTS => conn.execute(
+                sql,
+                params![
+                    300_i64,
+                    200_i64,
+                    ID,
+                    "local",
+                    100_i64,
+                    "00000000-0000-4000-8000-000000000002"
+                ],
+            ),
             GTD => conn.execute(
                 sql,
                 params![

@@ -20,8 +20,8 @@ graph-based retrieval engine (ADR-048).
 - [`src/config.rs`](../src/config.rs) -- `VamanaConfig` algorithm parameters
 - [`src/graph.rs`](../src/graph.rs) -- graph construction, greedy search, robust
   prune
-- [`src/index.rs`](../src/index.rs) -- build, search, save/load, snapshot
-  serialization
+- [`src/index.rs`](../src/index.rs) and [`src/index/`](../src/index/) -- build,
+  search, save/load, snapshot serialization
 - [`src/distance.rs`](../src/distance.rs) -- L2 squared distance kernel
 - [`src/error.rs`](../src/error.rs) -- error types
 
