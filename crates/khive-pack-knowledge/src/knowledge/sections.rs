@@ -1085,11 +1085,7 @@ impl KnowledgeHandlers {
                 // (including verified ones of the same type) untouched.
                 writer
                     .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_sections \
-                              (id, atom_id, namespace, section_type, heading, content, \
-                               content_hash, tokens, sort_order, created_at, updated_at) \
-                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
-                            .into(),
+                        sql: khive_runtime::sql!("knowledge_section_insert").into(),
                         params: vec![
                             SqlValue::Text(section_id.clone()),
                             SqlValue::Text(atom_id.clone()),
@@ -1407,10 +1403,7 @@ impl KnowledgeHandlers {
 
         let affected = writer
             .execute(SqlStatement {
-                sql: "UPDATE knowledge_sections SET status='disputed' \
-                      WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 \
-                      AND status NOT IN ('disputed','deprecated')"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_section_dispute").into(),
                 params: vec![
                     SqlValue::Text(atom_id.clone()),
                     SqlValue::Text(stype.as_str().to_string()),
