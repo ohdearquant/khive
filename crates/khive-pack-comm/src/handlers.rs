@@ -3646,9 +3646,7 @@ pub(crate) async fn handle_cursor_get(
 
     let row = w
         .query_row(khive_storage::types::SqlStatement {
-            sql: "SELECT source, generation, high_water, updated_at FROM comm_channel_cursor \
-                  WHERE channel_kind = ?1 AND channel_slug = ?2"
-                .into(),
+            sql: khive_runtime::sql!("channel_cursor_select").into(),
             params: vec![
                 SqlValue::Text(p.channel_kind.clone()),
                 SqlValue::Text(p.channel_slug.clone()),
@@ -3753,14 +3751,7 @@ pub(crate) async fn handle_cursor_commit(
         .map_err(RuntimeError::Storage)?;
 
     w.execute(khive_storage::types::SqlStatement {
-        sql: "INSERT INTO comm_channel_cursor(channel_kind, channel_slug, source, generation, high_water, updated_at) \
-              VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
-              ON CONFLICT(channel_kind, channel_slug) DO UPDATE SET \
-                source=excluded.source, \
-                generation=excluded.generation, \
-                high_water=excluded.high_water, \
-                updated_at=excluded.updated_at"
-            .into(),
+        sql: khive_runtime::sql!("channel_cursor_upsert").into(),
         params: vec![
             SqlValue::Text(p.channel_kind.clone()),
             SqlValue::Text(p.channel_slug.clone()),
