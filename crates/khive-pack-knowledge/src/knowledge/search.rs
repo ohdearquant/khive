@@ -2722,7 +2722,7 @@ async fn load_domain_by_id_or_slug(
     let row = if id.parse::<Uuid>().is_ok() {
         reader
             .query_row(SqlStatement {
-                sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_compose_domain_id").into(),
                 params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             })
@@ -2731,7 +2731,7 @@ async fn load_domain_by_id_or_slug(
     } else {
         let by_slug = reader
             .query_row(SqlStatement {
-                sql: "SELECT * FROM knowledge_domains WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_compose_domain_slug").into(),
                 params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             })
@@ -2747,11 +2747,8 @@ async fn load_domain_by_id_or_slug(
                 let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
                 let rows = reader
                     .query_all(SqlStatement {
-                        sql: "SELECT * FROM knowledge_domains WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 2".into(),
-                        params: vec![
-                            SqlValue::Text(pattern),
-                            SqlValue::Text(ns.to_owned()),
-                        ],
+                        sql: khive_runtime::sql!("knowledge_compose_domain_prefix").into(),
+                        params: vec![SqlValue::Text(pattern), SqlValue::Text(ns.to_owned())],
                         label: None,
                     })
                     .await
@@ -2786,7 +2783,7 @@ async fn load_atom_by_id_or_slug(
     let row = if id.parse::<Uuid>().is_ok() {
         reader
             .query_row(SqlStatement {
-                sql: "SELECT * FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_compose_atom_id").into(),
                 params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             })
