@@ -1,5 +1,4 @@
-//! Runtime-owned ADR-144 receipt capability. This prerequisite has no issuance
-//! call site yet; the v1 writer/reader and cutover policy remain unchanged.
+//! Runtime-owned ADR-144 receipt encryption and strict authenticated decoding.
 
 use std::sync::Arc;
 
@@ -81,6 +80,17 @@ impl ReceiptSealer {
         Ok(Self { ring, credentials })
     }
 
+    /// Resolve and validate the current encryption key without issuing a token.
+    pub(crate) fn ensure_key(&self) -> Result<(), ReceiptSealError> {
+        let entry = self
+            .ring
+            .keys
+            .iter()
+            .find(|entry| entry.encrypt)
+            .ok_or(ReceiptSealError::KeyUnavailable)?;
+        self.cipher(&entry.id).map(|_| ())
+    }
+
     pub(crate) fn seal(
         &self,
         namespace: &str,
@@ -131,31 +141,14 @@ impl ReceiptSealer {
         Ok(URL_SAFE_NO_PAD.encode(envelope))
     }
 
+    /// Validate envelope framing before the runtime resolves any custody state.
+    pub(crate) fn validate_envelope(token: &str) -> Result<(), ReceiptSealError> {
+        parse_envelope(token).map(|_| ())
+    }
+
     pub(crate) fn open(&self, token: &str) -> Result<ReceiptFields, ReceiptSealError> {
-        // Both encoded and decoded bounds are checked before any key lookup.
-        if token.len() > MAX_ENCODED_BYTES {
-            return Err(ReceiptSealError::InvalidReceipt);
-        }
-        let envelope = URL_SAFE_NO_PAD
-            .decode(token)
-            .map_err(|_| ReceiptSealError::InvalidReceipt)?;
-        if envelope.len() > MAX_ENVELOPE_BYTES
-            || URL_SAFE_NO_PAD.encode(&envelope) != token
-            || envelope.first() != Some(&VERSION)
-        {
-            return Err(ReceiptSealError::InvalidReceipt);
-        }
-        let key_len = usize::from(*envelope.get(1).ok_or(ReceiptSealError::InvalidReceipt)?);
-        let header_end = 2 + key_len;
-        let key_bytes = envelope
-            .get(2..header_end)
-            .ok_or(ReceiptSealError::InvalidReceipt)?;
-        // The smallest valid record carries a one-byte namespace.
-        if !valid_key_id(key_bytes)
-            || envelope.len() < header_end + NONCE_BYTES + TAG_BYTES + MIN_PLAINTEXT_BYTES + 1
-        {
-            return Err(ReceiptSealError::InvalidReceipt);
-        }
+        let (envelope, header_end) = parse_envelope(token)?;
+        let key_bytes = &envelope[2..header_end];
         let id = std::str::from_utf8(key_bytes).map_err(|_| ReceiptSealError::InvalidReceipt)?;
         let cipher = self.cipher(id)?;
         let nonce_end = header_end + NONCE_BYTES;
@@ -198,6 +191,34 @@ impl ReceiptSealer {
         XChaCha20Poly1305::new_from_slice(key.as_ref())
             .map_err(|_| ReceiptSealError::KeyUnavailable)
     }
+}
+
+fn parse_envelope(token: &str) -> Result<(Vec<u8>, usize), ReceiptSealError> {
+    // Both encoded and decoded bounds are checked before any key lookup.
+    if token.len() > MAX_ENCODED_BYTES {
+        return Err(ReceiptSealError::InvalidReceipt);
+    }
+    let envelope = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| ReceiptSealError::InvalidReceipt)?;
+    if envelope.len() > MAX_ENVELOPE_BYTES
+        || URL_SAFE_NO_PAD.encode(&envelope) != token
+        || envelope.first() != Some(&VERSION)
+    {
+        return Err(ReceiptSealError::InvalidReceipt);
+    }
+    let key_len = usize::from(*envelope.get(1).ok_or(ReceiptSealError::InvalidReceipt)?);
+    let header_end = 2 + key_len;
+    let key_bytes = envelope
+        .get(2..header_end)
+        .ok_or(ReceiptSealError::InvalidReceipt)?;
+    // The smallest valid record carries a one-byte namespace.
+    if !valid_key_id(key_bytes)
+        || envelope.len() < header_end + NONCE_BYTES + TAG_BYTES + MIN_PLAINTEXT_BYTES + 1
+    {
+        return Err(ReceiptSealError::InvalidReceipt);
+    }
+    Ok((envelope, header_end))
 }
 
 fn valid_key_id(id: &[u8]) -> bool {

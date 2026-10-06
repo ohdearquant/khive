@@ -421,6 +421,8 @@ struct Scanner<'a> {
     sql_sources: Option<&'a StaticSqlSources>,
     loader_bindings: CanonicalBindings,
     loaded_writers: Vec<(String, String)>,
+    markerless_calls: BTreeSet<(String, String)>,
+    recipient_stores: BTreeSet<String>,
 }
 
 impl<'ast> Visit<'ast> for Scanner<'_> {
@@ -429,7 +431,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         if !test_only(&item.attrs) {
             let old = std::mem::replace(&mut self.owner, item.sig.ident.to_string());
+            let stores = std::mem::take(&mut self.recipient_stores);
             syn::visit::visit_item_fn(self, item);
+            self.recipient_stores = stores;
             self.owner = old;
         }
     }
@@ -437,7 +441,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         if !test_only(&item.attrs) {
             let old = std::mem::replace(&mut self.owner, item.sig.ident.to_string());
+            let stores = std::mem::take(&mut self.recipient_stores);
             syn::visit::visit_impl_item_fn(self, item);
+            self.recipient_stores = stores;
             self.owner = old;
         }
     }
@@ -478,6 +484,69 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         if !test_only(&item.attrs) {
             syn::visit::visit_item_impl(self, item);
         }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if let (syn::Pat::Ident(binding), Some(init)) = (&local.pat, &local.init) {
+            if let syn::Expr::Call(call) = init.expr.as_ref() {
+                if let syn::Expr::Path(path) = call.func.as_ref() {
+                    let parts: Vec<_> = path
+                        .path
+                        .segments
+                        .iter()
+                        .map(|part| part.ident.to_string())
+                        .collect();
+                    if parts.ends_with(&["RecipientTransportStore".into(), "new".into()]) {
+                        self.recipient_stores.insert(binding.ident.to_string());
+                    }
+                }
+            }
+        }
+        syn::visit::visit_local(self, local);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        let method = call.method.to_string();
+        if markerless_route(&method) {
+            self.markerless_calls.insert((self.owner.clone(), method));
+        } else if method == "commit" {
+            let known_receiver = matches!(call.receiver.as_ref(), syn::Expr::Path(path)
+                if path
+                    .path
+                    .get_ident()
+                    .is_some_and(|name| self.recipient_stores.contains(&name.to_string()))
+            );
+            let recipient_argument = call.args.iter().any(|arg| {
+                matches!(arg, syn::Expr::Struct(value)
+                if value.path.segments.last().is_some_and(|part| part.ident == "RecipientCommit"))
+            });
+            if known_receiver || recipient_argument {
+                self.markerless_calls
+                    .insert((self.owner.clone(), "RecipientTransportStore::commit".into()));
+            }
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref() {
+            if let Some(last) = path.path.segments.last() {
+                let name = last.ident.to_string();
+                if markerless_route(&name) {
+                    self.markerless_calls.insert((self.owner.clone(), name));
+                } else if name == "commit"
+                    && path
+                        .path
+                        .segments
+                        .iter()
+                        .any(|part| part.ident == "RecipientTransportStore")
+                {
+                    self.markerless_calls
+                        .insert((self.owner.clone(), "RecipientTransportStore::commit".into()));
+                }
+            }
+        }
+        syn::visit::visit_expr_call(self, call);
     }
 
     fn visit_expr_block(&mut self, item: &'ast syn::ExprBlock) {
@@ -588,6 +657,180 @@ impl Scanner<'_> {
     }
 }
 
+fn markerless_route(name: &str) -> bool {
+    matches!(
+        name,
+        "upsert_note"
+            | "insert_note_if_absent"
+            | "try_insert_note"
+            | "try_insert_note_with_attachments"
+            | "upsert_notes"
+            | "batch_upsert_notes"
+            | "note_upsert_statement"
+            | "note_insert_if_absent_statement"
+            | "note_insert_keyed_statement"
+    )
+}
+
+#[derive(Clone, Copy)]
+enum MarkerDisposition {
+    StorageConstructor,
+    UnkeyedNote,
+    FixedNonMemoryKind,
+    RuntimeReceiptUnit,
+}
+
+// ADR-144 A4: only RuntimeReceiptUnit adds modern atomically; constructors and
+// forwarding wrappers do not infer provenance from the current binary.
+const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
+    (
+        DB,
+        "note_insert_if_absent_statement",
+        "note_upsert_statement",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "note_insert_keyed_statement",
+        "note_upsert_statement",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "upsert_note",
+        "note_upsert_statement",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "insert_note_if_absent",
+        "note_insert_if_absent_statement",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "try_insert_note",
+        "try_insert_note_with_attachments",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        DB,
+        "upsert_notes",
+        "batch_upsert_notes",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-runtime/src/note_store_guard.rs",
+        "upsert_note",
+        "upsert_note",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-runtime/src/note_store_guard.rs",
+        "insert_note_if_absent",
+        "insert_note_if_absent",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-runtime/src/note_store_guard.rs",
+        "upsert_notes",
+        "upsert_notes",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        "khive-runtime/src/note_store_guard.rs",
+        "try_insert_note",
+        "try_insert_note",
+        MarkerDisposition::StorageConstructor,
+    ),
+    (
+        OPERATIONS,
+        "create_note_inner",
+        "upsert_note",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        OPERATIONS,
+        "try_create_note_impl",
+        "try_insert_note",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        OPERATIONS,
+        "try_create_note_impl",
+        "try_insert_note_with_attachments",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        COMM,
+        "handle_heartbeat",
+        "insert_note_if_absent",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+    (
+        "kkernel/src/code_ingest.rs",
+        "persist_ingest_note",
+        "upsert_note",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+    (
+        "khive-runtime/src/atomic_prepare/add_update.rs",
+        "prepare_add_note",
+        "note_upsert_statement",
+        MarkerDisposition::UnkeyedNote,
+    ),
+    (
+        MESSAGE,
+        "create_keyed_message_pair_with_attachments",
+        "note_insert_if_absent_statement",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+    (
+        FAULT,
+        "prepare_atomic_note_requests",
+        "note_insert_keyed_statement",
+        MarkerDisposition::RuntimeReceiptUnit,
+    ),
+    (
+        FAULT,
+        "prepare_atomic_note_requests",
+        "note_upsert_statement",
+        MarkerDisposition::RuntimeReceiptUnit,
+    ),
+    (
+        CREATE,
+        "prepare_note_create",
+        "note_insert_if_absent_statement",
+        MarkerDisposition::RuntimeReceiptUnit,
+    ),
+    (
+        "khive-runtime/src/comm_recipient.rs",
+        "ingest_verified_recipient",
+        "RecipientTransportStore::commit",
+        MarkerDisposition::FixedNonMemoryKind,
+    ),
+];
+
+fn assert_markerless_callers(
+    found: &MarkerlessCalls,
+    inventory: &[(&str, &str, &str, MarkerDisposition)],
+) {
+    assert!(!found.is_empty(), "markerless note-route coverage is empty");
+    let expected = inventory
+        .iter()
+        .map(|(path, owner, route, _)| (path.to_string(), owner.to_string(), route.to_string()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected.len(),
+        inventory.len(),
+        "duplicate markerless caller disposition"
+    );
+    assert_eq!(
+        *found, expected,
+        "every markerless note-route caller needs an explicit disposition"
+    );
+}
+
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -605,13 +848,11 @@ fn files(dir: &Path, extension: &str, output: &mut Vec<PathBuf>) {
             ) {
                 files(&path, extension, output);
             }
-        } else if path.extension().is_some_and(|e| e == extension)
-            && !path
-                .file_stem()
-                .unwrap()
-                .to_string_lossy()
-                .ends_with("_tests")
-        {
+        } else if path.extension().is_some_and(|e| e == extension) && {
+            // Test-only modules are `<name>_tests.rs` or a directory module's `tests.rs`.
+            let stem = path.file_stem().unwrap().to_string_lossy();
+            !stem.ends_with("_tests") && stem != "tests"
+        } {
             output.push(path);
         }
     }
@@ -647,6 +888,16 @@ fn scan_sources_with_sql(
     sources: &[(String, String)],
     sql_sources: &StaticSqlSources,
 ) -> (NamedSqlWriters, LoadedSqlWriters) {
+    let (writers, loaded, _) = scan_sources_with_routes(sources, sql_sources);
+    (writers, loaded)
+}
+
+type MarkerlessCalls = BTreeSet<(String, String, String)>;
+
+fn scan_sources_with_routes(
+    sources: &[(String, String)],
+    sql_sources: &StaticSqlSources,
+) -> (NamedSqlWriters, LoadedSqlWriters, MarkerlessCalls) {
     let parsed = sources
         .iter()
         .map(|(path, source)| (path.clone(), syn::parse_file(source).unwrap()))
@@ -654,6 +905,7 @@ fn scan_sources_with_sql(
     let bindings = static_sql_source::canonical_bindings(&parsed, test_only);
     let mut found = BTreeMap::new();
     let mut loaded = BTreeSet::new();
+    let mut markerless = BTreeSet::new();
     for (path, file) in &parsed {
         let mut scanner = Scanner {
             source_path: path.clone(),
@@ -662,6 +914,9 @@ fn scan_sources_with_sql(
             ..Scanner::default()
         };
         scanner.visit_file(file);
+        for (owner, route) in scanner.markerless_calls {
+            markerless.insert((path.clone(), owner, route));
+        }
         for (asset, owner) in scanner.loaded_writers {
             loaded.insert((asset, path.clone(), owner));
         }
@@ -673,7 +928,7 @@ fn scan_sources_with_sql(
             );
         }
     }
-    (found, loaded)
+    (found, loaded, markerless)
 }
 
 fn assert_sql_ownership(
@@ -720,7 +975,8 @@ fn census() -> BTreeMap<(String, String), String> {
         })
         .collect::<Vec<_>>();
     let sql_sources = live_sql_sources();
-    let (found, loaded) = scan_sources_with_sql(&sources, &sql_sources);
+    let (found, loaded, markerless) = scan_sources_with_routes(&sources, &sql_sources);
+    assert_markerless_callers(&markerless, MARKERLESS_CALLERS);
     assert_sql_ownership(&sql_sources, &loaded);
     let expected = [
         (DB, "NOTE_UPSERT_SQL"),
@@ -1676,4 +1932,45 @@ fn application_sql_inventory_rejects_orphans_and_wrong_callers() {
         "UPDATE notes SET content='rogue'".into(),
     );
     assert!(std::panic::catch_unwind(|| assert_sql_ownership(&assets, &links)).is_err());
+}
+
+#[test]
+fn markerless_route_census_rejects_empty_and_unlisted_production_callers() {
+    let path = "khive-runtime/src/fixture.rs";
+    let source = r#"
+        async fn approved(store: Store, note: Note) { store.upsert_note(note).await; }
+        #[cfg(test)] mod tests { fn ignored() { note_insert_keyed_statement(&note); } }
+    "#;
+    let scan = |source: &str| {
+        scan_sources_with_routes(&[(path.into(), source.into())], &StaticSqlSources::new()).2
+    };
+    let inventory = [(
+        path,
+        "approved",
+        "upsert_note",
+        MarkerDisposition::StorageConstructor,
+    )];
+    assert_markerless_callers(&scan(source), &inventory);
+    assert!(std::panic::catch_unwind(|| assert_markerless_callers(&scan(""), &inventory)).is_err());
+    let added = format!("{source} fn unreviewed() {{ note_insert_keyed_statement(&note); }}");
+    assert!(
+        std::panic::catch_unwind(|| assert_markerless_callers(&scan(&added), &inventory)).is_err()
+    );
+    let transport = r#"async fn received(pool: Pool, request: RecipientCommit) {
+        let recipient = RecipientTransportStore::new(pool);
+        recipient.commit(request).await;
+    }"#;
+    assert_markerless_callers(
+        &scan(transport),
+        &[(
+            path,
+            "received",
+            "RecipientTransportStore::commit",
+            MarkerDisposition::FixedNonMemoryKind,
+        )],
+    );
+    assert!(
+        std::panic::catch_unwind(|| assert_markerless_callers(&scan(transport), &inventory))
+            .is_err()
+    );
 }

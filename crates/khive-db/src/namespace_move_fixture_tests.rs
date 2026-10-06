@@ -99,7 +99,11 @@ fn every_current_namespace_table_has_a_move_disposition() {
         unknown.is_empty(),
         "every shipped namespace-bearing table needs a move disposition: {unknown:?}"
     );
-    for name in ["memory_visibility_receipts", "memory_visibility_fences"] {
+    for name in [
+        "memory_visibility_receipts",
+        "memory_visibility_fences",
+        "memory_visibility_epochs",
+    ] {
         let table = inventory
             .tables
             .iter()
@@ -974,5 +978,173 @@ fn the_fixture_plants_what_it_says_it_plants() {
         1,
         "the knowledge index follows its base row by trigger and the builder \
          never writes it"
+    );
+}
+
+#[test]
+fn memory_epochs_follow_notes_without_receipts_and_keep_identity_through_lifecycle() {
+    let conn = migrated();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    assert_eq!(count(&conn, "PRAGMA foreign_keys"), 1);
+    for epoch in ["legacy", "modern", "unknown"] {
+        conn.execute(
+            "INSERT INTO notes(id, namespace, kind, key, name, content, created_at, updated_at) \
+             VALUES (?1, 'source', 'memory', ?1, 'name', 'content', 1, 1)",
+            [epoch],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_visibility_epochs(note_id, namespace, epoch) \
+             VALUES (?1, 'source', ?1)",
+            [epoch],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO memory_visibility_pre_v46(note_id) VALUES ('legacy')",
+        [],
+    )
+    .unwrap();
+    let request = MoveRequest::new(
+        "source",
+        vec![MoveRoute {
+            class: SubjectClass::Note("memory".into()),
+            target: "target".into(),
+        }],
+    );
+    let moved = attempt(&conn, &request).unwrap();
+    assert_eq!(moved.subjects.get("note:memory"), Some(&3));
+    assert_eq!(moved.rows.get("memory_visibility_epochs"), Some(&3));
+    assert!(!moved.left_behind.contains_key("memory_visibility_epochs"));
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM memory_visibility_receipts"),
+        0
+    );
+    assert_eq!(
+        count(
+            &conn,
+            concat!(
+                "SELECT COUNT(*) FROM memory_visibility_epochs ",
+                "WHERE namespace = 'target' AND note_id = epoch"
+            )
+        ),
+        3
+    );
+    assert_eq!(
+        count(
+            &conn,
+            concat!(
+                "SELECT COUNT(*) FROM memory_visibility_epochs e JOIN notes n ",
+                "ON n.id = e.note_id AND n.namespace = e.namespace"
+            )
+        ),
+        3
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM memory_visibility_pre_v46 WHERE note_id = 'legacy'"
+        ),
+        1
+    );
+
+    conn.execute("UPDATE notes SET deleted_at = 2 WHERE id = 'modern'", [])
+        .unwrap();
+    assert_eq!(
+        text(
+            &conn,
+            "SELECT epoch FROM memory_visibility_epochs WHERE note_id = 'modern'"
+        ),
+        "modern"
+    );
+    conn.execute("UPDATE notes SET deleted_at = NULL WHERE id = 'modern'", [])
+        .unwrap();
+    assert_eq!(
+        text(
+            &conn,
+            "SELECT epoch FROM memory_visibility_epochs WHERE note_id = 'modern'"
+        ),
+        "modern"
+    );
+    conn.execute("DELETE FROM notes WHERE id = 'legacy'", [])
+        .unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM memory_visibility_epochs WHERE note_id = 'legacy'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM memory_visibility_pre_v46 WHERE note_id = 'legacy'"
+        ),
+        0
+    );
+    conn.execute(
+        "INSERT INTO notes(id, namespace, kind, key, name, content, created_at, updated_at) \
+         VALUES ('replacement', 'target', 'memory', 'legacy', 'name', 'replacement', 3, 3)",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM memory_visibility_epochs WHERE note_id = 'replacement'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+        0
+    );
+}
+
+#[test]
+fn rolling_back_a_note_namespace_move_also_rolls_back_epoch_attribution() {
+    let conn = migrated();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute_batch(
+        "INSERT INTO notes(id, namespace, kind, key, name, content, created_at, updated_at) \
+         VALUES ('moving', 'source', 'memory', 'key', 'name', 'content', 1, 1); \
+         INSERT INTO memory_visibility_epochs(note_id, namespace, epoch) \
+         VALUES ('moving', 'source', 'unknown'); \
+         SAVEPOINT outer_move",
+    )
+    .unwrap();
+    let request = MoveRequest::new(
+        "source",
+        vec![MoveRoute {
+            class: SubjectClass::Note("memory".into()),
+            target: "target".into(),
+        }],
+    );
+    assert_eq!(
+        attempt(&conn, &request)
+            .unwrap()
+            .rows
+            .get("memory_visibility_epochs"),
+        Some(&1)
+    );
+    assert_eq!(
+        text(
+            &conn,
+            "SELECT namespace FROM memory_visibility_epochs WHERE note_id = 'moving'"
+        ),
+        "target"
+    );
+    conn.execute_batch("ROLLBACK TO outer_move; RELEASE outer_move")
+        .unwrap();
+    assert_eq!(
+        text(
+            &conn,
+            "SELECT namespace FROM memory_visibility_epochs WHERE note_id = 'moving'"
+        ),
+        "source"
+    );
+    assert_eq!(
+        text(&conn, "SELECT namespace FROM notes WHERE id = 'moving'"),
+        "source"
     );
 }

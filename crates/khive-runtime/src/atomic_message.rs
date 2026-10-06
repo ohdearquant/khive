@@ -532,6 +532,21 @@ pub(crate) async fn prepare_atomic_note_requests(
         notes.push(note);
     }
 
+    // Deferred key publication clears the temporary Note.key; its private receipt
+    // option is the original keyed-memory intent. Generic and stream routes
+    // retain options.key. Kind is always the canonical prepared note kind.
+    let memory_receipts: Vec<bool> = notes
+        .iter()
+        .zip(&requests)
+        .map(|(note, request)| {
+            note.kind == "memory"
+                && (request.options.key.is_some() || request.options.memory_visibility_receipt)
+        })
+        .collect();
+    if memory_receipts.iter().any(|capture| *capture) {
+        runtime.require_visibility_cutover()?;
+    }
+
     // ---- 2. Batch distinct content per model in parallel, BEFORE
     // opening any transaction. Any failure aborts here — no write has been
     // attempted. Identical note siblings reuse the same computed vector. ----
@@ -705,7 +720,7 @@ pub(crate) async fn prepare_atomic_note_requests(
             guard: Some(AffectedRowGuard::exactly(1)),
         }];
 
-        if requests[note_idx].options.memory_visibility_receipt {
+        if memory_receipts[note_idx] {
             statements.push(PlanStatement {
                 statement: SqlStatement {
                     sql:
@@ -777,7 +792,7 @@ pub(crate) async fn prepare_atomic_note_requests(
                     &outcome.vector,
                     &format!("atomic-message-vec-{table}-{}", note.id),
                 ));
-                if requests[note_idx].options.memory_visibility_receipt {
+                if memory_receipts[note_idx] {
                     // The preceding statement is the model's ann_write_log
                     // upsert. Keep this insert adjacent: last_insert_rowid()
                     // reads that exact transaction-local sequence, never a
@@ -799,6 +814,24 @@ pub(crate) async fn prepare_atomic_note_requests(
                     });
                 }
             }
+        }
+
+        // After every log/fence pair: inserting the independent marker must
+        // never disturb either ANN or FTS last_insert_rowid adjacency.
+        if memory_receipts[note_idx] {
+            statements.push(PlanStatement {
+                statement: SqlStatement {
+                    sql: "INSERT INTO memory_visibility_epochs (note_id, namespace, epoch) \
+                          VALUES (?1, ?2, 'modern')"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(note.id.to_string()),
+                        SqlValue::Text(note.namespace.clone()),
+                    ],
+                    label: Some("memory-visibility-epoch".into()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
         }
 
         plans.push(AtomicOpPlan::AddNote(Box::new(AddNotePlan {
