@@ -522,7 +522,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "curation.outbound.delivery",
-        site: "khive-runtime/src/curation.rs::KhiveRuntime::replace_outbound_message_properties",
+        site: "khive-runtime/src/curation/outbound_messages.rs::KhiveRuntime::replace_outbound_message_properties",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -535,7 +535,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "curation.outbound.owner",
-        site: "khive-runtime/src/curation.rs::KhiveRuntime::replace_outbound_message_properties_as_owner",
+        site: "khive-runtime/src/curation/outbound_messages.rs::KhiveRuntime::replace_outbound_message_properties_as_owner",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
