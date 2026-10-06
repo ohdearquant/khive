@@ -118,6 +118,63 @@ fn matching_daemon_claim_opens_read_only_snapshots_in_both_boot_routes() {
     }
 }
 
+#[test]
+fn sqlite_open_errors_preserve_backend_resolved_path_and_typed_cause() {
+    if initialize_in_isolated_child() {
+        return;
+    }
+    for (implicit, read_only) in [(false, false), (false, true), (true, false)] {
+        let home = PathBuf::from(std::env::var_os("HOME").expect("isolated child HOME"));
+        let dir = tempfile::tempdir_in(&home).unwrap();
+        let path = dir.path().join("invalid.db");
+        std::fs::write(&path, [b'X'; 1024]).unwrap();
+        let declared_path = PathBuf::from("~")
+            .join(dir.path().strip_prefix(&home).unwrap())
+            .join("invalid.db");
+        let error = if implicit {
+            let mut config = RuntimeConfig {
+                db_path: Some(path.clone()),
+                ..RuntimeConfig::no_embeddings()
+            };
+            open_single_backend(&mut config, Some(1), None)
+        } else {
+            open_backend(
+                &declared(&declared_path, read_only),
+                Some(1),
+                khive_db::WalCeilingPolicy::default(),
+                None,
+            )
+        }
+        .err()
+        .expect("invalid SQLite bytes must refuse backend construction");
+        let cause = error
+            .downcast_ref::<khive_db::SqliteError>()
+            .expect("open context must preserve the typed SQLite cause");
+        assert!(
+            matches!(cause, khive_db::SqliteError::Rusqlite(_)),
+            "fixture must reach the SQLite driver: {error:#}"
+        );
+        let expected_path = path.display().to_string();
+        assert!(
+            !cause.to_string().contains(&expected_path),
+            "fixture must require the added path context: {error:#}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("backend main"),
+            "implicit={implicit}, read_only={read_only}: {message}"
+        );
+        assert!(
+            message.contains(&expected_path),
+            "implicit={implicit}, read_only={read_only}: resolved path missing: {message}"
+        );
+        assert!(
+            !message.contains(&declared_path.display().to_string()),
+            "error must disclose the opened path rather than the tilde spelling: {message}"
+        );
+    }
+}
+
 fn initialize_in_isolated_child() -> bool {
     if crate::test_isolation::rerun_with_private_home() {
         return true;
