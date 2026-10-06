@@ -318,8 +318,10 @@ NOT abort the batch — each entry has its own ok/error. The aggregate response 
 - **Lint SQL.** `scripts/lint-sql.sh` loads every `crates/**/*.sql` into an
   in-memory SQLite db and checks hygiene; it runs in `make ci` and pre-commit. A
   malformed `.sql` fails before it ships.
-- **Reusable query SQL** (hot/tuned queries) should likewise move to `.sql` files
-  where it makes sense — lintable, `EXPLAIN`-able, and tunable without recompiling.
+- **Query SQL lives in `sql/<name>.sql`.** A statement stays inline only when its
+  text is assembled at run time, with the statement and reason recorded in the
+  crate's inline keep-list in `pack/sql_policy_tests.rs`. The source guard's
+  existing exclusion for test-only schema/data fixtures remains in place.
 
 ### MCP tool changes
 

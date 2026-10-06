@@ -121,18 +121,150 @@ fn note_insert_columns(words: &[String]) -> Option<usize> {
         .then_some(table + 1)
 }
 
+#[derive(Debug)]
+enum InitializerToken {
+    Word(String),
+    Quoted(String),
+    Symbol(char),
+}
+
+impl InitializerToken {
+    fn keyword(&self, expected: &str) -> bool {
+        matches!(self, Self::Word(word) if word.eq_ignore_ascii_case(expected))
+    }
+
+    fn identifier(&self) -> Option<&str> {
+        match self {
+            Self::Word(word) | Self::Quoted(word) => Some(word),
+            Self::Symbol(_) => None,
+        }
+    }
+
+    fn symbol(&self, expected: char) -> bool {
+        matches!(self, Self::Symbol(symbol) if *symbol == expected)
+    }
+}
+
+fn initializer_tokens(sql: &str) -> Vec<InitializerToken> {
+    let mut input = sql.chars().peekable();
+    let mut tokens = Vec::new();
+    let identifier_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii();
+    while let Some(c) = input.next() {
+        if matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0c' | '\u{feff}') {
+            continue;
+        }
+        if c == '-' && input.peek() == Some(&'-') {
+            for c in input.by_ref() {
+                if c == '\n' {
+                    break;
+                }
+            }
+        } else if c == '/' && input.peek() == Some(&'*') {
+            input.next();
+            // SQLite block comments end at the first closing pair; they do not nest.
+            while let Some(c) = input.next() {
+                if c == '*' && input.peek() == Some(&'/') {
+                    input.next();
+                    break;
+                }
+            }
+        } else if matches!(c, '\'' | '"' | '`' | '[') {
+            let close = if c == '[' { ']' } else { c };
+            let mut quoted = String::new();
+            while let Some(next) = input.next() {
+                if next == close {
+                    if close != ']' && input.peek() == Some(&close) {
+                        input.next();
+                    } else {
+                        break;
+                    }
+                }
+                quoted.push(next);
+            }
+            // Single quotes may denote identifiers in SQLite identifier positions,
+            // but no quoted token may start an INSERT or stand in for INTO.
+            tokens.push(InitializerToken::Quoted(quoted));
+        } else if identifier_char(c) {
+            let mut word = String::from(c);
+            while input.peek().is_some_and(|c| identifier_char(*c)) {
+                word.push(input.next().unwrap());
+            }
+            tokens.push(InitializerToken::Word(word));
+        } else {
+            tokens.push(InitializerToken::Symbol(c));
+        }
+    }
+    tokens
+}
+
+fn initializer_columns_at(tokens: &[InitializerToken], start: usize) -> Option<usize> {
+    let mut at = start + 1;
+    if tokens[start].keyword("INSERT") {
+        if tokens.get(at).is_some_and(|token| token.keyword("OR")) {
+            at += 1;
+            if !tokens.get(at).is_some_and(|token| {
+                ["ROLLBACK", "ABORT", "REPLACE", "FAIL", "IGNORE"]
+                    .iter()
+                    .any(|action| token.keyword(action))
+            }) {
+                return None;
+            }
+            at += 1;
+        }
+    } else if !tokens[start].keyword("REPLACE") {
+        return None;
+    }
+    if !tokens.get(at).is_some_and(|token| token.keyword("INTO")) {
+        return None;
+    }
+    at += 1;
+    let first = tokens.get(at)?.identifier()?;
+    at += 1;
+    let table = if tokens.get(at).is_some_and(|token| token.symbol('.')) {
+        if !first.eq_ignore_ascii_case("MAIN") {
+            return None;
+        }
+        at += 1;
+        let table = tokens.get(at)?.identifier()?;
+        at += 1;
+        table
+    } else {
+        first
+    };
+    if !table.eq_ignore_ascii_case("NOTES") {
+        return None;
+    }
+    if tokens.get(at).is_some_and(|token| token.keyword("AS")) {
+        at += 1;
+        tokens.get(at)?.identifier()?;
+        at += 1;
+    }
+    tokens
+        .get(at)
+        .is_some_and(|token| token.symbol('('))
+        .then_some(at + 1)
+}
+
 fn assert_note_version_implicit(sql: &str, owner: &str) {
-    let tokens = words(sql);
-    if let Some(start) = note_insert_columns(&tokens) {
-        let columns = &tokens[start..];
-        let end = columns
-            .iter()
-            .position(|w| w == "VALUES" || w == "SELECT")
-            .unwrap_or(columns.len());
-        assert!(
-            !columns[..end].iter().any(|w| w == "VERSION"),
-            "{owner} explicitly initializes note.version"
-        );
+    let tokens = initializer_tokens(sql);
+    for start in 0..tokens.len() {
+        let Some(mut column) = initializer_columns_at(&tokens, start) else {
+            continue;
+        };
+        while let Some(name) = tokens.get(column).and_then(InitializerToken::identifier) {
+            assert!(
+                !name.eq_ignore_ascii_case("VERSION"),
+                "{owner} explicitly initializes note.version"
+            );
+            if !tokens
+                .get(column + 1)
+                .is_some_and(|token| token.symbol(','))
+            {
+                break;
+            }
+            column += 2;
+        }
     }
 }
 
@@ -956,17 +1088,168 @@ fn plain_sql_insert_retains_the_note_version_initializer_guard() {
     .is_err());
 }
 
+fn assert_initializer_refusal(owner: &str, check: impl FnOnce() + std::panic::UnwindSafe) {
+    let failure = std::panic::catch_unwind(check).expect_err("explicit version must be refused");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("initializer refusal has a string diagnostic");
+    assert!(
+        message.contains(owner) && message.contains("explicitly initializes note.version"),
+        "wrong refusal: {message}"
+    );
+}
+
 #[test]
-fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
-    let root = root();
+fn note_version_initializer_checks_later_inserts_and_replace() {
+    for sql in [
+        "\u{feff}INSERT INTO notes (id, version) VALUES (1, 2);",
+        "INSERT INTO audit (id, version) VALUES (1, 2); INSERT INTO notes (id, version) VALUES (1, \
+            2);",
+        "INSERT INTO notes (id) VALUES (1); INSERT INTO main.notes (id, version) SELECT 2, 3;",
+        "REPLACE INTO notes (id, version) VALUES (1, 2);",
+        "WITH input(id) AS (SELECT 1) INSERT INTO notes AS target (id, version) SELECT id, 2 FROM \
+            input;",
+        "CREATE TRIGGER new_note AFTER INSERT ON audit BEGIN INSERT INTO notes (id, version) \
+            VALUES (NEW.id, 2); END;",
+    ] {
+        assert_initializer_refusal("statements.sql", || {
+            assert_note_version_implicit(sql, "statements.sql");
+        });
+    }
+    for prefix in [
+        "INSERT",
+        "INSERT OR ROLLBACK",
+        "INSERT OR ABORT",
+        "INSERT OR REPLACE",
+        "INSERT OR FAIL",
+        "INSERT OR IGNORE",
+        "REPLACE",
+    ] {
+        for target in [
+            "notes",
+            "main.notes",
+            r#""main"."notes""#,
+            "`main`.`notes`",
+            "[main].[notes]",
+            "'main'.'notes'",
+        ] {
+            let explicit = format!("{prefix} INTO {target} (id, \"version\") VALUES (1, 2);");
+            assert_initializer_refusal("forms.sql", || {
+                assert_note_version_implicit(&explicit, "forms.sql");
+            });
+            let ordinary = format!("{prefix} INTO {target} (id, content) VALUES (1, 'version');");
+            assert_note_version_implicit(&ordinary, "forms.sql");
+        }
+    }
+}
+
+#[test]
+fn note_version_initializer_respects_quotes_comments_and_column_boundaries() {
+    for sql in [
+        r#"INSERT INTO notes ("values", "select", "version") VALUES (1, 2, 3);"#,
+        "insert/* target */into MAIN /* schema */ . [NoTeS] (id, [VeRsIoN]) values (1, 2);",
+        "REPLACE INTO `notes` (id, `version`) SELECT 1, 2;",
+        "INSERT INTO 'notes' ('id', 'version') VALUES (1, 2);",
+        r#"INSERT INTO notes ("ver""sion", version) VALUES (1, 2);"#,
+        "INSERT INTO notes (`ver``sion`, version) VALUES (1, 2);",
+        "INSERT INTO notes ([semi;colon], version) VALUES (1, 2);",
+        "/* outer /* inner */ INSERT INTO notes (version) VALUES (1);",
+        "INSERT INTO audit (content) VALUES ('escaped ''; REPLACE INTO notes(version) VALUES \
+            (1);'); REPLACE INTO notes (version) VALUES (2);",
+    ] {
+        assert_initializer_refusal("quoted.sql", || {
+            assert_note_version_implicit(sql, "quoted.sql");
+        });
+    }
+    for sql in [
+        "INSERT INTO audit (version) VALUES (1); INSERT INTO notes (id, content) VALUES (2, \
+            'version');",
+        "INSERT INTO notes_seq (version) VALUES (1);",
+        "INSERT INTO other.notes (version) VALUES (1);",
+        r#"INSERT INTO "main.notes" (version) VALUES (1);"#,
+        "INSERT INTO notes (id, versioned, version$tag, versioné) SELECT id, version, 1, 2 FROM \
+            audit;",
+        "INSERT INTO notes DEFAULT VALUES;",
+        "\u{feff}INSERT INTO notes (id) VALUES (1);",
+        "INSERT INTO notes (ver\u{feff}sion) VALUES (1);",
+        "REPLACE INTO main.notes (id) VALUES (1);",
+        "SELECT 'INSERT INTO notes(version) VALUES (1);';",
+        r#"SELECT "INSERT", "INTO", "notes", "version";"#,
+        r#"SELECT "escaped ""; INSERT INTO notes(version) VALUES (1);";"#,
+        "SELECT 'escaped ''; INSERT INTO notes(version) VALUES (1);';",
+        "SELECT `escaped ``; INSERT INTO notes(version) VALUES (1);`;",
+        "SELECT [semicolon; INSERT INTO notes(version) VALUES (1)];",
+        "-- INSERT INTO notes(version) VALUES (1);\nINSERT INTO notes(id) VALUES (1);",
+        "/* REPLACE INTO notes(version) VALUES (1); */ INSERT INTO notes(id) VALUES (1);",
+        "INSERT INTO notes (id, content) VALUES (1, 'version; INSERT INTO notes(version) VALUES \
+            (2);');",
+        // Comments separate tokens; punctuation prevents borrowing another statement's INTO.
+        "INS/**/ERT INTO notes(version) VALUES (1);",
+        "SELECT INSERT; SELECT INTO notes(version);",
+        r#"SELECT "INSERT" INTO notes(version);"#,
+    ] {
+        assert_note_version_implicit(sql, "harmless.sql");
+    }
+}
+
+#[test]
+fn sql_file_inventory_applies_initializer_guard_before_writer_filtering() {
+    let fixture = tempfile::tempdir().unwrap();
+    let sql_dir = fixture.path().join("fixture").join("sql");
+    std::fs::create_dir_all(sql_dir.join("nested")).unwrap();
+    let writer = sql_dir.join("nested").join("writer.sql");
+    std::fs::write(
+        &writer,
+        "UPDATE notes SET content = 'safe' WHERE id = 'fixture';",
+    )
+    .unwrap();
+    std::fs::write(
+        sql_dir.join("ignored.txt"),
+        "INSERT INTO notes (version) VALUES (1);",
+    )
+    .unwrap();
+    let insert = sql_dir.join("insert.sql");
+    std::fs::write(
+        &insert,
+        "INSERT INTO audit (version) VALUES (1); INSERT INTO notes (id) VALUES (2);",
+    )
+    .unwrap();
+    let expected = BTreeSet::from([writer
+        .strip_prefix(fixture.path())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()]);
+    assert_eq!(sql_file_writer_inventory(fixture.path()), expected);
+
+    for poisoned in [
+        "\u{feff}INSERT INTO notes (version) VALUES (1);",
+        "INSERT INTO audit (id) VALUES (1); INSERT INTO notes (id, version) VALUES (2, 3);",
+        "INSERT INTO notes (id) VALUES (1); REPLACE INTO main.notes (id, version) VALUES (2, 3);",
+    ] {
+        assert!(
+            !note_writer(poisoned),
+            "the guard must precede the writer filter"
+        );
+        std::fs::write(&insert, poisoned).unwrap();
+        assert_initializer_refusal(&insert.display().to_string(), || {
+            sql_file_writer_inventory(fixture.path());
+        });
+    }
+    std::fs::write(&insert, "REPLACE INTO notes (id) VALUES (1);").unwrap();
+    assert_eq!(sql_file_writer_inventory(fixture.path()), expected);
+}
+
+fn sql_file_writer_inventory(root: &Path) -> BTreeSet<String> {
     let mut sources = Vec::new();
-    for entry in std::fs::read_dir(&root).unwrap() {
+    for entry in std::fs::read_dir(root).unwrap() {
         let sql = entry.unwrap().path().join("sql");
         if sql.is_dir() {
             files(&sql, "sql", &mut sources);
         }
     }
-    let found: BTreeSet<_> = sources
+    sources
         .into_iter()
         .filter(|path| {
             let sql = std::fs::read_to_string(path).unwrap();
@@ -974,12 +1257,17 @@ fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
             note_writer(&sql)
         })
         .map(|path| {
-            path.strip_prefix(&root)
+            path.strip_prefix(root)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned()
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
+    let found = sql_file_writer_inventory(&root());
     assert_eq!(
         found,
         LEGACY_SQL_WRITERS

@@ -1497,17 +1497,9 @@ read_only = true
 
         // Create retrieval_snapshots table and seed rows.
         let mut w = sql.writer().await.expect("writer");
-        w.execute_script(
-            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
-             namespace TEXT NOT NULL, \
-             index_type TEXT NOT NULL, \
-             snapshot BLOB NOT NULL, \
-             created_at INTEGER NOT NULL, \
-             PRIMARY KEY (namespace, index_type));"
-                .into(),
-        )
-        .await
-        .expect("create table");
+        w.execute_script(include_str!("../sql/retrieval_snapshots_prepare.sql").into())
+            .await
+            .expect("create table");
 
         for (ns, idx_type) in &[
             ("local::vamana::model-a", "vamana"),
