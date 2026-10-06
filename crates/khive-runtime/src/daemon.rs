@@ -5482,44 +5482,7 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), accept_task).await;
     }
 
-    /// #2230 review (Medium): a listener that accepts a connection but never
-    /// answers with a well-formed daemon response — e.g. an unrelated process
-    /// that happens to have bound the same socket path — must not be
-    /// classified as khived, and the probe must not hang past its own
-    /// bounded timeout.
-    #[tokio::test]
-    async fn socket_speaks_khived_protocol_rejects_a_non_protocol_listener() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sock_path = dir.path().join("fake.sock");
-        let listener = UnixListener::bind(&sock_path).expect("bind fake listener");
-        let held = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-        let held_for_task = held.clone();
-        let accept_task = tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                // Accept but never write anything back — the connection stays
-                // open exactly like a foreign process that speaks a different
-                // (or no) protocol on this socket.
-                held_for_task.lock().await.push(stream);
-            }
-        });
-
-        let before = tokio::time::Instant::now();
-        let speaks = socket_speaks_khived_protocol(&sock_path, "probe-test").await;
-        let elapsed = before.elapsed();
-
-        assert!(
-            !speaks,
-            "a listener that accepts but never answers the probe frame must not be treated as khived"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "the probe must be bounded by its own timeout, not hang indefinitely; took {elapsed:?}"
-        );
-
-        accept_task.abort();
-        let _ = accept_task.await;
-        drop(held);
-    }
+    include!("daemon/probe_listener_tests.rs");
 
     /// Regression (#2230): a well-formed [`DaemonResponseFrame`]
     /// that is not the unambiguous probe-ack sentinel — e.g. one reporting a
