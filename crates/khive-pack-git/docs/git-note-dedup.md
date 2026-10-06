@@ -69,7 +69,9 @@ refusal.
 The merge embeds the survivor the way ingest does, so its vector follows the
 merged body, and the donor's vector rows are removed. The donor is tombstoned
 with its original content and properties, and the normal edge rewiring and merge
-event apply.
+event apply. A reported post-commit reindex failure leaves the merge committed;
+the summary and JSON report identify the survivor and error, and the command
+exits nonzero.
 
 ## Reading the plan
 

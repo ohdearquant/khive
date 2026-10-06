@@ -938,6 +938,58 @@ async fn the_merge_embeds_the_survivor_and_drops_the_tombstoned_vector() {
 }
 
 #[tokio::test]
+async fn a_committed_reindex_failure_fails_the_report_without_stopping_merges() {
+    let mut f = Fixture::embedding().await;
+    let namespace = format!("git-dedup-reindex-{}", Uuid::new_v4().as_simple());
+    f.token = f
+        .runtime
+        .authorize(Namespace::parse(&namespace).unwrap())
+        .unwrap();
+    f.canonical = f.project().await;
+    let old = f.anchor().await;
+    let other = f.anchor().await;
+    let survivor = f
+        .pr(f.canonical, Some("#1 t"), 1, "t", "survivor body")
+        .await;
+    let first = f.pr(old, Some("#1 t"), 1, "t", "first donor body").await;
+    let second = f.pr(other, Some("#1 t"), 1, "t", "second donor body").await;
+    f.retire(old).await;
+    f.retire(other).await;
+    let plan = f.plan().await;
+    assert_eq!(plan.report().planned.len(), 1);
+    assert_eq!(plan.report().planned[0].survivor.id, survivor.id);
+    assert_eq!(plan.report().planned[0].donors.len(), 2);
+    let events_before = f.merge_events().await;
+
+    let _arm = khive_runtime::arm_fts_fail_scoped(&namespace);
+    let report = apply_dedup(&f.runtime, &f.token, plan).await.unwrap();
+
+    assert_eq!(report.applied.len(), 2);
+    assert!(report.refused_merges.is_empty());
+    let error = report.applied[0]
+        .summary
+        .post_commit_reindex_error
+        .as_deref()
+        .expect("the first committed merge must report the injected failure");
+    assert!(error.contains("injected FTS failure"), "{error}");
+    assert_eq!(report.applied[1].summary.post_commit_reindex_error, None);
+    assert!(!report.success, "a later success must not mask the failure");
+    assert_eq!(serde_json::to_value(&report).unwrap()["success"], false);
+    assert!(report.summary_lines().contains(&format!(
+        "note {}: merge committed; post-commit reindex failed: {}",
+        survivor.id, error
+    )));
+    assert!(f.is_deleted(first.id).await);
+    assert!(f.is_deleted(second.id).await);
+    let kept = f.current(survivor.id).await;
+    for body in ["survivor body", "first donor body", "second donor body"] {
+        assert!(kept.content.contains(body), "missing {body}");
+    }
+    assert_eq!(kept.version, report.applied[1].kept_version);
+    assert_eq!(f.merge_events().await, events_before + 2);
+}
+
+#[tokio::test]
 async fn preview_changes_nothing_and_a_second_apply_finds_nothing_to_do() {
     let f = Fixture::new().await;
     let old = f.anchor().await;
