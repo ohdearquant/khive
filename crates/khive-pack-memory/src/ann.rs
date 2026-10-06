@@ -529,7 +529,7 @@ pub(crate) async fn maybe_check_durable_epoch(rt: &KhiveRuntime, ann: &SharedAnn
 
 /// Pack-owned DDL for the durable ANN corpus epoch table.
 pub(crate) const MEMORY_SCHEMA_PLAN_STMTS: [&str; 1] =
-    [khive_runtime::sql!("memory_ann_epoch_create")];
+    [::khive_runtime::sql!("memory_ann_epoch_create")];
 
 /// Idempotently create the durable epoch table; never called from the hot read path.
 pub(crate) async fn ensure_epoch_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
@@ -551,7 +551,7 @@ pub(crate) async fn durable_epoch(rt: &KhiveRuntime) -> u64 {
     };
     let Ok(rows) = reader
         .query_all(SqlStatement {
-            sql: khive_runtime::sql!("memory_ann_epoch_select").into(),
+            sql: ::khive_runtime::sql!("memory_ann_epoch_select").into(),
             params: vec![],
             label: Some("memory_ann_durable_epoch_read".into()),
         })
@@ -573,7 +573,7 @@ pub(crate) async fn bump_durable_epoch(rt: &KhiveRuntime) -> Result<u64, Runtime
         .await
         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
     w.execute(SqlStatement {
-        sql: khive_runtime::sql!("memory_ann_epoch_increment").into(),
+        sql: ::khive_runtime::sql!("memory_ann_epoch_increment").into(),
         params: vec![],
         label: Some("memory_ann_durable_epoch_bump".into()),
     })
@@ -2621,7 +2621,7 @@ async fn registry_min_watermark_on(
 ) -> Result<Option<i64>, String> {
     let rows = reader
         .query_all(SqlStatement {
-            sql: khive_runtime::sql!("memory_ann_registry_min_select").into(),
+            sql: ::khive_runtime::sql!("memory_ann_registry_min_select").into(),
             params: vec![
                 SqlValue::Text(ANN_WILDCARD_NS.into()),
                 SqlValue::Text(model.to_owned()),
@@ -2646,7 +2646,7 @@ async fn consumer_watermark_on(
 ) -> Result<Option<i64>, String> {
     let rows = reader
         .query_all(SqlStatement {
-            sql: khive_runtime::sql!("memory_ann_consumer_watermark_select").into(),
+            sql: ::khive_runtime::sql!("memory_ann_consumer_watermark_select").into(),
             params: vec![
                 SqlValue::Text(consumer.into()),
                 SqlValue::Text(ANN_WILDCARD_NS.into()),

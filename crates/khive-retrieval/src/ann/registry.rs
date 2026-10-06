@@ -89,15 +89,11 @@ fn integer_range_error(value: u64) -> StorageError {
 // Statement text which both a transactional registry operation and its
 // single-statement (`pathless_*`) form run.  Each lives here once, so a change
 // to the registry rule reaches every runtime.
-const REGISTER_PENDING_SQL: &str = "INSERT OR IGNORE INTO ann_consumer_watermark \
-     (consumer, namespace, embedding_model, watermark) \
-     VALUES (?1, ?2, ?3, ?4)";
+const REGISTER_PENDING_SQL: &str =
+    include_str!("../../sql/ann_consumer_watermark_register_pending.sql");
 
-const MARK_RECOVERING_SQL: &str = "INSERT INTO ann_consumer_watermark \
-     (consumer, namespace, embedding_model, watermark) \
-     VALUES (?1, ?2, ?3, ?4) \
-     ON CONFLICT(consumer, namespace, embedding_model) \
-     DO UPDATE SET watermark = excluded.watermark";
+const MARK_RECOVERING_SQL: &str =
+    include_str!("../../sql/ann_consumer_watermark_mark_recovering.sql");
 
 /// The `UPDATE` which publishes watermark `?4` for the registry row named by
 /// `?1`, `?2` and `?3`, guarded by the predicate `authority` grants.
@@ -197,24 +193,12 @@ pub fn pathless_compact_log(
     let model = model.to_owned();
     match scope {
         CompactionScope::Namespace(namespace) => stmt(
-            "DELETE FROM ann_write_log \
-             WHERE namespace = ?1 AND embedding_model = ?2 \
-               AND seq <= (SELECT MIN(watermark.watermark) \
-                           FROM ann_consumer_watermark watermark \
-                           WHERE (watermark.namespace = ?1 \
-                                  OR watermark.namespace = '*') \
-                             AND watermark.embedding_model = ?2)",
+            include_str!("../../sql/ann_write_log_compact_namespace_pathless.sql"),
             vec![SqlValue::Text(namespace), SqlValue::Text(model)],
             &label,
         ),
         CompactionScope::Model => stmt(
-            "DELETE FROM ann_write_log \
-             WHERE embedding_model = ?1 \
-               AND seq <= (SELECT MIN(watermark.watermark) \
-                           FROM ann_consumer_watermark watermark \
-                           WHERE (watermark.namespace = ann_write_log.namespace \
-                                  OR watermark.namespace = '*') \
-                             AND watermark.embedding_model = ?1)",
+            include_str!("../../sql/ann_write_log_compact_model.sql"),
             vec![SqlValue::Text(model)],
             &label,
         ),
@@ -229,8 +213,7 @@ pub fn read_watermark_statement(
     model: &str,
 ) -> SqlStatement {
     stmt(
-        "SELECT watermark FROM ann_consumer_watermark \
-         WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3",
+        include_str!("../../sql/ann_consumer_watermark_select.sql"),
         vec![
             SqlValue::Text(consumer.to_owned()),
             SqlValue::Text(namespace.to_owned()),
@@ -307,20 +290,11 @@ async fn register_pending_at(
                 // An orphan metadata row can exist only after manual surgery,
                 // but it must not make a genuinely new registration inherit
                 // an already-expired timestamp.
-                "INSERT INTO ann_consumer_pending \
-                 (consumer, namespace, embedding_model, registered_at_us) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(consumer, namespace, embedding_model) \
-                 DO UPDATE SET registered_at_us = excluded.registered_at_us"
+                include_str!("../../sql/ann_consumer_pending_upsert.sql")
             } else {
                 // Repeated calls while the same first build is in flight must
                 // not refresh its grace window indefinitely.
-                "INSERT OR IGNORE INTO ann_consumer_pending \
-                 (consumer, namespace, embedding_model, registered_at_us) \
-                 SELECT ?1, ?2, ?3, ?4 \
-                 WHERE EXISTS (SELECT 1 FROM ann_consumer_watermark \
-                               WHERE consumer = ?1 AND namespace = ?2 \
-                                 AND embedding_model = ?3 AND watermark = ?5)"
+                include_str!("../../sql/ann_consumer_pending_insert_if_pending.sql")
             };
             let mut pending_params = vec![
                 SqlValue::Text(consumer),
@@ -375,8 +349,7 @@ pub async fn mark_recovering(
                 .await?;
             writer
                 .execute(stmt(
-                    "DELETE FROM ann_consumer_pending \
-                     WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3",
+                    include_str!("../../sql/ann_consumer_pending_delete.sql"),
                     vec![
                         SqlValue::Text(consumer),
                         SqlValue::Text(namespace),
@@ -434,8 +407,7 @@ pub async fn raise_watermark(
             if affected == 1 {
                 writer
                     .execute(stmt(
-                        "DELETE FROM ann_consumer_pending \
-                         WHERE consumer = ?1 AND namespace = ?2 AND embedding_model = ?3",
+                        include_str!("../../sql/ann_consumer_pending_delete.sql"),
                         vec![
                             SqlValue::Text(consumer),
                             SqlValue::Text(namespace),
@@ -572,12 +544,7 @@ async fn compact_write_log_at(
                 CompactionScope::Namespace(namespace) => {
                     writer
                         .execute(stmt(
-                            "DELETE FROM ann_write_log \
-                             WHERE namespace = ?1 AND embedding_model = ?2 \
-                               AND seq <= (SELECT MIN(watermark) \
-                                           FROM ann_consumer_watermark \
-                                           WHERE (namespace = ?1 OR namespace = '*') \
-                                             AND embedding_model = ?2)",
+                            include_str!("../../sql/ann_write_log_compact_namespace.sql"),
                             vec![
                                 SqlValue::Text(namespace.clone()),
                                 SqlValue::Text(model.clone()),
@@ -589,13 +556,7 @@ async fn compact_write_log_at(
                 CompactionScope::Model => {
                     writer
                         .execute(stmt(
-                            "DELETE FROM ann_write_log \
-                             WHERE embedding_model = ?1 \
-                               AND seq <= (SELECT MIN(watermark.watermark) \
-                                           FROM ann_consumer_watermark watermark \
-                                           WHERE (watermark.namespace = ann_write_log.namespace \
-                                                  OR watermark.namespace = '*') \
-                                             AND watermark.embedding_model = ?1)",
+                            include_str!("../../sql/ann_write_log_compact_model.sql"),
                             vec![SqlValue::Text(model.clone())],
                             "ann_registry_compact_model",
                         ))
@@ -994,11 +955,15 @@ mod tests {
     }
 
     // The statement tests below keep a copy of each literal the packs used to
-    // inline as the oracle: the builder must reproduce its text, its parameter
-    // order and its label exactly.
+    // inline as the oracle: the builder must reproduce its SQL up to whitespace,
+    // its parameter order and its label exactly.
 
     fn assert_statement(got: &SqlStatement, sql: &str, params: Vec<SqlValue>, label: &str) {
-        assert_eq!(got.sql, sql, "statement text");
+        assert_eq!(
+            got.sql.split_whitespace().collect::<Vec<_>>(),
+            sql.split_whitespace().collect::<Vec<_>>(),
+            "statement text"
+        );
         assert_eq!(
             format!("{:?}", got.params),
             format!("{params:?}"),

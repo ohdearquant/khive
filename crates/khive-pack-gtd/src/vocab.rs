@@ -79,16 +79,8 @@ pub(crate) static GTD_NOTE_KIND_SPECS: [NoteKindSpec; 1] = [NoteKindSpec {
 /// `ensure_audit_schema` path in `handlers.rs` (`PRAGMA table_info` check
 /// followed by `ALTER TABLE ... ADD COLUMN namespace` only when missing).
 pub(crate) static GTD_SCHEMA_PLAN_STMTS: [&str; 2] = [
-    "CREATE TABLE IF NOT EXISTS gtd_lifecycle_audit (\
-        note_id    TEXT NOT NULL,\
-        from_state TEXT NOT NULL,\
-        to_state   TEXT NOT NULL,\
-        note       TEXT,\
-        at         INTEGER NOT NULL,\
-        namespace  TEXT\
-    )",
-    "CREATE INDEX IF NOT EXISTS idx_gtd_audit_note \
-        ON gtd_lifecycle_audit(note_id, at DESC)",
+    khive_runtime::sql!("task-lifecycle-audit-ddl"),
+    khive_runtime::sql!("task-lifecycle-audit-note-index"),
 ];
 
 /// Illocutionary classification (Searle 1976):

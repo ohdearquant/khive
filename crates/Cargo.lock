@@ -3005,6 +3005,7 @@ dependencies = [
  "khive-pack-schedule",
  "khive-pack-session",
  "khive-pack-telemetry",
+ "khive-pack-template",
  "khive-pack-tool",
  "khive-pack-web",
  "khive-pack-workspace",

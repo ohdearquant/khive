@@ -523,19 +523,7 @@ async fn edge_path_reaches(
                 // sits on an old path.  Require both endpoints of every
                 // traversed hop to be live task notes, matching property-walk
                 // and read-diagnostic semantics.
-                sql: "SELECT edge.target_id FROM graph_edges AS edge \
-                      JOIN notes AS source_task \
-                        ON source_task.id = edge.source_id \
-                       AND source_task.kind = 'task' \
-                       AND source_task.deleted_at IS NULL \
-                      JOIN notes AS target_task \
-                        ON target_task.id = edge.target_id \
-                       AND target_task.kind = 'task' \
-                       AND target_task.deleted_at IS NULL \
-                      WHERE edge.source_id = ?1 AND edge.namespace = ?2 \
-                        AND edge.relation = 'depends_on' AND edge.deleted_at IS NULL \
-                      ORDER BY edge.target_id LIMIT ?3"
-                    .into(),
+                sql: khive_runtime::sql!("task-dependency-cycle-edges").into(),
                 params: vec![
                     SqlValue::Text(current.as_hyphenated().to_string()),
                     SqlValue::Text(namespace.to_owned()),

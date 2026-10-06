@@ -283,8 +283,13 @@ because inbox reads are interactive and latency-sensitive.
 
 #### Comm auxiliary indexes (v1 amendment)
 
-The comm pack registers two partial indexes on the shared notes table to keep `inbox` and
-`thread` queries off a full-table scan on high-volume deployments:
+_Corrected in place on 2026-10-05 (#4011):_ this section described the comm indexes as DDL that the
+comm pack registers and said no auxiliary tables are created. Core migration V52 now owns every comm
+index on the shared notes table, with the definitions the pack already used, and the pack's schema plan
+creates only its auxiliary `comm_channel_cursor` table.
+
+Two of those indexes keep `inbox` and `thread` queries off a full-table scan on high-volume
+deployments:
 
 | Index                        | Covers                                | Partial condition          |
 | ---------------------------- | ------------------------------------- | -------------------------- |
@@ -297,7 +302,10 @@ partial index on `kind` cannot be used for a parameterised comparison; the plann
 different predicates and falls back to a table scan. `deleted_at IS NULL` is present in all
 filtered queries, so the partial condition is always satisfied and the index is eligible.
 
-Statements are idempotent (`CREATE INDEX IF NOT EXISTS`) and no auxiliary tables are created.
+Statements are idempotent (`CREATE INDEX IF NOT EXISTS`). V52 also owns
+`idx_comm_message_to_actor`, `idx_comm_message_outbound_ref`, `idx_comm_message_outbound_recipient`
+and `idx_comm_quarantine_expiry`. Per ADR-015 and ADR-017, indexes on core tables belong to numbered
+core migrations; pack schema plans remain auxiliary-only.
 
 ---
 
@@ -636,6 +644,8 @@ standard `delete(id)` path.
 - The `scheduled_event` and `message` note kinds require no new table columns.
 - Schedule's indexes on `notes` and `events` are core DDL. Migration V51 owns them
   per ADR-015 / ADR-017, independently of schedule pack loading.
+- Comm's indexes on `notes` are core DDL as well. Migration V52 owns them, independently of
+  comm pack loading; the comm pack's schema plan creates only its cursor table.
 - Both packs are additive. Existing kg, gtd, and memory data are unaffected.
 
 ## Open Questions
@@ -671,6 +681,7 @@ standard `delete(id)` path.
 - `crates/khive-pack-schedule/src/handlers.rs`: `remind`, `schedule`, `agenda`, `cancel`
   handlers; executable recurrence validation; trigger-time payload storage.
 - `crates/khive-db/sql/051-schedule-core-indexes.sql`: trigger and creator-provenance indexes on core tables.
+- `crates/khive-db/sql/052-comm-core-indexes.sql`: the comm message and quarantine indexes on `notes`.
 - `crates/khive-mcp/src/serve.rs` (pack registration in `build_registry_for_multi_backend*`): conditional `CommPack` and
   `SchedulePack` registration from `RuntimeConfig::packs`.
 

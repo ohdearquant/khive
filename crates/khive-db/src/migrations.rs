@@ -242,6 +242,7 @@ const V49_UP: &str = include_str!("../sql/049-git-note-property-indexes.sql");
 
 const V50_UP: &str = include_str!("../sql/050-entity-list-plans.sql");
 const V51_UP: &str = include_str!("../sql/051-schedule-core-indexes.sql");
+const V52_UP: &str = include_str!("../sql/052-comm-core-indexes.sql");
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -577,6 +578,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 51,
         name: "schedule_core_indexes",
         up: V51_UP,
+    },
+    VersionedMigration {
+        version: 52,
+        name: "comm_core_indexes",
+        up: V52_UP,
     },
 ];
 
@@ -1832,3 +1838,7 @@ mod entity_list_indexes;
 #[cfg(test)]
 #[path = "schedule_core_index_migration_tests.rs"]
 mod schedule_core_index_migration_tests;
+
+#[cfg(test)]
+#[path = "comm_core_index_migration_tests.rs"]
+mod comm_core_index_migration_tests;

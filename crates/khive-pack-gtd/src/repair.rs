@@ -27,32 +27,9 @@ fn checked_update_sql(stored: &SqlValue) -> Result<&'static str, RuntimeError> {
     // the exact properties preimage. A clean preimage therefore yields a
     // clean final object, including when another writer races this prepare.
     khive_runtime::secret_gate::reject_reserved_secret_gate_property(properties.as_ref())?;
-    Ok(
-        r#"UPDATE notes SET created_at = CASE WHEN ?8 = 1 THEN ?9 ELSE created_at END,
-    updated_at = CASE WHEN ?10 = 1 THEN ?11 ELSE updated_at END,
-    properties = json_set(
-        CASE WHEN ?12 = 1
-             THEN json_set(COALESCE(properties, '{}'), '$.status', ?13)
-             ELSE COALESCE(properties, '{}')
-        END,
-        '$.gtd_repair', json(?14)
-    )
-WHERE id = ?1
-  AND kind = 'task'
-  AND deleted_at IS NULL
-  AND properties IS ?2
-  AND version = ?3
-  AND created_at IS ?4
-  AND updated_at IS ?5
-  AND typeof(created_at) = ?6
-  AND typeof(updated_at) = ?7
-"#,
-    )
+    Ok(khive_runtime::sql!("task-repair-update"))
 }
-const AUDIT_SQL: &str = concat!(
-    "INSERT INTO gtd_lifecycle_audit (note_id, from_state, to_state, note, at, namespace)\n",
-    "VALUES (?1, ?2, ?3, ?4, ?5, ?6)\n",
-);
+const AUDIT_SQL: &str = khive_runtime::sql!("task-lifecycle-audit-insert");
 const FIELDS: [&str; 3] = ["created_at", "updated_at", "status"];
 
 #[derive(Deserialize)]

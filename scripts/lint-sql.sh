@@ -260,6 +260,95 @@ chain = sorted([f for f in files if f in registered or (in_db_chain(f) and f in 
 ddl_files = [f for f in files if f in ddl and f not in chain]
 query_files = [f for f in files if f not in ddl and f not in registered]
 
+# This guarded pack upgrade requires the pre-namespace table, not current DDL.
+GTD_LEGACY_FIXTURE = """CREATE TABLE gtd_lifecycle_audit (
+    note_id TEXT NOT NULL,
+    from_state TEXT NOT NULL,
+    to_state TEXT NOT NULL,
+    note TEXT,
+    at INTEGER NOT NULL
+)
+"""
+
+def gtd_legacy_upgrade(root):
+    directory = os.path.join(root, "crates/khive-pack-gtd/sql")
+    paths = {role: os.path.join(directory, "task-lifecycle-audit-" + name + ".sql")
+             for role, name in [("upgrade", "add-namespace"), ("table", "ddl"),
+                                ("index", "note-index"), ("inspect", "table-info")]}
+    if not any(path in files for path in paths.values()):
+        return None
+    for path in paths.values():
+        if path not in files:
+            raise ValueError(f"incomplete GTD upgrade bundle: missing {path}")
+        if path not in ddl_files:
+            raise ValueError(f"GTD upgrade bundle must contain pack DDL: {path}")
+    return paths
+
+def validate_gtd_legacy_upgrade(paths):
+    fixture = "gtd_lifecycle_audit_without_namespace"
+    if any(line.rstrip() != line or "\t" in line for line in GTD_LEGACY_FIXTURE.splitlines()):
+        raise ValueError(f"{fixture}: invalid fixture whitespace")
+    statements = {}
+    for role, path in paths.items():
+        with open(path) as fh:
+            statements[role] = fh.read()
+    old_layout = [(at, name, kind, required, None, 0)
+                  for at, (name, kind, required) in enumerate([
+                      ("note_id", "TEXT", 1), ("from_state", "TEXT", 1),
+                      ("to_state", "TEXT", 1), ("note", "TEXT", 0),
+                      ("at", "INTEGER", 1)])]
+    new_layout = old_layout + [(5, "namespace", "TEXT", 0, None, 0)]
+
+    def expect_layout(con, sql, expected, context):
+        actual = con.execute(sql).fetchall()
+        if actual != expected:
+            raise ValueError(f"{fixture}: {context}: unexpected table layout {actual!r}")
+
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute(GTD_LEGACY_FIXTURE)
+        expect_layout(con, "PRAGMA table_info(gtd_lifecycle_audit)", old_layout, "legacy fixture")
+        con.execute(statements["table"])
+        con.execute(statements["index"])
+        expect_layout(con, statements["inspect"], old_layout, "before upgrade")
+        con.execute("INSERT INTO gtd_lifecycle_audit VALUES (?, ?, ?, ?, ?)",
+                    ("fixture-id", "inbox", "next", None, 7))
+        # execute admits one statement; the actual ALTER runs once, without a skip.
+        con.execute(statements["upgrade"])
+        expect_layout(con, "PRAGMA table_info(gtd_lifecycle_audit)", new_layout, "after upgrade")
+        if con.execute("SELECT * FROM gtd_lifecycle_audit").fetchall() != [
+                ("fixture-id", "inbox", "next", None, 7, None)]:
+            raise ValueError(f"{fixture}: upgrade changed the retained audit row")
+    finally:
+        con.close()
+
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute(statements["table"])
+        con.execute(statements["index"])
+        expect_layout(con, statements["inspect"], new_layout, "canonical schema")
+    finally:
+        con.close()
+
+try:
+    gtd_upgrade = gtd_legacy_upgrade(sys.argv[2])
+except ValueError as error:
+    print(f"SQL lint: cannot resolve GTD legacy upgrade: {error}")
+    sys.exit(1)
+legacy_upgrade_files = {gtd_upgrade["upgrade"]} if gtd_upgrade else set()
+ddl_files = [path for path in ddl_files if path not in legacy_upgrade_files]
+populations = [set(chain), set(ddl_files), set(query_files), legacy_upgrade_files]
+if (set.union(*populations) != set(files)
+        or sum(map(len, populations)) != len(files)):
+    print("SQL lint: validation populations must cover every file exactly once")
+    sys.exit(1)
+if gtd_upgrade:
+    try:
+        validate_gtd_legacy_upgrade(gtd_upgrade)
+    except (OSError, sqlite3.Error, sqlite3.Warning, ValueError) as error:
+        print(f"{gtd_upgrade['upgrade']}: FAILED legacy fixture gtd_lifecycle_audit_without_namespace: {error}")
+        failed += 1
+
 # Replay the migration chain cumulatively in one database so a forward migration
 # (e.g. ALTER TABLE / CREATE INDEX on a baseline table) sees prior schema.
 con = lint_connection()

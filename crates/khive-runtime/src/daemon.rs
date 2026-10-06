@@ -19,6 +19,9 @@ pub use store_guard::{acquire_daemon_store_guards, bind_daemon_store_files, clai
 pub use store_guard::{assert_daemon_store_identities, DaemonStoreGuard};
 #[cfg(unix)]
 pub use store_identity::claimed_daemon_store_identity;
+mod supervisor_marker;
+#[cfg(unix)]
+pub use supervisor_marker::supervisor_marker_path;
 
 #[cfg(unix)]
 use std::io::Write as _;
@@ -454,28 +457,6 @@ pub fn recoverer_lock_path() -> PathBuf {
         }
     }
     khive_dir().join("khived.recoverer.lock")
-}
-
-/// Marker file the supervisor's launcher publishes before it execs `khived`.
-/// It records the job label, launcher/daemon PID, restart interval in seconds,
-/// and the launcher's incarnation claim. The launcher or deliberate-stop procedure
-/// removes its own claim; the daemon never writes or removes it. A client
-/// waits up to three restart intervals before a logged degraded bootstrap,
-/// bounded by its caller deadline, rather than racing normal supervisor
-/// startup. Reading and acting on this file is the client's decision
-/// (`khive-mcp`); this module
-/// only resolves where it lives, matching the [`lock_path`] /
-/// [`recoverer_lock_path`] pattern.
-///
-/// Overridable via the `KHIVE_SUPERVISOR_MARKER` env var (for tests).
-#[cfg(unix)]
-pub fn supervisor_marker_path() -> PathBuf {
-    if let Ok(p) = std::env::var("KHIVE_SUPERVISOR_MARKER") {
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    khive_dir().join("khived.supervisor")
 }
 
 #[cfg(unix)]
