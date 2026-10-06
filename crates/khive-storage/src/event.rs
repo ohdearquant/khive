@@ -202,6 +202,38 @@ pub struct EventFilter {
     pub payload_proposal_id: Option<Uuid>,
 }
 
+/// Persisted ordering key; the physical UUID spelling is not normalized.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventOrderKey {
+    pub created_at_us: i64,
+    pub physical_id: String,
+}
+
+/// Count-free ascending window within one scoped event store.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageQuery {
+    pub since_us: i64,
+    pub until_us: i64,
+    pub kinds: Vec<EventKind>,
+    pub actors: Vec<String>,
+    pub exclude_namespaces: Vec<String>,
+    pub after: Option<EventOrderKey>,
+    pub max_rows: u32,
+}
+
+/// A decoded event with its exact persisted seek key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageRow {
+    pub event: Event,
+    pub order_key: EventOrderKey,
+}
+
+/// A bounded prefix, without a count of the complete matching window.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageWindow {
+    pub rows: Vec<EventPageRow>,
+}
+
 /// Per-row outcome of an [`EventStore::append_events_idempotent`] call, in
 /// input order. Distinguishes a fresh insert from a retry that reproduced an
 /// identical row from a retry whose identity now disagrees with what is
@@ -241,6 +273,18 @@ pub trait EventStore: Send + Sync + 'static {
         filter: EventFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Event>>;
+    /// Read at most 4096 rows in ascending physical time/ID order, without counting.
+    /// Filters and exclusions apply before the row bound. A backend must refuse
+    /// unsupported paging rather than substitute an offset query.
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        let _ = query;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "query_event_page".into(),
+            message: "this EventStore backend does not implement query_event_page".into(),
+        })
+    }
+
     /// Count events matching a filter.
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64>;
 
