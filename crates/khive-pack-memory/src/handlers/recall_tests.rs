@@ -1996,7 +1996,7 @@ async fn recall_failure_emits_no_recall_executed_event() {
 async fn recall_event_store_acquisition_failure_warns_without_failing_response() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let db_path = tmp.path().join("khive.db");
-    let backend = Arc::new(khive_db::StorageBackend::sqlite(&db_path).expect("backend"));
+    let backend = Arc::new(khive_db::StorageBackend::sqlite_for_test(&db_path).expect("backend"));
     {
         let mut writer = backend.pool().writer().expect("migration writer");
         khive_db::run_migrations(writer.conn_mut()).expect("migrations");

@@ -366,7 +366,7 @@ impl Fixture {
         // The acceptance race counts retained history, which public live-only lists omit.
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(self.database.clone()),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("live-WAL observer pool for this fixture's database");
         let reader = pool.reader().expect("scratch reader");

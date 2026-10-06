@@ -557,7 +557,7 @@ async fn dry_run_against_existing_wal_db_held_open_by_a_writer_leaves_sidecars_u
         String::from_utf8_lossy(&seed.stderr)
     );
 
-    let pin = StorageBackend::sqlite(&db).expect("open pin backend");
+    let pin = StorageBackend::sqlite_for_test(&db).expect("open pin backend");
     {
         let sql = pin.sql();
         let mut writer = sql.writer().await.expect("pin writer");

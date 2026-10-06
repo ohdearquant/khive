@@ -38,7 +38,7 @@ async fn multiple_long_lived_idle_cached_readers_allow_bounded_checkpoint_progre
             max_readers: 2,
             write_queue_enabled: Some(true),
             checkout_timeout: std::time::Duration::from_millis(50),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("file-backed pool"),
     );

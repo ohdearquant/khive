@@ -52,4 +52,4 @@ tempfile = { workspace = true }
 # established pattern in khive-pack-brain's `fold_gate.rs` and `persist.rs`
 # (documented there: env-var mutation races other tests' `KhiveRuntime::new`
 # calls in the same binary; a literal `PoolConfig` sidesteps that).
-khive-db = { version = "0.9.0", path = "../khive-db" }
+khive-db = { version = "0.9.0", path = "../khive-db", features = ["test-support"] }

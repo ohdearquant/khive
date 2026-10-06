@@ -41,6 +41,7 @@ tracing = { workspace = true }
 lattice-router = ["dep:lattice-fann"]
 
 [dev-dependencies]
+khive-db = { version = "0.9.0", path = "../khive-db", features = ["test-support"] }
 lattice-embed = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["test-internals"] }

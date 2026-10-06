@@ -1325,7 +1325,7 @@ mod tests {
         let db = root.path().join("map.db");
         let policy_path = root.path().join("policy.toml");
         std::fs::write(&policy_path, "policy_version = 1\n[crate_ranks]\n").unwrap();
-        let seed = StorageBackend::sqlite(&db).unwrap();
+        let seed = StorageBackend::sqlite_for_test(&db).unwrap();
         seed.prepare_core_schema().unwrap();
         drop(seed);
         let before = std::fs::read(&db).unwrap();
@@ -1457,7 +1457,7 @@ mod tests {
     /// carrying an unresolved import, and a same-named-but-different-
     /// language `crate_a::lib` in python with no edges at all).
     async fn build_fixture(path: &Path, edge_insert_order: [usize; 2]) {
-        let backend = StorageBackend::sqlite(path).expect("open fixture backend");
+        let backend = StorageBackend::sqlite_for_test(path).expect("open fixture backend");
         {
             let mut writer = backend.pool().writer().expect("writer guard");
             khive_db::run_migrations(writer.conn_mut()).expect("run core migrations");
@@ -1973,7 +1973,7 @@ crate-b = 1
     async fn manifest_import_mismatch_treats_every_declaration_kind_as_declared() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = tmp.path().join("map.db");
-        let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+        let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
         {
             let mut writer = backend.pool().writer().expect("writer guard");
             khive_db::run_migrations(writer.conn_mut()).expect("run core migrations");
@@ -2101,7 +2101,7 @@ undeclared-dep = 1
         let db = tmp.path().join("map.db");
         build_fixture(&db, [0, 1]).await;
         {
-            let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+            let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
             let mut writer = backend.pool().writer().expect("writer guard");
             writer
                 .conn_mut()
@@ -2148,7 +2148,7 @@ undeclared-dep = 1
         let db = tmp.path().join("map.db");
         build_fixture(&db, [0, 1]).await;
         {
-            let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+            let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
             let mut writer = backend.pool().writer().expect("writer guard");
             writer
                 .conn_mut()
@@ -2186,7 +2186,7 @@ undeclared-dep = 1
         let db = tmp.path().join("map.db");
         build_fixture(&db, [0, 1]).await;
         {
-            let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+            let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
             let mut writer = backend.pool().writer().expect("writer guard");
             writer
                 .conn_mut()
@@ -2242,7 +2242,7 @@ undeclared-dep = 1
         let db = tmp.path().join("map.db");
         build_fixture(&db, [0, 1]).await;
         {
-            let backend = StorageBackend::sqlite(&db).expect("open fixture backend");
+            let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
             let mut writer = backend.pool().writer().expect("writer guard");
             // `id` is part of `graph_edges`'s composite PRIMARY KEY
             // (namespace, id), so SQLite's `ALTER TABLE ... DROP COLUMN`
