@@ -3,8 +3,8 @@
 Technical reference for the `comm` pack's message write, threading, and read path —
 `comm.send` / `comm.delivered` / `comm.inbox` / `comm.read` / `comm.mark_read` / `comm.reply` /
 `comm.thread` / `comm.ingest` —
-spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
-`vocab.rs`.
+spanning `message.rs`, `handlers.rs`, `handlers/inbox.rs`, `params.rs`, and the
+inbox/thread indexes in `vocab.rs`.
 
 ## File attachments on local messages
 
