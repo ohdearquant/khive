@@ -694,7 +694,7 @@ mod tests {
 
         // One write per runtime pair keeps a background ANN warm from an earlier
         // write out of the way of the next write's custody preflight.
-        for (cached, keyed) in [(false, true), (true, false)] {
+        for (cached, keyed) in [(false, true), (true, false), (true, true), (false, false)] {
             let build_registry = |rt: &KhiveRuntime| {
                 let mut builder = VerbRegistryBuilder::new();
                 builder.register(KgPack::new(rt.clone()));
@@ -884,11 +884,22 @@ mod tests {
                 Arc::new(credentials),
             )
             .expect("receipt custody");
+        let builds = Arc::new(AtomicUsize::new(0));
+        let embeds = Arc::new(AtomicUsize::new(0));
+        rt.register_embedder(CountingProvider {
+            builds: builds.clone(),
+            embeds: embeds.clone(),
+        });
+        assert_eq!(
+            rt.registered_embedding_model_names(),
+            vec!["receipt-preflight-counter".to_owned()]
+        );
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         builder.register(MemoryPack::new(rt.clone()));
         let registry = builder.build().expect("registry");
         let before = domain_counts(&rt).await;
+        assert_eq!(before, [0; 7]);
         for key in [Some("receipt-down-key"), None] {
             let mut args = serde_json::json!({
                 "content": "a configured key that cannot be resolved must not write",
@@ -905,6 +916,8 @@ mod tests {
                 if error.kind() == ErrorKind::Unavailable
                     && error.details().and_then(|details| details.get("reason"))
                         == Some("visibility_key_unavailable")));
+            assert_eq!(builds.load(Ordering::SeqCst), 0);
+            assert_eq!(embeds.load(Ordering::SeqCst), 0);
             assert_eq!(domain_counts(&rt).await, before);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
