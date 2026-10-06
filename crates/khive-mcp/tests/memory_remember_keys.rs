@@ -10,7 +10,11 @@ mod receipt_credentials;
 use std::ops::Deref;
 use std::time::Duration;
 
-use khive_mcp::server::KhiveMcpServer;
+use khive_mcp::server::{compute_config_id, KhiveMcpServer};
+use khive_runtime::credentials::{
+    CredentialConfig, CredentialKind, VisibilityReceiptConfig, VisibilityReceiptKeyConfig,
+};
+use khive_runtime::daemon::{config_ids_compatible, first_config_mismatch_field};
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::{SqlStatement, SqlValue};
 use rmcp::{
@@ -21,25 +25,9 @@ use serde_json::{json, Value};
 
 const ACTOR: &str = "test:mcp-key-writer";
 
-#[test]
-fn receipt_custody_changes_daemon_identity_without_exposing_references() {
-    use khive_mcp::server::compute_config_id;
-    use khive_runtime::credentials::{
-        CredentialConfig, CredentialKind, VisibilityReceiptConfig, VisibilityReceiptKeyConfig,
-    };
-    use khive_runtime::daemon::{config_ids_compatible, first_config_mismatch_field};
-
-    let absent = RuntimeConfig::no_embeddings();
-    let absent_id = compute_config_id(&absent, None);
-    assert!(absent_id.contains(";visibility_receipts="));
-    let legacy_id = absent_id.split_once(";visibility_receipts=").unwrap().0;
-    assert!(!config_ids_compatible(&absent_id, legacy_id));
-    assert!(!config_ids_compatible(legacy_id, &absent_id));
-    assert_eq!(
-        first_config_mismatch_field(&absent_id, Some(legacy_id)),
-        "visibility_receipts"
-    );
-    let mut configured = absent.clone();
+fn receipt_identity_config() -> RuntimeConfig {
+    let mut configured = RuntimeConfig::no_embeddings();
+    configured.db_path = None;
     configured.credentials = ["current", "retired"]
         .map(|suffix| CredentialConfig {
             name: format!("private-reference-{suffix}"),
@@ -58,6 +46,24 @@ fn receipt_custody_changes_daemon_identity_without_exposing_references() {
             })
             .to_vec(),
     });
+    configured
+}
+
+#[test]
+fn receipt_custody_changes_daemon_identity_without_exposing_references() {
+    let configured = receipt_identity_config();
+    let mut absent = configured.clone();
+    absent.credentials.clear();
+    absent.visibility_receipts = None;
+    let absent_id = compute_config_id(&absent, None);
+    assert!(absent_id.contains(";visibility_receipts="));
+    let legacy_id = absent_id.split_once(";visibility_receipts=").unwrap().0;
+    assert!(!config_ids_compatible(&absent_id, legacy_id));
+    assert!(!config_ids_compatible(legacy_id, &absent_id));
+    assert_eq!(
+        first_config_mismatch_field(&absent_id, Some(legacy_id)),
+        "visibility_receipts"
+    );
     let configured_id = compute_config_id(&configured, None);
     assert_ne!(absent_id, configured_id);
     for private_reference in ["private-reference", "private-key-id", "RECEIPT_CUSTODY"] {
@@ -74,7 +80,7 @@ fn receipt_custody_changes_daemon_identity_without_exposing_references() {
         .reverse();
     assert_eq!(configured_id, compute_config_id(&reordered, None));
 
-    for mutation in 0..6 {
+    for mutation in 0..8 {
         let mut changed = configured.clone();
         match mutation {
             0 => changed.visibility_receipts = None,
@@ -95,8 +101,148 @@ fn receipt_custody_changes_daemon_identity_without_exposing_references() {
                 changed.credentials[0].provider = "external-vault".to_owned();
                 changed.credentials[0].env_var = None;
             }
+            6 => changed.credentials[1].env_var = Some("OTHER_RETIRED_LOCATION".to_owned()),
+            7 => {
+                changed.credentials[1].provider = "external-vault".to_owned();
+                changed.credentials[1].env_var = None;
+            }
             _ => unreachable!(),
         }
+        let changed_id = compute_config_id(&changed, None);
+        assert_ne!(configured_id, changed_id, "case {mutation}");
+        assert!(!config_ids_compatible(&configured_id, &changed_id));
+        assert!(!config_ids_compatible(&changed_id, &configured_id));
+        assert_eq!(
+            first_config_mismatch_field(&configured_id, Some(&changed_id)),
+            "visibility_receipts"
+        );
+    }
+}
+
+#[test]
+fn receipt_identity_ignores_unreferenced_credentials_with_or_without_a_ring() {
+    for has_ring in [false, true] {
+        let mut base = receipt_identity_config();
+        if !has_ring {
+            base.visibility_receipts = None;
+            base.credentials.clear();
+        }
+        let base_id = compute_config_id(&base, None);
+        let assert_compatible = |config: &RuntimeConfig| {
+            CredentialConfig::validate_all(&config.credentials).unwrap();
+            if let Some(ring) = &config.visibility_receipts {
+                ring.validate(&config.credentials).unwrap();
+            }
+            let changed_id = compute_config_id(config, None);
+            assert_eq!(base_id, changed_id, "has_ring={has_ring}");
+            assert!(config_ids_compatible(&base_id, &changed_id));
+            assert!(config_ids_compatible(&changed_id, &base_id));
+        };
+        let unrelated_start = base.credentials.len();
+        let mut unrelated = base.clone();
+        unrelated.credentials.extend([
+            CredentialConfig {
+                name: "private-reference-current-unrelated".to_owned(),
+                kind: CredentialKind::SigningKey,
+                provider: "env".to_owned(),
+                env_var: Some("UNRELATED_SIGNING_KEY".to_owned()),
+                header: None,
+            },
+            CredentialConfig {
+                name: "private-reference-retired-unrelated".to_owned(),
+                kind: CredentialKind::Header,
+                provider: "env".to_owned(),
+                env_var: Some("UNRELATED_HEADER".to_owned()),
+                header: Some("X-Unrelated".to_owned()),
+            },
+        ]);
+        assert_compatible(&unrelated);
+        for mutation in 0..6 {
+            let mut changed = unrelated.clone();
+            let signing = &mut changed.credentials[unrelated_start];
+            match mutation {
+                0 => signing.name.push_str("-renamed"),
+                1 => signing.kind = CredentialKind::Basic,
+                2 => {
+                    signing.provider = "external-vault".to_owned();
+                    signing.env_var = None;
+                }
+                3 => signing.env_var = Some("OTHER_UNRELATED_KEY".to_owned()),
+                4 => {
+                    changed.credentials[unrelated_start + 1].header =
+                        Some("X-Other-Unrelated".to_owned());
+                }
+                5 => changed.credentials[unrelated_start + 1]
+                    .env_var
+                    .as_mut()
+                    .unwrap()
+                    .push_str("_OTHER"),
+                _ => unreachable!(),
+            }
+            assert_compatible(&changed);
+        }
+        let mut reordered = unrelated.clone();
+        reordered.credentials.reverse();
+        assert_compatible(&reordered);
+        let mut reordered = unrelated.clone();
+        if let Some(ring) = reordered.visibility_receipts.as_mut() {
+            ring.keys.reverse();
+            assert_compatible(&reordered);
+        }
+        unrelated.credentials.pop();
+        assert_compatible(&unrelated);
+        unrelated.credentials.pop();
+        assert_compatible(&unrelated);
+    }
+}
+
+#[test]
+fn receipt_identity_tracks_shared_credentials_and_every_key_reference() {
+    let mut configured = receipt_identity_config();
+    configured.visibility_receipts.as_mut().unwrap().keys[1].credential =
+        configured.credentials[0].name.clone();
+    let configured_id = compute_config_id(&configured, None);
+    let mut changed_unused = configured.clone();
+    changed_unused.credentials[1].env_var = Some("UNUSED_RETIRED_LOCATION".to_owned());
+    assert_eq!(configured_id, compute_config_id(&changed_unused, None));
+
+    for reverse_keys in [false, true] {
+        let mut reordered = configured.clone();
+        if reverse_keys {
+            reordered
+                .visibility_receipts
+                .as_mut()
+                .unwrap()
+                .keys
+                .reverse();
+        } else {
+            reordered.credentials.reverse();
+        }
+        assert_eq!(configured_id, compute_config_id(&reordered, None));
+    }
+
+    for mutation in 0..3 {
+        let mut changed = configured.clone();
+        match mutation {
+            0 => changed.credentials[0].env_var = Some("OTHER_SHARED_LOCATION".to_owned()),
+            1 => {
+                changed.visibility_receipts.as_mut().unwrap().keys.pop();
+            }
+            2 => changed.visibility_receipts.as_mut().unwrap().keys.push(
+                VisibilityReceiptKeyConfig {
+                    id: "new-decrypt-only-id".to_owned(),
+                    credential: changed.credentials[1].name.clone(),
+                    encrypt: false,
+                },
+            ),
+            _ => unreachable!(),
+        }
+        changed
+            .visibility_receipts
+            .as_ref()
+            .unwrap()
+            .validate(&changed.credentials)
+            .unwrap();
         let changed_id = compute_config_id(&changed, None);
         assert_ne!(configured_id, changed_id, "case {mutation}");
         assert!(!config_ids_compatible(&configured_id, &changed_id));

@@ -77,6 +77,12 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     let mut receipt_credentials: Vec<_> = config
         .credentials
         .iter()
+        .filter(|entry| {
+            config
+                .visibility_receipts
+                .as_ref()
+                .is_some_and(|ring| ring.keys.iter().any(|key| key.credential == entry.name))
+        })
         .map(|entry| {
             (
                 &entry.name,
