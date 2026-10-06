@@ -1074,7 +1074,7 @@ impl KnowledgeHandlers {
                 } else {
                     let total_row = reader
                         .query_scalar(SqlStatement {
-                            sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
+                            sql: khive_runtime::sql!("knowledge_domain_count").into(),
                             params: vec![SqlValue::Text(ns)],
                             label: None,
                         })
@@ -1353,13 +1353,7 @@ impl KnowledgeHandlers {
         // slice rather than two sequential scans (#2218).
         let atom_stats = reader
             .query_row(SqlStatement {
-                sql: "SELECT COUNT(*) AS total_atoms, \
-                             COALESCE(SUM(CASE WHEN finalized = 1 THEN 1 ELSE 0 END), 0) \
-                                 AS finalized_atoms \
-                      FROM knowledge_atoms \
-                      WHERE namespace = ?1 AND deleted_at IS NULL \
-                        AND tags NOT LIKE '%type:domain%'"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_atom_stats").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.atom_aggregates".into()),
             })
@@ -1368,7 +1362,7 @@ impl KnowledgeHandlers {
 
         let domain_count = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
+                sql: khive_runtime::sql!("knowledge_domain_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: None,
             })
@@ -1377,8 +1371,7 @@ impl KnowledgeHandlers {
 
         let event_count = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_event_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.event_count".into()),
             })
@@ -1387,7 +1380,7 @@ impl KnowledgeHandlers {
 
         let retrieval_eval_run_count = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM knowledge_eval_runs WHERE namespace = ?1".into(),
+                sql: khive_runtime::sql!("knowledge_eval_run_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.eval_run_count".into()),
             })
