@@ -184,6 +184,225 @@ async fn install_vector(
         .unwrap();
 }
 
+async fn assert_record_unchanged(runtime: &KhiveRuntime, token: &NamespaceToken, record: &Record) {
+    match record {
+        Record::Entity(expected) => assert_eq!(
+            serde_json::to_value(
+                runtime
+                    .entities(token)
+                    .unwrap()
+                    .get_entity(expected.id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(Some(expected)).unwrap()
+        ),
+        Record::Note(expected) => assert_eq!(
+            runtime
+                .notes(token)
+                .unwrap()
+                .get_note(expected.id)
+                .await
+                .unwrap()
+                .as_ref(),
+            Some(expected)
+        ),
+    }
+}
+
+#[tokio::test]
+async fn blank_text_repairs_fts_without_vector_work() {
+    for entity in [false, true] {
+        for body in ["", " \t\n"] {
+            for stale in [false, true] {
+                let runtime = KhiveRuntime::memory().unwrap();
+                let token = NamespaceToken::local();
+                let other = seed(&runtime, &token, entity).await;
+                let record = if entity {
+                    let record = Entity::new("local", "concept", body).with_description(body);
+                    runtime
+                        .entities(&token)
+                        .unwrap()
+                        .upsert_entity(record.clone())
+                        .await
+                        .unwrap();
+                    Record::Entity(record)
+                } else {
+                    let record = Note::new("local", "observation", body);
+                    runtime
+                        .notes(&token)
+                        .unwrap()
+                        .upsert_note(record.clone())
+                        .await
+                        .unwrap();
+                    Record::Note(record)
+                };
+                let doc = record.document();
+                assert!(doc.body.trim().is_empty());
+                let store = text(&runtime, &token, entity);
+                if stale {
+                    let mut wrong = doc.clone();
+                    wrong.body = "obsolete blank-record index".into();
+                    store.upsert_document(wrong).await.unwrap();
+                }
+                let other_before = serde_json::to_value(
+                    store
+                        .get_document("local", other.document().subject_id)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                let healthy_calls = model(&runtime, "healthy", false);
+                let missing_calls = model(&runtime, "missing", false);
+                let unavailable_calls = model(&runtime, "unavailable", true);
+                let mut selected = match &record {
+                    Record::Entity(_) => runtime.registered_embedding_model_names(),
+                    Record::Note(note) => runtime.embedding_models_for_note_kind(&note.kind),
+                };
+                selected.sort();
+                assert_eq!(selected, vec!["healthy", "missing", "unavailable"]);
+                install_vector(&runtime, &token, &doc, "healthy", 0.75).await;
+                install_vector(&runtime, &token, &other.document(), "healthy", 0.9).await;
+                let before = ann_count(&runtime).await;
+
+                let report = runtime
+                    .repair_record_indexes(&token, doc.subject_id)
+                    .await
+                    .unwrap();
+                assert_eq!(report.repaired, vec!["fts"]);
+                assert!(report.failures.is_empty(), "{:?}", report.failures);
+                assert!(same_document(
+                    &store
+                        .get_document("local", doc.subject_id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    &doc
+                ));
+                let repeat = runtime
+                    .repair_record_indexes(&token, doc.subject_id)
+                    .await
+                    .unwrap();
+                assert!(repeat.repaired.is_empty() && repeat.failures.is_empty());
+                assert_eq!(healthy_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(missing_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(unavailable_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(ann_count(&runtime).await, before);
+                let kept = runtime
+                    .vectors_for_model(&token, "healthy")
+                    .unwrap()
+                    .get_vectors(
+                        &[doc.subject_id, other.document().subject_id],
+                        "local",
+                        record.tables().2,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(kept[&doc.subject_id], vec![0.75; 4]);
+                assert_eq!(kept[&other.document().subject_id], vec![0.9; 4]);
+                assert_eq!(
+                    serde_json::to_value(
+                        store
+                            .get_document("local", other.document().subject_id)
+                            .await
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    other_before
+                );
+                assert_record_unchanged(&runtime, &token, &record).await;
+                assert_record_unchanged(&runtime, &token, &other).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn vector_disappearing_after_identity_check_reports_presence_failure_without_embedding() {
+    for entity in [false, true] {
+        for remove in [false, true] {
+            let runtime = Arc::new(KhiveRuntime::memory().unwrap());
+            let token = NamespaceToken::local();
+            let record = seed(&runtime, &token, entity).await;
+            let other = seed(&runtime, &token, entity).await;
+            let doc = record.document();
+            let calls = model(&runtime, "read-race", false);
+            install_vector(&runtime, &token, &doc, "read-race", 0.75).await;
+            install_vector(&runtime, &token, &other.document(), "read-race", 0.9).await;
+            let vectors = runtime.vectors_for_model(&token, "read-race").unwrap();
+            let barriers = Arc::new((Barrier::new(2), Barrier::new(2)));
+            let repair_runtime = runtime.clone();
+            let repair_token = token.clone();
+            let id = doc.subject_id;
+            let repair = tokio::spawn(BEFORE_PUBLICATION.scope(
+                ("vector_read", barriers.clone()),
+                async move {
+                    repair_runtime
+                        .repair_record_indexes(&repair_token, id)
+                        .await
+                },
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(10), barriers.0.wait())
+                .await
+                .expect("repair observed the healthy identity before reading its vector");
+            let present = vectors
+                .get_vectors(&[id], "local", record.tables().2)
+                .await
+                .unwrap();
+            assert_eq!(present[&id], vec![0.75; 4]);
+            if remove {
+                assert!(vectors.delete(id).await.unwrap());
+            }
+            let before = ann_count(&runtime).await;
+            barriers.1.wait().await;
+            let report = repair.await.unwrap().unwrap();
+            assert!(report.repaired.is_empty());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(ann_count(&runtime).await, before);
+            if remove {
+                assert_eq!(report.failures.len(), 1);
+                assert_eq!(report.failures[0].stage, "vector_presence");
+                assert_eq!(
+                    report.failures[0].error,
+                    format!(
+                        "read-race: vector identity was present for {id}, \
+                         but its vector was not returned"
+                    )
+                );
+            } else {
+                assert!(report.failures.is_empty());
+            }
+            let kept = vectors
+                .get_vectors(
+                    &[id, other.document().subject_id],
+                    "local",
+                    record.tables().2,
+                )
+                .await
+                .unwrap();
+            if remove {
+                assert!(!kept.contains_key(&id));
+            } else {
+                assert_eq!(kept[&id], vec![0.75; 4]);
+            }
+            assert_eq!(kept[&other.document().subject_id], vec![0.9; 4]);
+            assert_record_unchanged(&runtime, &token, &record).await;
+            assert_record_unchanged(&runtime, &token, &other).await;
+            if remove {
+                let retry = runtime.repair_record_indexes(&token, id).await.unwrap();
+                assert_eq!(retry.repaired, vec!["vector:read-race"]);
+                assert!(retry.failures.is_empty());
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(ann_count(&runtime).await, before + 1);
+                let repeat = runtime.repair_record_indexes(&token, id).await.unwrap();
+                assert!(repeat.repaired.is_empty() && repeat.failures.is_empty());
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn degraded_note_insert_recovers_keyword_search_without_substrate_rewrite() {
     let runtime = KhiveRuntime::memory().unwrap();

@@ -1732,6 +1732,8 @@ fn is_trash_residue_name(name: &std::ffi::OsStr) -> bool {
 
 /// Liveness verdict for one staging wrapper.
 enum StagingLiveness {
+    /// Another cleanup already removed the wrapper before its mtime read.
+    Gone,
     /// A live handle holds the wrapper's lock (or it has not existed long
     /// enough yet for a missing lock file to mean anything) -- must survive
     /// regardless of age.
@@ -1755,6 +1757,7 @@ fn staging_liveness(
     wrapper: &Path,
     now: SystemTime,
     max_age: Duration,
+    wrapper_modified: &mut impl FnMut(&Path) -> std::io::Result<SystemTime>,
 ) -> Result<StagingLiveness, CacheError> {
     let lock_path = wrapper.join(STAGING_LOCK_FILE);
     match std::fs::OpenOptions::new().write(true).open(&lock_path) {
@@ -1766,9 +1769,13 @@ fn staging_liveness(
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let modified = std::fs::symlink_metadata(wrapper)
-                .and_then(|m| m.modified())
-                .map_err(|e| io_err("reap_stale_staging: wrapper mtime", wrapper, e))?;
+            let modified = match wrapper_modified(wrapper) {
+                Ok(modified) => modified,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(StagingLiveness::Gone);
+                }
+                Err(e) => return Err(io_err("reap_stale_staging: wrapper mtime", wrapper, e)),
+            };
             match now.duration_since(modified) {
                 Ok(age) if age > max_age => Ok(StagingLiveness::Abandoned),
                 _ => Ok(StagingLiveness::Live),
@@ -1806,6 +1813,18 @@ fn reap_stale_staging(
     root: &Path,
     now: SystemTime,
     max_age: Duration,
+) -> Result<usize, CacheError> {
+    reap_stale_staging_with(root, now, max_age, |path| {
+        std::fs::symlink_metadata(path).and_then(|m| m.modified())
+    })
+}
+
+// The second stat is injectable so tests can interpose after actual wrapper admission.
+fn reap_stale_staging_with(
+    root: &Path,
+    now: SystemTime,
+    max_age: Duration,
+    mut wrapper_modified: impl FnMut(&Path) -> std::io::Result<SystemTime>,
 ) -> Result<usize, CacheError> {
     let namespace_root = staging_namespace_path(root);
     let read_dir = match std::fs::read_dir(&namespace_root) {
@@ -1850,8 +1869,8 @@ fn reap_stale_staging(
             continue;
         }
 
-        match staging_liveness(&path, now, max_age)? {
-            StagingLiveness::Live => continue,
+        match staging_liveness(&path, now, max_age, &mut wrapper_modified)? {
+            StagingLiveness::Gone | StagingLiveness::Live => continue,
             StagingLiveness::Abandoned => {
                 remove_staging_wrapper(&namespace_root, &name)?;
                 removed += 1;
@@ -2266,6 +2285,69 @@ mod tests {
             !wrapper.exists(),
             "abandoned staging payload must be reclaimed"
         );
+    }
+
+    #[test]
+    fn staging_sweep_skips_wrapper_removed_before_mtime_read() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (wrapper, _id, _held) = make_staging_wrapper(root.path(), false);
+        let mut mtime_reads = 0;
+        let removed = reap_stale_staging_with(
+            root.path(),
+            SystemTime::now(),
+            Duration::from_secs(1),
+            |path| {
+                assert_eq!(path, wrapper.as_path());
+                mtime_reads += 1;
+                std::fs::remove_dir_all(path).expect("concurrent cleanup removes admitted wrapper");
+                std::fs::symlink_metadata(path).and_then(|m| m.modified())
+            },
+        )
+        .expect("a wrapper gone during liveness classification is skipped");
+
+        assert_eq!(mtime_reads, 1, "the real sweep must reach the second stat");
+        assert_eq!(removed, 0, "another cleanup's removal is not counted");
+        assert_eq!(
+            std::fs::symlink_metadata(&wrapper).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn staging_sweep_preserves_wrapper_mtime_errors() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (wrapper, _id, _held) = make_staging_wrapper(root.path(), false);
+        let payload = wrapper.join("repo").join("payload");
+        std::fs::write(&payload, b"keep").expect("fixture payload");
+        let mut mtime_reads = 0;
+        let error = reap_stale_staging_with(
+            root.path(),
+            SystemTime::now(),
+            Duration::from_secs(1),
+            |path| {
+                assert_eq!(path, wrapper.as_path());
+                mtime_reads += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected wrapper mtime denial",
+                ))
+            },
+        )
+        .expect_err("non-NotFound errors must still fail the sweep");
+
+        match error {
+            CacheError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                let message = error.to_string();
+                assert!(message.contains("reap_stale_staging: wrapper mtime"));
+                assert!(message.contains(&wrapper.display().to_string()));
+                assert!(message.contains("injected wrapper mtime denial"));
+            }
+            other => panic!("expected wrapper mtime I/O error, got {other:?}"),
+        }
+        assert_eq!(mtime_reads, 1);
+        assert!(wrapper.is_dir());
+        assert_eq!(std::fs::read(payload).unwrap(), b"keep");
     }
 
     /// Blocking-finding acceptance test: a wrapper whose lock is still held

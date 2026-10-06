@@ -2800,8 +2800,6 @@ dependencies = [
  "khive-types",
  "lattice-embed",
  "parking_lot",
- "rand 0.8.7",
- "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

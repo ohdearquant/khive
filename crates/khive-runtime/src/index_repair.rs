@@ -199,6 +199,13 @@ impl KhiveRuntime {
             },
             Err(error) => report.failure("fts", error),
         }
+        let body = match &record {
+            Record::Entity(_) => doc.body.as_str(),
+            Record::Note(note) => crate::curation::note_embedding_text_ref(note),
+        };
+        if body.trim().is_empty() {
+            return Ok(report);
+        }
         for model in models {
             let (storage_model, dimensions) = match self.vector_model_metadata(&model) {
                 Ok(metadata) => metadata,
@@ -232,17 +239,27 @@ impl KhiveRuntime {
             }
             .await;
             match presence {
-                Ok(Some(Publication::Healthy)) => match store
-                    .get_vectors(&[id], &doc.namespace, record.tables().2)
-                    .await
-                {
-                    Ok(vectors) if vectors.contains_key(&id) => continue,
-                    Ok(_) => {}
-                    Err(error) => {
-                        report.failure("vector_presence", format!("{model}: {error}"));
-                        continue;
+                Ok(Some(Publication::Healthy)) => {
+                    #[cfg(test)]
+                    tests::pause("vector_read").await;
+                    match store
+                        .get_vectors(&[id], &doc.namespace, record.tables().2)
+                        .await
+                    {
+                        Ok(vectors) if vectors.contains_key(&id) => continue,
+                        Ok(_) => report.failure(
+                            "vector_presence",
+                            format!(
+                                "{model}: vector identity was present for {id}, \
+                                 but its vector was not returned"
+                            ),
+                        ),
+                        Err(error) => {
+                            report.failure("vector_presence", format!("{model}: {error}"))
+                        }
                     }
-                },
+                    continue;
+                }
                 Ok(Some(Publication::Occupied)) => {
                     report.failure("vector_presence", format!("{model}: another vector identity occupies the subject; existing vector was preserved"));
                     continue;
@@ -253,10 +270,6 @@ impl KhiveRuntime {
                     continue;
                 }
             }
-            let body = match &record {
-                Record::Entity(_) => doc.body.as_str(),
-                Record::Note(note) => crate::curation::note_embedding_text_ref(note),
-            };
             let outcome = match self
                 .embed_document_with_model_outcome_for_token(token, &model, body)
                 .await

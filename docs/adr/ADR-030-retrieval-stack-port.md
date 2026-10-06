@@ -441,3 +441,36 @@ table. This amendment removes only the proofs from what those entries can claim 
 repository; their other reasons are unchanged.
 
 **Refs.** Commits ba4b35f1b, a7777e277, 1cbab6293.
+
+## Amendment 2 (2026-10-06): remove unused optional persistence and replay
+
+**Status**: Proposed
+
+**Context.** The optional `persist` feature exposes the `persist`, `replay` and `weights`
+modules, but no workspace consumer enables it or calls their public APIs. The weight and
+replay code depends on `atom_weights`, `weight_events` and `brain_events` tables without
+production schema definitions. Their tests construct the first two themselves; the
+`brain_events` reads sit behind an `engine` feature the crate never declares, so they never
+compile.
+
+**Proposed decision.** Remove these three modules, their tests, the `persist` feature and
+its public re-exports. Remove the direct `rusqlite` and `rand` dependency edges from
+`khive-retrieval`; retain `tracing` for the ANN registry. This is an explicit removal of
+unused optional library APIs, not a compatibility implementation. Any future replacement
+must bring its production schema and linted SQL with its callers.
+
+**Preserved behavior.** HNSW checkpointing, BM25/HNSW engine re-exports, ANN helpers and
+retrieval composition remain available through their existing features and APIs. The
+knowledge pack's legacy `retrieval_snapshots` readers and upgrade path, namespace moves
+and reindex invalidation remain intact. Existing snapshot rows and their table are not
+removed or migrated. The kkernel preparation schema remains a fixture for preparing the
+legacy-table deletion statements, not a production schema owner.
+
+**Consequences.** Callers outside this workspace that explicitly enabled `persist` or
+used its APIs must stop depending on that surface. Feature defaults stay empty, as already
+specified above. Removing these unused statements is separate from extracting fixed ANN
+SQL and extending the shared SQL guard; those changes retain their own acceptance checks.
+The earlier port description records the historical surface and is qualified by this
+amendment when accepted.
+
+**Refs.** #4201, #4186, #4193.

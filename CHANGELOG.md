@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tests. This is a source-breaking change for an out-of-tree Rust consumer; a caller that merged a
   primary and a legacy index through it now fuses the two result lists with
   `fuse_search_results_checked` and its own source order.
+- The `khive-retrieval` `persist` feature is removed, with the `persist`, `replay` and `weights`
+  modules and the `PersistError`, `PersistenceStats`, `RetrievalPersistence`, `ShadowMetrics`,
+  `ShadowValidationConfig` and `ShadowValidationResult` re-exports. Nothing in the workspace
+  enabled the feature. This is a source-breaking change for an out-of-tree Rust consumer that
+  enabled `persist`. HNSW checkpoints remain available through the `checkpoint` feature, and
+  existing `retrieval_snapshots` rows are left in place.
 
 ### Changed
 
@@ -73,9 +79,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive-retrieval` no longer compiles `khive-hnsw`, `khive-bm25` or `khive-db` by default. The
   `khive-hnsw` and `khive-bm25` types it re-exports at the crate root (`HnswIndex`, `HnswConfig`,
   `Bm25Index`, `Bm25Config` and the rest) are now behind the new `hnsw` and `bm25` features, so a
-  Rust consumer that uses them must enable the matching feature. `persist` implies both and
-  `checkpoint` implies `hnsw`, so those consumers need no change. `khive-db` is now a
-  dev-dependency only.
+  Rust consumer that uses them must enable the matching feature. `checkpoint` implies `hnsw`, so
+  its consumers need no change. `khive-db` is now a dev-dependency only.
 
 ## [0.9.0] - 2026-09-27
 

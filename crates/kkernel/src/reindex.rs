@@ -73,7 +73,7 @@ pub struct ReindexArgs {
 
     /// Records embedded per batch — also the DB page and write batch (default
     /// 128, max 500). One `embed_document_batch` call processes this many records.
-    #[arg(long, default_value = "128")]
+    #[arg(long, default_value_t = record_repair::DEFAULT_REINDEX_BATCH_SIZE)]
     pub batch_size: u32,
 
     /// Keep existing vectors instead of dropping before re-embedding.
