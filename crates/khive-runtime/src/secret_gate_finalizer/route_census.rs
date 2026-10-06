@@ -2528,7 +2528,7 @@ fn external_note_sql_constant_requires_an_inventoried_reservation_check() {
         .iter()
         .find(|route| route.id == "curation.merge.note")
         .expect("note merge route is declared");
-    let source_path = "khive-runtime/src/curation.rs";
+    let source_path = "khive-runtime/src/curation/merge_sql.rs";
     let checked = "fn merge_note_sql() {
         reject_reserved_secret_gate_property(merged_props);
         let _ = khive_db::stores::note::NOTE_UPSERT_SQL;
@@ -2542,7 +2542,7 @@ fn external_note_sql_constant_requires_an_inventoried_reservation_check() {
     assert!(check_inventory(&sites, &[route], 0).is_ok());
     assert!(check_inventory(&sites, &[], 0)
         .unwrap_err()
-        .contains("unmapped khive-runtime/src/curation.rs::merge_note_sql"));
+        .contains("unmapped khive-runtime/src/curation/merge_sql.rs::merge_note_sql"));
 
     let unchecked = "fn merge_note_sql() {
         let _ = khive_db::stores::note::NOTE_UPSERT_SQL;
