@@ -86,6 +86,39 @@ def lint_connection():
         raise SystemExit(f"SQL lint: cannot disable SQLite DQS: {error}") from error
     return con
 
+def sql_parameter_surface(sql):
+    """Hide quoted text and comments from bind checks, never preparation."""
+    surface = list(sql)
+    at = 0
+    while at < len(sql):
+        if sql.startswith("--", at):
+            end = sql.find("\n", at + 2)
+            if end < 0:
+                end = len(sql)
+        elif sql.startswith("/*", at):
+            end = sql.find("*/", at + 2)
+            end = len(sql) if end < 0 else end + 2
+        elif sql[at] in "'\"`[":
+            quote = sql[at]
+            closing = "]" if quote == "[" else quote
+            end = at + 1
+            while end < len(sql):
+                if sql[end] == closing:
+                    end += 1
+                    if quote != "[" and end < len(sql) and sql[end] == closing:
+                        end += 1
+                        continue
+                    break
+                end += 1
+        else:
+            at += 1
+            continue
+        for index in range(at, end):
+            if surface[index] not in "\r\n":
+                surface[index] = " "
+        at = end
+    return "".join(surface)
+
 def rust_tokens(source):
     """Read registration syntax without mistaking comments or strings for Rust."""
     tokens = []
@@ -424,13 +457,15 @@ if query_files:
                     print(f"{path}: more than one statement — one statement per file")
                     failed += 1
                     continue
-                binds = re.findall(r"\?(\d+)", sql)
+                parameter_sql = sql_parameter_surface(sql)
+                binds = re.findall(r"\?(\d+)", parameter_sql)
                 highest = max((int(b) for b in binds), default=0)
                 if binds and sorted({int(b) for b in binds}) != list(range(1, highest + 1)):
                     print(f"{path}: positional binds must run 1..N with no gaps")
                     failed += 1
                     continue
-                if re.search(r"\?(?!\d)", sql) or re.search(r"[:@$][A-Za-z_]", sql):
+                if (re.search(r"\?(?!\d)", parameter_sql)
+                        or re.search(r"[:@$][A-Za-z_]", parameter_sql)):
                     print(f"{path}: use numbered binds (?1, ?2), not anonymous or named ones")
                     failed += 1
                     continue
