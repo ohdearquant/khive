@@ -884,6 +884,12 @@ impl From<khive_db::SqliteError> for RuntimeError {
     fn from(error: khive_db::SqliteError) -> Self {
         match error {
             khive_db::SqliteError::RequestReadStopped(error) => Self::Storage(error),
+            khive_db::SqliteError::InheritedWriterTransaction
+            | khive_db::SqliteError::WriterSettlementUnknown => {
+                Self::Storage(khive_storage::StorageError::WriterTaskTerminated {
+                    request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                })
+            }
             error => Self::Sqlite(error),
         }
     }
