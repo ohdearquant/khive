@@ -1,3 +1,6 @@
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use async_trait::async_trait;
 use khive_brain_core::PackTunable;
 use khive_pack_gtd::GtdPack;
@@ -28,7 +31,9 @@ fn make_runtime() -> KhiveRuntime {
 fn make_registry(rt: KhiveRuntime) -> khive_runtime::VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     builder.build().expect("registry builds")
 }
 
@@ -485,7 +490,7 @@ async fn finite_adjustments_keep_rank_scores_numeric_through_mmr_and_final_sort(
         }
     }
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt.clone()));
     pack.warm().await;
     let token = rt.authorize(Namespace::local()).expect("local token");
 
@@ -1454,7 +1459,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     use khive_pack_memory::config::RecallConfig;
 
     let rt = make_runtime();
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt.clone()));
 
     // Sanity: with default config (0.70/0.20/0.10), the score for
     //   rrf=1.0, salience=1.0, decay=0.0, age=0 → 0.70+0.20+0.10 = 1.0
@@ -1505,7 +1510,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     // mutating the live registry's config from outside. We construct the test
     // by exercising the same wire on a fresh pack.
     let rt2 = make_runtime();
-    let pack2 = MemoryPack::new(rt2.clone());
+    let pack2 = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt2.clone()));
     // Use Weighted strategy so the input relevance score (1.0) passes through
     // unnormalized — RRF strategy would scale it by (k+1) = 61, producing 61.0.
     let relevance_only = RecallConfig {
@@ -4320,7 +4325,9 @@ async fn adr007_rev4_writes_stamp_local() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     let result = registry
@@ -4387,7 +4394,9 @@ async fn adr007_rev4_no_actor_yields_local_only_visible_set() {
     let mut builder = VerbRegistryBuilder::new();
     // deliberately NOT calling with_visible_namespaces
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // Default recall must NOT surface the foreign note.
@@ -4470,7 +4479,9 @@ async fn adr007_rev4_explicit_namespace_is_strict_reading2() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // Explicit namespace="lambda:khive" → strict {lambda:khive} only.
@@ -4549,7 +4560,9 @@ async fn adr007_rev4_get_byid_is_namespace_agnostic() {
     let mut builder = VerbRegistryBuilder::new();
     // No visible_namespaces — local-only token will be minted by dispatch default.
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // get by UUID with no namespace= param → must resolve the lambda:khive note.
@@ -4598,7 +4611,9 @@ async fn adr007_rev4_default_recall_surfaces_actor_ns_via_both_legs() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // Step 3: write the note into lambda:khive via the Rule-3 explicit-namespace escape.
@@ -4689,7 +4704,9 @@ async fn adr007_rev4_default_recall_surfaces_actor_ns_via_fts_leg() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // Write the note into lambda:khive via the Rule-3 explicit-namespace escape.
@@ -4820,7 +4837,7 @@ async fn test_multi_namespace_recall_overfetch_filter() {
     }
 
     // ── Assertion 2: wide token includes both namespaces ──────────────────────
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt.clone()));
     // Warm the ANN so vectors are indexed.
     pack.warm().await;
 
@@ -5060,7 +5077,7 @@ async fn c1_setup() -> (
         local_ids.push(r["id"].as_str().expect("note_id").to_string());
     }
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt.clone()));
     {
         use khive_runtime::PackRuntime;
         pack.warm().await;
@@ -5180,7 +5197,9 @@ fn make_registry_with_actor(rt: KhiveRuntime, actor_id: &str) -> khive_runtime::
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(actor_id.to_string()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     builder.build().expect("registry with actor builds")
 }
 
@@ -5375,7 +5394,9 @@ async fn adr007_rev6_episodic_cross_actor_isolation() {
     builder.with_actor_id(Some("alice".to_string()));
     builder.with_visible_namespaces(vec![Namespace::parse("alice").unwrap()]);
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let alice_registry = builder.build().expect("alice registry builds");
 
     // Anonymous (bob-equivalent) registry: no actor_id, no alice in visible set →
@@ -5811,7 +5832,9 @@ async fn test_readable_null_snapshot_profile_still_stamps_as_serving() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(NullSnapshotBrainPack);
     let registry = builder.build().expect("registry builds");
 
@@ -6800,7 +6823,9 @@ async fn generic_create_of_a_kind_with_its_own_hook_is_unaffected_by_the_memory_
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(GtdPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     let registry = builder.build().expect("registry builds");
 
     registry
@@ -7188,7 +7213,9 @@ async fn propose_add_note_changeset_admits_task_kind_via_the_proposal_note_hooks
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(GtdPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     let registry = builder.build().expect("registry builds");
 
     let propose = registry
@@ -7670,13 +7697,16 @@ async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay
             json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
             "keyed={keyed}: truncation and its fence must be returned together"
         );
-        let receipt = created["visibility_token"].clone();
-        assert_eq!(receipt["version"], json!(1));
-        assert_eq!(receipt["namespace"], json!("local"));
-        assert_eq!(receipt["fences"].as_array().map(Vec::len), Some(1));
-        assert_eq!(receipt["fences"][0]["model"], json!(MODEL));
-        let seq = receipt["fences"][0]["ann_write_log_seq"]
-            .as_u64()
+        let receipt = created["visibility_token"]
+            .as_str()
+            .expect("sealed receipt is an opaque string");
+        let receipt_runtime = receipt_credentials::with_receipt_credentials(rt.clone());
+        let opened = receipt_runtime
+            .open_visibility_receipt(receipt, &["local"], &[MODEL.to_owned()])
+            .expect("authenticate the actual returned receipt");
+        assert_eq!(opened.namespace(), "local");
+        let seq = opened
+            .sequence_for_model(MODEL)
             .expect("positive committed vector fence");
         assert!(seq > 0);
         let id: Uuid = created["id"].as_str().expect("note id").parse().unwrap();
@@ -7727,7 +7757,15 @@ async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay
             let replayed = registry.dispatch("memory.remember", args).await.unwrap();
             assert_eq!(replayed["id"], created["id"]);
             assert_eq!(replayed["replayed"], json!(true));
-            assert_eq!(replayed["visibility_token"], receipt);
+            let resealed = replayed["visibility_token"]
+                .as_str()
+                .expect("replay returns an opaque receipt");
+            assert_ne!(resealed, receipt, "replay uses a fresh nonce");
+            let replay_fence = receipt_runtime
+                .open_visibility_receipt(resealed, &["local"], &[MODEL.to_owned()])
+                .expect("authenticate the replay receipt after log compaction");
+            assert_eq!(replay_fence.namespace(), "local");
+            assert_eq!(replay_fence.sequence_for_model(MODEL), Some(seq));
             assert_eq!(
                 replayed["warnings"], created["warnings"],
                 "replay must retain its computed truncation warning with the original fence"
@@ -7752,5 +7790,163 @@ async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay
             assert_eq!(holders.len(), 1);
             assert_eq!(holders[0].id, id);
         }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn sealed_receipts_hide_intervening_namespace_writes_and_keep_own_session_visibility() {
+    const MODEL: &str = "sealed-interleaving-model-sentinel";
+    const OWN: &str = "receipt-owner-a";
+    const OTHER: &str = "receipt-other-b";
+    const FOREIGN_WRITES: u64 = 10;
+    const LATEST: &str = "quartz heron cobalt lighthouse latest owner receipt";
+
+    let rt = receipt_credentials::with_receipt_credentials(make_runtime());
+    rt.register_embedder(ConstVecProvider::new(MODEL, 8, 0.9));
+    let registry = make_registry(rt.clone());
+    let first = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": "quartz heron first owner receipt", "memory_type": "semantic",
+                "namespace": OWN, "embedding_model": MODEL, "salience": 0.5,
+            }),
+        )
+        .await
+        .expect("first owner write");
+    let first_token = first["visibility_token"]
+        .as_str()
+        .expect("opaque first receipt");
+    let first_receipt = rt
+        .open_visibility_receipt(first_token, &[OWN], &[MODEL.to_owned()])
+        .expect("authenticate first owner's actual fence");
+    assert_eq!(first_receipt.namespace(), OWN);
+    let first_seq = first_receipt
+        .sequence_for_model(MODEL)
+        .expect("first vector fence");
+    assert!(
+        (1..10).contains(&first_seq),
+        "fixture starts below a decimal-width boundary"
+    );
+
+    let mut preceding_seq = first_seq;
+    let mut foreign_ids = Vec::new();
+    for i in 0..FOREIGN_WRITES {
+        let foreign = registry
+            .dispatch(
+                "memory.remember",
+                json!({
+                    "content": format!("foreign intervening archive receipt {i}"),
+                    "memory_type": "semantic", "namespace": OTHER,
+                    "embedding_model": MODEL, "salience": 0.5,
+                }),
+            )
+            .await
+            .expect("foreign intervening write");
+        let receipt = rt
+            .open_visibility_receipt(
+                foreign["visibility_token"]
+                    .as_str()
+                    .expect("opaque foreign receipt"),
+                &[OTHER],
+                &[MODEL.to_owned()],
+            )
+            .expect("authenticate actual foreign write for the fixture oracle");
+        assert_eq!(receipt.namespace(), OTHER);
+        let sequence = receipt
+            .sequence_for_model(MODEL)
+            .expect("foreign vector fence");
+        assert_eq!(sequence, preceding_seq + 1);
+        preceding_seq = sequence;
+        foreign_ids.push(foreign["id"].as_str().expect("foreign ID").to_owned());
+    }
+
+    let latest = registry
+        .dispatch(
+            "memory.remember",
+            json!({
+                "content": LATEST, "memory_type": "semantic", "namespace": OWN,
+                "embedding_model": MODEL, "salience": 1.0,
+            }),
+        )
+        .await
+        .expect("latest owner write after foreign progress");
+    let latest_token = latest["visibility_token"]
+        .as_str()
+        .expect("opaque latest receipt");
+    let latest_receipt = rt
+        .open_visibility_receipt(latest_token, &[OWN], &[MODEL.to_owned()])
+        .expect("authenticate latest owner's actual fence");
+    assert_eq!(latest_receipt.namespace(), OWN);
+    let latest_seq = latest_receipt
+        .sequence_for_model(MODEL)
+        .expect("latest vector fence");
+    assert_eq!(latest_seq, preceding_seq + 1);
+    assert_eq!(latest_seq - first_seq, FOREIGN_WRITES + 1);
+    assert!(
+        latest_seq >= 10,
+        "real writes cross the decimal-width boundary"
+    );
+    assert_eq!(
+        first_token.len(),
+        latest_token.len(),
+        "fixed-width encrypted sequences must not reveal the larger global counter"
+    );
+    assert_ne!(first_token, latest_token);
+
+    for response in [&first, &latest] {
+        let token = response["visibility_token"]
+            .as_str()
+            .expect("opaque public string");
+        assert!(token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')));
+        let public = response.to_string();
+        for field in [
+            "namespace",
+            "model",
+            "fences",
+            "seq",
+            "ann_write_log_seq",
+            "issued_at",
+        ] {
+            assert!(
+                !public.contains(&format!("\"{field}\":")),
+                "public receipt exposed {field}"
+            );
+        }
+        for sentinel in [OWN, OTHER, MODEL] {
+            assert!(
+                !public.contains(sentinel),
+                "public receipt exposed {sentinel}"
+            );
+        }
+    }
+
+    let recalled = registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": LATEST, "namespace": OWN, "embedding_model": MODEL,
+                "consistency": "session", "visibility_token": latest_token,
+                "fusion_strategy": "vector_only", "timeout_ms": 0,
+                "limit": 20, "score_floor": 0.0,
+            }),
+        )
+        .await
+        .expect("latest owner's actual fence proves its candidate read");
+    let hits = recalled.as_array().expect("recall results");
+    assert!(
+        hits.iter().any(|hit| hit["id"] == latest["id"]),
+        "session recall lost the latest owner memory: {recalled:?}"
+    );
+    for id in foreign_ids {
+        assert!(
+            !hits
+                .iter()
+                .any(|hit| hit["id"].as_str() == Some(id.as_str())),
+            "own session recall included a foreign memory"
+        );
     }
 }

@@ -88,6 +88,9 @@
 //! in progress. Run the suite twice and require consistent numbers across both runs
 //! before recording or refreshing baselines.
 
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -270,7 +273,9 @@ async fn open_ann_measurement_window<T>(
 fn make_registry(rt: &KhiveRuntime) -> khive_runtime::VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     builder.build().expect("registry builds")
 }
 
