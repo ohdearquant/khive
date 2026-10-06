@@ -792,9 +792,7 @@ async fn validate_existing_import_identities(
     {
         let rows = reader
             .query_all(SqlStatement {
-                sql: "SELECT slug, source_uri, properties FROM knowledge_atoms \
-                      WHERE namespace = ?1 AND deleted_at IS NULL"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_import_existing_identities").into(),
                 params: vec![SqlValue::Text(namespace.clone())],
                 label: Some("knowledge.import.identity_preflight".into()),
             })
@@ -833,7 +831,7 @@ async fn validate_existing_import_identities(
         // Path-only imports need just these indexed lookups, not the identity scan.
         let existing = reader
             .query_row(SqlStatement {
-                sql: "SELECT tags, deleted_at FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_import_atom_tags").into(),
                 params: vec![
                     SqlValue::Text(prepared.slug.clone()),
                     SqlValue::Text(namespace.clone()),
@@ -982,7 +980,7 @@ impl KnowledgeHandlers {
                 // parsed value's canonical form, not the spelling the caller used.
                 reader
                     .query_row(SqlStatement {
-                        sql: "SELECT id FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                        sql: khive_runtime::sql!("knowledge_atom_resolve_id").into(),
                         params: vec![
                             SqlValue::Text(uuid.as_hyphenated().to_string()),
                             SqlValue::Text(ns.clone()),
@@ -994,7 +992,7 @@ impl KnowledgeHandlers {
             } else {
                 reader
                     .query_row(SqlStatement {
-                        sql: "SELECT id FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                        sql: khive_runtime::sql!("knowledge_atom_resolve_slug").into(),
                         params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.clone())],
                         label: None,
                     })
@@ -1042,9 +1040,7 @@ impl KnowledgeHandlers {
                 .map_err(|e| sql_err("edit section reader", e))?;
             let existing_section = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_sections \
-                          WHERE atom_id = ?1 AND content_hash = ?2 LIMIT 1"
-                        .into(),
+                    sql: khive_runtime::sql!("knowledge_section_hash_probe").into(),
                     params: vec![
                         SqlValue::Text(atom_id.clone()),
                         SqlValue::Text(hash.clone()),
@@ -1071,11 +1067,7 @@ impl KnowledgeHandlers {
                 // the incremental section pass below fills the NULL embedding.
                 writer
                     .execute(SqlStatement {
-                        sql: "UPDATE knowledge_sections SET \
-                              section_type=?1, heading=?2, tokens=?3, sort_order=?4, \
-                              embedding=CASE WHEN heading = ?2 THEN embedding ELSE NULL END, \
-                              updated_at=?5 WHERE id=?6"
-                            .into(),
+                        sql: khive_runtime::sql!("knowledge_section_metadata_update").into(),
                         params: vec![
                             SqlValue::Text(stype.as_str().to_string()),
                             SqlValue::Text(heading.clone()),
@@ -1093,11 +1085,7 @@ impl KnowledgeHandlers {
                 // (including verified ones of the same type) untouched.
                 writer
                     .execute(SqlStatement {
-                        sql: "INSERT INTO knowledge_sections \
-                              (id, atom_id, namespace, section_type, heading, content, \
-                               content_hash, tokens, sort_order, created_at, updated_at) \
-                              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
-                            .into(),
+                        sql: khive_runtime::sql!("knowledge_section_insert").into(),
                         params: vec![
                             SqlValue::Text(section_id.clone()),
                             SqlValue::Text(atom_id.clone()),
@@ -1415,10 +1403,7 @@ impl KnowledgeHandlers {
 
         let affected = writer
             .execute(SqlStatement {
-                sql: "UPDATE knowledge_sections SET status='disputed' \
-                      WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 \
-                      AND status NOT IN ('disputed','deprecated')"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_section_dispute").into(),
                 params: vec![
                     SqlValue::Text(atom_id.clone()),
                     SqlValue::Text(stype.as_str().to_string()),

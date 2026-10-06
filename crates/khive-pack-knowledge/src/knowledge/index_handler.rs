@@ -48,8 +48,11 @@ impl KnowledgeHandlers {
             for id_or_slug in ids {
                 let row = reader
                     .query_row(SqlStatement {
-                        sql: "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND (id = ?2 OR slug = ?2) AND deleted_at IS NULL LIMIT 1".into(),
-                        params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(id_or_slug.clone())],
+                        sql: khive_runtime::sql!("knowledge_index_atom_target").into(),
+                        params: vec![
+                            SqlValue::Text(ns.clone()),
+                            SqlValue::Text(id_or_slug.clone()),
+                        ],
                         label: None,
                     })
                     .await
@@ -73,7 +76,7 @@ impl KnowledgeHandlers {
                     .query_all(SqlStatement {
                         // #1671: `id` tiebreak — the batch re-embed sweep pages the
                         // full atom table; a non-total order would duplicate/skip atoms.
-                        sql: "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at ASC, id ASC LIMIT ?2 OFFSET ?3".into(),
+                        sql: khive_runtime::sql!("knowledge_index_atom_page").into(),
                         params: vec![
                             SqlValue::Text(ns.clone()),
                             SqlValue::Integer(batch_size as i64),
@@ -246,26 +249,22 @@ pub(crate) async fn rebuild_fts_indexes(runtime: &KhiveRuntime) -> Result<Value,
     writer
         .execute_batch(vec![
             SqlStatement {
-                sql: "INSERT INTO fts_knowledge(fts_knowledge) VALUES('rebuild')".into(),
+                sql: khive_runtime::sql!("knowledge_fts_rebuild").into(),
                 params: vec![],
                 label: Some("knowledge.index.fts_knowledge.rebuild".into()),
             },
             SqlStatement {
-                sql: "INSERT INTO fts_sections(fts_sections) VALUES('rebuild')".into(),
+                sql: khive_runtime::sql!("knowledge_sections_fts_rebuild").into(),
                 params: vec![],
                 label: Some("knowledge.index.fts_sections.rebuild".into()),
             },
             SqlStatement {
-                sql: "INSERT INTO fts_knowledge(fts_knowledge, rank) \
-                      VALUES('integrity-check', 1)"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_fts_integrity_check").into(),
                 params: vec![],
                 label: Some("knowledge.index.fts_knowledge.integrity".into()),
             },
             SqlStatement {
-                sql: "INSERT INTO fts_sections(fts_sections, rank) \
-                      VALUES('integrity-check', 1)"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_sections_fts_integrity_check").into(),
                 params: vec![],
                 label: Some("knowledge.index.fts_sections.integrity".into()),
             },

@@ -9,6 +9,7 @@ const CONVERTED: &[&str] = &[
     "khive-pack-git",
     "khive-pack-gtd",
     "khive-pack-kg",
+    "khive-pack-knowledge",
     "khive-pack-memory",
     "kkernel",
 ];
@@ -741,7 +742,7 @@ pub(super) fn check(sources: Vec<(PathBuf, String)>, crates_root: &Path) {
         &sources,
         crates_root,
         CONVERTED,
-        MEMORY_KEEPS,
+        INLINE_KEEPS,
     ));
     assert!(
         errors.is_empty(),
@@ -814,12 +815,45 @@ pub(super) fn check(sources: Vec<(PathBuf, String)>, crates_root: &Path) {
     );
 }
 
-const MEMORY_KEEPS: &[Keep] = &[
+const INLINE_KEEPS: &[Keep] = &[
     Keep { name: "session_union_arm", path: "khive-pack-memory/src/ann.rs", sql: "SELECT subject_id, vector_namespace, distance FROM session_knn_{index}", reason: "Per-namespace CTE identifier contains the runtime index." },
     Keep { name: "population_base_count", path: "khive-pack-memory/src/pack.rs", sql: "SELECT COUNT(*) AS cnt FROM {base_table} WHERE deleted_at IS NULL", reason: "Base table identifier is selected at runtime." },
     Keep { name: "population_fts_count", path: "khive-pack-memory/src/pack.rs", sql: "SELECT COUNT(*) AS cnt FROM {fts_table}", reason: "FTS table identifier is selected at runtime." },
     Keep { name: "final_tail_snapshot", path: "khive-pack-memory/src/ann/final_tail.rs", sql: "WITH {live_cte}selected AS ( SELECT seq, subject_id, op FROM ann_write_log WHERE embedding_model = ?1 AND kind = 'note' AND field = 'note.content' AND seq > ?2 {order_limit} ), finals AS ( SELECT seq, subject_id, op, first_seq FROM ( SELECT seq, subject_id, op, MIN(seq) OVER (PARTITION BY subject_id) AS first_seq, ROW_NUMBER() OVER ( PARTITION BY subject_id ORDER BY seq DESC ) AS final_rank FROM selected ) WHERE final_rank = 1 ) SELECT finals.seq, finals.subject_id, finals.op, vectors.embedding_model AS vector_model, vectors.kind AS vector_kind, vectors.field AS vector_field, vectors.embedding, live_note.id AS live_note_id FROM finals LEFT JOIN {table_name} AS vectors ON vectors.subject_id = finals.subject_id LEFT JOIN notes AS live_note ON live_note.id = finals.subject_id AND live_note.deleted_at IS NULL ORDER BY finals.first_seq", reason: "Vector table, optional CTE and order/limit clauses are assembled at runtime." },
     Keep { name: "prune_candidates", path: "khive-pack-memory/src/handlers/prune.rs", sql: "SELECT {projection} FROM notes WHERE kind = 'memory' AND namespace = ? AND deleted_at IS NULL", reason: "Projection depends on the requested pruning mode." },
+    Keep { name: "knowledge_compose_section_window", path: "khive-pack-knowledge/src/knowledge/compose.rs", sql: "SELECT id, atom_id, section_type, heading, content, embedding FROM knowledge_sections WHERE namespace = ?1 AND atom_id IN ({placeholders}) AND {SERVABLE_SECTION}", reason: "Variable atom-ID placeholder list and shared servable-section predicate." },
+    Keep { name: "knowledge_feedback_target_table", path: "khive-pack-knowledge/src/knowledge/crud.rs", sql: "SELECT id FROM {table} WHERE id = ?1 AND deleted_at IS NULL LIMIT 1", reason: "Atom/domain table identifier selected at runtime." },
+    Keep { name: "knowledge_domain_offset_projection", path: "khive-pack-knowledge/src/knowledge/crud.rs", sql: "SELECT {select_columns} FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3", reason: "Key-only versus full domain projection selected at runtime." },
+    Keep { name: "knowledge_atom_offset_projection_status", path: "khive-pack-knowledge/src/knowledge/crud.rs", sql: "SELECT {select_columns} FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{} ORDER BY created_at DESC, id DESC LIMIT ?2 OFFSET ?3", reason: "Selected projection and optional status clause." },
+    Keep { name: "knowledge_atom_count_status", path: "khive-pack-knowledge/src/knowledge/crud.rs", sql: "SELECT COUNT(*) FROM knowledge_atoms WHERE namespace = ?1 AND deleted_at IS NULL AND tags NOT LIKE '%type:domain%'{}", reason: "Optional status clause." },
+    Keep { name: "knowledge_delete_domain_head", path: "khive-pack-knowledge/src/knowledge/crud.rs", sql: "SELECT id, slug FROM knowledge_domains", reason: "Incomplete domain projection passed to key_match_statements; runtime key column, namespace predicate and IN binds follow." },
+    Keep { name: "knowledge_delete_atom_head", path: "khive-pack-knowledge/src/knowledge/crud.rs", sql: "SELECT id, slug, tags FROM knowledge_atoms", reason: "Incomplete atom projection passed to key_match_statements; runtime key column, namespace predicate and IN binds follow." },
+    Keep { name: "knowledge_delete_atom_update_head", path: "khive-pack-knowledge/src/knowledge/crud.rs", sql: "UPDATE knowledge_atoms SET deleted_at = ?2", reason: "Incomplete UPDATE passed to key_match_statements; runtime key column, namespace predicate and IN binds follow." },
+    Keep { name: "knowledge_cursor_page", path: "khive-pack-knowledge/src/knowledge/cursor_query.rs", sql: "SELECT {columns} FROM {table} WHERE namespace = ?1 AND deleted_at IS NULL {atom_filter}{seek}{status_clause} ORDER BY created_at ASC, id ASC LIMIT {limit}", reason: "Table, projection, status/seek clauses and bound limit assembled at runtime." },
+    Keep { name: "knowledge_refusal_target", path: "khive-pack-knowledge/src/knowledge/refusal.rs", sql: "SELECT a.* FROM knowledge_atoms a WHERE {predicate} AND a.deleted_at IS NULL AND NOT EXISTS (SELECT 1 FROM knowledge_domains d WHERE d.id = a.id) LIMIT 1", reason: "ID or namespace/slug predicate selected from the refused input." },
+    Keep { name: "knowledge_proto_fts_rowids", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY rowid LIMIT ?2", reason: "Test-only prototype chooses its FTS table at runtime." },
+    Keep { name: "knowledge_proto_term_frequency", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT count(*) AS frequency FROM ( SELECT rowid FROM {table} WHERE {table} MATCH ?1 ORDER BY rowid LIMIT ?2 )", reason: "Test-only prototype chooses its FTS table at runtime." },
+    Keep { name: "knowledge_fts_scoped_candidates", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT a.* FROM fts_knowledge CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid WHERE fts_knowledge MATCH ?1 AND +a.namespace = ?2 AND a.deleted_at IS NULL{scoped_status_clause}{type_clause} ORDER BY fts_knowledge.rowid LIMIT ?3", reason: "Status and atom/domain eligibility clauses selected at runtime." },
+    Keep { name: "knowledge_proto_fts_scoped_candidates", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT a.* FROM {table} CROSS JOIN knowledge_atoms AS a ON a.rowid = {table}.rowid WHERE {table} MATCH ?1 AND +a.namespace = ?2 AND a.deleted_at IS NULL{scoped_status_clause}{type_clause} ORDER BY {table}.rowid LIMIT ?3", reason: "Test-only FTS table and status/type clauses selected at runtime." },
+    Keep { name: "knowledge_fts_membership", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT 1 AS present FROM knowledge_atoms WHERE rowid IN ({placeholders}) AND namespace = ?1 LIMIT 1", reason: "Variable rowid placeholder list." },
+    Keep { name: "knowledge_proto_namespace_present", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT 1 AS present FROM {table} CROSS JOIN knowledge_atoms AS a ON a.rowid = {table}.rowid WHERE {table} MATCH ?1 AND +a.namespace = ?2 LIMIT 1", reason: "Test-only prototype chooses its FTS table at runtime." },
+    Keep { name: "knowledge_exact_name_eligibility", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT *, CASE WHEN 1{status_clause}{type_clause} THEN 1 ELSE 0 END AS exact_name_eligible FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1", reason: "Status and atom/domain eligibility clauses selected at runtime." },
+    Keep { name: "knowledge_hydrate_atoms", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT id, slug, name, content, tags, finalized, status FROM knowledge_atoms WHERE id IN ({placeholders}) AND +namespace = ?1 AND deleted_at IS NULL", reason: "Variable atom-ID placeholder list." },
+    Keep { name: "knowledge_hydrate_domains", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT id, slug, name, description, tags, status FROM knowledge_domains WHERE id IN ({placeholders}) AND +namespace = ?1 AND deleted_at IS NULL", reason: "Variable domain-ID placeholder list." },
+    Keep { name: "knowledge_hydrate_phase_b", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT a.*, a.rowid AS rowid FROM knowledge_atoms AS a WHERE a.rowid IN ({rowid_placeholders}) AND +a.namespace = ?1 AND a.deleted_at IS NULL{status_clause}{type_clause}", reason: "Variable rowid placeholders and status/type clauses." },
+    Keep { name: "knowledge_domain_member_sizes", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT DISTINCT d.id AS domain_id, a.id AS atom_id, a.name, a.content FROM knowledge_domains AS d LEFT JOIN json_each(d.members) AS member ON 1 = 1 LEFT JOIN knowledge_atoms AS a ON a.namespace = d.namespace AND a.slug = member.value AND a.deleted_at IS NULL WHERE d.namespace = ?1 AND d.id IN ({placeholders}) AND d.deleted_at IS NULL", reason: "Variable domain-ID placeholder list." },
+    Keep { name: "knowledge_atom_body_lines", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "SELECT atom_id, SUM(CASE WHEN content = '' THEN 0 ELSE length(content) - length(replace(content, char(10), '')) + (CASE WHEN substr(content, -1) = char(10) THEN 0 ELSE 1 END) END) AS body_lines FROM knowledge_sections WHERE namespace = ?1 AND atom_id IN ({placeholders}) AND {SERVABLE_SECTION} GROUP BY atom_id", reason: "Variable atom-ID placeholders and shared servable-section predicate." },
+    Keep { name: "knowledge_compose_atom_window", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "WITH input(ordinal,raw_ref,is_uuid,prefix) AS (VALUES {}) SELECT input.ordinal AS compose_ordinal, CASE WHEN input.is_uuid=0 AND NOT EXISTS( SELECT 1 FROM knowledge_atoms slug WHERE slug.slug=input.raw_ref AND slug.namespace=?1 AND slug.deleted_at IS NULL) THEN 1 ELSE 0 END AS compose_prefix, atom.* FROM input JOIN knowledge_atoms atom ON atom.rowid IN(SELECT by_id.rowid FROM knowledge_atoms by_id WHERE input.is_uuid=1 AND by_id.id=input.raw_ref AND by_id.namespace=?1 AND by_id.deleted_at IS NULL UNION ALL SELECT by_slug.rowid FROM knowledge_atoms by_slug WHERE input.is_uuid=0 AND by_slug.slug=input.raw_ref AND by_slug.namespace=?1 AND by_slug.deleted_at IS NULL LIMIT 1) OR atom.rowid IN(SELECT prefixed.rowid FROM knowledge_atoms prefixed WHERE input.is_uuid=0 AND input.prefix IS NOT NULL AND NOT EXISTS(SELECT 1 FROM knowledge_atoms slug WHERE slug.slug=input.raw_ref AND slug.namespace=?1 AND slug.deleted_at IS NULL) AND prefixed.namespace=?1 AND prefixed.deleted_at IS NULL AND prefixed.id LIKE input.prefix LIMIT 2) ORDER BY input.ordinal", reason: "Variable VALUES tuple list carrying per-input ordinals and bind positions." },
+    Keep { name: "knowledge_test_low_overlap_seed", path: "khive-pack-knowledge/src/knowledge/search.rs", sql: "WITH RECURSIVE x(n) AS ( VALUES(0) UNION ALL SELECT n + 1 FROM x WHERE n < {x_max} ), y(n) AS ( VALUES(0) UNION ALL SELECT n + 1 FROM y WHERE n < {y_max} ) INSERT INTO knowledge_atoms ( id, namespace, slug, name, content, tags, properties, finalized, status, source_uri, source_type, created_at, updated_at, deleted_at ) SELECT printf('80000000-0000-0000-0000-%012d', x.n * {y_stride} + y.n), 'local', printf('lowoverlap-%06d', x.n * {y_stride} + y.n), printf('Low Overlap %06d', x.n * {y_stride} + y.n), 'synthetic corpus content entry ' || (x.n * {y_stride} + y.n) || ' discusses topic term' || ((x.n * {y_stride} + y.n) % {vocab_size}) || ' with padding context sentence for realistic length and additional filler', '[]', NULL, 1, 'reviewed', NULL, NULL, x.n * {y_stride} + y.n, x.n * {y_stride} + y.n, NULL FROM x CROSS JOIN y WHERE x.n * {y_stride} + y.n < {n}", reason: "Test-only corpus dimensions, strides, vocabulary and row ceiling interpolated at runtime." },
+    Keep { name: "knowledge_challenge_dispute_count", path: "khive-pack-knowledge/src/knowledge/sections.rs", sql: "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',coalesce(json_extract(properties,'$.dispute_count'),0)+{affected}) WHERE id=?1 AND namespace=?2", reason: "Affected section count interpolated from the preceding write." },
+    Keep { name: "knowledge_resolve_section_status", path: "khive-pack-knowledge/src/knowledge/sections.rs", sql: "SELECT content_hash FROM knowledge_sections WHERE atom_id=?1 AND section_type=?2 AND {status_filter}", reason: "Caller-selected status predicate." },
+    Keep { name: "knowledge_adjudicate_status", path: "khive-pack-knowledge/src/knowledge/sections.rs", sql: "UPDATE knowledge_sections SET status='{new_status}' WHERE atom_id=?1 AND section_type=?2 AND content_hash=?3 AND status='disputed'", reason: "New status selected from the adjudication resolution." },
+    Keep { name: "knowledge_adjudicate_dispute_count", path: "khive-pack-knowledge/src/knowledge/sections.rs", sql: "UPDATE knowledge_atoms SET properties=json_set(coalesce(properties,'{{}}'),'$.dispute_count',CASE WHEN coalesce(json_extract(properties,'$.dispute_count'),0) >= {affected} THEN coalesce(json_extract(properties,'$.dispute_count'),0)-{affected} ELSE 0 END) WHERE id=?1 AND namespace=?2", reason: "Affected section count interpolated from the preceding write." },
+    Keep { name: "knowledge_section_embed_count", path: "khive-pack-knowledge/src/knowledge/sections_index.rs", sql: "SELECT count(*) AS cnt FROM knowledge_sections s JOIN knowledge_atoms a ON a.id = s.atom_id AND a.namespace = s.namespace AND a.deleted_at IS NULL WHERE s.namespace = ?1{atom_filter}{null_filter}", reason: "Optional atom and null-embedding filters." },
+    Keep { name: "knowledge_section_embed_page", path: "khive-pack-knowledge/src/knowledge/sections_index.rs", sql: "SELECT s.id AS id, s.heading AS heading, s.content AS content, a.name AS atom_name FROM knowledge_sections s JOIN knowledge_atoms a ON a.id = s.atom_id AND a.namespace = s.namespace AND a.deleted_at IS NULL WHERE s.namespace = ?1{atom_clause}{null_filter}{keyset_clause} ORDER BY s.id LIMIT ?{limit_pos}", reason: "Optional atom/null/keyset clauses and runtime numbered limit position." },
+    Keep { name: "knowledge_embedding_coverage", path: "khive-pack-knowledge/src/knowledge/util.rs", sql: "SELECT COUNT(DISTINCT a.id) FROM knowledge_atoms a WHERE a.namespace = ?1 AND a.deleted_at IS NULL AND a.tags NOT LIKE '%type:domain%' AND a.id IN ( SELECT v.subject_id FROM {table_name} v WHERE v.namespace = ?1 AND v.embedding_model = ?2 AND v.field = 'knowledge.atom' )", reason: "Vector table identifier selected from the active model." },
+    Keep { name: "knowledge_ann_replay_vector", path: "khive-pack-knowledge/src/knowledge/vamana.rs", sql: "SELECT namespace, embedding_model, field, embedding FROM {table_name} WHERE subject_id = ?1", reason: "Vector table identifier selected from the model." },
+    Keep { name: "knowledge_ann_fresh_tail_snapshot", path: "khive-pack-knowledge/src/knowledge/vamana.rs", sql: "WITH registry AS ( SELECT MIN(watermark) AS registry_min FROM ann_consumer_watermark WHERE (namespace = ?1 OR namespace = '*') AND embedding_model = ?2 ), own AS ( SELECT (SELECT watermark FROM ann_consumer_watermark WHERE consumer = ?4 AND namespace = ?1 AND embedding_model = ?2) AS own_watermark ), {live_cte} selected AS ( SELECT seq, subject_id, op FROM ann_write_log WHERE namespace = ?1 AND embedding_model = ?2 AND field = 'knowledge.atom' AND seq > MAX( ?3, COALESCE((SELECT registry_min FROM registry), ?3) ) {selected_order} ), finals AS ( SELECT first_seq AS seq, subject_id, op FROM ( SELECT MIN(seq) OVER (PARTITION BY subject_id) AS first_seq, subject_id, op, ROW_NUMBER() OVER ( PARTITION BY subject_id ORDER BY seq DESC ) AS final_rank FROM selected ) WHERE final_rank = 1 ) SELECT finals.seq, finals.subject_id, finals.op, vectors.namespace AS vector_namespace, vectors.embedding_model AS vector_model, vectors.field AS vector_field, vectors.embedding, registry.registry_min, own.own_watermark, {live_column} AS live_count FROM registry CROSS JOIN own {live_join} LEFT JOIN finals ON 1 = 1 LEFT JOIN {table_name} AS vectors ON vectors.subject_id = finals.subject_id ORDER BY finals.seq", reason: "Vector table, optional live-count CTE, selection order/limit, join and projection assembled at runtime." },
 ];
 
 fn strip_test_modules(text: &str) -> String {
@@ -830,18 +864,20 @@ fn strip_test_modules(text: &str) -> String {
         let start = cursor + found;
         // Only a `mod` item is stripped, not a test-only `use` or `fn`.
         let after = &text[start..];
-        let Some(brace_rel) = after.find('{') else {
+        // The item ends at its first `{` or `;`. A `mod name;` declaration keeps its body in
+        // another file, so the code after it stays.
+        let Some(end_rel) = after.find(['{', ';']) else {
             out.push_str(&text[cursor..]);
             return out;
         };
-        if !after[..brace_rel].contains("mod ") {
-            out.push_str(&text[cursor..start + brace_rel]);
-            cursor = start + brace_rel;
+        if after.as_bytes()[end_rel] == b';' || !after[..end_rel].contains("mod ") {
+            out.push_str(&text[cursor..start + end_rel]);
+            cursor = start + end_rel;
             continue;
         }
         out.push_str(&text[cursor..start]);
         let mut depth = 0usize;
-        let mut i = start + brace_rel;
+        let mut i = start + end_rel;
         while i < bytes.len() {
             match bytes[i] {
                 b'{' => depth += 1,

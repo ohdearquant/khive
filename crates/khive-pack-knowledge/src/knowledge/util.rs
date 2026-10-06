@@ -360,7 +360,7 @@ pub(super) async fn resolve_atom_id(
         // value's canonical form, not the spelling the caller used.
         reader
             .query_row(SqlStatement {
-                sql: "SELECT id FROM knowledge_atoms WHERE id = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_atom_resolve_id").into(),
                 params: vec![
                     SqlValue::Text(uuid.as_hyphenated().to_string()),
                     SqlValue::Text(ns.to_owned()),
@@ -372,7 +372,7 @@ pub(super) async fn resolve_atom_id(
     } else {
         reader
             .query_row(SqlStatement {
-                sql: "SELECT id FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_atom_resolve_slug").into(),
                 params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             })

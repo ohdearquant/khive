@@ -1447,11 +1447,7 @@ async fn fetch_final_states(
     let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT subject_id, op, MAX(seq) AS seq FROM ann_write_log \
-                  WHERE namespace = ?1 AND embedding_model = ?2 \
-                    AND field = 'knowledge.atom' AND seq > ?3 \
-                  GROUP BY subject_id"
-                .into(),
+            sql: khive_runtime::sql!("knowledge_ann_final_states").into(),
             params: vec![
                 SqlValue::Text(ns.to_owned()),
                 SqlValue::Text(model.to_owned()),
@@ -2412,9 +2408,7 @@ async fn try_load_snapshot(
     let mut reader = sql.reader().await.ok()?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT snapshot FROM retrieval_snapshots \
-                  WHERE namespace = ?1 AND index_type = ?2"
-                .into(),
+            sql: khive_runtime::sql!("knowledge_legacy_snapshot_load").into(),
             params: vec![SqlValue::Text(key), SqlValue::Text("vamana".into())],
             label: None,
         })
@@ -2579,7 +2573,7 @@ pub(crate) async fn invalidate_snapshot(rt: &KhiveRuntime, namespace: &str) {
     };
     match w
         .execute(SqlStatement {
-            sql: "DELETE FROM retrieval_snapshots WHERE namespace LIKE ?1 ESCAPE '\\'".into(),
+            sql: khive_runtime::sql!("knowledge_legacy_snapshots_invalidate").into(),
             params: vec![SqlValue::Text(pattern)],
             label: Some("invalidate_vamana_snapshot".into()),
         })
@@ -2639,9 +2633,7 @@ pub(crate) async fn warm_known_snapshots(rt: &KhiveRuntime, ann: &SharedAnn) {
         match sql.reader().await {
             Ok(mut reader) => reader
                 .query_all(SqlStatement {
-                    sql:
-                        "SELECT DISTINCT namespace FROM retrieval_snapshots WHERE namespace LIKE ?1"
-                            .into(),
+                    sql: khive_runtime::sql!("knowledge_legacy_snapshot_namespaces").into(),
                     params: vec![SqlValue::Text("%::vamana::%".into())],
                     label: None,
                 })

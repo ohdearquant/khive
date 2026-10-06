@@ -229,13 +229,8 @@ pub(crate) async fn embed_sections(
                         unit_normalize(&mut emb);
                         match writer
                             .execute(SqlStatement {
-                                sql:
-                                    "UPDATE knowledge_sections SET embedding = ?1, updated_at = ?2 \
-                                      WHERE id = ?3 AND heading = ?4 AND content = ?5 \
-                                      AND EXISTS (SELECT 1 FROM knowledge_atoms a \
-                                                  WHERE a.id = knowledge_sections.atom_id \
-                                                  AND a.name = ?6 AND a.deleted_at IS NULL)"
-                                        .into(),
+                                sql: khive_runtime::sql!("knowledge_section_embedding_update")
+                                    .into(),
                                 params: vec![
                                     SqlValue::Blob(f32_to_le_bytes(&emb)),
                                     SqlValue::Integer(now),
