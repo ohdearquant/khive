@@ -61,64 +61,148 @@ async fn resolve_holder(
     }
 }
 
-fn missing_visibility_receipt(note_id: Uuid) -> RuntimeError {
-    KhiveError::unavailable(format!(
-        "freshness_unmet: original visibility receipt for memory {note_id} is unavailable"
-    ))
-    .with_details(Details::new_owned([
-        ("reason", "freshness_unmet".into()),
-        ("memory_id", note_id.to_string()),
-    ]))
-    .into()
+struct VisibilityReceiptState {
+    epoch: Option<String>,
+    receipt_present: bool,
+    fences: Option<Vec<(String, u64)>>,
 }
 
-/// Read the original per-model fences, including the explicit header for a
-/// zero-model write. The join is one SQL statement so a concurrent hard delete
-/// cannot pair a header from one snapshot with fences from another.
+/// Join identity, independent provenance and original receipt in one snapshot.
+/// Joins use note identity first so a conflicting namespace cannot disappear
+/// behind a filter and masquerade as a genuinely absent receipt or marker.
+async fn visibility_receipt_state(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    note_id: Uuid,
+) -> RuntimeResult<VisibilityReceiptState> {
+    let unavailable = || {
+        crate::visibility_receipts::receipt_failure(
+            "receipt_store_unavailable",
+            Some(note_id),
+            false,
+        )
+    };
+    runtime
+        .require_visibility_cutover()
+        .map_err(|_| unavailable())?;
+    let mut reader = runtime.sql().reader().await.map_err(|_| unavailable())?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT n.kind AS note_kind, n.namespace AS note_namespace, \
+              e.namespace AS epoch_namespace, e.epoch, \
+              r.note_id AS receipt_id, r.namespace AS receipt_namespace, r.model_count, \
+              f.namespace AS fence_namespace, f.model, f.ann_write_log_seq \
+              FROM notes n LEFT JOIN memory_visibility_epochs e ON e.note_id = n.id \
+              LEFT JOIN memory_visibility_receipts r ON r.note_id = n.id \
+              LEFT JOIN memory_visibility_fences f ON f.note_id = n.id \
+              WHERE n.id = ?1 ORDER BY r.namespace, f.namespace, f.model"
+                .into(),
+            params: vec![SqlValue::Text(note_id.to_string())],
+            label: Some("memory-visibility-receipt-read".into()),
+        })
+        .await
+        .map_err(|_| unavailable())?;
+    let mut state = VisibilityReceiptState {
+        epoch: None,
+        receipt_present: false,
+        fences: None,
+    };
+    let Some(first) = rows.first() else {
+        return Ok(state);
+    };
+    let namespace = token.namespace().as_str();
+    let text = |value: Option<&SqlValue>, expected: &str| matches!(value, Some(SqlValue::Text(actual)) if actual == expected);
+    let identity_matches = text(first.get("note_kind"), "memory")
+        && text(first.get("note_namespace"), namespace)
+        && text(first.get("epoch_namespace"), namespace);
+    if identity_matches {
+        if let Some(SqlValue::Text(epoch)) = first.get("epoch") {
+            state.epoch = Some(epoch.clone());
+        }
+    }
+    state.receipt_present = rows
+        .iter()
+        .any(|row| matches!(row.get("receipt_id"), Some(SqlValue::Text(_))));
+    let expected_count = match first.get("model_count") {
+        Some(SqlValue::Integer(count)) if *count >= 0 => usize::try_from(*count).ok(),
+        _ => None,
+    };
+    let mut valid = text(first.get("note_kind"), "memory")
+        && text(first.get("note_namespace"), namespace)
+        && state.receipt_present
+        && expected_count.is_some();
+    let mut fences = std::collections::BTreeMap::new();
+    for row in &rows {
+        if (matches!(row.get("receipt_id"), Some(SqlValue::Text(_)))
+            && !text(row.get("receipt_namespace"), namespace))
+            || matches!(row.get("fence_namespace"), Some(SqlValue::Text(ns))
+                if ns != namespace || !text(row.get("receipt_namespace"), ns))
+        {
+            state.epoch = None;
+        }
+        valid &= text(row.get("receipt_namespace"), namespace)
+            && matches!(row.get("model_count"), Some(SqlValue::Integer(count))
+                if usize::try_from(*count).ok() == expected_count);
+        match (
+            row.get("fence_namespace"),
+            row.get("model"),
+            row.get("ann_write_log_seq"),
+        ) {
+            (
+                Some(SqlValue::Text(ns)),
+                Some(SqlValue::Text(model)),
+                Some(SqlValue::Integer(seq)),
+            ) if ns == namespace && !model.is_empty() && *seq > 0 => {
+                valid &= fences.insert(model.clone(), *seq as u64).is_none();
+            }
+            (
+                Some(SqlValue::Null) | None,
+                Some(SqlValue::Null) | None,
+                Some(SqlValue::Null) | None,
+            ) => {}
+            _ => valid = false,
+        }
+    }
+    if valid && expected_count == Some(fences.len()) {
+        state.fences = Some(fences.into_iter().collect());
+    }
+    Ok(state)
+}
+
+/// Read original fences without issuing a token. Callers needing a replay token
+/// must additionally apply the independent provenance classification below.
 pub async fn memory_visibility_receipt(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     note_id: Uuid,
 ) -> RuntimeResult<Option<Vec<(String, u64)>>> {
-    let mut reader = runtime.sql().reader().await?;
-    let rows = reader
-        .query_all(SqlStatement {
-            sql: "SELECT r.model_count, f.model, f.ann_write_log_seq \
-                  FROM memory_visibility_receipts r \
-                  LEFT JOIN memory_visibility_fences f \
-                    ON f.namespace = r.namespace AND f.note_id = r.note_id \
-                  WHERE r.namespace = ?1 AND r.note_id = ?2 ORDER BY f.model"
-                .into(),
-            params: vec![
-                SqlValue::Text(token.namespace().as_str().to_owned()),
-                SqlValue::Text(note_id.to_string()),
-            ],
-            label: Some("memory-visibility-receipt-read".into()),
-        })
-        .await?;
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    let expected_model_count = match rows.first().and_then(|row| row.get("model_count")) {
-        Some(SqlValue::Integer(count)) if *count >= 0 => *count as usize,
-        _ => return Err(missing_visibility_receipt(note_id)),
-    };
-    let mut fences = Vec::new();
-    for row in rows {
-        match (row.get("model"), row.get("ann_write_log_seq")) {
-            (Some(SqlValue::Text(model)), Some(SqlValue::Integer(seq)))
-                if !model.is_empty() && *seq > 0 =>
-            {
-                fences.push((model.clone(), *seq as u64));
+    Ok(visibility_receipt_state(runtime, token, note_id)
+        .await?
+        .fences)
+}
+
+async fn classified_visibility_receipt(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    note_id: Uuid,
+    replay: bool,
+) -> RuntimeResult<Vec<(String, u64)>> {
+    let state = visibility_receipt_state(runtime, token, note_id).await?;
+    let reason = match state.epoch.as_deref() {
+        Some("modern") => {
+            if let Some(fences) = state.fences {
+                return Ok(fences);
             }
-            (Some(SqlValue::Null) | None, Some(SqlValue::Null) | None) => {}
-            _ => return Err(missing_visibility_receipt(note_id)),
+            "receipt_temporarily_unavailable"
         }
-    }
-    if fences.len() != expected_model_count {
-        return Err(missing_visibility_receipt(note_id));
-    }
-    Ok(Some(fences))
+        Some("legacy") if !state.receipt_present => "legacy_receipt_absent",
+        _ => "receipt_epoch_unknown",
+    };
+    Err(crate::visibility_receipts::receipt_failure(
+        reason,
+        Some(note_id),
+        replay,
+    ))
 }
 
 pub async fn create_keyed_memory(
@@ -213,9 +297,7 @@ pub async fn create_keyed_memory_with_receipt_and_report(
             Ok(AtomicRunOutcome::Committed { .. }) => {
                 note.key = Some(spec.key.to_owned());
                 note.version = 2;
-                let fences = memory_visibility_receipt(runtime, token, note.id)
-                    .await?
-                    .ok_or_else(|| missing_visibility_receipt(note.id))?;
+                let fences = classified_visibility_receipt(runtime, token, note.id, false).await?;
                 return Ok((note, edge_id, false, fences, prepared.embedding_truncation));
             }
             Ok(AtomicRunOutcome::RolledBack {
@@ -232,9 +314,8 @@ pub async fn create_keyed_memory_with_receipt_and_report(
                     .await;
                 if let Some(holder) = resolve_holder(runtime, token, spec.key).await? {
                     if holder.content == spec.content {
-                        let fences = memory_visibility_receipt(runtime, token, holder.id)
-                            .await?
-                            .ok_or_else(|| missing_visibility_receipt(holder.id))?;
+                        let fences =
+                            classified_visibility_receipt(runtime, token, holder.id, true).await?;
                         return Ok((holder, None, true, fences, prepared.embedding_truncation));
                     }
                     return Err(idempotency_conflict(spec.key, &holder));
