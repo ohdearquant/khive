@@ -5502,10 +5502,10 @@ fn resolve_config(
     packs_overridden: bool,
     force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
-    match KhiveConfig::load_with_home_fallback(config_path, db_path)
+    match KhiveConfig::load_with_home_fallback_and_source(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
-        Some(khive_cfg) => {
+        Some((khive_cfg, source)) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let env_primary = std::env::var("KHIVE_EMBEDDING_MODEL").ok();
             let env_additional = std::env::var("KHIVE_ADDITIONAL_EMBEDDING_MODELS").ok();
@@ -5519,6 +5519,7 @@ fn resolve_config(
 
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
             resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
+            gate_boot_disclosure::emit(khive_cfg.gate.as_ref(), Some(&source));
             Ok(resolved)
         }
         None => {
@@ -5529,6 +5530,7 @@ fn resolve_config(
                 runtime_config_from_khive_config(&env_cfg, base)
             };
             resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
+            gate_boot_disclosure::emit(None, None);
             Ok(resolved)
         }
     }
@@ -5613,13 +5615,14 @@ fn resolve_actor_from_config(
     packs_overridden: bool,
     force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
-    match KhiveConfig::load_with_home_fallback(config_path, db_path)
+    match KhiveConfig::load_with_home_fallback_and_source(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
-        Some(khive_cfg) => {
+        Some((khive_cfg, source)) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);
             resolve_runtime_wal_ceiling(&mut resolved, &khive_cfg.backends, force_memory)?;
+            gate_boot_disclosure::emit(khive_cfg.gate.as_ref(), Some(&source));
             Ok(RuntimeConfig {
                 embedding_model: None,
                 additional_embedding_models: vec![],
@@ -5629,6 +5632,7 @@ fn resolve_actor_from_config(
         None => {
             let mut resolved = base;
             resolve_runtime_wal_ceiling(&mut resolved, &[], force_memory)?;
+            gate_boot_disclosure::emit(None, None);
             Ok(resolved)
         }
     }
@@ -18542,3 +18546,10 @@ mod reader_pool_tests;
 #[cfg(test)]
 #[path = "serve_email_policy_tests.rs"]
 mod email_policy_tests;
+
+#[path = "serve/gate_boot_disclosure.rs"]
+mod gate_boot_disclosure;
+
+#[cfg(test)]
+#[path = "serve/gate_boot_disclosure_tests.rs"]
+mod gate_boot_disclosure_tests;
