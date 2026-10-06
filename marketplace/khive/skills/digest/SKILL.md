@@ -65,34 +65,37 @@ For each relationship you identified in the material:
 link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.0>)
 ```
 
-**19 relations** (closed — map to these, don't invent):
+**20 relations** (closed — map to these, don't invent):
 
-| Category       | Relation        | Direction              | When                      |
-| -------------- | --------------- | ---------------------- | ------------------------- |
-| Structure      | `contains`      | parent → child         | System has component      |
-| Structure      | `part_of`       | child → parent         | Inverse of contains       |
-| Structure      | `instance_of`   | specific → general     | X is a case of Y          |
-| Structure      | `links_to`      | document → document    | A document references another |
-| Structure      | `located_in`    | located → location     | Occupies without being a part (finding in an organ) |
-| Derivation     | `extends`       | child → parent         | Builds on, generalizes    |
-| Derivation     | `variant_of`    | variant → original     | Modified version          |
-| Derivation     | `introduced_by` | concept → paper/person/org | First described in    |
-| Derivation     | `supersedes`    | new → old              | Replaces entirely         |
-| Provenance     | `derived_from`  | derived → source       | Data/artifact lineage     |
-| Temporal       | `precedes`      | earlier → later        | Ordering over time        |
-| Dependency     | `depends_on`    | consumer → dep         | Hard requirement          |
-| Dependency     | `enables`       | prerequisite → outcome | Makes possible            |
-| Implementation | `implements`    | code → concept         | Code realizes algorithm   |
-| Lateral        | `competes_with` | A ↔ B                  | Alternative approaches    |
-| Lateral        | `composed_with` | A ↔ B                  | Used together             |
-| Annotation     | `annotates`     | note → any substrate   | Note observes/comments on |
-| Epistemic      | `supports`      | evidence → claim       | Evidence for a claim      |
-| Epistemic      | `refutes`       | evidence → claim       | Evidence against a claim  |
+| Category       | Relation        | Direction                  | When                                                |
+| -------------- | --------------- | -------------------------- | --------------------------------------------------- |
+| Structure      | `contains`      | parent → child             | System has component                                |
+| Structure      | `part_of`       | child → parent             | Inverse of contains                                 |
+| Structure      | `instance_of`   | specific → general         | X is a case of Y                                    |
+| Structure      | `links_to`      | document → document        | A document references another                       |
+| Structure      | `located_in`    | located → location         | Occupies without being a part (finding in an organ) |
+| Derivation     | `extends`       | child → parent             | Builds on, generalizes                              |
+| Derivation     | `variant_of`    | variant → original         | Modified version                                    |
+| Derivation     | `introduced_by` | concept → paper/person/org | First described in                                  |
+| Derivation     | `supersedes`    | new → old                  | Replaces entirely                                   |
+| Provenance     | `derived_from`  | derived → source           | Data/artifact lineage                               |
+| Temporal       | `precedes`      | earlier → later            | Ordering over time                                  |
+| Dependency     | `depends_on`    | consumer → dep             | Hard requirement                                    |
+| Dependency     | `enables`       | prerequisite → outcome     | Makes possible                                      |
+| Implementation | `implements`    | code → concept             | Code realizes algorithm                             |
+| Lateral        | `competes_with` | A ↔ B                      | Alternative approaches                              |
+| Lateral        | `composed_with` | A ↔ B                      | Used together                                       |
+| Annotation     | `annotates`     | note → any substrate       | Note observes/comments on                           |
+| Epistemic      | `supports`      | evidence → claim           | Evidence for a claim                                |
+| Epistemic      | `refutes`       | evidence → claim           | Evidence against a claim                            |
+| Ownership      | `owns`          | owner → owned              | Current whole or partial holding; person/org → org  |
 
 **Direction matters.** `introduced_by` goes FROM the concept TO the paper (the concept was
 introduced by the paper). If you get direction wrong, the traversal breaks.
 
-**Weight**: 1.0 = definitional, 0.7-0.9 = strong, 0.4-0.6 = plausible.
+**Weight**: 1.0 = definitional, 0.7-0.9 = strong, 0.4-0.6 = plausible. For `owns`,
+weight is confidence, not stake size; use conventional `pct`/`class`/`as_of` metadata,
+or `by_class` for stakes in multiple classes.
 
 ### 4. Create notes (observations, insights, decisions)
 
@@ -135,5 +138,5 @@ as `question` notes for follow-up.
 If a tool returns an error, read the message — it lists valid values. Common cases:
 
 - Invalid `entity_kind` or `note_kind` → the error says which values are valid
-- Invalid `relation` → use only the 17 above
+- Invalid `relation` → use only the 20 above
 - ID not found → check the UUID; use `search` to find the correct one
