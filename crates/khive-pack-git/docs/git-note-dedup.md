@@ -51,6 +51,8 @@ survivor already holds, byte for byte, is not appended again.
 `--refuse-anchor` (repeatable, full UUID) leaves every note whose `project_id`
 is that anchor untouched: such a note is neither merged away nor chosen as a
 survivor. Other notes in the same group still merge.
+The canonical project, which is the survivor's re-home destination, cannot be
+refused; that option combination is rejected before planning.
 
 ## Guarded merges
 

@@ -316,6 +316,9 @@ pub async fn plan_dedup(
     options: DedupOptions,
 ) -> Result<DedupPlan> {
     let canonical = options.project_id;
+    if options.refused_anchors.contains(&canonical) {
+        bail!("cannot refuse canonical project anchor {canonical}");
+    }
     let namespace = token.namespace().as_str().to_owned();
     let mut reader = runtime.sql().reader().await?;
     let rows = reader
