@@ -2792,7 +2792,7 @@ async fn load_atom_by_id_or_slug(
     } else {
         let by_slug = reader
             .query_row(SqlStatement {
-                sql: "SELECT * FROM knowledge_atoms WHERE slug = ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                sql: khive_runtime::sql!("knowledge_compose_atom_slug").into(),
                 params: vec![SqlValue::Text(id.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             })
@@ -2808,11 +2808,8 @@ async fn load_atom_by_id_or_slug(
                 let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
                 let rows = reader
                     .query_all(SqlStatement {
-                        sql: "SELECT * FROM knowledge_atoms WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 2".into(),
-                        params: vec![
-                            SqlValue::Text(pattern),
-                            SqlValue::Text(ns.to_owned()),
-                        ],
+                        sql: khive_runtime::sql!("knowledge_compose_atom_prefix").into(),
+                        params: vec![SqlValue::Text(pattern), SqlValue::Text(ns.to_owned())],
                         label: None,
                     })
                     .await
