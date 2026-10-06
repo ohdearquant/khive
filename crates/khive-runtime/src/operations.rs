@@ -6688,10 +6688,10 @@ impl KhiveRuntime {
                         RuntimeError::Internal("injected FTS failure".to_string()),
                     ));
                 }
-                self.reindex_note(token, &restored)
-                    .await
-                    .map_err(|e| restore_reindex_failed("note", id, e))?;
-                Ok(Some((restored, true)))
+                let reindexed = self.reindex_note_with_report(token, &restored).await;
+                let report = reindexed.map_err(|e| restore_reindex_failed("note", id, e))?;
+                let degradations = report.post_commit_degradations();
+                legacy_post_commit_result("restore_note", id, Some((restored, true)), degradations)
             }
             Ok(AtomicRunOutcome::RolledBack {
                 failure: AtomicOpFailure::GuardFailed { .. },
