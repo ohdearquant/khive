@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use khive_db::{StorageBackend, WalCeilingPolicy};
-use khive_storage::event::IdempotentEventBatchResult;
+use khive_storage::event::{EventPageQuery, EventPageWindow, IdempotentEventBatchResult};
 use khive_storage::{
     BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageError,
     StorageResult,
@@ -541,6 +541,11 @@ pub enum EventsRequest {
         filter: EventFilter,
         page: PageRequest,
     },
+    QueryEventPage {
+        protocol_version: u32,
+        namespace: String,
+        query: EventPageQuery,
+    },
     CountEvents {
         protocol_version: u32,
         namespace: String,
@@ -563,6 +568,9 @@ impl EventsRequest {
             | Self::QueryEvents {
                 protocol_version, ..
             }
+            | Self::QueryEventPage {
+                protocol_version, ..
+            }
             | Self::CountEvents {
                 protocol_version, ..
             } => *protocol_version,
@@ -575,6 +583,7 @@ impl EventsRequest {
             | Self::AppendEventsIdempotent { namespace, .. }
             | Self::GetEvent { namespace, .. }
             | Self::QueryEvents { namespace, .. }
+            | Self::QueryEventPage { namespace, .. }
             | Self::CountEvents { namespace, .. } => namespace,
         }
     }
@@ -595,6 +604,9 @@ pub enum EventsResponse {
     },
     Pageful {
         page: Page<Event>,
+    },
+    EventPageWindow {
+        window: EventPageWindow,
     },
     Count {
         count: u64,
@@ -1566,6 +1578,15 @@ async fn dispatch_events_request(
                 Err(error) => storage_error_response(&error),
             }
         }
+        EventsRequest::QueryEventPage { query, .. } => {
+            if let Err(error) = crate::event_page::validate_page_query(&query) {
+                return storage_error_response(&error);
+            }
+            match store.query_event_page(query).await {
+                Ok(window) => EventsResponse::EventPageWindow { window },
+                Err(error) => storage_error_response(&error),
+            }
+        }
         EventsRequest::CountEvents { filter, .. } => match store.count_events(filter).await {
             Ok(count) => EventsResponse::Count { count },
             Err(error) => storage_error_response(&error),
@@ -2294,6 +2315,25 @@ impl EventStore for ForwardingEventStore {
         }
     }
 
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        crate::event_page::validate_page_query(&query)?;
+        let request = EventsRequest::QueryEventPage {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: self.namespace.clone(),
+            query: query.clone(),
+        };
+        match self.client.round_trip(&request).await? {
+            EventsResponse::EventPageWindow { window } => {
+                crate::event_page::validate_window(&query, Some(&self.namespace), &window)?;
+                Ok(window)
+            }
+            error @ EventsResponse::Error { .. } => Err(self.unexpected("query_event_page", error)),
+            _ => Err(crate::event_page::page_error(
+                "events page response kind mismatch",
+            )),
+        }
+    }
+
     fn preflight_event(&self, event: &Event) -> StorageResult<()> {
         // Same validation code path as the daemon-side store, zero I/O.
         self.client.preflight_store.preflight_event(event)
@@ -2443,6 +2483,10 @@ impl EventStore for SplitEventStore {
         let legacy = self.legacy.count_events(filter.clone()).await?;
         let lane = self.lane.count_events(filter).await?;
         Ok(legacy + lane)
+    }
+
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        crate::event_page::split_page(self.legacy.as_ref(), self.lane.as_ref(), query).await
     }
 
     fn preflight_event(&self, event: &Event) -> StorageResult<()> {
