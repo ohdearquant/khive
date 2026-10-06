@@ -254,7 +254,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
         kind_policy: KindPolicy::UpdateAgainstSnapshot,
-        reservation: Reservation::NamedCheck { function: "prepare_update_note_from_snapshot", file: "khive-runtime/src/curation.rs" },
+        reservation: Reservation::NamedCheck { function: "prepare_update_note_from_snapshot", file: "khive-runtime/src/curation/note_curation.rs" },
         transaction: TransactionOwner::RunAtomicUnit,
         stamp: StampCapability::ReservationOnly,
         family: Some("note.update"),
