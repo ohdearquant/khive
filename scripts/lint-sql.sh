@@ -41,7 +41,20 @@ if [ -z "$SQL_FILES" ]; then
     exit 0
 fi
 
-python3 - "$SQL_FILES" "$ROOT" <<'PY'
+# The DQS guard below needs sqlite3.Connection.setconfig (Python 3.12+). Run the
+# first interpreter that has it: KHIVE_SQL_LINT_PYTHON, then versioned names, then
+# python3. When none has it, python3 runs and the lint fails closed with its message.
+PYTHON=python3
+for candidate in "${KHIVE_SQL_LINT_PYTHON:-}" python3.14 python3.13 python3.12 python3; do
+    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1 \
+        && "$candidate" -c 'import sqlite3, sys; sys.exit(0 if hasattr(sqlite3.Connection, "setconfig") else 1)' \
+            >/dev/null 2>&1; then
+        PYTHON=$candidate
+        break
+    fi
+done
+
+"$PYTHON" - "$SQL_FILES" "$ROOT" <<'PY'
 import os
 import re
 import sqlite3
@@ -50,6 +63,28 @@ import sys
 files = sys.argv[1].split("\n") if len(sys.argv) > 1 else []
 files = [f for f in files if f.strip()]
 failed = 0
+
+def lint_connection():
+    """Create a lint database that never treats unknown quoted names as strings."""
+    missing = []
+    if not callable(getattr(sqlite3.Connection, "setconfig", None)):
+        missing.append("Connection.setconfig")
+    for name in ("SQLITE_DBCONFIG_DQS_DML", "SQLITE_DBCONFIG_DQS_DDL"):
+        if not hasattr(sqlite3, name):
+            missing.append(name)
+    if missing:
+        raise SystemExit(
+            "SQL lint: Python 3.12+ with SQLite DQS configuration support is required; "
+            "missing " + ", ".join(missing)
+        )
+    con = sqlite3.connect(":memory:")
+    try:
+        con.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+        con.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+    except (AttributeError, sqlite3.Error, ValueError) as error:
+        con.close()
+        raise SystemExit(f"SQL lint: cannot disable SQLite DQS: {error}") from error
+    return con
 
 def rust_tokens(source):
     """Read registration syntax without mistaking comments or strings for Rust."""
@@ -227,7 +262,7 @@ query_files = [f for f in files if f not in ddl and f not in registered]
 
 # Replay the migration chain cumulatively in one database so a forward migration
 # (e.g. ALTER TABLE / CREATE INDEX on a baseline table) sees prior schema.
-con = sqlite3.connect(":memory:")
+con = lint_connection()
 try:
     for path in chain:
         with open(path) as fh:
@@ -247,7 +282,7 @@ fragment_groups = {}
 for path in ddl_files:
     fragment_groups.setdefault(os.path.dirname(path), []).append(path)
 for directory in sorted(fragment_groups):
-    con = sqlite3.connect(":memory:")
+    con = lint_connection()
     try:
         fixtures = []
         if directory.replace(os.sep, "/").endswith(
@@ -270,7 +305,7 @@ for directory in sorted(fragment_groups):
 # wrong: unbound parameters act as NULL and can mutate rows or fail constraints.
 # PREPARE instead against a database holding every table this tree declares.
 if query_files:
-    con = sqlite3.connect(":memory:")
+    con = lint_connection()
     try:
         for path in chain:
             with open(path) as fh:

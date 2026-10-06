@@ -14826,20 +14826,64 @@ async fn list_edge_limit_over_cap_truncates_with_metadata_in_both_modes() {
         "must have seeded exactly 1001 edges for this test's premise"
     );
 
-    // Offset mode.
-    let resp = pack
-        .dispatch("list", json!({"kind": "edge", "limit": 1500}))
-        .await
-        .expect("#894: list edges must succeed even when the cap binds");
-    let items = resp["items"].as_array().expect("items must be an array");
-    assert_eq!(
-        items.len(),
-        1000,
-        "must truncate to EDGE_LIST_MAX_LIMIT (1000) exactly"
-    );
-    assert_eq!(resp["requested_limit"], 1500);
-    assert_eq!(resp["effective_limit"], 1000);
-    assert_eq!(resp["limit_clamped"], true);
+    let edge_ids = |response: &Value| {
+        let items = list_items(response);
+        let ids: std::collections::HashSet<uuid::Uuid> = items
+            .iter()
+            .map(|item| {
+                item["id"]
+                    .as_str()
+                    .expect("edge must expose its id")
+                    .parse()
+                    .expect("edge id must be a complete UUID")
+            })
+            .collect();
+        assert_eq!(ids.len(), items.len(), "page must not duplicate edge ids");
+        ids
+    };
+    for requested in [1000u32, 1500] {
+        let first = pack
+            .dispatch(
+                "list",
+                json!({"kind": "edge", "limit": requested, "offset": 0}),
+            )
+            .await
+            .expect("offset edge list at the cap must succeed");
+        assert_eq!(list_items(&first).len(), 1000);
+        assert_eq!(
+            first["has_more"], true,
+            "requested={requested}: capped first page must disclose more edges"
+        );
+        assert_eq!(first["requested_limit"], requested);
+        assert_eq!(first["effective_limit"], 1000);
+        assert_eq!(first["limit_clamped"], requested > 1000);
+
+        let tail = pack
+            .dispatch(
+                "list",
+                json!({"kind": "edge", "limit": requested, "offset": 1000}),
+            )
+            .await
+            .expect("terminal offset edge page must succeed");
+        assert_eq!(list_items(&tail).len(), 1);
+        assert_eq!(
+            tail["has_more"], false,
+            "requested={requested}: terminal page must be complete"
+        );
+        assert_eq!(tail["requested_limit"], requested);
+        assert_eq!(tail["effective_limit"], 1000);
+        assert_eq!(tail["limit_clamped"], requested > 1000);
+
+        let mut stitched = edge_ids(&first);
+        let tail_ids = edge_ids(&tail);
+        assert!(stitched.is_disjoint(&tail_ids), "pages must not overlap");
+        stitched.extend(tail_ids);
+        assert_eq!(
+            stitched.len(),
+            created,
+            "pages must cover all 1001 seeded edges"
+        );
+    }
 
     // Cursor mode retains its cursor metadata and adds the limit metadata.
     let cursor_resp = pack
