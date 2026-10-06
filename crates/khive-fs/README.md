@@ -35,6 +35,18 @@ last. A component that is a symlink is followed only when the caller's `LinkPoli
 - `budget` bounds the links the walk follows; a link met after it is spent ends the walk with a
   `BudgetExhausted` error.
 
+`AncestorLinkPolicy::new(AncestorWalkEndpoint)` is the standard policy for mirror, segment and
+WAL-pin directory walks, as proposed in [ADR-198](../../docs/adr/ADR-198-shared-fs-ancestor-link-policy.md).
+It trusts root/effective-user links and parents, permits group/other write only with sticky
+protection, refuses a macOS parent ACL that grants any right or cannot be inspected, and rechecks
+the link's device/inode/mode/uid after reading its target. Consumers pass the common
+`ANCESTOR_LINK_BUDGET` of eight.
+
+`FinalTarget` refuses a last-component link; `TargetParent` lets the last component be an ancestor
+when the caller separately opens its final target without following links. The policy's errors
+carry a named `AncestorLinkRefusal`, with available ownership/mode evidence and an underlying
+witness error where applicable. It does not replace the caller's final-object validation.
+
 ## `opened_file`
 
 Helpers that judge the file that was actually opened instead of the pathname that was checked

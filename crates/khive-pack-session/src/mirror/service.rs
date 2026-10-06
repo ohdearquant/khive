@@ -396,11 +396,8 @@ mod config_tests {
 
     #[cfg(unix)]
     #[test]
-    fn initial_probe_refuses_a_linked_configured_root_ancestor() {
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("QUALIFIED SKIP: a non-root-owned ancestor fixture requires a non-root test process");
-            return;
-        }
+    fn initial_probe_refuses_a_linked_root_ancestor_in_a_writable_parent() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::TempDir::new().expect("fixture directory");
         let fixture = std::fs::canonicalize(temp.path()).expect("fixture anchor");
         let inside = fixture.join("inside");
@@ -412,6 +409,7 @@ mod config_tests {
             super::probe_source_file(&root, &export).expect("ordinary initial probe");
         let linked_ancestor = fixture.join("linked");
         std::os::unix::fs::symlink(&inside, &linked_ancestor).expect("fixture ancestor link");
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o777)).unwrap();
         let linked_root = linked_ancestor.join("exports");
         let linked_export = linked_root.join("conversations.json");
 
@@ -419,8 +417,9 @@ mod config_tests {
         discovery.add_directory_tree(&linked_root, DirectoryKind::ChatGptExport, true);
         assert!(discovery.files.contains_key(&linked_export));
         assert!(
-            super::probe_source_file(&linked_root, &linked_export).is_err(),
-            "a linked ancestor must refuse before the initial root identity is admitted"
+            super::probe_source_file(&linked_root, &linked_export)
+                .is_err_and(|e| e.to_string().contains("refused: parent_permissions")),
+            "a link in an unsafe parent must refuse before the root identity is admitted"
         );
         let (_, reopened_identity, _) =
             super::probe_source_file(&root, &export).expect("ordinary root remains usable");
@@ -431,10 +430,7 @@ mod config_tests {
     #[cfg(unix)]
     #[test]
     fn initial_probe_refuses_a_root_ancestor_substituted_after_discovery() {
-        if unsafe { libc::geteuid() } == 0 {
-            eprintln!("QUALIFIED SKIP: a non-root-owned ancestor fixture requires a non-root test process");
-            return;
-        }
+        use std::os::unix::fs::PermissionsExt;
         use std::sync::{Arc, Barrier};
 
         let temp = tempfile::TempDir::new().expect("fixture directory");
@@ -457,8 +453,9 @@ mod config_tests {
         )
         .expect("protected identity before");
 
-        // Discovery is the pathname preflight. The first native probe has no
-        // directory witness yet, so the root chain must establish its safety.
+        // Discovery is the pathname preflight. The first native probe has no directory witness
+        // yet, so the root chain refuses the link substituted into this world-writable parent.
+        std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o777)).unwrap();
         let mut discovery = DiscoveryIndex::default();
         discovery.add_directory_tree(&root, DirectoryKind::ChatGptExport, true);
         let scheduled = discovery.schedule_files();
@@ -481,7 +478,8 @@ mod config_tests {
                 .expect("fixture substitution thread")
                 .expect("fixture substitution");
             assert!(
-                super::probe_source_file(&root, &scheduled[0].path).is_err(),
+                super::probe_source_file(&root, &scheduled[0].path)
+                    .is_err_and(|e| e.to_string().contains("refused: parent_permissions")),
                 "initial admission must refuse a root ancestor substituted after discovery"
             );
         });

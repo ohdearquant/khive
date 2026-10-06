@@ -24,7 +24,10 @@
 //! filesystem facilities use the documented best-effort path fallback.
 
 #[cfg(unix)]
-use khive_fs::directory_walk::{walk_to_directory, BudgetExhausted, LinkContext, LinkPolicy};
+use khive_fs::directory_walk::{
+    walk_to_directory, AncestorLinkPolicy, AncestorLinkRefusal, AncestorWalkEndpoint,
+    BudgetExhausted, LinkContext, LinkPolicy, ANCESTOR_LINK_BUDGET,
+};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -239,67 +242,25 @@ pub(crate) fn verify_original_dir_identity(
     Ok(())
 }
 
-/// Most ancestor symlinks one segment-directory walk may follow.
-#[cfg(unix)]
-const MAX_ANCESTOR_SYMLINKS: u32 = 40;
-
-/// The link policy of the segment-directory walk: an ancestor symlink is followed only when
-/// `trusted_ancestor_symlink` accepts it. The shared walk reports every failure as an
-/// `io::Error`, so the policy keeps the typed error of a refusal for `walk_error` to return.
+/// The shared policy makes every ancestor-link trust decision.
 /// `reading_link` is set from the moment a link is accepted until the walk has read its target,
 /// which is how a failed `readlinkat` is told from a failure to open a directory.
 #[cfg(unix)]
 struct SidecarLinkPolicy {
-    effective_uid: u32,
+    ancestors: AncestorLinkPolicy,
     reading_link: bool,
-    failure: Option<ExternalIdsWriteError>,
-}
-
-#[cfg(unix)]
-impl SidecarLinkPolicy {
-    /// Keep the typed error and hand the walk an error of its own to stop with.
-    fn refuse(&mut self, error: ExternalIdsWriteError) -> std::io::Error {
-        self.failure = Some(error);
-        std::io::Error::other("segment dir walk refused")
-    }
 }
 
 #[cfg(unix)]
 impl LinkPolicy for SidecarLinkPolicy {
     fn before_follow(&mut self, ctx: &LinkContext<'_>) -> std::io::Result<()> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        if ctx.is_last {
-            let error = ExternalIdsWriteError::InvalidPath {
-                context: "open segment dir",
-                detail: "final component is a symlink".into(),
-            };
-            return Err(self.refuse(error));
-        }
-        let parent_meta = match ctx.parent.metadata() {
-            Ok(meta) => meta,
-            Err(e) => {
-                let error = ExternalIdsWriteError::io("stat symlink parent", e);
-                return Err(self.refuse(error));
-            }
-        };
-        let symlink_uid = ctx.link_stat.st_uid;
-        let parent_uid = parent_meta.uid();
-        let parent_mode = parent_meta.mode();
-        if !trusted_ancestor_symlink(symlink_uid, parent_uid, parent_mode, self.effective_uid) {
-            let error = ExternalIdsWriteError::UntrustedAncestorSymlink {
-                component: ctx.name.to_os_string(),
-                symlink_uid,
-                parent_uid,
-                parent_mode,
-            };
-            return Err(self.refuse(error));
-        }
+        self.ancestors.before_follow(ctx)?;
         self.reading_link = true;
         Ok(())
     }
 
-    fn after_read(&mut self, _ctx: &LinkContext<'_>) -> std::io::Result<()> {
+    fn after_read(&mut self, ctx: &LinkContext<'_>) -> std::io::Result<()> {
+        self.ancestors.after_read(ctx)?;
         self.reading_link = false;
         Ok(())
     }
@@ -307,14 +268,17 @@ impl LinkPolicy for SidecarLinkPolicy {
 
 /// The typed error for the error that ended a walk.
 ///
-/// A failure the policy recorded wins. A spent link budget is the next case. An error that
-/// carries no OS error number is the walk refusing a path component before the kernel saw it.
+/// A shared policy refusal keeps its typed cause. A spent link budget is the next case. An error
+/// that carries no OS error number is the walk refusing a path component before the kernel saw it.
 /// Any other error is a system error, from reading a link target while `reading_link` is set and
 /// from opening a directory otherwise.
 #[cfg(unix)]
 fn walk_error(policy: SidecarLinkPolicy, error: std::io::Error) -> ExternalIdsWriteError {
-    if let Some(failure) = policy.failure {
-        return failure;
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<AncestorLinkRefusal>())
+    {
+        return ExternalIdsWriteError::io("open segment dir", error);
     }
     let exhausted = error
         .get_ref()
@@ -351,12 +315,10 @@ pub(crate) fn open_dir_with_trusted_symlinks(
     }
 
     let mut policy = SidecarLinkPolicy {
-        // SAFETY: `geteuid` takes no arguments and cannot fail.
-        effective_uid: unsafe { libc::geteuid() } as u32,
+        ancestors: AncestorLinkPolicy::new(AncestorWalkEndpoint::FinalTarget),
         reading_link: false,
-        failure: None,
     };
-    let walked = walk_to_directory(dir, &mut policy, MAX_ANCESTOR_SYMLINKS);
+    let walked = walk_to_directory(dir, &mut policy, ANCESTOR_LINK_BUDGET);
     let mut pinned = walked.map_err(|error| walk_error(policy, error))?;
     let Some(final_dir) = pinned.pop() else {
         return Err(ExternalIdsWriteError::InvalidPath {
@@ -365,17 +327,6 @@ pub(crate) fn open_dir_with_trusted_symlinks(
         });
     };
     Ok(final_dir)
-}
-
-#[cfg(unix)]
-fn trusted_ancestor_symlink(
-    symlink_uid: u32,
-    parent_uid: u32,
-    parent_mode: u32,
-    effective_uid: u32,
-) -> bool {
-    let owner_is_trusted = |uid| uid == 0 || uid == effective_uid;
-    owner_is_trusted(symlink_uid) && owner_is_trusted(parent_uid) && parent_mode & 0o022 == 0
 }
 
 #[cfg(any(windows, test))]
@@ -586,6 +537,18 @@ mod tests {
         tempfile::tempdir_in(root).expect("tempdir")
     }
 
+    #[cfg(unix)]
+    fn ancestor_link_refusal(error: &ExternalIdsWriteError) -> &AncestorLinkRefusal {
+        let ExternalIdsWriteError::Io { context, source } = error else {
+            panic!("expected shared ancestor-link I/O refusal, got {error}");
+        };
+        assert_eq!(context, "open segment dir");
+        source
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<AncestorLinkRefusal>())
+            .expect("shared typed refusal must be retained")
+    }
+
     #[test]
     fn windows_attribute_tag_acceptance_requires_expected_kind_without_reparse_data() {
         const DIRECTORY: u32 = 0x10;
@@ -755,9 +718,9 @@ mod tests {
 
         let err = write_external_ids_sidecar(&parent_link.join("segment"), &[3u8; 32], &[])
             .expect_err("a symlink in a world-writable parent must be refused");
-        assert!(
-            err.to_string().contains("untrusted ancestor symlink"),
-            "got: {err}"
+        assert_eq!(
+            ancestor_link_refusal(&err).condition,
+            khive_fs::directory_walk::AncestorLinkCondition::ParentPermissions
         );
         assert!(
             !real_segment.join("external_ids.bin.tmp").exists()
@@ -768,40 +731,29 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn ancestor_symlink_trust_requires_safe_owners_and_parent_mode() {
-        let effective_uid = unsafe { libc::geteuid() } as u32;
-        let foreign_uid = if effective_uid == 1 { 2 } else { 1 };
+    fn write_external_ids_sidecar_accepts_symlink_in_sticky_writable_parent() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-        assert!(trusted_ancestor_symlink(
-            effective_uid,
-            effective_uid,
-            0o40700,
-            effective_uid
-        ));
-        assert!(trusted_ancestor_symlink(
-            0,
-            effective_uid,
-            0o40755,
-            effective_uid
-        ));
-        assert!(!trusted_ancestor_symlink(
-            foreign_uid,
-            effective_uid,
-            0o40700,
-            effective_uid
-        ));
-        assert!(!trusted_ancestor_symlink(
-            effective_uid,
-            foreign_uid,
-            0o40700,
-            effective_uid
-        ));
-        assert!(!trusted_ancestor_symlink(
-            effective_uid,
-            effective_uid,
-            0o40722,
-            effective_uid
-        ));
+        let real_parent = tempdir();
+        let real_segment = real_parent.path().join("segment");
+        std::fs::create_dir(&real_segment).expect("create real segment dir");
+        let link_parent = tempdir();
+        std::fs::set_permissions(link_parent.path(), std::fs::Permissions::from_mode(0o1777))
+            .expect("make symlink parent sticky and writable");
+        let parent_link = link_parent.path().join("parent");
+        std::os::unix::fs::symlink(real_parent.path(), &parent_link).expect("symlink ancestor");
+        // SAFETY: `geteuid` takes no arguments and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(std::fs::symlink_metadata(&parent_link).unwrap().uid(), uid);
+        let digest = [4u8; 32];
+        let ids = vec![Uuid::new_v4()];
+
+        write_external_ids_sidecar(&parent_link.join("segment"), &digest, &ids)
+            .expect("a trusted link in a sticky writable parent must pass");
+        let (actual_digest, actual_ids) =
+            read_external_ids_sidecar(&real_segment).expect("read actual sidecar");
+        assert_eq!(actual_digest, digest);
+        assert_eq!(actual_ids, ids);
     }
 
     /// A segment dir reached through `links` ancestor symlinks, each pointing at the one before.
@@ -850,14 +802,14 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn open_dir_with_trusted_symlinks_follows_at_most_forty_ancestor_symlinks() {
-        let (_within_root, within) = segment_behind_symlink_chain(40);
+    fn open_dir_with_trusted_symlinks_follows_at_most_eight_ancestor_symlinks() {
+        let (_within_root, within) = segment_behind_symlink_chain(8);
         open_dir_with_trusted_symlinks(&within)
-            .expect("forty chained ancestor symlinks are within the limit");
+            .expect("eight chained ancestor symlinks are within the limit");
 
-        let (_beyond_root, beyond) = segment_behind_symlink_chain(41);
+        let (_beyond_root, beyond) = segment_behind_symlink_chain(9);
         let err = open_dir_with_trusted_symlinks(&beyond)
-            .expect_err("the forty-first ancestor symlink must be refused");
+            .expect_err("the ninth ancestor symlink must be refused");
         assert_eq!(
             err.to_string(),
             "open segment dir: too many ancestor symlinks"
@@ -895,10 +847,14 @@ mod tests {
         let err = write_external_ids_sidecar(&dir_link, &[6u8; 32], &[])
             .expect_err("a symlinked final component must be refused");
 
+        let refusal = ancestor_link_refusal(&err);
         assert_eq!(
-            err.to_string(),
-            "open segment dir: final component is a symlink"
+            refusal.condition,
+            khive_fs::directory_walk::AncestorLinkCondition::FinalComponent
         );
+        assert_eq!(refusal.component, std::ffi::OsString::from("segment"));
+        assert!(!real_dir.path().join("external_ids.bin.tmp").exists());
+        assert!(!real_dir.path().join("external_ids.bin").exists());
     }
 
     #[test]
@@ -920,20 +876,17 @@ mod tests {
             .expect_err("a symlink in a world-writable parent must be refused");
 
         let uid = unsafe { libc::geteuid() } as u32;
-        match err {
-            ExternalIdsWriteError::UntrustedAncestorSymlink {
-                component,
-                symlink_uid,
-                parent_uid,
-                parent_mode,
-            } => {
-                assert_eq!(component, std::ffi::OsString::from("parent"));
-                assert_eq!(symlink_uid, uid);
-                assert_eq!(parent_uid, uid);
-                assert_eq!(parent_mode, 0o40777);
-            }
-            other => panic!("expected an untrusted ancestor symlink, got: {other}"),
-        }
+        let refusal = ancestor_link_refusal(&err);
+        assert_eq!(
+            refusal.condition,
+            khive_fs::directory_walk::AncestorLinkCondition::ParentPermissions
+        );
+        assert_eq!(refusal.component, std::ffi::OsString::from("parent"));
+        assert_eq!(refusal.link_uid, uid);
+        assert_eq!(refusal.parent_uid, Some(uid));
+        assert_eq!(refusal.parent_mode, Some(0o40777));
+        assert!(!real_segment.join("external_ids.bin.tmp").exists());
+        assert!(!real_segment.join("external_ids.bin").exists());
     }
 
     #[test]

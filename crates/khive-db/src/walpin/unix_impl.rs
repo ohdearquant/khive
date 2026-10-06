@@ -1,5 +1,8 @@
 use super::io_other;
-use khive_fs::directory_walk::{walk_to_directory, BudgetExhausted, LinkContext, LinkPolicy};
+use khive_fs::directory_walk::{
+    walk_to_directory, AncestorLinkPolicy, AncestorWalkEndpoint, BudgetExhausted,
+    ANCESTOR_LINK_BUDGET,
+};
 use khive_fs::fd_relative::{clear_errno, current_errno, errno_location};
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -14,13 +17,6 @@ use std::time::{Duration, SystemTime};
 /// this module wrote, and reading it unboundedly would let a same-uid
 /// process balloon checkpoint-time enumeration.
 pub(super) const MAX_SIDECAR_ENTRY_BYTES: u64 = 64 * 1024;
-
-/// Bound on the number of ancestor symlink hops
-/// [`SidecarDirHandle::open_dir_component_walk`] will resolve (each
-/// independently root-owned-checked) before refusing outright — caps a
-/// pathological or looping symlink chain to bounded work instead of
-/// unbounded recursion.
-const MAX_ANCESTOR_SYMLINK_DEPTH: u32 = 8;
 
 /// Every raw directory entry — hidden or not — counts toward a scan
 /// bound of `RAW_SCAN_FACTOR * max` in `list_names`, so a flood of
@@ -117,23 +113,6 @@ fn is_symlink_mode(mode: libc::mode_t) -> bool {
     (mode & libc::S_IFMT) == libc::S_IFLNK
 }
 
-/// The ancestor-link decision for the sidecar's parent walk: a symlink
-/// is followed only when root owns it — the only party that plants
-/// firmlinks in stock platform layout, never an arbitrary user.
-struct RootOwnedAncestors;
-
-impl LinkPolicy for RootOwnedAncestors {
-    fn before_follow(&mut self, ctx: &LinkContext<'_>) -> io::Result<()> {
-        if ctx.link_stat.st_uid != 0 {
-            return Err(io_other(format!(
-                "walpin sidecar ancestor {:?} is a non-root-owned symlink; refusing",
-                ctx.name
-            )));
-        }
-        Ok(())
-    }
-}
-
 /// The walk reports a spent link budget as its own error type; the
 /// sidecar keeps the wording it has always reported for that case.
 fn sidecar_walk_error(error: io::Error) -> io::Error {
@@ -210,8 +189,8 @@ impl SidecarDirHandle {
     /// [`name_cstring_os`]), so the caller can `openat()` `dir` itself
     /// relative to an already-live descriptor instead of re-resolving
     /// `dir`'s full path. The parent is reached via
-    /// [`open_dir_component_walk`], which refuses a symlink at EVERY
-    /// path component, not just `dir`'s own final one — a bare
+    /// [`open_dir_component_walk`], which checks each ancestor link
+    /// under the shared policy — a bare
     /// `open(parent, O_NOFOLLOW)` only refuses a symlink at `parent`'s
     /// own final component; every component before that is followed by
     /// ordinary kernel path resolution, so an attacker who can replace
@@ -258,16 +237,15 @@ impl SidecarDirHandle {
     /// `ELOOP`/`ENOTDIR` gets exactly one second look, inside
     /// `walk_to_directory`: it `fstatat`s the component (without
     /// following) to confirm it really is a symlink, and
-    /// `RootOwnedAncestors` then requires it to be owned by root (uid 0,
-    /// mirroring the trust extended to firmlinks the OS itself planted
-    /// in stock platform layout — never an arbitrary user) before the
-    /// walk `readlinkat`s it and continues into its target through this
-    /// same component-at-a-time discipline. A non-root-owned symlink
-    /// ancestor is refused outright; total symlink hops across the
-    /// whole walk are capped by `MAX_ANCESTOR_SYMLINK_DEPTH`.
+    /// `AncestorLinkPolicy` applies the shared owner, parent, ACL and
+    /// identity checks before and after reading the link. This walks
+    /// only the sidecar's parent: even its last component is an
+    /// ancestor, while `open_validated_at` separately refuses a link
+    /// at the actual sidecar name. Total link hops use the common
+    /// `ANCESTOR_LINK_BUDGET`.
     fn open_dir_component_walk(path: &Path) -> io::Result<fs::File> {
-        let mut policy = RootOwnedAncestors;
-        let walked = walk_to_directory(path, &mut policy, MAX_ANCESTOR_SYMLINK_DEPTH);
+        let mut policy = AncestorLinkPolicy::new(AncestorWalkEndpoint::TargetParent);
+        let walked = walk_to_directory(path, &mut policy, ANCESTOR_LINK_BUDGET);
         let mut pinned = walked.map_err(sidecar_walk_error)?;
         pinned
             .pop()

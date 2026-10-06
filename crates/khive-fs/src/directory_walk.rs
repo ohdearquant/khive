@@ -11,6 +11,12 @@
 //! The walk owns the descriptor handling, the link buffer and the budget. The policy owns the
 //! decision about which links to trust.
 
+mod ancestor_policy;
+pub use ancestor_policy::{
+    AncestorLinkCondition, AncestorLinkPolicy, AncestorLinkRefusal, AncestorWalkEndpoint,
+    ANCESTOR_LINK_BUDGET,
+};
+
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
