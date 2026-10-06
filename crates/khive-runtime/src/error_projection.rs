@@ -56,6 +56,11 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
             (khive_types::ErrorKind::NotFound, Some("stream_write_not_found")) => {
                 Some("not_committed")
             }
+            // An exact keyed replay whose holder was hard-deleted before its
+            // provenance read: the attempt's unit rolled back on the key claim.
+            (khive_types::ErrorKind::NotFound, Some("keyed_replay_holder_missing")) => {
+                Some("not_committed")
+            }
             (khive_types::ErrorKind::InvalidInput, Some("member_unavailable")) => {
                 Some("not_committed")
             }

@@ -642,6 +642,12 @@ unknown epoch: return a retryable unavailable error without a token and without
 changing the persisted classification. A legacy marker paired with a receipt
 is contradictory evidence and takes `receipt_epoch_unknown`.
 
+A holder hard-deleted between the key claim and the provenance read is not an
+unknown epoch either: the memory is gone. Exact replay returns `not_found` with
+reason `keyed_replay_holder_missing` and `domain_disposition: "not_committed"`,
+because the attempt's unit rolled back on the key claim. It carries no
+`memory_id`, since the memory it would name no longer exists.
+
 **What the caller holds after a refusal.** Every refusal in the table is
 raised on the exact-replay path: the key claim found a live holder whose
 content is identical, and the attempt's atomic unit rolled back without
