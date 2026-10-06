@@ -1389,9 +1389,7 @@ impl KnowledgeHandlers {
 
         let latest_retrieval_eval = reader
             .query_row(SqlStatement {
-                sql: "SELECT run_at, precision_at_5, mrr FROM knowledge_eval_runs \
-                      WHERE namespace = ?1 ORDER BY run_at DESC, rowid DESC LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_eval_latest").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.latest_eval_run".into()),
             })
@@ -1482,10 +1480,7 @@ async fn fetch_sections(
 
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT * FROM knowledge_sections \
-                  WHERE atom_id = ?1 AND namespace = ?2 \
-                  ORDER BY sort_order ASC, created_at ASC, id ASC"
-                .into(),
+            sql: khive_runtime::sql!("knowledge_sections_for_atom").into(),
             params: vec![
                 SqlValue::Text(atom_id.to_owned()),
                 SqlValue::Text(ns.to_owned()),
