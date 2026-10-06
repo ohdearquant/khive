@@ -637,8 +637,7 @@ async fn l2_final_edge_audit_reobserves_a_row_changed_during_guarded_declaration
             .upsert_edge(changed)
             .await
             .unwrap();
-        pause.release.wait().await;
-        let (report, work) = future.await;
+        let (report, work) = resume_paused(&mut future, &pause).await;
         assert_eq!(
             stamp(&edge(&rt, &token, id).await),
             time(20).to_rfc3339(),
@@ -700,8 +699,7 @@ async fn l2_declaration_freshness_is_rechecked_after_a_guarded_rebase() {
             .upsert_entity(changed)
             .await
             .unwrap();
-        pause.release.wait().await;
-        let result = refresh.await;
+        let result = resume_paused(&mut refresh, &pause).await;
         assert!(
             !result.expect("guarded freshness check"),
             "rebased stale observation cannot authorize reuse"

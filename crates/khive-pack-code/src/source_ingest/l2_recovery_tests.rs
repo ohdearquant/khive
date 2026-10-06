@@ -211,6 +211,51 @@ async fn await_pause<F: std::future::Future>(future: &mut std::pin::Pin<Box<F>>,
     }
 }
 
+async fn resume_paused<F: std::future::Future>(
+    future: &mut std::pin::Pin<Box<F>>,
+    pause: &Pause,
+) -> F::Output {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (_, result) = tokio::join!(pause.release.wait(), future.as_mut());
+        result
+    })
+    .await
+    .expect("paused operation did not resume and complete")
+}
+
+#[tokio::test]
+async fn paused_operation_resumes_in_both_entry_arrival_orders() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    for operation_first in [true, false] {
+        let pause = Pause::new(Point::BeforeCompletion);
+        let value = std::sync::atomic::AtomicUsize::new(1);
+        let completed = AtomicBool::new(false);
+        let mut operation = Box::pin(async {
+            pause.wait().await;
+            completed.store(true, Ordering::Release);
+            value.load(Ordering::Acquire)
+        });
+        let mut entered = Box::pin(pause.entered.wait());
+        let mut cx = Context::from_waker(Waker::noop());
+
+        if !operation_first {
+            assert!(entered.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(operation.as_mut().poll(&mut cx).is_pending());
+        let Poll::Ready(entry) = entered.as_mut().poll(&mut cx) else {
+            panic!("both entry-barrier participants have arrived");
+        };
+        assert_eq!(entry.is_leader(), operation_first);
+        assert!(!completed.load(Ordering::Acquire));
+
+        value.store(2, Ordering::Release);
+        assert_eq!(resume_paused(&mut operation, &pause).await, 2);
+        assert!(completed.load(Ordering::Acquire));
+    }
+}
+
 #[tokio::test]
 async fn l2_recovery_whole_manifest_reuses_and_accounts_completion() {
     for wal in [true, false] {
@@ -579,11 +624,11 @@ async fn l2_recovery_competing_attempt_cannot_be_copied_into_completion() {
             .upsert_entity(competing)
             .await
             .expect("competing attempt commits");
-        pause.release.wait().await;
-        future
+        resume_paused(&mut future, &pause)
             .await
             .0
             .expect("superseded invocation returns normally");
+        drop(future);
         let current = project(&rt, &token, "fixture").await;
         assert_eq!(entry(&current)["attempted"]["run_id"], competitor);
         assert_eq!(
@@ -868,8 +913,7 @@ async fn l2_recovery_restored_read_skip_reobserves_actual_references() {
         await_pause(&mut future, &pause).await;
         fs::remove_file(&path).expect("replace source");
         std::os::unix::fs::symlink(&outside, &path).expect("outside symlink");
-        pause.release.wait().await;
-        let (result, _) = future.await;
+        let (result, _) = resume_paused(&mut future, &pause).await;
         let report = result.expect("read skip does not abort sweep");
         assert!(
             report.source_files_refused == 1

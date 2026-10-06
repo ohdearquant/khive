@@ -5,6 +5,7 @@ use syn::visit::Visit;
 
 const CONVERTED: &[&str] = &[
     "khive-pack-brain",
+    "khive-pack-comm",
     "khive-pack-git",
     "khive-pack-gtd",
     "khive-pack-kg",
