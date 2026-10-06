@@ -9,15 +9,18 @@ use serde_json::{json, Value};
 
 use khive_runtime::time_anchor::anchor_date_to_earliest_instant;
 use khive_runtime::{
-    micros_to_iso, split_stamped_label, DispatchHook, EventAttribution, EventView, KhiveRuntime,
-    Namespace, NamespaceToken, RuntimeError, VerbRegistry,
+    micros_to_iso, DispatchHook, EventAttribution, EventView, KhiveRuntime, Namespace,
+    NamespaceToken, RuntimeError, VerbRegistry,
 };
 use khive_storage::event::{Event, EventFilter};
 use khive_storage::types::PageRequest;
 use khive_types::{HandlerDef, IdResolutionMode};
 
+mod event_page;
+
 use crate::event::interpret;
 pub(crate) use crate::event_counts_grouping::EventCountsAccumulator;
+use crate::event_read_scope::event_actor_read_scope;
 use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 use khive_brain_core::derive_deterministic_weights;
 #[cfg(feature = "lattice-router")]
@@ -72,6 +75,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
             resolution_mode: IdResolutionMode::NotApplicable,
         }],
     },
+    event_page::HANDLER,
     // MAINTENANCE, deliberately kept out of the description: the event plane is
     // ADR-103 Stage 1 (#724 Ask A) and the cost_unit stamp is ADR-103 Amendment 1,
     // landed in PR #927.
@@ -993,41 +997,12 @@ impl BrainPack {
         let p: EventCountsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        let all_actors = p.all_actors.unwrap_or(false);
-        if all_actors && p.actor.is_some() {
-            return Err(RuntimeError::InvalidInput(
-                "all_actors=true cannot be combined with actor".into(),
-            ));
-        }
-        if all_actors
-            && !self
-                .runtime
-                .config()
-                .brain
-                .fleet_readers
-                .contains(&token.actor().id)
-        {
-            return Err(RuntimeError::InvalidInput(format!(
-                "actor {:?} is not a configured fleet reader",
-                token.actor().id
-            )));
-        }
-        let caller = token.actor().label();
-        if let Some(actor) = p.actor.as_deref() {
-            let (identity, is_self) = match split_stamped_label(actor) {
-                Some((kind, id)) => (
-                    if kind == "actor" { id } else { actor },
-                    token.actor().kind == kind && token.actor().id == id,
-                ),
-                None => (actor, actor == caller),
-            };
-            if !is_self && !token.visible_namespace_strs().contains(&identity) {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "actor {identity:?} is not visible to this caller"
-                )));
-            }
-        }
-        let default_scope = !all_actors && p.actor.is_none();
+        let actor_scope = event_actor_read_scope(
+            &self.runtime,
+            token,
+            p.actor.as_deref(),
+            p.all_actors.unwrap_or(false),
+        )?;
 
         let since_raw = p.since.as_deref().ok_or_else(|| {
             RuntimeError::InvalidInput(
@@ -1051,21 +1026,6 @@ impl BrainPack {
             None => None,
         };
 
-        // A prefixed id has no bare alias: that spelling belongs to another
-        // principal's canonical events. Only default scope coalesces actor keys.
-        let actor_filters: Vec<String> = match p.actor.as_deref() {
-            Some(a) if split_stamped_label(a).is_some() => vec![a.to_string()],
-            Some(a) => vec![a.to_string(), format!("actor:{a}")],
-            None if all_actors => Vec::new(),
-            None if token.actor().kind == "actor" && split_stamped_label(&caller).is_some() => {
-                vec![format!("actor:{caller}")]
-            }
-            None if token.actor().kind == "actor" => {
-                vec![caller.clone(), format!("actor:{caller}")]
-            }
-            None => vec![caller.clone()],
-        };
-
         // The event plane is read through a store scoped to exactly one
         // namespace (`Runtime::events` opens `token.namespace()` and the SQL
         // pins `namespace = ?`), so a visibility set does not widen this
@@ -1084,7 +1044,7 @@ impl BrainPack {
 
         let store = self.runtime.events(token)?;
         let base_filter = EventFilter {
-            actors: actor_filters,
+            actors: actor_scope.actors,
             kinds: kind_filter.into_iter().collect(),
             // Half-open window [since, until): `EventFilter.after` is a strict
             // `created_at > after`, so subtracting one microsecond from `since`
@@ -1097,7 +1057,7 @@ impl BrainPack {
 
         let exhaustive = p.exhaustive.unwrap_or(false);
         let mut counts =
-            EventCountsAccumulator::new(default_scope.then_some(caller.as_str()), p.group_by);
+            EventCountsAccumulator::new(actor_scope.default_caller.as_deref(), p.group_by);
         let (total, window_event_total, truncated) = if exhaustive {
             fold_event_counts_window_exhaustive(
                 store.as_ref(),
@@ -3625,6 +3585,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.state" => self.handle_state(params).await,
             "brain.config" => self.handle_config(params).await,
             "brain.events" => self.handle_events(token, params).await,
+            "brain.event_page" => self.handle_event_page(token, params).await,
             "brain.event_counts" => self.handle_event_counts(token, params).await,
             "brain.profiles" => self.handle_profiles(params).await,
             "brain.profile" => self.handle_profile(params).await,

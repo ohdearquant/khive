@@ -9,6 +9,7 @@ pub mod tunable;
 
 mod event;
 mod event_counts_grouping;
+mod event_read_scope;
 mod pack;
 mod section_feedback;
 mod sql;
