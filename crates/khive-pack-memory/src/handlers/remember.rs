@@ -9,6 +9,7 @@ use khive_runtime::keyed_memory::{
 use khive_runtime::{micros_to_iso, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{Direction, NeighborQuery};
 use khive_storage::EdgeRelation;
+use khive_types::{Details, KhiveError};
 
 use crate::ann;
 use crate::MemoryPack;
@@ -17,6 +18,35 @@ use super::common::{
     deser, to_json, validate_memory_type, RememberParams, DEFAULT_DECAY_EPISODIC,
     DEFAULT_DECAY_SEMANTIC, DEFAULT_SALIENCE_EPISODIC, DEFAULT_SALIENCE_SEMANTIC,
 };
+
+fn receipt_issuance_error(error: RuntimeError, memory_id: Uuid, replayed: bool) -> RuntimeError {
+    let reason = match error.refusal_source() {
+        RuntimeError::Khive(error) => {
+            match error.details().and_then(|details| details.get("reason")) {
+                Some("visibility_key_unavailable") => "visibility_key_unavailable",
+                Some("visibility_nonce_unavailable") => "visibility_nonce_unavailable",
+                Some("receipt_store_unavailable") => "receipt_store_unavailable",
+                _ => "visibility_receipt_unavailable",
+            }
+        }
+        _ => "visibility_receipt_unavailable",
+    };
+    KhiveError::unavailable("freshness_unmet: visibility receipt could not be issued")
+        .with_details(Details::new_owned([
+            ("reason", reason.to_owned()),
+            ("memory_id", memory_id.to_string()),
+            (
+                "receipt_phase",
+                if replayed {
+                    "exact_replay"
+                } else {
+                    "post_commit"
+                }
+                .to_owned(),
+            ),
+        ]))
+        .into()
+}
 
 impl MemoryPack {
     pub(crate) async fn handle_remember(
@@ -116,6 +146,9 @@ impl MemoryPack {
         if let Some(model_name) = p.embedding_model.as_deref() {
             self.runtime.resolve_embedding_model(Some(model_name))?;
         }
+
+        self.runtime.notes(write_token)?;
+        self.runtime.ensure_visibility_receipt_key()?;
 
         let annotates_target = annotates.first().copied();
 
@@ -218,6 +251,10 @@ impl MemoryPack {
             memory_type.to_owned()
         };
 
+        let visibility_token = self
+            .runtime
+            .seal_visibility_receipt(&note.namespace, &vector_fences)
+            .map_err(|error| receipt_issuance_error(error, note.id, replayed))?;
         let mut response = json!({
             "id": note.id.to_string(),
             "kind": note.kind,
@@ -225,17 +262,7 @@ impl MemoryPack {
             "decay_factor": note.decay_factor,
             "memory_type": response_memory_type,
             "created_at": micros_to_iso(note.created_at),
-            "visibility_token": {
-                "version": 1,
-                "namespace": note.namespace,
-                "fences": vector_fences
-                    .iter()
-                    .map(|(model, seq)| json!({
-                        "model": model,
-                        "ann_write_log_seq": seq,
-                    }))
-                    .collect::<Vec<_>>(),
-            },
+            "visibility_token": visibility_token,
         });
         if let Some(eid) = edge_id {
             response["edge_id"] = json!(eid);
@@ -257,7 +284,10 @@ mod tests {
     use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
     use khive_storage::{SqlStatement, SqlValue};
 
-    use crate::{test_support::HashVecProvider, MemoryPack};
+    use crate::{
+        test_support::{with_receipt_credentials, HashVecProvider},
+        MemoryPack,
+    };
 
     /// `memory.remember` must persist exactly ONE `NoteCreated` event carrying
     /// the calling actor, the new note's id as `target_id`, and
@@ -268,7 +298,7 @@ mod tests {
     /// load-bearing rather than incidental.
     #[tokio::test]
     async fn remember_persists_note_created_event_with_target() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns).expect("authorize local");
 
@@ -326,17 +356,21 @@ mod tests {
         // in the event payload: the runtime emitter knows the note, not the verb
         // that asked for it. The response is the caller-facing surface for it.
         assert_eq!(result["memory_type"], serde_json::json!("semantic"));
-        assert_eq!(
-            result["visibility_token"],
-            serde_json::json!({"version": 1, "namespace": "local", "fences": []}),
-            "a text-only memory has an explicit empty vector fence set"
-        );
+        let receipt = rt
+            .open_visibility_receipt(
+                result["visibility_token"].as_str().expect("opaque receipt"),
+                &["local"],
+                &[],
+            )
+            .expect("a text-only memory has an authenticated empty vector fence set");
+        assert_eq!(receipt.namespace(), "local");
+        assert_eq!(receipt.sequence_for_model("unwritten-model"), None);
     }
 
     #[tokio::test]
     async fn remember_returns_the_vector_writes_transactional_ann_sequence() {
         const MODEL: &str = "remember-visibility-test-model";
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
         rt.register_embedder(HashVecProvider {
             model_name: MODEL.to_owned(),
             dims: 8,
@@ -356,15 +390,31 @@ mod tests {
             )
             .await
             .expect("remember vector");
-        let token = &result["visibility_token"];
-        assert_eq!(token["version"], serde_json::json!(1));
-        assert_eq!(token["namespace"], serde_json::json!("local"));
-        assert_eq!(token["fences"][0]["model"], serde_json::json!(MODEL));
-        let seq = token["fences"][0]["ann_write_log_seq"]
-            .as_u64()
+        let token = result["visibility_token"].as_str().expect("opaque receipt");
+        let receipt = rt
+            .open_visibility_receipt(token, &["local"], &[MODEL.to_owned()])
+            .expect("authenticated one-model receipt");
+        assert_eq!(receipt.namespace(), "local");
+        let seq = receipt
+            .sequence_for_model(MODEL)
             .expect("positive log sequence");
         assert!(seq > 0);
-        assert_eq!(token["fences"].as_array().map(Vec::len), Some(1));
+        for hidden_field in [
+            "ann_write_log_seq",
+            "issued_at",
+            "fences",
+            "namespace",
+            "model",
+        ] {
+            assert!(
+                result.get(hidden_field).is_none(),
+                "receipt surface exposed {hidden_field}"
+            );
+        }
+        assert!(
+            !token.contains(MODEL),
+            "opaque receipt exposed the model sentinel"
+        );
 
         // AUTOINCREMENT retains the committed high sequence even if an ANN
         // checkpoint compacts the individual log row before this assertion.
@@ -382,7 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn remember_replay_returns_original_without_creating_a_duplicate() {
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns).expect("authorize local");
         let mut builder = VerbRegistryBuilder::new();
@@ -406,7 +456,22 @@ mod tests {
 
         assert_eq!(second["id"], first["id"]);
         assert_eq!(second["replayed"], serde_json::json!(true));
-        assert_eq!(second["visibility_token"], first["visibility_token"]);
+        assert_ne!(
+            second["visibility_token"], first["visibility_token"],
+            "replay must reseal with a fresh nonce"
+        );
+        for response in [&first, &second] {
+            let receipt = rt
+                .open_visibility_receipt(
+                    response["visibility_token"]
+                        .as_str()
+                        .expect("opaque receipt"),
+                    &["local"],
+                    &[],
+                )
+                .expect("authenticated zero-model replay receipt");
+            assert_eq!(receipt.namespace(), "local");
+        }
         let notes = rt
             .notes(&token)
             .expect("note store")
@@ -442,7 +507,7 @@ mod tests {
     async fn remember_replay_answers_from_the_stored_memory() {
         // #2700: a replay must carry the stored note's annotation edge and the
         // memory_type it was written with, never the replay request's values.
-        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns).expect("authorize local");
         let mut builder = VerbRegistryBuilder::new();
@@ -522,5 +587,278 @@ mod tests {
             .and_then(|v| v.as_str())
             .map(str::to_owned);
         assert_eq!(stored_type.as_deref(), Some("semantic"));
+    }
+    struct CountingService(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for CountingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(texts.iter().map(|_| vec![1.0, 0.0, 0.0, 0.0]).collect())
+        }
+        fn supports_model(&self, _: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "receipt-preflight-counter"
+        }
+    }
+
+    struct CountingProvider {
+        builds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        embeds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for CountingProvider {
+        fn name(&self) -> &str {
+            "receipt-preflight-counter"
+        }
+        fn dimensions(&self) -> usize {
+            4
+        }
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, khive_runtime::RuntimeError>
+        {
+            self.builds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::sync::Arc::new(CountingService(self.embeds.clone())))
+        }
+    }
+
+    async fn domain_counts(runtime: &KhiveRuntime) -> Vec<i64> {
+        let mut reader = runtime.sql().reader().await.expect("domain count reader");
+        let mut counts = Vec::new();
+        for table in [
+            "notes",
+            "graph_edges",
+            "vector_provenance",
+            "ann_write_log",
+            "memory_visibility_receipts",
+            "memory_visibility_fences",
+            "memory_visibility_epochs",
+        ] {
+            let count = reader
+                .query_scalar(SqlStatement {
+                    sql: format!("SELECT COUNT(*) FROM {table}").into(),
+                    params: vec![],
+                    label: Some("receipt-preflight-domain-count".into()),
+                })
+                .await
+                .expect("domain count");
+            let Some(SqlValue::Integer(count)) = count else {
+                panic!("integer domain count");
+            };
+            counts.push(count);
+        }
+        counts
+    }
+
+    #[tokio::test]
+    async fn missing_receipt_key_refuses_before_cold_or_cached_embedding_and_domain_writes() {
+        use khive_runtime::RuntimeError;
+        use khive_types::ErrorKind;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let rt = KhiveRuntime::memory().expect("runtime without receipt custody");
+        let builds = Arc::new(AtomicUsize::new(0));
+        let embeds = Arc::new(AtomicUsize::new(0));
+        rt.register_embedder(CountingProvider {
+            builds: builds.clone(),
+            embeds: embeds.clone(),
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+        let before = domain_counts(&rt).await;
+        for cached in [false, true] {
+            if cached {
+                rt.embedder("receipt-preflight-counter")
+                    .await
+                    .expect("prime the real cached service");
+            }
+            let before_builds = builds.load(Ordering::SeqCst);
+            let error = registry.dispatch("memory.remember", serde_json::json!({
+                "content": "preflight must not embed or write this memory", "memory_type": "semantic",
+                "key": "receipt-preflight", "embedding_model": "receipt-preflight-counter",
+            })).await.expect_err("missing key must refuse before effects");
+            assert!(matches!(error.refusal_source(), RuntimeError::Khive(error)
+                if error.kind() == ErrorKind::Unavailable
+                    && error.details().and_then(|details| details.get("reason")) == Some("visibility_key_unavailable")));
+            assert_eq!(builds.load(Ordering::SeqCst), before_builds);
+            assert_eq!(embeds.load(Ordering::SeqCst), 0);
+            assert_eq!(domain_counts(&rt).await, before);
+        }
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the cached branch is non-vacuous"
+        );
+        for invalid in [
+            serde_json::json!({"content": "valid", "key": "invalid\0key"}),
+            serde_json::json!({"content": " ", "memory_type": "semantic"}),
+            serde_json::json!({"content": "valid", "namespace": "bad\0namespace"}),
+        ] {
+            let error = registry
+                .dispatch("memory.remember", invalid)
+                .await
+                .expect_err("arguments precede custody checks");
+            assert!(matches!(
+                error.refusal_source(),
+                RuntimeError::InvalidInput(_)
+            ));
+        }
+        let error = registry.dispatch("memory.remember", serde_json::json!({
+            "content": "valid", "memory_type": "semantic", "embedding_model": "unregistered-receipt-model",
+        })).await.expect_err("model validation precedes custody");
+        assert!(matches!(
+            error.refusal_source(),
+            RuntimeError::UnknownModel(_)
+        ));
+        assert_eq!(domain_counts(&rt).await, before);
+    }
+
+    struct FailingReceiptProvider {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_on_call: usize,
+    }
+
+    impl khive_runtime::credentials::CredentialProvider for FailingReceiptProvider {
+        fn resolve(
+            &self,
+            _: &str,
+        ) -> Result<
+            khive_runtime::credentials::CredentialMaterial,
+            khive_runtime::credentials::CredentialError,
+        > {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call >= self.fail_on_call {
+                return Err(khive_runtime::credentials::CredentialError::Unavailable {
+                    name: "provider-secret-sentinel".into(),
+                });
+            }
+            Ok(khive_runtime::credentials::CredentialMaterial::new(
+                vec![b'A'; 43],
+            ))
+        }
+        fn cache_lifetime(&self) -> khive_runtime::credentials::CredentialCacheLifetime {
+            khive_runtime::credentials::CredentialCacheLifetime::NoCache
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_seal_key_failure_retains_holder_and_unknown_disposition_on_create_and_replay() {
+        use khive_runtime::credentials::{
+            CredentialConfig, CredentialKind, CredentialRegistry, VisibilityReceiptConfig,
+            VisibilityReceiptKeyConfig,
+        };
+        use khive_runtime::{DomainDisposition, RuntimeError};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        for replayed in [false, true] {
+            let rt = KhiveRuntime::memory().expect("in-memory runtime");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut credentials = CredentialRegistry::new(vec![CredentialConfig {
+                name: "receipt-outage".into(),
+                kind: CredentialKind::SigningKey,
+                provider: "receipt-outage-provider".into(),
+                env_var: None,
+                header: None,
+            }])
+            .expect("credential declaration");
+            credentials
+                .register_provider(
+                    "receipt-outage-provider".into(),
+                    Arc::new(FailingReceiptProvider {
+                        calls: calls.clone(),
+                        fail_on_call: if replayed { 4 } else { 2 },
+                    }),
+                )
+                .expect("outage provider");
+            let rt = rt
+                .with_visibility_receipt_credentials(
+                    VisibilityReceiptConfig {
+                        keys: vec![VisibilityReceiptKeyConfig {
+                            id: "receipt-outage-key".into(),
+                            credential: "receipt-outage".into(),
+                            encrypt: true,
+                        }],
+                    },
+                    Arc::new(credentials),
+                )
+                .expect("receipt custody");
+            let token = rt.authorize(Namespace::local()).expect("local token");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(MemoryPack::new(rt.clone()));
+            let registry = builder.build().expect("registry");
+            let args = serde_json::json!({"content": "committed receipt outage memory", "memory_type": "semantic", "key": "receipt-outage"});
+            let first = if replayed {
+                Some(
+                    registry
+                        .dispatch("memory.remember", args.clone())
+                        .await
+                        .expect("initial issuance"),
+                )
+            } else {
+                None
+            };
+            let error = registry
+                .dispatch("memory.remember", args)
+                .await
+                .expect_err("key becomes unavailable during actual issuance");
+            assert_eq!(calls.load(Ordering::SeqCst), if replayed { 4 } else { 2 });
+            let notes = rt
+                .notes(&token)
+                .expect("note store")
+                .get_live_notes_by_key("local", "receipt-outage", Some("memory"))
+                .await
+                .expect("reconcile holder");
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].content, "committed receipt outage memory");
+            if let Some(first) = first {
+                assert_eq!(first["id"], notes[0].id.to_string());
+            }
+            let RuntimeError::Khive(domain) = error.refusal_source() else {
+                panic!("typed issuance failure: {error:?}");
+            };
+            assert_eq!(
+                domain.details().and_then(|details| details.get("reason")),
+                Some("visibility_key_unavailable")
+            );
+            assert_eq!(
+                domain
+                    .details()
+                    .and_then(|details| details.get("memory_id")),
+                Some(notes[0].id.to_string().as_str())
+            );
+            assert_eq!(
+                domain
+                    .details()
+                    .and_then(|details| details.get("receipt_phase")),
+                Some(if replayed {
+                    "exact_replay"
+                } else {
+                    "post_commit"
+                })
+            );
+            let projected = khive_runtime::runtime_error_value(error, DomainDisposition::Unknown);
+            assert_eq!(projected["domain_disposition"], "unknown");
+            assert_eq!(projected["retryable"], true);
+            assert!(!projected.to_string().contains("provider-secret-sentinel"));
+            assert!(!projected.to_string().contains("ann_write_log_seq"));
+        }
     }
 }

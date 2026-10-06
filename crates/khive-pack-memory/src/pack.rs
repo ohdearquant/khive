@@ -285,9 +285,9 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
             },
             ParamDef {
                 name: "visibility_token",
-                param_type: "object",
+                param_type: "string",
                 required: false,
-                description: "Versioned namespace-bound visibility receipt returned by memory.remember; required when consistency is session.",
+                description: "Opaque sealed visibility receipt returned by memory.remember; required when consistency is session. Clear version-1 receipts are refused.",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {

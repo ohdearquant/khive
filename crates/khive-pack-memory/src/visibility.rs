@@ -1,20 +1,34 @@
 //! Validation for the memory session-visibility fence at the recall boundary.
 
 use std::collections::HashSet;
+use std::fmt;
 
-use khive_runtime::RuntimeError;
+use khive_runtime::{KhiveRuntime, RuntimeError};
+use khive_types::{Details, KhiveError};
 use serde_json::Value;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct ModelFence {
     pub(crate) model: String,
     pub(crate) ann_write_log_seq: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl fmt::Debug for ModelFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ModelFence([REDACTED])")
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct VisibilityFence {
     pub(crate) namespace: String,
     pub(crate) fences: Vec<ModelFence>,
+}
+
+impl fmt::Debug for VisibilityFence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VisibilityFence([REDACTED])")
+    }
 }
 
 impl VisibilityFence {
@@ -35,9 +49,10 @@ fn invalid(message: &str) -> RuntimeError {
     RuntimeError::InvalidInput(format!("memory.recall {message}"))
 }
 
-/// Parse the strict v1 receipt only when the caller asks for session consistency.
-/// Eventual reads have no fence obligation, even if a caller also sends a token.
+/// Eventual reads ignore an optional token. Session fences are copied only
+/// after runtime custody authenticates scope, requested models and token age.
 pub(crate) fn parse_recall_visibility(
+    runtime: &KhiveRuntime,
     consistency: Option<&Value>,
     visibility_token: Option<&Value>,
     visible_namespaces: &[&str],
@@ -50,58 +65,36 @@ pub(crate) fn parse_recall_visibility(
         _ => return Err(invalid("consistency must be 'eventual' or 'session'")),
     }
 
-    let token = visibility_token
+    if visibility_token
         .and_then(Value::as_object)
-        .ok_or_else(|| invalid("consistency=session requires a visibility_token object"))?;
-    if token.len() != 3 || token.get("version").and_then(Value::as_u64) != Some(1) {
-        return Err(invalid(
-            "visibility_token has an invalid version, namespace, or shape",
-        ));
+        .and_then(|object| object.get("version"))
+        .and_then(Value::as_u64)
+        == Some(1)
+    {
+        return Err(KhiveError::invalid_input(
+            "memory.recall clear visibility receipts are not accepted",
+        )
+        .with_details(Details::new([("reason", "visibility_token_legacy")]))
+        .into());
     }
-    let namespace = token
-        .get("namespace")
+    let token = visibility_token
         .and_then(Value::as_str)
-        .filter(|namespace| visible_namespaces.contains(namespace))
-        .ok_or_else(|| invalid("visibility_token namespace is not caller-visible"))?;
-    let entries = token
-        .get("fences")
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid("visibility_token.fences must be an array"))?;
-    let requested: HashSet<&str> = requested_models.iter().map(String::as_str).collect();
-    let mut seen = HashSet::with_capacity(entries.len());
-    let mut fences = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let object = entry
-            .as_object()
-            .ok_or_else(|| invalid("visibility_token fence must be an object"))?;
-        if object.len() != 2 {
-            return Err(invalid("visibility_token fence has an invalid shape"));
+        .ok_or_else(|| invalid("consistency=session requires an opaque visibility_token string"))?;
+    let receipt = runtime.open_visibility_receipt(token, visible_namespaces, requested_models)?;
+    let mut seen = HashSet::new();
+    let mut fences = Vec::new();
+    for model in requested_models {
+        if seen.insert(model.as_str()) {
+            if let Some(ann_write_log_seq) = receipt.sequence_for_model(model) {
+                fences.push(ModelFence {
+                    model: model.clone(),
+                    ann_write_log_seq,
+                });
+            }
         }
-        let model = object
-            .get("model")
-            .and_then(Value::as_str)
-            .filter(|model| !model.is_empty())
-            .ok_or_else(|| invalid("visibility_token fence model must be nonempty text"))?;
-        if !requested.contains(model) {
-            return Err(invalid(
-                "visibility_token fence model is outside the requested models",
-            ));
-        }
-        if !seen.insert(model) {
-            return Err(invalid("visibility_token contains a duplicate model fence"));
-        }
-        let ann_write_log_seq = object
-            .get("ann_write_log_seq")
-            .and_then(Value::as_u64)
-            .filter(|seq| *seq > 0)
-            .ok_or_else(|| invalid("visibility_token fence sequence must be a positive integer"))?;
-        fences.push(ModelFence {
-            model: model.to_owned(),
-            ann_write_log_seq,
-        });
     }
     Ok(Some(VisibilityFence {
-        namespace: namespace.to_owned(),
+        namespace: receipt.namespace().to_owned(),
         fences,
     }))
 }
@@ -123,42 +116,64 @@ pub(crate) fn parse_timeout_ms(raw: Option<&Value>) -> Result<u64, RuntimeError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use khive_types::ErrorKind;
     use serde_json::json;
+
+    fn runtime() -> KhiveRuntime {
+        crate::test_support::with_receipt_credentials(
+            KhiveRuntime::memory().expect("in-memory runtime"),
+        )
+    }
 
     fn models() -> Vec<String> {
         vec!["model-a".into(), "model-b".into()]
     }
 
+    fn seal(runtime: &KhiveRuntime, namespace: &str, fences: &[(String, u64)]) -> Value {
+        json!(runtime
+            .seal_visibility_receipt(namespace, fences)
+            .expect("seal authenticated fixture"))
+    }
+
     fn parse(
+        runtime: &KhiveRuntime,
         consistency: Option<&Value>,
         token: Option<&Value>,
     ) -> Result<Option<VisibilityFence>, RuntimeError> {
-        parse_recall_visibility(consistency, token, &["local"], &models())
+        parse_recall_visibility(runtime, consistency, token, &["local"], &models())
     }
 
     fn assert_invalid(result: Result<Option<VisibilityFence>, RuntimeError>) {
         assert!(
-            matches!(&result, Err(RuntimeError::InvalidInput(_))),
+            matches!(&result, Err(RuntimeError::InvalidInput(_)))
+                || matches!(&result, Err(RuntimeError::Khive(error)) if error.kind() == ErrorKind::InvalidInput),
             "expected InvalidInput, got {result:?}"
         );
     }
 
     #[test]
     fn eventual_is_the_default_and_does_not_consume_an_optional_token() {
-        assert_eq!(parse(None, None).unwrap(), None);
+        let runtime = KhiveRuntime::memory().expect("runtime without receipt custody");
+        assert_eq!(parse(&runtime, None, None).unwrap(), None);
         assert_eq!(
-            parse(Some(&json!("eventual")), Some(&json!({"bad": true}))).unwrap(),
+            parse(
+                &runtime,
+                Some(&json!("eventual")),
+                Some(&json!({"bad": true}))
+            )
+            .unwrap(),
             None
         );
         for invalid_mode in [json!("linearizable"), json!(null), json!(1), json!({})] {
-            assert_invalid(parse(Some(&invalid_mode), None));
+            assert_invalid(parse(&runtime, Some(&invalid_mode), None));
         }
     }
 
     #[test]
     fn session_requires_a_strict_versioned_namespace_bound_receipt() {
+        let runtime = runtime();
         let mode = json!("session");
-        assert_invalid(parse(Some(&mode), None));
+        assert_invalid(parse(&runtime, Some(&mode), None));
         for invalid_token in [
             json!(null),
             json!([]),
@@ -169,15 +184,31 @@ mod tests {
             json!({"version": 1, "namespace": "local", "fences": [], "extra": true}),
             json!({"version": 1, "namespace": "local", "fences": {}}),
         ] {
-            assert_invalid(parse(Some(&mode), Some(&invalid_token)));
+            assert_invalid(parse(&runtime, Some(&mode), Some(&invalid_token)));
         }
+        let legacy = json!({"version": 1, "namespace": "local", "fences": []});
+        let error = parse(&runtime, Some(&mode), Some(&legacy)).unwrap_err();
+        assert!(matches!(error, RuntimeError::Khive(error)
+            if error.kind() == ErrorKind::InvalidInput
+                && error.details().and_then(|details| details.get("reason")) == Some("visibility_token_legacy")));
+        let mut token = seal(&runtime, "local", &[])
+            .as_str()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let last = token.last_mut().expect("nonempty token");
+        *last = if *last == b'A' { b'B' } else { b'A' };
+        let token = json!(String::from_utf8(token).unwrap());
+        assert_invalid(parse(&runtime, Some(&mode), Some(&token)));
     }
 
     #[test]
     fn session_accepts_a_visible_actor_namespace_but_not_a_foreign_namespace() {
+        let runtime = runtime();
         let mode = json!("session");
-        let receipt = json!({"version": 1, "namespace": "actor-a", "fences": []});
+        let receipt = seal(&runtime, "actor-a", &[]);
         let accepted = parse_recall_visibility(
+            &runtime,
             Some(&mode),
             Some(&receipt),
             &["local", "actor-a"],
@@ -187,6 +218,7 @@ mod tests {
         .unwrap();
         assert_eq!(accepted.namespace, "actor-a");
         assert_invalid(parse_recall_visibility(
+            &runtime,
             Some(&mode),
             Some(&receipt),
             &["local"],
@@ -196,27 +228,23 @@ mod tests {
 
     #[test]
     fn session_rejects_duplicate_foreign_and_out_of_set_fences() {
+        let runtime = runtime();
         let mode = json!("session");
-        let valid = json!({"model": "model-a", "ann_write_log_seq": 7});
-        for invalid_fence in [
-            json!({"model": "model-c", "ann_write_log_seq": 7}),
-            json!({"model": "", "ann_write_log_seq": 7}),
-            json!({"model": "model-a", "ann_write_log_seq": 0}),
-            json!({"model": "model-a", "ann_write_log_seq": -1}),
-            json!({"model": "model-a", "ann_write_log_seq": "7"}),
-            json!({"model": "model-a", "ann_write_log_seq": 7, "extra": true}),
-            json!(["model-a", 7]),
-        ] {
-            let token = json!({"version": 1, "namespace": "local", "fences": [invalid_fence]});
-            assert_invalid(parse(Some(&mode), Some(&token)));
-        }
-        let duplicate =
-            json!({"version": 1, "namespace": "local", "fences": [valid.clone(), valid]});
-        assert_invalid(parse(Some(&mode), Some(&duplicate)));
-        let token = json!({"version": 1, "namespace": "local", "fences": [{"model": "model-b", "ann_write_log_seq": 9}]});
+        assert!(runtime
+            .seal_visibility_receipt("local", &[("model-a".into(), 7), ("model-a".into(), 8)])
+            .is_err());
+        assert!(runtime
+            .seal_visibility_receipt("local", &[("model-a".into(), 0)])
+            .is_err());
+        let foreign = seal(&runtime, "other", &[("model-a".into(), 7)]);
+        assert_invalid(parse(&runtime, Some(&mode), Some(&foreign)));
+        let outside = seal(&runtime, "local", &[("model-c".into(), 7)]);
+        assert_invalid(parse(&runtime, Some(&mode), Some(&outside)));
+        let model_b = seal(&runtime, "local", &[("model-b".into(), 9)]);
         assert_invalid(parse_recall_visibility(
+            &runtime,
             Some(&mode),
-            Some(&token),
+            Some(&model_b),
             &["local"],
             &["model-a".into()],
         ));
@@ -224,17 +252,21 @@ mod tests {
 
     #[test]
     fn empty_fences_succeed_and_future_sequences_remain_for_runtime_proof() {
+        let runtime = runtime();
         let mode = json!("session");
-        let empty = json!({"version": 1, "namespace": "local", "fences": []});
-        let fence = parse(Some(&mode), Some(&empty)).unwrap().unwrap();
+        let empty = seal(&runtime, "local", &[]);
+        let fence = parse(&runtime, Some(&mode), Some(&empty)).unwrap().unwrap();
         assert!(fence.fences.is_empty());
+        assert_eq!(fence.namespace, "local");
         assert_eq!(fence.seq_for_model("model-a"), None);
-
-        let future = json!({"version": 1, "namespace": "local", "fences": [
-            {"model": "model-b", "ann_write_log_seq": u64::MAX},
-            {"model": "model-a", "ann_write_log_seq": 7}
-        ]});
-        let fence = parse(Some(&mode), Some(&future)).unwrap().unwrap();
+        let future = seal(
+            &runtime,
+            "local",
+            &[("model-b".into(), u64::MAX), ("model-a".into(), 7)],
+        );
+        let fence = parse(&runtime, Some(&mode), Some(&future))
+            .unwrap()
+            .unwrap();
         assert_eq!(fence.seq_for_model("model-a"), Some(7));
         assert_eq!(fence.seq_for_model("model-b"), Some(u64::MAX));
         assert_eq!(fence.seq_for_model("model-c"), None);
@@ -246,17 +278,37 @@ mod tests {
         assert_eq!(parse_timeout_ms(None).unwrap(), 0);
         assert_eq!(parse_timeout_ms(Some(&json!(0))).unwrap(), 0);
         assert_eq!(parse_timeout_ms(Some(&json!(10_000))).unwrap(), 10_000);
-        for invalid_value in [
-            json!(10_001),
+        for invalid_timeout in [
             json!(-1),
+            json!(10_001),
             json!(1.5),
             json!("10"),
             json!(null),
         ] {
             assert!(matches!(
-                parse_timeout_ms(Some(&invalid_value)),
+                parse_timeout_ms(Some(&invalid_timeout)),
                 Err(RuntimeError::InvalidInput(_))
             ));
+        }
+    }
+
+    #[test]
+    fn visibility_fence_debug_never_discloses_authenticated_fields() {
+        let fence = VisibilityFence {
+            namespace: "private-namespace-sentinel".into(),
+            fences: vec![ModelFence {
+                model: "private-model-sentinel".into(),
+                ann_write_log_seq: 987654321,
+            }],
+        };
+        let rendered = format!("{fence:?} {:?}", fence.fences[0]);
+        assert!(rendered.contains("REDACTED"));
+        for hidden in [
+            "private-namespace-sentinel",
+            "private-model-sentinel",
+            "987654321",
+        ] {
+            assert!(!rendered.contains(hidden));
         }
     }
 }

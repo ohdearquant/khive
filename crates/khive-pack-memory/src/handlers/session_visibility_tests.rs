@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use serial_test::serial;
 
 use crate::ann::{self, AnnKey, SharedAnn};
-use crate::test_support::HashVecProvider;
+use crate::test_support::{with_receipt_credentials, HashVecProvider};
 use crate::MemoryPack;
 
 const MODEL: &str = "adr144-session-visibility-test-model";
@@ -77,7 +77,7 @@ fn registry_with_ann(rt: &KhiveRuntime) -> (VerbRegistry, SharedAnn) {
 }
 
 fn vector_runtime() -> KhiveRuntime {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
     rt.register_embedder(HashVecProvider {
         model_name: MODEL.to_owned(),
         dims: 16,
@@ -88,9 +88,15 @@ fn vector_runtime() -> KhiveRuntime {
 fn two_vector_runtimes() -> (KhiveRuntime, KhiveRuntime) {
     let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
     backend.prepare_core_schema().expect("core schema");
-    let reader = KhiveRuntime::from_backend(backend.clone(), RuntimeConfig::no_embeddings())
-        .with_ann_fresh_tail_enabled(false);
-    let writer = KhiveRuntime::from_backend(backend, RuntimeConfig::no_embeddings());
+    let reader = with_receipt_credentials(KhiveRuntime::from_backend(
+        backend.clone(),
+        RuntimeConfig::no_embeddings(),
+    ))
+    .with_ann_fresh_tail_enabled(false);
+    let writer = with_receipt_credentials(KhiveRuntime::from_backend(
+        backend,
+        RuntimeConfig::no_embeddings(),
+    ));
     for runtime in [&reader, &writer] {
         runtime.register_embedder(HashVecProvider {
             model_name: MODEL.to_owned(),
@@ -108,6 +114,24 @@ async fn remember(registry: &VerbRegistry, content: &str) -> Value {
         )
         .await
         .expect("memory.remember")
+}
+
+fn receipt_sequence(rt: &KhiveRuntime, receipt: &Value, namespace: &str, model: &str) -> u64 {
+    let receipt = rt
+        .open_visibility_receipt(
+            receipt.as_str().expect("opaque receipt string"),
+            &[namespace],
+            &[model.to_owned()],
+        )
+        .expect("authenticated receipt");
+    assert_eq!(receipt.namespace(), namespace);
+    receipt.sequence_for_model(model).expect("write fence")
+}
+
+fn sealed_fence(rt: &KhiveRuntime, namespace: &str, model: &str, sequence: u64) -> Value {
+    json!(rt
+        .seal_visibility_receipt(namespace, &[(model.to_owned(), sequence)])
+        .expect("authenticated fixture fence"))
 }
 
 fn session_request(content: &str, visibility_token: Value) -> Value {
@@ -154,10 +178,7 @@ async fn immediate_remember_then_session_recall_returns_the_new_memory() {
     let registry = registry(&rt);
     let remembered = remember(&registry, CONTENT).await;
     let visibility_token = remembered["visibility_token"].clone();
-    assert_eq!(visibility_token["fences"][0]["model"], MODEL);
-    assert!(visibility_token["fences"][0]["ann_write_log_seq"]
-        .as_u64()
-        .is_some_and(|seq| seq > 0));
+    assert!(receipt_sequence(&rt, &visibility_token, "local", MODEL) > 0);
 
     let recalled = registry
         .dispatch("memory.recall", session_request(CONTENT, visibility_token))
@@ -190,9 +211,7 @@ async fn interleaved_compaction_keeps_session_recall_on_the_same_snapshot() {
 
     let remembered = remember(&writer_registry, CONTENT).await;
     let receipt = remembered["visibility_token"].clone();
-    let sequence = receipt["fences"][0]["ann_write_log_seq"]
-        .as_u64()
-        .expect("write fence");
+    let sequence = receipt_sequence(&writer, &receipt, "local", MODEL);
     assert!(
         old_watermark < sequence,
         "reader segment predates the write"
@@ -272,8 +291,7 @@ async fn bound_actor_episodic_receipt_proves_in_its_visible_namespace() {
         .await
         .expect("episodic actor remember");
     let receipt = remembered["visibility_token"].clone();
-    assert_ne!(receipt["namespace"], "local");
-    assert_eq!(receipt["fences"][0]["model"], MODEL);
+    assert!(receipt_sequence(&rt, &receipt, "lambda:session-probe", MODEL) > 0);
     let recalled = registry
         .dispatch_with_identity(
             "memory.recall",
@@ -303,13 +321,15 @@ async fn future_sequence_refuses_with_typed_freshness_unmet_and_model() {
     let rt = vector_runtime();
     let registry = registry(&rt);
     let remembered = remember(&registry, CONTENT).await;
-    let mut visibility_token = remembered["visibility_token"].clone();
-    let issued_seq = visibility_token["fences"][0]["ann_write_log_seq"]
-        .as_u64()
-        .expect("issued sequence");
-    visibility_token["fences"][0]["ann_write_log_seq"] = json!(issued_seq
-        .checked_add(1_000_000)
-        .expect("fixture sequence leaves headroom"));
+    let issued_seq = receipt_sequence(&rt, &remembered["visibility_token"], "local", MODEL);
+    let visibility_token = sealed_fence(
+        &rt,
+        "local",
+        MODEL,
+        issued_seq
+            .checked_add(1_000_000)
+            .expect("fixture sequence leaves headroom"),
+    );
 
     let (result, probes, exact_statements) = ann::count_session_statements(
         registry.dispatch("memory.recall", session_request(CONTENT, visibility_token)),
@@ -331,11 +351,8 @@ async fn waiting_on_a_future_fence_polls_proof_without_repeating_knn() {
     let rt = vector_runtime();
     let registry = registry(&rt);
     let remembered = remember(&registry, CONTENT).await;
-    let mut visibility_token = remembered["visibility_token"].clone();
-    let issued_seq = visibility_token["fences"][0]["ann_write_log_seq"]
-        .as_u64()
-        .expect("issued sequence");
-    visibility_token["fences"][0]["ann_write_log_seq"] = json!(issued_seq + 1_000_000);
+    let issued_seq = receipt_sequence(&rt, &remembered["visibility_token"], "local", MODEL);
+    let visibility_token = sealed_fence(&rt, "local", MODEL, issued_seq + 1_000_000);
     let mut request = session_request(CONTENT, visibility_token);
     request["timeout_ms"] = json!(120);
 
@@ -362,9 +379,7 @@ async fn missing_original_log_proof_refuses_even_when_text_recall_finds_memory()
     let registry = registry(&rt);
     let remembered = remember(&registry, CONTENT).await;
     let visibility_token = remembered["visibility_token"].clone();
-    let seq = visibility_token["fences"][0]["ann_write_log_seq"]
-        .as_u64()
-        .expect("issued sequence");
+    let seq = receipt_sequence(&rt, &visibility_token, "local", MODEL);
 
     rt.sql()
         .writer()
@@ -443,11 +458,7 @@ async fn failed_second_engine_cannot_turn_a_session_fence_into_healthy_engine_su
                 "limit": 50,
                 "score_floor": 0.0,
                 "consistency": "session",
-                "visibility_token": {
-                    "version": 1,
-                    "namespace": "local",
-                    "fences": [{"model": FAILING_MODEL, "ann_write_log_seq": 1}],
-                },
+                "visibility_token": sealed_fence(&rt, "local", FAILING_MODEL, 1),
                 "timeout_ms": 0,
             }),
         )
@@ -460,13 +471,19 @@ async fn failed_second_engine_cannot_turn_a_session_fence_into_healthy_engine_su
 #[serial(background_tasks)]
 #[serial_test::serial(config_ledger)]
 async fn empty_fences_allow_text_only_session_recall() {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
     let registry = registry(&rt);
     let remembered = remember(&registry, CONTENT).await;
     let visibility_token = remembered["visibility_token"].clone();
-    assert_eq!(visibility_token["version"], 1);
-    assert_eq!(visibility_token["namespace"], "local");
-    assert_eq!(visibility_token["fences"], json!([]));
+    let authenticated = rt
+        .open_visibility_receipt(
+            visibility_token.as_str().expect("opaque receipt string"),
+            &["local"],
+            &[],
+        )
+        .expect("authenticated empty receipt");
+    assert_eq!(authenticated.namespace(), "local");
+    assert_eq!(authenticated.sequence_for_model(MODEL), None);
 
     let recalled = registry
         .dispatch("memory.recall", session_request(CONTENT, visibility_token))
@@ -486,7 +503,10 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
 
     let backend = Arc::new(StorageBackend::memory().expect("memory backend"));
     backend.prepare_core_schema().expect("core schema");
-    let rt = KhiveRuntime::from_backend(backend.clone(), RuntimeConfig::no_embeddings());
+    let rt = with_receipt_credentials(KhiveRuntime::from_backend(
+        backend.clone(),
+        RuntimeConfig::no_embeddings(),
+    ));
     rt.register_embedder(HashVecProvider {
         model_name: MODEL.to_owned(),
         dims: 16,
@@ -526,9 +546,7 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
     tokio::time::timeout(std::time::Duration::from_secs(10), warm_started)
         .await
         .expect("original remember starts its background ANN attempt");
-    let old_seq = original["visibility_token"]["fences"][0]["ann_write_log_seq"]
-        .as_u64()
-        .expect("original write fence");
+    let old_seq = receipt_sequence(&rt, &original["visibility_token"], source, MODEL);
     let destination_seq: i64 = {
         let connection = backend.pool().writer().expect("move writer");
         let request = MoveRequest::new(
@@ -573,9 +591,10 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
     assert_eq!(replay["id"], original["id"]);
     assert_eq!(replay["replayed"], true);
     let receipt = replay["visibility_token"].clone();
-    assert_eq!(receipt["namespace"], target);
-    assert_eq!(receipt["fences"][0]["model"], MODEL);
-    assert_eq!(receipt["fences"][0]["ann_write_log_seq"], destination_seq);
+    assert_eq!(
+        receipt_sequence(&rt, &receipt, target, MODEL),
+        u64::try_from(destination_seq).unwrap()
+    );
     {
         let connection = backend.pool().reader().expect("replay log reader");
         let replacement_rows: i64 = connection
@@ -606,7 +625,7 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
     assert!(matches!(
         unscoped,
         RuntimeError::InvalidInput(ref message)
-            if message.contains("visibility_token namespace is not caller-visible")
+            if message == "memory.recall invalid visibility receipt"
     ));
     let recalled = registry
         .dispatch_with_identity(
@@ -664,4 +683,48 @@ async fn moved_keyed_replay_proves_destination_before_and_after_ann_publication(
         .await
         .expect("published destination fence remains provable after compaction");
     assert!(contains_id(&recalled, &original["id"]));
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn public_recall_advertises_string_and_refuses_legacy_object_by_name() {
+    use khive_types::Pack;
+
+    let handler = MemoryPack::HANDLERS
+        .iter()
+        .find(|handler| handler.name == "memory.recall")
+        .expect("recall metadata");
+    let parameter = handler
+        .params
+        .iter()
+        .find(|parameter| parameter.name == "visibility_token")
+        .expect("visibility token metadata");
+    assert_eq!(parameter.param_type, "string");
+
+    let rt = with_receipt_credentials(KhiveRuntime::memory().expect("in-memory runtime"));
+    let registry = registry(&rt);
+    let legacy = json!({"version": 1, "namespace": "hidden-legacy-sentinel", "fences": []});
+    let error = registry
+        .dispatch("memory.recall", session_request(CONTENT, legacy.clone()))
+        .await
+        .expect_err("the public dispatcher must preserve the named legacy refusal");
+    let RuntimeError::Khive(domain) = error.refusal_source() else {
+        panic!("expected a named legacy refusal: {error:?}");
+    };
+    assert_eq!(domain.kind(), ErrorKind::InvalidInput);
+    assert_eq!(
+        domain.details().and_then(|details| details.get("reason")),
+        Some("visibility_token_legacy")
+    );
+    assert!(!format!("{error:?}").contains("hidden-legacy-sentinel"));
+
+    registry
+        .dispatch(
+            "memory.recall",
+            json!({
+                "query": CONTENT, "consistency": "eventual", "visibility_token": legacy,
+            }),
+        )
+        .await
+        .expect("eventual recall ignores an optional legacy token");
 }
