@@ -1,6 +1,6 @@
 //! ADR-115 Amendment 2: named redaction surfaces close the `mask_secrets`
-//! call-site population outside `secret_gate.rs` itself. Every caller that
-//! needs the canonical detector reaches it through
+//! call-site population outside `secret_gate.rs` and its `masking.rs` child.
+//! Every caller that needs the canonical detector reaches it through
 //! `secret_gate::mask_for_redaction_surface`, never the raw `mask_secrets`
 //! primitive directly — a truncation-before-masking bug at a raw call site
 //! is exactly what let a credential's terminating span survive past a fixed
@@ -8,20 +8,23 @@
 //!
 //! This test re-derives the population from live source at test time: it
 //! walks every `.rs` file under `crates/` outside `secret_gate.rs` (which
-//! owns the primitive and its sole in-module wrapper) and asserts none of
+//! owns the surface wrapper) and `secret_gate/masking.rs` (which owns the
+//! primitive), plus the explicit test exemptions below, and asserts none of
 //! them calls `mask_secrets(` directly. A future direct caller fails this
 //! test instead of silently joining the population.
 
 use std::path::{Path, PathBuf};
 
 /// Files exempt from the census, relative to the Cargo workspace root
-/// (`crates/` — see [`find_workspace_root`]): the primitive's owning file
-/// (which also defines the `mask_for_redaction_surface` wrapper every other
-/// caller must go through), its extracted regression tests, and this
+/// (`crates/` — see [`find_workspace_root`]): the primitive's `masking.rs`
+/// owning file, the parent `secret_gate.rs` defining the
+/// `mask_for_redaction_surface` wrapper every other caller must go through,
+/// its extracted regression tests, and this
 /// census test itself, which quotes the literal string `mask_secrets(` in its
 /// controls and panic message.
 const EXEMPT_FILES: &[&str] = &[
     "khive-runtime/src/secret_gate.rs",
+    "khive-runtime/src/secret_gate/masking.rs",
     "khive-runtime/src/secret_gate_tests.rs",
     "khive-runtime/src/secret_gate/issue_2655_tests.rs",
     "khive-runtime/tests/adr115_redaction_call_site_census.rs",
