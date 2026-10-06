@@ -16,7 +16,7 @@ The query layer must satisfy:
    Mutations go through verb handlers, not query strings.
 2. **Backend independence.** The query compiler targets SQL. It has no driver dependency on
    SQLite, no ATTACH awareness, and no backend topology knowledge.
-3. **Relation validation.** The 15 canonical edge relations (ADR-002) are validated by
+3. **Relation validation.** The canonical edge relations defined by ADR-002 are validated by
    delegating to `EdgeRelation::from_str`. The query layer does not maintain its own
    relation allowlist.
 4. **`entity_type` as first-class field.** ADR-001 settles `entity_type` as a dedicated

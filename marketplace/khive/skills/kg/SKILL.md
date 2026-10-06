@@ -5,7 +5,7 @@ description: Work the knowledge graph as typed entities and edges — search bef
 # Work the knowledge graph
 
 The kg pack is the shared, cross-project knowledge graph: typed entities (9 kinds), a closed set
-of edge relations (17), and notes. 26 verbs — the bare names `create`, `get`, `list`, `search`, `update`,
+of edge relations (20), and notes. 26 verbs — the bare names `create`, `get`, `list`, `search`, `update`,
 `delete`, `restore`, `merge`, `link`, `neighbors`, `traverse`, `query`, `context`, `resolve`, `whoami`,
 `scan`, `db_diagnostics`, `stats`, `propose`, `review`, `withdraw`, `verbs`, plus `stream.append` /
 `stream.read` / `stream.stat` — but the thing worth learning is the
@@ -51,7 +51,7 @@ Then wire it in with `link` — direction matters:
 | `depends_on`    | consumer → dependency | quantization depends_on calibration |
 
 Reach minimum density before you stop: concepts ≥ 4 edges, projects ≥ 3, documents ≥ 2. If the
-relation you want is not one of the 17, it is probably a property.
+relation you want is not one of the 20, it is probably a property.
 
 ### 3. Explore to ground yourself
 
