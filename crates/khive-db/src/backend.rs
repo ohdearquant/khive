@@ -599,6 +599,12 @@ impl StorageBackend {
         }
     }
 
+    /// Validate the sealed memory-receipt cutover without a writer or migration.
+    pub fn validate_memory_visibility_cutover(&self) -> Result<(), SqliteError> {
+        let reader = self.pool.reader()?;
+        crate::migrations::validate_memory_visibility_cutover(reader.conn())
+    }
+
     /// Read the applied schema version through the pool's ordinary reader or
     /// writer, without running migrations. Unlike
     /// [`migrations::inspect_schema_version`](crate::migrations::inspect_schema_version),
@@ -1653,6 +1659,34 @@ mod tests {
             SqlValue::Text(s) => assert_eq!(s, "world"),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn memory_visibility_readiness_uses_only_the_reader_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("visibility_readiness.db");
+        {
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
+            writable.prepare_core_schema().unwrap();
+            writable.validate_memory_visibility_cutover().unwrap();
+        }
+        let read_only = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
+        let before = read_only.pool().writer_acquisition_snapshot();
+        read_only.validate_memory_visibility_cutover().unwrap();
+        assert_eq!(read_only.pool().writer_acquisition_snapshot(), before);
+        drop(read_only);
+        {
+            let writable = StorageBackend::sqlite_for_test(&path).unwrap();
+            let writer = writable.pool().writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("DROP TABLE memory_visibility_epochs")
+                .unwrap();
+        }
+        let read_only = StorageBackend::sqlite_read_only_for_test(&path).unwrap();
+        let before = read_only.pool().writer_acquisition_snapshot();
+        assert!(read_only.validate_memory_visibility_cutover().is_err());
+        assert_eq!(read_only.pool().writer_acquisition_snapshot(), before);
     }
 
     #[test]

@@ -5606,3 +5606,6 @@ fn acknowledgement_journal_partial_one_column_refuses_without_changing_rows() {
 fn acknowledgement_journal_partial_two_columns_refuses_without_changing_rows() {
     assert_acknowledgement_journal_partial_columns_refused(true);
 }
+
+#[path = "migrations/memory_visibility_tests.rs"]
+mod memory_visibility_tests;
