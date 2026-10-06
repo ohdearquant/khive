@@ -31,6 +31,8 @@ CREATE INDEX IF NOT EXISTS idx_entities_live_namespace_order
     ON entities(namespace, created_at DESC, id DESC) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_entities_live_namespace_type_order
     ON entities(namespace, entity_type, created_at DESC, id DESC) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_entities_live_namespace_kind_order
+    ON entities(namespace, kind, created_at DESC, id DESC) WHERE deleted_at IS NULL;
 
 -- Durable list-cursor insertion order. This mirrors migration V13 as a
 -- belt-and-suspenders path for fresh/direct store construction that applies
