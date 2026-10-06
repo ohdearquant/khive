@@ -329,10 +329,7 @@ impl PackByIdResolver for KnowledgePack {
         // 2. Check knowledge_atoms.
         let atom_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, content, tags, properties, \
-                      status, finalized, source_uri, source_type, created_at, updated_at, deleted_at \
-                      FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_resolver_live_atom").into(),
                 params: vec![SqlValue::Text(id_str)],
                 label: Some("knowledge.resolve_by_id.atom".into()),
             })
@@ -372,10 +369,7 @@ impl PackByIdResolver for KnowledgePack {
 
         let domain_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, description, tags, members, \
-                      created_at, updated_at, deleted_at \
-                      FROM knowledge_domains WHERE id = ?1 LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_resolver_domain_including_deleted").into(),
                 params: vec![SqlValue::Text(id_str.clone())],
                 label: Some("knowledge.resolve_by_id_incl_deleted.domain".into()),
             })
@@ -398,10 +392,7 @@ impl PackByIdResolver for KnowledgePack {
 
         let atom_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, content, tags, properties, \
-                      status, finalized, source_uri, source_type, created_at, updated_at, deleted_at \
-                      FROM knowledge_atoms WHERE id = ?1 LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_resolver_atom_including_deleted").into(),
                 params: vec![SqlValue::Text(id_str)],
                 label: Some("knowledge.resolve_by_id_incl_deleted.atom".into()),
             })
@@ -471,7 +462,7 @@ impl PackByIdResolver for KnowledgePack {
                     writer
                         .execute_batch(vec![
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_sections WHERE atom_id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_atom_sections_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some(
                                     "knowledge.delete_by_id.domain_mirror_sections.hard".into(),
@@ -532,7 +523,7 @@ impl PackByIdResolver for KnowledgePack {
                     writer
                         .execute_batch(vec![
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_sections WHERE atom_id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_atom_sections_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some("knowledge.delete_by_id.atom_sections.hard".into()),
                             },
