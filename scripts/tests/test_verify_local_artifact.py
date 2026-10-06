@@ -828,6 +828,7 @@ class RecipeRun:
         signed_probe_invocations: int,
         replacement_started: bool = False,
         marker_after: bytes | None = None,
+        default_marker_after: bytes | None = None,
         old_daemon_returncode: int | None = None,
     ) -> None:
         self.rc = rc
@@ -840,6 +841,7 @@ class RecipeRun:
         self.signed_probe_invocations = signed_probe_invocations
         self.replacement_started = replacement_started
         self.marker_after = marker_after
+        self.default_marker_after = default_marker_after
         self.old_daemon_returncode = old_daemon_returncode
 
 
@@ -917,6 +919,10 @@ class MakefileGateContractTests(unittest.TestCase):
         makefile_text: str | None = None,
         fixture_shape: str = "bare",
         supervisor_marker: bytes | None = None,
+        default_supervisor_marker: bytes | None = None,
+        socket_relative: str | None = None,
+        marker_relative: str | None = None,
+        home_trailing_slash: bool = False,
         live_daemon: bool = False,
         observe_start: bool = False,
     ) -> RecipeRun:
@@ -1019,7 +1025,7 @@ class MakefileGateContractTests(unittest.TestCase):
                 (stub_bin / tool).chmod(0o755)
 
             env = dict(os.environ)
-            env["HOME"] = str(home)
+            env["HOME"] = str(home) + ("/" if home_trailing_slash else "")
             env["PATH"] = f"{stub_bin}:{env.get('PATH', '')}"
             env["PYTHONDONTWRITEBYTECODE"] = "1"
             env["CODESIGN_RECORD"] = str(codesign_record)
@@ -1045,7 +1051,19 @@ class MakefileGateContractTests(unittest.TestCase):
 
             khive_dir = home / ".khive"
             khive_dir.mkdir()
-            marker = khive_dir / "khived.supervisor"
+            default_marker = khive_dir / "khived.supervisor"
+            marker = default_marker
+            if socket_relative is not None:
+                env["KHIVE_SOCKET"] = str(home / socket_relative) if socket_relative else ""
+                if socket_relative and socket_relative != ".khive/khived.sock":
+                    env["KHIVE_PID"] = str(home / "private.pid")
+                    marker = home / (socket_relative + ".supervisor-marker")
+            if marker_relative is not None:
+                env["KHIVE_SUPERVISOR_MARKER"] = str(home / marker_relative) if marker_relative else ""
+                if marker_relative:
+                    marker = home / marker_relative
+            if default_supervisor_marker is not None:
+                default_marker.write_bytes(default_supervisor_marker)
             if supervisor_marker is not None:
                 marker.write_bytes(supervisor_marker)
             daemon: subprocess.Popen[bytes] | None = None
@@ -1121,6 +1139,9 @@ class MakefileGateContractTests(unittest.TestCase):
                 reaper.join(timeout=2)
                 old_daemon_returncode = daemon.returncode
             marker_after = marker.read_bytes() if marker.exists() else None
+            default_marker_after = (
+                default_marker.read_bytes() if default_marker.exists() else None
+            )
 
             staged = dest_dir / "kkernel.new"
             installed_bytes = dest.read_bytes() if dest.exists() else None
@@ -1150,6 +1171,7 @@ class MakefileGateContractTests(unittest.TestCase):
                 signed_probe_invocations=signed_probe_invocations,
                 replacement_started=replacement_started,
                 marker_after=marker_after,
+                default_marker_after=default_marker_after,
                 old_daemon_returncode=old_daemon_returncode,
             )
 
@@ -1872,6 +1894,93 @@ class MakefileGateContractTests(unittest.TestCase):
             "the harness did not reproduce the original defect, so a green "
             "result from it is not evidence\n" + reverted.output,
         )
+
+    def test_private_socket_marker_does_not_share_default_supervision(self) -> None:
+        for socket in ("x.sock", "x.other", ".khive/khived"):
+            with self.subTest(socket=socket):
+                run = self._run_local_recipe(
+                    observe_start=True,
+                    socket_relative=socket,
+                    default_supervisor_marker=self.FOREIGN_MARKER,
+                )
+                self.assertEqual(run.rc, 0, run.output)
+                self.assertTrue(run.replacement_started, run.output)
+                self.assertIsNone(run.marker_after, run.output)
+                self.assertEqual(run.default_marker_after, self.FOREIGN_MARKER, run.output)
+
+    def test_private_supervisor_marker_suppresses_its_replacement(self) -> None:
+        for socket in ("x.sock", "x.other", ".khive/khived"):
+            with self.subTest(socket=socket):
+                run = self._run_local_recipe(
+                    observe_start=True,
+                    socket_relative=socket,
+                    supervisor_marker=self.FOREIGN_MARKER,
+                )
+                self.assertEqual(run.rc, 0, run.output)
+                self.assertFalse(run.replacement_started, run.output)
+                self.assertEqual(run.marker_after, self.FOREIGN_MARKER, run.output)
+                self.assertIsNone(run.default_marker_after, run.output)
+
+    def test_private_marker_override_precedence_and_empty_fallback(self) -> None:
+        for override in ("", "explicit-marker"):
+            with self.subTest(override=override):
+                run = self._run_local_recipe(
+                    observe_start=True,
+                    socket_relative="x.sock",
+                    marker_relative=override,
+                    supervisor_marker=self.FOREIGN_MARKER,
+                )
+                self.assertEqual(run.rc, 0, run.output)
+                self.assertFalse(run.replacement_started, run.output)
+                self.assertEqual(run.marker_after, self.FOREIGN_MARKER, run.output)
+                self.assertIsNone(run.default_marker_after, run.output)
+        absent_override = self._run_local_recipe(
+            observe_start=True,
+            socket_relative="x.sock",
+            marker_relative="absent-explicit-marker",
+            default_supervisor_marker=self.FOREIGN_MARKER,
+        )
+        self.assertEqual(absent_override.rc, 0, absent_override.output)
+        self.assertTrue(absent_override.replacement_started, absent_override.output)
+        self.assertEqual(
+            absent_override.default_marker_after, self.FOREIGN_MARKER, absent_override.output
+        )
+
+    def test_default_marker_parity_with_trailing_home(self) -> None:
+        for trailing_slash in (False, True):
+            for socket in (None, "", ".khive/khived.sock"):
+                with self.subTest(trailing_slash=trailing_slash, socket=socket):
+                    run = self._run_local_recipe(
+                        observe_start=True,
+                        socket_relative=socket,
+                        home_trailing_slash=trailing_slash,
+                        supervisor_marker=self.FOREIGN_MARKER,
+                    )
+                    self.assertEqual(run.rc, 0, run.output)
+                    self.assertFalse(run.replacement_started, run.output)
+                    self.assertEqual(run.marker_after, self.FOREIGN_MARKER, run.output)
+                    self.assertEqual(run.default_marker_after, self.FOREIGN_MARKER, run.output)
+
+    def test_socket_scoped_marker_control_detects_global_derivation(self) -> None:
+        start = self.makefile.index('\tMARKER=$${KHIVE_SUPERVISOR_MARKER:-};')
+        end = self.makefile.index('\tMARKER_LOCK=', start)
+        global_marker = (
+            self.makefile[:start]
+            + '\tMARKER=$${KHIVE_SUPERVISOR_MARKER:-$$HOME/.khive/khived.supervisor}; \\\n'
+            + self.makefile[end:]
+        )
+        reverted = self._run_local_recipe(
+            observe_start=True,
+            socket_relative="x.sock",
+            default_supervisor_marker=self.FOREIGN_MARKER,
+            makefile_text=global_marker,
+        )
+        self.assertEqual(reverted.rc, 0, reverted.output)
+        self.assertFalse(
+            reverted.replacement_started,
+            "global-marker mutation must reproduce the private-socket refusal\n" + reverted.output,
+        )
+        self.assertEqual(reverted.default_marker_after, self.FOREIGN_MARKER, reverted.output)
 
     def test_cargo_receipt_drives_verifier_and_ci_runs_regression_suite(self) -> None:
         self.assertIn("scripts/build_local_artifact.py", self.makefile)

@@ -233,7 +233,8 @@ local: verify-local-artifact
 	SIGNED_SHA256=$$({ shasum -a 256 "$$DEST.new" 2>/dev/null || sha256sum "$$DEST.new"; } | awk '{print $$1}'); \
 	STAGED_HASH=$$(md5 -q "$$DEST.new"); \
 	KHIVE_PID_FILE=$${KHIVE_PID:-$$HOME/.khive/khived.pid}; \
-	SOCK=$${KHIVE_SOCKET:-$$HOME/.khive/khived.sock}; \
+	DEFAULT_SOCK=$${HOME%/}/.khive/khived.sock; \
+	SOCK=$${KHIVE_SOCKET:-$$DEFAULT_SOCK}; \
 	OLD_PID=$$(cat "$$KHIVE_PID_FILE" 2>/dev/null | tr -dc "0-9"); \
 	if [ -n "$$OLD_PID" ] && ! ps -p "$$OLD_PID" >/dev/null 2>&1; then OLD_PID=""; fi; \
 	if [ -n "$$OLD_PID" ]; then \
@@ -249,7 +250,14 @@ local: verify-local-artifact
 	fi; \
 	echo "==> Atomically moving into place..."; \
 	mv "$$DEST.new" "$$DEST"; \
-	MARKER=$${KHIVE_SUPERVISOR_MARKER:-$$HOME/.khive/khived.supervisor}; \
+	MARKER=$${KHIVE_SUPERVISOR_MARKER:-}; \
+	if [ -z "$$MARKER" ]; then \
+	  if [ "$$SOCK" = "$$DEFAULT_SOCK" ]; then \
+	    MARKER=$${HOME%/}/.khive/khived.supervisor; \
+	  else \
+	    MARKER=$$SOCK.supervisor-marker; \
+	  fi; \
+	fi; \
 	MARKER_LOCK=$${KHIVE_LOCK:-$$HOME/.khive/khived.recovery.lock}; \
 	MARKER_PY=$$(printf '%s\n' \
 	  'import fcntl, os, sys, tempfile' \

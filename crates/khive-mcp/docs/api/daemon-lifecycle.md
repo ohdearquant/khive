@@ -6,17 +6,35 @@ stale/dead one, and forwards request frames over the daemon socket. This
 document is the extended rationale for the concurrency and safety properties
 that the inline doc comments summarize.
 
-## Supervised startup (ADR-185 Amendments 1–3)
+## Supervised startup (ADR-185 Amendments 1–4)
 
 A supervisor launches the daemon through `kkernel supervisor launch`. The
-launcher publishes `~/.khive/khived.supervisor` before replacing itself with
+launcher publishes a marker for its socket before replacing itself with
 the daemon. Its four lines contain the supervisor job label, the launcher's
 PID, the restart interval in whole seconds, and a fresh UUID v4 incarnation
 claim. Unix exec preserves that PID. A client may ignore the fourth line;
 the launcher uses it to distinguish a live job from a daemon whose PID was reused.
 The interval must match the supervisor's restart policy. A legacy two-line
-marker has a ten-second interval. `KHIVE_SUPERVISOR_MARKER` overrides the path
-for isolated tests; it is not a second ownership declaration.
+marker has a ten-second interval. A nonempty `KHIVE_SUPERVISOR_MARKER` overrides
+the path for isolated tests; it is not a second ownership declaration.
+
+Without that override, the default socket retains `~/.khive/khived.supervisor`,
+including when `KHIVE_SOCKET` explicitly spells the default path. A private
+socket appends `.supervisor-marker` to its complete pathname: `/tmp/x.sock`
+uses `/tmp/x.sock.supervisor-marker`. Empty overrides are ignored. Launcher,
+client, daemon claim checks, release and the local installer use this rule;
+Launcher/client ownership locks remain `<marker>.lock`; the installer retains
+the separate boot-lock protocol described below. A default supervisor's marker
+therefore does not delay a private socket's startup. Path spellings are compared
+without filesystem canonicalization; participants must agree on the rendezvous
+spelling or explicit marker path.
+
+Upgrade an older private supervisor that used the implicit global marker by
+stopping the job first, releasing its old marker with the matching label and
+an explicit old-path override, then restarting the upgraded launcher and clients.
+An old global marker is never automatically removed or adopted. Mixed-version
+private deployments can keep an agreed explicit marker path during upgrade.
+Default deployments and explicit overrides keep their existing marker files.
 
 With a marker and no responsive socket, a client waits for at most three
 restart intervals from the start of its request. The bound applies to both
@@ -60,13 +78,12 @@ start-to-bind time and allow it to fit within two intervals. A marker's PID
 alone cannot prove that the supervisor is healthy: a reused PID and a crash
 loop are both bounded by the same client wait.
 
-The temporary marker written by `make local` is still a legacy two-line
-producer. Its publication is not atomic, its existence check does not use
-the launcher lock, and its cleanup does not re-check the job label. These
-limits are tracked in [#3086](https://github.com/ohdearquant/khive/issues/3086);
-the client continues to honor that marker with the ten-second default
-interval. The launcher's serialization guarantee covers cooperating
-`supervisor launch` and `supervisor release` commands, not that older producer.
+The temporary marker written by `make local` has three lines and follows the
+same socket-derived path rule. It publishes atomically and rechecks its label
+and PID before cleanup under the configured boot lock. That lock remains
+distinct from the launcher's marker lock. The launcher's serialization guarantee
+covers cooperating `supervisor launch` and `supervisor release` commands; this
+path change does not extend that guarantee to the installer's separate protocol.
 
 ## Long-poll deadlines and one read replay (#3045)
 
