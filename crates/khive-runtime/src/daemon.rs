@@ -770,6 +770,7 @@ struct ConfigIdFields<'a> {
     brain: &'a str,
     telemetry: &'a str,
     display_timezone: &'a str,
+    visibility_receipts: &'a str,
     backends: Option<&'a str>,
     pack_backends: Option<&'a str>,
 }
@@ -786,6 +787,9 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
 
     let base = base.strip_prefix("packs=[")?;
     let (packs, rest) = base.split_once("];db=")?;
+    let (rest, visibility_receipts) = rest
+        .rsplit_once(";visibility_receipts=")
+        .unwrap_or((rest, "<legacy-absent>"));
     let (rest, display_timezone) = rest
         .rsplit_once(";display_tz=")
         .unwrap_or((rest, "<legacy-absent>"));
@@ -824,6 +828,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         brain,
         telemetry,
         display_timezone,
+        visibility_receipts,
         backends,
         pack_backends,
     })
@@ -890,6 +895,7 @@ pub fn config_ids_compatible(client_id: &str, daemon_id: &str) -> bool {
         && client.brain == daemon.brain
         && client.telemetry == daemon.telemetry
         && client.display_timezone == daemon.display_timezone
+        && client.visibility_receipts == daemon.visibility_receipts
         && client.backends == daemon.backends
         && client.pack_backends == daemon.pack_backends
 }
@@ -933,6 +939,8 @@ pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> 
         "telemetry"
     } else if client.display_timezone != daemon.display_timezone {
         "display_tz"
+    } else if client.visibility_receipts != daemon.visibility_receipts {
+        "visibility_receipts"
     } else if client.backends != daemon.backends {
         "backends"
     } else if client.pack_backends != daemon.pack_backends {

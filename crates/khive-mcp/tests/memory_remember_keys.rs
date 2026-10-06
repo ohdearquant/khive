@@ -4,11 +4,15 @@
 //! and no embedders. This does not exercise daemon forwarding, independent
 //! processes, post-commit obligation failure, or Python's native socket client.
 
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use std::ops::Deref;
 use std::time::Duration;
 
 use khive_mcp::server::KhiveMcpServer;
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+use khive_storage::{SqlStatement, SqlValue};
 use rmcp::{
     model::{CallToolRequestParams, ClientInfo},
     ClientHandler, ServiceExt,
@@ -16,6 +20,93 @@ use rmcp::{
 use serde_json::{json, Value};
 
 const ACTOR: &str = "test:mcp-key-writer";
+
+#[test]
+fn receipt_custody_changes_daemon_identity_without_exposing_references() {
+    use khive_mcp::server::compute_config_id;
+    use khive_runtime::credentials::{
+        CredentialConfig, CredentialKind, VisibilityReceiptConfig, VisibilityReceiptKeyConfig,
+    };
+    use khive_runtime::daemon::{config_ids_compatible, first_config_mismatch_field};
+
+    let absent = RuntimeConfig::no_embeddings();
+    let absent_id = compute_config_id(&absent, None);
+    assert!(absent_id.contains(";visibility_receipts="));
+    let legacy_id = absent_id.split_once(";visibility_receipts=").unwrap().0;
+    assert!(!config_ids_compatible(&absent_id, legacy_id));
+    assert!(!config_ids_compatible(legacy_id, &absent_id));
+    assert_eq!(
+        first_config_mismatch_field(&absent_id, Some(legacy_id)),
+        "visibility_receipts"
+    );
+    let mut configured = absent.clone();
+    configured.credentials = ["current", "retired"]
+        .map(|suffix| CredentialConfig {
+            name: format!("private-reference-{suffix}"),
+            kind: CredentialKind::SigningKey,
+            provider: "env".to_owned(),
+            env_var: Some(format!("RECEIPT_CUSTODY_{suffix}")),
+            header: None,
+        })
+        .to_vec();
+    configured.visibility_receipts = Some(VisibilityReceiptConfig {
+        keys: ["current", "retired"]
+            .map(|suffix| VisibilityReceiptKeyConfig {
+                id: format!("private-key-id-{suffix}"),
+                credential: format!("private-reference-{suffix}"),
+                encrypt: suffix == "current",
+            })
+            .to_vec(),
+    });
+    let configured_id = compute_config_id(&configured, None);
+    assert_ne!(absent_id, configured_id);
+    for private_reference in ["private-reference", "private-key-id", "RECEIPT_CUSTODY"] {
+        assert!(!configured_id.contains(private_reference));
+    }
+
+    let mut reordered = configured.clone();
+    reordered.credentials.reverse();
+    reordered
+        .visibility_receipts
+        .as_mut()
+        .unwrap()
+        .keys
+        .reverse();
+    assert_eq!(configured_id, compute_config_id(&reordered, None));
+
+    for mutation in 0..6 {
+        let mut changed = configured.clone();
+        match mutation {
+            0 => changed.visibility_receipts = None,
+            1 => changed.visibility_receipts.as_mut().unwrap().keys[0]
+                .id
+                .push('2'),
+            2 => {
+                let keys = &mut changed.visibility_receipts.as_mut().unwrap().keys;
+                keys[0].encrypt = false;
+                keys[1].encrypt = true;
+            }
+            3 => {
+                changed.visibility_receipts.as_mut().unwrap().keys[0].credential =
+                    changed.credentials[1].name.clone();
+            }
+            4 => changed.credentials[0].env_var = Some("OTHER_CUSTODY_LOCATION".to_owned()),
+            5 => {
+                changed.credentials[0].provider = "external-vault".to_owned();
+                changed.credentials[0].env_var = None;
+            }
+            _ => unreachable!(),
+        }
+        let changed_id = compute_config_id(&changed, None);
+        assert_ne!(configured_id, changed_id, "case {mutation}");
+        assert!(!config_ids_compatible(&configured_id, &changed_id));
+        assert!(!config_ids_compatible(&changed_id, &configured_id));
+        assert_eq!(
+            first_config_mismatch_field(&configured_id, Some(&changed_id)),
+            "visibility_receipts"
+        );
+    }
+}
 
 #[derive(Clone, Default)]
 struct MemoryClient;
@@ -26,17 +117,29 @@ impl ClientHandler for MemoryClient {
     }
 }
 
-async fn connect() -> anyhow::Result<impl Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
-    static NO_DAEMON: std::sync::Once = std::sync::Once::new();
-    NO_DAEMON.call_once(|| std::env::set_var("KHIVE_NO_DAEMON", "1"));
-    let runtime = KhiveRuntime::new(RuntimeConfig {
+fn memory_runtime() -> anyhow::Result<KhiveRuntime> {
+    Ok(KhiveRuntime::new(RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::local(),
         actor_id: Some(ACTOR.to_owned()),
         visible_namespaces: vec![],
         packs: vec!["kg".to_owned(), "memory".to_owned()],
         ..RuntimeConfig::no_embeddings()
-    })?;
+    })?)
+}
+
+async fn connect() -> anyhow::Result<impl Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    connect_runtime(receipt_credentials::with_receipt_credentials(
+        memory_runtime()?,
+    ))
+    .await
+}
+
+async fn connect_runtime(
+    runtime: KhiveRuntime,
+) -> anyhow::Result<impl Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
+    static NO_DAEMON: std::sync::Once = std::sync::Once::new();
+    NO_DAEMON.call_once(|| std::env::set_var("KHIVE_NO_DAEMON", "1"));
     let server = KhiveMcpServer::new(runtime)?;
     let (server_transport, client_transport) = tokio::io::duplex(65536);
     tokio::spawn(async move {
@@ -348,5 +451,181 @@ async fn memory_keys_mcp_validation_counts_utf8_bytes_before_note_or_edge_writes
     }
     assert_eq!(memories(&client, namespace).await?.len(), 2);
     assert_eq!(annotations(&client, namespace, id(&source)).await?.len(), 2);
+    Ok(())
+}
+
+/// Snapshot the actual domain rows, including any dynamically created vector
+/// tables, rather than treating equal row counts as proof of a no-write replay.
+async fn visibility_domain_rows(runtime: &KhiveRuntime) -> anyhow::Result<Value> {
+    let mut reader = runtime.sql().reader().await?;
+    let tables = reader
+        .query_all(SqlStatement {
+            sql: "SELECT name FROM sqlite_master WHERE type = 'table' AND \
+                  (name IN ('notes', 'graph_edges', 'ann_write_log', \
+                   'memory_visibility_receipts', 'memory_visibility_fences', \
+                   'memory_visibility_epochs', 'vector_provenance') \
+                   OR name GLOB 'vec_*') ORDER BY name"
+                .into(),
+            params: vec![],
+            label: Some("receipt-replay-domain-tables".into()),
+        })
+        .await?;
+    let mut snapshot = serde_json::Map::new();
+    for table in tables {
+        let name = table.text("name")?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")),
+                params: vec![],
+                label: Some("receipt-replay-domain-rows".into()),
+            })
+            .await?;
+        let mut canonical = rows
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()?;
+        canonical.sort();
+        snapshot.insert(name.to_owned(), json!(canonical));
+    }
+    for required in [
+        "notes",
+        "graph_edges",
+        "ann_write_log",
+        "memory_visibility_receipts",
+        "memory_visibility_fences",
+        "memory_visibility_epochs",
+    ] {
+        assert!(
+            snapshot.contains_key(required),
+            "missing domain table {required}"
+        );
+    }
+    Ok(Value::Object(snapshot))
+}
+
+#[tokio::test]
+async fn classified_receipt_replays_reconcile_through_the_request_envelope() -> anyhow::Result<()> {
+    for (epoch, expected_reason, retryable) in [
+        ("legacy", "legacy_receipt_absent", false),
+        ("unknown", "receipt_epoch_unknown", false),
+        ("missing", "receipt_epoch_unknown", false),
+        ("modern", "receipt_temporarily_unavailable", true),
+    ] {
+        let runtime = receipt_credentials::with_receipt_credentials(memory_runtime()?);
+        let client = connect_runtime(runtime.clone()).await?;
+        let source = ok(
+            &client,
+            "create",
+            json!({"kind": "concept", "name": "receipt replay source"}),
+        )
+        .await?;
+        let args = remember(Some("receipt-replay"), None, Some(id(&source)));
+        let first = ok(&client, "memory.remember", args.clone()).await?;
+        assert!(
+            first["visibility_token"].is_string(),
+            "opaque receipt: {first}"
+        );
+        let memory_id = id(&first).to_owned();
+
+        // Seed the post-upgrade provenance states. The DB migration tests prove
+        // how real historical stores reach these states; this test proves their
+        // public transport disposition and exact no-write replay behavior.
+        let mut writer = runtime.sql().writer().await?;
+        if matches!(epoch, "legacy" | "modern") {
+            writer
+                .execute(SqlStatement {
+                    sql: "DELETE FROM memory_visibility_receipts WHERE note_id = ?1".into(),
+                    params: vec![SqlValue::Text(memory_id.clone())],
+                    label: Some("receipt-replay-remove-header".into()),
+                })
+                .await?;
+        }
+        let statement = if epoch == "missing" {
+            SqlStatement {
+                sql: "DELETE FROM memory_visibility_epochs WHERE note_id = ?1".into(),
+                params: vec![SqlValue::Text(memory_id.clone())],
+                label: Some("receipt-replay-remove-provenance".into()),
+            }
+        } else {
+            SqlStatement {
+                sql: "UPDATE memory_visibility_epochs SET epoch = ?1 WHERE note_id = ?2".into(),
+                params: vec![
+                    SqlValue::Text(epoch.into()),
+                    SqlValue::Text(memory_id.clone()),
+                ],
+                label: Some("receipt-replay-seed-provenance".into()),
+            }
+        };
+        writer.execute(statement).await?;
+        drop(writer);
+        let before = visibility_domain_rows(&runtime).await?;
+        assert_eq!(before["notes"].as_array().unwrap().len(), 1);
+        assert_eq!(before["graph_edges"].as_array().unwrap().len(), 1);
+
+        let mut previous = None;
+        for _ in 0..2 {
+            let receipt = request(&client, "memory.remember", args.clone()).await?;
+            assert_eq!(receipt["ok"], false, "{receipt}");
+            assert!(receipt.get("result").is_none(), "{receipt}");
+            let error = &receipt["error"];
+            assert_eq!(error["details"]["reason"], expected_reason, "{receipt}");
+            assert_eq!(error["details"]["memory_id"], memory_id, "{receipt}");
+            assert_eq!(
+                error["retryable"], retryable,
+                "boolean retryability: {receipt}"
+            );
+            assert_eq!(error["domain_disposition"], "not_committed", "{receipt}");
+            for hidden in [
+                "visibility_token",
+                "fences",
+                "ann_write_log_seq",
+                "issued_at",
+                "unknown_by_namespace",
+            ] {
+                assert!(
+                    error.get(hidden).is_none(),
+                    "private receipt field {hidden}: {receipt}"
+                );
+                assert!(
+                    error["details"].get(hidden).is_none(),
+                    "private detail {hidden}: {receipt}"
+                );
+            }
+            if let Some(previous) = previous.as_ref() {
+                assert_eq!(
+                    error, previous,
+                    "repeated replay must reconcile identically"
+                );
+            }
+            previous = Some(error.clone());
+            assert_eq!(
+                visibility_domain_rows(&runtime).await?,
+                before,
+                "{epoch}: exact replay changed domain rows"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn absent_receipt_key_refuses_before_a_memory_write() -> anyhow::Result<()> {
+    let runtime = memory_runtime()?;
+    let client = connect_runtime(runtime.clone()).await?;
+    let before = visibility_domain_rows(&runtime).await?;
+    let receipt = request(
+        &client,
+        "memory.remember",
+        remember(Some("missing-key"), None, None),
+    )
+    .await?;
+    assert_eq!(receipt["ok"], false, "{receipt}");
+    assert_eq!(
+        receipt["error"]["details"]["reason"], "visibility_key_unavailable",
+        "{receipt}"
+    );
+    assert_eq!(receipt["error"]["retryable"], true, "{receipt}");
+    assert!(receipt.get("result").is_none());
+    assert_eq!(visibility_domain_rows(&runtime).await?, before);
     Ok(())
 }

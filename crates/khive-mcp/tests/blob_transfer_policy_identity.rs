@@ -35,13 +35,16 @@ fn base_config() -> RuntimeConfig {
     base
 }
 
-// The pre-file-transfer fingerprint for this bounded in-memory configuration.
-// It contains no new policy field or call back into the fingerprint under test.
-fn legacy_identity(base: &RuntimeConfig) -> String {
+// Independent baseline after the receipt cutover, with file transfers disabled.
+// The fixed receipt digest binds the v2 domain plus `[[],null]` declarations;
+// this oracle never calls back into the fingerprint under test.
+fn transfer_disabled_identity(base: &RuntimeConfig) -> String {
     assert!(base.db_path.is_none());
     assert!(base.gate.configuration_fingerprint().is_none());
     assert!(base.embedding_model.is_none());
     assert!(base.additional_embedding_models.is_empty());
+    assert!(base.credentials.is_empty());
+    assert!(base.visibility_receipts.is_none());
     let mut git = Sha256::new();
     git.update(b"khive.git-write-policy.v2");
     git.update(serde_json::to_vec(&base.mounts).unwrap());
@@ -53,7 +56,7 @@ fn legacy_identity(base: &RuntimeConfig) -> String {
     telemetry.update(b"khive.telemetry-policy.v1");
     telemetry.update(serde_json::to_vec(&base.telemetry).unwrap());
     format!(
-        "packs=[blob];db=:memory:;embed=none;extra=[];fresh_tail={};blob_hydration_bytes={};backend={:?}:wal_ceiling_bytes=0;outbound=[];git_write={:x};brain={:x};telemetry={:x};display_tz=UTC",
+        "packs=[blob];db=:memory:;embed=none;extra=[];fresh_tail={};blob_hydration_bytes={};backend={:?}:wal_ceiling_bytes=0;outbound=[];git_write={:x};brain={:x};telemetry={:x};display_tz=UTC;visibility_receipts=90b56d7d55c456ceb209a1e71c875ebc247c19c0bbcf9804aff3b5ba2417bece",
         khive_runtime::ann_fresh_tail_enabled_from_env(),
         base.blob_hydration_bytes,
         base.backend_id,
@@ -74,7 +77,7 @@ fn enabled_file_transfers_distinguish_daemon_identity_without_changing_disabled_
     let disabled_id = compute_config_id(&disabled, None);
     assert_eq!(
         disabled_id,
-        legacy_identity(&disabled),
+        transfer_disabled_identity(&disabled),
         "disabled hosts keep their established identity"
     );
     let enabled_id = compute_config_id(&enabled, None);
@@ -94,7 +97,7 @@ fn daemon_identity_uses_the_boot_snapshot_after_the_transfer_environment_changes
     let _environment = TransferEnvironment::unset();
     let disabled = base_config();
     let before = compute_config_id(&disabled, None);
-    assert_eq!(before, legacy_identity(&disabled));
+    assert_eq!(before, transfer_disabled_identity(&disabled));
     std::env::set_var("KHIVE_FILE_TRANSFERS", "1");
     assert_eq!(
         compute_config_id(&disabled, None),

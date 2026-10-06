@@ -499,6 +499,41 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     );
     let telemetry = format!("{:x}", telemetry_hasher.finalize());
 
+    // A warm daemon must not keep issuing receipts with a superseded key ring.
+    // Hash declarations only: provider resolution and secret bytes never enter
+    // daemon identity. Include an explicit version even when custody is absent
+    // so pre-cutover writers cannot serve the new receipt contract.
+    let mut receipt_credentials: Vec<_> = config
+        .credentials
+        .iter()
+        .map(|entry| {
+            (
+                &entry.name,
+                format!("{:?}", entry.kind),
+                &entry.provider,
+                &entry.env_var,
+                &entry.header,
+            )
+        })
+        .collect();
+    receipt_credentials.sort();
+    let receipt_keys = config.visibility_receipts.as_ref().map(|ring| {
+        let mut keys: Vec<_> = ring
+            .keys
+            .iter()
+            .map(|key| (&key.id, &key.credential, key.encrypt))
+            .collect();
+        keys.sort();
+        keys
+    });
+    let mut receipt_hasher = Sha256::new();
+    receipt_hasher.update(b"khive.visibility-receipt-policy.v2");
+    receipt_hasher.update(
+        serde_json::to_vec(&(receipt_credentials, receipt_keys))
+            .expect("receipt configuration references are JSON serializable"),
+    );
+    let visibility_receipts = format!("{:x}", receipt_hasher.finalize());
+
     // The daemon compatibility parser compares this existing `backend` field.
     // For a declared topology, main uses the same effective value as its row
     // below; without one, RuntimeConfig already holds the resolved implicit
@@ -551,7 +586,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
     // a one-time operational cost that ends when the daemon is restarted, by
     // whoever restarts it.
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};telemetry={};display_tz={}",
+        "packs=[{}];db={};embed={};extra=[{}];fresh_tail={};blob_hydration_bytes={};backend={};outbound=[{}]{};git_write={};brain={};telemetry={};display_tz={};visibility_receipts={}",
         packs.join(","),
         db,
         primary,
@@ -565,6 +600,7 @@ pub(crate) fn compute_config_id_with_runtime_policies(
         brain,
         telemetry,
         config.display_timezone.name(),
+        visibility_receipts,
     );
 
     // Fold backend topology when non-empty so two configs differing only in
