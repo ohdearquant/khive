@@ -1,6 +1,6 @@
 {
   "schema_version": "khive.writer-census.manifest.v1",
-  "source_revision": "288b9eee1f471d505e7f5de33e121c58773a10af",
+  "source_revision": "b2f019333fe54bbe67a0571f7864865576769b84",
   "pack_set": [
     "kg",
     "gtd",
@@ -145,7 +145,7 @@
         "kind": "dispatch_audit",
         "symbol": "VerbRegistry::dispatch_with_identity -> EventStore::append_event",
         "evidence": {
-          "path": "crates/khive-runtime/src/pack.rs",
+          "path": "crates/khive-runtime/src/pack/audit.rs",
           "required_patterns": [
             "async fn append_audit_event_best_effort(",
             "store.append_event(event).await"
