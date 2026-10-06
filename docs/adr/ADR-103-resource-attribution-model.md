@@ -917,27 +917,39 @@ refused before it could be enqueued) or `AuditTerminalReason::AdmissionDeadlineE
 caller's bounded wait for the row's commit elapsed while the row was still pending or in-flight) —
 the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` may be
 dropped best-effort instead of failing the dispatch. The caller still receives the read's
-successful result. The fixed, reviewed set currently contains 40 verbs, grouped by owning pack:
+successful result. The set is the constant `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS`
+(`crates/khive-runtime/src/pack/registry_access.rs`), and the list below is that constant grouped by
+owning pack. Its count is taken from the code: at this revision the constant holds 64 entries. A
+test fails when this list or this count differs from the constant, so an entry added on one side
+only cannot pass unnoticed.
 
 - agent: `agent.observe`;
 - blob: `blob.get`, `blob.stat`;
 - brain: `brain.event_counts`, `brain.event_page`, `brain.profiles`, `brain.profile`,
   `brain.resolve`, `brain.bindings`;
-- comm: `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.thread`, `comm.health`,
-  `comm.probe`;
-- gtd: `gtd.next`, `gtd.tasks`;
+- comm: `comm.delivered`, `comm.transport_status`, `comm.inbox`, `comm.unread`, `comm.thread`,
+  `comm.health`, `comm.probe`;
+- exec: `exec.tree_get`, `exec.tree_diff`, `exec.receipt`, `exec.runs`, `exec.events`,
+  `exec.identity`;
+- git: `git.receipts`, `git.gates`, `git.status`, `git.log`, `git.ingest_cursor`;
+- gtd: `gtd.census`, `gtd.next`, `gtd.tasks`;
 - kg: `get`, `list`, `stats`, `search`, `neighbors`, `traverse`, `context`, `query`,
-  `resolve`, `whoami`, `verbs`;
+  `resolve`, `whoami`, `scan`, `verbs`, `stream.read`, `stream.stat`;
 - knowledge: `knowledge.get`, `knowledge.list`, `knowledge.stats`, `knowledge.fold`,
   `knowledge.topic`;
 - moodboard: `moodboard.model`, `moodboard.search`, `moodboard.preference`;
 - schedule: `schedule.agenda`;
-- session: `session.list`, `session.resume`, `session.export`.
+- session: `session.list`, `session.resume`, `session.export`, `session.search`, `session.stats`;
+- tool: `tool.suggest`, `tool.describe`, `tool.list`, `tool.check`, `tool.requests`,
+  `tool.policies`.
 
 The cross-pack source census classifies every current public Assertive handler exactly once.
-`memory.recall` (serve-ledger/accounting writes), `db_diagnostics` (PASSIVE checkpoint I/O), and
+`memory.recall` (serve-ledger/accounting writes), `db_diagnostics` (PASSIVE checkpoint I/O),
 `knowledge.search` / `knowledge.suggest` / `knowledge.compose` (persistent ANN
-consumer/checkpoint maintenance) remain explicitly fail-closed. A new Assertive handler is not
+consumer/checkpoint maintenance), `git.checkout` / `git.diff` / `git.reconcile` (a durable receipt
+on every dispatch) and `telemetry.channels` / `telemetry.counts` / `telemetry.emit` /
+`telemetry.read` (telemetry answers that must refuse when their audit cannot be recorded) remain
+explicitly fail-closed. A new Assertive handler is not
 eligible until its side effects are reviewed and the closed census is updated.
 
 Eligibility is bound to the owning pack and verb together, not the verb name alone: each entry on
