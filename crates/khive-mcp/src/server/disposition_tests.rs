@@ -1221,6 +1221,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "store_identity",
         "khive-runtime/src/daemon/store_identity.rs",
     ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "supervisor_marker",
+        "khive-runtime/src/daemon/supervisor_marker.rs",
+    ),
 ];
 
 impl<'ast> syn::visit::Visit<'ast> for ErrorConstructorCensus {
