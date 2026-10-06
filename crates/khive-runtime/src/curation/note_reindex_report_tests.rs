@@ -444,3 +444,160 @@ async fn healthy_note_restore_indexes_all_models_and_repeat_is_noop() {
         live
     );
 }
+
+async fn assert_committed_merge_indexes(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    into: &Note,
+    from: &Note,
+    summary: &crate::MergeSummary,
+    indexed_models: &[&str],
+) {
+    assert_eq!(summary.kept_id, into.id);
+    assert_eq!(summary.removed_id, from.id);
+    let notes = runtime.notes(token).unwrap();
+    let kept = notes.get_note(into.id).await.unwrap().unwrap();
+    assert_eq!(kept.version, into.version + 1);
+    assert!(kept.content.contains(&into.content));
+    assert!(kept.content.contains(&from.content));
+    let removed = notes
+        .get_note_including_deleted(from.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(removed.deleted_at.is_some());
+    assert_eq!(removed.content, from.content);
+    let text = runtime
+        .text_for_notes(token)
+        .unwrap()
+        .get_document(&kept.namespace, kept.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(text.body, kept.content);
+    for model in indexed_models {
+        let vectors = runtime
+            .vectors_for_model(token, model)
+            .unwrap()
+            .get_vectors(&[kept.id], &kept.namespace, "note.content")
+            .await
+            .unwrap();
+        assert_eq!(vectors.get(&kept.id), Some(&vec![0.5; 4]), "{model}");
+    }
+    let events = runtime
+        .events(token)
+        .unwrap()
+        .query_events(
+            khive_storage::EventFilter {
+                kinds: vec![khive_types::EventKind::NoteMerged],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.items.len(), 1);
+    assert_eq!(events.items[0].payload["into_id"], into.id.to_string());
+    assert_eq!(events.items[0].payload["from_id"], from.id.to_string());
+}
+
+#[tokio::test]
+async fn note_merge_reports_every_model_failure_after_commit() {
+    let (runtime, token, note, _, attempts) = fixture(Fault::Provider).await;
+    runtime.register_embedder(Provider {
+        name: "nonfinite",
+        fault: Fault::NonFinite,
+        attempts: attempts.clone(),
+        embed_calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let donor = Note::new(
+        "local",
+        "observation",
+        "x".repeat(crate::retrieval::document_embedding_budget("healthy") + 1),
+    );
+    runtime
+        .notes(&token)
+        .unwrap()
+        .upsert_note(donor.clone())
+        .await
+        .unwrap();
+
+    let summary = runtime
+        .merge_note(
+            &token,
+            note.id,
+            donor.id,
+            crate::EntityDedupMergePolicy::PreferInto,
+            crate::ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .expect("partial reindex failure must preserve the committed merge summary");
+
+    let error = summary
+        .post_commit_reindex_error
+        .as_deref()
+        .expect("both model failures must remain visible after the merge commits");
+    assert!(error.contains("model broken embedding:"), "{error}");
+    assert!(error.contains("injected provider failure"), "{error}");
+    assert!(
+        error.contains("model nonfinite vector_validation: non-finite output"),
+        "{error}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    assert!(summary.embedding_truncation.truncated > 0);
+    assert!(summary.embedding_truncation.discarded_bytes > 0);
+    assert_committed_merge_indexes(&runtime, &token, &note, &donor, &summary, &["healthy"]).await;
+    for model in ["broken", "nonfinite"] {
+        assert!(runtime
+            .vectors_for_model(&token, model)
+            .unwrap()
+            .get_vectors(&[note.id], &note.namespace, "note.content")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn healthy_note_merge_keeps_reindex_diagnostics_empty() {
+    let (runtime, token, note, _, attempts) = fixture(Fault::None).await;
+    let donor = Note::new("local", "observation", "healthy merge donor");
+    runtime
+        .notes(&token)
+        .unwrap()
+        .upsert_note(donor.clone())
+        .await
+        .unwrap();
+
+    let summary = runtime
+        .merge_note(
+            &token,
+            note.id,
+            donor.id,
+            crate::EntityDedupMergePolicy::PreferInto,
+            crate::ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(summary.post_commit_reindex_error, None);
+    assert_eq!(
+        summary.embedding_truncation,
+        EmbeddingTruncationReport::default()
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_committed_merge_indexes(
+        &runtime,
+        &token,
+        &note,
+        &donor,
+        &summary,
+        &["broken", "healthy"],
+    )
+    .await;
+}
