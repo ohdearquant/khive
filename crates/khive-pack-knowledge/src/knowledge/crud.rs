@@ -535,7 +535,7 @@ impl KnowledgeHandlers {
                     // null. Finalized is non-nullable, so its null value is bound as
                     // false. Only true promotes draft -> reviewed; clearing the flag
                     // does not demote an independent lifecycle status.
-                    sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=CASE WHEN ?5 = 1 THEN ?6 ELSE source_uri END, source_type=CASE WHEN ?7 = 1 THEN ?8 ELSE source_type END, finalized=CASE WHEN ?9 = 1 THEN ?10 ELSE finalized END, status=CASE WHEN ?9 = 1 AND ?10 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?11 WHERE id=?12 AND namespace=?13".into(),
+                    sql: khive_runtime::sql!("knowledge_atom_content_update").into(),
                     params: vec![
                         SqlValue::Text(atom_in.name.clone()),
                         SqlValue::Text(content),
@@ -649,7 +649,7 @@ impl KnowledgeHandlers {
             // the insert path runs, instead of leaking a raw unique-constraint error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id, deleted_at FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_slug_probe").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
@@ -678,9 +678,7 @@ impl KnowledgeHandlers {
             // partially-committed domain row behind.
             let atom_collision = reader
                 .query_row(SqlStatement {
-                    sql:
-                        "SELECT id FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1"
-                            .into(),
+                    sql: khive_runtime::sql!("knowledge_atom_slug_probe").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
@@ -701,9 +699,7 @@ impl KnowledgeHandlers {
             // ON CONFLICT(namespace, slug) would blind-overwrite an unrelated atom
             // that merely happens to share this slug.
             let mirror_stmt = SqlStatement {
-                sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, status, finalized, created_at, updated_at) \
-                      VALUES (?1,?2,?3,?4,?5,?6,?7,'reviewed',1,?8,?9) \
-                      ON CONFLICT(id) DO UPDATE SET slug=?3, name=?4, content=?5, tags=?6, properties=?7, status='reviewed', finalized=1, updated_at=?9".into(),
+                sql: khive_runtime::sql!("knowledge_domain_mirror_upsert").into(),
                 params: vec![
                     SqlValue::Text(id.clone()),
                     SqlValue::Text(ns.clone()),
