@@ -37,6 +37,9 @@ Revision `domain-effects-v9` classifies `blob.import` and `blob.export` as `Writ
 Revision `domain-effects-v10` classifies `comm.transport_status` as `Read`: it reads
 namespace-scoped sender records and receipts without changing transport metadata.
 
+Revision `domain-effects-v11` classifies `brain.event_page` as `Read`: it pages stored
+event rows inside the caller's visible namespaces and writes nothing.
+
 | Exact name                   | Access | Surface    | Registration                                                                          |
 | ---------------------------- | ------ | ---------- | ------------------------------------------------------------------------------------- |
 | `agent.kill`                 | Write  | Verb       | [khive-pack-agent/src/pack.rs](../../../khive-pack-agent/src/pack.rs#L101)            |
@@ -63,6 +66,7 @@ namespace-scoped sender records and receipts without changing transport metadata
 | `brain.deactivate`           | Write  | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L246)    |
 | `brain.emit`                 | Write  | Subhandler | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L684)    |
 | `brain.event_counts`         | Read   | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L77)     |
+| `brain.event_page`           | Read   | Verb       | [khive-pack-brain/src/handlers/event_page.rs](../../../khive-pack-brain/src/handlers/event_page.rs#L16)|
 | `brain.events`               | Read   | Subhandler | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L61)     |
 | `brain.feedback`             | Write  | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L285)    |
 | `brain.mark_turn`            | Write  | Verb       | [khive-pack-brain/src/handlers.rs](../../../khive-pack-brain/src/handlers.rs#L473)    |

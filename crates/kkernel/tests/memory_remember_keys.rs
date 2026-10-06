@@ -113,7 +113,11 @@ impl Fixture {
                  [display]\ntimezone = \"UTC\"\n\
                  [[backends]]\nname = \"main\"\nkind = \"sqlite\"\npath = {database:?}\n\
                  [packs.kg]\nbackend = \"main\"\nno_embed = true\n\
-                 [packs.memory]\nbackend = \"main\"\nno_embed = true\n"
+                 [packs.memory]\nbackend = \"main\"\nno_embed = true\n\
+                 [[credentials]]\nname = \"test-receipt\"\nkind = \"signing_key\"\n\
+                 provider = \"env\"\nenv_var = \"KHIVE_TEST_RECEIPT_KEY\"\n\
+                 [[visibility_receipts.keys]]\nid = \"test-receipt-key\"\n\
+                 credential = \"test-receipt\"\nencrypt = true\n"
             ),
         )
         .unwrap();
@@ -189,6 +193,8 @@ impl Fixture {
             .env("TZ", "UTC")
             .env("RUST_LOG", "error")
             .env("KHIVE_PACKS", "kg,memory")
+            // Public all-zero test material, scoped to this isolated child.
+            .env("KHIVE_TEST_RECEIPT_KEY", "A".repeat(43))
             .env("KHIVE_EVENTS_SPLIT", "0")
             .env("KHIVE_DAEMON_STRICT", "1")
             .env("KHIVE_SOCKET", self.socket(index))

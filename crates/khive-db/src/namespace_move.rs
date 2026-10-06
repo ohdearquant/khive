@@ -377,6 +377,7 @@ const SUBJECT_KEYED_TABLES: &[&str] = &["brain_implicit_mass", "brain_serve_ledg
 /// receipt by `(namespace, note_id)`, so they must follow it in dependency order.
 const MEMORY_VISIBILITY_RECEIPTS: &str = "memory_visibility_receipts";
 const MEMORY_VISIBILITY_FENCES: &str = "memory_visibility_fences";
+const MEMORY_VISIBILITY_EPOCHS: &str = "memory_visibility_epochs";
 
 /// Sender envelopes have a logical-message/device/epoch identity and survive
 /// deletion of their outbound note. The session mirror uses provider session
@@ -488,6 +489,9 @@ pub fn disposition(table: &namespace_census::NamespaceTable) -> Option<TableDisp
             subject_column: "note_id",
         },
         "memory_visibility_fences" => SubjectKeyed {
+            subject_column: "note_id",
+        },
+        "memory_visibility_epochs" => SubjectKeyed {
             subject_column: "note_id",
         },
 
@@ -1435,6 +1439,25 @@ pub fn move_namespace(conn: &Connection, request: &MoveRequest) -> Result<MoveCo
         if left > 0 {
             counts.left_behind.insert((*table).to_string(), left);
         }
+    }
+
+    // Epochs belong to the note even when its receipt is absent.
+    for target in &targets {
+        let moved = conn.execute(
+            "UPDATE memory_visibility_epochs SET namespace = ?2 \
+             WHERE namespace = ?1 AND note_id IN (SELECT id FROM notes WHERE namespace = ?2)",
+            rusqlite::params![source, target],
+        )? as u64;
+        *counts
+            .rows
+            .entry(MEMORY_VISIBILITY_EPOCHS.into())
+            .or_default() += moved;
+    }
+    let left = count_in_namespace(conn, MEMORY_VISIBILITY_EPOCHS, source)?;
+    if left > 0 {
+        counts
+            .left_behind
+            .insert(MEMORY_VISIBILITY_EPOCHS.into(), left);
     }
 
     // Visibility receipts follow notes, but their fences reference the receipt

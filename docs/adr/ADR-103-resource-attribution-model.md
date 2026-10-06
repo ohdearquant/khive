@@ -917,12 +917,12 @@ refused before it could be enqueued) or `AuditTerminalReason::AdmissionDeadlineE
 caller's bounded wait for the row's commit elapsed while the row was still pending or in-flight) —
 the per-dispatch audit row for a verb on `VerbRegistry::ADMISSION_DEGRADE_SAFE_VERBS` may be
 dropped best-effort instead of failing the dispatch. The caller still receives the read's
-successful result. The fixed, reviewed set currently contains 39 verbs, grouped by owning pack:
+successful result. The fixed, reviewed set currently contains 40 verbs, grouped by owning pack:
 
 - agent: `agent.observe`;
 - blob: `blob.get`, `blob.stat`;
-- brain: `brain.event_counts`, `brain.profiles`, `brain.profile`, `brain.resolve`,
-  `brain.bindings`;
+- brain: `brain.event_counts`, `brain.event_page`, `brain.profiles`, `brain.profile`,
+  `brain.resolve`, `brain.bindings`;
 - comm: `comm.delivered`, `comm.inbox`, `comm.unread`, `comm.thread`, `comm.health`,
   `comm.probe`;
 - gtd: `gtd.next`, `gtd.tasks`;

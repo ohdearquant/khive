@@ -1,6 +1,5 @@
 use super::query_embedding_models_conn;
 use super::*;
-
 fn open_memory() -> Connection {
     Connection::open_in_memory().expect("in-memory connection")
 }
@@ -105,7 +104,6 @@ fn insert_dependency_test_edge(
         rusqlite::params![id, source_id, target_id, relation, deleted_at],
     )
 }
-
 #[test]
 fn read_only_schema_validation_requires_exact_current_version_without_writes() {
     let mut current = open_memory();
@@ -187,7 +185,6 @@ fn read_only_schema_validation_requires_exact_current_version_without_writes() {
         "ahead-version diagnostic must be actionable: {ahead_error}"
     );
 }
-
 #[test]
 fn writable_upgrade_rejects_noncanonical_ledger_before_applying_next_migration() {
     let mut missing_middle = open_memory();
@@ -246,7 +243,6 @@ fn writable_upgrade_rejects_noncanonical_ledger_before_applying_next_migration()
         "ledger validation must fail before V19 is recorded"
     );
 }
-
 #[test]
 fn apply_schema_plan_rolls_back_migration_when_ledger_insert_fails() {
     static MIGRATIONS: &[Migration] = &[Migration {
@@ -5606,3 +5602,7 @@ fn acknowledgement_journal_partial_one_column_refuses_without_changing_rows() {
 fn acknowledgement_journal_partial_two_columns_refuses_without_changing_rows() {
     assert_acknowledgement_journal_partial_columns_refused(true);
 }
+
+#[cfg(test)]
+#[path = "migrations/memory_visibility_tests.rs"]
+mod memory_visibility_tests;

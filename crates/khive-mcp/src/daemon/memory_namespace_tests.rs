@@ -1,3 +1,6 @@
+#[path = "../../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use std::path::Path;
 use std::time::Duration;
 
@@ -313,6 +316,7 @@ async fn bound_actor_memory_namespace_round_trip() {
         ..RuntimeConfig::no_embeddings()
     };
     let runtime = KhiveRuntime::new(config).expect("file-backed runtime without embedders");
+    let runtime = receipt_credentials::with_receipt_credentials(runtime);
     let server = KhiveMcpServer::new(runtime).expect("kg and memory server");
     let config_id = server.config_id().to_owned();
     let daemon = tokio::spawn(run_daemon(server));

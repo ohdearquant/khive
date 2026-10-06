@@ -143,109 +143,6 @@ impl tracing::Subscriber for WarningCapture {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-/// `limit=0` returns no hits, the same as `top_k=0`; a lower clamp of one
-/// used to turn it into a single hit.
-#[tokio::test]
-#[serial(background_tasks)]
-#[serial_test::serial(config_ledger)]
-async fn recall_limit_zero_returns_no_hits_like_top_k_zero() {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let ns = Namespace::parse("local").expect("local namespace");
-    let token = rt.authorize(ns).expect("authorize local");
-    for i in 0..3 {
-        rt.create_note(
-            &token,
-            "memory",
-            None,
-            &format!("limit zero probe note {i}"),
-            Some(0.7),
-            None,
-            vec![],
-        )
-        .await
-        .expect("create note");
-    }
-
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
-    let registry = builder.build().expect("registry");
-
-    let hits_for = |params: serde_json::Value| {
-        let registry = &registry;
-        async move {
-            let out = registry
-                .dispatch("memory.recall", params)
-                .await
-                .expect("recall dispatch");
-            match out {
-                serde_json::Value::Array(items) => items.len(),
-                serde_json::Value::Object(map) => map
-                    .get("results")
-                    .and_then(serde_json::Value::as_array)
-                    .map(Vec::len)
-                    .unwrap_or(0),
-                _ => panic!("unexpected recall shape"),
-            }
-        }
-    };
-
-    let control = hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 2})).await;
-    assert_eq!(
-        control, 2,
-        "limit=2 is the control and must return two hits"
-    );
-    let by_top_k =
-        hits_for(serde_json::json!({"query": "limit zero probe note", "top_k": 0})).await;
-    assert_eq!(by_top_k, 0, "top_k=0 returns no hits");
-    let by_limit =
-        hits_for(serde_json::json!({"query": "limit zero probe note", "limit": 0})).await;
-    assert_eq!(by_limit, 0, "limit=0 returns no hits, the same as top_k=0");
-}
-
-/// Exercises `$` sanitization; serialized because non-empty recall tracks background work.
-#[tokio::test]
-#[serial(background_tasks)]
-#[serial_test::serial(config_ledger)]
-async fn recall_with_dollar_sign_query_does_not_error() {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let ns = Namespace::parse("local").expect("local namespace");
-    let token = rt.authorize(ns).expect("authorize local");
-
-    rt.create_note(
-        &token,
-        "memory",
-        None,
-        "use $prev.id to chain calls",
-        Some(0.7),
-        None,
-        vec![],
-    )
-    .await
-    .expect("create note");
-
-    let mut builder = VerbRegistryBuilder::new();
-    builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
-    let registry = builder.build().expect("registry");
-
-    let result = registry
-        .dispatch(
-            "memory.recall",
-            serde_json::json!({
-                "query": "$prev.id",
-                "limit": 10
-            }),
-        )
-        .await;
-
-    assert!(
-        result.is_ok(),
-        "#388 memory.recall must not hard-fail on a '$'-bearing query, got: {:?}",
-        result.err()
-    );
-}
-
 use crate::test_support::HashVecProvider;
 
 /// Verifies `@` is quoted as an unsafe FTS5 bareword and dispatch succeeds.
@@ -277,7 +174,9 @@ async fn recall_with_residual_fts5_char_now_sanitized() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     // Query text matches the note content exactly so the hash-vec embedder
@@ -331,7 +230,7 @@ async fn recall_836_degrades_to_fts_only_when_ann_lock_is_held() {
         .await
         .expect("create note");
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann_handle = pack.ann.clone();
 
     let mut builder = VerbRegistryBuilder::new();
@@ -414,7 +313,9 @@ async fn recall_836_normal_path_has_no_degraded_marker() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let result = registry
@@ -470,7 +371,7 @@ async fn recall_executed_event_carries_the_degradation() {
         .await
         .expect("create note");
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann_handle = pack.ann.clone();
 
     let mut builder = VerbRegistryBuilder::new();
@@ -604,7 +505,7 @@ async fn recall_1477_skipped_fresh_tail_stamps_degraded() {
         .await
         .expect("create note");
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann_handle = pack.ann.clone();
 
     // Warm the ANN bridge synchronously so the fresh-tail leg is
@@ -681,7 +582,7 @@ async fn recall_2587_degraded_reason_carries_the_error_on_a_non_empty_response()
         .await
         .expect("create note");
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann_handle = pack.ann.clone();
 
     // Warm the bridge synchronously so the fresh-tail leg runs on the
@@ -806,7 +707,7 @@ async fn recall_2587_degraded_reason_carries_the_error_on_an_empty_response() {
         .await
         .expect("create note");
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann_handle = pack.ann.clone();
 
     // One warm registers and activates this consumer, which the capped
@@ -931,7 +832,7 @@ async fn recall_budget_capped_empty_response_still_discloses_ann_degradation() {
         .await
         .expect("create note");
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann_handle = pack.ann.clone();
 
     // A one-character budget guarantees the first ranked candidate
@@ -1017,7 +918,7 @@ async fn recall_1657_degraded_with_zero_fts_hits_carries_marker_and_reason() {
     // Deliberately no notes seeded: the FTS leg has nothing to match, so
     // an ANN-degraded recall resolves to an empty result set that must
     // still carry the degradation evidence.
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann_handle = pack.ann.clone();
 
     let mut builder = VerbRegistryBuilder::new();
@@ -1082,7 +983,9 @@ async fn recall_1657_genuine_empty_match_has_no_degraded_marker() {
     // empty array with no degraded marker.
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let result = registry
@@ -1256,7 +1159,7 @@ async fn recall_836_self_build_timeout_detaches_build_instead_of_dropping_it() {
         .await
         .expect("create note");
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann_handle = pack.ann.clone();
     let build_hook = super::super::common::retrieval_failpoints::hold_ann_build(MODEL);
 
@@ -1392,7 +1295,9 @@ async fn hot_path_guard_g1_recall_batches_served_targets_into_one_writer_acquisi
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
     builder
         .with_runtime_event_store(&rt)
@@ -1534,7 +1439,9 @@ async fn recall_stamps_served_by_profile_id_and_appends_serve_ledger_row() {
     let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -1677,7 +1584,9 @@ async fn recall_with_unreadable_bound_profile_persists_unattributed_marker_on_le
     let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -1771,7 +1680,9 @@ async fn recall_emits_exactly_one_recall_executed_event() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
@@ -1889,7 +1800,9 @@ async fn successful_empty_recall_emits_recall_executed_event() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
@@ -1946,7 +1859,9 @@ async fn recall_failure_emits_no_recall_executed_event() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
@@ -2059,7 +1974,9 @@ async fn recall_event_store_acquisition_failure_warns_without_failing_response()
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
@@ -2222,7 +2139,9 @@ async fn recall_stamps_served_by_profile_id_via_actor_binding() {
     let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     // `VerbRegistry` mints its own per-dispatch tokens from its own
     // construction-baked actor id (independent of `RuntimeConfig::actor_id`,
@@ -2413,7 +2332,9 @@ async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
     let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     builder.with_actor_id(Some("leo".to_string()));
     let registry = builder.build().expect("registry");
@@ -2511,7 +2432,9 @@ async fn recall_anonymous_caller_does_not_match_explicit_actor_local_binding() {
     let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     // No `with_actor_id` call — registry-minted tokens stay anonymous too.
     let registry = builder.build().expect("registry");
@@ -2626,7 +2549,9 @@ async fn recall_without_brain_pack_omits_stamp_and_does_not_error() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let result = registry
@@ -2670,7 +2595,9 @@ async fn dispatch_single_note_recall(
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let mut params = serde_json::json!({
@@ -2793,7 +2720,9 @@ async fn recall_profile_resolution_latency_is_bounded() {
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(MemoryPack::new(
+            crate::test_support::with_receipt_credentials(rt.clone()),
+        ));
         if with_brain {
             builder.register(BrainPack::new(rt.clone()));
         }
@@ -3021,7 +2950,9 @@ async fn adr104_build_ranking_corpus() -> (
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
@@ -3141,7 +3072,9 @@ async fn recall_no_profile_scores_identically_with_or_without_brain_pack() {
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(MemoryPack::new(
+            crate::test_support::with_receipt_credentials(rt.clone()),
+        ));
         if with_brain {
             builder.register(BrainPack::new(rt.clone()));
         }
@@ -3204,7 +3137,9 @@ async fn recall_profile_id_override_stamps_ledger_and_rejects_unknown_profile() 
     let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -3352,7 +3287,9 @@ async fn namespaced_recall_loads_arm_profile_and_applies_its_state() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(BrainPack::new(rt.clone()));
     let registry = builder.build().expect("registry");
 
@@ -3433,7 +3370,9 @@ async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() 
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(MemoryPack::new(
+            crate::test_support::with_receipt_credentials(rt.clone()),
+        ));
         let registry = builder.build().expect("registry");
 
         let result = registry
@@ -3627,7 +3566,9 @@ async fn adr104_stage_b_no_posterior_candidate_scores_identically_with_fresh_pro
     let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -3715,7 +3656,9 @@ async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -3825,7 +3768,9 @@ async fn adr104_stage_b_saturated_posterior_never_exceeds_clamp_bound_end_to_end
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -3939,7 +3884,9 @@ async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count()
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -4053,7 +4000,9 @@ async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(ADR104_TRAINING_ACTOR.to_string()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -4179,7 +4128,9 @@ async fn adr104_r2_measure_profile_state_read_overhead() {
     let brain = BrainPack::new(rt.clone());
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(brain);
     let registry = builder.build().expect("registry");
 
@@ -4295,7 +4246,9 @@ async fn ns733_seed_three_memories() -> (khive_runtime::VerbRegistry, Uuid, Uuid
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     async fn remember(
@@ -4341,7 +4294,9 @@ async fn bound_actor_recalls_its_episodic_memory_without_a_namespace_param() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
     let identity = || khive_runtime::RequestIdentity {
         namespace: "local".to_string(),
@@ -4479,7 +4434,7 @@ async fn ns733_recall_namespace_explicit_returns_only_that_namespace() {
 #[serial_test::serial(config_ledger)]
 async fn direct_recall_rejects_namespace_token_mismatch() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let token = rt.authorize(Namespace::local()).expect("local token");
     let registry = VerbRegistryBuilder::new()
         .build()
@@ -4618,7 +4573,7 @@ async fn assert_ns733_overfetch_with_namespace_metadata(metadata: Ns733Namespace
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    let memory_pack = MemoryPack::new(rt.clone());
+    let memory_pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann = memory_pack.ann_for_test();
     let ann_key = crate::ann::AnnKey::from_token(NS733_ANN_MODEL);
     // Remember queues background warms. Keep them behind the model lock
@@ -4839,7 +4794,10 @@ async fn ns733b_seed_two_model_corpus(
 }
 
 /// Multi-model verbose breakdown must exclude every off-namespace ANN candidate.
-#[tokio::test]
+// The in-memory backend serves reads from its one connection. A current-thread runtime
+// cannot run the background ANN task that holds it across an await while the write path
+// makes its synchronous readiness read, so this test needs a second worker thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(background_tasks)]
 async fn ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates() {
     // Poll only through the bounded stale-serve window; never retry corpus setup.
@@ -4855,7 +4813,9 @@ async fn ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_cand
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
@@ -4934,7 +4894,10 @@ fn ns733b_assert_breakdown(result: &Value, local_filler_ids: &HashSet<Uuid>, tar
 // covered by its own regression, independent of `memory.recall`'s ──────
 
 /// The candidates subhandler's independent model map must exclude off-namespace IDs.
-#[tokio::test]
+// The in-memory backend serves reads from its one connection. A current-thread runtime
+// cannot run the background ANN task that holds it across an await while the write path
+// makes its synchronous readiness read, so this test needs a second worker thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial(background_tasks)]
 async fn ns733b_recall_candidates_multi_model_excludes_off_namespace_candidates() {
     // Candidate diagnostics share the same bounded stale-serve window as recall.
@@ -4950,7 +4913,9 @@ async fn ns733b_recall_candidates_multi_model_excludes_off_namespace_candidates(
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
@@ -5049,7 +5014,9 @@ async fn dispatch_single_note_recall_with_entity(
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let mut params = serde_json::json!({
@@ -5121,7 +5088,7 @@ async fn adr104_stage_c_duplicate_name_crowding_preserves_each_candidate_boost()
             .expect("seed duplicate candidate A");
     }
 
-    let anchored = MemoryPack::new(rt)
+    let anchored = MemoryPack::new(crate::test_support::with_receipt_credentials(rt))
         .entity_anchored_candidates(&token, "crowdalpha crowdbeta")
         .await
         .expect("Stage C lookup");
@@ -5166,7 +5133,7 @@ async fn adr104_stage_c_non_ascii_case_lookup_end_to_end_is_bounded() {
         .upsert_entity(Entity::new(ns.as_str(), "concept", "École"))
         .await
         .expect("seed entity");
-    let pack = MemoryPack::new(rt);
+    let pack = MemoryPack::new(crate::test_support::with_receipt_credentials(rt));
 
     let same_spelling = pack
         .entity_anchored_candidates(&token, "École research archive")
@@ -5526,7 +5493,9 @@ async fn recall_889_zero_deadline_override_returns_invalid_input_via_dispatch() 
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let result = registry
@@ -5581,7 +5550,9 @@ async fn held_embed_deadline_result_with_caller_delay(caller_delay: Option<std::
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let start = std::time::Instant::now();
@@ -5796,7 +5767,9 @@ fn recall_30_deadline_exceeded_emits_abandoned_slow_path_warn() {
 
             let mut builder = VerbRegistryBuilder::new();
             builder.register(KgPack::new(rt.clone()));
-            builder.register(MemoryPack::new(rt.clone()));
+            builder.register(MemoryPack::new(
+                crate::test_support::with_receipt_credentials(rt.clone()),
+            ));
             let registry = builder.build().expect("registry");
 
             let result = registry
@@ -5983,7 +5956,9 @@ async fn recall_889_deadline_exceeded_does_not_affect_concurrent_sibling_op() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let slow_recall = registry.dispatch(
@@ -6051,7 +6026,9 @@ async fn recall_889_normal_path_succeeds_within_default_deadline() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let result = registry
@@ -6094,7 +6071,9 @@ async fn recall_889_generous_override_succeeds() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let result = registry
@@ -6177,7 +6156,9 @@ async fn recall_1116_one_failed_engine_still_serves_the_healthy_engines_hits() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     // Seed while only the healthy engine is registered — write-time
@@ -6243,7 +6224,9 @@ async fn recall_1116_all_engines_failed_returns_error_not_empty() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let result = registry
@@ -6290,7 +6273,9 @@ async fn recall_1116_one_engine_ann_retrieval_failure_still_serves_healthy() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     registry
@@ -6355,7 +6340,9 @@ async fn recall_1116_one_engine_sqlite_vec_retrieval_failure_still_serves_health
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     registry
@@ -6420,7 +6407,9 @@ async fn recall_persists_recall_executed_event_with_full_payload() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let before = khive_runtime::background_task_count();
@@ -6566,7 +6555,9 @@ async fn recall_created_at_window_filters_half_open() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let recall = |extra: Value| {
@@ -6713,7 +6704,9 @@ async fn recall_widens_when_out_of_window_candidates_crowd_out_eligible_ones() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     // Fixture precondition: without a window the target must NOT be in
@@ -6937,7 +6930,9 @@ async fn keyword_only_widening_ignores_vector_leg_candidates() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        crate::test_support::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry");
 
     let recall_ids = |v: &Value| -> Vec<String> {
@@ -7016,3 +7011,7 @@ async fn keyword_only_widening_ignores_vector_leg_candidates() {
         "keyword_only widening must not stop on vector-leg-only candidates"
     );
 }
+
+#[cfg(test)]
+#[path = "recall_boundary_tests.rs"]
+mod recall_boundary_tests;

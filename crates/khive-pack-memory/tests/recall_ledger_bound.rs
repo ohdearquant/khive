@@ -2,6 +2,9 @@
 //! returns its results. This file holds a single test so the process-wide
 //! ledger bound is configured and saturated before anything else uses it.
 
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use khive_pack_kg::KgPack;
 use khive_pack_memory::MemoryPack;
 use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
@@ -21,7 +24,9 @@ async fn recall_results_are_unchanged_when_the_ledger_write_is_dropped() {
     .expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // A held ledger task occupies the only pending slot, as a stalled writer would.

@@ -316,6 +316,11 @@ pub fn process_ref_from_env() -> Option<String> {
 /// shorthand beside the provider registry.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
+    /// Named custody references; secret material stays inside credential providers.
+    pub credentials: Vec<crate::credentials::CredentialConfig>,
+    /// Configured receipt key ring. Absence never generates a replacement key.
+    pub visibility_receipts: Option<crate::credentials::VisibilityReceiptConfig>,
+
     pub mounts: Vec<crate::mount_config::MountConfig>,
 
     /// Path to the SQLite database file. `None` = in-memory (tests).
@@ -542,6 +547,8 @@ impl Default for RuntimeConfig {
             .ok()
             .filter(|s| !s.trim().is_empty());
         Self {
+            credentials: Vec::new(),
+            visibility_receipts: None,
             db_path,
             wal_ceiling_bytes: 0,
             wal_ceiling_configured_bytes: 0,
@@ -896,6 +903,8 @@ pub fn runtime_config_from_khive_config(
     // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
     let mounts = khive_cfg.mounts.clone();
+    let credentials = khive_cfg.credentials.clone();
+    let visibility_receipts = khive_cfg.visibility_receipts.clone();
 
     // base.brain_profile must carry only the explicit CLI tier, never an env
     // value: env sits below toml in precedence and is applied later by the MCP resolver.
@@ -1007,6 +1016,8 @@ pub fn runtime_config_from_khive_config(
 
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
+            credentials,
+            visibility_receipts,
             default_namespace,
             brain_profile,
             visible_namespaces,
@@ -1049,6 +1060,8 @@ pub fn runtime_config_from_khive_config(
     }
 
     RuntimeConfig {
+        credentials,
+        visibility_receipts,
         embedding_model,
         additional_embedding_models: additional,
         default_namespace,

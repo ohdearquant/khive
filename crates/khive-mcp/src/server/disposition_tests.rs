@@ -1202,6 +1202,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/server/search_diagnostics.rs",
     ),
     (
+        "khive-mcp/src/server.rs",
+        "config_id",
+        "khive-mcp/src/server/config_id.rs",
+    ),
+    (
         "khive-mcp/src/daemon.rs",
         "executable",
         "khive-mcp/src/daemon/executable.rs",
@@ -1210,6 +1215,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-runtime/src/daemon.rs",
         "load_limits",
         "khive-runtime/src/daemon/load_limits.rs",
+    ),
+    (
+        "khive-runtime/src/daemon.rs",
+        "config_id",
+        "khive-runtime/src/daemon/config_id.rs",
     ),
     (
         "khive-runtime/src/daemon.rs",

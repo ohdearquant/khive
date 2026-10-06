@@ -16,6 +16,8 @@ use crate::stores::blob::{try_acquire_database_gc_owner_for_path, DatabaseGcOwne
 #[path = "session_identity_migration.rs"]
 mod session_identity_migration;
 
+mod memory_visibility;
+
 // =============================================================================
 // Legacy per-service migration API (preserved for backward compatibility)
 // =============================================================================
@@ -244,6 +246,8 @@ const V50_UP: &str = include_str!("../sql/050-entity-list-plans.sql");
 const V51_UP: &str = include_str!("../sql/051-schedule-core-indexes.sql");
 const V52_UP: &str = include_str!("../sql/052-comm-core-indexes.sql");
 const V53_UP: &str = include_str!("../sql/053-entity-kind-list-order.sql");
+const MEMORY_VISIBILITY_CUTOVER_VERSION: u32 = 54;
+const V54_UP: &str = include_str!("../sql/054-memory-visibility-epochs.sql");
 const V48_UP: &str = include_str!("../sql/048-acknowledgement-journal-a-table.sql");
 const ACKNOWLEDGEMENT_JOURNAL_INDEX: &str =
     include_str!("../sql/048-acknowledgement-journal-b-index.sql");
@@ -589,6 +593,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 53,
         name: "entity_kind_list_order",
         up: V53_UP,
+    },
+    VersionedMigration {
+        version: MEMORY_VISIBILITY_CUTOVER_VERSION,
+        name: "memory_visibility_epochs",
+        up: V54_UP,
     },
 ];
 
@@ -1327,7 +1336,17 @@ pub fn validate_schema_is_current(conn: &Connection) -> Result<u32, SqliteError>
         ));
     }
 
+    if current_version >= MEMORY_VISIBILITY_CUTOVER_VERSION {
+        memory_visibility::validate_cutover(conn)?;
+    }
+
     Ok(current_version)
+}
+
+/// Require the complete core migration ledger and readable memory provenance
+/// schema without applying migrations or inferring an individual note's epoch.
+pub fn validate_memory_visibility_cutover(conn: &Connection) -> Result<(), SqliteError> {
+    validate_schema_is_current(conn).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1595,6 +1614,17 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             continue;
         }
 
+        if migration.version == 46 {
+            memory_visibility::capture_pre_v46(&tx).map_err(|error| SqliteError::Migration {
+                version: migration.version,
+                error: error.to_string(),
+            })?;
+            #[cfg(test)]
+            memory_visibility::test_state::stop_at(
+                memory_visibility::test_state::Stop::AfterCapture,
+            )?;
+        }
+
         if migration.version == ATTACHMENT_CUTOVER_VERSION {
             let status = attachment_cutover_status(&tx).map_err(|e| SqliteError::Migration {
                 version: migration.version,
@@ -1666,6 +1696,17 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                 })?;
         }
 
+        let visibility_counts = if migration.version == MEMORY_VISIBILITY_CUTOVER_VERSION {
+            Some(memory_visibility::cutover_counts(&tx).map_err(|error| {
+                SqliteError::Migration {
+                    version: migration.version,
+                    error: error.to_string(),
+                }
+            })?)
+        } else {
+            None
+        };
+
         // V19's repair contract includes normalizing the two known-divergent
         // recorded names. `_schema_migrations` is created and owned by this
         // runner (not by any migration file), so the normalization lives
@@ -1699,10 +1740,25 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
             test_sync::WINNER_COMMITTED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
+        #[cfg(test)]
+        if migration.version == MEMORY_VISIBILITY_CUTOVER_VERSION {
+            memory_visibility::test_state::stop_at(
+                memory_visibility::test_state::Stop::BeforeCutoverCommit,
+            )?;
+        }
         tx.commit().map_err(|e| SqliteError::Migration {
             version: migration.version,
             error: e.to_string(),
         })?;
+        if let Some(counts) = visibility_counts {
+            memory_visibility::log_counts(&counts, conn.path().unwrap_or(":memory:"));
+        }
+        #[cfg(test)]
+        if migration.version == 46 {
+            memory_visibility::test_state::stop_at(
+                memory_visibility::test_state::Stop::AfterV46Commit,
+            )?;
+        }
 
         applied_version = migration.version;
     }

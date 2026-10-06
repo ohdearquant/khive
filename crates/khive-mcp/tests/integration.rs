@@ -12,6 +12,12 @@
 
 // Force the knowledge pack to be linked (inventory::submit! requires the crate
 // to be linked into the test binary for its PackRegistration to self-register).
+#[path = "support/integration_full_server.rs"]
+mod full_server;
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+use full_server::make_full_server;
+
 use khive_pack_knowledge as _;
 
 use async_trait::async_trait;
@@ -3259,27 +3265,6 @@ async fn test_prev_after_unrelated_failure_points_at_the_failed_op() -> anyhow::
 // These tests confirm that help=true calls through the MCP surface return
 // non-empty params slices with specific known parameters — verifying that
 // the HandlerDef.params slices are populated (not left as &[]).
-
-fn make_full_server() -> KhiveMcpServer {
-    disable_daemon();
-    let config = RuntimeConfig {
-        db_path: None,
-        actor_id: Some("brain-feedback-test".to_string()),
-        default_namespace: Namespace::parse("test").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec![
-            "kg".to_string(),
-            "gtd".to_string(),
-            "memory".to_string(),
-            "brain".to_string(),
-            "session".to_string(),
-        ],
-        ..RuntimeConfig::default()
-    };
-    let runtime = KhiveRuntime::new(config).expect("in-memory runtime with all packs");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+gtd+memory+brain+session")
-}
 
 async fn connect_full(
 ) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {

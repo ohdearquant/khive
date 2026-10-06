@@ -1151,3 +1151,48 @@ authority, placement rule, maintained count or snapshot-isolation promise.
 Count-free paging does not itself bound skipped offset entries, residual-filter
 work or payload sizes. SQLite access paths and their measured acceptance are
 specified by ADR-015's proposed ordered entity-list amendment.
+
+## Amendment: count-free compound event pages (2026-10-06, #4118)
+
+**Status: Accepted (2026-10-06).** Acceptance is required before dependent implementation merges.
+This is an additive capability; the preceding streaming-walk proposal and existing
+`query_events`/`count_events` contracts remain unchanged.
+
+`EventStore::query_event_page(EventPageQuery)` returns an `EventPageWindow` containing
+`EventPageRow { event, order_key }` values and an optional `budget_stop` order key.
+Its default is an explicit
+`Unsupported(Events, "query_event_page")` error. There is no offset-query fallback.
+The query carries inclusive `since_us`, exclusive `until_us`, canonical kind and
+actor lists, namespace exclusions, an optional compound `after` key, and `max_rows`.
+The scoped store supplies the namespace. Empty kind/actor lists impose no predicate.
+Every predicate, including exclusions and strict seek, applies before ordering and
+the row limit. The operation performs no count or offset query.
+
+Order is ascending signed microsecond `created_at`, then the exact physical event
+ID text in binary collation. `EventOrderKey` preserves that text before UUID decoding;
+normalizing UUID spelling before seeking can skip or repeat rows. Returned physical
+IDs must parse as complete UUIDs equal to their decoded `Event.id`. The wire event ID
+remains the canonical UUID. Existing producer identity and split-plane multiset
+semantics are unchanged; this method introduces no deduplication or repair policy.
+If a returned leaf or merged prefix contains equal physical time/ID keys, the page
+must refuse before truncation. A strict cursor cannot resume between such rows;
+silently returning only one would lose data. Existing query/count behavior is unchanged.
+
+A leaf accepts 1 through 4096 rows. SQLite checks borrowed source text lengths before
+decoding each event and never returns a cumulative raw-text window above 1 MiB. When a
+row would pass that budget, the leaf stops before it and returns the rows already read
+with `budget_stop`, the order key of the row it did not return, so the refusal names
+the blocking row. A window shorter than `max_rows` without `budget_stop` means the
+leaf is exhausted. A stopped window is never presented to a caller as a short
+successful page, and no payload is truncated. Existing reader
+admission and cancellation remain applicable. Runtime normally requests `limit + 1`
+(at most 1001), over at most 16 namespaces and two event planes. The resulting 32 MiB
+raw-input bound is neither a measured RSS bound nor a bound on SQLite execution work.
+The public handler separately checks its actual serialized JSON against 4 MiB.
+
+Acceptance includes more than 4096 equal-time rows, physical UUID spelling order,
+predicate-removal controls with exact successful output oracles, no COUNT/OFFSET
+query observations, and explicit row/byte-budget refusals. The public live-window
+semantics are specified in [ADR-022](ADR-022-events-query-surface.md)'s compound-page
+amendment; transport composition is specified in
+[ADR-133](ADR-133-incidental-writes-off-the-request-hot-path.md) Amendment 8.

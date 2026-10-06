@@ -22,7 +22,7 @@ An always-machine-readable copy of this page is at
 | `kg`        | 26    | `KHIVE_PACKS=kg`                           | No — base substrate |
 | `gtd`       | 7     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
-| `brain`     | 16    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
+| `brain`     | 17    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 11    | `KHIVE_PACKS=kg,comm`                      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
@@ -1571,7 +1571,7 @@ request(ops="memory.vacuum()")
 
 ---
 
-## `brain` pack — 16 verbs
+## `brain` pack — 17 verbs
 
 Recall-tuning profiles: Beta-posterior scoring, profile lifecycle, and the actor/
 namespace/consumer-kind resolution table that picks which profile serves a given
@@ -1659,6 +1659,35 @@ best-effort live-window caveat. `window_event_total` remains independently read.
 
 ```text
 request(ops='brain.event_counts(since="2026-09-01T00:00:00Z", until="2026-09-02T00:00:00Z", kind="audit", group_by=["verb","actor"], exhaustive=true)')
+```
+
+### `brain.event_page` — Assertive
+
+Page stored event rows and their payloads in ascending timestamp/ID order, inside the
+caller's visible namespaces; the verb writes nothing. The cursor is a position in a live
+window, not a snapshot: a later page can only contain rows with greater stored keys. GTD
+audit rows, current and historical, carry no task ID or prior/new status, and the page
+infers none. A response is capped at 4 MiB; a page over the cap is refused, and a single
+row over it is refused with that row's `event_id` and a `resume_after` cursor that skips it.
+
+| Param                | Type    | Required | Notes                                                                                                    |
+| -------------------- | ------- | -------- | -------------------------------------------------------------------------------------------------------- |
+| `since`              | string  | yes      | Inclusive window start, RFC 3339, or a date in the display timezone.                                     |
+| `until`              | string  | no       | Exclusive window end. Omitted on the first page, it freezes at now; continuations keep that bound.       |
+| `kind`               | string  | no       | One EventKind, combined with `kinds` and deduplicated.                                                   |
+| `kinds`              | array   | no       | EventKind names; omit for all kinds.                                                                     |
+| `namespaces`         | array   | no       | At most 16, intersected with current visibility. Default is the request namespace; `[]` selects nothing. |
+| `exclude_namespaces` | array   | no       | At most 32 namespaces excluded before paging.                                                            |
+| `actor`              | string  | no       | Same aliases and visibility policy as `brain.event_counts`; defaults to the caller.                      |
+| `all_actors`         | bool    | no       | Requires the serving `[brain] fleet_readers` allowlist; cannot be combined with `actor`.                 |
+| `limit`              | integer | no       | Page size 1 to 1000; default 100.                                                                        |
+| `after`              | string  | no       | Opaque `next_after` from the previous page; filters, principal and visibility must still match.          |
+
+The result carries `count`, `events`, `has_more`, `next_after`, the resolved `since` and
+`until`, `scope.namespaces`, and `consistency: "live_ordered_window"`.
+
+```
+request(ops="brain.event_page(since=\"2026-10-01T00:00:00Z\", kind=\"audit\", limit=50)")
 ```
 
 ### `brain.profiles` — Assertive

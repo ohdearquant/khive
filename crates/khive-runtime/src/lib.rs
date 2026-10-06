@@ -24,6 +24,8 @@ pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
 pub mod credentials;
+mod visibility_receipts;
+pub use visibility_receipts::AuthenticatedVisibilityReceipt;
 pub mod curation;
 pub mod daemon;
 pub mod email_message_id;
@@ -32,6 +34,7 @@ pub mod engine_config;
 pub mod entity_write;
 pub mod error;
 mod error_projection;
+mod event_page;
 mod event_store_guard;
 pub mod events_split;
 mod fence_identity;
@@ -147,6 +150,9 @@ pub use error::{
     WRITER_TASK_REQUEST_FAILED_STAGE, WRITER_TASK_TERMINATED_STAGE,
 };
 pub use error_projection::runtime_error_value;
+pub use event_page::{
+    page_budget_exceeded_error, row_exceeds_budget_error, EventReadPageRequest, EventReadPageResult,
+};
 pub use event_store_guard::EventAttribution;
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
