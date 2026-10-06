@@ -418,7 +418,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.ingest.quarantine_repair",
-        site: "khive-pack-comm/src/handlers.rs::repair_duplicate_quarantine",
+        site: "khive-pack-comm/src/handlers/ingest.rs::repair_duplicate_quarantine",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::FixedKeySet { key_paths: &["$.channel_slug", "$.quarantine_content_ref"] },

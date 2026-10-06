@@ -4791,7 +4791,7 @@ impl KhiveRuntime {
     ///
     /// This is a deliberately named, separate entry point rather than a flag
     /// on `try_create_note` so the trust decision is visible at every call
-    /// site: `comm.ingest` (`khive-pack-comm/src/handlers.rs`) is the sole
+    /// site: `comm.ingest` (`khive-pack-comm/src/handlers/ingest.rs`) is the sole
     /// legitimate caller, because it is the only code that has just derived
     /// quarantine disposition and channel provenance from the inbound
     /// transport itself. The caller set is bounded by possession, not

@@ -3,8 +3,8 @@
 Technical reference for the `comm` pack's message write, threading, and read path —
 `comm.send` / `comm.delivered` / `comm.inbox` / `comm.read` / `comm.mark_read` / `comm.reply` /
 `comm.thread` / `comm.ingest` —
-spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
-`vocab.rs`.
+spanning `message.rs`, `handlers.rs`, `handlers/ingest.rs`, `params.rs`, and the
+inbox/thread indexes in `vocab.rs`.
 
 ## File attachments on local messages
 
@@ -666,6 +666,8 @@ a new row inserted before a cursor already passed may not be observed. It does n
 snapshot, bound total thread memory/work, or change the public chronological cursor contract.
 
 ## `handlers.rs::handle_ingest`
+
+The implementation lives in `handlers/ingest.rs`; `handlers.rs` retains the dispatch facade.
 
 Writes a single inbound message note from a channel adapter. This is a
 `Visibility::Subhandler` verb: not accessible via the MCP wire, only callable
