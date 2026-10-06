@@ -3,6 +3,65 @@
 use super::*;
 
 impl KhiveRuntime {
+    /// Merge `from_id` note into `into_id` note.
+    ///
+    /// Both notes must exist in the namespace and have the same `kind`. Content is merged
+    /// per `content_strategy`. Properties are merged per `strategy`. `from_id` is
+    /// tombstoned (status='deleted', deleted_at set). Returns a summary.
+    ///
+    /// If `dry_run` is true, computes and returns the planned summary without mutating
+    /// any rows, edges, or indexes.
+    /// The NoteMerged event, including destructive edge preimages, commits in
+    /// the same SQL transaction as the note and edge changes.
+    pub async fn merge_note(
+        &self,
+        token: &NamespaceToken,
+        into_id: Uuid,
+        from_id: Uuid,
+        strategy: EntityDedupMergePolicy,
+        content_strategy: ContentMergeStrategy,
+        dry_run: bool,
+    ) -> RuntimeResult<MergeSummary> {
+        self.merge_note_with_reason(
+            token,
+            into_id,
+            from_id,
+            strategy,
+            content_strategy,
+            dry_run,
+            None,
+        )
+        .await
+    }
+
+    /// Merge `from_id` note into `into_id` note and include an optional audit reason.
+    // REASON: these arguments mirror the merge verb's policy, content strategy,
+    // dry-run, and audit-reason fields; a builder would only move that surface.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn merge_note_with_reason(
+        &self,
+        token: &NamespaceToken,
+        into_id: Uuid,
+        from_id: Uuid,
+        strategy: EntityDedupMergePolicy,
+        content_strategy: ContentMergeStrategy,
+        dry_run: bool,
+        reason: Option<String>,
+    ) -> RuntimeResult<MergeSummary> {
+        self.merge_note_with_guard(
+            token,
+            into_id,
+            from_id,
+            strategy,
+            content_strategy,
+            dry_run,
+            reason,
+            None,
+        )
+        .await
+        .map(|(summary, _)| summary)
+    }
+
     /// Merge `from_id` note into `into_id` note, refusing unless the caller's
     /// guard still holds.
     ///
