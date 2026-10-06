@@ -71,14 +71,14 @@ const EXPECTED: &[(&str, &str, &str, &str, usize)] = &[
         1,
     ),
     (
-        "khive-runtime/src/curation.rs",
+        "khive-runtime/src/curation/entity_curation.rs",
         "entity_vector_insert_statements",
         "DELETE",
         "{table}",
         1,
     ),
     (
-        "khive-runtime/src/curation.rs",
+        "khive-runtime/src/curation/entity_curation.rs",
         "entity_vector_insert_statements",
         "INSERT",
         "{table}",

@@ -21,13 +21,13 @@ same-named nested key.
 
 Field applicability guard — authoritative field sets per substrate. Source of truth:
 `handler_defs.rs:241-243` + `EntityPatch`/`NotePatch`/`EdgePatch` in
-`crates/khive-runtime/src/curation.rs`:
+`crates/khive-runtime/src/curation/types_and_guards.rs`:
 
-| Substrate | Patchable fields |
-| --------- | ----------------- |
-| Entity    | `name`, `description`, `tags`, `properties` |
+| Substrate | Patchable fields                                                                                                                     |
+| --------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| Entity    | `name`, `description`, `tags`, `properties`                                                                                          |
 | Note      | `name`, `content`, `salience`, `decay_factor`, `properties` (notes have NO top-level tags column; tags live in `properties["tags"]`) |
-| Edge      | `relation`, `weight`, `properties` |
+| Edge      | `relation`, `weight`, `properties`                                                                                                   |
 
 `scheduled_event` is the security-sensitive exception: ADR-119 Amendment 4 makes those
 notes schedule-managed, so generic note update and merge reject them before applying any
