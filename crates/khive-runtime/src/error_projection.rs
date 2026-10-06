@@ -17,7 +17,9 @@ use crate::{DomainDisposition, RuntimeError};
 pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
     // These named outcomes carry their own domain proof. Do not infer general
     // write disposition from a conflict or unavailable variant.
+    let receipt_projection = crate::visibility_receipts::receipt_error_projection(&error);
     let named_disposition = match &error {
+        _ if receipt_projection.is_some_and(|(_, replay)| replay) => Some("not_committed"),
         // An immutable-stream policy refusal is a definite no-write. It is matched by the
         // shared predicate rather than by a reason string so the two consumers of that
         // predicate and this projection cannot drift into disagreeing about it.
@@ -227,6 +229,9 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         }
     };
     let mut value = payload;
+    if let Some((retryable, _)) = receipt_projection {
+        value["retryable"] = json!(retryable);
+    }
     value["domain_disposition"] = json!(disposition.as_str());
     if let Some(named) = named_disposition {
         value["domain_disposition"] = json!(named);

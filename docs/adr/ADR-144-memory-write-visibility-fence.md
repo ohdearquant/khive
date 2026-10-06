@@ -531,8 +531,8 @@ establish an actual consumer's session proof.
 
 ## Amendment 4 (2026-10-04): unknown write epochs at the sealed-receipt cutover
 
-**Status**: Proposed. Refs #3619. Acceptance is required before the dependent
-sealed-receipt implementation merges.
+**Status**: Accepted (2026-10-06). Refs #3619. Acceptance is required before the
+dependent sealed-receipt implementation merges.
 
 ### Deployed state and scope
 
@@ -598,6 +598,17 @@ New code must not serve a database until its cutover has completed, and old
 writers must not keep writing after that point. An interrupted migration either
 rolls back or resumes from its durable provenance without substituting the
 database's now-current version for the captured historical population.
+
+Receipt custody is not a precondition for writing. Where no receipt key is
+configured, `memory.remember` still succeeds and persists the receipt header,
+the model fences, and the `modern` marker exactly as a sealed write does; only
+the sealing is skipped. The response then carries `visibility_token: null` and
+`visibility_token_reason: "visibility_key_unavailable"`, never a clear or
+fabricated token. Session recall refuses with `visibility_key_unavailable` and
+`retryable: true` while custody is absent, and once a key is configured an
+exact keyed replay reseals the stored fences under it. A hosted deployment
+provisions custody before it serves traffic, and startup logs a warning naming
+the missing receipt configuration.
 
 The cutover reports what it classified, per database, in its own output. The
 migration runner returns only the schema version it reached, so the cutover

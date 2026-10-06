@@ -256,6 +256,7 @@ impl MemoryPack {
             .unwrap_or_else(|| self.runtime.registered_embedding_model_names());
         let visible_namespaces = token.visible_namespace_strs();
         let session_fence = crate::visibility::parse_recall_visibility(
+            &self.runtime,
             p.consistency.as_ref(),
             p.visibility_token.as_ref(),
             &visible_namespaces,

@@ -272,7 +272,7 @@ async fn remember_bumps_the_generation_and_a_prior_build_still_installs() {
         dims: 8,
     });
     let token = rt.authorize(Namespace::local()).expect("authorize local");
-    let pack = crate::MemoryPack::new(rt.clone());
+    let pack = crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann = pack.ann_for_test();
     let key = AnnKey::from_token(MODEL);
     let captured_generation = current_generation(&ann, &key).await;
@@ -325,7 +325,7 @@ async fn prune_bumps_the_generation_and_a_prior_build_still_installs() {
         dims: 8,
     });
     let token = rt.authorize(Namespace::local()).expect("authorize local");
-    let pack = crate::MemoryPack::new(rt.clone());
+    let pack = crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
     let ann = pack.ann_for_test();
     let key = AnnKey::from_token(MODEL);
 

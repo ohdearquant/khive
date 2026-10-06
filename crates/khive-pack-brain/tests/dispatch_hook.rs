@@ -4,6 +4,9 @@
 //! profile's `total_events` counter lives in `snapshot.balanced_recall.total_events`.
 //! These tests verify the dispatch hook still updates the balanced-recall state.
 
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use std::sync::Arc;
 
 use khive_pack_brain::BrainPack;
@@ -68,7 +71,9 @@ async fn dispatch_hook_fires_on_cold_namespace_no_prior_activation() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let hook: Arc<dyn DispatchHook> = brain.clone();
     builder.with_dispatch_hook(hook);
     let registry = builder.build().expect("registry builds");
@@ -111,7 +116,9 @@ async fn dispatch_hook_applies_signals_per_namespace_independently() {
         let ns_owned = ns.to_string();
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt2));
-        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(MemoryPack::new(
+            receipt_credentials::with_receipt_credentials(rt.clone()),
+        ));
         builder.with_default_namespace(ns_owned);
         let hook: Arc<dyn DispatchHook> = brain2;
         builder.with_dispatch_hook(hook);
@@ -290,7 +297,9 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
     // pending_hook_signals (cold pending path, not the saved_states path).
     let mut hook_builder = VerbRegistryBuilder::new();
     hook_builder.register(KgPack::new(rt.clone()));
-    hook_builder.register(MemoryPack::new(rt.clone()));
+    hook_builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     hook_builder.with_default_namespace("local".to_string());
     let hook_arc: Arc<dyn DispatchHook> = brain_b.clone();
     hook_builder.with_dispatch_hook(hook_arc);
@@ -449,7 +458,9 @@ async fn memory_recall_through_real_registry_updates_brain_posteriors() {
     // purely off the runtime's real post-dispatch machinery.
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let hook: Arc<dyn DispatchHook> = brain.clone();
     builder.with_dispatch_hook(hook);
     let registry = builder.build().expect("registry builds");

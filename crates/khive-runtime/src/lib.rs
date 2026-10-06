@@ -24,6 +24,8 @@ pub mod config;
 pub mod config_ledger;
 pub mod cost_unit;
 pub mod credentials;
+mod visibility_receipts;
+pub use visibility_receipts::AuthenticatedVisibilityReceipt;
 pub mod curation;
 pub mod daemon;
 pub mod email_message_id;

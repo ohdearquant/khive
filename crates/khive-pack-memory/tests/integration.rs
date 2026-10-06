@@ -1,3 +1,9 @@
+#[path = "support/const_vec.rs"]
+mod const_vec;
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+use const_vec::ConstVecProvider;
+
 use async_trait::async_trait;
 use khive_brain_core::PackTunable;
 use khive_pack_gtd::GtdPack;
@@ -28,7 +34,9 @@ fn make_runtime() -> KhiveRuntime {
 fn make_registry(rt: KhiveRuntime) -> khive_runtime::VerbRegistry {
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     builder.build().expect("registry builds")
 }
 
@@ -485,7 +493,7 @@ async fn finite_adjustments_keep_rank_scores_numeric_through_mmr_and_final_sort(
         }
     }
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt.clone()));
     pack.warm().await;
     let token = rt.authorize(Namespace::local()).expect("local token");
 
@@ -1454,7 +1462,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     use khive_pack_memory::config::RecallConfig;
 
     let rt = make_runtime();
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt.clone()));
 
     // Sanity: with default config (0.70/0.20/0.10), the score for
     //   rrf=1.0, salience=1.0, decay=0.0, age=0 → 0.70+0.20+0.10 = 1.0
@@ -1505,7 +1513,7 @@ async fn test_pack_tunable_apply_config_affects_recall_score() {
     // mutating the live registry's config from outside. We construct the test
     // by exercising the same wire on a fresh pack.
     let rt2 = make_runtime();
-    let pack2 = MemoryPack::new(rt2.clone());
+    let pack2 = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt2.clone()));
     // Use Weighted strategy so the input relevance score (1.0) passes through
     // unnormalized — RRF strategy would scale it by (k+1) = 61, producing 61.0.
     let relevance_only = RecallConfig {
@@ -2361,66 +2369,6 @@ async fn recall_presentation_alias_is_rejected_by_deny_unknown_fields() {
 }
 
 // ── PR #444 regressions ──────────────────────────────────────────────────────
-
-/// Trivial constant-vector embedding service for testing without real model weights.
-/// The `_model` parameter is ignored; returns a synthetic `dims × seed` vector.
-struct ConstVecService {
-    dims: usize,
-    seed: f32,
-}
-
-#[async_trait]
-impl EmbeddingService for ConstVecService {
-    async fn embed(
-        &self,
-        texts: &[String],
-        _model: EmbeddingModel,
-    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
-        Ok(texts.iter().map(|_| vec![self.seed; self.dims]).collect())
-    }
-
-    fn supports_model(&self, _model: EmbeddingModel) -> bool {
-        true
-    }
-
-    fn name(&self) -> &'static str {
-        "const-vec"
-    }
-}
-
-struct ConstVecProvider {
-    provider_name: String,
-    dims: usize,
-    seed: f32,
-}
-
-impl ConstVecProvider {
-    fn new(name: &str, dims: usize, seed: f32) -> Self {
-        Self {
-            provider_name: name.to_owned(),
-            dims,
-            seed,
-        }
-    }
-}
-
-#[async_trait]
-impl EmbedderProvider for ConstVecProvider {
-    fn name(&self) -> &str {
-        &self.provider_name
-    }
-
-    fn dimensions(&self) -> usize {
-        self.dims
-    }
-
-    async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
-        Ok(Arc::new(ConstVecService {
-            dims: self.dims,
-            seed: self.seed,
-        }))
-    }
-}
 
 /// PR #444 regression: a runtime with no lattice
 /// `embedding_model` in config but a custom registered embedder must fan out
@@ -4320,7 +4268,9 @@ async fn adr007_rev4_writes_stamp_local() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     let result = registry
@@ -4387,7 +4337,9 @@ async fn adr007_rev4_no_actor_yields_local_only_visible_set() {
     let mut builder = VerbRegistryBuilder::new();
     // deliberately NOT calling with_visible_namespaces
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // Default recall must NOT surface the foreign note.
@@ -4470,7 +4422,9 @@ async fn adr007_rev4_explicit_namespace_is_strict_reading2() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // Explicit namespace="lambda:khive" → strict {lambda:khive} only.
@@ -4549,7 +4503,9 @@ async fn adr007_rev4_get_byid_is_namespace_agnostic() {
     let mut builder = VerbRegistryBuilder::new();
     // No visible_namespaces — local-only token will be minted by dispatch default.
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // get by UUID with no namespace= param → must resolve the lambda:khive note.
@@ -4598,7 +4554,9 @@ async fn adr007_rev4_default_recall_surfaces_actor_ns_via_both_legs() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // Step 3: write the note into lambda:khive via the Rule-3 explicit-namespace escape.
@@ -4689,7 +4647,9 @@ async fn adr007_rev4_default_recall_surfaces_actor_ns_via_fts_leg() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_visible_namespaces(rt.config().visible_namespaces.clone());
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("registry builds");
 
     // Write the note into lambda:khive via the Rule-3 explicit-namespace escape.
@@ -4820,7 +4780,7 @@ async fn test_multi_namespace_recall_overfetch_filter() {
     }
 
     // ── Assertion 2: wide token includes both namespaces ──────────────────────
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt.clone()));
     // Warm the ANN so vectors are indexed.
     pack.warm().await;
 
@@ -5060,7 +5020,7 @@ async fn c1_setup() -> (
         local_ids.push(r["id"].as_str().expect("note_id").to_string());
     }
 
-    let pack = MemoryPack::new(rt.clone());
+    let pack = MemoryPack::new(receipt_credentials::with_receipt_credentials(rt.clone()));
     {
         use khive_runtime::PackRuntime;
         pack.warm().await;
@@ -5180,7 +5140,9 @@ fn make_registry_with_actor(rt: KhiveRuntime, actor_id: &str) -> khive_runtime::
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some(actor_id.to_string()));
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     builder.build().expect("registry with actor builds")
 }
 
@@ -5375,7 +5337,9 @@ async fn adr007_rev6_episodic_cross_actor_isolation() {
     builder.with_actor_id(Some("alice".to_string()));
     builder.with_visible_namespaces(vec![Namespace::parse("alice").unwrap()]);
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let alice_registry = builder.build().expect("alice registry builds");
 
     // Anonymous (bob-equivalent) registry: no actor_id, no alice in visible set →
@@ -5811,7 +5775,9 @@ async fn test_readable_null_snapshot_profile_still_stamps_as_serving() {
 
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt.clone()));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     builder.register(NullSnapshotBrainPack);
     let registry = builder.build().expect("registry builds");
 
@@ -6800,7 +6766,9 @@ async fn generic_create_of_a_kind_with_its_own_hook_is_unaffected_by_the_memory_
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(GtdPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     let registry = builder.build().expect("registry builds");
 
     registry
@@ -7188,7 +7156,9 @@ async fn propose_add_note_changeset_admits_task_kind_via_the_proposal_note_hooks
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(rt.clone()));
     builder.register(GtdPack::new(rt.clone()));
-    builder.register(MemoryPack::new(rt));
+    builder.register(MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt),
+    ));
     let registry = builder.build().expect("registry builds");
 
     let propose = registry
@@ -7589,7 +7559,10 @@ async fn remember_over_embedding_budget_succeeds_and_discloses_truncation() {
 /// A keyed memory over the embedder input budget discloses the truncation on
 /// the fresh write and its replay. Replay retains the stored identity and
 /// fences, reports its recomputed truncation, and adds no rows.
-#[tokio::test]
+// The in-memory backend serves reads from its one connection. A current-thread runtime
+// cannot run the background ANN task that holds it across an await while the write path
+// makes its synchronous readiness read, so this test needs a second worker thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(config_ledger)]
 async fn keyed_remember_discloses_truncation_on_fresh_write_and_on_identical_replay() {
     let rt = KhiveRuntime::new(RuntimeConfig {
@@ -7639,7 +7612,10 @@ async fn keyed_remember_discloses_truncation_on_fresh_write_and_on_identical_rep
 
 /// Both remember branches retain a visibility fence while disclosing bounded
 /// embedding input. Keyed replay keeps that fence even after log compaction.
-#[tokio::test]
+// The in-memory backend serves reads from its one connection. A current-thread runtime
+// cannot run the background ANN task that holds it across an await while the write path
+// makes its synchronous readiness read, so this test needs a second worker thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial(config_ledger)]
 async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay() {
     const MODEL: &str = "all-minilm-l6-v2";
@@ -7670,13 +7646,16 @@ async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay
             json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
             "keyed={keyed}: truncation and its fence must be returned together"
         );
-        let receipt = created["visibility_token"].clone();
-        assert_eq!(receipt["version"], json!(1));
-        assert_eq!(receipt["namespace"], json!("local"));
-        assert_eq!(receipt["fences"].as_array().map(Vec::len), Some(1));
-        assert_eq!(receipt["fences"][0]["model"], json!(MODEL));
-        let seq = receipt["fences"][0]["ann_write_log_seq"]
-            .as_u64()
+        let receipt = created["visibility_token"]
+            .as_str()
+            .expect("sealed receipt is an opaque string");
+        let receipt_runtime = receipt_credentials::with_receipt_credentials(rt.clone());
+        let opened = receipt_runtime
+            .open_visibility_receipt(receipt, &["local"], &[MODEL.to_owned()])
+            .expect("authenticate the actual returned receipt");
+        assert_eq!(opened.namespace(), "local");
+        let seq = opened
+            .sequence_for_model(MODEL)
             .expect("positive committed vector fence");
         assert!(seq > 0);
         let id: Uuid = created["id"].as_str().expect("note id").parse().unwrap();
@@ -7727,7 +7706,15 @@ async fn remember_truncation_and_visibility_survive_fresh_write_and_keyed_replay
             let replayed = registry.dispatch("memory.remember", args).await.unwrap();
             assert_eq!(replayed["id"], created["id"]);
             assert_eq!(replayed["replayed"], json!(true));
-            assert_eq!(replayed["visibility_token"], receipt);
+            let resealed = replayed["visibility_token"]
+                .as_str()
+                .expect("replay returns an opaque receipt");
+            assert_ne!(resealed, receipt, "replay uses a fresh nonce");
+            let replay_fence = receipt_runtime
+                .open_visibility_receipt(resealed, &["local"], &[MODEL.to_owned()])
+                .expect("authenticate the replay receipt after log compaction");
+            assert_eq!(replay_fence.namespace(), "local");
+            assert_eq!(replay_fence.sequence_for_model(MODEL), Some(seq));
             assert_eq!(
                 replayed["warnings"], created["warnings"],
                 "replay must retain its computed truncation warning with the original fence"

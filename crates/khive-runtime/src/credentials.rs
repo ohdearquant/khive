@@ -13,8 +13,6 @@ pub use config::{
     CredentialConfig, CredentialKind, VisibilityReceiptConfig, VisibilityReceiptKeyConfig,
 };
 
-// S1 supplies the custody/codec seam before the later receipt cutover wires issuance.
-#[allow(dead_code)]
 pub(crate) mod receipt_sealer;
 
 #[cfg(test)]
@@ -159,6 +157,10 @@ impl CredentialRegistry {
         }
         self.providers.insert(name, provider);
         Ok(())
+    }
+
+    pub(crate) fn declarations(&self) -> Vec<CredentialConfig> {
+        self.declarations.values().cloned().collect()
     }
 
     pub fn kind(&self, name: &str) -> Result<CredentialKind, CredentialError> {

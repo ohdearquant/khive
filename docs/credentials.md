@@ -54,8 +54,8 @@ Receipt signing-key material is canonical, unpadded base64url encoding of exactl
 32 bytes (43 characters). Only the runtime-private receipt sealer decodes it.
 Deployments must supply the same immutable ID-to-key mapping across replicas and
 restarts; the sealer never creates a replacement key when one is unavailable.
-Retain retired decrypt-only keys for at least the accepted receipt lifetime plus
-clock skew before removing them, as specified by
+Retain retired decrypt-only keys for at least 24 hours plus five minutes after
+the last receipt sealed with that key across all replicas, as specified by
 [ADR-144 Amendment 2](adr/ADR-144-memory-write-visibility-fence.md).
 
 The sealer implements the accepted v2 envelope using XChaCha20-Poly1305 and a fresh
@@ -64,9 +64,55 @@ the version byte, the one-byte key-ID length, and the key-ID bytes. This concret
 encoding binds the accepted purpose, version, and key ID. It is internal to the
 server; clients treat receipts as opaque.
 
-This stage supplies custody and a private seal/open capability. It does not change
-`memory.remember`, recall, v1 receipts, or receipt issuance. Web request binding and
-cookie hooks are later stages. ADR-192 C2 (resolution/error redaction) and C8 (the
-store secret-gate backstop) have regressions here; request-pipeline C1 and C3–C7
-await that wiring. The store gate is a backstop, while keeping material out of
-ordinary request payloads and persisted records is the primary boundary.
+With a configured, available receipt key, `memory.remember` returns a sealed v2
+`visibility_token`. Session recall opens that token within the caller's
+authorized read namespaces; the token grants no access by itself. Clients retain
+the opaque string and send it back unchanged. Eventual recall does not require a
+receipt key. See [Memory and Recall](guide/memory.md#session-consistency) for the
+receipt lifetime and failure behavior.
+
+Receipt custody is not a precondition for writing. When no `[visibility_receipts]`
+section is configured, `memory.remember` still stores the memory, its receipt
+header, its model fences and its provenance marker; only the sealing is skipped.
+The response then carries `visibility_token: null` and
+`visibility_token_reason: "visibility_key_unavailable"`. Session recall refuses
+with `visibility_key_unavailable` (retryable) until a key is configured, and once
+one is, an exact keyed replay of such a write returns a sealed token for the
+stored fences. At startup a runtime without the section logs one warning on the
+`khive.boot` target naming `[visibility_receipts]`. Deploy hosted services with the
+section provisioned before they accept traffic.
+
+A write still refuses when the section is configured but cannot be used, when the
+configured key cannot be resolved, or when the database has not completed its
+memory visibility cutover.
+
+## Upgrading receipt issuance
+
+Stop all writers that use the older receipt implementation before upgrading a
+database. Provision the receipt ring on every serving replica, then complete the
+database migrations before serving requests. Intermediate source commits are not
+rolling-upgrade deployment states. Do not restart an older writer against the
+upgraded database.
+
+The cutover records durable provenance for existing keyed memories. Only an exact
+capture committed with the original receipt migration proves a legacy identity;
+an existing database that passed that migration without a capture cannot recover
+that evidence from note timestamps. A complete original receipt can establish a
+modern identity. Other identities remain unknown. Migration diagnostics report
+the classified counts to the operator, including unknown counts by namespace;
+caller responses do not expose these cohort counts.
+
+An unknown identity stays unknown if its receipt is later repaired. Inspect the
+operator diagnostics before enabling traffic; do not remove provenance records or
+infer missing fences from the current ANN log maximum. Receipt failures on an
+exact keyed replay preserve the holder's identity and do not create a replacement
+memory. Existing content remains available to eventual recall.
+
+For key rotation, distribute the new immutable ID-to-key mapping to every replica
+before making it the encrypting key. Keep the preceding key decrypt-only for the
+retention period above. Reusing an ID for different key material or generating a
+replacement key on restart invalidates receipts and is unsupported.
+
+Web request binding and cookie hooks remain separate work. The store secret gate
+is a backstop; keeping credential material out of ordinary request payloads and
+persisted records is the primary boundary.

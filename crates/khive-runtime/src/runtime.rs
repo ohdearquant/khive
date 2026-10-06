@@ -27,6 +27,8 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::note_search_ann::NoteSearchAnnProvider;
 use crate::pack::KindHook;
 
+#[path = "runtime/config_access.rs"]
+mod config_access;
 mod embedder_init;
 mod serving_policy;
 
@@ -295,6 +297,7 @@ fn same_diagnostic_database(a: &OpenedDiagnosticBackend, b: &OpenedDiagnosticBac
 /// for each storage capability, plus a lazily-loaded embedder.
 #[derive(Clone)]
 pub struct KhiveRuntime {
+    pub(crate) visibility_receipts: Arc<crate::visibility_receipts::ReceiptCapability>,
     backend: Arc<StorageBackend>,
     /// Successful named-vector bindings and their namespace-scoped stores.
     /// Shared by runtime clones so repeated reads do not enter the writer or
@@ -582,6 +585,7 @@ impl KhiveRuntime {
             )
             .into());
         }
+        backend.validate_memory_visibility_cutover()?;
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;
         }
@@ -594,7 +598,11 @@ impl KhiveRuntime {
         }
         let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let (registry, default_embedder_name) = build_embedder_registry(&config);
+        let visibility_receipts = Arc::new(
+            crate::visibility_receipts::ReceiptCapability::from_config(&config),
+        );
         Self {
+            visibility_receipts,
             backend,
             named_vector_stores: Arc::new(RwLock::new(HashMap::new())),
             core_named_vector_stores: None,
@@ -741,6 +749,7 @@ impl KhiveRuntime {
                     ),
                 };
                 KhiveRuntime {
+                    visibility_receipts: self.visibility_receipts.clone(),
                     backend: main_arc.clone(),
                     named_vector_stores: self
                         .core_named_vector_stores
@@ -813,32 +822,6 @@ impl KhiveRuntime {
         {
             false
         }
-    }
-
-    /// Return the extra-visible namespaces assembled at config load.
-    ///
-    /// OSS dispatch uses this set to widen the default multi-record read scope
-    /// to `['local'] ∪ visible_namespaces`. Writes are unchanged: always
-    /// pinned to `'local'`. This set is also available as gate/cloud policy
-    /// input.
-    pub fn visible_namespaces(&self) -> &[Namespace] {
-        &self.config.visible_namespaces
-    }
-
-    /// Return a reference to the runtime config.
-    pub fn config(&self) -> &RuntimeConfig {
-        &self.config
-    }
-
-    /// Install the host's full declared SQLite topology before pack registration.
-    pub fn with_declared_backend_db_paths(mut self, paths: Arc<[PathBuf]>) -> Self {
-        self.declared_backend_db_paths = paths;
-        self
-    }
-
-    /// All declared SQLite backend paths known to this runtime's host.
-    pub fn declared_backend_db_paths(&self) -> &[PathBuf] {
-        &self.declared_backend_db_paths
     }
 
     /// Install only pools the host actually opened. A bare runtime defaults
