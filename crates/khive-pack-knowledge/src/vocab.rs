@@ -8,17 +8,7 @@ use khive_types::{HandlerDef, IdResolutionMode, ParamDef, VerbCategory, Visibili
 /// core migration ledger so multi-backend boot applies them to Knowledge's
 /// assigned backend. Both statements are idempotent for repeated startup.
 pub(crate) static KNOWLEDGE_SCHEMA_PLAN_STMTS: [&str; 2] = [
-    "CREATE TABLE IF NOT EXISTS knowledge_eval_runs (\
-        id              TEXT PRIMARY KEY,\
-        namespace       TEXT NOT NULL,\
-        run_at          INTEGER NOT NULL,\
-        query_set       TEXT NOT NULL,\
-        total_queries   INTEGER NOT NULL,\
-        precision_at_5  REAL NOT NULL,\
-        recall_at_5     REAL NOT NULL,\
-        mrr             REAL NOT NULL,\
-        notes           TEXT\
-    )",
+    khive_runtime::sql!("knowledge_eval_runs_create"),
     "CREATE INDEX IF NOT EXISTS idx_knowledge_eval_runs_ns_run_at \
         ON knowledge_eval_runs(namespace, run_at DESC)",
 ];

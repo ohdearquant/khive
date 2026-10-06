@@ -67,11 +67,7 @@ fn invalidate_section_vectors_for_atom_rename(
     now: i64,
 ) -> SqlStatement {
     SqlStatement {
-        sql: "UPDATE knowledge_sections SET embedding=NULL, updated_at=?1 \
-              WHERE atom_id=?2 AND namespace=?3 AND embedding IS NOT NULL \
-              AND EXISTS (SELECT 1 FROM knowledge_atoms a \
-                          WHERE a.id=?2 AND a.namespace=?3 AND a.name<>?4)"
-            .into(),
+        sql: khive_runtime::sql!("knowledge_sections_invalidate_atom_rename").into(),
         params: vec![
             SqlValue::Integer(now),
             SqlValue::Text(id.to_string()),
@@ -220,13 +216,7 @@ fn knowledge_get_prefix_statement(prefix: &str) -> Option<SqlStatement> {
         // A domain's FTS mirror atom has the same UUID. UNION (rather than
         // UNION ALL) deduplicates that legitimate cross-table duplicate so
         // one domain is not reported as an ambiguous prefix.
-        sql: "SELECT id FROM knowledge_domains \
-              WHERE id >= ?1 AND id < ?2 AND deleted_at IS NULL \
-              UNION \
-              SELECT id FROM knowledge_atoms \
-              WHERE id >= ?1 AND id < ?2 AND deleted_at IS NULL \
-              ORDER BY id LIMIT 2"
-            .into(),
+        sql: khive_runtime::sql!("knowledge_get_prefix").into(),
         params: vec![SqlValue::Text(lower), SqlValue::Text(upper)],
         label: Some("knowledge.get.resolve_prefix".into()),
     })
@@ -459,8 +449,7 @@ impl KnowledgeHandlers {
                 AtomWrite::Upsert(atom_in) => atom_in,
                 AtomWrite::PropertiesOnly(atom_in) => {
                     statements.push(SqlStatement {
-                        sql: "UPDATE knowledge_atoms SET properties=?1, updated_at=?2 WHERE id=?3"
-                            .into(),
+                        sql: khive_runtime::sql!("knowledge_atom_properties_update").into(),
                         params: vec![
                             if atom_in.properties.is_null() {
                                 SqlValue::Null
@@ -511,26 +500,28 @@ impl KnowledgeHandlers {
 
             if insert {
                 statements.push(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, source_uri, source_type, status, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)".into(),
-                        params: vec![
-                            SqlValue::Text(id),
-                            SqlValue::Text(ns.clone()),
-                            SqlValue::Text(slug.clone()),
-                            SqlValue::Text(atom_in.name.clone()),
-                            SqlValue::Text(content.clone()),
-                            SqlValue::Text(tags_json.clone()),
-                            props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
-                            source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            // status mirrors the lifecycle backfill (finalized => reviewed) so a
-                            // freshly-finalized atom is never left at the 'draft' default.
-                            SqlValue::Text(if finalized { "reviewed" } else { "draft" }.to_string()),
-                            SqlValue::Integer(finalized as i64),
-                            SqlValue::Integer(now),
-                            SqlValue::Integer(now),
-                        ],
-                        label: None,
-                    });
+                    sql: khive_runtime::sql!("knowledge_atom_insert").into(),
+                    params: vec![
+                        SqlValue::Text(id),
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(slug.clone()),
+                        SqlValue::Text(atom_in.name.clone()),
+                        SqlValue::Text(content.clone()),
+                        SqlValue::Text(tags_json.clone()),
+                        props_json
+                            .as_ref()
+                            .map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
+                        source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        // status mirrors the lifecycle backfill (finalized => reviewed) so a
+                        // freshly-finalized atom is never left at the 'draft' default.
+                        SqlValue::Text(if finalized { "reviewed" } else { "draft" }.to_string()),
+                        SqlValue::Integer(finalized as i64),
+                        SqlValue::Integer(now),
+                        SqlValue::Integer(now),
+                    ],
+                    label: None,
+                });
                 created += 1;
             } else {
                 statements.push(invalidate_section_vectors_for_atom_rename(
@@ -544,7 +535,7 @@ impl KnowledgeHandlers {
                     // null. Finalized is non-nullable, so its null value is bound as
                     // false. Only true promotes draft -> reviewed; clearing the flag
                     // does not demote an independent lifecycle status.
-                    sql: "UPDATE knowledge_atoms SET name=?1, content=?2, tags=?3, properties=?4, source_uri=CASE WHEN ?5 = 1 THEN ?6 ELSE source_uri END, source_type=CASE WHEN ?7 = 1 THEN ?8 ELSE source_type END, finalized=CASE WHEN ?9 = 1 THEN ?10 ELSE finalized END, status=CASE WHEN ?9 = 1 AND ?10 = 1 AND status = 'draft' THEN 'reviewed' ELSE status END, updated_at=?11 WHERE id=?12 AND namespace=?13".into(),
+                    sql: khive_runtime::sql!("knowledge_atom_content_update").into(),
                     params: vec![
                         SqlValue::Text(atom_in.name.clone()),
                         SqlValue::Text(content),
@@ -658,7 +649,7 @@ impl KnowledgeHandlers {
             // the insert path runs, instead of leaking a raw unique-constraint error.
             let existing = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id, deleted_at FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_slug_probe").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
@@ -687,9 +678,7 @@ impl KnowledgeHandlers {
             // partially-committed domain row behind.
             let atom_collision = reader
                 .query_row(SqlStatement {
-                    sql:
-                        "SELECT id FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1"
-                            .into(),
+                    sql: khive_runtime::sql!("knowledge_atom_slug_probe").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(slug.clone())],
                     label: None,
                 })
@@ -710,9 +699,7 @@ impl KnowledgeHandlers {
             // ON CONFLICT(namespace, slug) would blind-overwrite an unrelated atom
             // that merely happens to share this slug.
             let mirror_stmt = SqlStatement {
-                sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, status, finalized, created_at, updated_at) \
-                      VALUES (?1,?2,?3,?4,?5,?6,?7,'reviewed',1,?8,?9) \
-                      ON CONFLICT(id) DO UPDATE SET slug=?3, name=?4, content=?5, tags=?6, properties=?7, status='reviewed', finalized=1, updated_at=?9".into(),
+                sql: khive_runtime::sql!("knowledge_domain_mirror_upsert").into(),
                 params: vec![
                     SqlValue::Text(id.clone()),
                     SqlValue::Text(ns.clone()),
@@ -733,10 +720,13 @@ impl KnowledgeHandlers {
                 .map_err(|e| sql_err("upsert_domains writer", e))?;
             if existing.is_some() {
                 let domain_stmt = SqlStatement {
-                    sql: "UPDATE knowledge_domains SET name=?1, description=?2, tags=?3, members=?4, updated_at=?5 WHERE id=?6 AND namespace=?7".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_update").into(),
                     params: vec![
                         SqlValue::Text(name.clone()),
-                        domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
+                        domain_in
+                            .description
+                            .as_ref()
+                            .map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
                         SqlValue::Text(tags_json.clone()),
                         SqlValue::Text(members_json.clone()),
                         SqlValue::Integer(now),
@@ -759,13 +749,16 @@ impl KnowledgeHandlers {
                 updated += 1;
             } else {
                 let domain_stmt = SqlStatement {
-                    sql: "INSERT INTO knowledge_domains (id, namespace, slug, name, description, tags, members, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_insert").into(),
                     params: vec![
                         SqlValue::Text(id.clone()),
                         SqlValue::Text(ns.clone()),
                         SqlValue::Text(slug.clone()),
                         SqlValue::Text(name.clone()),
-                        domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
+                        domain_in
+                            .description
+                            .as_ref()
+                            .map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
                         SqlValue::Text(tags_json.clone()),
                         SqlValue::Text(members_json.clone()),
                         SqlValue::Integer(now),
@@ -821,7 +814,7 @@ impl KnowledgeHandlers {
             // their same-slug mirror atoms.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_get_slug").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(id.clone())],
                     label: Some("knowledge.get.domain_by_slug".into()),
                 })
@@ -835,7 +828,7 @@ impl KnowledgeHandlers {
 
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_atom_get_slug").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(id.clone())],
                     label: Some("knowledge.get.atom_by_slug".into()),
                 })
@@ -892,7 +885,7 @@ impl KnowledgeHandlers {
             // its own mirror atom instead of the canonical domain record.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_get_id").into(),
                     params: vec![SqlValue::Text(resolved_id.clone())],
                     label: Some("knowledge.get.domain_by_id".into()),
                 })
@@ -905,9 +898,7 @@ impl KnowledgeHandlers {
             }
             let row = reader
                 .query_row(SqlStatement {
-                    sql:
-                        "SELECT * FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                            .into(),
+                    sql: khive_runtime::sql!("knowledge_atom_get_id").into(),
                     params: vec![SqlValue::Text(resolved_id)],
                     label: Some("knowledge.get.atom_by_id".into()),
                 })
@@ -981,10 +972,10 @@ impl KnowledgeHandlers {
         let cursor_key = if let Some(after_id) = after_id {
             let cursor_sql = match kind {
                 KnowledgeListKind::Atom => {
-                    "SELECT created_at, id FROM knowledge_atoms WHERE namespace = ?1 AND id = ?2 AND tags NOT LIKE '%type:domain%' LIMIT 1"
+                    khive_runtime::sql!("knowledge_atom_cursor_key")
                 }
                 KnowledgeListKind::Domain => {
-                    "SELECT created_at, id FROM knowledge_domains WHERE namespace = ?1 AND id = ?2 LIMIT 1"
+                    khive_runtime::sql!("knowledge_domain_cursor_key")
                 }
             };
             let row = reader
@@ -1083,7 +1074,7 @@ impl KnowledgeHandlers {
                 } else {
                     let total_row = reader
                         .query_scalar(SqlStatement {
-                            sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
+                            sql: khive_runtime::sql!("knowledge_domain_count").into(),
                             params: vec![SqlValue::Text(ns)],
                             label: None,
                         })
@@ -1362,13 +1353,7 @@ impl KnowledgeHandlers {
         // slice rather than two sequential scans (#2218).
         let atom_stats = reader
             .query_row(SqlStatement {
-                sql: "SELECT COUNT(*) AS total_atoms, \
-                             COALESCE(SUM(CASE WHEN finalized = 1 THEN 1 ELSE 0 END), 0) \
-                                 AS finalized_atoms \
-                      FROM knowledge_atoms \
-                      WHERE namespace = ?1 AND deleted_at IS NULL \
-                        AND tags NOT LIKE '%type:domain%'"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_atom_stats").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.atom_aggregates".into()),
             })
@@ -1377,7 +1362,7 @@ impl KnowledgeHandlers {
 
         let domain_count = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM knowledge_domains WHERE namespace = ?1 AND deleted_at IS NULL".into(),
+                sql: khive_runtime::sql!("knowledge_domain_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: None,
             })
@@ -1386,8 +1371,7 @@ impl KnowledgeHandlers {
 
         let event_count = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM events WHERE namespace = ?1 AND verb LIKE 'knowledge.%'"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_event_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.event_count".into()),
             })
@@ -1396,7 +1380,7 @@ impl KnowledgeHandlers {
 
         let retrieval_eval_run_count = reader
             .query_scalar(SqlStatement {
-                sql: "SELECT COUNT(*) FROM knowledge_eval_runs WHERE namespace = ?1".into(),
+                sql: khive_runtime::sql!("knowledge_eval_run_count").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.eval_run_count".into()),
             })
@@ -1405,9 +1389,7 @@ impl KnowledgeHandlers {
 
         let latest_retrieval_eval = reader
             .query_row(SqlStatement {
-                sql: "SELECT run_at, precision_at_5, mrr FROM knowledge_eval_runs \
-                      WHERE namespace = ?1 ORDER BY run_at DESC, rowid DESC LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_eval_latest").into(),
                 params: vec![SqlValue::Text(ns.clone())],
                 label: Some("knowledge.stats.latest_eval_run".into()),
             })
@@ -1498,10 +1480,7 @@ async fn fetch_sections(
 
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT * FROM knowledge_sections \
-                  WHERE atom_id = ?1 AND namespace = ?2 \
-                  ORDER BY sort_order ASC, created_at ASC, id ASC"
-                .into(),
+            sql: khive_runtime::sql!("knowledge_sections_for_atom").into(),
             params: vec![
                 SqlValue::Text(atom_id.to_owned()),
                 SqlValue::Text(ns.to_owned()),

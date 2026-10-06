@@ -552,6 +552,74 @@ class SqlLintTests(unittest.TestCase):
         self.assertIn("6 file(s) OK (2 prepared, 4 executed)", result.stdout)
 
 
+    def test_quoted_and_commented_bind_spelling_is_not_a_parameter(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        query = core / "quoted-bind-select.sql"
+        for name, literal, comment in [
+            ("domain tag", "'%type:domain%'", ""),
+            ("parameter text", "'?999 :name @name $name'", ""),
+            ("doubled quote", "'it''s :name ?999 @name $name'", ""),
+            ("line comment", "'ok'", "-- ?999 :name @name $name\n"),
+            ("line comment EOF", "'ok'", "-- ?999 :name @name $name"),
+            ("block comment", "'ok'", "/* ?999 :name\n @name $name */"),
+            ("block comment EOF", "'ok'", "/* ?999 :name @name $name"),
+        ]:
+            with self.subTest(name=name):
+                query.write_text(
+                    f"SELECT {literal} AS marker, message FROM deliveries "
+                    f"WHERE message = ?1 AND ?2 IS NULL" + (f" {comment}" if comment else "")
+                )
+                result = self.run_lint()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("2 file(s) OK (1 prepared, 1 executed)", result.stdout)
+
+    def test_quoted_identifier_bind_spelling_is_not_a_parameter(self):
+        core = self.core_fixture(
+            "CREATE TABLE deliveries (\n"
+            "    message TEXT,\n"
+            '    ":name" TEXT,\n'
+            '    "@name" TEXT,\n'
+            '    "$name" TEXT,\n'
+            '    "?999" TEXT,\n'
+            '    "double""quote:name?999" TEXT,\n'
+            '    "tick`mark:@name?999" TEXT\n'
+            ");\n"
+        )
+        query = core / "identifier-bind-select.sql"
+        for identifier in [
+            '":name"', '`@name`', '[$name]', '"?999"',
+            '"double""quote:name?999"', '`tick``mark:@name?999`',
+        ]:
+            with self.subTest(identifier=identifier):
+                query.write_text(
+                    f"SELECT {identifier} FROM deliveries WHERE message = ?1\n"
+                )
+                result = self.run_lint()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("2 file(s) OK (1 prepared, 1 executed)", result.stdout)
+
+    def test_real_bind_forms_and_gaps_still_fail(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        query = core / "real-bind-select.sql"
+        forbidden = "use numbered binds (?1, ?2), not anonymous or named ones"
+        gap = "positional binds must run 1..N with no gaps"
+        for name, predicate, diagnostic in [
+            ("anonymous", "message = ?", forbidden),
+            ("colon", "message = :name", forbidden),
+            ("at sign", "message = @name", forbidden),
+            ("dollar", "message = $name", forbidden),
+            ("gap", "message = ?1 AND ?3 IS NULL", gap),
+            ("literal cannot fill gap", "message = ?1 AND ?3 IS NULL AND '?2' <> ''", gap),
+            ("comment cannot fill gap", "message = ?1 AND ?3 IS NULL /* ?2 */", gap),
+            ("comment separates anonymous", "message = ?/* ?1 */1", forbidden),
+        ]:
+            with self.subTest(name=name):
+                query.write_text(f"SELECT message FROM deliveries WHERE {predicate}\n")
+                result = self.run_lint()
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"real-bind-select.sql: {diagnostic}", result.stdout)
+
+
 class SqlLintConnectionTests(unittest.TestCase):
     def factory(self, sqlite_module):
         # Compile only the actual constructor, so capability failures can be
