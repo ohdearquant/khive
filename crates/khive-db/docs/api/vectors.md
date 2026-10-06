@@ -55,7 +55,7 @@ before returning the error.
 
 ## `replace_vector_row_dml` — shared DELETE-then-INSERT replacement (#546)
 
-See `crates/khive-db/src/stores/vectors.rs` — private fn `replace_vector_row_dml`.
+See `crates/khive-db/src/stores/vectors/dml.rs` — private fn `replace_vector_row_dml`.
 
 `vec0` virtual tables do not support `INSERT OR REPLACE`, so every
 replacement path (single-record insert/update, batch insert, and the
