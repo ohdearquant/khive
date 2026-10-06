@@ -3,7 +3,7 @@
 Technical reference for the `comm` pack's channel-heartbeat write path
 (`comm.ingest`'s companion operational surface) and the read-only `comm.health`
 verb — how poll-loop outcomes are persisted and reported, spanning `lib.rs` and
-`handlers.rs`.
+`handlers.rs` and `handlers/health.rs`.
 
 ## `lib.rs::CHANNEL_HEALTH_NAMESPACE` — rationale
 
@@ -96,7 +96,9 @@ tenant-scoped `comm.health` now observes that tenant's writer state instead of
 an empty set by construction. An unscoped read still resolves to `"local"` and
 sees the poll loop's rows.
 
-## `handlers.rs::channel_health_to_json`
+<a id="handlersrschannel_health_to_json"></a>
+
+## `handlers/health.rs::channel_health_to_json`
 
 Projects a persisted `channel_health` note into the `comm.health()` channel
 entry shape. Missing fields on an actual heartbeat row (a row written before a
@@ -114,7 +116,8 @@ exact `(channel_kind, channel_slug)` matches this entry.
 
 ## `handlers.rs::handle_health`
 
-Read-only per-channel health snapshot (khive #606).
+Read-only per-channel health snapshot (khive #606). The implementation lives in
+`handlers/health.rs`; `handlers.rs` retains the dispatch facade.
 
 Reads the daemon-persisted `channel_health` rows from `token.namespace()`
 (khive #877) — the same injected-namespace resolution every other comm verb
