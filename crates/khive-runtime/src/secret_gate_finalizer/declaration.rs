@@ -444,7 +444,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.read.one",
-        site: "khive-pack-comm/src/handlers.rs::mark_read_target",
+        site: "khive-pack-comm/src/handlers/read_marking.rs::mark_read_target",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
@@ -457,7 +457,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.read.atomic",
-        site: "khive-pack-comm/src/handlers.rs::mark_read_targets_atomic",
+        site: "khive-pack-comm/src/handlers/read_marking.rs::mark_read_targets_atomic",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
