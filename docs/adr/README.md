@@ -242,7 +242,7 @@ Supporting documents are exhibits cited by an ADR. They are not ADRs, carry no A
 ## Closed Taxonomies — Quick Reference
 
 - **Entity kinds**: 8 shared base kinds in `khive_types` (`concept`, `document`, `dataset`, `project`, `person`, `org`, `artifact`, `service`) plus KG pack-side `resource` governance for actionable knowledge resources (ADR-001, ADR-048)
-- **Edge relations (19 in 9 categories)** (ADR-002, extended by ADR-055, ADR-191 and ADR-196):
+- **Edge relations (20 in 10 categories)** (ADR-002, extended by ADR-055, ADR-191, ADR-196 and ADR-197):
   - Structure: `contains`, `part_of`, `instance_of`, `links_to`, `located_in`
   - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
   - Provenance: `derived_from`
@@ -252,6 +252,7 @@ Supporting documents are exhibits cited by an ADR. They are not ADRs, carry no A
   - Lateral: `competes_with`, `composed_with`
   - Annotation: `annotates`
   - Epistemic: `supports`, `refutes`
+  - Ownership: `owns`
 - **Note kinds (5 base)**: `observation`, `insight`, `question`, `decision`, `reference` (ADR-013). Packs may add (e.g., GTD adds `task`; memory pack adds `memory`).
 
 ## Cross-Cutting Principles
