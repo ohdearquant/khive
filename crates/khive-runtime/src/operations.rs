@@ -1201,6 +1201,9 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     // without being a constituent of it; base rows for concept and org, packs narrow the rest.
     ("concept", EdgeRelation::LocatedIn, "concept"),
     ("org", EdgeRelation::LocatedIn, "concept"),
+    // Ownership
+    ("person", EdgeRelation::Owns, "org"),
+    ("org", EdgeRelation::Owns, "org"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -2786,7 +2789,7 @@ impl KhiveRuntime {
     ///
     /// - `annotates`: source MUST be a note; target may be any substrate.
     /// - `supersedes` / `supports` / `refutes`: same-substrate only (note→note or entity→entity).
-    /// - All other 13 relations: both endpoints MUST be entities.
+    /// - All other relations: both endpoints MUST be entities.
     ///
     /// Returns the validated endpoint substrates when valid; otherwise
     /// `InvalidInput` or `NotFound` for an invalid endpoint pair.

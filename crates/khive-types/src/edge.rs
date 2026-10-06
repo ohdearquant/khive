@@ -8,7 +8,7 @@ use core::str::FromStr;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// The 9 structural categories that group the 19 canonical edge relations.
+/// The 10 semantic categories that group the 20 canonical edge relations.
 ///
 /// Exposed via [`EdgeRelation::category`] for query planners and UI rendering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -34,9 +34,11 @@ pub enum EdgeCategory {
     Annotation,
     /// Evidence for/against a claim: `supports`, `refutes`
     Epistemic,
+    /// Current whole or partial ownership: `owns`
+    Ownership,
 }
 
-/// Closed set of 19 canonical edge relations.
+/// Closed set of 20 canonical edge relations.
 ///
 /// No `Default` — every edge requires an explicit relation.
 /// Wire format: snake_case strings (e.g. `"part_of"`, `"introduced_by"`).
@@ -72,11 +74,13 @@ pub enum EdgeRelation {
     // Epistemic
     Supports,
     Refutes,
+    // Ownership
+    Owns,
 }
 
 impl EdgeRelation {
-    /// All 19 canonical relations in ontology-table order.
-    pub const ALL: [Self; 19] = [
+    /// All 20 canonical relations in ontology-table order.
+    pub const ALL: [Self; 20] = [
         Self::Contains,
         Self::PartOf,
         Self::InstanceOf,
@@ -96,9 +100,10 @@ impl EdgeRelation {
         Self::Annotates,
         Self::Supports,
         Self::Refutes,
+        Self::Owns,
     ];
 
-    /// Valid snake_case names for all 19 canonical relations.
+    /// Valid snake_case names for all 20 canonical relations.
     pub const VALID_NAMES: &'static [&'static str] = &[
         "contains",
         "part_of",
@@ -119,6 +124,7 @@ impl EdgeRelation {
         "annotates",
         "supports",
         "refutes",
+        "owns",
     ];
 
     /// `true` for symmetric relations: edge direction has no semantic meaning.
@@ -159,6 +165,7 @@ impl EdgeRelation {
             Self::CompetesWith | Self::ComposedWith => EdgeCategory::Lateral,
             Self::Annotates => EdgeCategory::Annotation,
             Self::Supports | Self::Refutes => EdgeCategory::Epistemic,
+            Self::Owns => EdgeCategory::Ownership,
         }
     }
 
@@ -184,6 +191,7 @@ impl EdgeRelation {
             Self::Annotates => "annotates",
             Self::Supports => "supports",
             Self::Refutes => "refutes",
+            Self::Owns => "owns",
         }
     }
 }
@@ -199,7 +207,7 @@ impl FromStr for EdgeRelation {
 
     /// Parse a string into an `EdgeRelation`.
     ///
-    /// Accepts the 19 canonical relation names (case-insensitive, with hyphens
+    /// Accepts the 20 canonical relation names (case-insensitive, with hyphens
     /// normalised to underscores) and also squashed forms that omit the separator
     /// (e.g. `"partof"`, `"derivedfrom"`).  The squashed forms exist for ergonomic
     /// DSL entry; they are **not** stored on the wire, which always uses the
@@ -240,6 +248,7 @@ impl FromStr for EdgeRelation {
             "annotates" => Ok(Self::Annotates),
             "supports" => Ok(Self::Supports),
             "refutes" => Ok(Self::Refutes),
+            "owns" => Ok(Self::Owns),
             _ => Err(crate::error::UnknownVariant::new(
                 "edge_relation",
                 s,
@@ -255,12 +264,12 @@ mod tests {
     use alloc::string::ToString;
 
     #[test]
-    fn all_has_nineteen_variants() {
-        assert_eq!(EdgeRelation::ALL.len(), 19);
+    fn all_has_twenty_variants() {
+        assert_eq!(EdgeRelation::ALL.len(), 20);
     }
 
     #[test]
-    fn all_nine_categories_covered() {
+    fn all_ten_categories_covered() {
         let mut cats = alloc::vec::Vec::new();
         for r in EdgeRelation::ALL {
             let c = r.category();
@@ -268,7 +277,17 @@ mod tests {
                 cats.push(c);
             }
         }
-        assert_eq!(cats.len(), 9, "all 9 categories must be represented");
+        assert_eq!(cats.len(), 10, "all 10 categories must be represented");
+    }
+
+    #[test]
+    fn owns_is_directional_ownership() {
+        assert_eq!("owns".parse::<EdgeRelation>().unwrap(), EdgeRelation::Owns);
+        assert_eq!("OWNS".parse::<EdgeRelation>().unwrap(), EdgeRelation::Owns);
+        assert_eq!(EdgeRelation::Owns.to_string(), "owns");
+        assert_eq!(EdgeRelation::Owns.category(), EdgeCategory::Ownership);
+        assert!(!EdgeRelation::Owns.is_symmetric());
+        assert_eq!(EdgeRelation::Owns.canonical_endpoints(9, 2), (9, 2));
     }
 
     #[test]
@@ -338,7 +357,7 @@ mod tests {
             "error should list derived_from"
         );
         assert!(msg.contains("precedes"), "error should list precedes");
-        assert!(msg.contains("annotates"), "error should list all 19");
+        assert!(msg.contains("annotates"), "error should list annotates");
     }
 
     #[test]

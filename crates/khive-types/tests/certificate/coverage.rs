@@ -73,10 +73,16 @@ struct SystemRoleException {
 /// eliminators. `cites` is a worked example in cites.rs, not a variant of
 /// EdgeRelation::ALL. Add entries here only after EdgeRelation::ALL gains the
 /// variant and its certificate module passes all seven eliminators.
-const CERTIFIED_RELATIONS: &[CertifiedRelation] = &[CertifiedRelation {
-    relation: "located_in",
-    fixtures: crate::located_in::FIXTURES,
-}];
+const CERTIFIED_RELATIONS: &[CertifiedRelation] = &[
+    CertifiedRelation {
+        relation: "located_in",
+        fixtures: crate::located_in::FIXTURES,
+    },
+    CertifiedRelation {
+        relation: "owns",
+        fixtures: crate::owns::FIXTURES,
+    },
+];
 
 /// Relations in EdgeRelation::ALL kept by declared system role (ADR-076 §D1/§D3).
 ///
