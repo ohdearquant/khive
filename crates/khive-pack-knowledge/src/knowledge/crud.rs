@@ -720,10 +720,13 @@ impl KnowledgeHandlers {
                 .map_err(|e| sql_err("upsert_domains writer", e))?;
             if existing.is_some() {
                 let domain_stmt = SqlStatement {
-                    sql: "UPDATE knowledge_domains SET name=?1, description=?2, tags=?3, members=?4, updated_at=?5 WHERE id=?6 AND namespace=?7".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_update").into(),
                     params: vec![
                         SqlValue::Text(name.clone()),
-                        domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
+                        domain_in
+                            .description
+                            .as_ref()
+                            .map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
                         SqlValue::Text(tags_json.clone()),
                         SqlValue::Text(members_json.clone()),
                         SqlValue::Integer(now),
@@ -746,13 +749,16 @@ impl KnowledgeHandlers {
                 updated += 1;
             } else {
                 let domain_stmt = SqlStatement {
-                    sql: "INSERT INTO knowledge_domains (id, namespace, slug, name, description, tags, members, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_insert").into(),
                     params: vec![
                         SqlValue::Text(id.clone()),
                         SqlValue::Text(ns.clone()),
                         SqlValue::Text(slug.clone()),
                         SqlValue::Text(name.clone()),
-                        domain_in.description.as_ref().map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
+                        domain_in
+                            .description
+                            .as_ref()
+                            .map_or(SqlValue::Null, |d| SqlValue::Text(d.clone())),
                         SqlValue::Text(tags_json.clone()),
                         SqlValue::Text(members_json.clone()),
                         SqlValue::Integer(now),
@@ -808,7 +814,7 @@ impl KnowledgeHandlers {
             // their same-slug mirror atoms.
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_domains WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_domain_get_slug").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(id.clone())],
                     label: Some("knowledge.get.domain_by_slug".into()),
                 })
@@ -822,7 +828,7 @@ impl KnowledgeHandlers {
 
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT * FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 AND deleted_at IS NULL LIMIT 1".into(),
+                    sql: khive_runtime::sql!("knowledge_atom_get_slug").into(),
                     params: vec![SqlValue::Text(ns.clone()), SqlValue::Text(id.clone())],
                     label: Some("knowledge.get.atom_by_slug".into()),
                 })
