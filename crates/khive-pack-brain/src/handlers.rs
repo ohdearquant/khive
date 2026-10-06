@@ -17,6 +17,7 @@ use khive_storage::types::PageRequest;
 use khive_types::{HandlerDef, IdResolutionMode};
 
 use crate::event::interpret;
+pub(crate) use crate::event_counts_grouping::EventCountsAccumulator;
 use crate::{sync_balanced_recall_record, BrainPack, ENTITY_CACHE_CAPACITY};
 use khive_brain_core::derive_deterministic_weights;
 #[cfg(feature = "lattice-router")]
@@ -1095,108 +1096,36 @@ impl BrainPack {
         };
 
         let exhaustive = p.exhaustive.unwrap_or(false);
-        let (items, window_event_total, truncated) = if exhaustive {
-            fetch_event_counts_window_exhaustive(
+        let mut counts =
+            EventCountsAccumulator::new(default_scope.then_some(caller.as_str()), p.group_by);
+        let (total, window_event_total, truncated) = if exhaustive {
+            fold_event_counts_window_exhaustive(
                 store.as_ref(),
                 &base_filter,
                 Self::EXHAUSTIVE_PAGE_SIZE,
                 Self::MAX_EXHAUSTIVE_EVENTS,
+                &mut counts,
             )
             .await?
         } else {
-            fetch_event_counts_window(
+            let (items, window_event_total, truncated) = fetch_event_counts_window(
                 store.as_ref(),
                 &base_filter,
                 p.kind.is_none(),
                 Self::MAX_WINDOW_EVENTS,
             )
-            .await?
+            .await?;
+            for event in &items {
+                counts.observe(event);
+            }
+            (items.len() as u64, window_event_total, truncated)
         };
-
-        let mut counts_by_kind: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        let mut counts_by_actor: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        let mut counts_by_verb: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        let mut by_profile: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        let mut feedback_by_originating_verb: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        // #34: signal breakdown for `feedback_explicit`, both flat (negative-signal
-        // saturation as a first-class metric) and crossed with the profile split
-        // above (negative-share per profile) — same source field
-        // (`payload.signal`, stamped by `brain.feedback`/`brain.auto_feedback`) as
-        // `by_profile` reads `payload.served_by_profile_id` from.
-        let mut counts_by_signal: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        let mut by_profile_and_signal: std::collections::BTreeMap<
-            String,
-            std::collections::BTreeMap<String, u64>,
-        > = std::collections::BTreeMap::new();
-        let mut counts_by_work_class: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        let mut total_cost_unit: i64 = 0;
-        let mut cost_unit_by_verb: std::collections::BTreeMap<String, i64> =
-            std::collections::BTreeMap::new();
-
-        for event in &items {
-            *counts_by_kind
-                .entry(event.kind.name().to_string())
-                .or_insert(0) += 1;
-            let actor_key = if default_scope { &caller } else { &event.actor };
-            *counts_by_actor.entry(actor_key.clone()).or_insert(0) += 1;
-            *counts_by_verb.entry(event.verb.clone()).or_insert(0) += 1;
-            if event.kind == khive_types::EventKind::FeedbackExplicit {
-                let originating_verb = event
-                    .payload
-                    .get("originating_verb")
-                    .and_then(Value::as_str)
-                    .unwrap_or(event.verb.as_str())
-                    .to_string();
-                *feedback_by_originating_verb
-                    .entry(originating_verb)
-                    .or_insert(0) += 1;
-                let profile = event
-                    .payload
-                    .get("served_by_profile_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unspecified")
-                    .to_string();
-                *by_profile.entry(profile.clone()).or_insert(0) += 1;
-                let signal = event
-                    .payload
-                    .get("signal")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unspecified")
-                    .to_string();
-                *counts_by_signal.entry(signal.clone()).or_insert(0) += 1;
-                *by_profile_and_signal
-                    .entry(profile)
-                    .or_default()
-                    .entry(signal)
-                    .or_insert(0) += 1;
-            }
-            if let Some(work_class) = event_work_class(&event.payload) {
-                *counts_by_work_class
-                    .entry(work_class.to_string())
-                    .or_insert(0) += 1;
-            }
-            if let Some(cost_unit) = event_cost_unit(&event.payload) {
-                total_cost_unit = total_cost_unit.saturating_add(cost_unit);
-                let entry = cost_unit_by_verb.entry(event.verb.clone()).or_insert(0);
-                *entry = entry.saturating_add(cost_unit);
-            }
-        }
 
         let mut result = json!({
             "since": micros_to_iso(since_us),
             "until": micros_to_iso(until_us),
             "actor": p.actor,
             "kind": p.kind,
-            "counts_by_kind": counts_by_kind,
-            "counts_by_actor": counts_by_actor,
-            "counts_by_verb": counts_by_verb,
             "truncated": truncated,
             "window_event_total": window_event_total,
             "exhaustive": exhaustive,
@@ -1211,35 +1140,8 @@ impl BrainPack {
                 "other_namespaces": scope_other,
             },
         });
-        result[Self::truncatable_total_key("total", truncated)] = json!(items.len() as u64);
-        if let Some(group_by) = p.group_by {
-            group_by.add_to_result(
-                &mut result,
-                &items,
-                default_scope.then_some(caller.as_str()),
-                truncated,
-            );
-        }
-        if !by_profile.is_empty() {
-            result["by_profile"] = json!(by_profile);
-        }
-        if !feedback_by_originating_verb.is_empty() {
-            result["feedback_by_originating_verb"] = json!(feedback_by_originating_verb);
-        }
-        if !counts_by_signal.is_empty() {
-            result["counts_by_signal"] = json!(counts_by_signal);
-        }
-        if !by_profile_and_signal.is_empty() {
-            result["by_profile_and_signal"] = json!(by_profile_and_signal);
-        }
-        if !counts_by_work_class.is_empty() {
-            result["counts_by_work_class"] = json!(counts_by_work_class);
-        }
-        if !cost_unit_by_verb.is_empty() {
-            result[Self::truncatable_total_key("total_cost_unit", truncated)] =
-                json!(total_cost_unit);
-            result["cost_unit_by_verb"] = json!(cost_unit_by_verb);
-        }
+        result[Self::truncatable_total_key("total", truncated)] = json!(total);
+        counts.add_to_result(&mut result, truncated);
         Ok(result)
     }
 
@@ -3173,10 +3075,10 @@ pub(crate) async fn fetch_event_counts_window(
 /// `before` is a strict `created_at <` bound, so stepping the cursor to the
 /// last row's timestamp would drop rows sharing that microsecond beyond the
 /// page edge. Step to `last.created_at + 1` instead — which re-admits the
-/// boundary microsecond — and drop the re-read rows by id. Aggregation is
-/// order-independent, so delivery order across pages does not matter; each
-/// row must simply arrive exactly once. A timestamp tie run wider than the
-/// transport cap cannot be paged past (widening the page is refused by the
+/// boundary microsecond — and drop the re-read rows by id. Deliver each row
+/// exactly once in the existing page order; signed saturating cost sums rely
+/// on that order. A timestamp tie run wider than the transport cap cannot be
+/// paged past (widening the page is refused by the
 /// daemon) and is reported as a typed error rather than looping.
 ///
 /// Read consistency: the walk issues independent page (and, at the cap,
@@ -3195,12 +3097,28 @@ pub(crate) async fn collect_events_cursor_walk(
     page_size: u32,
     max_rows: u64,
 ) -> Result<Vec<Event>, RuntimeError> {
-    let mut items: Vec<Event> = Vec::new();
+    let mut items = Vec::new();
+    visit_events_cursor_walk(store, base_filter, page_size, max_rows, |event| {
+        items.push(event)
+    })
+    .await?;
+    Ok(items)
+}
+
+/// Visit owned rows in cursor order, dropping each page before the next read.
+pub(crate) async fn visit_events_cursor_walk<F: FnMut(Event)>(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    page_size: u32,
+    max_rows: u64,
+    mut visit: F,
+) -> Result<u64, RuntimeError> {
+    let mut admitted = 0;
     let mut cursor: Option<i64> = base_filter.before;
     let mut boundary_at: Option<i64> = None;
     let mut boundary_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
     let mut fetch_limit = page_size.clamp(1, TRANSPORT_PAGE_ROWS);
-    while (items.len() as u64) < max_rows {
+    while admitted < max_rows {
         let mut filter = base_filter.clone();
         filter.before = cursor;
         let page = store
@@ -3251,7 +3169,7 @@ pub(crate) async fn collect_events_cursor_walk(
                     .count_events(ge_boundary)
                     .await
                     .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-                if ge_total == items.len() as u64 {
+                if ge_total == admitted {
                     cursor = Some(boundary);
                     continue;
                 }
@@ -3281,7 +3199,13 @@ pub(crate) async fn collect_events_cursor_walk(
                 .filter(|event| event.created_at == boundary)
                 .map(|event| event.id),
         );
-        items.extend(fresh);
+        // Preserve the old final truncate: only the remaining prefix is
+        // admitted, so surplus payloads never reach the aggregate callback.
+        let remaining = usize::try_from(max_rows - admitted).unwrap_or(usize::MAX);
+        for event in fresh.into_iter().take(remaining) {
+            visit(event);
+            admitted += 1;
+        }
         // `i64::MAX` admits no exclusive bound above it: keep the cursor as
         // is and re-read — dedup drops the re-admitted rows, and the
         // at-the-cap completeness check above advances past the boundary (or
@@ -3295,11 +3219,37 @@ pub(crate) async fn collect_events_cursor_walk(
             break;
         }
     }
-    // A page may carry the collection past `max_rows`; the bound is a row
-    // budget, so surplus rows from the final page are dropped rather than
-    // returned over-budget.
-    items.truncate(usize::try_from(max_rows).unwrap_or(usize::MAX));
-    Ok(items)
+    Ok(admitted)
+}
+
+#[cfg(test)]
+pub(crate) async fn fetch_event_counts_window_exhaustive(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    page_size: u32,
+    max_events: u64,
+) -> Result<(Vec<Event>, u64, bool), RuntimeError> {
+    let mut items = Vec::new();
+    let (_, total, truncated) =
+        visit_event_counts_window_exhaustive(store, base_filter, page_size, max_events, |event| {
+            items.push(event)
+        })
+        .await?;
+    Ok((items, total, truncated))
+}
+
+/// Production exhaustive aggregation retains counts but no completed page.
+pub(crate) async fn fold_event_counts_window_exhaustive(
+    store: &dyn khive_storage::event::EventStore,
+    base_filter: &EventFilter,
+    page_size: u32,
+    max_events: u64,
+    counts: &mut EventCountsAccumulator,
+) -> Result<(u64, u64, bool), RuntimeError> {
+    visit_event_counts_window_exhaustive(store, base_filter, page_size, max_events, |event| {
+        counts.observe(&event)
+    })
+    .await
 }
 
 /// #21: full-window aggregation for `brain.event_counts(exhaustive=true)`.
@@ -3308,7 +3258,7 @@ pub(crate) async fn collect_events_cursor_walk(
 /// one scalar per filter, not a GROUP BY) — that would live in `khive-storage`/
 /// `khive-db`, outside this crate. Exact per-verb/kind/actor counts over an
 /// arbitrarily large window are achievable without one: paginate `query_events`
-/// with a fixed page size until exhausted, accumulating every page instead of
+/// with a fixed page size until exhausted, folding every page instead of
 /// stopping at a single bounded page. The caller still makes exactly ONE
 /// `brain.event_counts` call — the pagination loop is internal to this
 /// function — so a coverage panel that needed 19 stitched sampled windows
@@ -3322,18 +3272,19 @@ pub(crate) async fn collect_events_cursor_walk(
 ///
 /// `max_events` is a safety bound, not a design limit: without one,
 /// a caller could open a pathological (multi-year, unfiltered) window and this
-/// function would loop until the process runs out of memory rather than
-/// returning. Set to 40x the bounded-mode cap (`BrainPack::MAX_WINDOW_EVENTS`)
+/// function could spend unbounded work reading and aggregating the window.
+/// Set to 40x the bounded-mode cap (`BrainPack::MAX_WINDOW_EVENTS`)
 /// — comfortably above the multi-million-event/month volumes `exhaustive` is
 /// meant to serve — so it only binds on something pathological. A window above
 /// the bound is rejected before aggregation; exhaustive mode never returns a
 /// partial result.
-pub(crate) async fn fetch_event_counts_window_exhaustive(
+async fn visit_event_counts_window_exhaustive<F: FnMut(Event)>(
     store: &dyn khive_storage::event::EventStore,
     base_filter: &EventFilter,
     page_size: u32,
     max_events: u64,
-) -> Result<(Vec<Event>, u64, bool), RuntimeError> {
+    visit: F,
+) -> Result<(u64, u64, bool), RuntimeError> {
     let window_event_total = store
         .count_events(base_filter.clone())
         .await
@@ -3353,10 +3304,11 @@ pub(crate) async fn fetch_event_counts_window_exhaustive(
     // bounded materialization window — and under the events daemon's
     // per-request page cap — at any depth. The count check above already
     // bounds the window, so the walk runs to exhaustion.
-    let items = collect_events_cursor_walk(store, base_filter, page_size, max_events).await?;
+    let admitted =
+        visit_events_cursor_walk(store, base_filter, page_size, max_events, visit).await?;
 
-    let truncated = (items.len() as u64) < window_event_total;
-    Ok((items, window_event_total, truncated))
+    let truncated = admitted < window_event_total;
+    Ok((admitted, window_event_total, truncated))
 }
 
 /// Parse an ISO-8601/RFC-3339 datetime string into a microsecond epoch,
@@ -3431,7 +3383,7 @@ fn parse_rfc3339_micros(
 ///
 /// Returns `None` (silently excluded from the split, not an error) when neither path is
 /// present — the overwhelming majority of event kinds today.
-fn event_work_class(payload: &Value) -> Option<&str> {
+pub(crate) fn event_work_class(payload: &Value) -> Option<&str> {
     payload
         .get("work_class")
         .and_then(Value::as_str)
@@ -3455,7 +3407,7 @@ fn event_work_class(payload: &Value) -> Option<&str> {
 /// when the field is absent, which per Amendment 1's "absence has exactly
 /// two meanings" rule is either a pre-Amendment-1 event or an
 /// errored/denied dispatch.
-fn event_cost_unit(payload: &Value) -> Option<i64> {
+pub(crate) fn event_cost_unit(payload: &Value) -> Option<i64> {
     payload
         .get("resource")
         .and_then(|resource| resource.get("cost_unit"))
