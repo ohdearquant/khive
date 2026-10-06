@@ -101,6 +101,16 @@ file-level exclusions. The existing D rows can still be fragile when the
 test's expected-versus-failure gap is narrow; classification describes the
 source of the bound, not proof that coverage passes.
 
+### Current follow-up status (6 October 2026)
+
+The A rows above retain the original census base and classifications. Subsequent repairs are:
+
+- `socket_speaks_khived_protocol_rejects_a_non_protocol_listener` now uses the shared timing helper with `DUPLICATE_PROBE_TIMEOUT * 4`: the ordinary strict bound remains 2 seconds for the production 500 ms timeout. Coverage omits only that numeric assertion. The real non-protocol-listener refusal and cleanup remain, with a separate 30-second hang watchdog in both modes. This is a timeout-derived timing assertion plus a watchdog, not a measured coverage result.
+- The comm hold-time tests already use the shared helper: ordinary runs retain the calibrated median/p95 limits, while coverage omits those numeric gates and retains sample-integrity checks. The calibration remains historical rather than fixture-derived.
+- `test_stalled_request_is_bounded_and_reaped` already gives initialization a separate 2-second startup allowance; the stalled request and reap budgets remain 0.25 seconds. Its setup no longer consumes the request's measured timeout.
+
+These updates do not establish coverage-run acceptance or close the other census follow-ups.
+
 The Python completion-envelope assertion at
 `scripts/tests/test_contract_harness.py:157-167`, called at
 `292,311,349,377,502`, is **D with a fixed scheduling floor**: its formula
