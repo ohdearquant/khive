@@ -46,7 +46,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use khive_db::{StorageBackend, WalCeilingPolicy};
-use khive_storage::event::IdempotentEventBatchResult;
+use khive_storage::event::{EventPageQuery, EventPageWindow, IdempotentEventBatchResult};
 use khive_storage::{
     BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageError,
     StorageResult,
@@ -541,6 +541,11 @@ pub enum EventsRequest {
         filter: EventFilter,
         page: PageRequest,
     },
+    QueryEventPage {
+        protocol_version: u32,
+        namespace: String,
+        query: EventPageQuery,
+    },
     CountEvents {
         protocol_version: u32,
         namespace: String,
@@ -563,6 +568,9 @@ impl EventsRequest {
             | Self::QueryEvents {
                 protocol_version, ..
             }
+            | Self::QueryEventPage {
+                protocol_version, ..
+            }
             | Self::CountEvents {
                 protocol_version, ..
             } => *protocol_version,
@@ -575,6 +583,7 @@ impl EventsRequest {
             | Self::AppendEventsIdempotent { namespace, .. }
             | Self::GetEvent { namespace, .. }
             | Self::QueryEvents { namespace, .. }
+            | Self::QueryEventPage { namespace, .. }
             | Self::CountEvents { namespace, .. } => namespace,
         }
     }
@@ -595,6 +604,9 @@ pub enum EventsResponse {
     },
     Pageful {
         page: Page<Event>,
+    },
+    EventPageWindow {
+        window: EventPageWindow,
     },
     Count {
         count: u64,
@@ -1566,6 +1578,15 @@ async fn dispatch_events_request(
                 Err(error) => storage_error_response(&error),
             }
         }
+        EventsRequest::QueryEventPage { query, .. } => {
+            if let Err(error) = crate::event_page::validate_page_query(&query) {
+                return storage_error_response(&error);
+            }
+            match store.query_event_page(query).await {
+                Ok(window) => EventsResponse::EventPageWindow { window },
+                Err(error) => storage_error_response(&error),
+            }
+        }
         EventsRequest::CountEvents { filter, .. } => match store.count_events(filter).await {
             Ok(count) => EventsResponse::Count { count },
             Err(error) => storage_error_response(&error),
@@ -2294,6 +2315,25 @@ impl EventStore for ForwardingEventStore {
         }
     }
 
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        crate::event_page::validate_page_query(&query)?;
+        let request = EventsRequest::QueryEventPage {
+            protocol_version: EVENTS_PROTOCOL_VERSION,
+            namespace: self.namespace.clone(),
+            query: query.clone(),
+        };
+        match self.client.round_trip(&request).await? {
+            EventsResponse::EventPageWindow { window } => {
+                crate::event_page::validate_window(&query, Some(&self.namespace), &window)?;
+                Ok(window)
+            }
+            error @ EventsResponse::Error { .. } => Err(self.unexpected("query_event_page", error)),
+            _ => Err(crate::event_page::page_error(
+                "events page response kind mismatch",
+            )),
+        }
+    }
+
     fn preflight_event(&self, event: &Event) -> StorageResult<()> {
         // Same validation code path as the daemon-side store, zero I/O.
         self.client.preflight_store.preflight_event(event)
@@ -2443,6 +2483,10 @@ impl EventStore for SplitEventStore {
         let legacy = self.legacy.count_events(filter.clone()).await?;
         let lane = self.lane.count_events(filter).await?;
         Ok(legacy + lane)
+    }
+
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        crate::event_page::split_page(self.legacy.as_ref(), self.lane.as_ref(), query).await
     }
 
     fn preflight_event(&self, event: &Event) -> StorageResult<()> {
@@ -3400,195 +3444,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shutdown_counts_and_logs_queued_and_in_flight_batches_as_dropped() {
-        // ADR-170 requires shutdown drops to be visible via counters/logs.
-        // Both `run_forwarder` shutdown arms must therefore count every
-        // batch it loses: the one parked mid-delivery against a hung peer,
-        // and every batch still sitting in the queue behind it. Drives
-        // `run_forwarder` directly with a local `CancellationToken` (rather
-        // than through `EventsSplitClient`, which wires the process-wide
-        // `daemon_shutdown_token()` singleton) so cancelling shutdown here
-        // cannot leak into other tests sharing the process.
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("hung-shutdown.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        // Accept and hold the connection open without ever reading or
-        // replying, so the first delivery blocks in `deliver_batch`'s
-        // read_frame until shutdown cancels it.
-        let _server = tokio::spawn(async move {
-            let mut held = Vec::new();
-            loop {
-                if let Ok((stream, _)) = listener.accept().await {
-                    held.push(stream);
-                }
-            }
-        });
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<QueuedAppend>(8);
-        let counters = Arc::new(ForwardingCounters::default());
-        let outage_logged = Arc::new(AtomicBool::new(false));
-        let shutdown = tokio_util::sync::CancellationToken::new();
-
-        let forwarder = tokio::spawn(run_forwarder(
-            socket,
-            rx,
-            Arc::clone(&counters),
-            outage_logged,
-            Duration::from_secs(30),
-            shutdown.clone(),
-        ));
-
-        fn probe_event(tag: &str) -> Event {
-            Event::new(
-                "test",
-                tag,
-                khive_types::EventKind::Audit,
-                khive_types::SubstrateKind::Event,
-                "tester",
-            )
-        }
-
-        tx.try_send(QueuedAppend::unmetered(
-            "test",
-            vec![probe_event("in-flight")],
-            Arc::clone(&counters),
-        ))
-        .expect("queue has room for the in-flight batch");
-        // No externally observable "delivery started" signal exists short of
-        // instrumenting the forwarder; a short sleep reliably lands inside
-        // the delivery `select!` arm before shutdown cancels it, given the
-        // 30s delivery timeout has no chance to fire first.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        tx.try_send(QueuedAppend::unmetered(
-            "test",
-            vec![probe_event("queued-1"), probe_event("queued-2")],
-            Arc::clone(&counters),
-        ))
-        .expect("queue has room for the first queued batch");
-        tx.try_send(QueuedAppend::unmetered(
-            "test",
-            vec![probe_event("queued-3")],
-            Arc::clone(&counters),
-        ))
-        .expect("queue has room for the second queued batch");
-
-        shutdown.cancel();
-
-        tokio::time::timeout(Duration::from_secs(5), forwarder)
-            .await
-            .expect("forwarder must exit promptly on shutdown")
-            .expect("forwarder task must not panic");
-
-        assert_eq!(
-            counters.dropped_batches.load(Ordering::Relaxed),
-            3,
-            "the in-flight batch and both queued batches must all be counted as dropped"
-        );
-        assert_eq!(
-            counters.dropped_events.load(Ordering::Relaxed),
-            4,
-            "1 in-flight + 2 + 1 queued events must all be counted as dropped"
-        );
-        assert_eq!(
-            counters.forwarded_batches.load(Ordering::Relaxed),
-            0,
-            "a hung peer never acknowledges anything in this test"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn shutdown_during_backoff_drains_queued_batches() {
-        // A failed delivery sends the forwarder into `FORWARDER_BACKOFF`
-        // before it loops back to `rx.recv()`. Shutdown arriving while it
-        // sits in that backoff sleep must drain and count whatever is left
-        // in the queue, not just break out silently. Points at a socket path
-        // with no listener bound so the very first delivery attempt fails
-        // fast (connect refused) rather than needing a hung peer.
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("no-listener.sock");
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<QueuedAppend>(8);
-        let counters = Arc::new(ForwardingCounters::default());
-        let outage_logged = Arc::new(AtomicBool::new(false));
-        let shutdown = tokio_util::sync::CancellationToken::new();
-
-        let forwarder = tokio::spawn(run_forwarder(
-            socket,
-            rx,
-            Arc::clone(&counters),
-            outage_logged,
-            Duration::from_secs(30),
-            shutdown.clone(),
-        ));
-
-        fn probe_event(tag: &str) -> Event {
-            Event::new(
-                "test",
-                tag,
-                khive_types::EventKind::Audit,
-                khive_types::SubstrateKind::Event,
-                "tester",
-            )
-        }
-
-        tx.try_send(QueuedAppend::unmetered(
-            "test",
-            vec![probe_event("failed-delivery")],
-            Arc::clone(&counters),
-        ))
-        .expect("queue has room for the first batch");
-
-        // Wait for the failed-delivery drop to land, which proves the
-        // forwarder has moved on to the `FORWARDER_BACKOFF` sleep.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if counters.dropped_batches.load(Ordering::Relaxed) >= 1 {
-                break;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "forwarder never dropped the first (unreachable-daemon) batch"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        tx.try_send(QueuedAppend::unmetered(
-            "test",
-            vec![
-                probe_event("queued-during-backoff-1"),
-                probe_event("queued-during-backoff-2"),
-            ],
-            Arc::clone(&counters),
-        ))
-        .expect("queue has room for the batch queued during backoff");
-
-        shutdown.cancel();
-
-        tokio::time::timeout(Duration::from_secs(5), forwarder)
-            .await
-            .expect("forwarder must exit promptly on shutdown, not wait out the full backoff")
-            .expect("forwarder task must not panic");
-
-        assert_eq!(
-            counters.dropped_batches.load(Ordering::Relaxed),
-            2,
-            "the failed-delivery batch and the batch queued during backoff must both be counted as dropped"
-        );
-        assert_eq!(
-            counters.dropped_events.load(Ordering::Relaxed),
-            3,
-            "1 failed-delivery + 2 queued-during-backoff events must all be counted as dropped"
-        );
-        assert_eq!(
-            counters.forwarded_batches.load(Ordering::Relaxed),
-            0,
-            "no listener is bound, so nothing can ever be acknowledged"
-        );
-    }
+    include!("events_split_shutdown_tests.rs");
 
     #[cfg(unix)]
     #[tokio::test]

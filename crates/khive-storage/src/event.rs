@@ -202,6 +202,44 @@ pub struct EventFilter {
     pub payload_proposal_id: Option<Uuid>,
 }
 
+/// Persisted ordering key; the physical UUID spelling is not normalized.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventOrderKey {
+    pub created_at_us: i64,
+    pub physical_id: String,
+}
+
+/// Count-free ascending window within one scoped event store.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageQuery {
+    pub since_us: i64,
+    pub until_us: i64,
+    pub kinds: Vec<EventKind>,
+    pub actors: Vec<String>,
+    pub exclude_namespaces: Vec<String>,
+    pub after: Option<EventOrderKey>,
+    pub max_rows: u32,
+}
+
+/// A decoded event with its exact persisted seek key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageRow {
+    pub event: Event,
+    pub order_key: EventOrderKey,
+}
+
+/// A bounded prefix, without a count of the complete matching window.
+///
+/// `budget_stop` names the row the leaf did not return because reading it would
+/// pass the leaf's raw-text budget; `rows` then holds every row ordered before it,
+/// whole, and is shorter than the requested row bound.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventPageWindow {
+    pub rows: Vec<EventPageRow>,
+    #[serde(default)]
+    pub budget_stop: Option<EventOrderKey>,
+}
+
 /// Per-row outcome of an [`EventStore::append_events_idempotent`] call, in
 /// input order. Distinguishes a fresh insert from a retry that reproduced an
 /// identical row from a retry whose identity now disagrees with what is
@@ -241,6 +279,18 @@ pub trait EventStore: Send + Sync + 'static {
         filter: EventFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Event>>;
+    /// Read at most 4096 rows in ascending physical time/ID order, without counting.
+    /// Filters and exclusions apply before the row bound. A backend must refuse
+    /// unsupported paging rather than substitute an offset query.
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        let _ = query;
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Events,
+            operation: "query_event_page".into(),
+            message: "this EventStore backend does not implement query_event_page".into(),
+        })
+    }
+
     /// Count events matching a filter.
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64>;
 
@@ -316,5 +366,23 @@ mod tests {
         wire.as_object_mut().unwrap().remove("target_id");
         let legacy: EventFilter = serde_json::from_value(wire).unwrap();
         assert_eq!(legacy.target_id, None);
+    }
+
+    #[test]
+    fn event_page_window_budget_stop_roundtrips_and_defaults_when_absent() {
+        let stop = EventOrderKey {
+            created_at_us: 7,
+            physical_id: Uuid::from_u128(9).to_string(),
+        };
+        let window = EventPageWindow {
+            rows: Vec::new(),
+            budget_stop: Some(stop.clone()),
+        };
+        let mut wire = serde_json::to_value(&window).unwrap();
+        let decoded: EventPageWindow = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded.budget_stop, Some(stop));
+        wire.as_object_mut().unwrap().remove("budget_stop");
+        let legacy: EventPageWindow = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.budget_stop, None);
     }
 }

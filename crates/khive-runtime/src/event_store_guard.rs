@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use khive_storage::event::IdempotentEventBatchResult;
+use khive_storage::event::{EventPageQuery, EventPageWindow, IdempotentEventBatchResult};
 use khive_storage::{
     BatchWriteSummary, Event, EventFilter, EventStore, Page, PageRequest, StorageResult,
 };
@@ -107,6 +107,10 @@ impl EventStore for AttributedEventStore {
 
     async fn count_events(&self, filter: EventFilter) -> StorageResult<u64> {
         self.inner.count_events(filter).await
+    }
+
+    async fn query_event_page(&self, query: EventPageQuery) -> StorageResult<EventPageWindow> {
+        self.inner.query_event_page(query).await
     }
 
     fn preflight_event(&self, event: &Event) -> StorageResult<()> {
