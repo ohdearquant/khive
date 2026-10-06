@@ -17,10 +17,6 @@ const A_NAMESPACE: &str = "a";
 const B_NAMESPACE: &str = "b";
 const QUERY: &str = "zznamespaceguard zzsecondguard";
 const TERM: &str = "zznamespaceguard";
-// A design baseline for comparison, held as a test fixture rather than
-// installed as a numbered migration.
-const SLOT_TABLE_BASELINE_SQL: &str = include_str!("namespace_trigram_slot_table_baseline.sql.txt");
-
 struct Fixture {
     _directory: tempfile::TempDir,
     runtime: KhiveRuntime,
@@ -56,8 +52,14 @@ fn fixture(foreign_rows: i64) -> Fixture {
     assert_eq!(a_key.chars().count(), 3);
     let mut connection = Connection::open(&path).expect("open temporary database");
     register(&connection).expect("register prototype tokenizer before FTS DDL");
+    // A design baseline for comparison, held as a test fixture rather than
+    // installed as a numbered migration.
     connection
-        .execute_batch(SLOT_TABLE_BASELINE_SQL)
+        .execute_batch(&format!(
+            include_str!("namespace_trigram_slot_table_baseline.sql.txt"),
+            namespace_keys_ddl = khive_runtime::sql!("knowledge_fts_namespace_keys_create"),
+            namespace_tokens_ddl = khive_runtime::sql!("knowledge_fts_namespace_tokens_create"),
+        ))
         .expect("apply the slot-table baseline schema to the temp DB");
     connection
         .execute(
