@@ -1,7 +1,5 @@
 // REASON: format_args! inlining would break compatibility with older Rust toolchains in CI
 #![allow(clippy::uninlined_format_args)]
-// REASON: field_reassign_with_default is needed by the shadow-validation builder pattern in persist
-#![allow(clippy::field_reassign_with_default)]
 // REASON: benchmark helpers use hand-tuned constants close to Rust built-ins (e.g. 1.0/3.0)
 #![allow(clippy::approx_constant)]
 
@@ -26,16 +24,10 @@ pub mod hit;
 pub mod hybrid;
 pub mod materialization;
 pub mod metrics;
-#[cfg(feature = "persist")]
-pub mod persist;
 pub mod policy;
 pub mod query_ir;
-#[cfg(feature = "persist")]
-pub mod replay;
 pub mod search_config;
 pub mod timeout;
-#[cfg(feature = "persist")]
-pub mod weights;
 
 // Re-export adapter types
 #[cfg(feature = "storage-adapters")]
@@ -76,11 +68,6 @@ pub use materialization::{
     MAX_MATERIALIZATION_LOADER_BATCH, MAX_MATERIALIZATION_OUTPUTS,
 };
 pub use metrics::{MetricEvent, MetricValue, MetricsSink, NoopSink, RecordingSink};
-#[cfg(feature = "persist")]
-pub use persist::{
-    PersistError, PersistenceStats, RetrievalPersistence, ShadowMetrics, ShadowValidationConfig,
-    ShadowValidationResult,
-};
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
 pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
 pub use search_config::SearchConfig;
