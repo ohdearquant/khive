@@ -469,12 +469,12 @@ impl PackByIdResolver for KnowledgePack {
                                 ),
                             },
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_atom_hard_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some("knowledge.delete_by_id.domain_mirror.hard".into()),
                             },
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_domains WHERE id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_domain_hard_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some("knowledge.delete_by_id.domain.hard".into()),
                             },
@@ -488,9 +488,7 @@ impl PackByIdResolver for KnowledgePack {
                 } else {
                     writer
                         .execute(SqlStatement {
-                            sql: "UPDATE knowledge_domains SET deleted_at = ?1 \
-                                  WHERE id = ?2 AND deleted_at IS NULL"
-                                .into(),
+                            sql: khive_runtime::sql!("knowledge_domain_soft_delete").into(),
                             params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
                             label: Some("knowledge.delete_by_id.domain.soft".into()),
                         })
@@ -503,9 +501,7 @@ impl PackByIdResolver for KnowledgePack {
                     // Tombstone the mirror atom so FTS no longer surfaces it.
                     writer
                         .execute(SqlStatement {
-                            sql: "UPDATE knowledge_atoms SET deleted_at = ?1 \
-                                  WHERE id = ?2 AND deleted_at IS NULL"
-                                .into(),
+                            sql: khive_runtime::sql!("knowledge_atom_soft_delete").into(),
                             params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
                             label: Some("knowledge.delete_by_id.domain_mirror.soft".into()),
                         })
@@ -528,7 +524,7 @@ impl PackByIdResolver for KnowledgePack {
                                 label: Some("knowledge.delete_by_id.atom_sections.hard".into()),
                             },
                             SqlStatement {
-                                sql: "DELETE FROM knowledge_atoms WHERE id = ?1".into(),
+                                sql: khive_runtime::sql!("knowledge_atom_hard_delete").into(),
                                 params: vec![SqlValue::Text(id_str.clone())],
                                 label: Some("knowledge.delete_by_id.atom.hard".into()),
                             },
@@ -540,9 +536,7 @@ impl PackByIdResolver for KnowledgePack {
                 } else {
                     writer
                         .execute(SqlStatement {
-                            sql: "UPDATE knowledge_atoms SET deleted_at = ?1 \
-                                  WHERE id = ?2 AND deleted_at IS NULL"
-                                .into(),
+                            sql: khive_runtime::sql!("knowledge_atom_soft_delete").into(),
                             params: vec![SqlValue::Integer(now_us), SqlValue::Text(id_str.clone())],
                             label: Some("knowledge.delete_by_id.atom.soft".into()),
                         })
