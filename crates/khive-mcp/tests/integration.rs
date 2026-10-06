@@ -12,6 +12,9 @@
 
 // Force the knowledge pack to be linked (inventory::submit! requires the crate
 // to be linked into the test binary for its PackRegistration to self-register).
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use khive_pack_knowledge as _;
 
 use async_trait::async_trait;
@@ -3278,6 +3281,7 @@ fn make_full_server() -> KhiveMcpServer {
         ..RuntimeConfig::default()
     };
     let runtime = KhiveRuntime::new(config).expect("in-memory runtime with all packs");
+    let runtime = receipt_credentials::with_receipt_credentials(runtime);
     KhiveMcpServer::new(runtime).expect("server builds with kg+gtd+memory+brain+session")
 }
 

@@ -1,4 +1,7 @@
 //! Integration tests for `BrainPack` dispatch.
+#[path = "../../khive-runtime/tests/support/receipt_credentials.rs"]
+mod receipt_credentials;
+
 use super::*;
 use khive_runtime::{
     DispatchHook, KhiveRuntime, Namespace, NamespaceToken, PackRuntime, RuntimeConfig,
@@ -3886,7 +3889,9 @@ async fn brain_auto_feedback_accepts_presented_recall_results() {
     let token = rt.authorize(Namespace::local()).unwrap();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(rt.clone()));
-    builder.register(khive_pack_memory::MemoryPack::new(rt.clone()));
+    builder.register(khive_pack_memory::MemoryPack::new(
+        receipt_credentials::with_receipt_credentials(rt.clone()),
+    ));
     let registry = builder.build().expect("memory registry");
     let remembered = registry
         .dispatch(
