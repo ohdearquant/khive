@@ -58,7 +58,7 @@ pub(super) fn open_single_backend(
                 })?;
             }
             open_claimed_sqlite(path, max_readers, wal_ceiling, false, claims).map_err(|error| {
-                let context = format!("open single SQLite backend: {error}");
+                let context = format!("backend main: sqlite open at {}: {error}", path.display());
                 anyhow::Error::new(error).context(context)
             })?
         }
@@ -99,8 +99,11 @@ pub(super) fn open_backend(
             if cfg.read_only {
                 open_claimed_sqlite(&expanded, max_readers, wal_ceiling, true, claims).map_err(
                     |error| {
-                        let context =
-                            format!("backend {}: sqlite read-only open: {error}", cfg.name);
+                        let context = format!(
+                            "backend {}: sqlite read-only open at {}: {error}",
+                            cfg.name,
+                            expanded.display()
+                        );
                         anyhow::Error::new(error).context(context)
                     },
                 )
@@ -108,7 +111,11 @@ pub(super) fn open_backend(
                 let backend =
                     open_claimed_sqlite(&expanded, max_readers, wal_ceiling, false, claims)
                         .map_err(|error| {
-                            let context = format!("backend {}: sqlite open: {error}", cfg.name);
+                            let context = format!(
+                                "backend {}: sqlite open at {}: {error}",
+                                cfg.name,
+                                expanded.display()
+                            );
                             anyhow::Error::new(error).context(context)
                         })?;
                 if backend.is_read_only() {
