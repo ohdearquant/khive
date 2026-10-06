@@ -307,10 +307,7 @@ impl PackByIdResolver for KnowledgePack {
         // 1. Check knowledge_domains first (canonical over the mirror atom).
         let domain_row = reader
             .query_row(SqlStatement {
-                sql: "SELECT id, namespace, slug, name, description, tags, members, \
-                      created_at, updated_at, deleted_at \
-                      FROM knowledge_domains WHERE id = ?1 AND deleted_at IS NULL LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_resolver_live_domain").into(),
                 params: vec![SqlValue::Text(id_str.clone())],
                 label: Some("knowledge.resolve_by_id.domain".into()),
             })

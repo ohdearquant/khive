@@ -259,16 +259,12 @@ pub(crate) async fn rebuild_fts_indexes(runtime: &KhiveRuntime) -> Result<Value,
                 label: Some("knowledge.index.fts_sections.rebuild".into()),
             },
             SqlStatement {
-                sql: "INSERT INTO fts_knowledge(fts_knowledge, rank) \
-                      VALUES('integrity-check', 1)"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_fts_integrity_check").into(),
                 params: vec![],
                 label: Some("knowledge.index.fts_knowledge.integrity".into()),
             },
             SqlStatement {
-                sql: "INSERT INTO fts_sections(fts_sections, rank) \
-                      VALUES('integrity-check', 1)"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_sections_fts_integrity_check").into(),
                 params: vec![],
                 label: Some("knowledge.index.fts_sections.integrity".into()),
             },
