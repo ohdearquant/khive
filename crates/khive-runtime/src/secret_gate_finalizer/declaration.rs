@@ -120,7 +120,7 @@ pub(crate) const RUNTIME_TABLE_WRITE_INVENTORY: &[RuntimeTableWriteInventoryEntr
         properties_route: None,
     },
     RuntimeTableWriteInventoryEntry {
-        site: "khive-runtime/src/curation.rs::KhiveRuntime::entity_vector_insert_statements",
+        site: "khive-runtime/src/curation/entity_curation.rs::KhiveRuntime::entity_vector_insert_statements",
         expected_writes: 1,
         properties_route: None,
     },
@@ -509,7 +509,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "curation.entity.update",
-        site: "khive-runtime/src/curation.rs::KhiveRuntime::persist_prepared_entity_update",
+        site: "khive-runtime/src/curation/entity_curation.rs::KhiveRuntime::persist_prepared_entity_update",
         expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
