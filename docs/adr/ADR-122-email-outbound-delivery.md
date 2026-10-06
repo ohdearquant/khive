@@ -350,7 +350,8 @@ start-up warning names the missing value.
 Explicit entries, the default recipient and the requested recipient (the
 address after `email:`) are compared in one normalized form: the addr-spec
 produced by the maintainer-address parser, without any display name or
-angle brackets and lowercased. A recipient is allowed when its normalized
+angle brackets and with ASCII letters lowercased; every other character
+compares exactly. A recipient is allowed when its normalized
 form equals a normalized entry; a recipient that does not parse matches no
 entry. The policy stores its entries in this normalized form, and refusals
 and log lines name addresses in it; a requested recipient that does not

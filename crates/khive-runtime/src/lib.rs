@@ -58,6 +58,8 @@ pub mod note_write;
 mod note_write_tests;
 pub mod objectives;
 pub mod operations;
+mod outbound_email_policy;
+pub use outbound_email_policy::OutboundEmailPolicy;
 pub mod pack;
 pub mod pack_metadata;
 mod params;

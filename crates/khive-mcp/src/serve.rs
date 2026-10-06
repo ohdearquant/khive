@@ -14,7 +14,7 @@ use anyhow::Context as _;
 use khive_runtime::{
     config_from_env, parse_pack_list, runtime_config_from_khive_config, BackendConfig, BackendId,
     BackendKind, BlobHydrator, ConnectionPool, KhiveConfig, KhiveRuntime, OpenedDiagnosticBackend,
-    OutputFormat, RuntimeConfig, StorageBackend,
+    OutboundEmailPolicy, OutputFormat, RuntimeConfig, StorageBackend,
 };
 
 use crate::args::{resolve_cli_namespace, Args};
@@ -614,17 +614,12 @@ fn spawn_email_channel_loops(
             let runtime = server.channel_outbox_runtime_clone();
             let ingest_ns = ingest_namespace_from_env();
             let default_actor = email_default_inbound_actor_from_env();
-            let mut allowlist = allowed_recipients_from_env();
-            if allowlist.is_empty() {
-                allowlist.push(email_ch.maintainer_address().to_string());
-            }
             let mailbox = email_ch.mailbox().to_string();
 
             let ingest_ns_clone = ingest_ns.clone();
             let default_actor_clone = default_actor.clone();
             let verb_reg_poll = verb_reg.clone();
             let ingest_ns_outbox = ingest_ns.clone();
-            let allowlist_clone = allowlist.clone();
             let mailbox_clone = mailbox.clone();
             let email_ch_clone = Arc::clone(&email_ch);
             let runtime_outbox = runtime.clone();
@@ -665,7 +660,6 @@ fn spawn_email_channel_loops(
                                         rt.clone(),
                                         ingest_ns_outbox.clone(),
                                         mailbox_clone.clone(),
-                                        allowlist_clone.clone(),
                                         ctx,
                                     ))
                                 },
@@ -728,24 +722,6 @@ fn default_inbound_actor_from_env(actor_variable: &str, fallback: &str) -> Strin
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| fallback.to_string())
-}
-
-/// Parse the outbox allowlist from `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`.
-///
-/// Returns a `Vec` of trimmed, non-empty address strings. When the env var is
-/// unset or blank the returned vec is empty; callers should fall back to the
-/// channel maintainer address in that case.
-#[cfg(feature = "channel-email")]
-fn allowed_recipients_from_env() -> Vec<String> {
-    std::env::var("KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .map(|r| r.trim().to_string())
-                .filter(|r| !r.is_empty())
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Run `on_authorized` only when the ingest namespace passes the preflight check.
@@ -1964,9 +1940,9 @@ pub(crate) async fn channel_outbox_loop(
     runtime: khive_runtime::KhiveRuntime,
     ingest_namespace: String,
     mailbox: String,
-    allowlist: Vec<String>,
     ctx: crate::components::HostContext,
 ) -> Result<(), crate::components::ComponentError> {
+    outbox::require_email_delivery_policy(&runtime)?;
     let historical = match std::env::var(khive_runtime::HISTORICAL_DOMAINS_ENV) {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => String::new(),
@@ -1999,7 +1975,6 @@ pub(crate) async fn channel_outbox_loop(
             outbox::OutboxPolicy::Email {
                 mailbox: &mailbox,
                 domains: &domains,
-                allowlist: &allowlist,
             },
             &runtime,
             &namespace,
@@ -2029,15 +2004,17 @@ async fn channel_outbox_once(
     let domains = khive_runtime::EmailMessageIdDomains::from_mailbox_and_history(mailbox, "")
         .map_err(crate::components::ComponentError::Permanent)?;
     debug_assert_eq!(domains.current(), domain);
+    let policy = OutboundEmailPolicy::configured(allowlist.to_vec())
+        .map_err(crate::components::ComponentError::Permanent)?;
+    let runtime = runtime.clone().with_outbound_email_policy(policy);
     let mut pause_until = None;
     outbox::outbox_once(
         outbox::OutboxChannels::Single(email_channel),
         outbox::OutboxPolicy::Email {
             mailbox,
             domains: &domains,
-            allowlist,
         },
-        runtime,
+        &runtime,
         namespace,
         cancellation,
         &mut pause_until,
@@ -3760,6 +3737,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
     let PreparedStorageTopology {
         base_config,
         backends,
@@ -3788,6 +3766,7 @@ async fn build_registry_for_multi_backend_inner_with_max_readers(
         cfg.backend_id = BackendId::main();
         cfg
     })
+    .with_outbound_email_policy(email_policy)
     .with_declared_backend_db_paths(declared_backend_db_paths.clone())
     .with_diagnostic_backends(diagnostic_backends.clone());
 
@@ -4866,6 +4845,7 @@ async fn build_single_backend_runtime_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<KhiveRuntime> {
+    let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
     let backend = Arc::new(claimed_backend::open_single_backend(
         &mut config,
         max_readers,
@@ -4886,6 +4866,7 @@ async fn build_single_backend_runtime_with_max_readers(
     .await?;
 
     let runtime = KhiveRuntime::from_prepared_backend(backend, config)?
+        .with_outbound_email_policy(email_policy)
         .with_declared_backend_db_paths(declared_backend_db_paths(khive_cfg));
     if let Some(hydrator) = hydrator {
         runtime.install_blob_hydrator(hydrator)?;
@@ -5024,6 +5005,7 @@ fn build_pack_runtime(
     // main-assigned pack has no core pointer, but with `no_embed` its own
     // registry is empty and core-routed concept writes must still embed.
     let rt = KhiveRuntime::from_backend(backend, rt_config)
+        .with_outbound_email_policy(main_runtime.outbound_email_policy().clone())
         .with_declared_backend_db_paths(declared_backend_db_paths)
         .with_diagnostic_backends(diagnostic_backends)
         .with_diagnostic_observer_from(main_runtime)
@@ -18556,3 +18538,7 @@ mod outbox_slug_tests;
 #[cfg(all(test, unix))]
 #[path = "serve_reader_pool_tests.rs"]
 mod reader_pool_tests;
+
+#[cfg(test)]
+#[path = "serve_email_policy_tests.rs"]
+mod email_policy_tests;

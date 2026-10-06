@@ -333,7 +333,35 @@ request(ops="comm.send(to=\"email:prof.sheng@example.edu\", subject=\"Draft read
 
 ### How outbound delivery works
 
-`comm.send` itself only writes the note; it does not talk to SMTP directly.
+`comm.send` and `comm.reply` do not talk to SMTP directly. The serving host
+resolves one recipient policy at boot, independently of connector startup or
+credentials, and shares it with admission and the outbox. A configured denied
+recipient is refused before a fresh message is written. Nonempty trimmed
+`KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` entries take precedence; otherwise,
+including when that variable holds only blanks and separators, the first
+configured maintainer address is the fallback. Entries and requested
+recipients use the same normalization: display names are removed and the
+addr-spec has its ASCII letters lowercased; every other character compares
+exactly. Stored recipient spelling is unchanged.
+A refusal names the requested recipient in that normalized form, or as
+requested when it does not parse as an address.
+Invalid or unreadable configured policy prevents startup, as does a set but
+empty policy with no fallback recipient. A `KHIVE_EMAIL_MAINTAINER_ADDRESS`
+that is set is read the way the email connector reads it at start: comma
+separated, trimmed, empty values dropped, every remaining value must parse and
+at least one must remain. A value that fails prevents startup even beside a
+valid explicit list. An unset maintainer beside a valid explicit list is
+configured: allowed recipients are admitted and their messages stay pending
+while the connector cannot start, and the start-up warning names the missing
+value. With neither policy variable set, messages can
+still queue for later delivery, without a new backlog age cutoff.
+
+An exact keyed retry returns the original committed pair even if policy has
+since changed to deny a fresh send. It does not reset delivery state or request
+retransmission. A fresh denied keyed request claims no key; if another request
+commits after its final no-holder observation, a later retry can retrieve that
+receipt.
+
 A background outbox loop polls every 5 seconds for undelivered outbound
 notes. A note is eligible only when it has no terminal `delivery` value and
 its optional RFC 3339 `next_attempt_at` deadline is due:
@@ -342,10 +370,12 @@ its optional RFC 3339 `next_attempt_at` deadline is due:
 list(namespace=<ingest_namespace>, kind="message", direction="outbound", delivered=false, limit=200)
 ```
 
-For each note returned, the loop keeps only those where `to_actor` starts
-with `email:` and the note is not already delivered, then checks the
-recipient against the allowlist (`KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS`, or the
-channel's maintainer address if that variable is unset). Passing notes are
+Delivery requires a configured policy; starting it with absent policy returns
+a permanent component error without sending or restarting. The loop selects
+eligible email rows and defensively checks each recipient
+against the same policy, including messages queued by an earlier process.
+Stored Message-ID verification precedes recipient classification, so an
+unverifiable ID remains a visible hold. Passing notes are
 sent over SMTP, using the note's `subject`, `content`, and any
 `thread_id`/`in_reply_to_message_id`/`references_chain` properties to set the
 RFC 822 `Message-ID`, `In-Reply-To`, and `References` headers so replies group
@@ -426,7 +456,8 @@ Optional, with defaults:
   uncorrelated email messages. Set it to `local` only to retain the previous
   shared inbox routing.)
 - `KHIVE_EMAIL_SEND_ALLOWED_RECIPIENTS` (comma-separated outbound allowlist;
-  falls back to the maintainer address when unset)
+  falls back to the maintainer address when unset or when it holds only
+  blanks and separators)
 
 An anonymous `local` caller cannot read the delegated `channel:email` mailbox;
 the mailbox gate denies that read with `mailbox_read_not_granted`. To grant a

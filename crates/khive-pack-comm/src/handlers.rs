@@ -43,9 +43,11 @@ pub(crate) use thread::handle_thread;
 pub(crate) use parameter_aliases::{handle_delivered, handle_mark_read};
 
 use validation::{
-    canonicalize_ingest_sent_at, canonicalize_thread_id, inbox_note_matches, parse_inbox_timestamp,
-    parse_supplied_timestamp, require_existing_thread_root, send_response_thread_id,
-    thread_id_query_spellings, validate_actor_label, validate_inbox_substring,
+    addressed_recipient, caller_inherits_legacy_pool, caller_is_addressee,
+    canonicalize_ingest_sent_at, canonicalize_thread_id, inbox_note_matches, legacy_recipient,
+    parse_inbox_timestamp, parse_supplied_timestamp, require_existing_thread_root,
+    send_response_thread_id, thread_id_query_spellings, validate_actor_label,
+    validate_inbox_substring,
 };
 
 fn add_embedding_truncation_warning(
@@ -150,6 +152,7 @@ pub(crate) async fn handle_send(
     } = dual_write_message_with_identity(
         runtime,
         token,
+        "comm.send",
         &caller_ns,
         &caller_ns,
         p.subject.as_deref(),
@@ -211,28 +214,6 @@ pub(crate) async fn handle_transport_status(
     })?;
     let status = runtime.sender_transport_status(token, outbound_id).await?;
     Ok(json!({"id": outbound_id, "status": status}))
-}
-
-fn caller_inherits_legacy_pool(token: &NamespaceToken) -> bool {
-    token.actor().is_anonymous() && token.actor().id == "local"
-}
-
-fn legacy_recipient(properties: Option<&Value>) -> bool {
-    properties
-        .and_then(|properties| properties.get("to_actor"))
-        .is_none_or(Value::is_null)
-}
-
-fn addressed_recipient(properties: Option<&Value>) -> Option<&str> {
-    properties
-        .and_then(|properties| properties.get("to_actor"))
-        .and_then(Value::as_str)
-        .filter(|recipient| *recipient == "local" || is_valid_mailbox_actor_label(recipient))
-}
-
-fn caller_is_addressee(token: &NamespaceToken, properties: Option<&Value>) -> bool {
-    addressed_recipient(properties) == Some(token.actor().id.as_str())
-        || (caller_inherits_legacy_pool(token) && legacy_recipient(properties))
 }
 
 /// `inbox` — list inbound messages by default, or caller-authored sent rows (ADR-057).
@@ -1614,6 +1595,7 @@ pub(crate) async fn handle_reply(
     } = dual_write_message_with_identity(
         runtime,
         token,
+        "comm.reply",
         &caller_ns,
         &caller_ns,
         reply_subject_opt,

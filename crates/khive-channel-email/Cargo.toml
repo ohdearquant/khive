@@ -12,6 +12,7 @@ categories.workspace = true
 description = "Email (SMTP/IMAP) channel adapter for khive (ADR-056)"
 
 [dependencies]
+khive-types = { version = "0.9.0", path = "../khive-types" }
 khive-channel = { version = "0.9.0", path = "../khive-channel" }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

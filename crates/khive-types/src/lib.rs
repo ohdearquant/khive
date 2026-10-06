@@ -16,6 +16,7 @@ pub mod agent;
 #[cfg(feature = "serde")]
 pub mod canonical_json;
 pub mod edge;
+pub mod email_address;
 pub mod entity;
 pub mod entity_type;
 pub mod error;

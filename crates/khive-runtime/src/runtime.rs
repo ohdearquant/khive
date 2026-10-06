@@ -28,6 +28,7 @@ use crate::note_search_ann::NoteSearchAnnProvider;
 use crate::pack::KindHook;
 
 mod embedder_init;
+mod serving_policy;
 
 #[cfg(all(test, target_os = "macos"))]
 const IN_PROCESS_TEST_NOFILE_LIMIT: libc::rlim_t = 4096;
@@ -307,6 +308,7 @@ pub struct KhiveRuntime {
     /// `None` when this runtime is already bound to the main backend.
     core_backend: Option<Arc<StorageBackend>>,
     config: RuntimeConfig,
+    outbound_email_policy: crate::OutboundEmailPolicy,
     /// All SQLite backends declared by the host process, including those
     /// assigned to other packs. The code pack fences these from ingest.
     declared_backend_db_paths: Arc<[PathBuf]>,
@@ -598,6 +600,7 @@ impl KhiveRuntime {
             core_named_vector_stores: None,
             core_backend: None,
             config,
+            outbound_email_policy: Default::default(),
             declared_backend_db_paths: Vec::new().into(),
             diagnostic_backends: Vec::new().into(),
             late_diagnostic_backends: Arc::new(Mutex::new(Vec::new())),
@@ -746,6 +749,7 @@ impl KhiveRuntime {
                     core_named_vector_stores: None,
                     core_backend: None,
                     config: core_config,
+                    outbound_email_policy: self.outbound_email_policy.clone(),
                     declared_backend_db_paths: self.declared_backend_db_paths.clone(),
                     diagnostic_backends: self.diagnostic_backends.clone(),
                     late_diagnostic_backends: self.late_diagnostic_backends.clone(),
@@ -936,22 +940,6 @@ impl KhiveRuntime {
     /// dispatch path uses to report `arm_participation`/`vector_selected`.
     pub fn vector_arm_selected(&self) -> bool {
         self.config.embedding_model.is_some()
-    }
-
-    /// Return the immutable ADR-118 fresh-tail serving policy captured when
-    /// this runtime was constructed.
-    pub fn ann_fresh_tail_enabled(&self) -> bool {
-        self.ann_fresh_tail_enabled
-    }
-
-    /// Override ADR-118's fresh-tail serving policy for this runtime instance.
-    ///
-    /// This is primarily useful for embedded runtimes and deterministic tests:
-    /// it avoids mutating process-global environment state. Clones and `core()`
-    /// handles preserve the chosen value.
-    pub fn with_ann_fresh_tail_enabled(mut self, enabled: bool) -> Self {
-        self.ann_fresh_tail_enabled = enabled;
-        self
     }
 
     /// Return a reference to the underlying storage backend.
