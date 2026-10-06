@@ -380,7 +380,7 @@ is byte-identical whenever there is nothing to merge.
 
 ## Regression history
 
-These issues shaped invariants enforced directly by tests in `ann.rs`; they are noted here
+These issues shaped invariants enforced directly by tests in the `ann` test modules; they are noted here
 rather than as prose scattered through the source:
 
 - **#750** — a slow build with an older write generation must never replace a newer,
