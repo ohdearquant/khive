@@ -1,0 +1,1 @@
+UPDATE knowledge_sections SET embedding = ?1, updated_at = ?2 WHERE id = ?3 AND heading = ?4 AND content = ?5 AND EXISTS (SELECT 1 FROM knowledge_atoms a WHERE a.id = knowledge_sections.atom_id AND a.name = ?6 AND a.deleted_at IS NULL)

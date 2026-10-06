@@ -33,6 +33,27 @@ mod tests {
         assert!(!still_inline_seen(&sources, &root));
     }
 
+    #[test]
+    fn out_of_line_test_module_declaration_keeps_the_code_after_it() {
+        let source = r#"#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod lib_tests;
+
+impl Store {
+    fn q() -> &'static str { "SELECT id FROM notes" }
+}
+
+#[cfg(test)]
+mod inline {
+    const Q: &str = "SELECT secret FROM notes";
+}
+"#;
+        assert_eq!(
+            sql_literals(&strip_test_modules(source)),
+            vec!["SELECT id FROM notes".to_string()]
+        );
+    }
+
     fn fixture(source: &str) -> (BTreeMap<PathBuf, String>, BTreeSet<PathBuf>, PathBuf) {
         let root = PathBuf::from("/crates");
         let sources = BTreeMap::from([

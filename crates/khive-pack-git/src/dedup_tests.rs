@@ -557,6 +557,46 @@ async fn a_refused_anchor_keeps_its_notes_out_of_every_merge() {
 }
 
 #[tokio::test]
+async fn refusing_the_canonical_anchor_prevents_preview_and_apply() {
+    let f = Fixture::new().await;
+    let old = f.anchor().await;
+    let other = f.anchor().await;
+    let canonical_note = f.pr(f.canonical, Some("#8 t"), 8, "t", "body").await;
+    let old_note = f.pr(old, Some("#8 t"), 8, "t", "body").await;
+    let other_note = f.pr(other, Some("#8 t"), 8, "t", "body").await;
+    f.retire(old).await;
+    f.retire(other).await;
+    let ordinary = f.plan().await;
+    assert_eq!(ordinary.report().planned.len(), 1);
+    assert_eq!(ordinary.report().planned[0].survivor.id, canonical_note.id);
+    assert_eq!(ordinary.report().planned[0].donors.len(), 2);
+    let before = f.snapshot().await;
+
+    for apply in [false, true] {
+        let mut options = f.options();
+        options.refused_anchors.insert(f.canonical);
+        options.apply = apply;
+        let error = match run_dedup(&f.runtime, &f.token, options).await {
+            Ok(_) => panic!("canonical anchor must be refused before planning: apply={apply}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("cannot refuse canonical project anchor {}", f.canonical)
+        );
+        assert_eq!(f.snapshot().await, before, "apply={apply}");
+        let mut canonical_live = 0;
+        for id in [canonical_note.id, old_note.id, other_note.id] {
+            assert!(!f.is_deleted(id).await);
+            let current = f.current(id).await;
+            canonical_live +=
+                usize::from(property(&current, "project_id") == json!(f.canonical.to_string()));
+        }
+        assert_eq!(canonical_live, 1, "apply={apply}");
+    }
+}
+
+#[tokio::test]
 async fn notes_without_proof_or_a_number_are_left_alone() {
     let f = Fixture::new().await;
     let old = f.anchor().await;
@@ -895,6 +935,58 @@ async fn the_merge_embeds_the_survivor_and_drops_the_tombstoned_vector() {
         "the survivor's vector reflects the merged body"
     );
     assert!(vector(gone).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_committed_reindex_failure_fails_the_report_without_stopping_merges() {
+    let mut f = Fixture::embedding().await;
+    let namespace = format!("git-dedup-reindex-{}", Uuid::new_v4().as_simple());
+    f.token = f
+        .runtime
+        .authorize(Namespace::parse(&namespace).unwrap())
+        .unwrap();
+    f.canonical = f.project().await;
+    let old = f.anchor().await;
+    let other = f.anchor().await;
+    let survivor = f
+        .pr(f.canonical, Some("#1 t"), 1, "t", "survivor body")
+        .await;
+    let first = f.pr(old, Some("#1 t"), 1, "t", "first donor body").await;
+    let second = f.pr(other, Some("#1 t"), 1, "t", "second donor body").await;
+    f.retire(old).await;
+    f.retire(other).await;
+    let plan = f.plan().await;
+    assert_eq!(plan.report().planned.len(), 1);
+    assert_eq!(plan.report().planned[0].survivor.id, survivor.id);
+    assert_eq!(plan.report().planned[0].donors.len(), 2);
+    let events_before = f.merge_events().await;
+
+    let _arm = khive_runtime::arm_fts_fail_scoped(&namespace);
+    let report = apply_dedup(&f.runtime, &f.token, plan).await.unwrap();
+
+    assert_eq!(report.applied.len(), 2);
+    assert!(report.refused_merges.is_empty());
+    let error = report.applied[0]
+        .summary
+        .post_commit_reindex_error
+        .as_deref()
+        .expect("the first committed merge must report the injected failure");
+    assert!(error.contains("injected FTS failure"), "{error}");
+    assert_eq!(report.applied[1].summary.post_commit_reindex_error, None);
+    assert!(!report.success, "a later success must not mask the failure");
+    assert_eq!(serde_json::to_value(&report).unwrap()["success"], false);
+    assert!(report.summary_lines().contains(&format!(
+        "note {}: merge committed; post-commit reindex failed: {}",
+        survivor.id, error
+    )));
+    assert!(f.is_deleted(first.id).await);
+    assert!(f.is_deleted(second.id).await);
+    let kept = f.current(survivor.id).await;
+    for body in ["survivor body", "first donor body", "second donor body"] {
+        assert!(kept.content.contains(body), "missing {body}");
+    }
+    assert_eq!(kept.version, report.applied[1].kept_version);
+    assert_eq!(f.merge_events().await, events_before + 2);
 }
 
 #[tokio::test]

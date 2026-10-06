@@ -445,10 +445,18 @@ fn production_lines(source: &str) -> Vec<&str> {
             break;
         }
         let indent = lines[item].len() - lines[item].trim_start().len();
+        // A `use` item ends at its `;`, including a grouped `use a::{b, c};`, so its braces are
+        // not a body to strip through.
+        let head = lines[item].trim_start();
+        let head = match head.strip_prefix("pub") {
+            Some(rest) => rest.trim_start_matches(|c: char| c != ' ').trim_start(),
+            None => head,
+        };
+        let use_item = head.starts_with("use ");
         let mut end = item;
         let mut has_body = false;
         while end < lines.len() {
-            if lines[end].contains('{') {
+            if !use_item && lines[end].contains('{') {
                 has_body = true;
                 break;
             }
@@ -832,4 +840,29 @@ fn raw_vec0_writer_census_keeps_production_cfg_and_fixture_names() {
         sites("new-crate/src/unconditional_fixture.rs", &source).len(),
         1
     );
+}
+
+#[test]
+fn raw_vec0_writer_census_ends_test_only_use_at_its_semicolon() {
+    let writer = r#"sql!("DELETE FROM vec_live WHERE id = ?1");"#;
+    let fixture = r#"sql!("INSERT INTO vec_fixture VALUES (1)");"#;
+    for import in [
+        "use super::{Uuid, Value};",
+        "use super::{\n    Uuid,\n    Value,\n};",
+        "pub(crate) use super::{Uuid, Value};",
+    ] {
+        let source = format!(
+            "#[cfg(test)]\n{import}\nimpl Handler {{\n    fn writer() {{ {writer} }}\n}}\n\
+             #[cfg(test)]\nmod tests {{\n    fn fixture() {{ {fixture} }}\n}}\n"
+        );
+        let found: Vec<_> = sites("new-crate/src/writer.rs", &source)
+            .into_iter()
+            .map(|(site, _)| site)
+            .collect();
+        assert_eq!(
+            found,
+            vec!["new-crate/src/writer.rs::writer::DELETE::vec_live".to_string()],
+            "{import}"
+        );
+    }
 }

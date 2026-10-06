@@ -51,6 +51,8 @@ survivor already holds, byte for byte, is not appended again.
 `--refuse-anchor` (repeatable, full UUID) leaves every note whose `project_id`
 is that anchor untouched: such a note is neither merged away nor chosen as a
 survivor. Other notes in the same group still merge.
+The canonical project, which is the survivor's re-home destination, cannot be
+refused; that option combination is rejected before planning.
 
 ## Guarded merges
 
@@ -67,7 +69,9 @@ refusal.
 The merge embeds the survivor the way ingest does, so its vector follows the
 merged body, and the donor's vector rows are removed. The donor is tombstoned
 with its original content and properties, and the normal edge rewiring and merge
-event apply.
+event apply. A reported post-commit reindex failure leaves the merge committed;
+the summary and JSON report identify the survivor and error, and the command
+exits nonzero.
 
 ## Reading the plan
 

@@ -20,7 +20,7 @@ pub(super) async fn target(
             let id = input.id.to_string();
             let domain = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT id FROM knowledge_domains WHERE id = ?1".into(),
+                    sql: khive_runtime::sql!("knowledge_target_domain_probe").into(),
                     params: vec![SqlValue::Text(id.clone())],
                     label: None,
                 })
@@ -33,8 +33,7 @@ pub(super) async fn target(
             }
             let row = reader
                 .query_row(SqlStatement {
-                    sql: "SELECT tags FROM knowledge_atoms WHERE id = ?1 AND deleted_at IS NULL"
-                        .into(),
+                    sql: khive_runtime::sql!("knowledge_target_atom_tags").into(),
                     params: vec![SqlValue::Text(id.clone())],
                     label: None,
                 })
@@ -54,11 +53,17 @@ pub(super) async fn target(
     };
     let slug = input.slug.trim();
     // Tombstones and domain mirrors still own the unique namespace/slug entry.
-    let existing = reader.query_row(SqlStatement {
-        sql: "SELECT id, deleted_at, tags FROM knowledge_atoms WHERE namespace = ?1 AND slug = ?2 LIMIT 1".into(),
-        params: vec![SqlValue::Text(namespace.to_owned()), SqlValue::Text(slug.to_owned())],
-        label: None,
-    }).await.map_err(|error| sql_err("upsert_atoms lookup", error))?;
+    let existing = reader
+        .query_row(SqlStatement {
+            sql: khive_runtime::sql!("knowledge_target_atom_slug_probe").into(),
+            params: vec![
+                SqlValue::Text(namespace.to_owned()),
+                SqlValue::Text(slug.to_owned()),
+            ],
+            label: None,
+        })
+        .await
+        .map_err(|error| sql_err("upsert_atoms lookup", error))?;
     let Some(row) = existing else {
         return Ok(None);
     };
