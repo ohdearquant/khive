@@ -431,6 +431,8 @@ async fn page_uses_no_count_or_offset_and_does_not_write() {
         .unwrap();
     let counts = Arc::new(AtomicUsize::new(0));
     let observed = Arc::clone(&counts);
+    let writes = Arc::new(AtomicUsize::new(0));
+    let observed_writes = Arc::clone(&writes);
     store
         .pool
         .writer()
@@ -444,6 +446,7 @@ async fn page_uses_no_count_or_offset_and_does_not_write() {
                 Authorization::Deny
             }
             AuthAction::Insert { .. } | AuthAction::Update { .. } | AuthAction::Delete { .. } => {
+                observed_writes.fetch_add(1, Ordering::SeqCst);
                 Authorization::Deny
             }
             _ => Authorization::Allow,
@@ -451,6 +454,7 @@ async fn page_uses_no_count_or_offset_and_does_not_write() {
         .unwrap();
     let page = store.query_event_page(query(1)).await.unwrap();
     assert_eq!(page.rows.len(), 1);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
     assert_eq!(counts.load(Ordering::SeqCst), 0);
     assert!(store.count_events(EventFilter::default()).await.is_err());
     assert_eq!(
@@ -459,6 +463,22 @@ async fn page_uses_no_count_or_offset_and_does_not_write() {
         "COUNT-denial control was not active"
     );
     let guard = store.pool.writer().unwrap();
+    let error = guard
+        .conn()
+        .execute(
+            "DELETE FROM events WHERE id = ?1",
+            rusqlite::params![Uuid::from_u128(1).to_string()],
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::AuthorizationForStatementDenied)
+    );
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "write-denial control was not active"
+    );
     let mut program = guard.conn().prepare(&format!("EXPLAIN {QUERY}")).unwrap();
     let opcodes: Vec<String> = program
         .query_map(
