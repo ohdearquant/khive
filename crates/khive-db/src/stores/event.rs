@@ -29,6 +29,9 @@ use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::writer_task::WriterTaskHandle;
 
+#[path = "event_cursor.rs"]
+mod cursor;
+
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Events, op, e)
 }
@@ -1468,6 +1471,13 @@ impl EventStore for SqlEventStore {
             Ok(Page { items, total: None })
         })
         .await
+    }
+
+    async fn query_event_page(
+        &self,
+        query: khive_storage::event::EventPageQuery,
+    ) -> Result<khive_storage::event::EventPageWindow, StorageError> {
+        cursor::query_event_page(self, query).await
     }
 
     async fn count_events(&self, filter: EventFilter) -> Result<u64, StorageError> {

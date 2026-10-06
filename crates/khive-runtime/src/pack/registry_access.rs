@@ -384,6 +384,7 @@ impl VerbRegistry {
         ("blob", "blob.stat"),
         // brain
         ("brain", "brain.event_counts"),
+        ("brain", "brain.event_page"),
         ("brain", "brain.profiles"),
         ("brain", "brain.profile"),
         ("brain", "brain.resolve"),

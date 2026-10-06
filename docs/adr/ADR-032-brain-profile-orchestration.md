@@ -1491,6 +1491,35 @@ the enum rule above applies from its first snapshot.
 
 ---
 
+## Amendment 6 — Read persisted events in compound pages (2026-10-06, #4118)
+
+**Status**: Accepted (2026-10-06). Acceptance is required before dependent implementation merges.
+
+Add `brain.event_page` as an assertive read with the request, response and live-window
+contract in [ADR-022](ADR-022-events-query-surface.md)'s compound-page amendment.
+`brain.events` remains its fixed-verb debugging read; `brain.event_counts` retains
+its existing output fields, traversal, aggregation order and cost behavior.
+
+Factor only the existing event-count actor selector into a shared private helper.
+Preserve caller aliases (including historical bare/stamped forms), prefixed principal
+separation, anonymous behavior, explicit visible-actor checks, error/validation order,
+and the serving runtime's `brain.fleet_readers` policy. Only the count accumulator's
+existing default-caller coalescing remains count-specific. The page reader preserves
+each stored actor value. Reapply the selector on every continuation; neither cursor
+contents nor client-side configuration grant fleet access or broader namespaces.
+
+Return persisted event payloads as recorded. In particular, a real feedback writer's
+target, signal and profile attribution remain intact. Current and historical GTD
+audit rows do not contain task ID or prior/new status; leave them absent rather than
+infer them. Future typed GTD success-audit enrichment is out of scope and does not
+block this API. No profile fold, event emission or lifecycle-audit producer changes.
+
+Acceptance requires public MCP calls to real feedback and GTD writers followed by
+pages over a fixed window, exact stored-field comparison, and successful untruncated
+count parity under matching selectors. Retain existing count/debug/actor regression
+tests and add page-specific cursor, visibility and serving-fleet controls. The handler
+checks the actual serialized response against 4 MiB and fails explicitly if exceeded.
+
 ## References
 
 - ADR-006 — Deterministic Scoring (`DeterministicScore`, i64 fixed-point, canonical ordering)
