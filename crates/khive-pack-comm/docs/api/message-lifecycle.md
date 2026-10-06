@@ -865,7 +865,13 @@ can receive its deadline on a matching trusted replay.
 
 ## `vocab.rs::COMM_SCHEMA_PLAN_STMTS`
 
-Pack-auxiliary indexes for comm inbox and thread queries. Indexes use `WHERE
+The pack plan contains only the auxiliary `comm_channel_cursor` table. Numbered core migration
+V52 installs the six comm indexes on `notes`: `idx_comm_message_direction`,
+`idx_comm_message_thread`, `idx_comm_message_to_actor`, `idx_comm_message_outbound_ref`,
+`idx_comm_message_outbound_recipient`, and `idx_comm_quarantine_expiry`. They are available
+without loading the comm pack; existing names and definitions are preserved.
+
+The inbox and thread indexes use `WHERE
 deleted_at IS NULL` (not `WHERE kind = 'message'`) so that SQLite's index
 planner can match them when queries contain the parameterized `kind = ?N`
 predicate emitted by `build_note_filter_where`. A literal-value partial index
@@ -874,7 +880,7 @@ planner sees different predicates and falls back to a table scan.
 `deleted_at IS NULL` is always present in filtered queries, so the partial
 condition is always satisfied and the index is eligible. `kind` is included
 as an indexed column so the `kind = ?N` predicate is covered. The remaining
-pack statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
+core index statements are idempotent (`CREATE INDEX IF NOT EXISTS`).
 
 `idx_comm_message_outbound_ref` covers the exact `comm.delivered` lookup by
 namespace, note kind, direction, sender actor, and `properties.outbound_ref`.

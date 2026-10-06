@@ -3803,10 +3803,10 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
 /// fell back to `idx_comm_message_direction` (namespace, kind, direction,
 /// read — no recipient key at all) and every caller's unread inbox listing
 /// scanned every unread inbound row IN THE NAMESPACE, not just their own.
-/// `idx_comm_message_direction` (khive-pack-comm/src/vocab.rs) is reproduced
-/// here verbatim since khive-db has no dependency on khive-pack-comm to
-/// import it from; it must be present for this test to reflect the real
-/// index landscape a comm-pack-loaded server actually has.
+/// `idx_comm_message_direction` (core migration V52,
+/// sql/052-comm-core-indexes.sql) is reproduced here verbatim because this
+/// fixture builds the notes table without running migrations; it must be
+/// present for this test to reflect the index landscape of a real database.
 ///
 /// The control section pins the pre-fix `EqOrMissing` shape (still reachable
 /// as a `FilterOp` variant) against the exact regression this closes: it
@@ -3920,11 +3920,11 @@ async fn inbox_unread_listing_uses_recipient_index_not_direction_blind_scan() {
     fn build_pool_with_comm_indexes() -> Arc<ConnectionPool> {
         let pool = setup_pool();
         let writer = pool.writer().unwrap();
-        // Reproduces khive-pack-comm/src/vocab.rs COMM_SCHEMA_PLAN_STMTS's
-        // idx_comm_message_direction verbatim: applied at comm-pack init in
-        // the real system, so this test reflects the actual index landscape
-        // a comm-pack-loaded server has (khive-db cannot depend on
-        // khive-pack-comm to import the constant directly).
+        // Reproduces idx_comm_message_direction from core migration V52
+        // (sql/052-comm-core-indexes.sql) verbatim: every migrated database
+        // has it, so this test reflects the real index landscape; this
+        // fixture builds the notes table without running migrations, so the
+        // index is created here.
         writer
             .conn()
             .execute_batch(

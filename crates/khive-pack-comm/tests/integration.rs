@@ -3559,35 +3559,17 @@ async fn comm_pack_exposes_non_empty_schema_plan() {
         "CommPack must return a non-empty SchemaPlan"
     );
     assert_eq!(plan.pack, "comm", "SchemaPlan.pack must be 'comm'");
-    assert!(
-        !plan.statements.is_empty(),
-        "schema plan must have at least one DDL statement"
-    );
-
-    let combined = plan.statements.join(" ");
-    assert!(
-        combined.contains("idx_comm_message_direction"),
-        "schema plan must declare idx_comm_message_direction; got: {combined}"
-    );
-    assert!(
-        combined.contains("idx_comm_message_thread"),
-        "schema plan must declare idx_comm_message_thread; got: {combined}"
-    );
-    assert!(
-        combined.contains("idx_comm_message_outbound_ref"),
-        "schema plan must declare idx_comm_message_outbound_ref; got: {combined}"
-    );
-    assert!(
-        !combined.contains("idx_comm_message_outbound_due"),
-        "the function-backed channel deadline index must be installed by a numbered core migration"
-    );
-    assert!(
-        combined.contains("CREATE INDEX IF NOT EXISTS"),
-        "schema plan DDL must be idempotent; got: {combined}"
-    );
-    assert!(
-        combined.contains("deleted_at IS NULL"),
-        "schema plan indexes must use WHERE deleted_at IS NULL partial condition; got: {combined}"
+    assert_eq!(
+        plan.statements,
+        &["CREATE TABLE IF NOT EXISTS comm_channel_cursor (\
+    channel_kind TEXT NOT NULL CHECK (length(trim(channel_kind)) > 0),\
+    channel_slug TEXT NOT NULL CHECK (length(trim(channel_slug)) > 0),\
+    source TEXT NOT NULL CHECK (length(trim(source)) > 0),\
+    generation INTEGER NOT NULL CHECK (generation > 0),\
+    high_water INTEGER CHECK (high_water IS NULL OR high_water > 0),\
+    updated_at INTEGER NOT NULL,\
+    PRIMARY KEY (channel_kind, channel_slug)\
+)"]
     );
 }
 
@@ -3604,9 +3586,12 @@ async fn verb_registry_aggregates_comm_schema_plan() {
         .iter()
         .find(|p| p.pack == "comm")
         .expect("comm plan present");
-    assert!(
-        !comm_plan.is_empty(),
-        "comm schema plan must have DDL statements"
+    assert!(!comm_plan.is_empty(), "cursor schema stays pack-owned");
+    assert_eq!(comm_plan.statements.len(), 1);
+    let pack = CommPack::new(_rt);
+    assert_eq!(
+        comm_plan.statements,
+        khive_runtime::PackRuntime::schema_plan(&pack).statements
     );
 }
 
