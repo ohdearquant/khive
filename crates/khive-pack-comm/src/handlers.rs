@@ -1868,24 +1868,7 @@ async fn repair_duplicate_quarantine(
             let mut writer = sql.writer().await.map_err(RuntimeError::Storage)?;
             let repaired = writer
                 .execute(SqlStatement {
-                    sql: "UPDATE notes SET \
-                      properties = json_set(properties, '$.channel_slug', ?5, \
-                                            '$.quarantine_content_ref', ?3), \
-                      expires_at = CASE WHEN ?6 IS NULL THEN expires_at \
-                        WHEN expires_at IS NULL OR expires_at < ?6 \
-                        THEN ?6 ELSE expires_at END, \
-                      updated_at = MAX(updated_at, ?7) \
-                      WHERE id = ?1 AND namespace = ?2 AND kind = 'message' \
-                        AND deleted_at IS NULL \
-                        AND (json_type(properties, '$.quarantine_content_ref') IS NULL \
-                             OR json_extract(properties, '$.quarantine_content_ref') = ?3) \
-                        AND json_extract(properties, '$.channel_kind') = ?4 \
-                        AND (json_type(properties, '$.channel_slug') IS NULL \
-                             OR (json_type(properties, '$.channel_slug') = 'text' \
-                                 AND json_extract(properties, '$.channel_slug') = ?5)) \
-                        AND (json_extract(properties, '$.quarantined') = 'true' \
-                             OR json_type(properties, '$.quarantined') = 'true')"
-                        .into(),
+                    sql: khive_runtime::sql!("quarantine_duplicate_retention_repair").into(),
                     params: vec![
                         SqlValue::Text(duplicate.id.as_hyphenated().to_string()),
                         SqlValue::Text(ns.to_string()),
@@ -2558,10 +2541,7 @@ async fn detach_deleted_legacy_original(
         .writer()
         .await?
         .execute(SqlStatement {
-            sql: "DELETE FROM attachments WHERE record_uuid = ?1 \
-                  AND role = 'quarantine-original' AND substrate = 'note' \
-                  AND content_ref = ?2"
-                .into(),
+            sql: khive_runtime::sql!("quarantine_original_detach").into(),
             params: vec![
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(expected.as_str().to_string()),
@@ -2659,18 +2639,7 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         // SQLite-space-only text slug. Existing tombstones stay eligible,
         // including an operator-soft-deleted historical quarantine.
         (
-            "SELECT id FROM notes \
-             WHERE namespace = ?1 AND kind = 'message' \
-               AND ((expires_at IS NOT NULL AND expires_at <= ?2) \
-                    OR (expires_at IS NULL AND created_at <= ?3)) \
-               AND json_extract(properties, '$.channel_kind') = ?4 \
-               AND (json_type(properties, '$.channel_slug') IS NULL \
-                    OR json_type(properties, '$.channel_slug') = 'null' \
-                    OR (json_type(properties, '$.channel_slug') = 'text' \
-                        AND trim(json_extract(properties, '$.channel_slug')) = '')) \
-               AND (json_extract(properties, '$.quarantined') = 'true' \
-                    OR json_type(properties, '$.quarantined') = 'true') \
-             ORDER BY COALESCE(expires_at, created_at), id LIMIT 128",
+            khive_runtime::sql!("quarantine_legacy_expired_select"),
             vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(as_of),
@@ -2680,14 +2649,7 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         )
     } else {
         (
-            "SELECT id FROM notes \
-             WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
-               AND expires_at IS NOT NULL AND expires_at <= ?2 \
-               AND json_extract(properties, '$.channel_kind') = ?3 \
-               AND json_extract(properties, '$.channel_slug') = ?4 \
-               AND (json_extract(properties, '$.quarantined') = 'true' \
-                    OR json_type(properties, '$.quarantined') = 'true') \
-             ORDER BY expires_at, id LIMIT 128",
+            khive_runtime::sql!("quarantine_expired_select"),
             vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(as_of),
@@ -3169,19 +3131,7 @@ async fn load_quarantine_counts(
         .map_err(RuntimeError::Storage)?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT json_extract(properties, '$.channel_kind') AS channel_kind, \
-                         json_extract(properties, '$.channel_slug') AS channel_slug, \
-                         COUNT(*) AS quarantined_count \
-                  FROM notes \
-                  WHERE namespace = ?1 \
-                    AND kind = 'message' \
-                    AND deleted_at IS NULL \
-                    AND (json_extract(properties, '$.quarantined') = 'true' \
-                         OR json_type(properties, '$.quarantined') = 'true') \
-                  GROUP BY json_extract(properties, '$.channel_kind'), \
-                           json_extract(properties, '$.channel_slug') \
-                  ORDER BY channel_kind, channel_slug"
-                .into(),
+            sql: khive_runtime::sql!("quarantine_counts_select").into(),
             params: vec![SqlValue::Text(token.namespace().as_str().to_string())],
             label: Some("comm_health_quarantined_counts".into()),
         })
@@ -3407,53 +3357,7 @@ pub(crate) struct ProbeMessage {
 /// crates/khive-pack-comm/docs/api/probe-cursor.md#handlersrsprobe_sql for the full
 /// #780/#827 incident history.
 #[doc(hidden)]
-pub const PROBE_SQL: &str = "WITH \
-stats AS ( \
-    SELECT COUNT(*) AS stale_unread_count \
-    FROM ( \
-        SELECT 1 \
-        FROM notes INDEXED BY idx_notes_unread_probe_recipient_type_direction \
-        WHERE notes.namespace = ?1 \
-          AND notes.kind = 'message' \
-          AND notes.deleted_at IS NULL \
-          AND json_type(notes.properties, '$.to_actor') = 'text' \
-          AND ifnull(json_extract(notes.properties, '$.to_actor'), '') = ?2 \
-          AND json_extract(notes.properties, '$.direction') = 'inbound' \
-          AND (json_type(notes.properties, '$.read') IS NULL \
-               OR json_type(notes.properties, '$.read') != 'true') \
-          AND notes.created_at < ?4 \
-        LIMIT 1000 \
-    ) AS stale_unread_rows \
-), \
-new_rows AS ( \
-    SELECT \
-        notes_seq.seq AS cursor_us, \
-        notes.id, \
-        notes.created_at AS created_at_us, \
-        COALESCE(json_extract(notes.properties, '$.from_actor'), notes.namespace) AS from_actor, \
-        json_extract(notes.properties, '$.subject') AS subject \
-    FROM notes INDEXED BY idx_comm_message_to_actor \
-    JOIN notes_seq ON notes_seq.note_id = notes.id \
-    WHERE notes.namespace = ?1 \
-      AND notes.kind = 'message' \
-      AND notes.deleted_at IS NULL \
-      AND json_type(notes.properties, '$.to_actor') = 'text' \
-      AND json_extract(notes.properties, '$.to_actor') = ?2 \
-      AND json_extract(notes.properties, '$.direction') = 'inbound' \
-      AND (?3 IS NULL OR notes_seq.seq > ?3) \
-    ORDER BY notes_seq.seq ASC \
-    LIMIT 100 \
-) \
-SELECT \
-    new_rows.cursor_us, \
-    stats.stale_unread_count, \
-    new_rows.id, \
-    new_rows.created_at_us, \
-    new_rows.from_actor, \
-    new_rows.subject \
-FROM stats \
-LEFT JOIN new_rows ON TRUE \
-ORDER BY new_rows.created_at_us ASC, new_rows.cursor_us ASC";
+pub const PROBE_SQL: &str = khive_runtime::sql!("probe_messages_select");
 
 /// `probe` — strictly read-only poll for new inbound message metadata and a
 /// stale-unread count capped at 1000 (ADR-D5). No read-flag mutation, no writes:
@@ -3497,7 +3401,7 @@ async fn notes_seq_high_water_mark(
 ) -> Result<i64, RuntimeError> {
     let row = reader
         .query_row(khive_storage::types::SqlStatement {
-            sql: "SELECT seq FROM sqlite_sequence WHERE name = 'notes_seq'".into(),
+            sql: khive_runtime::sql!("notes_seq_high_water_select").into(),
             params: vec![],
             label: Some("comm_probe_notes_seq_hwm".into()),
         })
@@ -3646,9 +3550,7 @@ pub(crate) async fn handle_cursor_get(
 
     let row = w
         .query_row(khive_storage::types::SqlStatement {
-            sql: "SELECT source, generation, high_water, updated_at FROM comm_channel_cursor \
-                  WHERE channel_kind = ?1 AND channel_slug = ?2"
-                .into(),
+            sql: khive_runtime::sql!("channel_cursor_select").into(),
             params: vec![
                 SqlValue::Text(p.channel_kind.clone()),
                 SqlValue::Text(p.channel_slug.clone()),
@@ -3753,14 +3655,7 @@ pub(crate) async fn handle_cursor_commit(
         .map_err(RuntimeError::Storage)?;
 
     w.execute(khive_storage::types::SqlStatement {
-        sql: "INSERT INTO comm_channel_cursor(channel_kind, channel_slug, source, generation, high_water, updated_at) \
-              VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
-              ON CONFLICT(channel_kind, channel_slug) DO UPDATE SET \
-                source=excluded.source, \
-                generation=excluded.generation, \
-                high_water=excluded.high_water, \
-                updated_at=excluded.updated_at"
-            .into(),
+        sql: khive_runtime::sql!("channel_cursor_upsert").into(),
         params: vec![
             SqlValue::Text(p.channel_kind.clone()),
             SqlValue::Text(p.channel_slug.clone()),

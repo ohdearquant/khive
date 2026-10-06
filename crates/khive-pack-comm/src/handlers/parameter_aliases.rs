@@ -67,15 +67,7 @@ pub(crate) async fn handle_delivered(
     let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
     let row = reader
         .query_row(SqlStatement {
-            sql: "SELECT COUNT(*) AS inbound_count \
-                  FROM notes \
-                  WHERE namespace = ?1 \
-                    AND kind = 'message' \
-                    AND deleted_at IS NULL \
-                    AND json_extract(properties, '$.direction') = 'inbound' \
-                    AND json_extract(properties, '$.from_actor') = ?2 \
-                    AND json_extract(properties, '$.outbound_ref') = ?3"
-                .into(),
+            sql: khive_runtime::sql!("delivered_count_select").into(),
             params: vec![
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Text(token.actor().id.clone()),

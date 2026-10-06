@@ -9,15 +9,7 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 1] = [COMM_CHANNEL_CURSOR_SCHEM
 /// #449), idempotent (`CREATE TABLE IF NOT EXISTS`). See
 /// crates/khive-pack-comm/docs/api/probe-cursor.md#vocabrscomm_channel_cursor_schema_stmt
 pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
-    "CREATE TABLE IF NOT EXISTS comm_channel_cursor (\
-    channel_kind TEXT NOT NULL CHECK (length(trim(channel_kind)) > 0),\
-    channel_slug TEXT NOT NULL CHECK (length(trim(channel_slug)) > 0),\
-    source TEXT NOT NULL CHECK (length(trim(source)) > 0),\
-    generation INTEGER NOT NULL CHECK (generation > 0),\
-    high_water INTEGER CHECK (high_water IS NULL OR high_water > 0),\
-    updated_at INTEGER NOT NULL,\
-    PRIMARY KEY (channel_kind, channel_slug)\
-)";
+    khive_runtime::sql!("channel_cursor_create");
 
 pub(crate) static COMM_HANDLERS: [HandlerDef; 16] = [
     HandlerDef {
