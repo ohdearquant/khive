@@ -67,11 +67,7 @@ fn invalidate_section_vectors_for_atom_rename(
     now: i64,
 ) -> SqlStatement {
     SqlStatement {
-        sql: "UPDATE knowledge_sections SET embedding=NULL, updated_at=?1 \
-              WHERE atom_id=?2 AND namespace=?3 AND embedding IS NOT NULL \
-              AND EXISTS (SELECT 1 FROM knowledge_atoms a \
-                          WHERE a.id=?2 AND a.namespace=?3 AND a.name<>?4)"
-            .into(),
+        sql: khive_runtime::sql!("knowledge_sections_invalidate_atom_rename").into(),
         params: vec![
             SqlValue::Integer(now),
             SqlValue::Text(id.to_string()),
@@ -220,13 +216,7 @@ fn knowledge_get_prefix_statement(prefix: &str) -> Option<SqlStatement> {
         // A domain's FTS mirror atom has the same UUID. UNION (rather than
         // UNION ALL) deduplicates that legitimate cross-table duplicate so
         // one domain is not reported as an ambiguous prefix.
-        sql: "SELECT id FROM knowledge_domains \
-              WHERE id >= ?1 AND id < ?2 AND deleted_at IS NULL \
-              UNION \
-              SELECT id FROM knowledge_atoms \
-              WHERE id >= ?1 AND id < ?2 AND deleted_at IS NULL \
-              ORDER BY id LIMIT 2"
-            .into(),
+        sql: khive_runtime::sql!("knowledge_get_prefix").into(),
         params: vec![SqlValue::Text(lower), SqlValue::Text(upper)],
         label: Some("knowledge.get.resolve_prefix".into()),
     })
@@ -459,8 +449,7 @@ impl KnowledgeHandlers {
                 AtomWrite::Upsert(atom_in) => atom_in,
                 AtomWrite::PropertiesOnly(atom_in) => {
                     statements.push(SqlStatement {
-                        sql: "UPDATE knowledge_atoms SET properties=?1, updated_at=?2 WHERE id=?3"
-                            .into(),
+                        sql: khive_runtime::sql!("knowledge_atom_properties_update").into(),
                         params: vec![
                             if atom_in.properties.is_null() {
                                 SqlValue::Null
@@ -511,26 +500,28 @@ impl KnowledgeHandlers {
 
             if insert {
                 statements.push(SqlStatement {
-                        sql: "INSERT INTO knowledge_atoms (id, namespace, slug, name, content, tags, properties, source_uri, source_type, status, finalized, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)".into(),
-                        params: vec![
-                            SqlValue::Text(id),
-                            SqlValue::Text(ns.clone()),
-                            SqlValue::Text(slug.clone()),
-                            SqlValue::Text(atom_in.name.clone()),
-                            SqlValue::Text(content.clone()),
-                            SqlValue::Text(tags_json.clone()),
-                            props_json.as_ref().map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
-                            source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
-                            // status mirrors the lifecycle backfill (finalized => reviewed) so a
-                            // freshly-finalized atom is never left at the 'draft' default.
-                            SqlValue::Text(if finalized { "reviewed" } else { "draft" }.to_string()),
-                            SqlValue::Integer(finalized as i64),
-                            SqlValue::Integer(now),
-                            SqlValue::Integer(now),
-                        ],
-                        label: None,
-                    });
+                    sql: khive_runtime::sql!("knowledge_atom_insert").into(),
+                    params: vec![
+                        SqlValue::Text(id),
+                        SqlValue::Text(ns.clone()),
+                        SqlValue::Text(slug.clone()),
+                        SqlValue::Text(atom_in.name.clone()),
+                        SqlValue::Text(content.clone()),
+                        SqlValue::Text(tags_json.clone()),
+                        props_json
+                            .as_ref()
+                            .map_or(SqlValue::Null, |p| SqlValue::Text(p.clone())),
+                        source_uri.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        source_type.map_or(SqlValue::Null, |s| SqlValue::Text(s.to_string())),
+                        // status mirrors the lifecycle backfill (finalized => reviewed) so a
+                        // freshly-finalized atom is never left at the 'draft' default.
+                        SqlValue::Text(if finalized { "reviewed" } else { "draft" }.to_string()),
+                        SqlValue::Integer(finalized as i64),
+                        SqlValue::Integer(now),
+                        SqlValue::Integer(now),
+                    ],
+                    label: None,
+                });
                 created += 1;
             } else {
                 statements.push(invalidate_section_vectors_for_atom_rename(
