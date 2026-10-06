@@ -9,6 +9,30 @@ use tempfile::TempDir;
 use super::*;
 use crate::mirror::ingest::file_identity;
 
+fn shared_refusal(error: &std::io::Error) -> &AncestorLinkRefusal {
+    error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref())
+        .expect("shared ancestor policy refusal")
+}
+
+fn trusted_fixture_parent(path: &Path) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// A physical fixture directory; the returned guard removes it when the test ends.
 fn physical_fixture() -> (TempDir, PathBuf) {
     let temp = TempDir::new().expect("fixture directory");
@@ -40,8 +64,7 @@ fn assert_handles_pin_the_directories_of(handles: &[File], path: &Path) {
 }
 
 /// Follows every link and counts the links the walk offers it. The mirror's own policy follows
-/// only links that root owns, which a test run by another user cannot create, so the walk's
-/// handles and its budget are exercised under this policy over links the test builds itself.
+/// uses the shared ancestor policy; this policy isolates generic handle/budget behavior.
 struct FollowEveryLink {
     offered: u32,
 }
@@ -141,7 +164,7 @@ fn a_link_as_the_final_root_component_reports_the_kernel_refusal() {
 }
 
 #[test]
-fn policy_refuses_a_non_root_link_before_it_checks_the_parent() {
+fn policy_refuses_a_foreign_link_before_it_checks_the_parent() {
     let (_temp, fixture) = physical_fixture();
     // Writable by group and others without the sticky bit: no owner makes this parent trusted.
     let open_parent = fixture.join("open");
@@ -152,26 +175,25 @@ fn policy_refuses_a_non_root_link_before_it_checks_the_parent() {
     let parent = File::open(&open_parent).expect("parent handle");
     let name = OsStr::new("link");
     let mut stat = stat_at(&parent, name).expect("link metadata");
-    let mut policy = RootOwnedAncestorLinks;
+    let mut policy = MirrorAncestorLinks::new();
 
-    stat.st_uid = 1;
+    let effective_uid = unsafe { libc::geteuid() };
+    stat.st_uid = if effective_uid == 1 { 2 } else { 1 };
     let context = walk_context(&parent, name, stat);
-    let refusal = policy.before_follow(&context).expect_err("a non-root link");
+    let refusal = policy.before_follow(&context).expect_err("a foreign link");
     assert_eq!(refusal.kind(), std::io::ErrorKind::Other);
-    let message = refusal.to_string();
     assert_eq!(
-        message,
-        "mirror source root has a non-root-owned ancestor symlink"
+        shared_refusal(&refusal).condition,
+        AncestorLinkCondition::LinkOwner
     );
 
     stat.st_uid = 0;
     let context = walk_context(&parent, name, stat);
     let refusal = policy.before_follow(&context).expect_err("a root link");
     assert_eq!(refusal.kind(), std::io::ErrorKind::Other);
-    let message = refusal.to_string();
     assert_eq!(
-        message,
-        "mirror source root ancestor symlink parent permits non-root entry replacement"
+        shared_refusal(&refusal).condition,
+        AncestorLinkCondition::ParentPermissions
     );
 }
 
@@ -184,7 +206,7 @@ fn after_read_refuses_a_link_replaced_while_it_resolved() {
     let name = OsStr::new("link");
     let stat = stat_at(&parent, name).expect("link metadata");
     let context = walk_context(&parent, name, stat);
-    let mut policy = RootOwnedAncestorLinks;
+    let mut policy = MirrorAncestorLinks::new();
 
     policy.after_read(&context).expect("an unchanged link");
 
@@ -193,10 +215,9 @@ fn after_read_refuses_a_link_replaced_while_it_resolved() {
     std::os::unix::fs::symlink("second", &replacement).expect("replacement link");
     std::fs::rename(&replacement, &link).expect("replace link");
     let refusal = policy.after_read(&context).expect_err("a replaced link");
-    let message = refusal.to_string();
     assert_eq!(
-        message,
-        "mirror source root ancestor symlink changed while resolving"
+        shared_refusal(&refusal).condition,
+        AncestorLinkCondition::LinkChanged
     );
 }
 
@@ -210,4 +231,87 @@ fn a_root_component_with_a_nul_byte_keeps_its_message() {
     assert_eq!(refusal.kind(), std::io::ErrorKind::InvalidInput);
     let message = refusal.to_string();
     assert_eq!(message, "mirror source root contains a NUL byte");
+}
+
+#[test]
+fn actual_mirror_root_accepts_current_user_ancestry_and_denies_unsafe_parent() {
+    let (_temp, fixture) = physical_fixture();
+    trusted_fixture_parent(&fixture);
+    std::fs::create_dir_all(fixture.join("real/inner")).unwrap();
+    std::os::unix::fs::symlink("real", fixture.join("link")).unwrap();
+    let root = fixture.join("link/inner");
+    let handles = open_source_root(&root).expect("shared policy permits the current-user ancestor");
+    let physical = File::open(fixture.join("real/inner")).unwrap();
+    assert_eq!(
+        file_identity(handles.last().unwrap()).unwrap(),
+        file_identity(&physical).unwrap()
+    );
+    println!("mirror ancestor policy current user: ALLOW");
+
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let error = open_source_root(&root).expect_err("nonsticky writable parent must deny");
+    assert_eq!(
+        shared_refusal(&error).condition,
+        AncestorLinkCondition::ParentPermissions
+    );
+    assert_eq!(shared_refusal(&error).parent_mode.unwrap() & 0o7777, 0o777);
+    println!("mirror ancestor policy unsafe parent: DENY parent_permissions");
+}
+
+#[test]
+fn invalid_input_typed_policy_refusal_is_not_rewritten_as_a_nul_path() {
+    let (_temp, fixture) = physical_fixture();
+    std::os::unix::fs::symlink("missing", fixture.join("link")).unwrap();
+    let parent = File::open(&fixture).unwrap();
+    let name = OsStr::new("link");
+    let mut stat = stat_at(&parent, name).unwrap();
+    let effective_uid = unsafe { libc::geteuid() };
+    stat.st_uid = if effective_uid == 1 { 2 } else { 1 };
+    let context = walk_context(&parent, name, stat);
+    let error = AncestorLinkPolicy::new(AncestorWalkEndpoint::FinalTarget)
+        .before_follow(&context)
+        .expect_err("actual shared evaluator refuses a foreign owner");
+    let error = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        error.into_inner().expect("typed policy cause"),
+    );
+    let error = root_walk_error(error);
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        shared_refusal(&error).condition,
+        AncestorLinkCondition::LinkOwner
+    );
+    assert!(error.to_string().contains("link_owner"));
+    assert!(!error.to_string().contains("NUL"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn actual_mirror_root_denies_acl_grant_with_unchanged_mode() {
+    use std::os::unix::fs::MetadataExt as _;
+    let (_temp, fixture) = physical_fixture();
+    trusted_fixture_parent(&fixture);
+    std::fs::create_dir_all(fixture.join("real/inner")).unwrap();
+    std::os::unix::fs::symlink("real", fixture.join("link")).unwrap();
+    let root = fixture.join("link/inner");
+    open_source_root(&root).expect("no ACL grants");
+    let mode = std::fs::metadata(&fixture).unwrap().mode();
+    let output = std::process::Command::new("/bin/chmod")
+        .args(["+a", "everyone allow add_file,delete_child"])
+        .arg(&fixture)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::metadata(&fixture).unwrap().mode(), mode);
+    let error =
+        open_source_root(&root).expect_err("shared ACL grant condition must deny the root walk");
+    assert_eq!(
+        shared_refusal(&error).condition,
+        AncestorLinkCondition::ParentAclGrant
+    );
+    println!("mirror actual macOS ACL grant: DENY parent_acl_grant");
 }

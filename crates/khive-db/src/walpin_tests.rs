@@ -167,24 +167,53 @@ fn ensure_sidecar_dir_refuses_symlink() {
 
 #[test]
 #[cfg(unix)]
-fn ensure_sidecar_dir_refuses_non_root_owned_ancestor_symlink() {
-    // The sidecar dir's own final component is real; a symlink sits at
-    // an ANCESTOR of it instead. This must be refused just as hard as a
-    // symlinked final component — only a root-owned ancestor symlink
-    // (the OS's own firmlinks, e.g. macOS's /tmp -> private/tmp) gets a
-    // pass, and the test process does not own this symlink as root.
+fn ensure_sidecar_dir_accepts_current_user_link_at_end_of_parent_walk() {
     let root = tempfile::tempdir().unwrap();
     let real = root.path().join("real_ancestor");
     fs::create_dir(&real).unwrap();
     let link = root.path().join("linked_ancestor");
     std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(fs::symlink_metadata(&link).unwrap().uid(), current_uid());
     let dir = link.join("khive.db.walpin");
-    let err =
-        ensure_sidecar_dir(&dir).expect_err("non-root-owned ancestor symlink must be refused");
-    assert!(
-        err.to_string().contains("symlink"),
-        "unexpected error: {err}"
+
+    ensure_sidecar_dir(&dir).expect("the parent walk's final link is a trusted ancestor");
+    let meta = fs::symlink_metadata(real.join("khive.db.walpin")).unwrap();
+    assert!(meta.is_dir());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    assert_eq!(meta.uid(), current_uid());
+}
+
+#[test]
+#[cfg(unix)]
+fn ensure_sidecar_dir_refuses_ancestor_link_in_nonsticky_writable_parent() {
+    use khive_fs::directory_walk::{AncestorLinkCondition, AncestorLinkRefusal};
+
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("real_ancestor");
+    fs::create_dir(&real).unwrap();
+    let payload = real.join("payload");
+    fs::write(&payload, b"keep").unwrap();
+    let link = root.path().join("linked_ancestor");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+    let err = ensure_sidecar_dir(&link.join("khive.db.walpin"))
+        .expect_err("a nonsticky writable link parent must be refused");
+    let refusal = err
+        .get_ref()
+        .and_then(|cause| cause.downcast_ref::<AncestorLinkRefusal>())
+        .expect("the shared typed refusal must survive the caller");
+    assert_eq!(refusal.condition, AncestorLinkCondition::ParentPermissions);
+    assert_eq!(
+        refusal.component,
+        std::ffi::OsString::from("linked_ancestor")
     );
+    assert_eq!(refusal.link_uid, current_uid());
+    assert_eq!(refusal.parent_uid, Some(current_uid()));
+    assert_eq!(refusal.parent_mode, Some(0o40777));
+    assert!(!real.join("khive.db.walpin").exists());
+    assert_eq!(fs::read(payload).unwrap(), b"keep");
+    assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
 }
 
 #[test]
