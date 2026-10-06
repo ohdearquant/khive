@@ -220,6 +220,23 @@ pub trait EntityStore: Send + Sync + 'static {
         filter: EntityFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Entity>>;
+    /// Query an offset page without computing an exact total.
+    ///
+    /// The returned page has `total: None`. Callers needing a has-more signal
+    /// request one extra row. Backends must implement this operation directly;
+    /// falling back to `query_entities` could perform a discarded full count.
+    async fn query_entities_count_free(
+        &self,
+        _namespace: &str,
+        _filter: EntityFilter,
+        _page: PageRequest,
+    ) -> StorageResult<Page<Entity>> {
+        Err(crate::StorageError::Unsupported {
+            capability: crate::StorageCapability::Entities,
+            operation: "query_entities_count_free".into(),
+            message: "this backend does not implement count-free entity pages".into(),
+        })
+    }
     /// Resolve an entity id to its immutable insertion sequence.
     async fn entity_sequence(&self, _id: Uuid) -> StorageResult<Option<i64>> {
         Err(crate::StorageError::Unsupported {

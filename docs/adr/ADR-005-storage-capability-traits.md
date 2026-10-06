@@ -1119,3 +1119,35 @@ test fails when the corresponding behavior is removed.
 Acceptance applies to the final reviewed text and its conformant implementation.
 This proposal changes neither git.receipts pagination nor event-plane WAL
 configuration; those have separate contracts.
+
+## Proposed amendment: count-free entity list pages (2026-10-05)
+
+**Status: Proposed.**
+
+`EntityStore` adds the provided method
+`query_entities_count_free(&self, namespace: &str, filter: EntityFilter, page: PageRequest) -> StorageResult<Page<Entity>>`.
+An implementation returns the same filtered row projection and page order as
+`query_entities`, with `total: None`, without computing an exact matching count.
+Callers that need `has_more` request one lookahead row. An absent total does not
+mean the population is empty or exhausted.
+
+The default returns `StorageError::Unsupported` for the Entities capability and
+this operation. It must not call `query_entities` or `count_entities` as a
+fallback. Existing implementors remain source-compatible, but a custom backend
+must implement this operation to serve runtime entity lists. Storage failures
+from an implemented operation remain errors rather than capability absence or
+an empty successful page.
+
+Runtime scalar, composed and tagged entity lists use the count-free operation.
+Reference resolution and callers that require an exact total retain
+`query_entities`; explicit entity count operations retain `count_entities`.
+Existing complete-ID and candidate-name total exceptions on the exact query
+operation remain unchanged. The SQLite implementation preserves filter
+intersections, alias membership, namespace selection, live-row filtering,
+attachment content references, name ranking and pagination validation.
+
+This is a single-backend read capability. It adds no vocabulary, namespace
+authority, placement rule, maintained count or snapshot-isolation promise.
+Count-free paging does not itself bound skipped offset entries, residual-filter
+work or payload sizes. SQLite access paths and their measured acceptance are
+specified by ADR-015's proposed ordered entity-list amendment.

@@ -2604,3 +2604,195 @@ async fn issue2673_entity_versions_cover_typed_storage_writers() {
         1
     );
 }
+
+#[tokio::test]
+async fn entity_count_free_page_never_calls_count() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    fn deny_count(ctx: AuthContext<'_>) -> Authorization {
+        match ctx.action {
+            AuthAction::Function { function_name }
+                if function_name.eq_ignore_ascii_case("count") =>
+            {
+                Authorization::Deny
+            }
+            _ => Authorization::Allow,
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("entity-count-free.db")),
+            max_readers: 1,
+            write_queue_enabled: Some(false),
+            ..PoolConfig::for_test()
+        })
+        .unwrap(),
+    );
+    {
+        let writer = pool.writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!("{ENTITIES_DDL}\n{TEST_ATTACHMENTS_DDL}"))
+            .unwrap();
+        for i in 1..=2_000 {
+            writer.conn().execute(
+                "INSERT INTO entities(id,namespace,kind,entity_type,name,description,properties,\
+                    tags,created_at,updated_at) VALUES(?1,'local','concept','algorithm',?2,\
+                    'description','{\"type\":\"algorithm\"}','[\"Tag\"]',?3,?3)",
+                rusqlite::params![Uuid::from_u128(i).to_string(), format!("row{i}"), i as i64],
+            ).unwrap();
+        }
+        writer.conn().execute(
+            "INSERT INTO attachments(record_uuid,substrate,role,content_ref,created_at) VALUES(?1,\
+                'entity','content',?2,1)",
+            rusqlite::params![Uuid::from_u128(2_000).to_string(), "a".repeat(64)],
+        ).unwrap();
+    }
+    // max_readers=1 keeps both control and count-free queries on the authorized reader.
+    assert_eq!(pool.max_readers(), 1, "exercise the pooled reader path");
+    let store = SqlEntityStore::new(Arc::clone(&pool), false);
+    let filters = [
+        EntityFilter::default(),
+        EntityFilter {
+            kinds: vec!["concept".into()],
+            entity_types: vec!["algorithm".into()],
+            legacy_entity_type_fallback: true,
+            tags_any: vec!["tag".into()],
+            ..Default::default()
+        },
+        EntityFilter {
+            kinds: vec!["absent".into()],
+            ..Default::default()
+        },
+    ];
+    for filter in filters {
+        for (limit, offset) in [(6, 0), (4, 9), (0, 0), (4, 3_000)] {
+            let request = PageRequest { limit, offset };
+            let expected = store
+                .query_entities("local", filter.clone(), request.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                expected.total,
+                Some(
+                    if filter.kinds.first().is_some_and(|kind| kind == "absent") {
+                        0
+                    } else {
+                        2_000
+                    }
+                )
+            );
+            pool.reader()
+                .unwrap()
+                .conn()
+                .authorizer(Some(deny_count))
+                .unwrap();
+            let control = store
+                .query_entities(
+                    "local",
+                    filter.clone(),
+                    PageRequest {
+                        limit: 6,
+                        offset: 0,
+                    },
+                )
+                .await;
+            assert!(
+                control.is_err(),
+                "exact-total control must exercise the denied COUNT"
+            );
+            let actual = store
+                .query_entities_count_free("local", filter.clone(), request.clone())
+                .await
+                .expect("count-free paging must not execute COUNT");
+            assert_eq!(actual.total, None);
+            assert_eq!(
+                serde_json::to_value(&actual.items).unwrap(),
+                serde_json::to_value(&expected.items).unwrap(),
+                "complete projection, limit={limit}, offset={offset}"
+            );
+            pool.reader()
+                .unwrap()
+                .conn()
+                .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+                .unwrap();
+            let restored = store
+                .query_entities("local", filter.clone(), request)
+                .await
+                .unwrap();
+            assert_eq!(
+                restored.total, expected.total,
+                "exact totals must remain available"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn count_free_entity_pages_preserve_candidates_ids_and_multi_namespace_rows() {
+    let store = setup_memory_store();
+    let mut entities = Vec::new();
+    for (i, namespace, name) in [
+        (1, "local", "Alpha"),
+        (2, "local", "alphabet"),
+        (3, "team", "ALPHA"),
+        (4, "local", "Beta"),
+    ] {
+        let mut entity = make_entity(namespace, "concept", name);
+        entity.id = Uuid::from_u128(i);
+        entity.created_at = i as i64;
+        entity.description = Some(format!("description{i}"));
+        entity.properties = Some(serde_json::json!({"type":"algorithm"}));
+        entity.tags = vec!["Tag".into()];
+        store.upsert_entity(entity.clone()).await.unwrap();
+        entities.push(entity);
+    }
+    let filters = [
+        EntityFilter {
+            namespaces: vec!["local".into(), "team".into(), "local".into()],
+            ..Default::default()
+        },
+        EntityFilter {
+            names_ci: vec!["alpha".into(), "ALPHA".into(), "beta".into()],
+            ..Default::default()
+        },
+        EntityFilter {
+            name_prefix: Some("Alpha".into()),
+            ..Default::default()
+        },
+        EntityFilter {
+            name_exact: Some("Alpha".into()),
+            ..Default::default()
+        },
+        EntityFilter {
+            ids: entities.iter().map(|e| e.id).collect(),
+            ..Default::default()
+        },
+        EntityFilter {
+            ids: entities.iter().map(|e| e.id).collect(),
+            tags_any: vec!["tag".into()],
+            ..Default::default()
+        },
+    ];
+    for filter in filters {
+        for (limit, offset) in [(4, 0), (2, 1), (0, 0), (2, 20)] {
+            let request = PageRequest { limit, offset };
+            let expected = store
+                .query_entities("local", filter.clone(), request.clone())
+                .await
+                .unwrap();
+            let actual = store
+                .query_entities_count_free("local", filter.clone(), request)
+                .await
+                .unwrap();
+            assert_eq!(actual.total, None);
+            assert_eq!(
+                serde_json::to_value(&actual.items).unwrap(),
+                serde_json::to_value(&expected.items).unwrap(),
+                "{filter:?}, limit={limit}, offset={offset}"
+            );
+        }
+    }
+}

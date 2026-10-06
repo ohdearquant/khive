@@ -2610,7 +2610,7 @@ impl KhiveRuntime {
             .collect();
         let page = self
             .entities(token)?
-            .query_entities(
+            .query_entities_count_free(
                 token.namespace().as_str(),
                 filter,
                 PageRequest {
@@ -2722,7 +2722,7 @@ impl KhiveRuntime {
         };
         let page = self
             .entities(token)?
-            .query_entities(
+            .query_entities_count_free(
                 token.namespace().as_str(),
                 filter,
                 PageRequest {
@@ -9021,6 +9021,7 @@ mod tests {
     use std::sync::Arc;
 
     mod embed_failure_latency;
+    mod entity_list_pages;
     mod try_create_note;
 
     fn rt() -> KhiveRuntime {
@@ -9111,97 +9112,6 @@ mod tests {
         assert_eq!(
             salience_weighted_rank(DeterministicScore::ZERO, None),
             DeterministicScore::ZERO
-        );
-    }
-
-    #[tokio::test]
-    async fn list_composed_type_filters_apply_alias_and_disjoint_sets_before_pagination() {
-        let runtime = rt();
-        let token = runtime.authorize(Namespace::local()).unwrap();
-        let store = runtime.entities(&token).unwrap();
-        let mut expected = Vec::new();
-        for (kind, column, property, matches) in [
-            ("document", Some("paper"), "ignored", true),
-            ("document", None, "preprint", true),
-            ("document", Some("preprint"), "ignored", true),
-            ("document", Some("report"), "preprint", false),
-            ("concept", None, "preprint", false),
-        ] {
-            let row = Entity::new("local", kind, "type predicate")
-                .with_entity_type(column)
-                .with_properties(serde_json::json!({"type": property}));
-            if matches {
-                expected.push(row.id);
-            }
-            store.upsert_entity(row).await.unwrap();
-        }
-        store
-            .upsert_entity(
-                Entity::new("foreign", "document", "foreign alias")
-                    .with_properties(serde_json::json!({"type":"preprint"})),
-            )
-            .await
-            .unwrap();
-        for (values, should_match) in [
-            (vec!["paper".to_string(), "preprint".to_string()], true),
-            (vec!["absent".to_string()], false),
-            (Vec::new(), false),
-        ] {
-            let filter = EntityFilter {
-                entity_types_by_kind: [("document".to_string(), values)].into_iter().collect(),
-                legacy_entity_type_fallback: true,
-                namespaces: vec!["foreign".to_string()], // Runtime supplies token visibility.
-                ..Default::default()
-            };
-            let mut offset_ids = Vec::new();
-            for offset in 0..=expected.len() {
-                let page = runtime
-                    .list_entities_filtered(&token, filter.clone(), 1, offset as u32)
-                    .await
-                    .unwrap();
-                offset_ids.extend(page.into_iter().map(|row| row.id));
-            }
-            let mut cursor_ids = Vec::new();
-            let mut after = None;
-            for _ in 0..=expected.len() {
-                let (page, next) = runtime
-                    .list_entities_after_filtered(&token, filter.clone(), after, 1)
-                    .await
-                    .unwrap();
-                cursor_ids.extend(page.into_iter().map(|row| row.id));
-                after = next;
-                if after.is_none() {
-                    break;
-                }
-            }
-            let mut wanted = if should_match {
-                expected.clone()
-            } else {
-                Vec::new()
-            };
-            wanted.sort_unstable();
-            offset_ids.sort_unstable();
-            cursor_ids.sort_unstable();
-            assert_eq!(offset_ids, wanted);
-            assert_eq!(cursor_ids, wanted);
-        }
-        // Existing scalar callers retain literal matching, including legacy fallback.
-        assert_eq!(
-            runtime
-                .list_entities(&token, None, Some("paper"), 20, 0)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            runtime
-                .list_entities_after(&token, None, Some("paper"), &[], None, 20)
-                .await
-                .unwrap()
-                .0
-                .len(),
-            1
         );
     }
 
