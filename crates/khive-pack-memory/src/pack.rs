@@ -999,7 +999,7 @@ mod ann_route_tests {
 }
 
 /// Pack-level lifecycle coverage for `start_rotation_watcher`'s production
-/// wiring (issue #2340): the rotation tests in `ann.rs` call the private
+/// wiring (issue #2340): the rotation unit tests call the private
 /// `refresh_rotated_segments_once` test helper directly, so nothing
 /// previously asserted that a writable `warm()` actually starts the tracked
 /// watcher, that a repeated `warm()` is idempotent, or that the watcher
