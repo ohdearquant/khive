@@ -535,9 +535,7 @@ fn phase_a_rowids_statement(term: &str, limit: usize) -> SqlStatement {
         };
     }
     SqlStatement {
-        sql: "SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
-              ORDER BY rowid LIMIT ?2"
-            .into(),
+        sql: khive_runtime::sql!("knowledge_search_fts_rowids").into(),
         params: vec![SqlValue::Text(term.into()), SqlValue::Integer(limit as i64)],
         label: Some("knowledge.fts_rowids".into()),
     }
@@ -561,11 +559,7 @@ fn term_frequency_statement(term: &str) -> SqlStatement {
         };
     }
     SqlStatement {
-        sql: "SELECT count(*) AS frequency FROM ( \
-                  SELECT rowid FROM fts_knowledge WHERE fts_knowledge MATCH ?1 \
-                  ORDER BY rowid LIMIT ?2 \
-              )"
-        .into(),
+        sql: khive_runtime::sql!("knowledge_search_fts_term_frequency").into(),
         params: vec![
             SqlValue::Text(term.into()),
             SqlValue::Integer((FTS_TERM_LIMIT + 1) as i64),
@@ -989,9 +983,7 @@ async fn fetch_fts_candidates(
             .read(
                 LexicalPhase::ReaderOpen,
                 reader.query_row(SqlStatement {
-                    sql: "SELECT namespace_key FROM knowledge_fts_namespace_tokens \
-                          WHERE namespace = ?1"
-                        .into(),
+                    sql: khive_runtime::sql!("knowledge_search_namespace_key").into(),
                     params: vec![SqlValue::Text(ns.into())],
                     label: Some("knowledge.fts_namespace_key".into()),
                 }),
@@ -1355,10 +1347,7 @@ async fn fetch_fts_candidates(
     if !namespace_has_match {
         for term in unexhausted_terms {
             let statement = SqlStatement {
-                sql: "SELECT 1 AS present FROM fts_knowledge \
-                      CROSS JOIN knowledge_atoms AS a ON a.rowid = fts_knowledge.rowid \
-                      WHERE fts_knowledge MATCH ?1 AND +a.namespace = ?2 LIMIT 1"
-                    .into(),
+                sql: khive_runtime::sql!("knowledge_search_fts_namespace_present").into(),
                 params: vec![SqlValue::Text(term.clone()), SqlValue::Text(ns.to_owned())],
                 label: None,
             };
