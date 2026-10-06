@@ -7,7 +7,6 @@ pub(super) enum OutboxPolicy<'a> {
     Email {
         mailbox: &'a str,
         domains: &'a khive_runtime::EmailMessageIdDomains,
-        allowlist: &'a [String],
     },
     #[cfg(feature = "channel-telegram")]
     Telegram(std::marker::PhantomData<&'a ()>),
@@ -157,11 +156,9 @@ impl OutboxPolicy<'_> {
     ) -> Result<Option<Prepared>, crate::components::ComponentError> {
         match self {
             #[cfg(feature = "channel-email")]
-            Self::Email {
-                mailbox,
-                domains,
-                allowlist,
-            } => prepare_email(runtime, token, note, mailbox, domains, allowlist).await,
+            Self::Email { mailbox, domains } => {
+                prepare_email(runtime, token, note, mailbox, domains).await
+            }
             #[cfg(feature = "channel-telegram")]
             Self::Telegram(_) => {
                 let _ = (runtime, token);
@@ -282,6 +279,19 @@ impl OutboxPolicy<'_> {
     }
 }
 
+#[cfg(feature = "channel-email")]
+pub(super) fn require_email_delivery_policy(
+    runtime: &KhiveRuntime,
+) -> Result<(), crate::components::ComponentError> {
+    if runtime.outbound_email_policy().is_configured() {
+        Ok(())
+    } else {
+        Err(crate::components::ComponentError::Permanent(
+            "outbound email delivery requires a configured recipient policy".into(),
+        ))
+    }
+}
+
 /// Row carries `channel_slug`: only the channel registered as exactly `(kind, slug)` may take it.
 /// If no configured channel has that slug, the row stays pending (delivery state untouched,
 /// never failed). No credential is touched.
@@ -300,6 +310,10 @@ pub(super) async fn outbox_once(
     pause_until: &mut Option<tokio::time::Instant>,
 ) -> Result<(), crate::components::ComponentError> {
     use crate::components::ComponentError;
+    #[cfg(feature = "channel-email")]
+    if matches!(&policy, OutboxPolicy::Email { .. }) {
+        require_email_delivery_policy(runtime)?;
+    }
     if pause_until
         .as_ref()
         .is_some_and(|deadline| tokio::time::Instant::now() < *deadline)
@@ -409,7 +423,6 @@ async fn prepare_email(
     note: &Note,
     mailbox: &str,
     domains: &khive_runtime::EmailMessageIdDomains,
-    allowlist: &[String],
 ) -> Result<Option<Prepared>, crate::components::ComponentError> {
     use chrono::Utc;
     let Some(props) = note
@@ -464,12 +477,15 @@ async fn prepare_email(
             return Ok(None);
         }
     }
-    if !allowlist.is_empty() && !allowlist.contains(&recipient) {
+    let normalized_recipient = khive_types::email_address::normalize_email_recipient(&recipient);
+    if !runtime.outbound_email_policy().allows(&recipient) {
         // ADR-122 §2: an allowlist rejection is a PERMANENT failure and
         // must be recorded — skipping with only a log line leaves the row
         // pending forever while the sender saw `ok: true`.
         let failed_at = Utc::now().to_rfc3339();
-        let last_error = format!("recipient {recipient} not in outbound allowlist");
+        // A recipient that does not parse has no normalized form; name it as requested.
+        let log_recipient = normalized_recipient.as_deref().unwrap_or(&recipient);
+        let last_error = format!("recipient {log_recipient} not in outbound allowlist");
         let mark_result = match uuid::Uuid::parse_str(&note_id) {
             Ok(uuid) => runtime
                 .mark_outbound_message_failed(token, uuid, failed_at, last_error.clone())
@@ -482,12 +498,12 @@ async fn prepare_email(
         match mark_result {
             Ok(_) => tracing::warn!(target: "khive_mcp::serve",
                 note_id = %note_id,
-                recipient = %recipient,
+                recipient = %log_recipient,
                 "outbox loop: recipient not in allowlist; recorded permanent failure"
             ),
             Err(error) => tracing::warn!(target: "khive_mcp::serve",
                 note_id = %note_id,
-                recipient = %recipient,
+                recipient = %log_recipient,
                 error = %error,
                 "outbox loop: recipient not in allowlist; failed to record failure (will re-encounter)"
             ),
@@ -578,7 +594,7 @@ async fn prepare_email(
     Ok(Some(Prepared {
         envelope,
         external_id: Some(message_id),
-        recipient,
+        recipient: normalized_recipient.expect("configured policy accepted a parsed recipient"),
     }))
 }
 

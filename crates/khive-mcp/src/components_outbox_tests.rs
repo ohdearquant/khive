@@ -127,6 +127,10 @@ fn email_registration(
     runtime: KhiveRuntime,
     channel: Arc<ScriptedChannel>,
 ) -> ComponentRegistration {
+    let runtime = runtime.with_outbound_email_policy(
+        khive_runtime::OutboundEmailPolicy::configured(vec!["recipient@example.com".into()])
+            .unwrap(),
+    );
     let mut registration = channel_component_registration(
         "email-outbound",
         Arc::new(move |ctx| {
@@ -135,7 +139,6 @@ fn email_registration(
                 runtime.clone(),
                 "local".into(),
                 "sender@example.com".into(),
-                vec!["recipient@example.com".into()],
                 ctx,
             ))
         }),
@@ -361,7 +364,10 @@ async fn mismatched_outbox_kind_is_permanent_before_heartbeat() {
         let channel = Arc::new(ScriptedChannel::new("outbox-test", []));
         let health = HealthReporter::default();
         let captured_channel = channel.clone();
-        let captured_runtime = runtime.clone();
+        let captured_runtime = runtime.clone().with_outbound_email_policy(
+            khive_runtime::OutboundEmailPolicy::configured(vec!["recipient@example.com".into()])
+                .unwrap(),
+        );
         let registration = channel_component_registration(
             "mismatched-outbox",
             Arc::new(move |ctx| {
@@ -374,7 +380,6 @@ async fn mismatched_outbox_kind_is_permanent_before_heartbeat() {
                             runtime,
                             "local".into(),
                             "sender@example.com".into(),
-                            vec![],
                             ctx,
                         )
                         .await
@@ -408,6 +413,14 @@ async fn mismatched_outbox_kind_is_permanent_before_heartbeat() {
         )
         .await;
         let status = health.status("mismatched-outbox").unwrap();
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .unwrap()
+                .starts_with("outbox adapter kind"),
+            "fixture must reach the adapter-kind guard, not the email policy guard"
+        );
         assert_eq!(
             status.state,
             ComponentState::Unhealthy,
@@ -419,4 +432,69 @@ async fn mismatched_outbox_kind_is_permanent_before_heartbeat() {
         );
         assert_eq!(channel.sends.load(Ordering::SeqCst), 0);
     }
+}
+
+#[cfg(feature = "channel-email")]
+#[tokio::test]
+async fn email_delivery_without_policy_stops_permanently_without_smtp_or_restart() {
+    let (server, runtime, id) = fixture("email:recipient@example.com").await;
+    assert!(!runtime.outbound_email_policy().is_configured());
+    let before = properties(&runtime, id).await;
+    let channel = Arc::new(ScriptedChannel::new("email", [Outcome::Delivered]));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let health = HealthReporter::default();
+    let cancellation = CancellationToken::new();
+    let registration = channel_component_registration(
+        "email-outbound",
+        Arc::new({
+            let runtime = runtime.clone();
+            let channel = channel.clone();
+            let starts = starts.clone();
+            move |ctx| {
+                starts.fetch_add(1, Ordering::SeqCst);
+                Box::pin(crate::serve::channel_outbox_loop(
+                    channel.clone(),
+                    runtime.clone(),
+                    "local".into(),
+                    "sender@example.com".into(),
+                    ctx,
+                ))
+            }
+        }),
+    );
+    assert!(registration.max_restarts > 0);
+    let mut task = tokio::spawn(supervise(
+        registration,
+        server,
+        cancellation.clone(),
+        health.clone(),
+    ));
+    let outcome = tokio::time::timeout(Duration::from_secs(3), &mut task).await;
+    if outcome.is_err() {
+        cancellation.cancel();
+        if tokio::time::timeout(Duration::from_secs(3), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+        panic!("absent policy must stop the component at startup");
+    }
+    outcome.unwrap().unwrap();
+    let status = health.status("email-outbound").unwrap();
+    assert_eq!(status.state, ComponentState::Unhealthy);
+    assert_eq!(status.restart_count, 0);
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        status.last_error.as_deref(),
+        Some("outbound email delivery requires a configured recipient policy")
+    );
+    assert!(status.last_heartbeat.is_none());
+    assert_eq!(channel.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        properties(&runtime, id).await,
+        before,
+        "configuration refusal must preserve the queued note"
+    );
 }

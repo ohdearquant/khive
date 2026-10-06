@@ -1,6 +1,7 @@
 use super::{
-    DateTime, FilterOp, HashSet, InboxParams, KhiveRuntime, NamespaceToken, Note, NoteFilter,
-    PageRequest, PropertyFilter, RuntimeError, SqlValue, Utc, Uuid, Value,
+    is_valid_mailbox_actor_label, DateTime, FilterOp, HashSet, InboxParams, KhiveRuntime,
+    NamespaceToken, Note, NoteFilter, PageRequest, PropertyFilter, RuntimeError, SqlValue, Utc,
+    Uuid, Value,
 };
 
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
@@ -255,4 +256,26 @@ pub(super) fn parse_supplied_timestamp(
 pub(super) fn canonicalize_ingest_sent_at(raw: &str) -> Result<String, RuntimeError> {
     parse_supplied_timestamp("ingest", "sent_at", raw)
         .map(|timestamp| timestamp.with_timezone(&Utc).to_rfc3339())
+}
+
+pub(super) fn caller_inherits_legacy_pool(token: &NamespaceToken) -> bool {
+    token.actor().is_anonymous() && token.actor().id == "local"
+}
+
+pub(super) fn legacy_recipient(properties: Option<&Value>) -> bool {
+    properties
+        .and_then(|properties| properties.get("to_actor"))
+        .is_none_or(Value::is_null)
+}
+
+pub(super) fn addressed_recipient(properties: Option<&Value>) -> Option<&str> {
+    properties
+        .and_then(|properties| properties.get("to_actor"))
+        .and_then(Value::as_str)
+        .filter(|recipient| *recipient == "local" || is_valid_mailbox_actor_label(recipient))
+}
+
+pub(super) fn caller_is_addressee(token: &NamespaceToken, properties: Option<&Value>) -> bool {
+    addressed_recipient(properties) == Some(token.actor().id.as_str())
+        || (caller_inherits_legacy_pool(token) && legacy_recipient(properties))
 }

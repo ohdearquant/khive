@@ -12,6 +12,8 @@ pub(crate) mod vocab;
 pub use pack::CommPack;
 
 #[cfg(test)]
+mod email_admission_tests;
+#[cfg(test)]
 mod idempotency_tests;
 #[cfg(test)]
 mod inbox_filter_tests;

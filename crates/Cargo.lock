@@ -2017,6 +2017,7 @@ dependencies = [
  "khive-pack-comm",
  "khive-pack-kg",
  "khive-runtime",
+ "khive-types",
  "lettre",
  "mail-parser",
  "rand 0.8.7",
