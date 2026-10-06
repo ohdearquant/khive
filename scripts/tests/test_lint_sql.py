@@ -33,10 +33,121 @@ class SqlLintTests(unittest.TestCase):
         shutil.copy2(ROOT / "scripts/lint-sql.sh", self.root / "scripts/lint-sql.sh")
 
     def run_lint(self):
+        if ((self.root / "crates/khive-db/sql").exists()
+                and not (self.root / "crates/khive-db/src/migrations.rs").exists()):
+            self.write_registry(["schema.sql"])
         return subprocess.run(
             ["sh", str(self.root / "scripts/lint-sql.sh")],
             text=True, capture_output=True, timeout=20, check=False,
         )
+
+    def write_registry(self, names):
+        source = self.root / "crates/khive-db/src/migrations.rs"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        constants = [
+            f'const V{index}_UP: &str = include_str!("../sql/{name}");'
+            for index, name in enumerate(names, 1)
+        ]
+        entries = [
+            f'VersionedMigration {{ version: {index}, name: "fixture", up: V{index}_UP }},'
+            for index in range(1, len(names) + 1)
+        ]
+        source.write_text("\n".join(constants)
+                          + "\npub const MIGRATIONS: &[VersionedMigration] = &[\n"
+                          + "\n".join(entries) + "\n];\n")
+
+    def core_fixture(self, schema):
+        core = self.root / "crates/khive-db/sql"
+        core.mkdir(parents=True)
+        (core / "schema.sql").write_text(schema)
+        self.write_registry(["schema.sql"])
+        return core
+
+    def test_core_parameterized_insert_is_prepared_without_null_execution(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT NOT NULL);\n")
+        # A numbered name is still a query when it is not registered as a migration.
+        (core / "006-message-insert.sql").write_text(
+            "INSERT INTO deliveries (message) VALUES (?1);\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("2 file(s) OK (1 prepared, 1 executed)", result.stdout)
+
+    def test_core_missing_column_is_refused_during_preparation(self):
+        core = self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        (core / "message-select.sql").write_text("SELECT missing FROM deliveries;\n")
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("message-select.sql: FAILED to prepare", result.stdout)
+        self.assertIn("no such column: missing", result.stdout)
+
+    def test_registered_data_reconciliation_runs_before_its_unique_index(self):
+        core = self.core_fixture(
+            "CREATE TABLE deliveries (message TEXT NOT NULL);\n"
+            "INSERT INTO deliveries VALUES ('same'), ('same');\n"
+        )
+        (core / "002-delivery-status.sql").write_text(
+            "ALTER TABLE deliveries ADD COLUMN ready INTEGER DEFAULT 1;\n"
+        )
+        # Registration, not the filename or first keyword, makes this a migration.
+        (core / "reconcile-deliveries.sql").write_text(
+            "DELETE FROM deliveries WHERE rowid NOT IN "
+            "(SELECT MIN(rowid) FROM deliveries GROUP BY message);\n"
+            "CREATE UNIQUE INDEX one_message ON deliveries(message);\n"
+        )
+        (core / "delivery-select.sql").write_text(
+            "SELECT message FROM deliveries WHERE ready = ?1;\n"
+        )
+        self.write_registry(["schema.sql", "reconcile-deliveries.sql"])
+        # Version constants and comments must not hide an actual up target.
+        source = self.root / "crates/khive-db/src/migrations.rs"
+        source.write_text("const RECONCILE_VERSION: u32 = 2;\n" + source.read_text().replace(
+            "version: 2", "version: RECONCILE_VERSION /* up: NOT_A_MIGRATION */"
+        ))
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("4 file(s) OK (1 prepared, 3 executed)", result.stdout)
+
+    def test_core_queries_see_other_ddl_and_never_fire_write_triggers(self):
+        core = self.core_fixture(
+            "CREATE TABLE deliveries (message TEXT NOT NULL);\n"
+            "INSERT INTO deliveries VALUES ('held');\n"
+            "CREATE TRIGGER no_insert BEFORE INSERT ON deliveries "
+            "BEGIN SELECT RAISE(ABORT, 'query executed INSERT'); END;\n"
+            "CREATE TRIGGER no_update BEFORE UPDATE ON deliveries "
+            "BEGIN SELECT RAISE(ABORT, 'query executed UPDATE'); END;\n"
+            "CREATE TRIGGER no_delete BEFORE DELETE ON deliveries "
+            "BEGIN SELECT RAISE(ABORT, 'query executed DELETE'); END;\n"
+        )
+        for name, sql in [
+            ("insert", "INSERT INTO deliveries VALUES ('new');"),
+            ("update", "UPDATE deliveries SET message = 'new';"),
+            ("delete", "DELETE FROM deliveries;"),
+        ]:
+            (core / f"message-{name}.sql").write_text(sql + "\n")
+        other = self.root / "crates/reader/sql"
+        other.mkdir(parents=True)
+        (other / "statuses.sql").write_text("CREATE TABLE statuses (ready INTEGER);\n")
+        (core / "message-select.sql").write_text(
+            "SELECT message FROM deliveries CROSS JOIN statuses WHERE ready = ?1;\n"
+        )
+        result = self.run_lint()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("6 file(s) OK (4 prepared, 2 executed)", result.stdout)
+
+    def test_unresolved_or_missing_registered_migration_fails_closed(self):
+        self.core_fixture("CREATE TABLE deliveries (message TEXT);\n")
+        source = self.root / "crates/khive-db/src/migrations.rs"
+        original = source.read_text()
+        source.write_text(original.replace("up: V1_UP", "up: UNKNOWN_UP"))
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot resolve registered migrations", result.stdout)
+        self.assertIn("UNKNOWN_UP", result.stdout)
+        source.write_text(original.replace("../sql/schema.sql", "../sql/missing.sql"))
+        result = self.run_lint()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("registered migration is missing", result.stdout)
 
     def copy_git_fragments(self):
         """Git auxiliary DDL and live-note indexes depend on the core notes table."""

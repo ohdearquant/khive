@@ -98,6 +98,21 @@ fn note_insert_columns(words: &[String]) -> Option<usize> {
         .then_some(table + 1)
 }
 
+fn assert_note_version_implicit(sql: &str, owner: &str) {
+    let tokens = words(sql);
+    if let Some(start) = note_insert_columns(&tokens) {
+        let columns = &tokens[start..];
+        let end = columns
+            .iter()
+            .position(|w| w == "VALUES" || w == "SELECT")
+            .unwrap_or(columns.len());
+        assert!(
+            !columns[..end].iter().any(|w| w == "VERSION"),
+            "{owner} explicitly initializes note.version"
+        );
+    }
+}
+
 fn starts_with_ci(bytes: &[u8], at: usize, needle: &[u8]) -> bool {
     bytes.len() >= at + needle.len() && bytes[at..at + needle.len()].eq_ignore_ascii_case(needle)
 }
@@ -349,18 +364,7 @@ impl<'ast> Visit<'ast> for Scanner {
                 self.owner
             );
         }
-        if let Some(start) = note_insert_columns(&tokens) {
-            let columns = &tokens[start..];
-            let end = columns
-                .iter()
-                .position(|w| w == "VALUES" || w == "SELECT")
-                .unwrap_or(columns.len());
-            assert!(
-                !columns[..end].iter().any(|w| w == "VERSION"),
-                "{} explicitly initializes note.version",
-                self.owner
-            );
-        }
+        assert_note_version_implicit(&sql, &self.owner);
         if note_writer(&sql) {
             assert!(!self.owner.is_empty(), "note writer needs a named owner");
             self.statements.push((self.owner.clone(), sql));
@@ -767,6 +771,19 @@ fn note_version_scanner_skips_tokio_tests_but_keeps_async_writers() {
 }
 
 #[test]
+fn plain_sql_insert_retains_the_note_version_initializer_guard() {
+    let ordinary = "INSERT INTO notes (id, properties) VALUES (?1, ?2)";
+    assert!(!note_writer(ordinary));
+    assert_note_version_implicit(ordinary, "ordinary.sql");
+    let explicit = "INSERT INTO notes (id, version, properties) VALUES (?1, 1, ?2)";
+    assert!(!note_writer(explicit));
+    assert!(std::panic::catch_unwind(|| {
+        assert_note_version_implicit(explicit, "explicit.sql");
+    })
+    .is_err());
+}
+
+#[test]
 fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
     let root = root();
     let mut sources = Vec::new();
@@ -778,7 +795,11 @@ fn note_version_sql_files_are_inventoried_and_trigger_is_the_only_exception() {
     }
     let found: BTreeSet<_> = sources
         .into_iter()
-        .filter(|path| note_writer(&std::fs::read_to_string(path).unwrap()))
+        .filter(|path| {
+            let sql = std::fs::read_to_string(path).unwrap();
+            assert_note_version_implicit(&sql, &path.display().to_string());
+            note_writer(&sql)
+        })
         .map(|path| {
             path.strip_prefix(&root)
                 .unwrap()

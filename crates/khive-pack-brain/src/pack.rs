@@ -488,12 +488,24 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
         self.0.note_kind_specs()
     }
 
+    fn entity_types(&self) -> &'static [khive_types::EntityTypeDef] {
+        self.0.entity_types()
+    }
+
+    fn note_embedding_policies(&self) -> &'static [khive_types::NoteEmbeddingPolicySpec] {
+        self.0.note_embedding_policies()
+    }
+
     fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn khive_runtime::KindHook>> {
         self.0.kind_hook(kind)
     }
 
     fn schema_plan(&self) -> khive_runtime::SchemaPlan {
         self.0.schema_plan()
+    }
+
+    fn schema_column_additions(&self) -> &'static [khive_types::PackColumnAddition] {
+        self.0.schema_column_additions()
     }
 
     fn validation_rules(&self) -> &'static [khive_runtime::ValidationRule] {
