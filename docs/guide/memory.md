@@ -24,6 +24,12 @@ type.
 request(ops="memory.remember(content=\"khive uses RRF fusion for hybrid search scoring\", salience=0.8, memory_type=\"semantic\")")
 ```
 
+The server must have a [receipt signing key](../credentials.md) configured.
+Successful writes return an opaque string in `visibility_token`; retain it if a
+subsequent recall must prove visibility of this write. An unavailable key refuses
+before the write. If custody becomes unavailable after the write commits, the
+error retains the memory ID; it does not claim that the write was rolled back.
+
 ### Parameters
 
 | Parameter      | Type   | Default                          | Description                                                               |
@@ -33,6 +39,7 @@ request(ops="memory.remember(content=\"khive uses RRF fusion for hybrid search s
 | `decay_factor` | float  | episodic: 0.02 / semantic: 0.005 | Higher = faster decay. 0.02 ≈ 35-day half-life; 0.005 ≈ 139-day half-life |
 | `memory_type`  | string | "episodic"                       | `episodic` or `semantic`                                                  |
 | `source_id`    | uuid   | none                             | Entity or note this memory annotates                                      |
+| `key`          | string | none                             | Stable identity for an exact keyed replay                                 |
 
 ### Salience calibration
 
@@ -93,6 +100,62 @@ Returns a scored list of matching memories:
 ```
 request(ops="memory.recall(query=\"search optimization\", tags=[\"khive\", \"retrieval\"], tag_mode=\"any\")")
 ```
+
+### Session consistency
+
+Recall defaults to `consistency: "eventual"`. To require visibility of a completed
+write, send its returned token unchanged with `consistency: "session"`:
+
+```text
+memory.recall(query="search optimization", consistency="session", visibility_token="<returned opaque string>")
+```
+
+| Parameter          | Type    | Default      | Description                                    |
+| ------------------ | ------- | ------------ | ---------------------------------------------- |
+| `consistency`      | string  | `"eventual"` | `eventual` or `session`                        |
+| `visibility_token` | string  | none         | Returned receipt; required for session recall  |
+| `timeout_ms`       | integer | 0            | Bounded wait for visibility, at most 10,000 ms |
+
+The server authenticates the receipt and checks its namespace against the
+caller's authorized read scope. The receipt cannot add a namespace to that scope.
+Its model fences must belong to the recall's requested model set. A zero-model
+receipt still requires authentication, namespace authorization and a valid age.
+Eventual recall ignores an optional token.
+
+Receipts expire after 24 hours. A timestamp more than five minutes in the future
+is invalid. Session recall rejects the old clear v1 object with
+`visibility_token_legacy`; it does not treat that object as an authenticated
+receipt. Malformed or tampered receipts are invalid input. An expired receipt
+returns `freshness_unmet` with reason `visibility_token_expired` and is not
+retryable. An unknown or unavailable key returns reason
+`visibility_key_unavailable` and is retryable after custody is restored.
+
+Success proves coverage in the same snapshot that produced the recall candidates.
+It does not guarantee that a particular memory survives ranking, filters or a zero
+result limit. An unprovable fence returns `freshness_unmet`. A nonzero timeout
+waits only within the requested bound and remaining request deadline, and honors
+cancellation.
+
+### Keyed replay receipts
+
+An exact replay using the same `key` and content retains the original memory and
+its durable visibility fences, then seals a fresh token with the current key and
+issue time. It creates no new vector or ANN log entry. Differing content under a
+held key remains a conflict.
+
+Some historical identities cannot supply a receipt. These exact replay refusals
+include `memory_id` and `domain_disposition: "not_committed"`:
+
+| Reason                            | Meaning                                        | Retryable |
+| --------------------------------- | ---------------------------------------------- | --------- |
+| `legacy_receipt_absent`           | Proven legacy identity has no original receipt | No        |
+| `receipt_epoch_unknown`           | Provenance is absent, unknown or contradictory | No        |
+| `receipt_temporarily_unavailable` | Modern identity has an incomplete receipt      | Yes       |
+
+An unreadable provenance store is an availability failure, not evidence of a
+legacy identity. Refusals do not mint new fences or replace the held memory.
+Eventual recall remains available. A failure after a new write committed has a
+different disposition; do not interpret every receipt error as a failed write.
 
 ## Scoring formula
 
