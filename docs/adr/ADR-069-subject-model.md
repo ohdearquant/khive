@@ -108,7 +108,7 @@ A Subject consists of four reusable components and two per-run inputs.
 1. **OntologySpec** -- the declared contract for a vertical. Three parts:
    - The entity kind tokens this vertical registers (subtype declarations against a base
      `EntityKind`, per ADR-001 §"Pack extensibility rule").
-   - The relation mappings: how this vertical's structural relations map onto khive's 17
+   - The relation mappings: how this vertical's structural relations map onto khive's 20
      closed edge relations as additive `EDGE_RULES` (per ADR-017 §"Pack-extensible edge
      endpoints"). A vertical cannot add new relations -- only new legal endpoint triples for
      existing ones.
@@ -166,12 +166,12 @@ The OntologySpec drives the pack (single source of truth). The formal-math pack'
 `ENTITY_KINDS` and `EDGE_RULES` are read from or constrained by the OntologySpec, so ingestion
 ontology and runtime schema cannot drift.
 
-### D2: Domain relations map onto the 17 closed edge relations, additively
+### D2: Domain relations map onto the 20 closed edge relations, additively
 
-The 17 `EdgeRelation` enum variants (ADR-002, amended by ADR-055) are a closed compile-time
+The 20 `EdgeRelation` enum variants (ADR-002, amended through ADR-197) are a closed compile-time
 Rust enum (`crates/khive-types/src/edge.rs`). A Subject cannot add enum variants.
 
-A Subject's OntologySpec maps its structural relations onto the existing 17 by declaring
+A Subject's OntologySpec maps its structural relations onto the existing 20 by declaring
 additive `EDGE_RULES` on its pack -- new legal `(source_kind, relation, target_kind)` endpoint
 triples for existing relations. The base endpoint contract (operations.rs:215-292) is
 unchanged; the rules broaden it for the pack's registered kinds.
@@ -322,7 +322,7 @@ the minimal structure that avoids re-implementing the ontology for each proof as
 ### Why additive EDGE_RULES, not relations-as-data (D2)
 
 The closed `EdgeRelation` enum is the system's auditability mechanism. Every edge in the store
-has one of 17 semantically defined relation types. An agent traversing the graph knows exactly
+has one of 20 semantically defined relation types. An agent traversing the graph knows exactly
 what `depends_on` means, regardless of which domain the entities belong to. A query for all
 `depends_on` edges returns all dependency relationships across all subjects in the same store.
 
@@ -560,7 +560,7 @@ carries no such guarantee.
 
 ### Hard constraints
 
-- The 17 `EdgeRelation` variants are a closed compile-time enum. A Subject cannot add relation
+- The 20 `EdgeRelation` variants are a closed compile-time enum. A Subject cannot add relation
   kinds -- only additive endpoint rules for existing relations via `Pack::EDGE_RULES`.
 - `EDGE_RULES` for entity subtypes MUST use `EndpointKind::EntityOfType`, not
   `EndpointKind::EntityOfKind`. The latter compares against the base kind string (`"concept"`);

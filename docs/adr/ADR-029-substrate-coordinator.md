@@ -674,7 +674,8 @@ write queue. `link()` and ordinary writes still hard-fail on partition (see D6).
 ### Neutral
 
 - **ADR-002's 15 edge relations** (closed taxonomy) — `target_backend` is row metadata,
-  not a relation. (Amended by ADR-055: current total is 17 edge relations.)
+  not a relation. (ADR-055 expanded the set to 17; ADR-191, ADR-196 and
+  [ADR-197](ADR-197-owns-relation.md) bring the current total to 20 edge relations.)
 - **ADR-013 cross-substrate search contract preserved** — D4 fulfills it for
   multi-backend.
 - **MCP wire format unchanged** — clients see the same verbs; backend assignment is

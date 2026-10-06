@@ -7,6 +7,7 @@ import {
   EDGE_RELATION_FAMILIES,
   EDGE_RELATION_LEGEND,
   EDGE_RELATIONS,
+  edgeLegendFor,
   ENTITY_KIND_LEGEND,
   ENTITY_KINDS,
   NOTE_KIND_LEGEND,
@@ -113,6 +114,17 @@ describe("ontology legend", () => {
         expect(EDGE_RELATION_LEGEND[relation].family).toBe(family);
       }
     }
+  });
+
+  it("renders owns as directional ownership instead of an unsupported relation", () => {
+    expect(edgeLegendFor("owns")).toMatchObject({
+      label: "Owns",
+      family: "ownership",
+      glyph: "O",
+      treatment: "directional",
+      directed: true,
+    });
+    expect(edgeLegendFor("owned_by").label).toBe("Unsupported relation");
   });
 
   it("keeps every distinction legible without hue", () => {

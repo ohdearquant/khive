@@ -32,6 +32,7 @@ export const EDGE_RELATIONS = [
   "annotates",
   "supports",
   "refutes",
+  "owns",
 ] as const;
 
 export const NOTE_KINDS = [
@@ -53,6 +54,7 @@ export const EDGE_RELATION_FAMILY_NAMES = [
   "lateral",
   "annotation",
   "epistemic",
+  "ownership",
 ] as const;
 
 export type EntityKind = (typeof ENTITY_KINDS)[number];
@@ -70,6 +72,7 @@ export const EDGE_RELATION_FAMILIES = {
   lateral: ["competes_with", "composed_with"],
   annotation: ["annotates"],
   epistemic: ["supports", "refutes"],
+  ownership: ["owns"],
 } as const satisfies Record<EdgeRelationFamily, readonly EdgeRelation[]>;
 
 export type OntologyIconName =
@@ -360,6 +363,15 @@ export const EDGE_RELATION_LEGEND = {
     treatment: "epistemic",
     variant: "secondary",
     hue: "var(--ontology-refute)",
+    directed: true,
+  },
+  owns: {
+    label: "Owns",
+    family: "ownership",
+    glyph: "O",
+    treatment: "directional",
+    variant: "primary",
+    hue: neutralEdge,
     directed: true,
   },
 } as const satisfies Record<EdgeRelation, EdgeLegendEntry>;

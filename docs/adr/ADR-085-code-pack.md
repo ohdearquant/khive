@@ -4,7 +4,7 @@
 **Date**: 2026-07-03\
 **Authors**: khive maintainers
 **Depends on**: ADR-001 (Entity Kind Taxonomy — `entity_type` subtype registration), ADR-002
-(Edge Ontology — closed 17 relations, base endpoint contract), ADR-013 (Note Kind Taxonomy —
+(Edge Ontology — closed 20 relations (amended through ADR-197), base endpoint contract), ADR-013 (Note Kind Taxonomy —
 pack-declared note kinds), ADR-017 (Pack Standard — `EDGE_RULES`, `EntityOfType`,
 `NOTE_KINDS`), ADR-019 (GTD Pack — `NoteKindSpec` lifecycle precedent), ADR-055 (Epistemic
 Edge Relations), ADR-069 (Subject Model — domain-ontology paradigm, `EntityOfType` mechanism)\
@@ -437,7 +437,7 @@ This ADR authorizes design, not code; implementation follows design review appro
 ## References
 
 - ADR-001: Entity Kind Taxonomy — pack extensibility rule; governed `entity_type`
-- ADR-002: Edge Ontology — closed 17 relations; base endpoint contract
+- ADR-002: Edge Ontology — closed 20 relations (amended through ADR-197); base endpoint contract
 - ADR-013: Note Kind Taxonomy — pack-declared note kinds
 - ADR-017: Pack Standard — `EDGE_RULES`, `EntityOfType`, additive-only endpoints
 - ADR-019: GTD Pack — `NoteKindSpec` lifecycle precedent (`task`)

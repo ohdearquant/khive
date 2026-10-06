@@ -21,6 +21,19 @@ impl From<EmbeddingTruncationReport> for NoteReindexReport {
     }
 }
 
+impl NoteReindexReport {
+    /// One post-commit degradation per embedding model whose reindex failed.
+    pub(crate) fn post_commit_degradations(self) -> Vec<crate::PostCommitDegradation> {
+        self.failures
+            .into_iter()
+            .map(|failure| crate::PostCommitDegradation {
+                stage: failure.stage.as_str(),
+                error: format!("model {}: {}", failure.model, failure.error),
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 #[path = "note_reindex_report_tests.rs"]
 mod report_tests;
@@ -30,6 +43,7 @@ impl KhiveRuntime {
     ///
     /// Excluded-model cleanup is revision-guarded and fail-closed. Embedding
     /// eligible models remains best-effort like entity reindexing.
+    #[cfg(test)]
     pub(crate) async fn reindex_note(
         &self,
         token: &NamespaceToken,

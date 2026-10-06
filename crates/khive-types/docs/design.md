@@ -28,22 +28,22 @@ types for proposals, events, and namespace isolation.
 
 ## Primary Modules
 
-| Module | Path | Purpose |
-|--------|------|---------|
-| `entity` | [src/entity.rs](../src/entity.rs) | Entity, EntityKind (8 closed kinds), Link, PropertyValue |
-| `edge` | [src/edge.rs](../src/edge.rs) | EdgeRelation (19 closed relations), EdgeCategory |
-| `note` | [src/note.rs](../src/note.rs) | Note, NoteStatus |
-| `event` | [src/event.rs](../src/event.rs) | Event, EventKind, EventPayload, proposal types |
-| `pack` | [src/pack.rs](../src/pack.rs) | Pack trait, HandlerDef, VerbCategory, endpoint rules |
-| `substrate` | [src/substrate.rs](../src/substrate.rs) | SubstrateKind (3 substrates) |
-| `id` | [src/id.rs](../src/id.rs) | Id128 (128-bit UUID) |
-| `namespace` | [src/namespace.rs](../src/namespace.rs) | Namespace (validated string token) |
-| `khive_error` | [src/khive_error.rs](../src/khive_error.rs) | KhiveError, ErrorKind, ErrorCode, Details |
-| `error` | [src/error.rs](../src/error.rs) | TypeError, UnknownVariant |
-| `timestamp` | [src/timestamp.rs](../src/timestamp.rs) | Timestamp (microsecond precision) |
-| `header` | [src/header.rs](../src/header.rs) | Header (shared record metadata) |
-| `hash` | [src/hash.rs](../src/hash.rs) | Hash32 (256-bit content hash) |
-| `vector` | [src/vector.rs](../src/vector.rs) | DistanceMetric |
+| Module        | Path                                        | Purpose                                                  |
+| ------------- | ------------------------------------------- | -------------------------------------------------------- |
+| `entity`      | [src/entity.rs](../src/entity.rs)           | Entity, EntityKind (8 closed kinds), Link, PropertyValue |
+| `edge`        | [src/edge.rs](../src/edge.rs)               | EdgeRelation (20 closed relations), EdgeCategory         |
+| `note`        | [src/note.rs](../src/note.rs)               | Note, NoteStatus                                         |
+| `event`       | [src/event.rs](../src/event.rs)             | Event, EventKind, EventPayload, proposal types           |
+| `pack`        | [src/pack.rs](../src/pack.rs)               | Pack trait, HandlerDef, VerbCategory, endpoint rules     |
+| `substrate`   | [src/substrate.rs](../src/substrate.rs)     | SubstrateKind (3 substrates)                             |
+| `id`          | [src/id.rs](../src/id.rs)                   | Id128 (128-bit UUID)                                     |
+| `namespace`   | [src/namespace.rs](../src/namespace.rs)     | Namespace (validated string token)                       |
+| `khive_error` | [src/khive_error.rs](../src/khive_error.rs) | KhiveError, ErrorKind, ErrorCode, Details                |
+| `error`       | [src/error.rs](../src/error.rs)             | TypeError, UnknownVariant                                |
+| `timestamp`   | [src/timestamp.rs](../src/timestamp.rs)     | Timestamp (microsecond precision)                        |
+| `header`      | [src/header.rs](../src/header.rs)           | Header (shared record metadata)                          |
+| `hash`        | [src/hash.rs](../src/hash.rs)               | Hash32 (256-bit content hash)                            |
+| `vector`      | [src/vector.rs](../src/vector.rs)           | DistanceMetric                                           |
 
 ## Tests
 
@@ -53,7 +53,7 @@ types for proposals, events, and namespace isolation.
 ## Invariants and Failure Modes
 
 - **Closed taxonomies are compile-time enforced.** EntityKind (8 variants),
-  EdgeRelation (15 variants), SubstrateKind (3 variants), and NoteStatus are
+  EdgeRelation (20 variants), SubstrateKind (3 variants), and NoteStatus are
   closed enums. Unrecognized strings produce `UnknownVariant` errors with the
   valid set listed. Adding variants is a source-breaking change requiring an ADR.
 - **Namespace validation rejects invalid input.** Empty, too-long (>256 bytes),
@@ -86,15 +86,15 @@ types for proposals, events, and namespace isolation.
 
 ### Edge Ontology (ADR-002)
 
-- `EdgeRelation` is a closed enum with exactly 19 canonical relations (17 base
-  per ADR-002, including `links_to` added by ADR-191 and `located_in` added by
-  ADR-196, + 2 epistemic `supports`/`refutes` added by ADR-055).
+- `EdgeRelation` is a closed enum with exactly 20 canonical relations (18 non-epistemic
+  relations, including `links_to` added by ADR-191, `located_in` added by ADR-196,
+  and `owns` added by ADR-197, plus 2 epistemic `supports`/`refutes` added by ADR-055).
 - `EdgeRelation::ALL` lists them in ontology-table order.
 - Wire format is snake_case (e.g., `"part_of"`, `"introduced_by"`).
 - `FromStr` accepts canonical snake_case names, hyphen variants, and squashed
   forms (e.g., `"partof"`, `"derivedfrom"`) for ergonomic DSL entry. Squashed
   forms are not stored on the wire.
-- `EdgeCategory` groups the 19 relations into 9 structural categories for query
+- `EdgeCategory` groups the 20 relations into 10 descriptive categories for query
   planners and UI rendering.
 - Symmetric relations (`competes_with`, `composed_with`) are identified via
   `is_symmetric()`.

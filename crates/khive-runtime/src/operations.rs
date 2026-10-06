@@ -1201,6 +1201,9 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     // without being a constituent of it; base rows for concept and org, packs narrow the rest.
     ("concept", EdgeRelation::LocatedIn, "concept"),
     ("org", EdgeRelation::LocatedIn, "concept"),
+    // Ownership
+    ("person", EdgeRelation::Owns, "org"),
+    ("org", EdgeRelation::Owns, "org"),
     // Derivation
     ("concept", EdgeRelation::Extends, "concept"),
     ("concept", EdgeRelation::VariantOf, "concept"),
@@ -2786,7 +2789,7 @@ impl KhiveRuntime {
     ///
     /// - `annotates`: source MUST be a note; target may be any substrate.
     /// - `supersedes` / `supports` / `refutes`: same-substrate only (note→note or entity→entity).
-    /// - All other 13 relations: both endpoints MUST be entities.
+    /// - All other relations: both endpoints MUST be entities.
     ///
     /// Returns the validated endpoint substrates when valid; otherwise
     /// `InvalidInput` or `NotFound` for an invalid endpoint pair.
@@ -6685,10 +6688,10 @@ impl KhiveRuntime {
                         RuntimeError::Internal("injected FTS failure".to_string()),
                     ));
                 }
-                self.reindex_note(token, &restored)
-                    .await
-                    .map_err(|e| restore_reindex_failed("note", id, e))?;
-                Ok(Some((restored, true)))
+                let reindexed = self.reindex_note_with_report(token, &restored).await;
+                let report = reindexed.map_err(|e| restore_reindex_failed("note", id, e))?;
+                let degradations = report.post_commit_degradations();
+                legacy_post_commit_result("restore_note", id, Some((restored, true)), degradations)
             }
             Ok(AtomicRunOutcome::RolledBack {
                 failure: AtomicOpFailure::GuardFailed { .. },
@@ -21064,70 +21067,7 @@ mod tests {
         );
     }
 
-    // ── Location endpoint pair (ADR-196) ─────────────────────────────────────
-    // Base rows are concept->concept and org->concept (amended 2026-10-05); other
-    // base kinds are left to the first pack that emits them.
-
-    #[tokio::test]
-    async fn link_concept_located_in_concept_allowed_other_base_kinds_rejected() {
-        let rt = rt();
-        let tok = NamespaceToken::local();
-
-        let pneumonia = rt
-            .create_entity(&tok, "concept", None, "Pneumonia", None, None, vec![])
-            .await
-            .unwrap();
-        let lung = rt
-            .create_entity(&tok, "concept", None, "Lung", None, None, vec![])
-            .await
-            .unwrap();
-
-        let result = rt
-            .link(
-                &tok,
-                pneumonia.id,
-                lung.id,
-                EdgeRelation::LocatedIn,
-                1.0,
-                None,
-            )
-            .await;
-        assert!(
-            result.is_ok(),
-            "concept->concept located_in must be allowed by the ADR-196 \
-             endpoint amendment; got {result:?}"
-        );
-        let edge = result.unwrap();
-        assert_eq!(edge.relation, EdgeRelation::LocatedIn);
-        assert!(
-            edge.metadata.is_none(),
-            "located_in carries no governed metadata and infers none; got {:?}",
-            edge.metadata
-        );
-
-        let page = rt
-            .create_entity(&tok, "document", None, "Atlas page", None, None, vec![])
-            .await
-            .unwrap();
-        let concept_to_doc = rt
-            .link(
-                &tok,
-                pneumonia.id,
-                page.id,
-                EdgeRelation::LocatedIn,
-                1.0,
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            concept_to_doc
-                .to_string()
-                .contains("base endpoint allowlist"),
-            "concept->document located_in must be refused with the \
-             endpoint-contract error; got {concept_to_doc}"
-        );
-    }
+    mod located_in_endpoints;
 
     #[tokio::test]
     async fn link_org_introduced_by_document_rejected_direction_matters() {

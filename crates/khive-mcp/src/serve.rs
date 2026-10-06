@@ -5,6 +5,8 @@
 
 #[path = "serve/claimed_backend.rs"]
 mod claimed_backend;
+#[path = "serve/gate_boot_disclosure.rs"]
+mod gate_boot_disclosure;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -5502,9 +5504,7 @@ fn resolve_config(
     packs_overridden: bool,
     force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
-    match KhiveConfig::load_with_home_fallback(config_path, db_path)
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-    {
+    match gate_boot_disclosure::load(config_path, db_path)? {
         Some(khive_cfg) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let env_primary = std::env::var("KHIVE_EMBEDDING_MODEL").ok();
@@ -5613,9 +5613,7 @@ fn resolve_actor_from_config(
     packs_overridden: bool,
     force_memory: bool,
 ) -> anyhow::Result<RuntimeConfig> {
-    match KhiveConfig::load_with_home_fallback(config_path, db_path)
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-    {
+    match gate_boot_disclosure::load(config_path, db_path)? {
         Some(khive_cfg) => {
             let base = apply_config_pack_selection(&khive_cfg, base, packs_overridden);
             let mut resolved = runtime_config_from_khive_config(&khive_cfg, base);

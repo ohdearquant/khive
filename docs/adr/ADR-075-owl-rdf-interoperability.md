@@ -14,7 +14,7 @@ ADR-069 (Subject Model), ADR-072 (Subject OntologySpec as Runtime Data)
 ## Context
 
 khive stores a typed property graph: closed entity kinds (ADR-001), closed edge relations
-(ADR-002, 17 in 9 categories), and pack- or Subject-declared subtypes and additive endpoint
+(ADR-002 as amended through ADR-197, 20 in 10 categories), and pack- or Subject-declared subtypes and additive endpoint
 rules (ADR-017, ADR-069, ADR-072). Its query surface is GQL plus a SPARQL subset compiled to SQL
 (ADR-008). The model is closed-world and optimized for ingestion and serving at scale.
 
@@ -55,11 +55,17 @@ two IRIs denote the same entity.
 
 ### D3: Publish the khive vocabulary as OWL/RDFS/SKOS
 
-The closed 17 relations and the entity kinds are published as a machine-readable vocabulary:
+The closed 20 relations and the entity kinds are published as a machine-readable vocabulary:
 RDFS/OWL classes and properties for kinds and relations, SKOS for taxonomy labels. This
 published vocabulary is the contract external tools align against. It is generated from the same
 closed enums and pack/Subject declarations that define the internal model, so it cannot drift
 from what khive actually stores.
+
+The ownership alignment recorded by [ADR-197](ADR-197-owns-relation.md) maps
+`owns` to Wikidata `P1830` ("owner of"), with inverse `P127` ("owned by").
+Its stake qualifier `P1107` ("proportion") is `pct / 100`, not the edge's
+confidence weight. No vocabulary export ships in the tree yet; this records
+the semantic alignment for that future exporter.
 
 ### D4: RDF export first (MVP), Turtle and JSON-LD
 
@@ -180,7 +186,7 @@ per-vertical source of truth (ADR-072); alignment belongs there.
 
 ## References
 
-- ADR-002: Edge Ontology -- the closed 17 relations published as the OWL/RDFS property set
+- ADR-002: Edge Ontology -- the closed 20 relations published as the OWL/RDFS property set
 - ADR-008: Query Layer Separation -- the existing SPARQL subset over SQL
 - ADR-055: Epistemic Edge Relations -- `supports`/`refutes`; the `supports` false-friend in D5
 - ADR-069: Subject Model -- the vertical abstraction whose vocabulary is published

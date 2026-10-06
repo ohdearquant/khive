@@ -61,7 +61,7 @@ caller what you found before proceeding.
 
 ### Edge creation rules
 
-Use only these 19 relations (no others — the parser rejects unknown relations):
+Use only these 20 relations (no others — the parser rejects unknown relations):
 
 - Structure: `contains`, `part_of`, `instance_of`, `links_to`, `located_in`
 - Derivation: `extends`, `variant_of`, `introduced_by`, `supersedes`
@@ -72,6 +72,7 @@ Use only these 19 relations (no others — the parser rejects unknown relations)
 - Lateral: `competes_with`, `composed_with`
 - Annotation: `annotates`
 - Epistemic: `supports`, `refutes` (evidence → claim)
+- Ownership: `owns` (owner → owned; person → org or org → org)
 
 **`introduced_by` direction**: concept → paper/person/org, or paper → author/publisher.
 Never the reverse.
@@ -189,7 +190,7 @@ Density: 47 edges / 11 entities = 4.3 (was 3.8 before)
 
 - Do not search externally for things already in the graph — check the graph first
 - Do not create entities without edges — orphans degrade graph quality immediately
-- Do not use ad-hoc edge relations (`uses`, `related_to`, `references`) — map to the 17 or don't
+- Do not use ad-hoc edge relations (`uses`, `related_to`, `references`) — map to the 20 or don't
   link
 - Do not reverse `introduced_by` — direction is concept → paper/person/org (or paper → author/publisher), never the reverse
 - Do not use entity names as strings in `source_id`/`target_id` — always use IDs from prior

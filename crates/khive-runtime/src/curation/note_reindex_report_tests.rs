@@ -21,8 +21,9 @@ struct Provider {
     name: &'static str,
     fault: Fault,
     attempts: Arc<AtomicUsize>,
+    embed_calls: Arc<AtomicUsize>,
 }
-struct Service(Fault);
+struct Service(Fault, Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
 impl EmbedderProvider for Provider {
@@ -37,7 +38,7 @@ impl EmbedderProvider for Provider {
         if matches!(self.fault, Fault::Provider) {
             return Err(RuntimeError::Internal("injected provider failure".into()));
         }
-        Ok(Arc::new(Service(self.fault)))
+        Ok(Arc::new(Service(self.fault, self.embed_calls.clone())))
     }
 }
 
@@ -48,6 +49,7 @@ impl EmbeddingService for Service {
         texts: &[String],
         _model: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        self.1.fetch_add(1, Ordering::SeqCst);
         let value = if matches!(self.0, Fault::NonFinite) {
             f32::NAN
         } else {
@@ -72,6 +74,19 @@ async fn fixture(
     EmbeddingModelPlan,
     Arc<AtomicUsize>,
 ) {
+    fixture_with_embed_calls(fault, Arc::new(AtomicUsize::new(0))).await
+}
+
+async fn fixture_with_embed_calls(
+    fault: Fault,
+    embed_calls: Arc<AtomicUsize>,
+) -> (
+    KhiveRuntime,
+    NamespaceToken,
+    Note,
+    EmbeddingModelPlan,
+    Arc<AtomicUsize>,
+) {
     let runtime = KhiveRuntime::memory().unwrap();
     let token = NamespaceToken::local();
     let attempts = Arc::new(AtomicUsize::new(0));
@@ -80,6 +95,7 @@ async fn fixture(
             name,
             fault,
             attempts: attempts.clone(),
+            embed_calls: embed_calls.clone(),
         });
     }
     let note = Note::new("local", "observation", "current note report text");
@@ -254,5 +270,177 @@ async fn report_fts_failure_remains_an_error() {
             .unwrap()
             .unwrap(),
         note
+    );
+}
+
+async fn tombstone_for_restore(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    note: &Note,
+) -> Note {
+    runtime
+        .text_for_notes(token)
+        .unwrap()
+        .upsert_document(note_fts_document(note))
+        .await
+        .unwrap();
+    for model in ["broken", "healthy"] {
+        runtime
+            .vectors_for_model(token, model)
+            .unwrap()
+            .insert(
+                note.id,
+                khive_storage::SubstrateKind::Note,
+                &note.namespace,
+                "note.content",
+                vec![vec![0.25; 4]],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(runtime.delete_note(token, note.id, false).await.unwrap());
+    let tombstone = runtime
+        .notes(token)
+        .unwrap()
+        .get_note_including_deleted(note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tombstone.deleted_at.is_some());
+    assert!(runtime
+        .text_for_notes(token)
+        .unwrap()
+        .get_document(&note.namespace, note.id)
+        .await
+        .unwrap()
+        .is_none());
+    for model in ["broken", "healthy"] {
+        assert!(runtime
+            .vectors_for_model(token, model)
+            .unwrap()
+            .get_vectors(&[note.id], &note.namespace, "note.content")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+    tombstone
+}
+
+async fn assert_restored_indexes(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    tombstone: &Note,
+    models: &[&str],
+) -> Note {
+    let live = runtime
+        .notes(token)
+        .unwrap()
+        .get_note(tombstone.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(live.deleted_at.is_none());
+    assert_eq!(live.content, tombstone.content);
+    assert_eq!(live.version, tombstone.version + 1);
+    let text = runtime
+        .text_for_notes(token)
+        .unwrap()
+        .get_document(&live.namespace, live.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(text.body, live.content);
+    for model in models {
+        let vectors = runtime
+            .vectors_for_model(token, model)
+            .unwrap()
+            .get_vectors(&[live.id], &live.namespace, "note.content")
+            .await
+            .unwrap();
+        assert_eq!(vectors.get(&live.id), Some(&vec![0.5; 4]));
+    }
+    live
+}
+
+#[tokio::test]
+async fn restore_note_reports_partial_embedding_failure_after_commit() {
+    let embed_calls = Arc::new(AtomicUsize::new(0));
+    let (runtime, token, note, _, attempts) =
+        fixture_with_embed_calls(Fault::Provider, embed_calls.clone()).await;
+    let tombstone = tombstone_for_restore(&runtime, &token, &note).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
+
+    let error = runtime
+        .restore_note(&token, note.id)
+        .await
+        .expect_err("partial model failure must not report unqualified restore success");
+    let RuntimeError::Khive(domain) = error.refusal_source() else {
+        panic!("expected typed committed degradation: {error:?}");
+    };
+    let details = domain.details().unwrap();
+    assert_eq!(details.get("reason"), Some("post_commit_degraded"));
+    assert_eq!(details.get("operation"), Some("restore_note"));
+    assert_eq!(details.get("record_id"), Some(note.id.to_string().as_str()));
+    assert_eq!(details.get("committed"), Some("true"));
+    assert_eq!(details.get("retryable"), Some("false"));
+    let failures: serde_json::Value =
+        serde_json::from_str(details.get("post_commit_degradations").unwrap()).unwrap();
+    assert_eq!(failures.as_array().unwrap().len(), 1);
+    assert_eq!(failures[0]["stage"], "embedding");
+    let diagnostic = failures[0]["error"].as_str().unwrap();
+    assert!(diagnostic.contains("model broken:"));
+    assert!(diagnostic.contains("injected provider failure"));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(embed_calls.load(Ordering::SeqCst), 1);
+    assert_restored_indexes(&runtime, &token, &tombstone, &["healthy"]).await;
+    assert!(runtime
+        .vectors_for_model(&token, "broken")
+        .unwrap()
+        .get_vectors(&[note.id], &note.namespace, "note.content")
+        .await
+        .unwrap()
+        .is_empty());
+    let projected =
+        crate::error_projection::runtime_error_value(error, crate::DomainDisposition::Unknown);
+    assert_eq!(projected["domain_disposition"], "committed");
+}
+
+#[tokio::test]
+async fn healthy_note_restore_indexes_all_models_and_repeat_is_noop() {
+    let embed_calls = Arc::new(AtomicUsize::new(0));
+    let (runtime, token, note, _, attempts) =
+        fixture_with_embed_calls(Fault::None, embed_calls.clone()).await;
+    let tombstone = tombstone_for_restore(&runtime, &token, &note).await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(embed_calls.load(Ordering::SeqCst), 0);
+
+    let (restored, changed) = runtime
+        .restore_note(&token, note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(changed);
+    let live = assert_restored_indexes(&runtime, &token, &tombstone, &["broken", "healthy"]).await;
+    assert_eq!(restored, live);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(embed_calls.load(Ordering::SeqCst), 2);
+
+    let (repeated, changed) = runtime
+        .restore_note(&token, note.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(repeated, live);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        embed_calls.load(Ordering::SeqCst),
+        2,
+        "the no-op restore must not invoke either cached embedding service"
+    );
+    assert_eq!(
+        assert_restored_indexes(&runtime, &token, &tombstone, &["broken", "healthy"]).await,
+        live
     );
 }

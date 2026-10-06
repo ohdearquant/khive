@@ -43,7 +43,7 @@
 
 ### Edge Ontology (ADR-002)
 
-- `EdgeRecord.relation` must be one of the 19 canonical relations (ADR-002 base 17, including `links_to` via ADR-191 and `located_in` via ADR-196, plus the ADR-055 epistemic pair).
+- `EdgeRecord.relation` must be one of the 20 canonical relations (ADR-002 non-epistemic base 18, including `links_to` via ADR-191, `located_in` via ADR-196, and `owns` via ADR-197, plus the ADR-055 epistemic pair).
 - Validation uses `khive_types::EdgeRelation::from_str` at parse time.
 - Unknown relations always produce `AdapterError::UnknownRelation`, regardless of schema mode.
 - `EdgeRecord.weight` must be finite and in `[0.0, 1.0]`. Out-of-range values produce

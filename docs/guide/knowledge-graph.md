@@ -64,7 +64,7 @@ for your server's loaded-pack surface.
 
 ## Model relationships deliberately
 
-Edges are directed unless noted otherwise. Their 19 relation names are grouped
+Edges are directed unless noted otherwise. Their 20 relation names are grouped
 by purpose below; the set is closed.
 
 | Group          | Relations                                                      | Typical reading                                                                             |
@@ -78,6 +78,7 @@ by purpose below; the set is closed.
 | Lateral        | `competes_with`, `composed_with`                               | peer relationship; both are symmetric                                                       |
 | Annotation     | `annotates`                                                    | note → its subject                                                                          |
 | Epistemic      | `supports`, `refutes`                                          | evidence → claim                                                                            |
+| Ownership      | `owns`                                                         | owner → owned; current whole or partial holding                                             |
 
 The endpoint rules are part of the model, not suggestions. `annotates` is the
 cross-substrate relation. `supersedes`, `supports`, and `refutes` are
@@ -85,6 +86,14 @@ same-substrate only: entity → entity or note → note. The source of a
 `supports` or `refutes` edge is evidence; the target is the claim. In the KG
 base contract, the remaining base relations are entity → entity, subject to
 their specific allowlist.
+
+`owns` permits person → org and org → org in the base contract. It is directional
+and not transitive: membership, control and indirect stake calculations are separate.
+Its weight is confidence, not the size of a stake. Store stake information in
+conventional edge metadata (`pct`, `class`, `as_of`, `valid_from`, or `by_class` for
+multiple classes); use the returned edge ID with `get` or `query` to read metadata.
+Update that edge for a changed holding and delete it when the holding ends. See
+[ADR-197](../adr/ADR-197-owns-relation.md).
 
 ## Work through the request DSL
 
