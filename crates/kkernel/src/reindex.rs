@@ -73,7 +73,7 @@ pub struct ReindexArgs {
 
     /// Records embedded per batch — also the DB page and write batch (default
     /// 128, max 500). One `embed_document_batch` call processes this many records.
-    #[arg(long, default_value = "128")]
+    #[arg(long, default_value_t = DEFAULT_REINDEX_BATCH_SIZE)]
     pub batch_size: u32,
 
     /// Keep existing vectors instead of dropping before re-embedding.
@@ -123,6 +123,8 @@ pub struct ReindexArgs {
     #[arg(long)]
     pub human: bool,
 }
+
+const DEFAULT_REINDEX_BATCH_SIZE: u32 = 128;
 
 /// Load the same discovered config as runtime resolution and ensure that a
 /// one-database reindex cannot silently escape a declared backend topology.
