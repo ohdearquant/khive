@@ -62,6 +62,7 @@ async fn resolve_holder(
 }
 
 struct VisibilityReceiptState {
+    note_present: bool,
     epoch: Option<String>,
     receipt_present: bool,
     fences: Option<Vec<(String, u64)>>,
@@ -103,6 +104,7 @@ async fn visibility_receipt_state(
         .await
         .map_err(|_| unavailable())?;
     let mut state = VisibilityReceiptState {
+        note_present: !rows.is_empty(),
         epoch: None,
         receipt_present: false,
         fences: None,
@@ -191,6 +193,11 @@ async fn classified_visibility_receipt(
     replay: bool,
 ) -> RuntimeResult<Vec<(String, u64)>> {
     let state = visibility_receipt_state(runtime, token, note_id).await?;
+    if replay && !state.note_present {
+        return Err(RuntimeError::NotFound(
+            "memory not found during keyed replay".into(),
+        ));
+    }
     let reason = match state.epoch.as_deref() {
         Some("modern") => {
             if let Some(fences) = state.fences {
@@ -343,4 +350,169 @@ pub async fn create_keyed_memory_with_receipt_and_report(
             ]))
             .into(),
     )
+}
+
+#[cfg(test)]
+mod receipt_read_tests {
+    use super::*;
+    use crate::DomainDisposition;
+
+    const KEY: &str = "receipt-race-key";
+    const CONTENT: &str = "private receipt race content";
+
+    async fn captured_holder() -> (KhiveRuntime, NamespaceToken, Note) {
+        let runtime = KhiveRuntime::memory().unwrap();
+        runtime.install_kind_registry(vec![], vec!["memory".into()]);
+        let token = runtime
+            .authorize(khive_types::Namespace::parse("receipt-read-race").unwrap())
+            .unwrap();
+        let (note, _, replayed, fences) = create_keyed_memory_with_receipt(
+            &runtime,
+            &token,
+            KeyedMemorySpec {
+                content: CONTENT,
+                key: KEY,
+                salience: 0.7,
+                decay_factor: 0.95,
+                properties: serde_json::json!({}),
+                source_id: None,
+                embedding_model: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!replayed);
+        assert!(fences.is_empty());
+        let holder = resolve_holder(&runtime, &token, KEY)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(holder, note);
+        assert!(
+            classified_visibility_receipt(&runtime, &token, holder.id, true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        (runtime, token, holder)
+    }
+
+    #[tokio::test]
+    async fn replay_receipt_reports_missing_after_captured_holder_is_hard_deleted() {
+        let (runtime, token, holder) = captured_holder().await;
+        // This is the exact boundary in the replay path: holder lookup has
+        // completed, but its joined receipt/epoch read has not started.
+        assert!(runtime.delete_note(&token, holder.id, true).await.unwrap());
+        assert!(runtime
+            .notes(&token)
+            .unwrap()
+            .get_note_including_deleted(holder.id)
+            .await
+            .unwrap()
+            .is_none());
+        let error = classified_visibility_receipt(&runtime, &token, holder.id, true)
+            .await
+            .unwrap_err();
+        assert!(matches!(&error, RuntimeError::NotFound(_)));
+        let value = crate::error_projection::runtime_error_value(error, DomainDisposition::Unknown);
+        assert_eq!(value["kind"], "not_found");
+        assert_eq!(value["details"], Value::Null);
+        assert_eq!(value["domain_disposition"], "unknown");
+        assert!(value.get("retryable").is_none());
+        let encoded = value.to_string();
+        let id = holder.id.to_string();
+        for private in [KEY, CONTENT, id.as_str()] {
+            assert!(!encoded.contains(private));
+        }
+        assert!(memory_visibility_receipt(&runtime, &token, holder.id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(resolve_holder(&runtime, &token, KEY)
+            .await
+            .unwrap()
+            .is_none());
+
+        // The post-commit caller retains its existing uncertainty semantics.
+        let error = classified_visibility_receipt(&runtime, &token, holder.id, false)
+            .await
+            .unwrap_err();
+        let value = crate::error_projection::runtime_error_value(error, DomainDisposition::Unknown);
+        assert_eq!(value["details"]["reason"], "receipt_epoch_unknown");
+        assert_eq!(value["domain_disposition"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn present_holder_with_missing_or_invalid_epoch_is_not_missing() {
+        for mutation in [
+            "DELETE FROM memory_visibility_epochs WHERE note_id = ?1",
+            "UPDATE memory_visibility_epochs SET epoch = 'unknown' WHERE note_id = ?1",
+            "UPDATE memory_visibility_epochs SET epoch = 'malformed' WHERE note_id = ?1",
+            "UPDATE memory_visibility_epochs SET epoch = 'legacy' WHERE note_id = ?1",
+            "UPDATE memory_visibility_epochs SET namespace = 'foreign-private-namespace' WHERE note_id = ?1",
+            "UPDATE notes SET namespace = 'foreign-private-namespace' WHERE id = ?1",
+        ] {
+            let (runtime, token, holder) = captured_holder().await;
+            {
+                // Model a damaged epoch value as well as valid but incomplete
+                // provenance. Restore constraint checks before reading it.
+                let writer = runtime.backend().pool().try_writer().unwrap();
+                writer
+                    .conn()
+                    .pragma_update(None, "ignore_check_constraints", true)
+                    .unwrap();
+                writer.conn().execute(mutation, [holder.id.to_string()]).unwrap();
+                writer
+                    .conn()
+                    .pragma_update(None, "ignore_check_constraints", false)
+                    .unwrap();
+            }
+            assert!(runtime
+                .notes(&token)
+                .unwrap()
+                .get_note_including_deleted(holder.id)
+                .await
+                .unwrap()
+                .is_some());
+            let error = classified_visibility_receipt(&runtime, &token, holder.id, true)
+                .await
+                .unwrap_err();
+            let value = crate::error_projection::runtime_error_value(error, DomainDisposition::Unknown);
+            assert_eq!(value["details"]["reason"], "receipt_epoch_unknown");
+            assert_eq!(value["details"]["memory_id"], holder.id.to_string());
+            assert_eq!(value["domain_disposition"], "not_committed");
+            assert_eq!(value["retryable"], false);
+            for private in [KEY, CONTENT, "foreign-private-namespace"] {
+                assert!(!value.to_string().contains(private));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_note_store_is_unavailable_not_missing() {
+        let (runtime, token, holder) = captured_holder().await;
+        runtime
+            .sql()
+            .writer()
+            .await
+            .unwrap()
+            .execute(SqlStatement {
+                sql: "ALTER TABLE notes RENAME TO private_unreadable_notes".into(),
+                params: vec![],
+                label: Some("receipt-unreadable-note-control".into()),
+            })
+            .await
+            .unwrap();
+        let error = classified_visibility_receipt(&runtime, &token, holder.id, true)
+            .await
+            .unwrap_err();
+        let value = crate::error_projection::runtime_error_value(error, DomainDisposition::Unknown);
+        assert_eq!(value["details"]["reason"], "receipt_store_unavailable");
+        assert_eq!(value["details"]["memory_id"], holder.id.to_string());
+        assert_eq!(value["domain_disposition"], "unknown");
+        assert_eq!(value["retryable"], true);
+        for private in [KEY, CONTENT, "private_unreadable_notes"] {
+            assert!(!value.to_string().contains(private));
+        }
+    }
 }
