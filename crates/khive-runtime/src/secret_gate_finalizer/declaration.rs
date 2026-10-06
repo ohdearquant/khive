@@ -197,7 +197,7 @@ pub(crate) enum Acceptance {
 pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     RouteInventoryEntry {
         id: "runtime.atomic.entity.create",
-        site: "khive-runtime/src/atomic_prepare.rs::prepare_add_entity",
+        site: "khive-runtime/src/atomic_prepare/add_update.rs::prepare_add_entity",
         expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
@@ -210,7 +210,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.atomic.entity.update",
-        site: "khive-runtime/src/atomic_prepare.rs::prepare_update_entity_plan_with_version_and_type",
+        site: "khive-runtime/src/atomic_prepare/add_update.rs::prepare_update_entity_plan_with_version_and_type",
         expected_writes: 1,
         target: Substrate::Entity,
         write_class: WriteClass::WholeObject,
@@ -236,7 +236,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "runtime.atomic.note.create",
-        site: "khive-runtime/src/atomic_prepare.rs::prepare_add_note",
+        site: "khive-runtime/src/atomic_prepare/add_update.rs::prepare_add_note",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
