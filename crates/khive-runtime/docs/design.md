@@ -4,7 +4,7 @@
 
 ### Edge Ontology (ADR-002)
 
-- 19 closed edge relations (15 base relations, 2 epistemic relations added by ADR-055, `links_to` added by ADR-191 and `located_in` added by ADR-196);
+- 20 closed edge relations (18 non-epistemic relations, including `links_to` added by ADR-191, `located_in` added by ADR-196 and `owns` added by ADR-197, plus the 2 epistemic relations added by ADR-055);
   endpoint contract enforced at the runtime layer in `operations.rs`
 - Symmetric relations (`competes_with`, `composed_with`) are stored with `source_uuid < target_uuid`
 - `annotates` is the only cross-substrate relation: source must be a note, target may be anything
