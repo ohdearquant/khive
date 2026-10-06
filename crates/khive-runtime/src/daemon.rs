@@ -316,7 +316,7 @@ fn khive_root_from(home: Option<String>, userprofile: Option<String>) -> PathBuf
 
 /// The directory for the SQLite volume lock files, from the single rule in
 /// [`khive_db::default_volume_lock_dir`]: `KHIVE_VOLUME_LOCK_DIR` when set,
-/// else `<home>/.khive/sqlite-volume-locks`. Unlike [`khive_dir`] it has no
+/// else `<home>/.khive/sqlite-volume-locks`. Unlike `khive_dir` it has no
 /// last-resort root: without a home directory the result is a configuration
 /// error, because a working-directory-relative lock directory would give two
 /// processes two different lock files.

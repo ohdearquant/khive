@@ -17,8 +17,10 @@ TRIGGERS = (
     "execute_atomic_ops_file(", "run_reindex(",
     "run_reindex_without_embeddings(", "run_reindex_offline(",
 )
-MODULES = ("exec.rs", "exec_tests.rs", "cli.rs", "code_ingest.rs", "reindex.rs", "pack_introspect.rs",
-           "atomic_apply.rs", "atomic_project_origin_tests.rs")
+MODULES = ("exec.rs", "exec_tests.rs", "exec_atomic_result_shape_tests.rs", "cli.rs", "code_ingest.rs",
+           "reindex.rs", "pack_introspect.rs", "atomic_apply.rs", "atomic_project_origin_tests.rs")
+# Test files included at column zero rather than as an inline module.
+COLUMN_ZERO = ("exec_tests.rs", "exec_atomic_result_shape_tests.rs")
 
 
 def functions(source, indent="    "):
@@ -33,12 +35,12 @@ def functions(source, indent="    "):
 
 
 def module_functions(filename):
-    indent = "" if filename == "exec_tests.rs" else "    "
+    indent = "" if filename in COLUMN_ZERO else "    "
     return functions((SOURCE / filename).read_text(), indent)
 
 
 def isolation(filename):
-    return ISOLATION.replace("\n    ", "\n") if filename == "exec_tests.rs" else ISOLATION
+    return ISOLATION.replace("\n    ", "\n") if filename in COLUMN_ZERO else ISOLATION
 
 
 def function(filename, name):
@@ -68,7 +70,8 @@ class KkernelTestIsolationTests(unittest.TestCase):
 
     def test_atomic_execution_callers_enter_exact_children(self):
         count = 0
-        for filename in ("exec.rs", "exec_tests.rs", "atomic_apply.rs", "atomic_project_origin_tests.rs"):
+        for filename in ("exec.rs", "exec_tests.rs", "exec_atomic_result_shape_tests.rs", "atomic_apply.rs",
+                         "atomic_project_origin_tests.rs"):
             for name, attributes, body in module_functions(filename):
                 if "#[tokio::test" not in attributes or "execute_atomic_ops_file(" not in body:
                     continue
