@@ -81,7 +81,9 @@ async fn recall_pipeline_visits_each_admitted_prefix_once() {
         let runtime = KhiveRuntime::memory().expect("in-memory runtime");
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(runtime.clone()));
-        builder.register(crate::MemoryPack::new(runtime));
+        builder.register(crate::MemoryPack::new(
+            crate::test_support::with_receipt_credentials(runtime),
+        ));
         let registry = builder.build().expect("registry");
         for index in 0..n {
             registry

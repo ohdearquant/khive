@@ -361,7 +361,8 @@ mod prune_recall_visibility_tests {
         let ns = Namespace::parse("local").expect("local namespace");
         rt.authorize(ns).expect("authorize local");
 
-        let pack = crate::MemoryPack::new(rt.clone());
+        let pack =
+            crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
         let ann = pack.ann_for_test();
 
         let mut builder = VerbRegistryBuilder::new();
@@ -555,7 +556,8 @@ mod prune_recall_visibility_tests {
         let ns = Namespace::parse("local").expect("local namespace");
         rt.authorize(ns).expect("authorize local");
 
-        let pack = crate::MemoryPack::new(rt.clone());
+        let pack =
+            crate::MemoryPack::new(crate::test_support::with_receipt_credentials(rt.clone()));
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
@@ -669,7 +671,9 @@ mod prune_index_cleanup_tests {
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(crate::MemoryPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(
+            crate::test_support::with_receipt_credentials(rt.clone()),
+        ));
         let registry = builder.build().expect("registry");
 
         // One low-salience note to be pruned, one high-salience note that must survive.
@@ -817,7 +821,9 @@ mod prune_effective_salience_tests {
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
-        builder.register(crate::MemoryPack::new(rt.clone()));
+        builder.register(crate::MemoryPack::new(
+            crate::test_support::with_receipt_credentials(rt.clone()),
+        ));
         let registry = builder.build().expect("registry");
         (rt, registry)
     }
