@@ -607,8 +607,9 @@ the sealing is skipped. The response then carries `visibility_token: null` and
 fabricated token. Session recall refuses with `visibility_key_unavailable` and
 `retryable: true` while custody is absent, and once a key is configured an
 exact keyed replay reseals the stored fences under it. A hosted deployment
-provisions custody before it serves traffic, and startup logs a warning naming
-the missing receipt configuration.
+provisions custody before it serves traffic, and each memory-pack activation
+logs a warning naming the missing receipt configuration. Activation also warns
+when the configured receipt section is unusable.
 
 The cutover reports what it classified, per database, in its own output. The
 migration runner returns only the schema version it reached, so the cutover
