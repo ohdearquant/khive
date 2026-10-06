@@ -1,6 +1,6 @@
 # Vamana Persistence
 
-**Scope:** `crates/khive-vamana/src/index.rs` — `VamanaIndex::save`, `VamanaIndex::load`, `VamanaIndex::to_snapshot`, `VamanaIndex::from_snapshot`
+**Scope:** `crates/khive-vamana/src/index/index_load_save.rs` — `VamanaIndex::save`, `VamanaIndex::load`, `VamanaIndex::to_snapshot`, `VamanaIndex::from_snapshot`
 **ADR refs:** ADR-048 (persistence and snapshot validation requirements)
 **Last reviewed:** 2026-06-06
 
@@ -194,8 +194,8 @@ while refusing an additional incumbent vector-sized heap copy.
 
 ## lifecycle.bin format
 
-Written by `write_lifecycle` (`index.rs`) as part of the v2 segmented save. All
-fields little-endian:
+Written by `encode_lifecycle` (`index/v2_commit.rs`) as part of the v2 segmented
+save. All fields little-endian:
 
 | Field               | Size                 | Type                                    |
 | ------------------- | -------------------- | --------------------------------------- |
@@ -217,7 +217,7 @@ derived from `tombstone_words`; the caller already knows `num_vectors` from
 
 `VamanaGraph::restore_reverse_adj` installs a previously serialized in-neighbor list
 as `reverse_adj` in O(1) (a move). This is safe to call without redoing the O(N×R)
-rebuild because the v2 fast-load path (`load_v2_fast` in `index.rs`) has already paid
+rebuild because the v2 fast-load path (`load_v2_fast` in `index/index_load_save.rs`) has already paid
 that cost validating bidirectional consistency between the loaded `reverse_adj` and
 the forward `adjacency` before calling it — the O(N×R) work isn't skipped, it just
 happens in the validation step rather than in `restore_reverse_adj` itself.
