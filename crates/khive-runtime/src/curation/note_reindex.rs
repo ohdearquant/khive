@@ -54,6 +54,7 @@ impl KhiveRuntime {
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn reindex_note_with_plan(
         &self,
         token: &NamespaceToken,

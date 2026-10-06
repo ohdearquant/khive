@@ -284,16 +284,35 @@ impl KhiveRuntime {
                     if crate::operations::consume_fts_fail_fault(&updated_note.namespace) {
                         Err(RuntimeError::Internal("injected FTS failure".to_string()))
                     } else {
-                        self.reindex_note_with_plan(token, &updated_note, &embedding_plan)
+                        self.reindex_note_report_with_plan(token, &updated_note, &embedding_plan)
                             .await
                     };
                 #[cfg(not(any(test, feature = "fault-injection")))]
                 let reindex_result = self
-                    .reindex_note_with_plan(token, &updated_note, &embedding_plan)
+                    .reindex_note_report_with_plan(token, &updated_note, &embedding_plan)
                     .await;
 
                 match reindex_result {
-                    Ok(report) => summary.embedding_truncation = report,
+                    Ok(report) => {
+                        summary.embedding_truncation = report.truncation;
+                        if !report.failures.is_empty() {
+                            summary.post_commit_reindex_error = Some(
+                                report
+                                    .failures
+                                    .iter()
+                                    .map(|failure| {
+                                        format!(
+                                            "model {} {}: {}",
+                                            failure.model,
+                                            failure.stage.as_str(),
+                                            failure.error
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("; "),
+                            );
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(
                             into_id = %summary.kept_id,
