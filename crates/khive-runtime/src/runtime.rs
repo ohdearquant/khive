@@ -295,6 +295,7 @@ fn same_diagnostic_database(a: &OpenedDiagnosticBackend, b: &OpenedDiagnosticBac
 /// for each storage capability, plus a lazily-loaded embedder.
 #[derive(Clone)]
 pub struct KhiveRuntime {
+    pub(crate) visibility_receipts: Arc<crate::visibility_receipts::ReceiptCapability>,
     backend: Arc<StorageBackend>,
     /// Successful named-vector bindings and their namespace-scoped stores.
     /// Shared by runtime clones so repeated reads do not enter the writer or
@@ -582,6 +583,7 @@ impl KhiveRuntime {
             )
             .into());
         }
+        backend.validate_memory_visibility_cutover()?;
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;
         }
@@ -594,7 +596,11 @@ impl KhiveRuntime {
         }
         let ann_fresh_tail_enabled = crate::config::ann_fresh_tail_enabled_from_env();
         let (registry, default_embedder_name) = build_embedder_registry(&config);
+        let visibility_receipts = Arc::new(
+            crate::visibility_receipts::ReceiptCapability::from_config(&config),
+        );
         Self {
+            visibility_receipts,
             backend,
             named_vector_stores: Arc::new(RwLock::new(HashMap::new())),
             core_named_vector_stores: None,
@@ -741,6 +747,7 @@ impl KhiveRuntime {
                     ),
                 };
                 KhiveRuntime {
+                    visibility_receipts: self.visibility_receipts.clone(),
                     backend: main_arc.clone(),
                     named_vector_stores: self
                         .core_named_vector_stores
@@ -823,6 +830,17 @@ impl KhiveRuntime {
     /// input.
     pub fn visible_namespaces(&self) -> &[Namespace] {
         &self.config.visible_namespaces
+    }
+
+    pub(crate) fn install_visibility_receipt_capability(
+        &mut self,
+        ring: crate::credentials::VisibilityReceiptConfig,
+        credentials: Vec<crate::credentials::CredentialConfig>,
+        capability: crate::visibility_receipts::ReceiptCapability,
+    ) {
+        self.config.credentials = credentials;
+        self.config.visibility_receipts = Some(ring);
+        self.visibility_receipts = Arc::new(capability);
     }
 
     /// Return a reference to the runtime config.
