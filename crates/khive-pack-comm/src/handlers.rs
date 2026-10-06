@@ -2558,10 +2558,7 @@ async fn detach_deleted_legacy_original(
         .writer()
         .await?
         .execute(SqlStatement {
-            sql: "DELETE FROM attachments WHERE record_uuid = ?1 \
-                  AND role = 'quarantine-original' AND substrate = 'note' \
-                  AND content_ref = ?2"
-                .into(),
+            sql: khive_runtime::sql!("quarantine_original_detach").into(),
             params: vec![
                 SqlValue::Text(id.to_string()),
                 SqlValue::Text(expected.as_str().to_string()),
@@ -2659,18 +2656,7 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         // SQLite-space-only text slug. Existing tombstones stay eligible,
         // including an operator-soft-deleted historical quarantine.
         (
-            "SELECT id FROM notes \
-             WHERE namespace = ?1 AND kind = 'message' \
-               AND ((expires_at IS NOT NULL AND expires_at <= ?2) \
-                    OR (expires_at IS NULL AND created_at <= ?3)) \
-               AND json_extract(properties, '$.channel_kind') = ?4 \
-               AND (json_type(properties, '$.channel_slug') IS NULL \
-                    OR json_type(properties, '$.channel_slug') = 'null' \
-                    OR (json_type(properties, '$.channel_slug') = 'text' \
-                        AND trim(json_extract(properties, '$.channel_slug')) = '')) \
-               AND (json_extract(properties, '$.quarantined') = 'true' \
-                    OR json_type(properties, '$.quarantined') = 'true') \
-             ORDER BY COALESCE(expires_at, created_at), id LIMIT 128",
+            khive_runtime::sql!("quarantine_legacy_expired_select"),
             vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(as_of),
@@ -2680,14 +2666,7 @@ pub(crate) async fn handle_cleanup_expired_quarantine(
         )
     } else {
         (
-            "SELECT id FROM notes \
-             WHERE namespace = ?1 AND kind = 'message' AND deleted_at IS NULL \
-               AND expires_at IS NOT NULL AND expires_at <= ?2 \
-               AND json_extract(properties, '$.channel_kind') = ?3 \
-               AND json_extract(properties, '$.channel_slug') = ?4 \
-               AND (json_extract(properties, '$.quarantined') = 'true' \
-                    OR json_type(properties, '$.quarantined') = 'true') \
-             ORDER BY expires_at, id LIMIT 128",
+            khive_runtime::sql!("quarantine_expired_select"),
             vec![
                 SqlValue::Text(namespace.to_string()),
                 SqlValue::Integer(as_of),
@@ -3169,19 +3148,7 @@ async fn load_quarantine_counts(
         .map_err(RuntimeError::Storage)?;
     let rows = reader
         .query_all(SqlStatement {
-            sql: "SELECT json_extract(properties, '$.channel_kind') AS channel_kind, \
-                         json_extract(properties, '$.channel_slug') AS channel_slug, \
-                         COUNT(*) AS quarantined_count \
-                  FROM notes \
-                  WHERE namespace = ?1 \
-                    AND kind = 'message' \
-                    AND deleted_at IS NULL \
-                    AND (json_extract(properties, '$.quarantined') = 'true' \
-                         OR json_type(properties, '$.quarantined') = 'true') \
-                  GROUP BY json_extract(properties, '$.channel_kind'), \
-                           json_extract(properties, '$.channel_slug') \
-                  ORDER BY channel_kind, channel_slug"
-                .into(),
+            sql: khive_runtime::sql!("quarantine_counts_select").into(),
             params: vec![SqlValue::Text(token.namespace().as_str().to_string())],
             label: Some("comm_health_quarantined_counts".into()),
         })
