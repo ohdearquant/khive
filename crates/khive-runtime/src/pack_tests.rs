@@ -3656,6 +3656,7 @@ fn converted_crates_keep_their_sql_out_of_rust() {
     /// Crates whose statements live in `sql/`. One pull request adds one name.
     const CONVERTED: &[&str] = &[
         "khive-pack-brain",
+        "khive-pack-comm",
         "khive-pack-git",
         "khive-pack-gtd",
         "khive-pack-kg",

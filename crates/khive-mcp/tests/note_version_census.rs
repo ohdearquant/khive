@@ -17,6 +17,11 @@ const LEGACY_SQL_WRITERS: &[&str] = &[
 ];
 const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
     (
+        "khive-pack-comm/sql/quarantine_duplicate_retention_repair.sql",
+        COMM,
+        "repair_duplicate_quarantine",
+    ),
+    (
         "khive-pack-gtd/sql/task-transition-update.sql",
         GTD,
         "gtd_transition_statement",
