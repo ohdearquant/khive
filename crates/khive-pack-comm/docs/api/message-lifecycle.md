@@ -3,7 +3,7 @@
 Technical reference for the `comm` pack's message write, threading, and read path —
 `comm.send` / `comm.delivered` / `comm.inbox` / `comm.read` / `comm.mark_read` / `comm.reply` /
 `comm.thread` / `comm.ingest` —
-spanning `message.rs`, `handlers.rs`, `params.rs`, and the inbox/thread indexes in
+spanning `message.rs`, `handlers.rs`, `handlers/reply.rs`, `params.rs`, and the inbox/thread indexes in
 `vocab.rs`.
 
 ## File attachments on local messages
@@ -561,6 +561,8 @@ committed mark as successful, with `read=true` merged into its validated propert
 siblings retain their fresh properties. The write transaction is never retried by this readback.
 
 ## `handlers.rs::handle_reply`
+
+The implementation lives in `handlers/reply.rs`; `handlers.rs` retains the crate-visible facade.
 
 Replies to a message, threading linkage.
 

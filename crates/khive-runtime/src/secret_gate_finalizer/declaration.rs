@@ -431,7 +431,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.reply.read",
-        site: "khive-pack-comm/src/handlers.rs::handle_reply",
+        site: "khive-pack-comm/src/handlers/reply.rs::handle_reply",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
