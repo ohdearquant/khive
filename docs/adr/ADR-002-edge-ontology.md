@@ -45,6 +45,10 @@ relation expresses it without a false claim.
 from) and `Org competes_with Org` (two organizations that name each other as competitors). See
 "Base endpoint contract" below and "Why the 2026-10-05 organization amendment?" in Rationale.
 This also amends ADR-196 D1, which kept `located_in` to one base row.
+**Amendment specified by [ADR-197](ADR-197-owns-relation.md)**: adds `owns`,
+the tenth category (Ownership), and the base pairs `Person owns Org` and
+`Org owns Org`, expanding the closed set from 19 → 20. ADR-197 keeps its
+own status.
 
 ## Context
 
@@ -66,7 +70,7 @@ classification ambiguity.
 
 ## Decision
 
-**19 canonical relations, grouped into 9 categories. No others.**
+**20 canonical relations, grouped into 10 categories. No others.**
 
 > **Amended 2026-06-14 ([ADR-055](ADR-055-epistemic-edge-relations.md))**: added Category 9
 > (Epistemic / Evidential) with `supports` and `refutes`, expanding the closed set from 15 → 17.
@@ -142,6 +146,20 @@ standard scale. Directional (evidence → claim), **not** symmetric.
 | ---------- | ---------------- | --------------------------------------------------------------- |
 | `supports` | evidence → claim | Evidence **for** the claim (corroborates, confirms, replicates) |
 | `refutes`  | evidence → claim | Evidence **against** the claim (contradicts, falsifies)         |
+
+### Category 10: Ownership (current whole or partial interest)
+
+| Relation | Direction     | When                                                                                                |
+| -------- | ------------- | --------------------------------------------------------------------------------------------------- |
+| `owns`   | owner → owned | A person or organization holds a current direct or beneficial interest in an organization (ADR-197) |
+
+Ownership is distinct from membership, composition and control. Weight remains
+confidence; conventional `pct`, `class`, `as_of`, `valid_from` and
+`by_class` metadata describe the stake. These keys are not governed.
+A holding is one current edge: update its metadata, delete it when the holding
+ends, and use `resurrect: true` on a later reacquisition. No transitive
+ownership or control edge is inferred. Retrieve edge metadata by the edge IDs
+returned by neighbors or traversal; those projections do not include it.
 
 ### `supersedes` vs `precedes`
 
@@ -250,10 +268,10 @@ non-symmetric — is legal at the storage layer for every relation. Three reason
 semantically coherent. For curation and validation-pipeline use (advisory — never
 write-time enforcement):
 
-| Class                                   | Relations                                                                                                                                            | Reciprocal pair means                                                                                                                                                                                          |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements`, `located_in` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                                                                         |
-| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`, `links_to`                                                                                           | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other, two documents linking to each other). Not findings (ADR-191). |
+| Class                                   | Relations                                                                                                                                            | Reciprocal pair means                                                                                                                                                                                                                                   |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Order-like — reciprocal pair INCOHERENT | `contains`, `part_of`, `instance_of`, `extends`, `variant_of`, `introduced_by`, `supersedes`, `derived_from`, `precedes`, `implements`, `located_in` | The two edges contradict: each claims a directional subordination or ordering the other denies. Surface as curation-review candidates.                                                                                                                  |
+| State-like — reciprocal pair COHERENT   | `depends_on`, `enables`, `supports`, `refutes`, `links_to`, `owns`                                                                                   | The two edges are independent assertions that can both hold (mutual dependency, mutual enablement, claims that each support or refute the other, two documents linking to each other, reciprocal ownership interests). Not findings (ADR-191, ADR-197). |
 
 `annotates` is note-sourced, so it cannot form an entity-endpoint reciprocal pair and
 sits outside the entity census below. Note→note reciprocal `annotates` pairs (note A
@@ -434,6 +452,17 @@ allowlist but cannot remove base rules.
 > registered in X" is a graph query rather than a property scan. The target is the jurisdiction
 > as a concept entity. `instance_of` is not used for this, because an organization is not an
 > instance of a place.
+
+#### Ownership relation
+
+| Source   | Relation | Target |
+| -------- | -------- | ------ |
+| `Person` | `owns`   | `Org`  |
+| `Org`    | `owns`   | `Org`  |
+
+These are exactly the base pairs from ADR-197. Self-loops remain refused;
+reciprocal Org→Org holdings are legal, directional assertions. Pack endpoint
+rules may add typed subtypes through the existing additive contract.
 
 #### Derivation relations
 
@@ -685,6 +714,7 @@ For provenance/lineage-sensitive relations, hard-delete cascade emits a warning 
 | `supports` / `refutes` | cascade edge; emit evidential-link-loss warning     |
 | `annotates`            | cascade as documented                               |
 | `located_in`           | cascade normally                                    |
+| `owns`                 | cascade normally; no ownership-loss audit warning   |
 | others                 | cascade normally                                    |
 
 Warnings use the existing `audit` event kind and target the hard-deleted record. The runtime
@@ -744,10 +774,15 @@ The fourth expansion (→ 19, [ADR-196](ADR-196-located-in-relation.md)) adds `l
   export. See [ADR-196](ADR-196-located-in-relation.md) for the analysis and the ADR-076
   certificate.
 
+The fifth expansion (→ 20, [ADR-197](ADR-197-owns-relation.md)) adds `owns`
+in the new **Ownership** category. Holder queries distinguish stakes from
+employment, subsidiary membership and structural containment. Its seven
+certificate fixtures preserve that distinction under the cheaper encodings.
+
 ### How is the closed set calculable and auditable?
 
 [ADR-076](ADR-076-relation-calculability-and-system-role.md) records why there is no
-first-principles relation algebra whose closure uniquely derives these 17 relations: khive's
+first-principles relation algebra whose closure uniquely derives the current relation set: khive's
 query classes are design inputs, not deductions. The calculable result is instead a repeatable
 falsification audit. Each relation names a system role, and a proposed relation is tested against
 seven cheaper encodings: converse (Cv), endpoint restriction (Er), attribute (At), polarity
@@ -755,6 +790,10 @@ seven cheaper encodings: converse (Cv), endpoint restriction (Er), attribute (At
 (Sr).
 
 The audit disposition for the current set is:
+
+- `located_in` and `owns` have explicit seven-family certificates in
+  `khive-types/tests/certificate`; the live coverage gate requires their fixtures.
+  Owns is not added to the grandfathered set or the closed collision exceptions.
 
 - Exactly the 15 base relations in this ADR are registered as the grandfathered
   `SurvivesAll` set. No base relation is treated as a converse, fixed composition, or
@@ -885,10 +924,10 @@ had shared the single pair `Concept -> Concept`. The `located_in` certificate's 
 stands on that shared pair. The collision exemption in the signature tripwire is withdrawn
 rather than left stale.
 
-### Why 9 categories?
+### Why 10 categories?
 
 Each category serves a distinct query class. Single- or two-relation categories (Implementation,
-Annotation, Provenance, Temporal, Epistemic) are justified because the relation(s) within each
+Annotation, Provenance, Temporal, Epistemic, Ownership) are justified because the relation(s) within each
 answer a question no other category covers. Category count is driven by query semantics, not by
 balancing relation counts.
 
@@ -918,6 +957,7 @@ pub enum EdgeCategory {
     Lateral,
     Annotation,
     Epistemic,
+    Ownership,
 }
 
 pub enum EdgeRelation {
@@ -939,6 +979,8 @@ pub enum EdgeRelation {
     Annotates,
     // Epistemic
     Supports, Refutes,
+    // Ownership
+    Owns,
 }
 ```
 

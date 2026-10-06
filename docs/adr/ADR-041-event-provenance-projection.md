@@ -50,7 +50,9 @@ break replay determinism, cursor semantics, and the atomicity required by any fu
 PackEventConsumer contract (ADR-017).
 
 > **Amended ([ADR-055](ADR-055-epistemic-edge-relations.md))**: ADR-055 added 2
-> epistemic relations (`supports`, `refutes`); the current total is 17 edge relations.
+> epistemic relations (`supports`, `refutes`), bringing the set to 17 at that amendment.
+> ADR-191, ADR-196 and [ADR-197](ADR-197-owns-relation.md) bring the current total to 20
+> edge relations. This ADR still adds no canonical relation.
 
 This ADR resolves the tension via a **hybrid** model: the event log stays canonical
 (append-only, ordered, cursor-anchored), and a **sibling projection table**

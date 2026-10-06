@@ -234,3 +234,19 @@ fn supports_refutes_have_identical_base_signatures_adr076_d3() {
          per ADR-076 §D3; if this fails, revisit the D3 system-role declaration"
     );
 }
+
+#[test]
+fn owns_has_exactly_the_two_ownership_endpoint_pairs() {
+    let owns = base_entity_endpoint_rules()
+        .iter()
+        .filter(|(_, relation, _)| *relation == khive_types::EdgeRelation::Owns)
+        .map(|(source, _, target)| (*source, *target))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        owns,
+        std::collections::BTreeSet::from([("org", "org"), ("person", "org")])
+    );
+    assert!(!KgPack::EDGE_RULES
+        .iter()
+        .any(|rule| rule.relation == khive_types::EdgeRelation::Owns));
+}

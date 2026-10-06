@@ -30,7 +30,7 @@ pub enum AdapterError {
     #[error("record {index}: unknown entity kind '{kind}'")]
     UnknownKind { index: usize, kind: String },
 
-    /// An edge relation is not in the closed set of 19 canonical relations.
+    /// An edge relation is not in the closed set of 20 canonical relations.
     ///
     /// This is always an error regardless of `--schema-mode`.
     #[error("record {index}: unknown edge relation '{relation}'")]

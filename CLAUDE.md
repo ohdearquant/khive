@@ -15,7 +15,7 @@ concepts, links ideas, records decisions — khive gives that work a typed, quer
 persists across sessions.
 
 It is NOT a general-purpose database, a vector DB, or a chat memory system. It has opinions:
-9 entity kinds, 19 edge relations, 5 note kinds — all closed sets. If your data doesn't fit the
+9 entity kinds, 20 edge relations, 5 note kinds — all closed sets. If your data doesn't fit the
 schema, change how you model it, not the schema. Schema changes require an ADR.
 
 ---
@@ -156,7 +156,7 @@ not shipped.
 
 `concept` | `document` | `dataset` | `project` | `person` | `org` | `artifact` | `service` | `resource`
 
-### 19 edge relations ([ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic; [ADR-191](docs/adr/ADR-191-web-pack-ontology-and-operations.md) `links_to`; [ADR-196](docs/adr/ADR-196-located-in-relation.md) `located_in`)
+### 20 edge relations ([ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic; [ADR-191](docs/adr/ADR-191-web-pack-ontology-and-operations.md) `links_to`; [ADR-196](docs/adr/ADR-196-located-in-relation.md) `located_in`; [ADR-197](docs/adr/ADR-197-owns-relation.md) `owns`)
 
 Structure: `contains` | `part_of` | `instance_of` | `links_to` | `located_in`
 Derivation: `extends` | `variant_of` | `introduced_by` | `supersedes`
@@ -167,6 +167,7 @@ Implementation: `implements`
 Lateral: `competes_with` | `composed_with`
 Annotation: `annotates`
 Epistemic: `supports` | `refutes`
+Ownership: `owns` (owner → owned; person → org or org → org)
 
 ### 5 note kinds ([ADR-013](docs/adr/ADR-013-note-kind-taxonomy.md))
 
@@ -424,19 +425,19 @@ ADRs specify. Changing the schema or interface requires an ADR **before** code l
 
 Key ADRs for contributors:
 
-| ADR                                                  | What it governs                                                                                                 |
-| ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)      | 9 entity kinds (8 base + resource ADR-048) — don't add without this                                             |
-| [002](docs/adr/ADR-002-edge-ontology.md)             | 15 base edge relations; +2 epistemic via ADR-055, +`links_to` via ADR-191, +`located_in` via ADR-196 = 19 total |
-| [005](docs/adr/ADR-005-storage-capability-traits.md) | Storage traits — the abstraction boundary                                                                       |
-| [008](docs/adr/ADR-008-query-layer-separation.md)    | Query crate — parser/validator/compiler separation                                                              |
-| [013](docs/adr/ADR-013-note-kind-taxonomy.md)        | 5 base note kinds                                                                                               |
-| [015](docs/adr/ADR-015-schema-migrations.md)         | Migration system — how to change the DB schema                                                                  |
-| [016](docs/adr/ADR-016-request-dsl.md)               | Request DSL — verb-dispatch syntax for `request`                                                                |
-| [017](docs/adr/ADR-017-pack-standard.md)             | Pack trait, `EDGE_RULES`, pack-extensible endpoints                                                             |
-| [023](docs/adr/ADR-023-declarative-pack-format.md)   | Pack verb surface, visibility, and composition                                                                  |
-| [027](docs/adr/ADR-027-dynamic-pack-loading.md)      | Dynamic pack loading via self-registration                                                                      |
-| [028](docs/adr/ADR-028-pack-scoped-backends.md)      | Pack-scoped backends and per-pack schema declaration                                                            |
+| ADR                                                  | What it governs                                                                                                                      |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| [001](docs/adr/ADR-001-entity-kind-taxonomy.md)      | 9 entity kinds (8 base + resource ADR-048) — don't add without this                                                                  |
+| [002](docs/adr/ADR-002-edge-ontology.md)             | 15 base edge relations; +2 epistemic via ADR-055, +`links_to` via ADR-191, +`located_in` via ADR-196, +`owns` via ADR-197 = 20 total |
+| [005](docs/adr/ADR-005-storage-capability-traits.md) | Storage traits — the abstraction boundary                                                                                            |
+| [008](docs/adr/ADR-008-query-layer-separation.md)    | Query crate — parser/validator/compiler separation                                                                                   |
+| [013](docs/adr/ADR-013-note-kind-taxonomy.md)        | 5 base note kinds                                                                                                                    |
+| [015](docs/adr/ADR-015-schema-migrations.md)         | Migration system — how to change the DB schema                                                                                       |
+| [016](docs/adr/ADR-016-request-dsl.md)               | Request DSL — verb-dispatch syntax for `request`                                                                                     |
+| [017](docs/adr/ADR-017-pack-standard.md)             | Pack trait, `EDGE_RULES`, pack-extensible endpoints                                                                                  |
+| [023](docs/adr/ADR-023-declarative-pack-format.md)   | Pack verb surface, visibility, and composition                                                                                       |
+| [027](docs/adr/ADR-027-dynamic-pack-loading.md)      | Dynamic pack loading via self-registration                                                                                           |
+| [028](docs/adr/ADR-028-pack-scoped-backends.md)      | Pack-scoped backends and per-pack schema declaration                                                                                 |
 
 Full index: [docs/adr/README.md](docs/adr/README.md).
 

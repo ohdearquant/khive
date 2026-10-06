@@ -894,8 +894,8 @@ model as `esbuild` and `turbo`.
 
 ## References
 
-- [ADR-002](ADR-002-edge-ontology.md): Edge ontology — `validate` enforces the 15-relation
-  closed enum and pack-extensible endpoint contract on every NDJSON import
+- [ADR-002](ADR-002-edge-ontology.md): Edge ontology — `validate` enforces the closed enum
+  of relations and pack-extensible endpoint contract on every NDJSON import
 - [ADR-003](ADR-003-system-architecture.md): System architecture — kkernel binary
 - [ADR-005](ADR-005-storage-capability-traits.md): Storage capability traits —
   `working.db` implements the same SqlAccess + GraphStore + VectorStore + TextSearch

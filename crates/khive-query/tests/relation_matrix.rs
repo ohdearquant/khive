@@ -1,6 +1,6 @@
 //! ADR-008 canonical relation regression matrix.
 //!
-//! Table-driven tests covering all 19 ADR-002 edge relations through the parser
+//! Table-driven tests covering all 20 ADR-002 edge relations through the parser
 //! and validator paths. Ensures relation parsing, alias normalization, and
 //! EdgeRelation delegation work for every canonical relation.
 
@@ -10,7 +10,7 @@ fn opts() -> CompileOptions {
     CompileOptions::default()
 }
 
-/// All 19 canonical edge relations from ADR-002.
+/// All 20 canonical edge relations from ADR-002.
 const ALL_RELATIONS: &[&str] = &[
     "contains",
     "part_of",
@@ -31,6 +31,7 @@ const ALL_RELATIONS: &[&str] = &[
     "annotates",
     "supports",
     "refutes",
+    "owns",
 ];
 
 #[test]

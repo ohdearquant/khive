@@ -531,7 +531,7 @@ annotates=[entity_id], ...)`.
 
 ---
 
-## The 19-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic; [ADR-191](docs/adr/ADR-191-web-pack-ontology-and-operations.md) `links_to`; [ADR-196](docs/adr/ADR-196-located-in-relation.md) `located_in`)
+## The 20-relation ontology (closed set — [ADR-002](docs/adr/ADR-002-edge-ontology.md) base 15; [ADR-055](docs/adr/ADR-055-epistemic-edge-relations.md) +2 epistemic; [ADR-191](docs/adr/ADR-191-web-pack-ontology-and-operations.md) `links_to`; [ADR-196](docs/adr/ADR-196-located-in-relation.md) `located_in`; [ADR-197](docs/adr/ADR-197-owns-relation.md) `owns`)
 
 When you `link` nodes, use ONLY these relations:
 
@@ -580,6 +580,13 @@ When you `link` nodes, use ONLY these relations:
 
 - `supports` — evidence for a claim (evidence → claim; weight = strength); same-substrate
 - `refutes` — evidence against a claim (evidence → claim; weight = strength); same-substrate
+
+### Ownership
+
+- `owns` — owner → owned; person → org or org → org in the base contract. The edge
+  states a current whole or partial holding, not membership or control. `weight` is
+  confidence; stake size belongs in conventional metadata (`pct`, `class`, `as_of`,
+  `valid_from`, or `by_class` for multiple classes). Ownership is not transitive.
 
 **Why closed**: a sparse ontology stays queryable. Ad-hoc relations (`uses`, `related_to`,
 `loaded_by`) fragment the graph and make traversal useless. If your relationship doesn't fit, it's
@@ -775,7 +782,7 @@ structural traces.
 | ------------------------------------------------- | -------------------------------------------------- |
 | Storing findings only as notes, never as entities | Notes are for context; entities are for structure  |
 | Creating duplicate entities                       | Always `search` first — link to existing if found  |
-| Using ad-hoc relations                            | Map to the closed 19-relation set or don't link    |
+| Using ad-hoc relations                            | Map to the closed 20-relation set or don't link    |
 | Reversed `introduced_by` direction                | concept → paper (the paper introduces the concept) |
 | One-hop neighbor queries when you need lineage    | Use `traverse` with `max_depth` for multi-hop      |
 | Adding `version`/`date` to entity names           | Those are properties, not names                    |

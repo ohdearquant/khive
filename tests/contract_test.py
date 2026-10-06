@@ -676,17 +676,17 @@ def test_closed_taxonomy_errors(proc: subprocess.Popen) -> None:
     err_rel = _expect_rpc_error(proc, "link", {
         "source_id": src["id"],
         "target_id": tgt["id"],
-        "relation": "invented_by",  # not in the 19-relation closed set
+        "relation": "invented_by",  # not in the 20-relation closed set
     })
     assert err_rel, "Expected non-empty error for invalid edge relation"
     assert "invented_by" in err_rel, (
         f"Error should name the offending relation 'invented_by': {err_rel!r}"
     )
-    # All 19 canonical relations must be listed (ADR-002 amended by ADR-055, ADR-191, ADR-196).
+    # All 20 canonical relations must be listed (ADR-002 amended by ADR-055, ADR-191, ADR-196, ADR-197).
     for rel in ("contains", "part_of", "instance_of", "links_to", "located_in", "extends", "variant_of",
                 "introduced_by", "supersedes", "derived_from", "precedes",
                 "depends_on", "enables", "implements", "competes_with",
-                "composed_with", "annotates", "supports", "refutes"):
+                "composed_with", "annotates", "supports", "refutes", "owns"):
         assert rel in err_rel, (
             f"Valid edge relation '{rel}' missing from error message: {err_rel!r}"
         )

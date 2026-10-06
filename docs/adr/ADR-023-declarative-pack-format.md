@@ -527,16 +527,16 @@ Three reasons:
 
 ## Alternatives Considered
 
-| Alternative                                                   | Why rejected                                                                                                                                                                                             |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| YAML pack manifests (original ADR-023 v0)                     | Bifurcates the pack ecosystem into code-packs and data-packs. Half-feature: real packs want vocabulary + verbs. Increases maintenance load. The accepted decision keeps packs in Rust.                   |
-| Pack verb override (last-loaded-wins or explicit declaration) | Breaks agent predictability. Verb semantics become deployment-dependent. KindHook is the safe extension point.                                                                                           |
-| Pack middleware / wrap interception                           | Composes badly (order-dependent chains); auth and audit belong at the runtime gate (ADR-018), not the pack layer.                                                                                        |
-| Four-tier visibility (Public/Advanced/Debug/Internal)         | Conflates MCP exposure with documentation gating. Skills already handle docs; two tiers (on/off the MCP wire) are sufficient.                                                                            |
-| Proc macro (`#[derive(Pack)]`)                                | Adds expansion magic; rust-analyzer + debuggers have to expand. Cargo-generate produces plain Rust that any LLM/human reads directly.                                                                    |
-| Declarative bang macro (`khive_pack! { ... }`)                | Same as proc macro; adds a DSL parallel to the real trait. Template + plain Rust is simpler.                                                                                                             |
-| Operators can promote Internal → Verb in khive.toml           | Bypasses pack author's safety contract. Operator can disable but never expand the MCP surface.                                                                                                           |
-| Allow new edge relation names from packs                      | Fragments traversal semantics; two packs may invent different names for the same concept. The closed 15-relation set (ADR-002) plus extensible endpoints (ADR-017 `EDGE_RULES`) covers the design space. |
+| Alternative                                                   | Why rejected                                                                                                                                                                                          |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| YAML pack manifests (original ADR-023 v0)                     | Bifurcates the pack ecosystem into code-packs and data-packs. Half-feature: real packs want vocabulary + verbs. Increases maintenance load. The accepted decision keeps packs in Rust.                |
+| Pack verb override (last-loaded-wins or explicit declaration) | Breaks agent predictability. Verb semantics become deployment-dependent. KindHook is the safe extension point.                                                                                        |
+| Pack middleware / wrap interception                           | Composes badly (order-dependent chains); auth and audit belong at the runtime gate (ADR-018), not the pack layer.                                                                                     |
+| Four-tier visibility (Public/Advanced/Debug/Internal)         | Conflates MCP exposure with documentation gating. Skills already handle docs; two tiers (on/off the MCP wire) are sufficient.                                                                         |
+| Proc macro (`#[derive(Pack)]`)                                | Adds expansion magic; rust-analyzer + debuggers have to expand. Cargo-generate produces plain Rust that any LLM/human reads directly.                                                                 |
+| Declarative bang macro (`khive_pack! { ... }`)                | Same as proc macro; adds a DSL parallel to the real trait. Template + plain Rust is simpler.                                                                                                          |
+| Operators can promote Internal → Verb in khive.toml           | Bypasses pack author's safety contract. Operator can disable but never expand the MCP surface.                                                                                                        |
+| Allow new edge relation names from packs                      | Fragments traversal semantics; two packs may invent different names for the same concept. The closed relation set (ADR-002) plus extensible endpoints (ADR-017 `EDGE_RULES`) covers the design space. |
 
 ## Implementation
 
@@ -630,7 +630,7 @@ refactor that unifies `gtd.assign` onto the shared create-plus-`TaskHook` path.
 
 - [ADR-001](ADR-001-entity-kind-taxonomy.md) — closed `EntityKind` taxonomy that packs
   extend via `entity_type`, not new kinds
-- [ADR-002](ADR-002-edge-ontology.md) — closed 15-relation set; packs extend endpoints
+- [ADR-002](ADR-002-edge-ontology.md) — closed relation set; packs extend endpoints
   via `EDGE_RULES`, not new relations
 - [ADR-003](ADR-003-system-architecture.md) — kkernel / khive split
 - [ADR-013](ADR-013-note-kind-taxonomy.md) — closed note kind taxonomy

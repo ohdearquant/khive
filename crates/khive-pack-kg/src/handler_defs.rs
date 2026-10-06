@@ -623,7 +623,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 name: "relation",
                 param_type: "string",
                 required: false,
-                description: "New edge relation (edges only; any of the 19 canonical relations).",
+                description: "New edge relation (edges only; any of the 20 canonical relations).",
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
@@ -932,13 +932,14 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 26] = [
                 // drift and only that test will say so. Pack extensions come from
                 // `KG_EDGE_RULES` in this crate's `pack.rs`. A crate path and an issue
                 // number cannot be acted on by the caller this text is published to.
-                description: "`kind` is accepted as an alias for `relation`; supply only one spelling, even when the values agree. Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | links_to | located_in | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes). \
+                description: "`kind` is accepted as an alias for `relation`; supply only one spelling, even when the values agree. Required in singleton mode; ignored when links is supplied. Edge relation (contains | part_of | instance_of | links_to | located_in | extends | variant_of | introduced_by | supersedes | derived_from | precedes | depends_on | enables | implements | competes_with | composed_with | annotates | supports | refutes | owns). \
                     Each relation only accepts specific (source_kind -> target_kind) endpoint pairs; an out-of-allowlist pair between two otherwise-valid endpoints is rejected with InvalidInput, and a missing endpoint returns NotFound — never silently accepted. \
                     Base entity->entity allowlist: \
                     contains: concept->concept, project->project, project->artifact, org->project, org->service. \
                     part_of: concept->concept, project->project, project->org. \
                     instance_of: *->concept (any source kind), service->project. \
                     links_to: document->document. \
+                    owns: person->org, org->org. \
                     located_in: concept->concept, org->concept. \
                     extends: concept->concept. variant_of: concept->concept, artifact->artifact. \
                     introduced_by: concept->document, concept->person, concept->org, artifact->document, project->document, service->document, document->person, document->org. \
