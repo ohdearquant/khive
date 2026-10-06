@@ -156,7 +156,7 @@ Acceptance is pending the lattice parity measurements and maintainer approval. T
 
 ## References
 
-- [ADR-002](ADR-002-edge-ontology.md): Closed edge ontology — the 17 typed relations traversed during expansion
+- [ADR-002](ADR-002-edge-ontology.md): Closed edge ontology — the 20 typed relations in the set amended through ADR-197, traversed during expansion
 - [ADR-021](ADR-021-memory-pack.md): Memory pack — `annotates` edge from memory note to source entity, the primary propagation path
 - [ADR-033](ADR-033-recall-pipeline.md): Recall pipeline — `RecallConfig.reranker_weights`, REPLACE semantics, five shipped feature keys
 - [ADR-042](ADR-042-local-rerank-via-lattice-inference.md): Composable rerank pipeline — `reranker_params` mechanism, `graph_proximity` listed as a planned built-in name in §7
