@@ -317,6 +317,9 @@ impl Parser {
 
         self.skip_whitespace();
         if self.peek() != Some(']') && self.peek() != Some(':') && self.peek() != Some('*') {
+            if !self.peek().is_some_and(|c| c.is_alphabetic() || c == '_') {
+                return Err(self.err("edge variable must start with a letter or '_'"));
+            }
             variable = Some(self.parse_ident()?);
         }
 
