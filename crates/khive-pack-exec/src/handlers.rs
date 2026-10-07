@@ -172,7 +172,15 @@ pub async fn tree_put(rt: &KhiveRuntime, params: Value) -> Result<Value, Runtime
         }
         seen.insert(path.clone(), index);
 
-        let deleting = matches!(edit.get("delete"), Some(Value::Bool(true)));
+        let deleting = match edit.get("delete") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(deleting)) => *deleting,
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "edits[{index}].delete must be a boolean"
+                )));
+            }
+        };
         let reference = opt_str(edit, "ref")?;
         let content = opt_str(edit, "content")?;
         let named = usize::from(deleting)
