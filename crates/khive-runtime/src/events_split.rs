@@ -257,6 +257,29 @@ pub fn events_socket_path_beside(events_db: &Path) -> PathBuf {
     events_db.with_extension("sock")
 }
 
+/// Refuse an events socket pathname that cannot fit the platform address field.
+/// The daemon anchors relative paths before binding, so preflight counts that
+/// same absolute spelling, including the terminating NUL.
+#[cfg(unix)]
+pub fn validate_events_socket_path(socket_path: &Path) -> crate::error::RuntimeResult<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let socket_path = absolutize(socket_path);
+    // SAFETY: sockaddr_un contains only integer fields and a character array;
+    // all-zero is valid. No syscall uses this value; only the field size is read.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let limit = address.sun_path.len();
+    let path_bytes = socket_path.as_os_str().as_bytes().len();
+    let required_bytes = path_bytes.saturating_add(1);
+    if required_bytes > limit {
+        return Err(crate::error::RuntimeError::InvalidInput(format!(
+            "events socket path {socket_path:?} uses {path_bytes} path bytes \
+             ({required_bytes} including NUL), exceeding the platform sun_path limit of {limit} bytes"
+        )));
+    }
+    Ok(())
+}
+
 /// How a runtime reaches event storage when the split is configured.
 #[derive(Debug, Clone)]
 pub struct EventsSplitConfig {
@@ -1294,6 +1317,7 @@ pub async fn run_events_daemon_with_policies(
     // relative; anchor them before anything derives a parent from them.
     let db_path = &absolutize(db_path);
     let socket_path = &absolutize(socket_path);
+    validate_events_socket_path(socket_path)?;
     // Directory trust comes FIRST: the lock guard below opens and chmods a
     // path in this directory, and validating only before the later bind
     // would let those operations run in a directory another user controls.
@@ -1939,6 +1963,7 @@ impl EventsSplitClient {
         byte_budget: usize,
         delivery_timeout: Duration,
     ) -> crate::error::RuntimeResult<Arc<Self>> {
+        validate_events_socket_path(&socket_path)?;
         let preflight_backend = StorageBackend::memory()?;
         let preflight_store = preflight_backend.events()?;
         // The in-memory backend must outlive the store handle; the store holds

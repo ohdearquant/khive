@@ -477,6 +477,16 @@ impl KhiveRuntime {
         create_parent: bool,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        #[cfg(unix)]
+        if config.db_path.is_some() {
+            if let Some(socket) = config
+                .events_split
+                .as_ref()
+                .and_then(|split| split.socket_path.as_deref())
+            {
+                crate::events_split::validate_events_socket_path(socket)?;
+            }
+        }
         #[cfg(all(test, target_os = "macos"))]
         ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {
@@ -549,6 +559,16 @@ impl KhiveRuntime {
         config: RuntimeConfig,
         open_file: impl FnOnce(&std::path::Path) -> Result<StorageBackend, khive_db::SqliteError>,
     ) -> RuntimeResult<Self> {
+        #[cfg(unix)]
+        if config.db_path.is_some() {
+            if let Some(socket) = config
+                .events_split
+                .as_ref()
+                .and_then(|split| split.socket_path.as_deref())
+            {
+                crate::events_split::validate_events_socket_path(socket)?;
+            }
+        }
         #[cfg(all(test, target_os = "macos"))]
         ensure_in_process_test_nofile_limit();
         let backend = match &config.db_path {

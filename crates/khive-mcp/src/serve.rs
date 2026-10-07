@@ -179,6 +179,23 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         resolve_cli_namespace(&args).map_err(|error| anyhow::anyhow!("{error}"))?;
     let mut prepared = prepare_server_boot(&args, cli_ns, cli_ns_explicit, cli_ns_explicit)?;
     #[cfg(unix)]
+    let store_plan = if args.daemon {
+        let plan = prepare_daemon_store_plan(
+            &mut prepared.config.db_path,
+            &mut prepared.db_anchor,
+            &mut prepared.khive_cfg.backends,
+            args.db.as_deref() == Some(":memory:"),
+        )?;
+        preflight_events_socket_for_boot(
+            &prepared.config,
+            &prepared.khive_cfg.backends,
+            args.db.as_deref() == Some(":memory:"),
+        )?;
+        Some(plan)
+    } else {
+        None
+    };
+    #[cfg(unix)]
     let boot_guard = if args.daemon {
         Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
     } else {
@@ -189,13 +206,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         crate::daemon::refuse_serving_socket_before_store_claim().await?;
     }
     #[cfg(unix)]
-    let store_guards = if args.daemon {
-        let plan = prepare_daemon_store_plan(
-            &mut prepared.config.db_path,
-            &mut prepared.db_anchor,
-            &mut prepared.khive_cfg.backends,
-            args.db.as_deref() == Some(":memory:"),
-        )?;
+    let store_guards = if let Some(plan) = store_plan {
         let mut guards = khive_runtime::daemon::claim_stores(&plan.paths, &plan.read_only_paths)?;
         plan.assert_aliases_unchanged()?;
         khive_runtime::daemon::bind_daemon_store_files(&mut guards, &plan.read_only_paths)?;
@@ -3602,6 +3613,9 @@ async fn prepare_configured_storage_topology(
     // preparation is deferred until after main is identified: every distinct
     // secondary must be inventoried before main can atomically enable
     // attachment-only GC at V21.
+    #[cfg(unix)]
+    preflight_events_socket_for_boot(&base_config, &effective_backends, force_memory)?;
+
     let backends = open_effective_backends_with(
         &base_config,
         &effective_backends,
@@ -4892,6 +4906,8 @@ async fn build_single_backend_runtime_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<KhiveRuntime> {
+    #[cfg(unix)]
+    preflight_events_socket_for_boot(&config, &[], false)?;
     let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
     let backend = Arc::new(claimed_backend::open_single_backend(
         &mut config,
@@ -5487,6 +5503,44 @@ pub fn enable_events_forwarding_for_daemon(config: &mut RuntimeConfig) {
             &split.db_path,
         ));
     }
+}
+
+/// Validate the socket that the resolved boot topology will actually use.
+/// Daemon hosts call this after freezing backend paths but before binding any
+/// store files; the public builders repeat it before opening their backends.
+#[cfg(unix)]
+pub fn preflight_events_socket_for_boot(
+    config: &RuntimeConfig,
+    backends: &[BackendConfig],
+    force_memory: bool,
+) -> anyhow::Result<()> {
+    if force_memory {
+        return Ok(());
+    }
+    let Some(socket) = config
+        .events_split
+        .as_ref()
+        .and_then(|split| split.socket_path.as_deref())
+    else {
+        return Ok(());
+    };
+    if backends.is_empty() {
+        if config.db_path.is_some() {
+            khive_runtime::events_split::validate_events_socket_path(socket)?;
+        }
+    } else if let Some(main_path) = backends
+        .iter()
+        .find(|backend| backend.name == BackendId::MAIN && backend.kind == BackendKind::Sqlite)
+        .and_then(|backend| backend.path.as_ref())
+    {
+        // Match prepare_configured_storage_topology's reanchor, including the
+        // canonicalized paths supplied by prepare_daemon_store_plan.
+        let expanded = khive_runtime::expand_tilde(main_path);
+        let db_path = khive_runtime::events_split::events_db_path_beside(&expanded);
+        let socket_path = khive_runtime::events_split::events_socket_path_beside(&db_path);
+        khive_runtime::events_split::validate_events_socket_path(&socket_path)?;
+    }
+    Ok(())
 }
 
 /// Apply `KHIVE_BRAIN_PROFILE` env var as the tier-3 fallback for `brain_profile`.

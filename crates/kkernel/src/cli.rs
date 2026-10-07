@@ -626,6 +626,24 @@ pub async fn cli_main() -> Result<()> {
                 let max_readers =
                     khive_mcp::serve::mcp_max_readers(&a, &base_cfg, &khive_cfg.backends, None);
 
+                #[cfg(unix)]
+                let store_plan = if a.daemon {
+                    let plan = khive_mcp::serve::prepare_daemon_store_plan(
+                        &mut base_cfg.db_path,
+                        &mut db_anchor,
+                        &mut khive_cfg.backends,
+                        a.db.as_deref() == Some(":memory:"),
+                    )?;
+                    khive_mcp::serve::preflight_events_socket_for_boot(
+                        &base_cfg,
+                        &khive_cfg.backends,
+                        a.db.as_deref() == Some(":memory:"),
+                    )?;
+                    Some(plan)
+                } else {
+                    None
+                };
+
                 // #667: acquire the boot/recovery lock before building the
                 // coordinator server — that construction runs migrations and
                 // applies pack schema plans (FTS DDL included) — and hold it
@@ -653,13 +671,7 @@ pub async fn cli_main() -> Result<()> {
                     khive_mcp::daemon::refuse_serving_socket_before_store_claim().await?;
                 }
                 #[cfg(unix)]
-                let store_guards = if a.daemon {
-                    let plan = khive_mcp::serve::prepare_daemon_store_plan(
-                        &mut base_cfg.db_path,
-                        &mut db_anchor,
-                        &mut khive_cfg.backends,
-                        a.db.as_deref() == Some(":memory:"),
-                    )?;
+                let store_guards = if let Some(plan) = store_plan {
                     let mut guards =
                         khive_runtime::daemon::claim_stores(&plan.paths, &plan.read_only_paths)?;
                     plan.assert_aliases_unchanged()?;
