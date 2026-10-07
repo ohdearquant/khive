@@ -61,9 +61,18 @@ async fn ingest_disk_file(
     relative_path: &str,
     bytes: Vec<u8>,
 ) -> Result<Uuid, RuntimeError> {
-    let target_url = origin.join(relative_path).map_err(|error| {
+    let mut target_url = origin.join(".").map_err(|error| {
         RuntimeError::Internal(format!("bad relative path {relative_path:?}: {error}"))
     })?;
+    target_url
+        .path_segments_mut()
+        .map_err(|()| {
+            RuntimeError::Internal(format!(
+                "bad relative path {relative_path:?}: origin has no path"
+            ))
+        })?
+        .pop_if_empty()
+        .extend(relative_path.split('/'));
     let content_type = guess_content_type(Path::new(relative_path));
 
     let settled = crate::fetch::settle_content(
