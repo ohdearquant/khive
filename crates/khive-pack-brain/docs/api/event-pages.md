@@ -51,7 +51,9 @@ does not change or deduplicate those rows.
 Filters apply before the page limit, and a peek row determines whether more results
 exist. The implementation does not count the whole window or use offset pagination.
 Each leaf read has a 1 MiB cumulative raw-text budget before event decoding; the final
-JSON response has a 4 MiB cap, and one request reads at most 32 MiB across namespaces.
+JSON response has a 4 MiB cap. The 32 MiB aggregate budget charges serialized rows from
+each namespace's fetched window, including peek rows, before the merged rows are
+truncated to `limit`.
 These are materialization limits, not measured process-memory or query-time guarantees.
 Older daemons that lack the new event-page operation refuse it explicitly; clients must
 use a compatible serving runtime.
@@ -65,21 +67,27 @@ page cannot be served within a budget, the request fails with a typed error whos
 | `details.reason`       | Other `details` fields     | When                                                                                                                                     |
 | ---------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | `row_exceeds_budget`   | `event_id`, `resume_after` | The next event alone cannot be returned: its stored text passes the 1 MiB read budget, or a one-event page passes the 4 MiB response cap |
-| `page_budget_exceeded` | none                       | A page of more than one event passes a budget (1 MiB read, 4 MiB response or 32 MiB aggregate)                                           |
+| `page_budget_exceeded` | none                       | Multiple events pass a read or response budget, or fetched namespace windows pass the 32 MiB aggregate, even at `limit=1`                |
 
 Neither error carries the event's payload or its raw ordering key. `event_id` is the
 canonical event ID and `resume_after` is a cursor positioned at that event, bound to
 the same window, principal, kinds, actors, namespaces and exclusions as the request.
 
-- `page_budget_exceeded`: lower `limit` and repeat the request from the same `after`.
-  A smaller page reaches the same rows without skipping any. No cursor is returned.
+- `page_budget_exceeded`: lower `limit` when it is greater than 1, keeping the same
+  filters and `after` to retry without skipping rows. No cursor is returned. If the
+  aggregate budget still refuses at `limit=1`, request fewer namespaces or a smaller
+  time window. Start that changed query without `after`; page any remaining subsets
+  separately if you still need the original selection. Smaller queries may still hit
+  a budget. To retain a known prior `until`, supply it explicitly: omitting both
+  `after` and `until` freezes a new server-time bound.
 - `row_exceeds_budget`: no `limit` can return that event. Either continue with
   `after` set to `resume_after`, which skips exactly that event, or stop and read the
   event by ID with the event get. Repeating the request from the previous `after`
   (or from the window start) refuses again at the same event.
 
 Skipping an event through `resume_after` is the caller's own act, and it is the only
-case in which the page API omits a row. When a budget would be passed by a later row
-and at least `limit` rows precede it, the page is returned normally with
-`has_more: true`; two events that together pass the read budget are therefore read on
-separate pages at `limit` 1.
+case in which the page API omits a row. When a leaf budget would be passed by a later
+row and at least `limit` rows precede it, the page is returned normally with
+`has_more: true`, subject to the aggregate and response budgets. Two events that
+together pass the leaf read budget can be read on separate pages at `limit` 1 when
+those other budgets allow.

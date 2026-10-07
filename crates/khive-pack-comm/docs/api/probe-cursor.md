@@ -2,7 +2,7 @@
 
 Technical reference for `comm.probe`'s cursor semantics and the durable channel
 poll checkpoint used by the polling loop (`comm.cursor_get`/`comm.cursor_commit`),
-spanning `handlers.rs` and `vocab.rs`.
+spanning `handlers.rs`, `handlers/probe_cursor.rs` and `vocab.rs`.
 
 ## `handlers.rs::PROBE_SQL`
 
@@ -40,10 +40,10 @@ not `created_at` (#780, #827):
 - `created_at` is an application-clock read taken before a note's write
   acquires the writer critical section, so two concurrent writers can commit
   out of stamp order; a `created_at`-keyed cursor can then advance past a row
-  that committed *after* it, permanently hiding that row from every later
+  that committed _after_ it, permanently hiding that row from every later
   probe.
 - `notes.rowid` looked monotonic with commit order, but `notes` has a TEXT
-  PRIMARY KEY, so that rowid is *implicit*: SQLite may renumber it on
+  PRIMARY KEY, so that rowid is _implicit_: SQLite may renumber it on
   `VACUUM` (khive exposes `memory.vacuum`), and reuses the highest rowid once
   that row is hard-deleted (khive exposes a public hard delete), either of
   which can permanently exclude a later message whose rowid lands at or below
@@ -59,7 +59,9 @@ microsecond timestamp; do not revert this to `created_at` or `rowid`.
 display timestamp, still ordered ascending by `created_at` for readability,
 and carries no cursor guarantee of its own.
 
-## `handlers.rs::notes_seq_high_water_mark`
+<a id="handlersrsnotes_seq_high_water_mark"></a>
+
+## `handlers/probe_cursor.rs::notes_seq_high_water_mark`
 
 A caller-supplied `since_us` above `notes_seq`'s durable high-water mark
 (`sqlite_sequence.seq` for the `notes_seq` table) cannot be a genuine cursor —

@@ -607,8 +607,9 @@ the sealing is skipped. The response then carries `visibility_token: null` and
 fabricated token. Session recall refuses with `visibility_key_unavailable` and
 `retryable: true` while custody is absent, and once a key is configured an
 exact keyed replay reseals the stored fences under it. A hosted deployment
-provisions custody before it serves traffic, and startup logs a warning naming
-the missing receipt configuration.
+provisions custody before it serves traffic, and each memory-pack activation
+logs a warning naming the missing receipt configuration. Activation also warns
+when the configured receipt section is unusable.
 
 The cutover reports what it classified, per database, in its own output. The
 migration runner returns only the schema version it reached, so the cutover
@@ -641,6 +642,12 @@ An unreadable provenance store is an availability failure, not proof of an
 unknown epoch: return a retryable unavailable error without a token and without
 changing the persisted classification. A legacy marker paired with a receipt
 is contradictory evidence and takes `receipt_epoch_unknown`.
+
+A holder hard-deleted between the key claim and the provenance read is not an
+unknown epoch either: the memory is gone. Exact replay returns `not_found` with
+reason `keyed_replay_holder_missing` and `domain_disposition: "not_committed"`,
+because the attempt's unit rolled back on the key claim. It carries no
+`memory_id`, since the memory it would name no longer exists.
 
 **What the caller holds after a refusal.** Every refusal in the table is
 raised on the exact-replay path: the key claim found a live holder whose
