@@ -998,7 +998,7 @@ fn gtd_audit_from_to(effect: &PostCommitEffect) -> Option<(String, String)> {
 /// commit pass — safe for the same reason the post-commit reindex pass is.
 ///
 /// `original_args`: the op's args exactly as the caller supplied them
-/// (needed for delete's `id`/`kind` echo). `resolved_args`: the normalized,
+/// (needed for delete's `kind` echo). `resolved_args`: the normalized,
 /// id-rewritten form `resolve_kg_ids_in_args`
 /// produced for update/delete/link (canonical alias spellings for gtd ops, whose
 /// own prepare fns resolve `id` internally).
@@ -1098,21 +1098,15 @@ async fn build_op_result(
                 }
             }
         }
-        // Canonical shape: `{"deleted": deleted, "id": p.id, "kind": p.kind}`
-        // (update.rs:327/:356/:360) — `p.id`/`p.kind` are the CALLER's
-        // original strings (pre id-resolution), not the resolved UUID.
-        ("delete", AtomicOpPlan::Delete(_)) => {
-            let id_val = original_args
-                .as_object()
-                .and_then(|o| o.get("id"))
-                .cloned()
-                .unwrap_or(Value::Null);
+        // Match the canonical handler's resolved UUID. Keep the existing
+        // atomic kind projection from the caller's original arguments.
+        ("delete", AtomicOpPlan::Delete(p)) => {
             let kind_val = original_args
                 .as_object()
                 .and_then(|o| o.get("kind"))
                 .cloned()
                 .unwrap_or(Value::Null);
-            Ok(json!({"deleted": true, "id": id_val, "kind": kind_val}))
+            Ok(json!({"deleted": true, "id": p.target_id().to_string(), "kind": kind_val}))
         }
         // Canonical shape: `to_json(&edge)` with `source_id`/`target_id`
         // swapped back to the CALLER's order for a symmetric relation
