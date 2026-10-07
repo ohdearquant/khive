@@ -407,6 +407,11 @@ fn triples_to_ast(
                 Object::Variable(target) => {
                     edges.push((triple.subject, target, name, min_hops, max_hops));
                 }
+                _ if min_hops != 1 || max_hops != 1 => {
+                    return Err(QueryError::Unsupported(
+                        "SPARQL property predicates require one-hop bounds (1,1); use a variable object for path traversal".into(),
+                    ));
+                }
                 Object::StringLiteral(val) => {
                     insert_string_property_constraint(&mut node_props, triple.subject, name, val)?;
                 }
