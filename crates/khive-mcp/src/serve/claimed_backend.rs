@@ -98,7 +98,7 @@ pub(super) fn open_single_backend(
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).map_err(|error| {
                     anyhow::anyhow!(
-                        "cannot create database parent directory {}: {error}",
+                        "backend main: cannot create database parent directory {}: {error}",
                         parent.display()
                     )
                 })?;
@@ -107,7 +107,7 @@ pub(super) fn open_single_backend(
                 .map_err(open_error)?
         }
         None => StorageBackend::memory()
-            .map_err(|error| anyhow::anyhow!("open single in-memory backend: {error}"))?,
+            .map_err(|error| anyhow::anyhow!("backend main: memory open: {error}"))?,
     };
     Ok(backend)
 }
