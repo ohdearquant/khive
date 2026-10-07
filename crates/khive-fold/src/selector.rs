@@ -264,7 +264,7 @@ impl<T: Clone> Selector<T> for GreedySelector {
             let mut category_counts: std::collections::BTreeMap<String, usize> =
                 std::collections::BTreeMap::new();
 
-            while !remaining.is_empty() && total_size < budget {
+            while !remaining.is_empty() {
                 let mut candidates = Vec::with_capacity(remaining.len());
                 for (i, item) in remaining.iter().enumerate() {
                     if item.size > budget.saturating_sub(total_size) {
@@ -909,5 +909,77 @@ mod tests {
         assert_eq!(out.selected.len(), 2);
         assert_eq!(out.selected[0].id, "a");
         assert_eq!(out.selected[1].id, "z");
+    }
+
+    #[test]
+    fn zero_size_candidates_fit_zero_and_exhausted_budgets() {
+        for budget in [0, 1] {
+            for bias in [0.0, 0.5, 1.0] {
+                for reverse in [false, true] {
+                    let mut inputs = vec![
+                        input("oversized", 2, 5.0),
+                        input("paid", 1, 4.0),
+                        input("free_z", 0, 2.0),
+                        input("free_a", 0, 2.0),
+                        input("below_floor", 0, -1.0),
+                    ];
+                    if reverse {
+                        inputs.reverse();
+                    }
+                    let weights = SelectorWeights {
+                        diversity_bias: bias,
+                        ..Default::default()
+                    };
+                    let out = GreedySelector.select(inputs, budget, &weights).unwrap();
+                    let ids: Vec<_> = out.selected.iter().map(|item| item.id.as_str()).collect();
+                    let expected = if budget == 0 {
+                        vec!["free_a", "free_z"]
+                    } else {
+                        vec!["paid", "free_a", "free_z"]
+                    };
+                    assert_eq!(
+                        ids, expected,
+                        "budget={budget}, bias={bias}, reverse={reverse}"
+                    );
+                    assert_eq!(out.total_size, budget);
+                    assert_eq!(out.budget, budget);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_size_candidates_keep_diversity_order_at_full_budget() {
+        for budget in [0, 1] {
+            for (bias, expected) in [
+                (0.0, ["first", "same_category", "other_category"]),
+                (0.5, ["first", "other_category", "same_category"]),
+                (1.0, ["first", "other_category", "same_category"]),
+            ] {
+                for reverse in [false, true] {
+                    let mut inputs = vec![
+                        input_cat("oversized", budget + 1, 5.0, "b"),
+                        input_cat("first", budget, 4.0, "a"),
+                        input_cat("same_category", 0, 3.0, "a"),
+                        input_cat("other_category", 0, 2.5, "b"),
+                    ];
+                    if reverse {
+                        inputs.reverse();
+                    }
+                    let weights = SelectorWeights {
+                        diversity_bias: bias,
+                        ..Default::default()
+                    };
+                    let out = GreedySelector.select(inputs, budget, &weights).unwrap();
+                    let ids: Vec<_> = out.selected.iter().map(|item| item.id.as_str()).collect();
+                    assert_eq!(
+                        ids, expected,
+                        "budget={budget}, bias={bias}, reverse={reverse}"
+                    );
+                    assert_eq!(out.total_size, budget);
+                    assert_eq!(out.budget, budget);
+                }
+            }
+        }
     }
 }
