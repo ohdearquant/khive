@@ -7,6 +7,12 @@ function-specific technical reference for the pool's private/internal
 mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
 ("Single-Writer Write Queue") for the ADR-067 rationale.
 
+Runtime write-route classification and checkpoint-ownership coordination live in
+`crates/khive-db/src/pool/admission.rs`. The public
+`khive_db::pool::RuntimeWriteOperation` path and the `ConnectionPool` entrypoints
+remain in `pool`; disk-space admission and write units live in
+`crates/khive-db/src/pool/write_units.rs`.
+
 ## Physical database identity
 
 On the first writable open of a new or legacy file-backed database, the pool
