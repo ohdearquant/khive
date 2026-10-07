@@ -481,6 +481,13 @@ inventory::submit! { khive_runtime::PackRegistration(&MemoryPackFactory) }
 impl PackRuntime for MemoryPack {
     khive_runtime::pack_runtime_metadata!();
 
+    fn validate_config(&self) -> Result<(), RuntimeError> {
+        if let Some(notice) = self.runtime.visibility_receipt_custody_notice() {
+            tracing::warn!(target: "khive.boot", "{notice}");
+        }
+        Ok(())
+    }
+
     fn kind_hook(&self, kind: &str) -> Option<Arc<dyn KindHook>> {
         match kind {
             "memory" => Some(Arc::new(crate::hook::MemoryHook)),
@@ -807,6 +814,9 @@ async fn fts_population_guard(rt: &KhiveRuntime) {
         }
     }
 }
+
+#[cfg(test)]
+mod receipt_custody_tests;
 
 #[cfg(test)]
 mod read_only_warm_tests {

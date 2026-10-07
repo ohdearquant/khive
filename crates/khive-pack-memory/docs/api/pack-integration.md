@@ -12,6 +12,12 @@ The pack name is `memory`, its note kind is `memory`, and it requires `kg`. Inve
 
 Verb categories are intentional: recall and its dotted stages are assertive; remember, feedback, prune, and vacuum mutate state and use the corresponding commissive/declaration classifications defined in the handler table.
 
+## Receipt custody notice
+
+Raw runtime construction is silent. Each executable registry build activates the memory pack through `MemoryPack::validate_config`, which emits one `khive.boot` warning when that pack's own runtime has absent or unusable `[visibility_receipts]` custody. The notice does not refuse activation. Metadata-only builds and builds without the memory pack emit no custody notice; repeated memory-pack activations each report their state.
+
+Install programmatic custody with `KhiveRuntime::with_visibility_receipt_credentials` before cloning or passing the runtime to a pack. `KhiveRuntime::visibility_receipt_custody_notice` returns only fixed safe text for absent or unusable configuration. It neither resolves credentials nor reads storage, and `None` does not prove that a configured provider is currently available. Hosts serving memory only through direct runtime APIs can report this notice themselves.
+
 ## Warm phase
 
 `PackRuntime::warm` schedules ANN warming for registered embedding models, then runs an FTS population guard. ANN warm is writer-bearing: it may register a consumer, publish a checkpoint, and compact a tail. It is therefore skipped when this pack's assigned runtime is an ADR-028 A2 read-only snapshot, and a recall-time cache miss likewise falls through to the exact sqlite-vec reader instead of scheduling a detached rebuild. The FTS population guard is genuinely load-only and still runs there. The guard compares live base rows with unified FTS rows and warns when a database with more than 100 rows has less than half represented in FTS. It never hard-fails boot and skips legitimately new or empty databases. This detects the V3-to-V4 migration failure mode where empty unified tables stranded recall until manual reindexing.

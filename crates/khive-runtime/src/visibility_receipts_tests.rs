@@ -457,12 +457,15 @@ fn write_preflight_proceeds_unsealed_only_when_no_custody_is_configured() {
     );
 }
 
+/// One captured event: its fields as (name, debug value) pairs.
+type BootFields = Vec<(String, String)>;
+
 #[derive(Clone, Default)]
-struct BootNotices(Arc<std::sync::Mutex<Vec<(String, tracing::Level, String)>>>);
+struct BootNotices(Arc<std::sync::Mutex<Vec<BootFields>>>);
 
 impl tracing::Subscriber for BootNotices {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "khive.boot"
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -470,56 +473,68 @@ impl tracing::Subscriber for BootNotices {
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
     fn event(&self, event: &tracing::Event<'_>) {
-        struct Message(String);
-        impl tracing::field::Visit for Message {
+        struct Fields(Vec<(String, String)>);
+        impl tracing::field::Visit for Fields {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
+                self.0.push((field.name().to_owned(), format!("{value:?}")));
             }
         }
-        let mut message = Message(String::new());
-        event.record(&mut message);
-        self.0.lock().unwrap().push((
-            event.metadata().target().to_owned(),
-            *event.metadata().level(),
-            message.0,
-        ));
+        let mut fields = Fields(Vec::new());
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(fields.0);
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
 #[test]
-fn absent_custody_logs_one_boot_warning_naming_the_missing_section() {
+fn runtime_construction_and_custody_notice_projection_are_quiet() {
     let notices = BootNotices::default();
-    // With a single live dispatcher tracing caches a callsite's interest from
-    // whichever thread registers it first, so concurrent tests without a
-    // subscriber could silence this one. A second live dispatcher makes every
-    // registration consult all dispatchers.
+    // Keep a second dispatcher alive so concurrent tests cannot cache this
+    // callsite as disabled before the collecting dispatcher is registered.
     let _second_dispatcher = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-    let once = Once::new();
     tracing::subscriber::with_default(notices.clone(), || {
-        for _ in 0..3 {
-            let capability =
-                ReceiptCapability::from_config_noticing(&RuntimeConfig::default(), &once);
-            assert!(matches!(capability, ReceiptCapability::Absent));
-        }
-        let configured = RuntimeConfig {
-            visibility_receipts: Some(ring()),
-            ..Default::default()
+        let memory_config = || RuntimeConfig {
+            db_path: None,
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: crate::WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
+            packs: vec!["kg".into()],
+            brain_profile: None,
+            actor_id: None,
+            ..RuntimeConfig::no_embeddings()
         };
-        let capability = ReceiptCapability::from_config_noticing(&configured, &Once::new());
-        assert!(matches!(capability, ReceiptCapability::Unavailable));
+        for config in [
+            memory_config(),
+            RuntimeConfig {
+                visibility_receipts: Some(ring()),
+                ..memory_config()
+            },
+        ] {
+            // No schema is prepared: notice projection must not require the
+            // receipt cutover or any other storage readiness check.
+            let runtime = KhiveRuntime::from_backend(
+                Arc::new(khive_db::StorageBackend::memory().unwrap()),
+                config,
+            );
+            let expected = match runtime.visibility_receipts.as_ref() {
+                ReceiptCapability::Absent => "no [visibility_receipts] section is configured: memory.remember stores memories without a visibility token and session recall refuses until receipt keys are configured",
+                ReceiptCapability::Unavailable => "configured [visibility_receipts] custody is unusable: memory.remember and session recall refuse with visibility_key_unavailable; check configuration",
+                ReceiptCapability::Configured(_) => panic!("fixture must lack usable custody"),
+            };
+            assert_eq!(runtime.visibility_receipt_custody_notice(), Some(expected));
+        }
+        let (configured, available) = configure(KhiveRuntime::from_backend(
+            Arc::new(khive_db::StorageBackend::memory().unwrap()),
+            memory_config(),
+        ));
+        available.store(false, Ordering::SeqCst);
+        assert_eq!(configured.visibility_receipt_custody_notice(), None);
     });
     let notices = notices.0.lock().unwrap();
-    assert_eq!(
-        notices.len(),
-        1,
-        "one warning, only for the absent section: {notices:?}"
+    assert!(
+        notices.is_empty(),
+        "construction and projection stay quiet: {notices:?}"
     );
-    let (target, level, message) = &notices[0];
-    assert_eq!(target, "khive.boot");
-    assert_eq!(*level, tracing::Level::WARN);
-    assert!(message.contains("[visibility_receipts]"), "{message}");
 }
