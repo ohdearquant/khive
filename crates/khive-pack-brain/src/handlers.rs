@@ -2877,7 +2877,7 @@ impl BrainPack {
             adapter_id: String,
             content_hash: String,
             base_model_revision: String,
-            metadata: Option<serde_json::Value>,
+            metadata: Option<serde_json::Map<String, serde_json::Value>>,
         }
         let p: RegisterAdapterParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
@@ -2896,7 +2896,7 @@ impl BrainPack {
             "content_hash": p.content_hash,
             "base_model_revision": p.base_model_revision,
         });
-        if let Some(serde_json::Value::Object(meta)) = p.metadata {
+        if let Some(meta) = p.metadata {
             let props_obj = props.as_object_mut().unwrap();
             for (k, v) in meta {
                 if k != "content_hash" && k != "base_model_revision" {
