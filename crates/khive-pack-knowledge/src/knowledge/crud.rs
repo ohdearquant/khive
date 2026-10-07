@@ -961,7 +961,9 @@ impl KnowledgeHandlers {
         let sql = runtime.sql();
         let limit_usize = p.limit.unwrap_or(20).clamp(1, 500);
         let limit = limit_usize as i64;
-        let offset = p.offset.unwrap_or(0) as i64;
+        let offset = i64::try_from(p.offset.unwrap_or(0)).map_err(|_| {
+            RuntimeError::InvalidInput("knowledge.list offset exceeds the supported range".into())
+        })?;
         let select_columns = list_select_columns(p.fields.as_deref());
 
         let mut reader = sql.reader().await.map_err(|e| sql_err("list reader", e))?;
