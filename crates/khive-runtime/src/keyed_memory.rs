@@ -340,6 +340,9 @@ pub async fn create_keyed_memory_with_receipt_and_report(
                 failed_op_index,
                 failure,
             }) => {
+                // Admission is cached after the first successful cutover check,
+                // so a receipt store that broke since then surfaces here.
+                runtime.recheck_visibility_cutover()?;
                 return Err(RuntimeError::Internal(format!(
                     "atomic memory write rolled back at op {failed_op_index}: {failure:?}"
                 )));
