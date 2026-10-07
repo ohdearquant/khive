@@ -16,13 +16,15 @@ HTML reports land in `target/criterion/gtd/`.
 
 ## Scenarios
 
-| Benchmark                    | Description                                                                              | Setup                                                    |
-| ---------------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `gtd/assign`                 | Write latency for a single `gtd.assign` call.                                            | Fresh in-memory runtime per measurement.                 |
-| `gtd/next/10`                | `gtd.next(limit=10)` over a corpus of 10 seeded tasks (mixed statuses/priorities).       | 10 tasks seeded once before the group.                   |
-| `gtd/next/100`               | `gtd.next(limit=10)` over a corpus of 100 seeded tasks.                                  | 100 tasks seeded once before the group.                  |
-| `gtd/tasks/filter_by_status` | `gtd.tasks(status="next", limit=50)` over 100 seeded tasks.                              | 100 tasks seeded once.                                   |
-| `gtd/transition`             | `gtd.assign` + `gtd.transition(status="next")` — inline create+transition per iteration. | No pre-seeding; each iteration creates then transitions. |
+| Benchmark                    | Description                                                                              | Setup                                                      |
+| ---------------------------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `gtd/assign`                 | Write latency for a single `gtd.assign` call.                                            | One in-memory fixture; tasks accumulate across iterations. |
+| `gtd/next/10`                | `gtd.next(limit=10)` over a corpus of 10 seeded tasks (mixed statuses/priorities).       | 10 tasks seeded once for this benchmark case.              |
+| `gtd/next/100`               | `gtd.next(limit=10)` over a corpus of 100 seeded tasks.                                  | 100 tasks seeded once for this benchmark case.             |
+| `gtd/tasks/filter_by_status` | `gtd.tasks(status="next", limit=50)` over 100 seeded tasks.                              | 100 tasks seeded once.                                     |
+| `gtd/transition`             | `gtd.assign` + `gtd.transition(status="next")` — inline create+transition per iteration. | One fixture; each iteration adds and transitions a task.   |
+
+The write benchmarks reuse their in-memory fixture, so their task corpus grows during warmup and measurement. The read benchmarks use a fixed, pre-seeded corpus for each case.
 
 ---
 
