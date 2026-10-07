@@ -1017,7 +1017,7 @@ async fn per_term_fetch_degrades_at_controlled_deadline_boundary() {
 /// interrupt of an executing statement, proven by a probe that counts
 /// progress callbacks) is deterministically covered where the mechanism
 /// lives: `request_deadline_interrupts_statement_without_outer_timeout`
-/// in `crates/khive-db/src/sql_bridge.rs`, whose probe assertion fails
+/// in `crates/khive-db/src/sql_bridge_tests.rs`, whose probe assertion fails
 /// if SQLite work never started. This test does not re-prove the
 /// in-flight arm; it pins the pack-visible contract over all arms.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
