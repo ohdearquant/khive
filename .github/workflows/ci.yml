@@ -1431,10 +1431,57 @@ jobs:
           # in field 4 and Lines% in field 10, so the prior `awk '{print $4}'`
           # silently gated on REGION coverage while logs claimed line coverage.
           # `.data[0].totals.lines.percent` is unambiguous and format-stable.
+          # Observing profdata must not turn a coverage failure into success.
+          # Older replay checkouts may not have the diagnostic helper.
+          HELPER="$GITHUB_WORKSPACE/scripts/coverage-profile-diagnostics.py"
+          if [[ -x "$HELPER" ]] && \
+             DIAGNOSTICS=$(mktemp -d "$RUNNER_TEMP/coverage-profiles.XXXXXX") && \
+             RUST_LIBDIR=$(rustc --print target-libdir); then
+            export COVERAGE_PROFILE_DIAGNOSTICS="$DIAGNOSTICS"
+            export COVERAGE_PROFILE_DIAGNOSTICS_MODE=forward
+            export COVERAGE_REAL_PROFDATA="${LLVM_PROFDATA-$RUST_LIBDIR/../bin/llvm-profdata}"
+            PROFILE_TARGET="${CARGO_LLVM_COV_TARGET_DIR-${CARGO_TARGET_DIR-$PWD/target}/llvm-cov-target}"
+            printf 'profile_diagnostics=%s\n' "$DIAGNOSTICS" >> "$GITHUB_OUTPUT" || true
+            printf 'real_profdata=%s\n' "$COVERAGE_REAL_PROFDATA" >> "$GITHUB_OUTPUT" || true
+            printf 'profile_target=%s\n' "$PROFILE_TARGET" >> "$GITHUB_OUTPUT" || true
+            export COVERAGE_PROFILE_TARGET="$PROFILE_TARGET"
+            # EXIT cleanup cannot change the original status and never signals a PID.
+            trap '{ : > "$DIAGNOSTICS/observer.stop"; } 2>/dev/null || true' EXIT
+            { : > "$DIAGNOSTICS/observer.requested"; } 2>/dev/null || true
+            COVERAGE_PROFILE_DIAGNOSTICS_MODE=observe "$HELPER" </dev/null >/dev/null 2>&1 &
+            export LLVM_PROFDATA="$HELPER"
+          else
+            echo "coverage profile diagnostics unavailable; running the original coverage command" >&2
+          fi
           cargo llvm-cov --workspace --summary-only --json > /tmp/cov.json
           CURRENT=$(jq -r '.data[0].totals.lines.percent' /tmp/cov.json)
           echo "Current line coverage: ${CURRENT}%"
           echo "current=${CURRENT}" >> "$GITHUB_OUTPUT"
+      - name: Collect failed coverage profiles
+        if: always() && steps.compute_coverage.outcome == 'failure' && steps.compute_coverage.outputs.profile_diagnostics != ''
+        continue-on-error: true
+        timeout-minutes: 5
+        working-directory: crates
+        env:
+          COVERAGE_PROFILE_DIAGNOSTICS_MODE: collect
+          COVERAGE_PROFILE_DIAGNOSTICS: ${{ steps.compute_coverage.outputs.profile_diagnostics }}
+          COVERAGE_REAL_PROFDATA: ${{ steps.compute_coverage.outputs.real_profdata }}
+          COVERAGE_PROFILE_TARGET: ${{ steps.compute_coverage.outputs.profile_target }}
+        run: ../scripts/coverage-profile-diagnostics.py
+      - name: Upload failed coverage profile diagnostics
+        if: always() && steps.compute_coverage.outcome == 'failure' && steps.compute_coverage.outputs.profile_diagnostics != ''
+        continue-on-error: true
+        timeout-minutes: 2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-profiles-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.compute_coverage.outputs.profile_diagnostics }}/profiles.jsonl
+            ${{ steps.compute_coverage.outputs.profile_diagnostics }}/merge-stderr.txt
+            ${{ steps.compute_coverage.outputs.profile_diagnostics }}/tool-versions.txt
+            ${{ steps.compute_coverage.outputs.profile_diagnostics }}/corrupt/*.profraw
+          retention-days: 7
+          if-no-files-found: warn
       - name: Report unavailable coverage measurement
         if: steps.compute_coverage.outcome != 'success'
         continue-on-error: true
