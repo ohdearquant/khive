@@ -247,6 +247,7 @@ fn capture(mut pipe: impl Read, limit: usize) -> std::io::Result<(Vec<u8>, bool)
 
 struct GitOutput {
     stdout: Vec<u8>,
+    stderr: Vec<u8>,
     exit_code: i32,
 }
 
@@ -388,6 +389,7 @@ fn run_git_command_output(
     }
     Ok(GitOutput {
         stdout: bytes,
+        stderr,
         exit_code,
     })
 }
@@ -1558,6 +1560,36 @@ fn parse_status(bytes: &[u8], limit: usize) -> Result<StatusResult> {
     })
 }
 
+/// Probe this directory itself, without discovering an enclosing repository.
+async fn repository_at_target(program: &Path, repo: &Path) -> Result<bool> {
+    let program = program.to_path_buf();
+    let repo = repo.to_path_buf();
+    blocking("rev-parse", false, move || {
+        let output = run_git_output(
+            &program,
+            &repo,
+            &["rev-parse", "--resolve-git-dir", "."],
+            None,
+            None,
+            false,
+            Some(128),
+        )?;
+        match output.exit_code {
+            0 => Ok(true),
+            128 if output.stdout.is_empty()
+                && output.stderr.as_slice() == b"fatal: not a gitdir '.'\n" =>
+            {
+                Ok(false)
+            }
+            _ => Err(LocalGitError::new(
+                "git_failed",
+                "git repository probe did not establish an uninitialized target",
+            )),
+        }
+    })
+    .await
+}
+
 /// `git init` on a directory the operator already allow-listed. The path must exist and must not
 /// already hold a repository: re-running `init` over a live repository is refused rather than
 /// performed, because git would rewrite configuration in place and the caller would read success.
@@ -1572,7 +1604,7 @@ pub(crate) async fn init(program: &Path, repo: &Path, branch: &str) -> Result<St
             "init target must be an existing directory",
         ));
     }
-    if repo.join(".git").exists() {
+    if repo.join(".git").exists() || repository_at_target(program, repo).await? {
         return Err(LocalGitError::new(
             "already_initialized",
             "init target already holds a repository",
@@ -1686,6 +1718,10 @@ pub(crate) async fn log(
 #[cfg(all(test, unix))]
 #[path = "local_git_gp_tests.rs"]
 mod gp_tests;
+
+#[cfg(all(test, unix))]
+#[path = "local_git_init_tests.rs"]
+mod init_tests;
 
 #[cfg(test)]
 mod tests {
