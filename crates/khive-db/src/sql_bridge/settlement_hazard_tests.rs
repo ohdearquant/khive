@@ -534,3 +534,17 @@ async fn standalone_script_whose_rollback_is_refused_closes_the_connection_under
         "closing the connection must discard the open transaction"
     );
 }
+
+#[test]
+fn file_backed_pool_cannot_take_in_memory_writer_route_from_legacy_hint() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("hint-mismatch.db")),
+            ..PoolConfig::for_test()
+        })
+        .unwrap(),
+    );
+    let bridge = SqlBridge::new(pool, false);
+    assert!(bridge.is_file_backed);
+}
