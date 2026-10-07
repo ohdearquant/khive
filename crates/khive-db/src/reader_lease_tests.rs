@@ -462,3 +462,140 @@ async fn reader_lease_cancellation_during_parameter_conversion_never_enters_the_
         );
     }
 }
+
+#[tokio::test]
+async fn active_reader_cancellation_bypasses_an_active_floor_and_reuses_the_connection() {
+    let home = tempfile::tempdir().unwrap();
+    if crate::test_process::run_in_child(|command| {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("KHIVE_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env("KHIVE_WRITER_TIMEOUT_SINK_DIR", home.path().join("sink"))
+            .env("KHIVE_WALPIN_SIDECAR", "1")
+            .env("KHIVE_WALPIN_CENSUS_BUDGET_MS", "0");
+    }) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let path = root.join("reader-floor.db");
+    let locks = root.join("locks");
+    let mut pool = ConnectionPool::new(crate::pool::PoolConfig {
+        max_readers: 1,
+        path: Some(path.clone()),
+        volume_lock_dir: Some(locks.clone()),
+        write_queue_enabled: Some(false),
+        disk_guard_config: Some(
+            crate::disk_guard_config::DiskGuardEnvironment::default()
+                .resolve(Some(0), Some(100))
+                .unwrap(),
+        ),
+        ..crate::pool::PoolConfig::for_test()
+    })
+    .unwrap();
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let forbid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&probes);
+    let forbidden = Arc::clone(&forbid);
+    pool.set_test_write_admission(100, move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !forbidden.load(Ordering::SeqCst),
+            "recovery must not sample capacity"
+        );
+        Ok(0)
+    });
+    assert!(matches!(
+        pool.writer(),
+        Err(crate::SqliteError::CapacityFloor {
+            available_bytes: 0,
+            floor_bytes: 100,
+            ..
+        })
+    ));
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+    assert!(
+        locks.is_dir(),
+        "ordinary admission must create its private lease directory"
+    );
+    std::fs::remove_dir_all(&locks).unwrap();
+    probes.store(0, Ordering::SeqCst);
+    forbid.store(true, Ordering::SeqCst);
+    let before = pool.writer_acquisition_snapshot();
+    let lease = pool.reader().unwrap();
+    assert_eq!(
+        lease
+            .query_row("SELECT 7", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    let progress = Arc::new(AtomicUsize::new(0));
+    let signal_progress = Arc::clone(&progress);
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let signal = std::thread::spawn(move || {
+        let started = Instant::now();
+        while signal_progress.load(Ordering::Acquire) == 0
+            && started.elapsed() < Duration::from_secs(10)
+        {
+            std::thread::yield_now();
+        }
+        let observed = signal_progress.load(Ordering::Acquire) > 0;
+        (observed, tx.send(true).is_ok())
+    });
+    let result = crate::scope_test_read_progress(
+        Arc::clone(&progress),
+        crate::scope_request_read_cancellation(rx, async {
+            lease.query_row(SLOW_READ, [], |row| row.get::<_, i64>(0))
+        }),
+    )
+    .await;
+    let (observed, sent) = signal.join().expect("join the cancellation signal thread");
+    assert!(
+        observed && sent,
+        "cancellation must follow actual SQLite stepping"
+    );
+    assert_stopped(result);
+    let stopped_at = progress.load(Ordering::Acquire);
+    assert!(stopped_at > 0);
+    assert_eq!(
+        lease
+            .conn()
+            .query_row(
+                "WITH RECURSIVE values_to_sum(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM values_to_sum WHERE value < 1000) SELECT sum(value) FROM values_to_sum",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        500500
+    );
+    assert_eq!(
+        progress.load(Ordering::Acquire),
+        stopped_at,
+        "the old progress callback must be cleared before public reuse replaces it"
+    );
+    assert_eq!(
+        lease
+            .query_row("SELECT 11", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        11
+    );
+    assert_eq!(
+        progress.load(Ordering::Acquire),
+        stopped_at,
+        "the old progress callback must be cleared"
+    );
+    drop(lease);
+    assert_eq!(
+        pool.reader_acquisition_snapshot().active_pooled_checkouts,
+        0
+    );
+    assert_eq!(probes.load(Ordering::SeqCst), 0);
+    assert!(!locks.exists());
+    assert_eq!(pool.writer_acquisition_snapshot(), before);
+}
