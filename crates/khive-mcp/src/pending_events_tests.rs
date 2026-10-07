@@ -5717,7 +5717,7 @@ impl Gate for DenyCommSendWithCredentialGate {
 }
 
 /// Captures `tracing` output for masking assertions. Mirrors
-/// `khive-mcp/src/server.rs`'s `SearchCapturedLog` test helper.
+/// `khive-mcp/src/server_tests.rs`'s `SearchCapturedLog` test helper.
 #[derive(Clone, Default)]
 struct CapturedDrainLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
