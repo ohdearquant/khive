@@ -6253,11 +6253,10 @@ mod tests {
 
     #[test]
     fn pid_directory_owned_by_another_uid_is_refused() {
-        let workspace = std::env::current_dir().expect("workspace directory");
         let dir = tempfile::Builder::new()
             .prefix("khive-pid-owner-")
-            .tempdir_in(workspace)
-            .expect("workspace-local tempdir");
+            .tempdir()
+            .expect("tempdir");
         let parent = dir.path().join("private");
         std::fs::create_dir(&parent).expect("create private directory");
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
