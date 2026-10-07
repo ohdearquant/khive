@@ -507,3 +507,99 @@ fn db_capacity_floor_covers_standalone_and_cancellable_writer_transaction() {
     assert_eq!(counters.standalone_acquisitions, 0);
     assert_eq!(counters.pooled_acquisitions, 0);
 }
+
+#[test]
+fn explicit_zero_reserve_warns_at_real_pool_startup_only() {
+    use tracing_subscriber::layer::SubscriberExt;
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Message(String);
+            impl tracing::field::Visit for Message {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0 = value.to_owned();
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut message = Message::default();
+            event.record(&mut message);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message.0));
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    if crate::test_process::run_in_child(|command| {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("KHIVE_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env("KHIVE_WRITER_TIMEOUT_SINK_DIR", home.path().join("sink"))
+            .env("KHIVE_WALPIN_SIDECAR", "1")
+            .env("KHIVE_WALPIN_CENSUS_BUDGET_MS", "0");
+    }) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let warning =
+        "SQLite disk reserve is explicitly zero; new logical writes will not be floor-refused";
+    for (index, reserve, file_backed) in [(0, 0, true), (1, 1, true), (2, 0, false)] {
+        let capture = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let policy = crate::disk_guard_config::DiskGuardEnvironment::default()
+            .resolve(Some(reserve), Some(100))
+            .unwrap();
+        let pool = tracing::subscriber::with_default(subscriber, || {
+            ConnectionPool::new(PoolConfig {
+                path: file_backed.then(|| root.join(format!("warning-{index}.db"))),
+                volume_lock_dir: Some(root.join(format!("locks-{index}"))),
+                write_queue_enabled: Some(false),
+                disk_guard_config: Some(policy),
+                ..PoolConfig::for_test()
+            })
+        })
+        .expect("real pool startup");
+        assert_eq!(pool.canonical_path().is_some(), file_backed);
+        assert_eq!(
+            pool.effective_disk_guard_config()
+                .map(|policy| policy.reserve_bytes),
+            file_backed.then_some(reserve)
+        );
+        let events = capture.0.lock().unwrap();
+        let warnings: Vec<_> = events
+            .iter()
+            .filter(|(_, message)| message == warning)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            usize::from(file_backed && reserve == 0),
+            "captured startup events: {events:?}"
+        );
+        for (level, _) in warnings {
+            assert_eq!(*level, tracing::Level::WARN);
+        }
+    }
+}

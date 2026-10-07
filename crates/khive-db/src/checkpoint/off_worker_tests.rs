@@ -183,3 +183,248 @@ async fn truncate_busy_wait_does_not_starve_a_single_worker_runtime() {
          the {TRUNCATE_BUSY:?} busy timeout"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduled_checkpoint_and_sidecar_recovery_bypass_an_active_floor() {
+    let home = tempfile::tempdir().unwrap();
+    if crate::test_process::run_in_child(|command| {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("KHIVE_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env("KHIVE_WRITER_TIMEOUT_SINK_DIR", home.path().join("sink"))
+            .env("KHIVE_WALPIN_SIDECAR", "1")
+            .env("KHIVE_WALPIN_CENSUS_BUDGET_MS", "0");
+    }) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let path = root.join("scheduled-floor.db");
+    let locks = root.join("locks");
+    let mut pool = ConnectionPool::new(crate::pool::PoolConfig {
+        path: Some(path.clone()),
+        volume_lock_dir: Some(locks.clone()),
+        write_queue_enabled: Some(false),
+        disk_guard_config: Some(
+            crate::disk_guard_config::DiskGuardEnvironment::default()
+                .resolve(Some(0), Some(100))
+                .unwrap(),
+        ),
+        ..crate::pool::PoolConfig::for_test()
+    })
+    .unwrap();
+    pool.set_test_write_admission(0, |_| Ok(0));
+    pool.writer()
+        .unwrap()
+        .execute_batch("CREATE TABLE payload (id INTEGER); INSERT INTO payload VALUES (1)")
+        .unwrap();
+    let wal = path.with_extension("db-wal");
+    assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let forbid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&probes);
+    let forbidden = Arc::clone(&forbid);
+    pool.set_test_write_admission(100, move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !forbidden.load(Ordering::SeqCst),
+            "recovery must not sample capacity"
+        );
+        Ok(0)
+    });
+    assert!(matches!(
+        pool.writer(),
+        Err(crate::SqliteError::CapacityFloor {
+            available_bytes: 0,
+            floor_bytes: 100,
+            ..
+        })
+    ));
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+    assert!(
+        locks.is_dir(),
+        "ordinary admission must create its private lease directory"
+    );
+    std::fs::remove_dir_all(&locks).unwrap();
+    probes.store(0, Ordering::SeqCst);
+    forbid.store(true, Ordering::SeqCst);
+    let before = pool.writer_acquisition_snapshot();
+    let sidecar = crate::walpin::sidecar_dir_for(pool.canonical_path().unwrap());
+    let dead_pid = 2_000_000_000;
+    assert!(!crate::walpin::is_process_alive(dead_pid));
+    crate::walpin::write_beacon(
+        &sidecar,
+        &crate::walpin::WalpinBeacon {
+            pid: dead_pid,
+            process_role: "session".into(),
+            started_at: 1,
+            sweep_interval_ms: 5_000,
+        },
+    )
+    .unwrap();
+    let dead_beacon = crate::walpin::beacon_path(&sidecar, dead_pid);
+    let live_beacon = crate::walpin::beacon_path(&sidecar, std::process::id());
+    assert!(dead_beacon.exists());
+    let pool = Arc::new(pool);
+    let config = CheckpointConfig {
+        interval: Duration::from_millis(10),
+        truncate_high_water_pages: 0,
+        warn_pages: u64::MAX,
+        high_water_pages: u64::MAX,
+        ..CheckpointConfig::default()
+    };
+    let (shutdown, shutdown_rx) = tokio::sync::watch::channel(());
+    let mut task = tokio::spawn(run_checkpoint_task(
+        Arc::clone(&pool),
+        config,
+        None,
+        shutdown_rx,
+        false,
+    ));
+    let progressed = wait_for(Duration::from_secs(10), || {
+        std::fs::metadata(&wal).is_ok_and(|m| m.len() == 0)
+            && !dead_beacon.exists()
+            && live_beacon.exists()
+    })
+    .await;
+    // A healthy tick must repair a lost registration rather than permanently
+    // treating its cached beacon_registered state as proof of a file.
+    let removed = progressed && std::fs::remove_file(&live_beacon).is_ok();
+    let recovered = removed && wait_for(Duration::from_secs(10), || live_beacon.exists()).await;
+    let _ = shutdown.send(());
+    let joined = tokio::time::timeout(Duration::from_secs(10), &mut task).await;
+    if joined.is_err() {
+        task.abort();
+        let _ = task.await;
+        panic!("checkpoint task did not finish shutdown");
+    }
+    joined.unwrap().expect("checkpoint task panicked");
+    assert!(
+        progressed,
+        "armed scheduled TRUNCATE and dead-sidecar cleanup must run below floor"
+    );
+    assert!(
+        recovered,
+        "the same scheduled owner must restore its missing beacon below floor"
+    );
+    assert_eq!(probes.load(Ordering::SeqCst), 0);
+    assert!(!locks.exists(), "recovery must not acquire a volume lease");
+    // The task's startup ownership claim takes exactly one bounded pooled
+    // checkout, below the reserve and without a lease; recovery takes no other.
+    let mut expected = before;
+    expected.acquisitions += 1;
+    expected.pooled_acquisitions += 1;
+    assert_eq!(pool.writer_acquisition_snapshot(), expected);
+    assert_eq!(
+        pool.reader()
+            .unwrap()
+            .query_row("SELECT count(*) FROM payload", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_once_bypasses_an_active_floor_on_its_real_dedicated_connection() {
+    let home = tempfile::tempdir().unwrap();
+    if crate::test_process::run_in_child(|command| {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("KHIVE_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("KHIVE_TEST_HARNESS", "1")
+            .env("KHIVE_WRITER_TIMEOUT_SINK_DIR", home.path().join("sink"))
+            .env("KHIVE_WALPIN_SIDECAR", "1")
+            .env("KHIVE_WALPIN_CENSUS_BUDGET_MS", "0");
+    }) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let path = root.join("once-floor.db");
+    let locks = root.join("locks");
+    let mut pool = ConnectionPool::new(crate::pool::PoolConfig {
+        path: Some(path.clone()),
+        volume_lock_dir: Some(locks.clone()),
+        write_queue_enabled: Some(false),
+        disk_guard_config: Some(
+            crate::disk_guard_config::DiskGuardEnvironment::default()
+                .resolve(Some(0), Some(100))
+                .unwrap(),
+        ),
+        ..crate::pool::PoolConfig::for_test()
+    })
+    .unwrap();
+    pool.set_test_write_admission(0, |_| Ok(0));
+    pool.writer()
+        .unwrap()
+        .execute_batch("CREATE TABLE payload (id INTEGER); INSERT INTO payload VALUES (1)")
+        .unwrap();
+    let wal = path.with_extension("db-wal");
+    assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+    let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let forbid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&probes);
+    let forbidden = Arc::clone(&forbid);
+    pool.set_test_write_admission(100, move |_| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            !forbidden.load(Ordering::SeqCst),
+            "recovery must not sample capacity"
+        );
+        Ok(0)
+    });
+    assert!(matches!(
+        pool.writer(),
+        Err(crate::SqliteError::CapacityFloor {
+            available_bytes: 0,
+            floor_bytes: 100,
+            ..
+        })
+    ));
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+    assert!(
+        locks.is_dir(),
+        "ordinary admission must create its private lease directory"
+    );
+    std::fs::remove_dir_all(&locks).unwrap();
+    probes.store(0, Ordering::SeqCst);
+    forbid.store(true, Ordering::SeqCst);
+    let before = pool.writer_acquisition_snapshot();
+    let mut dedicated = super::CheckpointConnection::new();
+    let conn = dedicated
+        .ensure_open(&pool)
+        .expect("dedicated recovery open bypasses admission");
+    let mut state = TruncateState::default();
+    let pages = super::checkpoint_once(
+        &pool,
+        conn,
+        &CheckpointConfig {
+            truncate_high_water_pages: 0,
+            ..CheckpointConfig::default()
+        },
+        &mut state,
+    )
+    .unwrap();
+    assert!(pages > 0, "the PASSIVE pass must observe the seeded WAL");
+    assert!(
+        state.last_attempt.is_some(),
+        "the threshold must actually arm TRUNCATE"
+    );
+    assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    assert_eq!(probes.load(Ordering::SeqCst), 0);
+    assert!(!locks.exists());
+    assert_eq!(pool.writer_acquisition_snapshot(), before);
+}
