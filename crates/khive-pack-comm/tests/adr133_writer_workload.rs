@@ -52,6 +52,7 @@ fn counter_delta(
             before.writer_task_acquisitions,
         ),
         timeouts: subtract(after.timeouts, before.timeouts),
+        lease_timeouts: subtract(after.lease_timeouts, before.lease_timeouts),
         direct_busy_refusals: after
             .direct_busy_refusals
             .checked_sub(before.direct_busy_refusals)
@@ -75,6 +76,10 @@ fn counter_delta(
         writer_task_side_effects_unknown: subtract(
             after.writer_task_side_effects_unknown,
             before.writer_task_side_effects_unknown,
+        ),
+        writer_guard_drop_rollbacks: subtract(
+            after.writer_guard_drop_rollbacks,
+            before.writer_guard_drop_rollbacks,
         ),
     }
 }

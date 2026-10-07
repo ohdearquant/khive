@@ -1458,10 +1458,10 @@ mod tests {
     /// language `crate_a::lib` in python with no edges at all).
     async fn build_fixture(path: &Path, edge_insert_order: [usize; 2]) {
         let backend = StorageBackend::sqlite_for_test(path).expect("open fixture backend");
-        {
-            let mut writer = backend.pool().writer().expect("writer guard");
-            khive_db::run_migrations(writer.conn_mut()).expect("run core migrations");
-        }
+        backend
+            .pool()
+            .run_migrations()
+            .expect("run core migrations");
         let sql = backend.sql();
         let mut writer = sql.writer().await.expect("sql writer");
 
@@ -1974,10 +1974,10 @@ crate-b = 1
         let tmp = tempfile::TempDir::new().unwrap();
         let db = tmp.path().join("map.db");
         let backend = StorageBackend::sqlite_for_test(&db).expect("open fixture backend");
-        {
-            let mut writer = backend.pool().writer().expect("writer guard");
-            khive_db::run_migrations(writer.conn_mut()).expect("run core migrations");
-        }
+        backend
+            .pool()
+            .run_migrations()
+            .expect("run core migrations");
         let sql = backend.sql();
         let mut writer = sql.writer().await.expect("sql writer");
 

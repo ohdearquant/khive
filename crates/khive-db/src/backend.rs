@@ -99,6 +99,7 @@ fn sqlite_table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool,
 fn ensure_fts_rowid_map_backfilled(
     conn: &rusqlite::Connection,
     table: &str,
+    admission: &crate::pool::WriteAdmission,
 ) -> Result<(), SqliteError> {
     let map = text::rowid_map_table(table);
     let state = text::rowid_map_state_table(table);
@@ -120,6 +121,14 @@ fn ensure_fts_rowid_map_backfilled(
     }
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
+    if let Err(error) = admission.check() {
+        return Err(crate::migrations::capacity_refusal_after_rollback(
+            conn,
+            conn.execute_batch("ROLLBACK"),
+            error,
+            "FTS rowid-map backfill",
+        ));
+    }
     let result: Result<(), SqliteError> = (|| {
         conn.execute_batch(&format!(
             "DELETE FROM {map} WHERE NOT EXISTS ( \
@@ -338,6 +347,30 @@ impl StorageBackend {
         )
     }
 
+    /// [`Self::sqlite_for_test_with_journal_mode`] with its volume-lock files in
+    /// `volume_lock_dir`. Under the test harness each directory takes its own
+    /// in-process lease slot, so a fixture that holds the lease across a pause
+    /// does not stall fixtures on other databases in the same test binary.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn sqlite_for_test_with_journal_mode_in(
+        path: impl AsRef<Path>,
+        wal_mode: bool,
+        busy_timeout: std::time::Duration,
+        volume_lock_dir: std::path::PathBuf,
+    ) -> Result<Self, SqliteError> {
+        Self::sqlite_with_pool_config(
+            path,
+            PoolConfig {
+                wal_mode,
+                busy_timeout,
+                write_queue_enabled: Some(true),
+                volume_lock_dir: Some(volume_lock_dir),
+                ..PoolConfig::for_test()
+            },
+            None,
+        )
+    }
+
     /// Open SQLite with a reader count selected before any connections are opened.
     /// `None` preserves the default pool size and filesystem read-only detection.
     /// The volume-lock directory defaults as in [`Self::sqlite`].
@@ -366,7 +399,7 @@ impl StorageBackend {
         )
     }
 
-    fn sqlite_with_pool_config(
+    pub(crate) fn sqlite_with_pool_config(
         path: impl AsRef<Path>,
         pool_config: PoolConfig,
         max_readers: Option<usize>,
@@ -513,8 +546,12 @@ impl StorageBackend {
         &self,
         plan: &crate::migrations::ServiceSchemaPlan,
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.try_writer()?;
-        crate::migrations::apply_schema_plan(writer.conn(), plan)
+        let admission = self.pool.write_admission();
+        crate::migrations::apply_schema_plan_with_admission(
+            &mut self.pool.migration_transactions(),
+            plan,
+            &admission,
+        )
     }
 
     /// Apply pack-auxiliary DDL statements.
@@ -550,7 +587,7 @@ impl StorageBackend {
         statements: &[&'static str],
         additions: &[khive_types::PackColumnAddition],
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.try_writer()?;
+        let writer = self.pool.writer_for_admitted_operation()?;
         writer.transaction(|conn| {
             pack_schema::add_missing_columns(conn, additions)?;
             for &stmt in statements {
@@ -607,8 +644,7 @@ impl StorageBackend {
                     "failed to acquire database GC owner before schema preparation: {error}"
                 ))
             })?;
-            let mut writer = self.pool.try_writer()?;
-            self.run_core_migrations(writer.conn_mut(), &owner)
+            self.run_core_migrations(&owner)
         }
     }
 
@@ -616,13 +652,8 @@ impl StorageBackend {
     pub fn attachment_cutover_status(
         &self,
     ) -> Result<crate::migrations::AttachmentCutoverStatus, SqliteError> {
-        if self.is_read_only() {
-            let reader = self.pool.reader()?;
-            crate::migrations::attachment_cutover_status(reader.conn())
-        } else {
-            let writer = self.pool.try_writer()?;
-            crate::migrations::attachment_cutover_status(writer.conn())
-        }
+        let reader = self.pool.reader()?;
+        crate::migrations::attachment_cutover_status(reader.conn())
     }
 
     fn require_attachment_cutover_owner(
@@ -654,8 +685,9 @@ impl StorageBackend {
                 "cannot stage attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.try_writer()?;
-        crate::migrations::stage_attachment_cutover(writer.conn_mut())
+        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let admission = self.pool.write_admission();
+        crate::migrations::stage_attachment_cutover_with_admission(writer.conn_mut(), &admission)
     }
 
     /// Atomically publish a verified batch of pack-owned attachment roles.
@@ -670,10 +702,20 @@ impl StorageBackend {
                 "cannot apply verified attachments on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.try_writer()?;
+        let mut writer = self.pool.writer_for_admitted_operation()?;
         let tx = writer
             .conn_mut()
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let admission = self.pool.write_admission();
+        if let Err(error) = admission.check() {
+            let rollback = tx.rollback();
+            return Err(crate::migrations::capacity_refusal_after_rollback(
+                writer.conn(),
+                rollback,
+                error,
+                "verified attachment publication",
+            ));
+        }
         for attachment in attachments {
             attachment
                 .validate()
@@ -705,8 +747,9 @@ impl StorageBackend {
                 "cannot finalize attachment cutover on a read-only backend".into(),
             ));
         }
-        let mut writer = self.pool.try_writer()?;
-        crate::migrations::finalize_attachment_cutover(writer.conn_mut())
+        let mut writer = self.pool.writer_for_admitted_operation()?;
+        let admission = self.pool.write_admission();
+        crate::migrations::finalize_attachment_cutover_with_admission(writer.conn_mut(), &admission)
     }
 
     /// Get an EntityStore. Applies the entities DDL if not already present.
@@ -804,18 +847,22 @@ impl StorageBackend {
         Ok(())
     }
 
-    fn constructor_writer(&self) -> Result<crate::pool::WriterGuard<'_>, SqliteError> {
+    fn constructor_writer(
+        &self,
+    ) -> Result<crate::pool::PooledAutocommitWriteUnit<'_>, SqliteError> {
         let context = khive_storage::capture_request_read_context();
         let Some(operation) = context.store_acquisition_operation() else {
-            return self.pool.try_writer();
+            return self.pool.autocommit_write_unit();
         };
-        self.pool
-            .writer_until(|| context.blocking_stop_reason().is_some())?
+        let writer = self
+            .pool
+            .writer_until_for_admitted_operation(|| context.blocking_stop_reason().is_some())?
             .ok_or_else(|| {
                 SqliteError::RequestReadStopped(khive_storage::StorageError::Timeout {
                     operation: operation.into(),
                 })
-            })
+            })?;
+        writer.admit_autocommit()
     }
 
     /// Get a NoteStore. Applies the notes DDL if not already present.
@@ -1102,7 +1149,7 @@ impl StorageBackend {
         key_version: &str,
         dimensions: u32,
     ) -> Result<(), SqliteError> {
-        let writer = self.pool.try_writer()?;
+        let writer = self.pool.autocommit_write_unit()?;
         writer
             .conn()
             .execute_batch(crate::migrations::EMBEDDING_MODELS_DDL)?;
@@ -1177,7 +1224,7 @@ impl StorageBackend {
                 )));
             }
         } else {
-            let writer = self.pool.try_writer()?;
+            let writer = self.pool.autocommit_write_unit()?;
             sparse::ensure_sparse_schema(writer.conn(), model_key)
                 .map_err(SqliteError::Rusqlite)?;
         }
@@ -1314,10 +1361,10 @@ impl StorageBackend {
                 )));
             }
         } else {
-            let writer = self.pool.try_writer()?;
+            let writer = self.pool.autocommit_write_unit()?;
             writer.conn().execute_batch(&ddl)?;
             writer.conn().execute_batch(&text::rowid_map_ddl(&table))?;
-            ensure_fts_rowid_map_backfilled(writer.conn(), &table)?;
+            ensure_fts_rowid_map_backfilled(writer.conn(), &table, &self.pool.write_admission())?;
         }
 
         Ok(Arc::new(text::Fts5TextSearch::new(
@@ -2894,62 +2941,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn invalid_model_key_rejected() {
-        let backend = StorageBackend::memory().unwrap();
-        assert!(backend.vectors("bad key!", "bad key!", 3).is_err());
-        assert!(backend.vectors("", "", 3).is_err());
-    }
-
-    #[test]
-    fn invalid_table_key_rejected() {
-        let backend = StorageBackend::memory().unwrap();
-        assert!(backend.text("bad key!").is_err());
-        assert!(backend.text("").is_err());
-    }
-
-    /// A `table_key` ending in `_rowids` must be rejected outright — it
-    /// would otherwise resolve to the exact sidecar
-    /// table name another key's own rowid map already reserves (e.g.
-    /// `"entities_rowids"` -> `fts_entities_rowids`, colliding with
-    /// `"entities"`'s own map).
-    #[test]
-    fn table_key_ending_in_rowids_suffix_rejected() {
-        let backend = StorageBackend::memory().unwrap();
-        assert!(backend.text("entities_rowids").is_err());
-        assert!(backend.text("notes_rowids").is_err());
-        assert!(backend.text("anything_rowids").is_err());
-    }
-
-    /// The accepted case: a key that merely contains, but does not end in,
-    /// the reserved suffix must still work normally.
-    #[test]
-    fn table_key_containing_but_not_ending_in_rowids_suffix_accepted() {
-        let backend = StorageBackend::memory().unwrap();
-        assert!(backend.text("rowids_but_not_at_the_end").is_ok());
-    }
-
-    /// A `table_key` ending in `_rowids_state` must be rejected outright too
-    /// — it would otherwise resolve to the exact sidecar completion-marker
-    /// table name another key's own rowid map already reserves (e.g.
-    /// `"entities_rowids_state"` -> `fts_entities_rowids_state`, colliding
-    /// with `"entities"`'s own map-state table). This suffix does not end in
-    /// `_rowids`, so it needs its own check separate from the one above.
-    #[test]
-    fn table_key_ending_in_rowids_state_suffix_rejected() {
-        let backend = StorageBackend::memory().unwrap();
-        assert!(backend.text("entities_rowids_state").is_err());
-        assert!(backend.text("notes_rowids_state").is_err());
-        assert!(backend.text("anything_rowids_state").is_err());
-    }
-
-    /// The accepted case for the `_rowids_state` suffix: a key that merely
-    /// contains, but does not end in, the reserved suffix must still work.
-    #[test]
-    fn table_key_containing_but_not_ending_in_rowids_state_suffix_accepted() {
-        let backend = StorageBackend::memory().unwrap();
-        assert!(backend.text("rowids_state_but_not_at_the_end").is_ok());
-    }
+    include!("backend/key_validation_tests.rs");
 
     #[tokio::test]
     async fn sqlite_read_only_graph_store_rejects_upsert_edge() {
@@ -3261,35 +3253,7 @@ mod tests {
         assert!(store.is_ok());
     }
 
-    #[test]
-    fn apply_schema_runs_migrations_idempotently() {
-        static MIGRATIONS: &[crate::migrations::Migration] = &[crate::migrations::Migration {
-            id: "001_init",
-            up_sql: "CREATE TABLE IF NOT EXISTS schema_test (id TEXT PRIMARY KEY);",
-            down_sql: None,
-            is_already_applied: None,
-        }];
-        let plan = crate::migrations::ServiceSchemaPlan {
-            service: "schema_test_svc",
-            sqlite: MIGRATIONS,
-            postgres: &[],
-        };
-
-        let backend = StorageBackend::memory().unwrap();
-        backend.apply_schema(&plan).unwrap();
-        backend.apply_schema(&plan).unwrap();
-
-        let reader = backend.pool().reader().unwrap();
-        let count: i64 = reader
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_test'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
-    }
+    include!("backend/migration_tests.rs");
 
     #[test]
     fn pack_ddl_plan_rolls_back_all_statements_on_failure() {
@@ -3633,3 +3597,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "backend_admission_tests.rs"]
+mod admission_tests;

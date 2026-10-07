@@ -51,7 +51,9 @@ impl WriterAcquisitionCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn snapshot(&self) -> WriterAcquisitionSnapshot {
+    /// `lease_timeouts` is owned by the pool's write admission, which takes
+    /// the volume lease for every writer class, so the pool supplies it.
+    pub(super) fn snapshot(&self, lease_timeouts: u64) -> WriterAcquisitionSnapshot {
         let pooled_acquisitions = self.pooled_acquisitions.load(Ordering::Relaxed);
         let standalone_acquisitions = self.standalone_acquisitions.load(Ordering::Relaxed);
         let writer_task_acquisitions = self.writer_task_acquisitions.load(Ordering::Relaxed);
@@ -63,6 +65,7 @@ impl WriterAcquisitionCounters {
             standalone_acquisitions,
             writer_task_acquisitions,
             timeouts: self.pooled_timeouts.load(Ordering::Relaxed),
+            lease_timeouts,
             direct_busy_refusals: self.direct_busy_refusals.load(Ordering::Relaxed),
             writer_task_begin_busy: self.writer_task_begin_busy.load(Ordering::Relaxed),
             writer_task_begin_busy_absorbed: self
@@ -73,6 +76,7 @@ impl WriterAcquisitionCounters {
             writer_task_side_effects_unknown: self
                 .writer_task_side_effects_unknown
                 .load(Ordering::Relaxed),
+            writer_guard_drop_rollbacks: self.writer_guard_drop_rollbacks.load(Ordering::Relaxed),
         }
     }
 }
@@ -86,6 +90,27 @@ impl ConnectionPool {
                 .direct_busy_refusals
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Record a pooled writer guard dropped inside a transaction: count it in
+    /// [`WriterAcquisitionSnapshot::writer_guard_drop_rollbacks`] and write a
+    /// `writer_guard_drop` sink row naming how the drop settled it.
+    pub(crate) fn record_writer_guard_drop(
+        &self,
+        settlement: &Result<(), crate::error::SqliteError>,
+    ) {
+        self.writer_acquisition_counters
+            .writer_guard_drop_rollbacks
+            .fetch_add(1, Ordering::Relaxed);
+        let outcome = match settlement {
+            Ok(()) => "guard dropped with open transaction; rolled back".to_string(),
+            Err(error) => {
+                format!("guard dropped with open transaction; writer retired: {error}")
+            }
+        };
+        let db = crate::timeout_sink::db_label(self);
+        tracing::warn!(db = %db, %outcome, "pooled writer guard settled on drop");
+        crate::timeout_sink::emit_writer_guard_drop(&db, &outcome);
     }
 }
 

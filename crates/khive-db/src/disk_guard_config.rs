@@ -169,13 +169,24 @@ pub fn resolve_disk_guard_config(
 /// absolute, the result is a configuration error rather than a relative path,
 /// because a working-directory-relative lock directory would give two processes
 /// two different lock files.
+///
+/// A process carrying the workspace test marker `KHIVE_TEST_HARNESS=1` (cargo
+/// sets it for every test and test-spawned binary) uses
+/// `<temp>/khive-test-sqlite-volume-locks` in place of the per-user namespace,
+/// so tests share one namespace among themselves and never wait on a lease
+/// held by an installed process of the same user. The explicit override still
+/// wins under the marker.
 pub fn default_volume_lock_dir() -> Result<PathBuf, SqliteError> {
+    let test_harness = std::env::var(crate::pool::TEST_HARNESS_ENV).as_deref() == Ok("1");
     volume_lock_dir_from(
         std::env::var_os(VOLUME_LOCK_DIR_ENV),
+        test_harness.then(|| std::env::temp_dir().join(TEST_HARNESS_LOCK_SUBDIR)),
         std::env::var_os("HOME"),
         std::env::var_os("USERPROFILE"),
     )
 }
+
+const TEST_HARNESS_LOCK_SUBDIR: &str = "khive-test-sqlite-volume-locks";
 
 /// A caller's optional lock directory, or the configuration error that
 /// [`default_volume_lock_dir`] reports when no directory can be resolved.
@@ -187,13 +198,15 @@ pub fn require_volume_lock_dir(configured: Option<PathBuf>) -> Result<PathBuf, S
 /// without mutating process-global environment variables.
 fn volume_lock_dir_from(
     override_dir: Option<OsString>,
+    test_harness_dir: Option<PathBuf>,
     home: Option<OsString>,
     userprofile: Option<OsString>,
 ) -> Result<PathBuf, SqliteError> {
     let is_set = |value: &OsString| !value.to_str().is_some_and(|text| text.trim().is_empty());
-    let directory = match override_dir.filter(is_set) {
-        Some(directory) => PathBuf::from(directory),
-        None => {
+    let directory = match (override_dir.filter(is_set), test_harness_dir) {
+        (Some(directory), _) => PathBuf::from(directory),
+        (None, Some(directory)) => directory,
+        (None, None) => {
             let home = home
                 .filter(is_set)
                 .or_else(|| userprofile.filter(is_set))
@@ -371,6 +384,7 @@ mod tests {
     ) -> Result<PathBuf, SqliteError> {
         volume_lock_dir_from(
             override_dir.map(OsString::from),
+            None,
             home.map(OsString::from),
             userprofile.map(OsString::from),
         )
@@ -460,6 +474,59 @@ mod tests {
                 other => panic!("expected a configuration error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn volume_lock_dir_under_the_test_marker_is_the_harness_namespace() {
+        let harness = PathBuf::from("/tmp/khive-test-sqlite-volume-locks");
+        let resolve = |override_dir: Option<&str>, harness: Option<PathBuf>| {
+            volume_lock_dir_from(
+                override_dir.map(OsString::from),
+                harness,
+                Some(OsString::from("/home/a")),
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(resolve(None, Some(harness.clone())), harness);
+        assert_eq!(resolve(None, None), per_user_lock_dir("/home/a"));
+        assert_eq!(
+            resolve(Some("/locks"), Some(harness)),
+            PathBuf::from("/locks"),
+            "the explicit override still wins under the marker"
+        );
+    }
+
+    #[test]
+    fn default_volume_lock_dir_with_the_test_marker_is_the_temp_namespace() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env_remove(VOLUME_LOCK_DIR_ENV)
+                .env(crate::pool::TEST_HARNESS_ENV, "1")
+                .env("HOME", "/home/marker-present");
+        }) {
+            return;
+        }
+        assert_eq!(
+            default_volume_lock_dir().unwrap(),
+            std::env::temp_dir().join(TEST_HARNESS_LOCK_SUBDIR)
+        );
+    }
+
+    #[test]
+    fn default_volume_lock_dir_without_the_test_marker_is_the_per_user_namespace() {
+        if crate::test_process::run_in_child(|command| {
+            command
+                .env_remove(VOLUME_LOCK_DIR_ENV)
+                .env_remove(crate::pool::TEST_HARNESS_ENV)
+                .env("HOME", "/home/marker-absent");
+        }) {
+            return;
+        }
+        assert_eq!(
+            default_volume_lock_dir().unwrap(),
+            per_user_lock_dir("/home/marker-absent")
+        );
     }
 
     #[test]

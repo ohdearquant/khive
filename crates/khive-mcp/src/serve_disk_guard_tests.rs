@@ -381,3 +381,26 @@ fn invalid_disk_environment_folds_to_a_deterministic_marker() {
     assert!(id.ends_with(";sqlite_disk_guard=invalid"), "{id}");
     assert_eq!(id, crate::server::compute_config_id(&config, None));
 }
+
+#[test]
+fn startup_names_the_resolved_volume_lock_directory() {
+    let dir = PathBuf::from("/tmp/khive-test-sqlite-volume-locks");
+    assert_eq!(
+        volume_lock_disclosure(Some(&dir), false),
+        "volume locks: /tmp/khive-test-sqlite-volume-locks"
+    );
+    assert_eq!(
+        volume_lock_disclosure(Some(&dir), true),
+        "volume locks: /tmp/khive-test-sqlite-volume-locks \
+         (test marker: in-process leases scoped by lock directory)"
+    );
+    assert_eq!(
+        volume_lock_disclosure(None, true),
+        "volume locks: unresolved; writable SQLite opens are refused"
+    );
+    // Cargo runs this test under the marker, so the public line names it.
+    assert_eq!(
+        resolved_volume_lock_disclosure(Some(&dir)),
+        volume_lock_disclosure(Some(&dir), true)
+    );
+}

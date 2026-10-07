@@ -493,8 +493,16 @@ async fn compose_deadline_is_fatal_without_sizing_degradation_or_successor_windo
 async fn compose_real_pool_deadline_and_statement_failure_are_fatal_at_window_first_ordinal() {
     let dir = TempDir::new().expect("directory");
     let backend = Arc::new(
-        khive_db::StorageBackend::sqlite_with_max_readers(dir.path().join("pool.db"), Some(1))
-            .expect("one-reader backend"),
+        khive_db::StorageBackend::sqlite_with_max_readers_and_policies(
+            dir.path().join("pool.db"),
+            Some(1),
+            khive_db::WalCeilingPolicy::default(),
+            khive_db::DiskGuardEnvironment::default()
+                .resolve(Some(0), None)
+                .expect("test disk policy"),
+            dir.path().join("volume-locks"),
+        )
+        .expect("one-reader backend"),
     );
     backend.prepare_core_schema().expect("schema");
     let rt = KhiveRuntime::from_backend(

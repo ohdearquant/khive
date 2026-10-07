@@ -2,6 +2,15 @@
 //!
 //! Provides entity, note, event, edge, FTS5 text search, and optional
 //! `sqlite-vec` vector storage over a WAL-mode connection pool.
+//!
+//! # Terminal write settlement
+//! Pooled, standalone, and lifetime write owners retain their volume lease
+//! through rollback or successful owned connection close. If a retired
+//! connection remains outside autocommit and close also fails, cleanup reports
+//! the path, volume, rollback and close errors, returns a terminal
+//! outcome-unknown error, and poisons the pool so it refuses every later write
+//! and releases the lease. The process keeps running: the host decides whether
+//! to exit.
 
 /// Concrete storage backend providing capability-trait factories.
 pub mod backend;
@@ -10,15 +19,13 @@ pub mod checkpoint;
 // Kept internal while the code-map constructor and SQLite callback wiring land.
 #[allow(dead_code)]
 mod code_map_vfs;
+mod connection_settlement;
 /// Durable database owner identity paired with the opened physical file.
 pub mod database_owner_identity;
 /// Read-only-by-intent database-integrity and WAL/checkpoint diagnostics.
 pub mod diagnostics;
 /// Physical-volume identity and bounded cooperative SQLite admission lease.
-// Kept internal until execution-time write admission takes the lease.
-#[allow(dead_code)]
 mod disk_guard;
-#[allow(dead_code)]
 mod disk_guard_config;
 /// Error types for the SQLite layer.
 pub mod error;
@@ -52,7 +59,6 @@ pub mod stores;
 /// Append-only NDJSON writer-timeout event sink (crate-internal).
 mod timeout_sink;
 /// Metadata-only copy-size estimate for guarded VACUUM admission.
-#[allow(dead_code)]
 mod vacuum_capacity;
 /// Cross-process WAL-pin attribution sidecar (ADR-091 Amendment 2 Plank B).
 /// The sidecar write path (heartbeat/beacon) and identity primitives are
@@ -69,6 +75,9 @@ mod writer_busy_fixture;
 #[cfg(test)]
 mod test_process;
 
+#[cfg(test)]
+mod lease_latency_tests;
+
 pub use backend::StorageBackend;
 pub use checkpoint::{
     checkpoint_once, run_checkpoint_task, CheckpointConfig, CheckpointLifecycleOwner,
@@ -76,6 +85,7 @@ pub use checkpoint::{
 };
 pub use checkpoint::{run_session_sweep_task, SessionSweepConfig, SweepBackend};
 pub use database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
+pub use disk_guard::harness_scoped_process_leases;
 pub use disk_guard_config::{
     default_volume_lock_dir, require_volume_lock_dir, resolve_disk_guard_config,
     DiskGuardConfigSource, DiskGuardEnvironment, EffectiveDiskGuardConfig,
@@ -96,8 +106,8 @@ pub use khive_storage::{
 };
 pub use migrations::{
     inspect_schema_is_current, inspect_schema_version, query_embedding_models, read_schema_version,
-    run_migrations, EmbeddingModelRegistryRecord, Migration, MigrationWritePolicy,
-    ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
+    run_migrations, run_migrations_with_policy, EmbeddingModelRegistryRecord, Migration,
+    MigrationWritePolicy, ServiceSchemaPlan, VersionedMigration, MIGRATIONS,
 };
 pub use pool::{
     CheckpointGuard, CheckpointResult, ConnectionPool, PoolConfig, ReaderGuard, ReaderRow,

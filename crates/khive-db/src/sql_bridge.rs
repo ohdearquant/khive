@@ -15,6 +15,17 @@ mod write_errors;
 #[path = "sql_bridge/manual_atomic.rs"]
 mod manual_atomic;
 use manual_atomic::run_manual_atomic_unit;
+#[path = "sql_bridge/standalone_admission.rs"]
+mod standalone_admission;
+use standalone_admission::{
+    acquire_standalone_lease, acquire_unit_lease, admit_standalone_operation, StandaloneWriteError,
+};
+mod standalone_batch;
+#[cfg(test)]
+use standalone_batch::BatchPoisonReason;
+use standalone_batch::{
+    execute_standalone_batch, BatchFailure, BatchHandleDisposition, PoisonedBatchError,
+};
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -314,151 +325,44 @@ fn reject_transaction_control_statements(
     Ok(())
 }
 
-/// One standalone-`execute_batch` failure, paired with the reason the handle
-/// was poisoned (dropped instead of restored), if it was.
-struct BatchFailure {
-    error: rusqlite::Error,
-    poison_reason: Option<BatchPoisonReason>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BatchHandleDisposition {
-    Retain,
-    Poison,
-}
-
-/// Execute one standalone batch while every prepared statement remains scoped
-/// to the borrowed connection. The owned [`StandaloneHandle`] stays outside
-/// this helper, so it can be restored or dropped only after all statement
-/// borrows have ended.
-fn execute_standalone_batch(
-    conn: &rusqlite::Connection,
-    statements: &[SqlStatement],
-    origin: khive_storage::tx_registry::TxOrigin,
-    event_rows: Option<&AtomicEventRows>,
-) -> (BatchHandleDisposition, Result<u64, BatchFailure>) {
-    let prepared = match prepare_batch_statements(conn, statements) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            return (
-                BatchHandleDisposition::Retain,
-                Err(BatchFailure {
-                    error,
-                    poison_reason: None,
-                }),
-            );
-        }
-    };
-    if let Err(begin_error) = conn.execute_batch("BEGIN IMMEDIATE") {
-        // Busy/locked is transient contention (another writer held SQLite's
-        // write lock past `busy_timeout`); the connection itself is untouched,
-        // so the handle remains reusable. Any other failure leaves transaction
-        // state suspect and poisons the handle.
-        drop(prepared);
-        let (disposition, poison_reason) = if crate::timeout_sink::is_busy_or_locked(&begin_error) {
-            (BatchHandleDisposition::Retain, None)
-        } else {
-            tracing::warn!(
-                %begin_error,
-                "execute_batch: BEGIN IMMEDIATE failed non-transiently; \
-                 poisoning the standalone connection — the handle is \
-                 dropped and must be re-acquired"
-            );
-            (
-                BatchHandleDisposition::Poison,
-                Some(BatchPoisonReason::BeginFailed),
-            )
-        };
-        return (
-            disposition,
-            Err(BatchFailure {
-                error: begin_error,
-                poison_reason,
-            }),
-        );
+/// Settle a pooled call that left its connection inside a transaction, before
+/// the guard is released. The guard is checked out for this call only, so the
+/// transaction cannot be continued by a later call: it is rolled back here and
+/// the call fails, rather than the guard's drop rolling it back after the call
+/// has already reported success.
+///
+/// The outcome, in order: a rollback that cannot prove autocommit retires the
+/// writer and the call fails with `WriterSettlementUnknown` (side effects
+/// unknown), whatever the call itself returned; a call that failed keeps its own error once its
+/// transaction is rolled back; a call that succeeded fails with
+/// `InvalidInput`.
+fn settle_pooled_call<T>(
+    guard: &crate::pool::WriterGuard<'_>,
+    operation: &'static str,
+    result: khive_storage::types::StorageResult<T>,
+) -> khive_storage::types::StorageResult<T> {
+    if guard.is_autocommit() {
+        return result;
     }
-
-    // Registered only after BEGIN succeeds, and retained through COMMIT or
-    // ROLLBACK so the registry never reports a transaction as finished early.
-    let _tx_handle =
-        khive_storage::tx_registry::register_scoped(Some("execute_batch".to_string()), origin);
-    let result = (|| -> Result<u64, rusqlite::Error> {
-        let total = execute_prepared_batch(conn, prepared, statements, event_rows)?;
-        conn.execute_batch("COMMIT")?;
-        Ok(total)
-    })();
-
-    let mut disposition = BatchHandleDisposition::Retain;
-    let mut poison_reason = None;
-    if let Err(error) = &result {
-        if let Err(rollback_error) = conn.execute_batch("ROLLBACK") {
-            // A failed ROLLBACK leaves the connection in an unknown
-            // transaction state. Preserve the original statement error while
-            // making the poison cause explicit to the caller.
+    if let Err(settlement) = guard.rollback_or_retire("pooled call left its transaction open") {
+        if let Err(error) = &result {
             tracing::warn!(
+                operation,
                 %error,
-                %rollback_error,
-                "execute_batch: ROLLBACK after statement failure failed; \
-                 poisoning the standalone connection — the handle is \
-                 dropped and must be re-acquired"
+                "pooled call failed inside a transaction it opened, and its rollback \
+                 could not prove autocommit; reporting the settlement failure"
             );
-            disposition = BatchHandleDisposition::Poison;
-            poison_reason = Some(BatchPoisonReason::RollbackFailed(rollback_error));
         }
+        return Err(settlement.into_storage_error(StorageCapability::Sql, operation));
     }
-
-    (
-        disposition,
-        result.map_err(|error| BatchFailure {
-            error,
-            poison_reason,
-        }),
-    )
-}
-
-#[derive(Debug)]
-enum BatchPoisonReason {
-    BeginFailed,
-    RollbackFailed(rusqlite::Error),
-}
-
-impl std::fmt::Display for BatchPoisonReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::BeginFailed => f.write_str(
-                "BEGIN IMMEDIATE failed non-transiently; connection transaction state is suspect",
-            ),
-            Self::RollbackFailed(error) => {
-                write!(f, "ROLLBACK after statement failure failed: {error}")
-            }
-        }
-    }
-}
-
-/// A `rusqlite::Error` whose display carries the poison context, so a
-/// poisoned handle is visible to the caller in the returned error instead of
-/// being discoverable only through later calls' generic "connection already
-/// consumed" failures.
-#[derive(Debug)]
-struct PoisonedBatchError {
-    original: rusqlite::Error,
-    poison_reason: BatchPoisonReason,
-}
-
-impl std::fmt::Display for PoisonedBatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}; original error: {}",
-            self.poison_reason, self.original
-        )
-    }
-}
-
-impl std::error::Error for PoisonedBatchError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.original)
-    }
+    result?;
+    Err(StorageError::InvalidInput {
+        capability: StorageCapability::Sql,
+        operation: operation.into(),
+        message: "the call left a transaction open; it was rolled back before the pooled \
+                  writer was released — use atomic_unit to run statements as one transaction"
+            .into(),
+    })
 }
 
 fn prepare_bound_statement<'conn>(
@@ -1124,12 +1028,28 @@ fn open_standalone_reader(pool: &ConnectionPool) -> Result<rusqlite::Connection,
         .map_err(|error| StorageError::driver(StorageCapability::Sql, "open_reader", error))
 }
 
+#[cfg(test)]
 fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection, StorageError> {
-    let config = pool.config();
     let conn = pool
         .open_standalone_writer()
         .map_err(|e| e.into_storage_error(StorageCapability::Sql, "open_writer"))?;
+    configure_standalone_writer(pool, conn)
+}
 
+fn open_admitted_standalone_writer(
+    pool: &ConnectionPool,
+) -> Result<rusqlite::Connection, StorageError> {
+    let conn = pool
+        .open_standalone_writer_for_admitted_operation()
+        .map_err(|e| e.into_storage_error(StorageCapability::Sql, "open_writer"))?;
+    configure_standalone_writer(pool, conn)
+}
+
+fn configure_standalone_writer(
+    pool: &ConnectionPool,
+    conn: rusqlite::Connection,
+) -> Result<rusqlite::Connection, StorageError> {
+    let config = pool.config();
     conn.busy_timeout(config.busy_timeout)
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
     conn.pragma_update(None, "cache_size", "-65536")
@@ -1176,13 +1096,14 @@ async fn open_standalone_reader_on_blocking(
     open_standalone_on_blocking(pool, slot, "open_reader", open_standalone_reader).await
 }
 
-/// [`open_standalone_writer`] lifted onto the blocking thread pool; see
-/// [`open_standalone_reader_on_blocking`] for the blocking rationale.
+/// Open the writer handle without a premature capacity sample. Its later
+/// operation owns admission; a cold handle must allow a recovery checkpoint.
+/// See [`open_standalone_reader_on_blocking`] for the blocking rationale.
 async fn open_standalone_writer_on_blocking(
     pool: Arc<ConnectionPool>,
     slot: OwnedSemaphorePermit,
 ) -> khive_storage::types::StorageResult<(rusqlite::Connection, OwnedSemaphorePermit)> {
-    open_standalone_on_blocking(pool, slot, "open_writer", open_standalone_writer).await
+    open_standalone_on_blocking(pool, slot, "open_writer", open_admitted_standalone_writer).await
 }
 
 // =============================================================================
@@ -1890,6 +1811,10 @@ struct SqliteWriter {
     /// Reader-pool owner and explicit-transaction exception source.
     pool: Arc<ConnectionPool>,
     event_rows: Option<Arc<AtomicEventRows>>,
+    /// The volume lease an enclosing manual atomic unit holds for its whole
+    /// transaction, so the unit's own statements do not request it again.
+    /// Declared last: the connection closes before the lease is released.
+    held_lease: Option<crate::disk_guard::DetachedVolumeLease>,
 }
 
 fn execute_top_level_maintenance(
@@ -1916,7 +1841,10 @@ fn execute_top_level_maintenance(
 impl SqliteWriter {
     /// A standalone handle holds its connection across calls, so opening it
     /// cannot serve as admission for every later write on that connection.
-    fn admit_standalone_write(
+    /// Each write admits itself on its blocking thread
+    /// ([`admit_standalone_operation`]); this only refuses a consumed handle
+    /// before it is taken.
+    fn require_standalone_handle(
         &self,
         operation: &'static str,
     ) -> khive_storage::types::StorageResult<()> {
@@ -1926,10 +1854,7 @@ impl SqliteWriter {
                 message: "connection already consumed".into(),
             });
         }
-        self.pool
-            .write_admission()
-            .check()
-            .map_err(|error| error.into_storage_error(StorageCapability::Sql, operation))
+        Ok(())
     }
 
     async fn use_queue_read_transaction_handle(
@@ -2208,8 +2133,10 @@ impl khive_storage::SqlWriter for SqliteWriter {
     ) -> khive_storage::types::StorageResult<u64> {
         // ADR-067 Component A (Fork C slice 2): a single statement is
         // self-contained, just like `execute_batch`'s full statement list —
-        // transaction-control rejection remains an `execute_batch` contract;
-        // this primitive is also used by internal atomic transaction owners.
+        // on the writer task, transaction-control rejection remains an
+        // `execute_batch` contract; the standalone branch below refuses it
+        // unless a unit holds the volume lease, because this primitive is also
+        // used by internal atomic transaction owners.
         // route it through the writer task when available. `self.handle` is
         // left untouched so a subsequent `execute`/`execute_script` call on
         // this same handle still works over the standalone connection.
@@ -2232,13 +2159,38 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
-        self.admit_standalone_write("execute")?;
+        self.require_standalone_handle("execute")?;
+        let unit_holds_lease = self.held_lease.is_some();
+        // ADR-154: a standalone statement holds the volume lease only for the
+        // call, so a transaction it opened would continue after the lease was
+        // released. Only a unit that already holds the lease for its whole
+        // span (`atomic_unit`'s manual transaction) may send transaction
+        // control through `execute`.
+        if !unit_holds_lease {
+            if let Some(keyword) = transaction_control_head(&statement.sql) {
+                return Err(StorageError::InvalidInput {
+                    capability: StorageCapability::Sql,
+                    operation: "execute".into(),
+                    message: format!(
+                        "statement is transaction control ({keyword}); a standalone \
+                         statement holds the volume lease only for the call — use \
+                         atomic_unit to run statements as one transaction"
+                    ),
+                });
+            }
+        }
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute".into(),
             message: "connection already consumed".into(),
         })?;
         let event_rows = self.event_rows.clone();
+        let pool = Arc::clone(&self.pool);
         let (handle, result) = tokio::task::spawn_blocking(move || {
+            let lease = match admit_standalone_operation(&pool, unit_holds_lease, "execute", false)
+            {
+                Ok(lease) => lease,
+                Err(error) => return (handle, Err(StandaloneWriteError::Refused(error))),
+            };
             let res = (|| -> Result<usize, rusqlite::Error> {
                 let mut stmt = prepare_cached_sql_statement(&handle.conn, &statement.sql)?;
                 bind_params(&mut stmt, &statement.params)?;
@@ -2248,12 +2200,16 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 }
                 Ok(affected)
             })();
-            (handle, res)
+            drop(lease);
+            (handle, res.map_err(StandaloneWriteError::Sql))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute", e))?;
         self.handle = Some(handle);
-        let affected = result.map_err(|e| self.map_direct_error(e, "execute"))?;
+        let affected = result.map_err(|failure| match failure {
+            StandaloneWriteError::Refused(error) => error,
+            StandaloneWriteError::Sql(error) => self.map_direct_error(error, "execute"),
+        })?;
         Ok(affected as u64)
     }
 
@@ -2289,26 +2245,50 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
-        self.admit_standalone_write("execute_batch")?;
+        self.require_standalone_handle("execute_batch")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_batch".into(),
             message: "connection already consumed".into(),
         })?;
         let origin = self.origin.clone();
         let event_rows = self.event_rows.clone();
+        let pool = Arc::clone(&self.pool);
+        let unit_holds_lease = self.held_lease.is_some();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            let (disposition, result) =
-                execute_standalone_batch(&handle.conn, &statements, origin, event_rows.as_deref());
+            let lease = match acquire_standalone_lease(&pool, unit_holds_lease, "execute_batch") {
+                Ok(lease) => lease,
+                Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
+            };
+            let admit = || {
+                pool.write_admission().check().map_err(|error| {
+                    error.into_storage_error(StorageCapability::Sql, "execute_batch")
+                })
+            };
+            let (disposition, result) = execute_standalone_batch(
+                &handle.conn,
+                &statements,
+                origin,
+                event_rows.as_deref(),
+                admit,
+            );
             let retained = match disposition {
                 BatchHandleDisposition::Retain => Some(handle),
-                BatchHandleDisposition::Poison => None,
+                // The connection closes while the lease is still held.
+                BatchHandleDisposition::Poison => {
+                    drop(handle);
+                    None
+                }
             };
+            drop(lease);
             (retained, result)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_batch", e))?;
         self.handle = handle;
-        result.map_err(|failure| self.map_direct_batch_failure(failure))
+        result.map_err(|failure| match failure {
+            StandaloneWriteError::Refused(error) => error,
+            StandaloneWriteError::Sql(failure) => self.map_direct_batch_failure(failure),
+        })
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
@@ -2333,19 +2313,85 @@ impl khive_storage::SqlWriter for SqliteWriter {
                 .await;
         }
 
-        self.admit_standalone_write("execute_script")?;
+        self.require_standalone_handle("execute_script")?;
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script".into(),
             message: "connection already consumed".into(),
         })?;
+        let pool = Arc::clone(&self.pool);
+        let unit_holds_lease = self.held_lease.is_some();
         let (handle, result) = tokio::task::spawn_blocking(move || {
-            let res = handle.conn.execute_batch(&script);
-            (handle, res)
+            let lease = match admit_standalone_operation(
+                &pool,
+                unit_holds_lease,
+                "execute_script",
+                false,
+            ) {
+                Ok(lease) => lease,
+                Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
+            };
+            let res = handle
+                .conn
+                .execute_batch(&script)
+                .map_err(StandaloneWriteError::Sql);
+            // ADR-154: without a unit lease the volume lease covers this call
+            // only, so a transaction the script left open is settled here,
+            // while the lease is still held, instead of continuing outside it.
+            if unit_holds_lease || handle.conn.is_autocommit() {
+                drop(lease);
+                return (Some(handle), res);
+            }
+            let (handle, settled) =
+                if handle.conn.execute_batch("ROLLBACK").is_ok() && handle.conn.is_autocommit() {
+                    (Some(handle), Ok(()))
+                } else {
+                    // The connection closes while the lease is still held; the
+                    // handle's slots are released after it.
+                    let StandaloneHandle {
+                        conn,
+                        _retained_slot,
+                        read_transaction_slot,
+                    } = handle;
+                    let settled = pool.write_admission().close_retired_connection(conn);
+                    drop((_retained_slot, read_transaction_slot));
+                    (None, settled)
+                };
+            drop(lease);
+            let result = match (res, settled) {
+                (res, Err(settlement)) => {
+                    if let Err(StandaloneWriteError::Sql(error)) = &res {
+                        tracing::warn!(
+                            %error,
+                            "execute_script failed inside a transaction it opened, and the \
+                             transaction could not be settled; reporting the settlement failure"
+                        );
+                    }
+                    Err(StandaloneWriteError::Refused(
+                        settlement.into_storage_error(StorageCapability::Sql, "execute_script"),
+                    ))
+                }
+                (Err(failure), Ok(())) => Err(failure),
+                (Ok(()), Ok(())) => {
+                    Err(StandaloneWriteError::Refused(StorageError::InvalidInput {
+                        capability: StorageCapability::Sql,
+                        operation: "execute_script".into(),
+                        message: "the script left a transaction open; a standalone script holds \
+                              the volume lease only for the call, so the transaction was \
+                              rolled back before the lease was released — use atomic_unit \
+                              to run statements as one transaction"
+                            .into(),
+                    }))
+                }
+            };
+            (handle, result)
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script", e))?;
-        self.handle = Some(handle);
-        result.map_err(|e| self.map_direct_error(e, "execute_script"))
+        self.handle = handle;
+        result.map_err(|failure| match failure {
+            StandaloneWriteError::Refused(error) => error,
+            StandaloneWriteError::Sql(error) => self.map_direct_error(error, "execute_script"),
+        })
     }
 
     async fn execute_script_top_level(
@@ -2363,34 +2409,53 @@ impl khive_storage::SqlWriter for SqliteWriter {
         // wrap entirely.
         if let Some(writer_task) = self.writer_task.clone() {
             let pool = Arc::clone(&self.pool);
-            return writer_task
-                .send_top_level_bounded(move |conn| {
-                    execute_top_level_maintenance(&pool, conn, maintenance)
-                        .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
-                })
-                .await;
+            let execute = move |conn: &rusqlite::Connection| {
+                execute_top_level_maintenance(&pool, conn, maintenance)
+                    .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
+            };
+            return if maintenance == TopLevelMaintenance::WalCheckpointTruncate {
+                writer_task.send_checkpoint_bounded(execute).await
+            } else {
+                writer_task.send_vacuum_bounded(execute).await
+            };
         }
 
-        // Flag off / no writer task: identical to `execute_script`'s own
-        // flag-off path — a bare `execute_batch` on the standalone
-        // connection, already transaction-free. This is a request-path
-        // maintenance operation, so it has the same reserve check as an
-        // ordinary standalone write. Only infrastructure checkpoint
-        // connections are exempt.
-        self.admit_standalone_write("execute_script_top_level")?;
+        // Flag off / no writer task: keep the volume lease through the
+        // whole top-level operation. A checkpoint is a recovery bypass;
+        // VACUUM uses a copy-sized DB/WAL metadata estimate.
         let handle = self.handle.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script_top_level".into(),
             message: "connection already consumed".into(),
         })?;
         let pool = Arc::clone(&self.pool);
+        let unit_holds_lease = self.held_lease.is_some();
         let (handle, result) = tokio::task::spawn_blocking(move || {
+            let lease = if maintenance == TopLevelMaintenance::Vacuum {
+                match admit_standalone_operation(
+                    &pool,
+                    unit_holds_lease,
+                    "execute_script_top_level",
+                    true,
+                ) {
+                    Ok(lease) => lease,
+                    Err(error) => return (handle, Err(StandaloneWriteError::Refused(error))),
+                }
+            } else {
+                None
+            };
             let res = execute_top_level_maintenance(&pool, &handle.conn, maintenance);
-            (handle, res)
+            drop(lease);
+            (handle, res.map_err(StandaloneWriteError::Sql))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script_top_level", e))?;
         self.handle = Some(handle);
-        result.map_err(|e| self.map_direct_error(e, "execute_script_top_level"))
+        result.map_err(|failure| match failure {
+            StandaloneWriteError::Refused(error) => error,
+            StandaloneWriteError::Sql(error) => {
+                self.map_direct_error(error, "execute_script_top_level")
+            }
+        })
     }
 }
 
@@ -2865,10 +2930,23 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<u64> {
-        // Boundary: `execute_batch` owns transaction-control rejection;
-        // this one-statement primitive is used by internal DML/transaction
-        // owners and is still guarded by the SqlStatement single-statement
-        // prepare contract.
+        // Each call checks the pooled writer out and releases it before
+        // returning, so a transaction opened here could not outlive the call:
+        // the guard would settle it on release while the caller believed it
+        // open. Transaction control is refused before anything runs; a
+        // transaction is opened through `atomic_unit`, which holds one guard
+        // for the whole unit.
+        if let Some(keyword) = transaction_control_head(&statement.sql) {
+            return Err(StorageError::InvalidInput {
+                capability: StorageCapability::Sql,
+                operation: "pool_writer.execute".into(),
+                message: format!(
+                    "statement is transaction control ({keyword}); a pooled writer is \
+                     released after every call, so it cannot hold a transaction across \
+                     calls — use atomic_unit to run statements as one transaction"
+                ),
+            });
+        }
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
@@ -2884,7 +2962,8 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
                     .map_err(|e| map_rusqlite_err(e, "pool_writer.execute"))?;
                 Ok(rows as u64)
             })();
-            result.inspect_err(|error| pool.record_direct_writer_error(error))
+            settle_pooled_call(&guard, "pool_writer.execute", result)
+                .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "pool_writer.execute", e))?
@@ -2938,15 +3017,18 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
         // Boundary: raw scripts are internal/migration-only and do not inherit
-        // `execute_batch`'s transaction-control rejection.
+        // `execute_batch`'s transaction-control rejection. A script may open
+        // and close its own transaction; one it leaves open is rolled back and
+        // refused before the pooled writer is released.
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e: SqliteError| {
                 StorageError::driver(StorageCapability::Sql, "pool_writer.execute_script", e)
             })?;
-            guard
+            let result = guard
                 .execute_batch(&script)
-                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_script"))
+                .map_err(|e| map_rusqlite_err(e, "pool_writer.execute_script"));
+            settle_pooled_call(&guard, "pool_writer.execute_script", result)
                 .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
@@ -3172,7 +3254,11 @@ pub struct SqlBridge {
 
 impl SqlBridge {
     /// Create a new bridge wrapping the given pool.
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, _is_file_backed: bool) -> Self {
+        // The legacy hint is not an authority for choosing an unguarded
+        // in-memory writer. A caller cannot route a file-backed pool through
+        // PoolBackedWriter by supplying `false`.
+        let is_file_backed = pool.canonical_path().is_some();
         Self {
             pool,
             is_file_backed,
@@ -3292,6 +3378,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                 origin: self.pool.origin(),
                 db,
                 pool: Arc::clone(&self.pool),
+                held_lease: None,
             }))
         } else {
             Ok(Box::new(PoolBackedWriter {
@@ -3392,6 +3479,9 @@ impl khive_storage::SqlAccess for SqlBridge {
                     SlotTimeoutClass::Admission,
                 )
                 .await?;
+                // The unit's lease spans its BEGIN, statements and COMMIT or
+                // ROLLBACK, as one queued request does on the write-queue path.
+                let unit_lease = acquire_unit_lease(Arc::clone(&self.pool)).await?;
                 let (conn, handle_slot) =
                     open_standalone_writer_on_blocking(Arc::clone(&self.pool), handle_slot).await?;
                 let mut writer = SqliteWriter {
@@ -3406,6 +3496,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                     origin: self.pool.origin(),
                     db: crate::timeout_sink::db_label(&self.pool),
                     pool: Arc::clone(&self.pool),
+                    held_lease: unit_lease,
                 };
                 run_manual_atomic_unit(&mut writer, op, self.pool.origin())
                     .await
@@ -3479,6 +3570,20 @@ mod tests {
     use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::{SqlAccess as _, SqlReader as _};
 
+    #[test]
+    fn file_backed_pool_cannot_take_in_memory_writer_route_from_legacy_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(dir.path().join("hint-mismatch.db")),
+                ..PoolConfig::for_test()
+            })
+            .unwrap(),
+        );
+        let bridge = SqlBridge::new(pool, false);
+        assert!(bridge.is_file_backed);
+    }
+
     #[tokio::test]
     async fn top_level_wal_checkpoint_ends_the_active_pin_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -3519,6 +3624,7 @@ mod tests {
     }
 
     include!("sql_bridge_atomic_serialization_tests.rs");
+    include!("sql_bridge_write_admission_tests.rs");
 
     fn database_tx_view(pool: &ConnectionPool) -> khive_storage::tx_registry::TxOriginFilter {
         match pool.origin() {
@@ -6452,6 +6558,10 @@ mod tests {
                 write_queue_enabled: Some(false),
                 max_readers: 1,
                 checkout_timeout: std::time::Duration::from_millis(250),
+                // The unit lease is held across the gated read below, so it
+                // takes a lock namespace of its own instead of the one the
+                // other tests in this binary share.
+                volume_lock_dir: Some(dir.path().join("volume-locks")),
                 ..PoolConfig::default()
             })
             .unwrap(),
@@ -6463,6 +6573,9 @@ mod tests {
             .unwrap();
         let conn = open_standalone_writer(&pool).unwrap();
         let (entered, release, _completed) = blocking_non_interrupting_progress_gate(&conn);
+        // A manual transaction holds its unit lease for the whole span, as
+        // `atomic_unit`'s manual branch does; without it `execute` refuses BEGIN.
+        let unit_lease = acquire_unit_lease(Arc::clone(&pool)).await.unwrap();
         let mut writer = SqliteWriter {
             observe_direct_errors: true,
             event_rows: None,
@@ -6475,6 +6588,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: unit_lease,
         };
         khive_storage::SqlWriter::execute(
             &mut writer,
@@ -6684,6 +6798,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         };
         let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let query = tokio::spawn(crate::scope_test_read_progress(
@@ -6753,6 +6868,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let query = tokio::spawn(crate::scope_request_read_cancellation(
@@ -6847,6 +6963,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let query = tokio::spawn(crate::scope_request_read_cancellation(
@@ -6940,6 +7057,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         }));
         let writer_clone = Arc::clone(&writer);
         let query = tokio::spawn(async move {
@@ -7034,6 +7152,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         };
 
         for tail in ["COMMIT", "BEGIN"] {
@@ -7612,6 +7731,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         };
 
         let batch = khive_storage::SqlWriter::execute_batch(
@@ -7715,6 +7835,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         };
 
         let batch = khive_storage::SqlWriter::execute_batch(
@@ -7817,6 +7938,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         };
 
         let batch = khive_storage::SqlWriter::execute_batch(
@@ -8607,6 +8729,7 @@ mod tests {
             origin: pool.origin(),
             db: crate::timeout_sink::db_label(&pool),
             pool: Arc::clone(&pool),
+            held_lease: None,
         };
         let row = post_cancel
             .query_row(SqlStatement {
@@ -8945,7 +9068,6 @@ mod tests {
             "execute_batch",
             "execute_script",
             "top_level_vacuum",
-            "top_level_checkpoint",
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut pool = ConnectionPool::new(PoolConfig {
@@ -8958,8 +9080,8 @@ mod tests {
             let observed = Arc::clone(&samples);
             pool.set_test_write_admission(100, move |_| {
                 match observed.fetch_add(1, Ordering::SeqCst) {
-                    0 | 1 => Ok(101), // Handle open, then first operation.
-                    2 => Ok(100),     // The same handle's next operation.
+                    0 => Ok(101), // First operation; handle open does not sample.
+                    1 => Ok(100), // The same handle's next operation.
                     extra => panic!("unexpected capacity sample {extra}"),
                 }
             });
@@ -8992,11 +9114,6 @@ mod tests {
                         .execute_script_top_level(TopLevelMaintenance::Vacuum)
                         .await
                 }
-                "top_level_checkpoint" => {
-                    writer
-                        .execute_script_top_level(TopLevelMaintenance::WalCheckpointTruncate)
-                        .await
-                }
                 _ => unreachable!(),
             }
             .expect_err("the second operation must see the new reserve sample");
@@ -9011,7 +9128,7 @@ mod tests {
                 ),
                 "{operation} must retain typed capacity-floor classification: {error:?}"
             );
-            assert_eq!(samples.load(Ordering::SeqCst), 3, "{operation}");
+            assert_eq!(samples.load(Ordering::SeqCst), 2, "{operation}");
             assert!(
                 matches!(
                     writer
@@ -9165,3 +9282,7 @@ mod tests {
 #[cfg(test)]
 #[path = "sql_bridge/direct_busy_tests.rs"]
 mod direct_busy_tests;
+
+#[cfg(test)]
+#[path = "sql_bridge/settlement_hazard_tests.rs"]
+mod settlement_hazard_tests;

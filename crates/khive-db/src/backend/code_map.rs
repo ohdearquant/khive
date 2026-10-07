@@ -89,14 +89,20 @@ impl StorageBackend {
         })
     }
 
-    /// Run the core-schema migrations on `conn`, the writer of this backend's
-    /// pool.
+    /// Run the core-schema migrations through this backend's pooled writer,
+    /// one admitted unit per migration transaction.
     pub(super) fn run_core_migrations(
         &self,
-        conn: &mut rusqlite::Connection,
         owner: &DatabaseGcOwnerGuard,
     ) -> Result<u32, SqliteError> {
-        let mut run = || crate::migrations::run_migrations_with_database_gc_owner(conn, owner);
+        let admission = self.pool.write_admission();
+        let run = || {
+            crate::migrations::run_migrations_with_database_gc_owner(
+                &mut self.pool.migration_transactions(),
+                owner,
+                &admission,
+            )
+        };
         match self.pool.config().code_map_vfs.as_deref() {
             // A guarded journal or main open refused mid-migration
             // surfaces as SQLITE_CANTOPEN; name the refusal.

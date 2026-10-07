@@ -45,12 +45,14 @@ fn public_constructors_carry_the_resolved_volume_lock_directory() {
 }
 
 // MUST-FAIL: falling back to a working-directory-relative path would make this
-// default `Some`.
+// default `Some`. The child drops the test marker too, since under it the
+// default is the shared test namespace rather than the per-user one.
 #[test]
 fn pool_config_default_has_no_lock_directory_when_the_user_has_no_home() {
     if run_exact_test_in_child(CHILD, false, |command| {
         command
             .env_remove("KHIVE_VOLUME_LOCK_DIR")
+            .env_remove("KHIVE_TEST_HARNESS")
             .env_remove("HOME")
             .env_remove("USERPROFILE");
     }) {

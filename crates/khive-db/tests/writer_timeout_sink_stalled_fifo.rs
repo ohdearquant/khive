@@ -82,11 +82,18 @@ fn sink_never_adds_measurable_latency_when_its_file_is_a_blocked_fifo() {
     let pool =
         bounded(move || Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open")));
 
-    let held = pool.writer().expect("first checkout should succeed");
+    // The checkpoint capability holds only the writer mutex, not the volume
+    // lease, so the second checkout waits at the pool writer and times out there.
+    let held = pool
+        .try_checkpoint_nowait()
+        .expect("checkpoint capability holds only the writer mutex");
     let pool_for_thread = Arc::clone(&pool);
     let (timed_out, elapsed) = bounded(move || {
         let started = Instant::now();
-        let timed_out = pool_for_thread.writer().is_err();
+        let timed_out = matches!(
+            pool_for_thread.writer(),
+            Err(khive_db::SqliteError::WriterPoolCheckoutTimeout { .. })
+        );
         (timed_out, started.elapsed())
     });
     drop(held);

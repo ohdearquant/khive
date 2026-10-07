@@ -60,6 +60,8 @@
 //! identify the main pool's counter window; a secondary pool's reader/writer
 //! counters have their own reconstruction window. Checkpoint counters remain global.
 
+#[path = "diagnostics/disk_guard.rs"]
+mod disk_guard;
 #[path = "diagnostics/writer_contention.rs"]
 mod writer_contention;
 
@@ -76,6 +78,8 @@ use serde::Serialize;
 
 use crate::checkpoint;
 use crate::pool::{ConnectionPool, WalCeilingSource};
+
+pub use disk_guard::DiskGuardDiagnostics;
 
 /// Raw `PRAGMA wal_checkpoint(PASSIVE)` return row.
 ///
@@ -919,6 +923,23 @@ pub struct WriterContentionDiagnostics {
     pub writer_task_acquisitions: u64,
     /// Main-pool writer checkouts that exhausted their finite deadline.
     pub writer_acquisition_timeouts: u64,
+    /// Writer acquisitions refused because another writer held the volume
+    /// lease past the guard deadline (`CapacityUnavailable`, phase `lock`).
+    /// Every writer class takes the lease before its connection, so ordinary
+    /// same-volume writer contention is counted here, not in
+    /// `writer_acquisition_timeouts`.
+    pub writer_lease_timeouts: u64,
+    /// The guard deadline a writer waits for the volume lease, in ms; `None`
+    /// when the pool takes no lease (in-memory or read-only).
+    pub configured_guard_deadline_ms: Option<u64>,
+    /// `checkout_timeout`, which bounds only the pool-mutex wait that comes
+    /// after the lease.
+    pub configured_checkout_timeout_ms: u64,
+    /// The effective pooled-writer wait bound under contention: the guard
+    /// deadline for the lease, then `checkout_timeout` for the pool mutex. A
+    /// pool configured with a 50 ms `checkout_timeout` and the default 2000 ms
+    /// guard deadline can wait about 2050 ms before refusing.
+    pub effective_writer_wait_bound_ms: u64,
     /// Final instrumented direct execution refusals retaining primary SQLITE_BUSY,
     /// once per operation; excludes SQLITE_LOCKED and task/reader/open/admission errors.
     pub direct_writer_busy_refusals: u64,
@@ -1455,6 +1476,7 @@ pub struct DbDiagnostics {
     pub db_path: Option<String>,
     /// Explicit WAL ceiling policy for this already-open database.
     pub wal_ceiling: WalCeilingDiagnostics,
+    pub disk_guard: DiskGuardDiagnostics,
     pub wal_file: Option<WalFileState>,
     pub checkpoint_counters: CheckpointCounters,
     pub checkpoint_probe: Option<CheckpointProbe>,
@@ -1737,6 +1759,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
+            disk_guard: DiskGuardDiagnostics::snapshot(&pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1794,6 +1817,7 @@ pub async fn collect_with_runtime_audit_metrics_for_process_interruptibly(
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(&pool),
+        disk_guard: DiskGuardDiagnostics::snapshot(&pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -1865,6 +1889,7 @@ fn collect_inner(
             search_mechanism,
             db_path: None,
             wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
+            disk_guard: DiskGuardDiagnostics::snapshot(pool),
             wal_file: None,
             checkpoint_counters: counters,
             checkpoint_probe: None,
@@ -1917,6 +1942,7 @@ fn collect_inner(
         search_mechanism,
         db_path: Some(path.display().to_string()),
         wal_ceiling: WalCeilingDiagnostics::from_pool(pool),
+        disk_guard: DiskGuardDiagnostics::snapshot(pool),
         wal_file: Some(wal_file),
         checkpoint_counters: counters,
         checkpoint_probe: inspection.checkpoint_probe,
@@ -2303,65 +2329,7 @@ mod tests {
     use super::*;
     use crate::pool::{ConnectionPool, PoolConfig, WalCeilingPolicy, WalCeilingSource};
 
-    #[test]
-    fn default_wal_ceiling_is_explicitly_disabled_in_diagnostics() {
-        let pool = ConnectionPool::new(PoolConfig::for_test()).expect("in-memory pool");
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        let json = serde_json::to_value(report).expect("report serializes");
-        assert_eq!(
-            json.get("wal_ceiling"),
-            Some(&serde_json::json!({
-                "configured_bytes": 0,
-                "effective_bytes": 0,
-                "source": "default",
-                "enabled": false,
-                "status": "disabled"
-            })),
-            "zero is an explicit disabled policy, not an omitted field"
-        );
-    }
-
-    #[test]
-    fn read_only_wal_ceiling_keeps_configured_value_without_enforcement() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("read-only-ceiling.db");
-        rusqlite::Connection::open(&path)
-            .expect("create source database")
-            .execute_batch("CREATE TABLE seed (id INTEGER PRIMARY KEY)")
-            .expect("persist source database");
-        let pool = ConnectionPool::new(PoolConfig {
-            path: Some(path),
-            read_only: true,
-            write_queue_enabled: Some(false),
-            wal_ceiling: WalCeilingPolicy {
-                bytes: 8192,
-                source: WalCeilingSource::BackendField,
-            },
-            ..PoolConfig::for_test()
-        })
-        .expect("read-only backend must accept configured policy");
-        let report = collect(
-            &pool,
-            BuildIdentity::from_env("test", None),
-            Duration::from_secs(30),
-        );
-        let json = serde_json::to_value(report).expect("report serializes");
-        assert_eq!(
-            json["wal_ceiling"],
-            serde_json::json!({
-                "configured_bytes": 8192,
-                "effective_bytes": 0,
-                "source": "backend_field",
-                "enabled": false,
-                "status": "read_only_not_enforced"
-            })
-        );
-    }
-
+    include!("diagnostics/wal_ceiling_tests.rs");
     include!("diagnostics/environment_tests.rs");
     include!("diagnostics_census_evidence_tests.rs");
 

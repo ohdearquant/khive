@@ -237,6 +237,9 @@ pub(crate) enum Site {
     /// `ConnectionPool::writer()` timed out waiting for the pooled writer
     /// mutex.
     PoolAdmission,
+    /// A write of any writer class waited out the guard deadline for the
+    /// volume lease, which it takes before its connection (ADR-154 §3).
+    VolumeLease,
     /// A standalone writer connection opened by `stores::graph`.
     StandaloneGraph,
     /// A standalone writer connection opened by `stores::event`.
@@ -289,6 +292,7 @@ impl Site {
     fn as_str(self) -> &'static str {
         match self {
             Site::PoolAdmission => "pool_admission",
+            Site::VolumeLease => "volume_lease",
             Site::StandaloneGraph => "standalone:graph",
             Site::StandaloneEvent => "standalone:event",
             Site::StandaloneText => "standalone:text",
@@ -322,9 +326,12 @@ impl Site {
 ///
 /// `kind` distinguishes the durable row shapes this sink emits:
 /// `"timeout"` (a writer-admission or busy/locked timeout, carries `site` +
-/// `error`), `"queue_saturation"` (a caller-visible `WriteQueueFull`, carries
+/// `error`; a volume-lease timeout also carries `phase` = `"lock"`),
+/// `"queue_saturation"` (a caller-visible `WriteQueueFull`, carries
 /// `timeout_ms`), `"writer_task_retirement"` (a `WriterTask` terminal
 /// retirement, carries `error` as the retirement reason),
+/// `"writer_guard_drop"` (a pooled writer guard released inside a transaction
+/// and settled by its drop, carries `error` as the settlement outcome),
 /// `"sqlite_full"` (SQLite exhausted the volume during a write),
 /// `"direct_route_violation"` (a direct writer acquisition bypassing an
 /// enabled queue, carries `site`), and `"slow_write"` (a queued write whose
@@ -335,6 +342,7 @@ struct QueuedEvent {
     kind: &'static str,
     db: String,
     site: Option<&'static str>,
+    phase: Option<&'static str>,
     error: Option<String>,
     timeout_ms: Option<u64>,
     elapsed_ms: Option<u64>,
@@ -373,7 +381,7 @@ pub(crate) fn capture_sqlite_full_for_test(sender: Option<mpsc::Sender<String>>)
     *SQLITE_FULL_CAPTURE.lock().unwrap() = sender;
 }
 
-/// One JSON line: `{ts_utc, kind, db, site, error, timeout_ms?}`.
+/// One JSON line: `{ts_utc, kind, db, site, phase?, error, timeout_ms?}`.
 /// `site`/`error`/`timeout_ms`/`pid`/`version` are omitted (not null) when
 /// not applicable to `kind` — `startup` rows carry `pid`/`version` and no
 /// `site`/`error`; `timeout`/`sink_error_summary` rows are the reverse.
@@ -384,6 +392,8 @@ struct EventRecord<'a> {
     db: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     site: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -406,6 +416,7 @@ fn build_line(
     kind: &str,
     db: &str,
     site: Option<&str>,
+    phase: Option<&str>,
     error: Option<&str>,
     timeout_ms: Option<u64>,
     elapsed_ms: Option<u64>,
@@ -419,6 +430,7 @@ fn build_line(
         kind,
         db,
         site,
+        phase,
         error,
         timeout_ms,
         elapsed_ms,
@@ -450,6 +462,7 @@ fn build_line_now(
         kind,
         db,
         site,
+        None,
         error,
         timeout_ms,
         None,
@@ -685,6 +698,7 @@ fn write_event(sink: &mut AppendSink<File>, dropped: &AtomicU64, event: QueuedEv
         event.kind,
         &event.db,
         event.site,
+        event.phase,
         event.error.as_deref(),
         event.timeout_ms,
         event.elapsed_ms,
@@ -1018,8 +1032,32 @@ pub(crate) fn emit_timeout(db: &str, site: Site, error: &str, timeout_ms: Option
         kind: "timeout",
         db: db.to_string(),
         site: Some(site.as_str()),
+        phase: None,
         error: Some(truncate_error(error, MAX_ERROR_BYTES)),
         timeout_ms,
+        elapsed_ms: None,
+        queue_depth: None,
+        writer_stages: None,
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// Record a writer timeout at the volume lease: the write waited out the guard
+/// deadline because another writer held the volume. The same `timeout` row as
+/// the pool mutex stage, with `site` naming the lease and `phase` the capacity
+/// phase the caller received (`CapacityUnavailable { phase: Lock }`).
+pub(crate) fn emit_lease_timeout(db: &str, error: &str, timeout_ms: u64) {
+    let Some(handle) = SINK.get() else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "timeout",
+        db: db.to_string(),
+        site: Some(Site::VolumeLease.as_str()),
+        phase: Some("lock"),
+        error: Some(truncate_error(error, MAX_ERROR_BYTES)),
+        timeout_ms: Some(timeout_ms),
         elapsed_ms: None,
         queue_depth: None,
         writer_stages: None,
@@ -1067,6 +1105,7 @@ fn sqlite_full_event(db: &str, error: &(dyn std::error::Error + 'static)) -> Que
         kind: "sqlite_full",
         db: db.to_string(),
         site: None,
+        phase: None,
         error: Some(truncate_error(&error.to_string(), MAX_ERROR_BYTES)),
         timeout_ms: None,
         elapsed_ms: None,
@@ -1089,6 +1128,7 @@ pub(crate) fn emit_queue_saturation(db: &str, timeout_ms: u64) {
         kind: "queue_saturation",
         db: db.to_string(),
         site: None,
+        phase: None,
         error: None,
         timeout_ms: Some(timeout_ms),
         elapsed_ms: None,
@@ -1111,7 +1151,30 @@ pub(crate) fn emit_writer_task_retirement(db: &str, reason: &str) {
         kind: "writer_task_retirement",
         db: db.to_string(),
         site: None,
+        phase: None,
         error: Some(truncate_error(reason, MAX_ERROR_BYTES)),
+        timeout_ms: None,
+        elapsed_ms: None,
+        queue_depth: None,
+        writer_stages: None,
+    };
+    enqueue(&handle.sender, &handle.dropped, event);
+}
+
+/// Record a pooled writer guard released inside a transaction, which its drop
+/// then settled. `outcome` says whether the rollback restored autocommit or the
+/// writer was retired.
+pub(crate) fn emit_writer_guard_drop(db: &str, outcome: &str) {
+    let Some(handle) = SINK.get() else {
+        return;
+    };
+    let event = QueuedEvent {
+        ts_utc: now_rfc3339(),
+        kind: "writer_guard_drop",
+        db: db.to_string(),
+        site: None,
+        phase: None,
+        error: Some(truncate_error(outcome, MAX_ERROR_BYTES)),
         timeout_ms: None,
         elapsed_ms: None,
         queue_depth: None,
@@ -1167,6 +1230,7 @@ pub(crate) fn emit_direct_route_violation(db: &str, site: Site) {
         kind: "direct_route_violation",
         db: db.to_string(),
         site: Some(site.as_str()),
+        phase: None,
         error: None,
         timeout_ms: None,
         elapsed_ms: None,
@@ -1190,6 +1254,7 @@ pub(crate) fn emit_slow_write(db: &str, stages: &crate::writer_task::WriterStage
         kind: "slow_write",
         db: db.to_string(),
         site: None,
+        phase: None,
         error: None,
         timeout_ms: None,
         elapsed_ms: Some(stages.total_micros / 1_000),
@@ -1226,6 +1291,31 @@ pub(crate) fn maybe_emit_busy(db: &str, site: Site, err: &rusqlite::Error) {
         emit_timeout(db, site, &err.to_string(), None);
     } else {
         maybe_emit_sqlite_full(db, err);
+    }
+}
+
+/// A typed direct transaction can fail at `BEGIN IMMEDIATE`, before its DML
+/// closure runs. Follow the driver source chain at the completed operation
+/// boundary so that busy errors from both BEGIN and the body reach the same
+/// standalone timeout site exactly once. `execute_direct_transaction` owns
+/// SQLITE_FULL escalation, so this helper emits only busy/locked rows.
+pub(crate) fn maybe_emit_busy_storage_error(
+    db: &str,
+    site: Site,
+    error: &khive_storage::StorageError,
+) {
+    let mut cause: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(sqlite_error) = cause.downcast_ref::<rusqlite::Error>() {
+            if is_busy_or_locked(sqlite_error) {
+                emit_timeout(db, site, &sqlite_error.to_string(), None);
+            }
+            return;
+        }
+        let Some(source) = cause.source() else {
+            return;
+        };
+        cause = source;
     }
 }
 
@@ -1344,6 +1434,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(1234),
             Some(7),
             Some(stages),
@@ -1404,6 +1495,7 @@ mod tests {
             kind: "timeout",
             db: "test-db".to_string(),
             site: Some(Site::PoolAdmission.as_str()),
+            phase: None,
             error: Some("boom".to_string()),
             timeout_ms: Some(5),
             elapsed_ms: None,
@@ -1584,6 +1676,7 @@ mod tests {
                         kind: "timeout",
                         db: "concurrent-test".to_string(),
                         site: Some(Site::StandaloneGraph.as_str()),
+                        phase: None,
                         error: Some(format!("contention-{i}")),
                         timeout_ms: Some(i as u64),
                         elapsed_ms: None,
@@ -1608,6 +1701,7 @@ mod tests {
                 event.kind,
                 &event.db,
                 event.site,
+                event.phase,
                 event.error.as_deref(),
                 event.timeout_ms,
                 event.elapsed_ms,

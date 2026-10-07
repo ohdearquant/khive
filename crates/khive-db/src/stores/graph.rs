@@ -1014,8 +1014,12 @@ where
     let is_file_backed = backend.is_file_backed();
     tokio::task::spawn_blocking(move || {
         if is_file_backed {
+            let admission = pool.write_admission();
+            let _lease = admission
+                .acquire()
+                .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
             let conn = pool
-                .open_standalone_writer()
+                .open_standalone_writer_for_admitted_operation()
                 .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
             run_graph_mutation_transaction(&pool, &conn, false, move |conn| {
                 graph_mutation_events_enlisted(
@@ -1028,7 +1032,7 @@ where
             })
         } else {
             let guard = pool
-                .try_writer()
+                .writer_for_admitted_operation()
                 .map_err(|error| map_sqlite_err(error, GRAPH_MUTATION_EVENTS_OP))?;
             run_graph_mutation_transaction(&pool, guard.conn(), true, move |conn| {
                 graph_mutation_events_enlisted(
@@ -1296,12 +1300,6 @@ impl SqlGraphStore {
         .await
     }
 
-    fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_writer()
-            .map_err(|e| map_sqlite_err(e, "open_graph_writer"))
-    }
-
     fn current_writer_task(
         &self,
         operation: &'static str,
@@ -1329,35 +1327,27 @@ impl SqlGraphStore {
 
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteGraphGeneralWrite);
-        if self.is_file_backed {
-            let conn = self.open_standalone_writer()?;
-            let db = crate::timeout_sink::db_label(&self.pool);
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                f(&conn)
-                    .map_err(|e| {
-                        crate::timeout_sink::maybe_emit_busy(
-                            &db,
-                            crate::timeout_sink::Site::StandaloneGraph,
-                            &e,
-                        );
-                        map_err(e, op)
-                    })
-                    .inspect_err(|error| pool.record_direct_writer_error(error))
-            })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
-        } else {
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn())
-                    .map_err(|e| map_err(e, op))
-                    .inspect_err(|error| pool.record_direct_writer_error(error))
-            })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
-        }
+        let pool = Arc::clone(&self.pool);
+        let db = crate::timeout_sink::db_label(&pool);
+        let is_file_backed = self.is_file_backed;
+        tokio::task::spawn_blocking(move || {
+            let result =
+                pool.execute_direct_transaction(StorageCapability::Graph, op, move |conn| {
+                    f(conn).map_err(|error| map_err(error, op))
+                });
+            if is_file_backed {
+                if let Err(error) = &result {
+                    crate::timeout_sink::maybe_emit_busy_storage_error(
+                        &db,
+                        crate::timeout_sink::Site::StandaloneGraph,
+                        error,
+                    );
+                }
+            }
+            result
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Graph, op, e))?
     }
 
     async fn observed_edge_write(
@@ -1375,23 +1365,8 @@ impl SqlGraphStore {
                 .await;
         }
 
-        let origin = self.pool.origin();
         self.with_writer(operation, move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register_scoped(Some(operation.to_string()), origin);
-            let outcome = match observed_edge_upsert(conn, &request, guard_endpoints) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(error);
-                }
-            };
-            if let Err(error) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-            Ok(outcome)
+            observed_edge_upsert(conn, &request, guard_endpoints)
         })
         .await
     }
@@ -1411,23 +1386,8 @@ impl SqlGraphStore {
                 .await;
         }
 
-        let origin = self.pool.origin();
         self.with_writer(operation, move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle =
-                khive_storage::tx_registry::register_scoped(Some(operation.to_string()), origin);
-            let outcome = match observed_edge_batch_upsert(conn, &requests, guard_endpoints) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(error);
-                }
-            };
-            if let Err(error) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-            Ok(outcome)
+            observed_edge_batch_upsert(conn, &requests, guard_endpoints)
         })
         .await
     }

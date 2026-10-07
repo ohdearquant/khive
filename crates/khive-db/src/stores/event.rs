@@ -25,7 +25,6 @@ use khive_storage::SqlWriter;
 use khive_storage::StorageCapability;
 use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
-use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::writer_task::WriterTaskHandle;
 
@@ -34,10 +33,6 @@ mod cursor;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Events, op, e)
-}
-
-fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    e.into_storage_error(StorageCapability::Events, op)
 }
 
 // Preserve the existing error-classification fixtures at their original seam.
@@ -97,12 +92,6 @@ impl SqlEventStore {
         result
     }
 
-    fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_writer()
-            .map_err(|e| map_sqlite_err(e, "open_event_writer"))
-    }
-
     fn current_writer_task(
         &self,
         operation: &'static str,
@@ -136,40 +125,36 @@ impl SqlEventStore {
 
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteEventGeneralWrite);
-        if self.is_file_backed {
-            let conn = self.open_standalone_writer()?;
-            let db = crate::timeout_sink::db_label(&self.pool);
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                f(&conn)
-                    .map_err(|e| {
-                        crate::timeout_sink::maybe_emit_busy(
-                            &db,
-                            crate::timeout_sink::Site::StandaloneEvent,
-                            &e,
-                        );
-                        map_err(e, op)
-                    })
-                    .inspect_err(|error| pool.record_direct_writer_error(error))
-            })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
+        // Atomic SQL units release an in-memory connection between statements;
+        // share their unit budget so this transaction cannot overlap one.
+        let unit_slot = if self.is_file_backed {
+            None
         } else {
-            // Atomic SQL units release the connection guard between statements;
-            // share their unit budget so this transaction cannot overlap one.
-            let unit_slot = crate::sql_bridge::acquire_in_memory_write_unit(&self.pool, op).await?;
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                // Cancellation of the caller must not release the slot before this job ends.
-                let _unit_slot = unit_slot;
-                let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn())
-                    .map_err(|e| map_err(e, op))
-                    .inspect_err(|error| pool.record_direct_writer_error(error))
-            })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
-        }
+            Some(crate::sql_bridge::acquire_in_memory_write_unit(&self.pool, op).await?)
+        };
+        let pool = Arc::clone(&self.pool);
+        let db = crate::timeout_sink::db_label(&pool);
+        let is_file_backed = self.is_file_backed;
+        tokio::task::spawn_blocking(move || {
+            // Cancellation of the caller must not release the slot before this job ends.
+            let _unit_slot = unit_slot;
+            let result =
+                pool.execute_direct_transaction(StorageCapability::Events, op, move |conn| {
+                    f(conn).map_err(|error| map_err(error, op))
+                });
+            if is_file_backed {
+                if let Err(error) = &result {
+                    crate::timeout_sink::maybe_emit_busy_storage_error(
+                        &db,
+                        crate::timeout_sink::Site::StandaloneEvent,
+                        error,
+                    );
+                }
+            }
+            result
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Events, op, e))?
     }
 
     async fn with_reader<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
@@ -736,9 +721,9 @@ pub fn hard_delete_lineage_warning_statements(
 /// `BEGIN`/`COMMIT`/`ROLLBACK` of its own.
 ///
 /// This exists alongside `insert_event_with_observations` (the raw
-/// `rusqlite::Connection` path `SqlEventStore::append_event` uses, which
-/// opens its own `BEGIN IMMEDIATE`/`COMMIT` for the ordinary
-/// caller-owns-nothing case) rather than replacing it: the two run on
+/// `rusqlite::Connection` path `SqlEventStore::append_event` uses, whose
+/// caller now owns an admitted transaction for the ordinary case) rather
+/// than replacing it: the two run on
 /// different connection abstractions — a standalone `rusqlite::Connection`
 /// vs. a `Box<dyn SqlWriter>` — so they cannot share one function body. Both
 /// build on [`event_insert_statements`] for the actual insert shape.
@@ -1321,22 +1306,9 @@ impl EventStore for SqlEventStore {
             return result;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
-        let origin = self.pool.origin();
         let result = self
             .with_writer("append_event", move |conn| {
-                conn.execute_batch("BEGIN IMMEDIATE")?;
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
-                    Some("event_append".to_string()),
-                    origin,
-                );
-                if let Err(e) = insert_event_with_observations(conn, &event) {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
-                conn.execute_batch("COMMIT")?;
-                Ok(())
+                insert_event_with_observations(conn, &event)
             })
             .await;
         #[cfg(test)]
@@ -1366,27 +1338,9 @@ impl EventStore for SqlEventStore {
             return result;
         }
 
-        // Explicitly disabled or degraded fallback path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
-        let origin = self.pool.origin();
         let result = self
             .with_writer("append_events", move |conn| {
-                conn.execute_batch("BEGIN IMMEDIATE")?;
-                let _tx_handle = khive_storage::tx_registry::register_scoped(
-                    Some("event_append_batch".to_string()),
-                    origin,
-                );
-
-                let summary = match batch_append_events_dml(conn, &events, attempted) {
-                    Ok(summary) => summary,
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        return Err(e);
-                    }
-                };
-
-                conn.execute_batch("COMMIT")?;
-                Ok(summary)
+                batch_append_events_dml(conn, &events, attempted)
             })
             .await;
         #[cfg(test)]
@@ -1514,24 +1468,8 @@ impl EventStore for SqlEventStore {
                 .await;
         }
 
-        let origin = self.pool.origin();
         self.with_writer("append_events_idempotent", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            let _tx_handle = khive_storage::tx_registry::register_scoped(
-                Some("event_append_idempotent".to_string()),
-                origin,
-            );
-
-            let result = match idempotent_batch_dml(conn, &events) {
-                Ok(result) => result,
-                Err(e) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(e);
-                }
-            };
-
-            conn.execute_batch("COMMIT")?;
-            Ok(result)
+            idempotent_batch_dml(conn, &events)
         })
         .await
     }

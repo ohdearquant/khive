@@ -27,7 +27,16 @@ fn file_runtime(path: &Path, read_only: bool) -> KhiveRuntime {
     let backend = if read_only {
         StorageBackend::sqlite_read_only_with_max_readers(path, Some(2)).unwrap()
     } else {
-        StorageBackend::sqlite_with_max_readers(path, Some(2)).unwrap()
+        StorageBackend::sqlite_with_max_readers_and_policies(
+            path,
+            Some(2),
+            khive_db::WalCeilingPolicy::default(),
+            khive_db::DiskGuardEnvironment::default()
+                .resolve(Some(0), None)
+                .unwrap(),
+            path.with_file_name("volume-locks"),
+        )
+        .unwrap()
     };
     if !read_only {
         // from_backend is assembly only. Core migration 049, including its

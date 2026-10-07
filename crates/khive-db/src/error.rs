@@ -34,6 +34,12 @@ pub enum SqliteError {
     #[error("writer transaction settlement is unknown; connection retired")]
     WriterSettlementUnknown,
 
+    /// An earlier write on this database could not prove its settlement, so
+    /// every later write is refused before it starts. Only the write whose
+    /// settlement failed reports an unknown outcome; this one never ran.
+    #[error("writer refused: an earlier write's settlement is unknown; this write did not start")]
+    WriterPoisoned,
+
     /// The process-local writer mutex was not acquired within the pool's
     /// configured finite checkout deadline. This stage happens before SQLite
     /// executes, so callers must not conflate it with SQLite busy/locked or
@@ -68,6 +74,18 @@ pub enum SqliteError {
     CapacityUnavailable {
         phase: khive_storage::CapacityUnavailablePhase,
         message: String,
+    },
+
+    /// The thread asking for a volume's write lease already holds it, so
+    /// waiting could never succeed. This is a nested write, not lock
+    /// contention, and it is refused at once instead of at the deadline.
+    #[error(
+        "volume lease re-entry: this thread already holds the lease for this volume \
+         (held at {holder_site}, requested again at {requester_site})"
+    )]
+    VolumeLeaseReentry {
+        holder_site: String,
+        requester_site: String,
     },
 
     /// A configured WAL ceiling cannot be represented by SQLite's signed
@@ -162,6 +180,9 @@ impl SqliteError {
                     request_state: WriterTaskRequestState::SideEffectsUnknown,
                 }
             }
+            Self::WriterPoisoned => StorageError::WriterTaskTerminated {
+                request_state: WriterTaskRequestState::NotStarted,
+            },
             other => StorageError::driver(capability, operation, other),
         }
     }
@@ -228,6 +249,17 @@ mod tests {
                     "{capability:?}: {mapped:?}"
                 );
             }
+
+            let refused = SqliteError::WriterPoisoned.into_storage_error(capability, "write");
+            assert!(
+                matches!(
+                    refused,
+                    StorageError::WriterTaskTerminated {
+                        request_state: WriterTaskRequestState::NotStarted,
+                    }
+                ),
+                "{capability:?}: {refused:?}"
+            );
         }
     }
 }

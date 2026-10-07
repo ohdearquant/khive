@@ -29,6 +29,33 @@ fn callback_cause(error: &StorageError, standalone: bool) -> &StorageError {
     }
 }
 
+/// The pooled route serves in-memory pools only: a file-backed pool takes the
+/// guarded route whatever the legacy hint says, so pooled arms run on this.
+fn memory_pool() -> Arc<ConnectionPool> {
+    let pool = Arc::new(
+        ConnectionPool::new(crate::pool::PoolConfig {
+            busy_timeout: std::time::Duration::from_millis(50),
+            ..crate::pool::PoolConfig::for_test()
+        })
+        .unwrap(),
+    );
+    pool.try_writer()
+        .unwrap()
+        .execute_batch("CREATE TABLE direct_busy_fixture (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    pool
+}
+
+/// The unit's primary pool: a file fixture for the guarded route, memory for the
+/// pooled one. The fixture is returned so its directory outlives the pool.
+fn primary(standalone: bool) -> (Option<Fixture>, Arc<ConnectionPool>) {
+    let fixture = standalone.then(|| Fixture::new(true, false));
+    let pool = fixture
+        .as_ref()
+        .map_or_else(memory_pool, |fixture| Arc::clone(&fixture.pool));
+    (fixture, pool)
+}
+
 macro_rules! sql_case {
     ($name:ident, $method:ident, $argument:expr) => {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -88,7 +115,7 @@ async fn manual_atomic_absorbed_inner_busy_and_unknown_outcome_add_zero() {
     // inner execution refusal, while the original database remains writable.
     for standalone in [false, true] {
         for mode in [0, 1, 2] {
-            let primary = Fixture::new(true, false);
+            let (_primary, pool) = primary(standalone);
             let blocked = Fixture::new(true, false);
             let holder = blocked.lock(false);
             let blocked_path = blocked
@@ -99,7 +126,7 @@ async fn manual_atomic_absorbed_inner_busy_and_unknown_outcome_add_zero() {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            let bridge = SqlBridge::new(Arc::clone(&primary.pool), standalone);
+            let bridge = SqlBridge::new(Arc::clone(&pool), standalone);
             let result = bridge
                 .atomic_unit(Box::new(move |writer| {
                     Box::pin(async move {
@@ -135,7 +162,7 @@ async fn manual_atomic_absorbed_inner_busy_and_unknown_outcome_add_zero() {
                 !holder.is_autocommit(),
                 "lock spans inner execution and unit cleanup"
             );
-            let snapshot = primary.pool.writer_acquisition_snapshot();
+            let snapshot = pool.writer_acquisition_snapshot();
             match mode {
                 0 => {
                     result.unwrap();
@@ -172,7 +199,7 @@ async fn manual_atomic_absorbed_inner_busy_and_unknown_outcome_add_zero() {
                     );
                 }
             }
-            let guard = primary.pool.try_writer().unwrap();
+            let guard = pool.try_writer().unwrap();
             assert!(guard.is_autocommit(), "outer unit cleanup did not finish");
             let rows: i64 = guard
                 .query_row("SELECT COUNT(*) FROM direct_busy_fixture", [], |row| {
@@ -211,6 +238,7 @@ async fn poisoned_batch_wrapper_preserves_real_busy_cause_and_counts_once() {
         origin: fixture.pool.origin(),
         db: crate::timeout_sink::db_label(&fixture.pool),
         pool: Arc::clone(&fixture.pool),
+        held_lease: None,
     };
     let mapped = writer.map_direct_batch_failure(BatchFailure {
         error: raw,
@@ -296,10 +324,10 @@ async fn manual_atomic_cyclic_source_returns_original_error_and_rolls_back() {
     }
 
     for standalone in [false, true] {
-        let fixture = Fixture::new(true, false);
+        let (_primary, pool) = primary(standalone);
         let calls = Arc::new(AtomicUsize::new(0));
         let callback_calls = Arc::clone(&calls);
-        let bridge = SqlBridge::new(Arc::clone(&fixture.pool), standalone);
+        let bridge = SqlBridge::new(Arc::clone(&pool), standalone);
         let error = bridge
             .atomic_unit(Box::new(move |writer| {
                 Box::pin(async move {
@@ -346,14 +374,8 @@ async fn manual_atomic_cyclic_source_returns_original_error_and_rolls_back() {
             calls.load(Ordering::Relaxed),
             if standalone { 31 } else { 30 }
         );
-        assert_eq!(
-            fixture
-                .pool
-                .writer_acquisition_snapshot()
-                .direct_busy_refusals,
-            0
-        );
-        let guard = fixture.pool.try_writer().unwrap();
+        assert_eq!(pool.writer_acquisition_snapshot().direct_busy_refusals, 0);
+        let guard = pool.try_writer().unwrap();
         assert!(guard.is_autocommit(), "manual rollback did not finish");
         let rows: i64 = guard
             .query_row("SELECT COUNT(*) FROM direct_busy_fixture", [], |row| {

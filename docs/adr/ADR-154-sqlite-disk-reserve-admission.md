@@ -92,6 +92,9 @@ Memory and read-only backends do not create a guard; specifying a non-zero SQLit
 memory backend is a configuration error. Disabling the floor does not disable an independently
 configured WAL ceiling; see ADR-194.
 
+A zero reserve removes the floor term only; an operation-specific headroom is still compared, and a
+missing estimate still refuses.
+
 The warm-daemon `config_id` fingerprints the effective reserve bytes and guard deadline for the
 implicit main backend and for every named SQLite backend in the same deterministic backend order as
 the existing topology fold. It fingerprints the effective numeric policy, not its source, current
@@ -131,6 +134,10 @@ reuses `write_admission_deadline_ms`, which remains exclusively the queue-capaci
 by ADR-131. The lease is held until the admitted operation commits, rolls back, or otherwise
 returns to autocommit.
 
+A lease request from the thread that already holds that volume's lease fails at once with a typed
+re-entry error naming both call sites; nesting that crosses to another thread is not detected and
+waits out `disk_guard_deadline_ms` as contention.
+
 The lock order is **volume lease, then SQLite writer acquisition, then capacity probe, then first
 logical write**. Every participating path uses that order. The probe remains after a successful
 `BEGIN IMMEDIATE`, as required below, but acquiring the volume lease first prevents a top-level
@@ -166,6 +173,17 @@ may run after space is recovered. A failed rollback retains the existing
 | Startup bootstrap DDL                  | Resolve against the existing parent for a new file; lease and probe immediately before each current pre-`BEGIN` autocommit bootstrap call, and retain the lease until SQLite returns to autocommit |
 | Migration/schema transactions          | Lease before each transaction, probe after `BEGIN`, before its first DDL/DML                                                                                                                       |
 | Top-level maintenance such as `VACUUM` | Lease and probe immediately before execution; retain it until the call returns                                                                                                                     |
+
+A standalone statement or script, and a call through a pool-backed writer, holds the lease and the
+writer only for its own call, so no transaction it opens may outlive the call. On the standalone
+path, `execute` refuses transaction control unless a manual transaction unit already holds the lease
+for the unit's whole span, and a script that leaves a transaction open without that lease is rolled
+back before the lease is released. A pool-backed `execute` refuses transaction control, and a
+pool-backed script that leaves a transaction open is rolled back before its writer is released. The
+call then fails: with `InvalidInput` if it otherwise succeeded, with its own error if it failed, and
+with `WriterSettlementUnknown` if the transaction cannot be proven settled, in which case the
+connection is retired. Statements inside `atomic_unit` and calls routed through the writer task run
+inside a transaction whose lease already spans them, and are outside this rule.
 
 `TopLevelMaintenance::WalCheckpointTruncate` is a checkpoint operation, not a copy-sized
 maintenance operation like `VACUUM`: it follows §5's checkpoint bypass, never this table's

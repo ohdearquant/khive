@@ -1542,6 +1542,14 @@ fn rt_with_embedder(db_path: Option<std::path::PathBuf>) -> KhiveRuntime {
         git_write: Default::default(),
         display_timezone: khive_runtime::config::resolve_default_display_timezone(),
         events_split: None,
+        // A file runtime takes the lock namespace beside its database, so its
+        // migrations and writes do not queue behind other tests' on this
+        // volume; a child process reopening the same file shares it.
+        volume_lock_dir: db_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map(|dir| dir.join("volume-locks"))
+            .or_else(|| khive_runtime::RuntimeConfig::no_embeddings().volume_lock_dir),
         db_path,
         blob_hydration_bytes: khive_runtime::DEFAULT_BLOB_HYDRATION_BYTES,
         default_namespace: Namespace::local(),
@@ -2968,25 +2976,49 @@ async fn concurrent_pathless_normal_checkpoints_publish_monotonically() {
 /// of trying to open a nested manual atomic-unit transaction.
 #[tokio::test]
 async fn pathless_lifecycle_helpers_do_not_open_nested_transactions() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
     let rt = memory_rt_with_embedder();
     let key = AnnKey::new("local", WARM_TEST_MODEL);
-    let sql = rt.sql();
-    let mut outer = sql.writer().await.expect("outer writer");
-    outer
-        .execute(SqlStatement {
-            sql: "BEGIN IMMEDIATE".into(),
-            params: vec![],
-            label: Some("test_knowledge_pathless_outer_begin".into()),
-        })
-        .await
-        .expect("begin outer transaction");
+    // A pooled writer rolls back a transaction still open when it is
+    // returned, so no transaction can be held across helper calls. Deny
+    // transaction control on the shared connection instead: a BEGIN,
+    // COMMIT, ROLLBACK or SAVEPOINT issued by any helper fails.
+    let set_tripwire = |armed: bool| {
+        let writer = rt.backend().pool().writer().expect("pathless writer");
+        let result = if armed {
+            writer.authorizer(Some(|context: AuthContext<'_>| match context.action {
+                AuthAction::Transaction { .. } | AuthAction::Savepoint { .. } => {
+                    Authorization::Deny
+                }
+                _ => Authorization::Allow,
+            }))
+        } else {
+            writer.authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        };
+        result.expect("set the transaction tripwire");
+    };
+    set_tripwire(true);
+    // The probe goes to the pooled connection itself: `SqlWriter::execute`
+    // refuses transaction control before SQLite sees it, so a probe through
+    // it would pass without the authorizer.
+    let probe = rt
+        .backend()
+        .pool()
+        .writer()
+        .expect("probe writer")
+        .execute_batch("BEGIN IMMEDIATE");
+    assert!(
+        probe.is_err(),
+        "the tripwire must refuse transaction control: {probe:?}"
+    );
 
     register_consumer(&rt, "local", WARM_TEST_MODEL)
         .await
-        .expect("register pending inside outer transaction");
+        .expect("register pending without a transaction");
     write_force_rebuild_sentinel_row(&rt, &key)
         .await
-        .expect("publish recovery sentinel inside outer transaction");
+        .expect("publish recovery sentinel without a transaction");
     raise_watermark(
         &rt,
         "local",
@@ -2995,25 +3027,17 @@ async fn pathless_lifecycle_helpers_do_not_open_nested_transactions() {
         CheckpointAuthority::FullSentinel,
     )
     .await
-    .expect("activate sentinel inside outer transaction");
+    .expect("activate sentinel without a transaction");
     compact_log(&rt, "local", WARM_TEST_MODEL)
         .await
-        .expect("compact inside outer transaction");
+        .expect("compact without a transaction");
     assert_eq!(
         read_own_watermark(&rt, "local", WARM_TEST_MODEL)
             .await
             .expect("read pathless lifecycle state"),
         Some(0)
     );
-
-    outer
-        .execute(SqlStatement {
-            sql: "ROLLBACK".into(),
-            params: vec![],
-            label: Some("test_knowledge_pathless_outer_rollback".into()),
-        })
-        .await
-        .expect("rollback outer transaction");
+    set_tripwire(false);
 }
 
 #[tokio::test]

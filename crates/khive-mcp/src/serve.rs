@@ -11,6 +11,8 @@ mod disk_policy;
 mod gate_boot_disclosure;
 
 use disk_policy::{disk_guard_numbers, open_backend_with_policies, validate_disk_guard_topology};
+#[cfg(test)]
+use disk_policy::{open_backend, open_backend_with_wal_ceiling};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -4286,6 +4288,11 @@ async fn build_server_from_prepared(
     // backends slice keeps the line truthful in multi-backend mode, where the
     // config-declared backend paths — not `config.db_path` — receive writes.
     tracing::info!(target: "khive.boot", "{}", resolved_database_disclosure(config.db_path.as_deref(), &khive_cfg.backends));
+    tracing::info!(
+        target: "khive.boot",
+        "{}",
+        resolved_volume_lock_disclosure(config.volume_lock_dir.as_deref())
+    );
     tracing::info!(target: "khive.boot", "{}", resolved_wal_ceiling_disclosure(&config, &khive_cfg.backends, args.db.as_deref() == Some(":memory:")));
 
     if khive_cfg.backends.is_empty() {
@@ -5057,33 +5064,6 @@ fn build_pack_runtime(
     }
 }
 
-/// Open a `StorageBackend` from a `BackendConfig`.
-#[cfg(test)]
-fn open_backend(cfg: &BackendConfig, max_readers: Option<usize>) -> anyhow::Result<StorageBackend> {
-    open_backend_with_wal_ceiling(cfg, max_readers, khive_db::WalCeilingPolicy::default())
-}
-
-#[cfg(test)]
-fn open_backend_with_wal_ceiling(
-    cfg: &BackendConfig,
-    max_readers: Option<usize>,
-    wal_ceiling: khive_db::WalCeilingPolicy,
-) -> anyhow::Result<StorageBackend> {
-    let config = RuntimeConfig::no_embeddings();
-    let lock_dir = cfg
-        .path
-        .as_ref()
-        .map(|path| khive_runtime::expand_tilde(path))
-        .and_then(|path| path.parent().map(|parent| parent.join("volume-locks")));
-    open_backend_with_policies(
-        cfg,
-        max_readers,
-        wal_ceiling,
-        cfg.resolve_disk_guard(&config.disk_guard_environment)?,
-        lock_dir.as_deref(),
-    )
-}
-
 /// Resolve the `--db`/`KHIVE_DB` value into the anchor used for tier-3
 /// project-local `.khive/config.toml` DISCOVERY — as distinct from
 /// [`khive_runtime::resolve_db_anchor`], which always materializes a concrete
@@ -5150,6 +5130,26 @@ pub fn resolved_database_disclosure(
             )
         }
         Some(path) => format!("database: {} (resolved)", path.display()),
+    }
+}
+
+/// Name the volume-lock directory this process resolved, beside its storage
+/// targets. A process carrying the workspace test marker resolves a temporary
+/// namespace instead of the per-user one and scopes its in-process leases by
+/// lock directory, and the marker is only an environment variable, so the
+/// startup line is where that shows.
+pub fn resolved_volume_lock_disclosure(lock_dir: Option<&std::path::Path>) -> String {
+    volume_lock_disclosure(lock_dir, khive_db::harness_scoped_process_leases())
+}
+
+fn volume_lock_disclosure(lock_dir: Option<&std::path::Path>, harness_scoped: bool) -> String {
+    match lock_dir {
+        Some(dir) if harness_scoped => format!(
+            "volume locks: {} (test marker: in-process leases scoped by lock directory)",
+            dir.display()
+        ),
+        Some(dir) => format!("volume locks: {}", dir.display()),
+        None => "volume locks: unresolved; writable SQLite opens are refused".to_string(),
     }
 }
 
@@ -5761,7 +5761,7 @@ mod tests {
     async fn schema_prepare_waits_for_gc_owner_off_the_async_worker() {
         let dir = tempfile::tempdir().expect("temp dir");
         let database = dir.path().join("owner-wait.db");
-        let backend = Arc::new(StorageBackend::sqlite(&database).expect("open backend"));
+        let backend = Arc::new(StorageBackend::sqlite_for_test(&database).expect("open backend"));
         let owner = khive_db::stores::blob::acquire_database_gc_owner(backend.sql().as_ref())
             .await
             .expect("pre-hold database GC owner");
@@ -7557,7 +7557,7 @@ id = "lambda:project-actor"
         };
         assert!(error.to_string().contains("legacy_refs=1"));
 
-        let main = StorageBackend::sqlite(&main_path).unwrap();
+        let main = StorageBackend::sqlite_for_test(&main_path).unwrap();
         assert_eq!(
             main.attachment_cutover_status().unwrap(),
             AttachmentCutoverStatus::Pending,
@@ -8797,7 +8797,7 @@ region = "us-east-1"
     }
 
     fn prepare_current_snapshot_source(path: &std::path::Path) {
-        let backend = StorageBackend::sqlite(path).expect("create snapshot source");
+        let backend = StorageBackend::sqlite_for_test(path).expect("create snapshot source");
         backend
             .prepare_core_schema()
             .expect("prepare exact-current migration ledger");
@@ -10306,7 +10306,7 @@ region = "us-east-1"
         let db_path = dir.path().join("ro_test.db");
 
         // Create a writable backend first so the file exists.
-        let rw = StorageBackend::sqlite(&db_path).expect("rw backend");
+        let rw = StorageBackend::sqlite_for_test(&db_path).expect("rw backend");
         rw.apply_pack_ddl_statements(&[
             "CREATE TABLE IF NOT EXISTS ro_check (id INTEGER PRIMARY KEY)",
         ])
@@ -10376,7 +10376,7 @@ region = "us-east-1"
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("chmod_snapshot.db");
-        drop(StorageBackend::sqlite(&db_path).expect("create snapshot source"));
+        drop(StorageBackend::sqlite_for_test(&db_path).expect("create snapshot source"));
 
         let mut permissions = std::fs::metadata(&db_path).unwrap().permissions();
         permissions.set_mode(0o444);
@@ -18247,7 +18247,7 @@ backend = "kg-backend"
     }
 
     fn issue2768_seed_tool_database(path: &std::path::Path, upgraded: bool) {
-        let backend = StorageBackend::sqlite(path).unwrap();
+        let backend = StorageBackend::sqlite_for_test(path).unwrap();
         backend.prepare_core_schema().unwrap();
         backend
             .apply_pack_ddl_statements(&[ISSUE2768_LEGACY_GRANTS, ISSUE2768_LEGACY_POLICY])
@@ -18397,7 +18397,7 @@ backend = "kg-backend"
         let tool_path = dir.path().join("tool.db");
         issue2768_seed_tool_database(&tool_path, false);
         {
-            let backend = StorageBackend::sqlite(&tool_path).unwrap();
+            let backend = StorageBackend::sqlite_for_test(&tool_path).unwrap();
             assert_eq!(issue2768_tool_shape(&backend), before);
         }
         let multi = build_registry_for_multi_backend_inner(

@@ -56,3 +56,33 @@ pub(super) fn open_backend_with_policies(
         volume_lock_dir,
     )
 }
+
+/// Open a `StorageBackend` from a `BackendConfig`.
+#[cfg(test)]
+pub(super) fn open_backend(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+) -> anyhow::Result<StorageBackend> {
+    open_backend_with_wal_ceiling(cfg, max_readers, khive_db::WalCeilingPolicy::default())
+}
+
+#[cfg(test)]
+pub(super) fn open_backend_with_wal_ceiling(
+    cfg: &BackendConfig,
+    max_readers: Option<usize>,
+    wal_ceiling: khive_db::WalCeilingPolicy,
+) -> anyhow::Result<StorageBackend> {
+    let config = RuntimeConfig::no_embeddings();
+    let lock_dir = cfg
+        .path
+        .as_ref()
+        .map(|path| khive_runtime::expand_tilde(path))
+        .and_then(|path| path.parent().map(|parent| parent.join("volume-locks")));
+    open_backend_with_policies(
+        cfg,
+        max_readers,
+        wal_ceiling,
+        cfg.resolve_disk_guard(&config.disk_guard_environment)?,
+        lock_dir.as_deref(),
+    )
+}

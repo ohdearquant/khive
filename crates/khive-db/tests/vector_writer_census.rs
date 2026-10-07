@@ -149,7 +149,7 @@ const NON_VEC0: &[(&str, &str, &str, &str, usize)] = &[
     // vec0 or note table. Keep the dynamic DML site visible to this census.
     (
         "khive-db/src/pool.rs",
-        "initialize_database_id",
+        "initialize_database_id_with_admission",
         "INSERT",
         "main.{DATABASE_ID_TABLE}",
         1,

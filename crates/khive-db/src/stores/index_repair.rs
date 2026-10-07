@@ -103,7 +103,9 @@ impl IndexRepairContext {
                 gate.ready.store(false, Ordering::Release);
                 let writer = self
                     .pool
-                    .writer_until(|| context.blocking_stop_reason().is_some())
+                    .writer_until_for_admitted_operation(|| {
+                        context.blocking_stop_reason().is_some()
+                    })
                     .map_err(|error| error.into_storage_error(capability, operation))?
                     .ok_or_else(|| StorageError::Timeout {
                         operation: operation.into(),
@@ -113,6 +115,9 @@ impl IndexRepairContext {
                         operation: operation.into(),
                     });
                 }
+                let writer = writer
+                    .admit_autocommit()
+                    .map_err(|error| error.into_storage_error(capability, operation))?;
                 // Once admitted, schema work retains the constructor's
                 // non-interruptible write semantics. No notes_seq backfill.
                 gate.ensure(writer.conn(), index.ensure).map_err(|error| {

@@ -2,11 +2,13 @@
 //! The database and filler live on a bounded mounted filesystem, never on the
 //! developer's ordinary data volume.
 
+#![cfg(target_os = "linux")]
+
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -22,92 +24,61 @@ const MAX_CONSTRAINED_VOLUME_BYTES: u64 = 512 * MIB;
 
 struct ConstrainedVolume {
     mount: PathBuf,
-    // The image is outside its mount. Keep it alive until after detach.
-    _image_dir: Option<tempfile::TempDir>,
-    detach: bool,
+    _fixture: tempfile::TempDir,
 }
 
-impl Drop for ConstrainedVolume {
-    fn drop(&mut self) {
-        if self.detach {
-            let status = Command::new("/usr/bin/hdiutil")
-                .arg("detach")
-                .arg("-force")
-                .arg(&self.mount)
-                .status();
-            if !matches!(&status, Ok(exit) if exit.success()) {
-                if let Some(image_dir) = self._image_dir.take() {
-                    let recovery_path = image_dir.path().to_path_buf();
-                    std::mem::forget(image_dir);
-                    eprintln!(
-                        "WARNING: detach failed for {:?}: {status:?}; image preserved at {:?}",
-                        self.mount, recovery_path
-                    );
-                }
-            }
+fn verify_isolation(mount: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(mount).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() {
+        return Err("constrained mount must be a directory".into());
+    }
+    let workspace = std::env::current_dir().map_err(|error| error.to_string())?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME is unavailable; cannot prove volume isolation")?;
+    for protected in [Path::new("/"), workspace.as_path(), home.as_path()] {
+        let protected_metadata = fs::metadata(protected).map_err(|error| error.to_string())?;
+        if metadata.dev() == protected_metadata.dev() {
+            return Err(format!(
+                "constrained device matches protected filesystem {}",
+                protected.display()
+            ));
         }
     }
+    let total = fs4::total_space(mount).map_err(|error| error.to_string())?;
+    if !(FLOOR_BYTES + 32 * MIB..=MAX_CONSTRAINED_VOLUME_BYTES).contains(&total) {
+        return Err(format!(
+            "constrained device size must be 96..512 MiB, got {total}"
+        ));
+    }
+    Ok(())
 }
 
 fn constrained_volume() -> Option<ConstrainedVolume> {
-    if let Some(mount) = std::env::var_os("KHIVE_TEST_CONSTRAINED_MOUNT") {
-        let mount = PathBuf::from(mount)
-            .canonicalize()
-            .expect("configured mount exists");
-        assert!(mount.is_dir(), "configured mount must be a directory");
-        return Some(ConstrainedVolume {
-            mount,
-            _image_dir: None,
-            detach: false,
-        });
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let image_dir = tempfile::tempdir().expect("image host tempdir");
-        let mount = image_dir.path().join("mount");
-        fs::create_dir(&mount).expect("image mountpoint");
-        let image = image_dir.path().join("capacity.sparseimage");
-        let output = Command::new("/usr/bin/hdiutil")
-            .args(["create", "-size", "256m", "-fs", "APFS", "-type", "SPARSE"])
-            .arg(&image)
-            .output()
-            .expect("hdiutil create");
-        assert!(
-            output.status.success(),
-            "hdiutil create failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        // Arm cleanup before attach: a failed command may still have mounted.
-        let volume = ConstrainedVolume {
-            mount,
-            _image_dir: Some(image_dir),
-            detach: true,
-        };
-        let output = Command::new("/usr/bin/hdiutil")
-            .args(["attach", "-nobrowse", "-mountpoint"])
-            .arg(&volume.mount)
-            .arg(&image)
-            .output()
-            .expect("hdiutil attach");
-        assert!(
-            output.status.success(),
-            "hdiutil attach failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Some(volume)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
+    let Some(mount) = std::env::var_os("KHIVE_TEST_CONSTRAINED_MOUNT") else {
         eprintln!(
-            "SKIP: set KHIVE_TEST_CONSTRAINED_MOUNT to a pre-mounted <=512 MiB writable filesystem"
+            "SKIP ADR154_CAPACITY: run scripts/test-sqlite-capacity-linux.sh \
+             with the compiled test binary"
         );
-        None
+        return None;
+    };
+    let mount = PathBuf::from(mount);
+    if let Err(reason) = verify_isolation(&mount) {
+        eprintln!("SKIP ADR154_CAPACITY: {reason}");
+        return None;
     }
+    let fixture = tempfile::Builder::new()
+        .prefix("khive-capacity-")
+        .tempdir_in(&mount)
+        .expect("private fixture on verified isolated device");
+    Some(ConstrainedVolume {
+        mount: fixture.path().to_path_buf(),
+        _fixture: fixture,
+    })
 }
 
 fn fill_to_headroom(mount: &Path, floor: u64) {
+    verify_isolation(mount).expect("isolation must still hold immediately before filling");
     let total = fs4::total_space(mount).expect("constrained volume size");
     assert!(
         total <= MAX_CONSTRAINED_VOLUME_BYTES,
@@ -122,6 +93,7 @@ fn fill_to_headroom(mount: &Path, floor: u64) {
 
     let mut filler = File::create(mount.join("capacity-filler.bin")).expect("filler create");
     let block = vec![0xA5_u8; (4 * MIB) as usize];
+    let mut written = 0_u64;
     loop {
         let available = fs4::available_space(mount).expect("available space after fill");
         if available <= target {
@@ -131,6 +103,11 @@ fn fill_to_headroom(mount: &Path, floor: u64) {
             );
             break;
         }
+        written += block.len() as u64;
+        assert!(
+            written <= total,
+            "constrained filesystem did not account for bounded filler allocation"
+        );
         filler.write_all(&block).expect("bounded filler write");
         filler.flush().expect("flush filler allocation");
         filler.sync_data().expect("reserve actual disk blocks");
@@ -175,8 +152,7 @@ fn heartbeat_count(content: &str) -> usize {
         .count()
 }
 
-/// Requires hdiutil on macOS, or KHIVE_TEST_CONSTRAINED_MOUNT on Linux.
-/// Run: cargo test -p khive-db --test capacity_floor_real_fs -- --ignored
+/// The runner mounts a bounded tmpfs in a private Linux mount namespace.
 #[tokio::test]
 #[ignore = "mounts and fills a real small filesystem; opt in on a disposable host"]
 async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
@@ -189,7 +165,6 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
         "refusing to use a volume larger than 512 MiB: {total} bytes"
     );
     let sink_dir = tempfile::tempdir().expect("sink host tempdir");
-    std::env::set_var("KHIVE_DB_FREE_SPACE_FLOOR_BYTES", FLOOR_BYTES.to_string());
     std::env::set_var("KHIVE_WRITER_TIMEOUT_SINK_DIR", sink_dir.path());
     std::env::set_var("KHIVE_WRITER_TIMEOUT_SINK_HEARTBEAT_MS", "100");
 
@@ -198,6 +173,11 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
         ConnectionPool::new(PoolConfig {
             path: Some(db_path.clone()),
             write_queue_enabled: Some(false),
+            disk_guard_config: Some(
+                khive_db::DiskGuardEnvironment::default()
+                    .resolve(Some(FLOOR_BYTES), Some(2_000))
+                    .unwrap(),
+            ),
             ..PoolConfig::for_test()
         })
         .expect("pool opens before filling"),
@@ -208,9 +188,17 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
         let writer = pool.writer().expect("schema writer");
         writer
             .conn()
-            .execute_batch("CREATE TABLE payloads (id INTEGER PRIMARY KEY, bytes BLOB NOT NULL)")
+            .execute_batch(include_str!("fixtures/capacity-floor.sql"))
             .expect("schema creation");
     }
+    assert_eq!(
+        pool.try_checkpoint_nowait()
+            .unwrap()
+            .truncate()
+            .unwrap()
+            .busy,
+        0
+    );
 
     let sink_path = sink_dir
         .path()
@@ -226,7 +214,9 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
         .execute_batch("BEGIN")
         .expect("old reader begins");
     let initial: i64 = old_reader
-        .query_row("SELECT COUNT(*) FROM payloads", [], |row| row.get(0))
+        .query_row("SELECT generation FROM payloads WHERE id = 1", [], |row| {
+            row.get(0)
+        })
         .expect("establish old read snapshot");
     assert_eq!(initial, 0);
 
@@ -247,8 +237,11 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
         };
         let result = writer
             .execute(SqlStatement {
-                sql: "INSERT INTO payloads (bytes) VALUES (?1)".into(),
-                params: vec![SqlValue::Blob(vec![0x5A; MIB as usize])],
+                sql: "UPDATE payloads SET bytes = ?1, generation = ?2 WHERE id = 1".into(),
+                params: vec![
+                    SqlValue::Blob(vec![(writes % 255 + 1) as u8; MIB as usize]),
+                    SqlValue::Integer(writes + 1),
+                ],
                 label: Some("real_capacity_floor_acceptance".into()),
             })
             .await;
@@ -275,7 +268,9 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
     assert!(available_bytes <= floor_bytes);
 
     let still_old: i64 = old_reader
-        .query_row("SELECT COUNT(*) FROM payloads", [], |row| row.get(0))
+        .query_row("SELECT generation FROM payloads WHERE id = 1", [], |row| {
+            row.get(0)
+        })
         .expect("old snapshot remains readable");
     assert_eq!(still_old, 0, "old reader must pin its pre-write WAL view");
 
@@ -294,11 +289,49 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
         .execute_batch("ROLLBACK")
         .expect("release old reader");
     drop(old_reader);
-    let checkpoint = Connection::open(&db_path).expect("checkpoint connection");
-    let (busy, _log, _checkpointed): (i64, i64, i64) = checkpoint
-        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+    let checkpoint = pool
+        .try_checkpoint_nowait()
+        .expect("floor-bypassed checkpoint capability")
+        .truncate()
+        .expect("checkpoint after reader release");
+    assert_eq!(
+        checkpoint.busy, 0,
+        "checkpoint must complete after the reader leaves"
+    );
+    assert!(
+        fs4::available_space(&volume.mount).unwrap() > FLOOR_BYTES,
+        "truncation of repeated-update WAL must restore admission headroom"
+    );
+    let mut writer = bridge
+        .writer()
+        .await
+        .expect("ordinary admission recovers after checkpoint");
+    assert_eq!(
+        writer
+            .execute(SqlStatement {
+                sql: "UPDATE payloads SET generation = generation + 1 WHERE id = 1".into(),
+                params: vec![],
+                label: Some("real_capacity_floor_recovery".into()),
+            })
+            .await
+            .expect("ordinary write after recovery"),
+        1
+    );
+    drop(writer);
+    let reader = pool.reader().unwrap();
+    let generation: i64 = reader
+        .query_row("SELECT generation FROM payloads WHERE id = 1", [], |row| {
+            row.get(0)
         })
-        .expect("reserved space permits checkpoint after reader release");
-    assert_eq!(busy, 0, "checkpoint must complete after the reader leaves");
+        .unwrap();
+    assert_eq!(generation, writes + 1);
+    println!("ADR154_CAPACITY_PASS");
+}
+
+#[test]
+fn constrained_fixture_rejects_the_workspace_volume_without_writing() {
+    let workspace = std::env::current_dir().unwrap();
+    assert!(verify_isolation(&workspace)
+        .unwrap_err()
+        .contains("protected filesystem"));
 }
