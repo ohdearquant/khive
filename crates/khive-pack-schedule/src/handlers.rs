@@ -4,7 +4,7 @@
 //! `scheduled_event` notes. Trigger evaluation is NOT performed by the pack —
 //! the pack only stores intent. See `docs/design.md` for execution modes.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -1043,10 +1043,8 @@ pub(crate) async fn handle_agenda(
         }
     };
 
-    // The exact SQL predicate and sort parse stored RFC 3339 text into a UTC
-    // key. Chrono accepts four-digit date prefixes and offsets under one day,
-    // so widened local-date bounds can use the existing raw trigger index.
-    // The exact predicate remains authoritative at each inclusive boundary.
+    // Accepted timestamps can have unpadded components or signed years, so
+    // raw-text date bounds can exclude rows that match the exact UTC window.
     let store = runtime.notes(token)?;
     let namespace = token.namespace().as_str();
     let mut property_filters = vec![
@@ -1062,16 +1060,6 @@ pub(crate) async fn handle_agenda(
         },
     ];
     if let Some(from) = from_instant {
-        if let Some(local_start) = from.checked_sub_signed(Duration::days(1)) {
-            let date = local_start.format("%Y-%m-%d").to_string();
-            if date.len() == 10 && date.as_bytes()[0].is_ascii_digit() {
-                property_filters.push(PropertyFilter {
-                    json_path: "$.trigger_at".to_string(),
-                    op: FilterOp::Gte,
-                    value: SqlValue::Text(date),
-                });
-            }
-        }
         property_filters.push(PropertyFilter {
             json_path: "$.trigger_at".to_string(),
             op: FilterOp::Rfc3339Gte,
@@ -1079,16 +1067,6 @@ pub(crate) async fn handle_agenda(
         });
     }
     if let Some(to) = to_instant {
-        if let Some(local_end_exclusive) = to.checked_add_signed(Duration::days(2)) {
-            let date = local_end_exclusive.format("%Y-%m-%d").to_string();
-            if date.len() == 10 && date.as_bytes()[0].is_ascii_digit() {
-                property_filters.push(PropertyFilter {
-                    json_path: "$.trigger_at".to_string(),
-                    op: FilterOp::Lt,
-                    value: SqlValue::Text(date),
-                });
-            }
-        }
         property_filters.push(PropertyFilter {
             json_path: "$.trigger_at".to_string(),
             op: FilterOp::Rfc3339Lte,
