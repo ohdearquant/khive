@@ -172,15 +172,20 @@ pub fn resolve_disk_guard_config(
 ///
 /// A process carrying the workspace test marker `KHIVE_TEST_HARNESS=1` (cargo
 /// sets it for every test and test-spawned binary) uses
-/// `<temp>/khive-test-sqlite-volume-locks` in place of the per-user namespace,
-/// so tests share one namespace among themselves and never wait on a lease
-/// held by an installed process of the same user. The explicit override still
+/// `<temp>/khive-test-sqlite-volume-locks/<pid>` in place of the per-user
+/// namespace, so a test process never waits on a lease held by an installed
+/// process of the same user or by another test process. Tests whose processes
+/// must contend name one directory explicitly. The explicit override still
 /// wins under the marker.
 pub fn default_volume_lock_dir() -> Result<PathBuf, SqliteError> {
     let test_harness = std::env::var(crate::pool::TEST_HARNESS_ENV).as_deref() == Ok("1");
     volume_lock_dir_from(
         std::env::var_os(VOLUME_LOCK_DIR_ENV),
-        test_harness.then(|| std::env::temp_dir().join(TEST_HARNESS_LOCK_SUBDIR)),
+        test_harness.then(|| {
+            std::env::temp_dir()
+                .join(TEST_HARNESS_LOCK_SUBDIR)
+                .join(std::process::id().to_string())
+        }),
         std::env::var_os("HOME"),
         std::env::var_os("USERPROFILE"),
     )
@@ -498,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn default_volume_lock_dir_with_the_test_marker_is_the_temp_namespace() {
+    fn default_volume_lock_dir_with_the_test_marker_is_this_process_temp_namespace() {
         if crate::test_process::run_in_child(|command| {
             command
                 .env_remove(VOLUME_LOCK_DIR_ENV)
@@ -509,7 +514,10 @@ mod tests {
         }
         assert_eq!(
             default_volume_lock_dir().unwrap(),
-            std::env::temp_dir().join(TEST_HARNESS_LOCK_SUBDIR)
+            std::env::temp_dir()
+                .join(TEST_HARNESS_LOCK_SUBDIR)
+                .join(std::process::id().to_string()),
+            "each test process takes its own namespace"
         );
     }
 
