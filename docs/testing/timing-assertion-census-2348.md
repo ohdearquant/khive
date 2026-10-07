@@ -105,6 +105,8 @@ source of the bound, not proof that coverage passes.
 
 The A rows above retain the original census base and classifications. Subsequent repairs are:
 
+- The MCP forwarding write/read timeout tests in `crates/khive-mcp/src/daemon_tests.rs` now select their bounds through the shared timing helper. Both modes retain an unconditional strict numeric assertion: the 2-second request timeout plus 1 second ordinarily (3 seconds), or three times that timeout under coverage (6 seconds). Both keep the separate 10-second watchdog, outcome classification, stream cleanup, and private-home child isolation. This consolidates policy selection without changing the timing contract or establishing coverage-run acceptance.
+
 - `socket_speaks_khived_protocol_rejects_a_non_protocol_listener` now uses the shared timing helper with `DUPLICATE_PROBE_TIMEOUT * 4`: the ordinary strict bound remains 2 seconds for the production 500 ms timeout. Coverage omits only that numeric assertion. The real non-protocol-listener refusal and cleanup remain, with a separate 30-second hang watchdog in both modes. This is a timeout-derived timing assertion plus a watchdog, not a measured coverage result.
 - The comm hold-time tests already use the shared helper: ordinary runs retain the calibrated median/p95 limits, while coverage omits those numeric gates and retains sample-integrity checks. The calibration remains historical rather than fixture-derived.
 - `test_stalled_request_is_bounded_and_reaped` already gives initialization a separate 2-second startup allowance; the stalled request and reap budgets remain 0.25 seconds. Its setup no longer consumes the request's measured timeout.
