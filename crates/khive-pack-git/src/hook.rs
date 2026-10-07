@@ -305,9 +305,9 @@ fn validate_number_shape(kind: &str, value: &Value) -> Result<(), RuntimeError> 
 }
 
 /// Shared shape predicate for `{kind} properties.project_id`: must be a
-/// string parseable as a full UUID. Does not normalize/insert the canonical
-/// hyphenated form — that mutation is `prepare_create`'s job alone, since
-/// `validate_note_update` is handed an immutable patch.
+/// string parseable as a full UUID. The mutable create/update normalization
+/// seams store the canonical hyphenated form; this predicate also serves the
+/// immutable update validator.
 fn validate_project_id_shape(kind: &str, value: &Value) -> Result<Uuid, RuntimeError> {
     let project_id = value.as_str().ok_or_else(|| {
         RuntimeError::InvalidInput(format!("{kind} requires properties.project_id"))
@@ -390,6 +390,30 @@ impl KindHook for IssueLikeHook {
             Value::String(project_uuid.as_hyphenated().to_string()),
         );
 
+        Ok(())
+    }
+
+    async fn normalize_note_update(
+        &self,
+        _runtime: &KhiveRuntime,
+        _token: &NamespaceToken,
+        _note: &Note,
+        args: &mut Value,
+    ) -> Result<(), RuntimeError> {
+        let Some(project_id) = args
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("project_id"))
+        else {
+            return Ok(());
+        };
+        // Leave invalid/null values to the existing validator and its refusals.
+        if let Some(project_uuid) = project_id
+            .as_str()
+            .and_then(|value| Uuid::parse_str(value).ok())
+        {
+            *project_id = Value::String(project_uuid.as_hyphenated().to_string());
+        }
         Ok(())
     }
 
