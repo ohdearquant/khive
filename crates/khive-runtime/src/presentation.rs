@@ -586,21 +586,32 @@ fn cell_text(key: &str, value: &Value, truncate: bool) -> String {
     }
 }
 
-/// Convert a microsecond epoch `i64` to an RFC 3339 / ISO-8601 string.
+/// Convert a microsecond epoch `i64` to an exact UTC ISO-8601 string.
 ///
-/// Entity and Note storage uses `i64` microseconds internally; this is the
-/// single conversion point before any field reaches the MCP boundary.
-///
-/// Format: `YYYY-MM-DDTHH:MM:SS.ffffffZ` (SecondsFormat::Micros, UTC `Z`).
+/// Output always carries six fractional digits and a `Z` suffix. Years
+/// 0000–9999 use the RFC 3339 spelling; other years use Chrono's signed
+/// expanded-year convention. The full `i64` microsecond range is supported.
 pub fn micros_to_iso(micros: i64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros)
-        .unwrap_or_else(chrono::Utc::now)
-        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    if let Some(dt) = chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros) {
+        return dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    }
+
+    // Gregorian leap positions repeat every 400 years. Euclidean reduction
+    // keeps the remainder in 1970–2369, including for negative timestamps.
+    const CYCLE_MICROS: i64 = 146_097 * 86_400 * 1_000_000;
+    let cycles = micros.div_euclid(CYCLE_MICROS);
+    let reduced =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros.rem_euclid(CYCLE_MICROS))
+            .expect("400-year remainder is within Chrono's range");
+    let year = i64::from(chrono::Datelike::year(&reduced)) + cycles * 400;
+    let rendered = reduced.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    format!("{year:+05}{}", &rendered[4..])
 }
 
 /// Parse an RFC 3339 timestamp (offset required) into microsecond epoch
-/// `i64` — the inverse of [`micros_to_iso`], and the single parse point for
-/// caller-supplied instants entering storage comparisons.
+/// `i64` — the inverse of [`micros_to_iso`] within the RFC 3339 four-digit
+/// year range. Expanded ISO years are not accepted. This is the single parse
+/// point for caller-supplied instants entering storage comparisons.
 ///
 /// Leading/trailing whitespace is tolerated. Date-only and offset-less forms
 /// are rejected; callers own the verb-specific error context around the
@@ -1319,6 +1330,59 @@ mod tests {
 
     /// A fixed "now" for deterministic tests: 2025-05-23T16:08:00Z.
     const NOW: i64 = 1_748_016_480;
+
+    #[test]
+    fn micros_to_iso_preserves_chrono_range_spelling() {
+        for (micros, expected) in [
+            (0, "1970-01-01T00:00:00.000000Z"),
+            (-1, "1969-12-31T23:59:59.999999Z"),
+            (1_748_016_480_123_456, "2025-05-23T16:08:00.123456Z"),
+            (-62_198_755_200_000_000, "-0001-01-01T00:00:00.000000Z"),
+            (253_402_300_800_000_000, "+10000-01-01T00:00:00.000000Z"),
+            (-8_334_601_228_800_000_000, "-262143-01-01T00:00:00.000000Z"),
+            (8_210_266_876_799_999_999, "+262142-12-31T23:59:59.999999Z"),
+        ] {
+            assert!(
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros).is_some(),
+                "{micros}"
+            );
+            assert_eq!(micros_to_iso(micros), expected, "{micros}");
+        }
+    }
+
+    #[test]
+    fn micros_to_iso_formats_outside_chrono_range_exactly() {
+        for (micros, expected) in [
+            (i64::MIN, "-290308-12-21T19:59:05.224192Z"),
+            (i64::MAX, "+294247-01-10T04:00:54.775807Z"),
+            (-8_334_601_228_800_000_001, "-262144-12-31T23:59:59.999999Z"),
+            (8_210_266_876_800_000_000, "+262143-01-01T00:00:00.000000Z"),
+            (-8_898_108_636_303_876_544, "-280000-02-29T12:34:56.123456Z"),
+            (8_776_940_198_400_000_001, "+280100-03-01T00:00:00.000001Z"),
+        ] {
+            assert!(
+                chrono::DateTime::<chrono::Utc>::from_timestamp_micros(micros).is_none(),
+                "{micros}"
+            );
+            assert_eq!(micros_to_iso(micros), expected, "{micros}");
+        }
+    }
+
+    #[test]
+    fn expanded_micros_timestamps_pass_through_agent_without_relative_labels() {
+        for (micros, expected) in [
+            (i64::MIN, "-290308-12-21T19:59:05.224192Z"),
+            (i64::MAX, "+294247-01-10T04:00:54.775807Z"),
+        ] {
+            let shown = present(
+                json!({"items": [{"created_at": micros_to_iso(micros)}]}),
+                PresentationMode::Agent,
+                NOW,
+            );
+            assert_eq!(shown, json!({"items": [{"created_at": expected}]}));
+            assert!(rfc3339_to_utc_micros(expected).is_err());
+        }
+    }
 
     #[test]
     fn rfc3339_to_utc_micros_round_trips_and_rejects_partial_forms() {

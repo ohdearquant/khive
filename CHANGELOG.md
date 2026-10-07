@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the workspace used this surface outside its own tests. This is a source-breaking change
   for an out-of-tree Rust consumer, including users of `metrics::emit` or `metrics::names`.
   The separate metrics APIs in `khive-bm25` and `khive-hnsw` remain unchanged.
+- The unused `khive_retrieval::query_ir` module and the `QueryNode`, `FuseStrategy`,
+  `FilterPredicate` and `RerankMethod` crate-root re-exports are removed. Nothing in the
+  workspace used this surface outside its own tests. This is a source-breaking change
+  for an out-of-tree Rust consumer; no replacement query-plan API is provided.
 - The `khive-retrieval` `persist` feature is removed, with the `persist`, `replay` and `weights`
   modules and the `PersistError`, `PersistenceStats`, `RetrievalPersistence`, `ShadowMetrics`,
   `ShadowValidationConfig` and `ShadowValidationResult` re-exports. Nothing in the workspace

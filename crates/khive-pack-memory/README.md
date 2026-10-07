@@ -6,13 +6,13 @@ feedback and curation verbs.
 
 ## Verbs
 
-| Verb              | What it does                                                           |
-| ----------------- | ---------------------------------------------------------------------- |
-| `memory.remember` | Create a memory note with salience and decay                           |
-| `memory.recall`   | Recall memories via decay-aware hybrid (FTS + vector) ranking          |
-| `memory.feedback` | Emit explicit feedback on a recalled entity; updates recall posteriors |
-| `memory.prune`    | Soft-delete memories below a salience floor and/or past `expires_at`   |
-| `memory.vacuum`   | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows        |
+| Verb              | What it does                                                         |
+| ----------------- | -------------------------------------------------------------------- |
+| `memory.remember` | Create a memory note with salience and decay                         |
+| `memory.recall`   | Recall memories via decay-aware hybrid (FTS + vector) ranking        |
+| `memory.feedback` | Emit feedback on a recalled record identified by its full UUID       |
+| `memory.prune`    | Soft-delete memories below a salience floor and/or past `expires_at` |
+| `memory.vacuum`   | Run SQLite `VACUUM` to reclaim space freed by soft-deleted rows      |
 
 These five are `Visibility::Verb` (MCP-callable). `MemoryPack` also declares
 five `Visibility::Subhandler` entries (`memory.recall_embed`,
@@ -33,8 +33,10 @@ decays faster). Defaults are type-differentiated
 
 Explicit caller-supplied values always override these defaults. `memory.recall`
 fuses lexical and vector retrieval (`khive-fusion`, `khive-retrieval`,
-`khive-vamana`) and folds decay into the composite score, which is always
-normalized to `[0, 1]`; `min_score` / `score_floor` filter below a threshold.
+`khive-vamana`) and combines relevance, salience, and age for ranking. The
+response `score` stays within `[0, 1]`. The composite `rank_score` drives
+ordering and may exceed `1.0` after profile posterior adjustments. See
+[scoring and reranking](docs/api/scoring.md) for threshold and diversity rules.
 Recall results also route feedback signals into per-namespace Beta-posterior
 state (`khive-brain-core`'s `BalancedRecallState`) that tunes future ranking.
 

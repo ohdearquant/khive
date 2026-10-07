@@ -45,9 +45,9 @@ The 50 ms threshold reflects normal local SQLite FTS5 latency of roughly 1–20 
 
 ## `memory.prune`
 
-Prune selects live memory notes in the requested namespace. It can match raw salience strictly below `min_salience`, expiry at or before `before`, or both. `before` defaults to the current Unix microsecond timestamp; zero disables the expiry predicate. `dry_run` returns the count without mutation.
+Prune selects live memory notes in the requested namespace. `min_salience` compares raw stored salience; `min_effective_salience` compares salience after applying the active recall configuration's decay model to the note's age and decay factor. Each salience filter selects values strictly below its threshold. A note is selected when either salience filter matches or its expiry is at or before `before`. `before` defaults to the current Unix microsecond timestamp; zero disables the expiry predicate. `dry_run` returns the count without mutation.
 
-Deletion is soft, performed directly through `NoteStore`. That raw path bypasses the runtime mutation hooks, so the handler itself bumps ANN generations and schedules background rebuilding for affected models. A candidate disappearing after selection is tolerated as ordinary concurrent mutation.
+Selected notes are soft-deleted through `KhiveRuntime::delete_note`. After the row change, the runtime attempts FTS5 cleanup, vector cleanup for every registered embedding model, and deletion-event append, then fires installed note-mutation hooks. Index or event failures surface as non-retryable post-commit errors; the note may already be soft-deleted. After the deletion loop succeeds with at least one deletion, prune also bumps ANN generations and requests background maintenance for registered models. A candidate disappearing after selection is tolerated as ordinary concurrent mutation.
 
 ## `memory.vacuum`
 

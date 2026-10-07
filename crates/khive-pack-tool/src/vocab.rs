@@ -274,7 +274,7 @@ pub static TOOL_HANDLERS: [HandlerDef; 14] = [
         category: VerbCategory::Assertive,
         params: &[
             ParamDef { name: "status", param_type: "string", required: false, description: "requested, granted, denied or revoked.", resolution_mode: IdResolutionMode::NotApplicable },
-            P_ACTOR,
+            ParamDef { name: "actor", param_type: "string", required: false, description: "Optional exact actor filter. Omit to apply no actor filter within the request namespace.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "tool", param_type: "string", required: false, description: "Restrict to one tool name.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 50).", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
@@ -311,7 +311,7 @@ pub static TOOL_HANDLERS: [HandlerDef; 14] = [
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
-            P_ACTOR,
+            ParamDef { name: "actor", param_type: "string", required: false, description: "Optional actor value to match against stored policy patterns. Omit to apply no actor filter within the request namespace.", resolution_mode: IdResolutionMode::NotApplicable },
             ParamDef { name: "limit", param_type: "integer", required: false, description: "Page size (default 100).", resolution_mode: IdResolutionMode::NotApplicable },
             P_NAMESPACE,
         ],
