@@ -37,13 +37,13 @@ verb-dispatch machinery that lets packs (`kg`, `gtd`, `memory`, …) extend the 
 ## Usage
 
 ```rust
-use khive_runtime::{KhiveRuntime, RuntimeConfig};
+use khive_runtime::KhiveRuntime;
 use khive_types::namespace::Namespace;
 
-// In-memory runtime (tests and pure local embedding). Production callers use
+// In-memory runtime with embedding models disabled. Production callers use
 // khive-mcp/kkernel's async host builders so legacy V21 attachment cutover is
 // completed before any runtime is exposed.
-let runtime = KhiveRuntime::new(RuntimeConfig::default())?;
+let runtime = KhiveRuntime::memory()?;
 
 // Every read/write is scoped by a NamespaceToken minted through the configured Gate.
 let token = runtime.authorize(Namespace::local())?;

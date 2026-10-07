@@ -528,8 +528,25 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         // configured bounded retries exist for — treating them as terminal
         // would abandon a generation on the first blip of a daemon restart.
         StorageError::Pool { .. } | StorageError::Timeout { .. } => RetryDecision::Retry,
-        StorageError::WriterTaskRequestFailed { request_state, .. }
-        | StorageError::WriterTaskTerminated { request_state } => match request_state {
+        // The writer task wraps any request operation that failed and was rolled
+        // back, whatever the cause, so the wrapper alone does not say whether a
+        // retry can succeed: a missing column fails the same way on every
+        // attempt. Judge the cause it carries. A request left in an unknown
+        // state is replayed regardless, because the append is idempotent.
+        StorageError::WriterTaskRequestFailed {
+            request_state,
+            source,
+        } => match request_state {
+            WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
+                if is_sqlite_busy_or_locked(source) {
+                    RetryDecision::Retry
+                } else {
+                    classify_store_error(source)
+                }
+            }
+            WriterTaskRequestState::SideEffectsUnknown => RetryDecision::Retry,
+        },
+        StorageError::WriterTaskTerminated { request_state } => match request_state {
             WriterTaskRequestState::NotStarted | WriterTaskRequestState::TransactionRolledBack => {
                 RetryDecision::Retry
             }
@@ -542,6 +559,22 @@ fn classify_store_error(err: &StorageError) -> RetryDecision {
         }
         _ => RetryDecision::Terminal(AuditTerminalReason::StoreFailure),
     }
+}
+
+/// Whether a failed writer request's preserved cause is SQLite contention. The
+/// writer keeps the request body's driver error as the cause, and a driver
+/// error is not one of the typed transient variants `classify_store_error`
+/// retries on its own.
+fn is_sqlite_busy_or_locked(err: &StorageError) -> bool {
+    let StorageError::Driver { source, .. } = err else {
+        return false;
+    };
+    matches!(
+        source
+            .downcast_ref::<rusqlite::Error>()
+            .and_then(|error| error.sqlite_error_code()),
+        Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
 }
 
 enum GenerationResult {
@@ -601,15 +634,23 @@ async fn run_generation(
         attempt += 1;
         match store.append_events_idempotent(events.clone()).await {
             Ok(result) => return GenerationResult::Committed(result.rows),
-            Err(err) => match classify_store_error(&err) {
-                RetryDecision::Retry if attempt < config.max_commit_attempts.get() => {
-                    tokio::time::sleep(config.retry_backoff).await;
-                }
-                RetryDecision::Retry => {
-                    return GenerationResult::Failed(AuditTerminalReason::RetryExhausted)
-                }
-                RetryDecision::Terminal(reason) => return GenerationResult::Failed(reason),
-            },
+            Err(err) => {
+                let reason = match classify_store_error(&err) {
+                    RetryDecision::Retry if attempt < config.max_commit_attempts.get() => {
+                        tokio::time::sleep(config.retry_backoff).await;
+                        continue;
+                    }
+                    RetryDecision::Retry => AuditTerminalReason::RetryExhausted,
+                    RetryDecision::Terminal(reason) => reason,
+                };
+                tracing::warn!(
+                    error = %err,
+                    attempts = attempt,
+                    ?reason,
+                    "audit generation failed; its rows were not committed"
+                );
+                return GenerationResult::Failed(reason);
+            }
         }
     }
 }

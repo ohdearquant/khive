@@ -28,7 +28,13 @@ use khive_types::{EventKind, EventOutcome, SubstrateKind};
 use serial_test::serial;
 
 struct FakeStore {
+    /// Armed N times: the next N `append_events_idempotent` calls fail with
+    /// `WriterTaskRequestFailed { TransactionRolledBack, source }`, the shape
+    /// the writer task gives any request operation it rolled back.
     fail_next: AtomicUsize,
+    /// Builds the `source` carried by the `fail_next` wrapper. Defaults to the
+    /// transient shape a failed COMMIT reports.
+    fail_next_source: Mutex<fn() -> StorageError>,
     /// Armed N times: the next N `append_events_idempotent` calls fail with
     /// `StorageError::Pool` — the shape the ADR-170 forwarding lane reports
     /// for an unreachable events daemon.
@@ -52,6 +58,7 @@ impl FakeStore {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             fail_next: AtomicUsize::new(0),
+            fail_next_source: Mutex::new(commit_failure_source),
             fail_pool_next: AtomicUsize::new(0),
             fail_terminal_next: AtomicUsize::new(0),
             calls: AtomicU64::new(0),
@@ -110,9 +117,7 @@ impl EventStore for FakeStore {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
             return Err(StorageError::WriterTaskRequestFailed {
                 request_state: WriterTaskRequestState::TransactionRolledBack,
-                source: Box::new(StorageError::Internal(
-                    "simulated operation error after proven rollback".into(),
-                )),
+                source: Box::new((*self.fail_next_source.lock())()),
             });
         }
         if self.fail_pool_next.load(Ordering::SeqCst) > 0 {
@@ -161,6 +166,92 @@ impl EventStore for FakeStore {
     fn supports_idempotent_audit_batch(&self) -> bool {
         true
     }
+}
+
+/// What a failed COMMIT reports: the writer keeps only the SQLite error text,
+/// as a transient `Pool` cause behind the rolled-back wrapper.
+fn commit_failure_source() -> StorageError {
+    StorageError::Pool {
+        operation: "writer_task_commit".into(),
+        message: "commit refused (simulated transient failure)".into(),
+    }
+}
+
+/// What an events table missing a column produces: SQLite's own refusal,
+/// preserved as the cause of the rolled-back request. Built by running the
+/// statement, so the error is the driver's, not a hand-made imitation.
+fn missing_column_source() -> StorageError {
+    let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+    conn.execute_batch("CREATE TABLE events (id TEXT)")
+        .expect("create events");
+    let error = conn
+        .execute("INSERT INTO events (id, op_index) VALUES ('a', 1)", [])
+        .expect_err("a column the table lacks must be refused");
+    StorageError::driver(StorageCapability::Events, "append_events_idempotent", error)
+}
+
+/// The same refusal as the events-daemon lane delivers it: the daemon marks it
+/// non-retryable and the client rebuilds it as `InvalidInput`.
+fn daemon_refusal_source() -> StorageError {
+    StorageError::InvalidInput {
+        capability: StorageCapability::Events,
+        operation: "append_events_idempotent".into(),
+        message: "table events has no column named op_index".into(),
+    }
+}
+
+fn sqlite_contention_source(code: i32) -> StorageError {
+    StorageError::driver(
+        StorageCapability::Events,
+        "append_events_idempotent",
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None),
+    )
+}
+
+fn sqlite_busy_source() -> StorageError {
+    sqlite_contention_source(rusqlite::ffi::SQLITE_BUSY)
+}
+
+fn sqlite_locked_source() -> StorageError {
+    sqlite_contention_source(rusqlite::ffi::SQLITE_LOCKED)
+}
+
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock()).into_owned()
+    }
+}
+
+/// Run `work` with this thread's tracing output captured, and return what it
+/// logged. The tests below run on a current-thread runtime, so the generation
+/// driver tasks log on this thread too.
+async fn with_logs<T>(work: impl std::future::Future<Output = T>) -> (T, String) {
+    let logs = CapturedLogs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let output = work.await;
+    drop(guard);
+    (output, logs.text())
 }
 
 fn mk_event(verb: &str) -> Event {
@@ -329,7 +420,7 @@ async fn d1_retry_table_uses_typed_request_state() {
     assert_eq!(
         store.calls.load(Ordering::SeqCst),
         2,
-        "a proven rollback makes the idempotent batch replay effect-safe even when the source error is not independently transient"
+        "a proven rollback with a transient cause is replayed, and the idempotent batch makes the replay effect-safe"
     );
 }
 
@@ -484,7 +575,7 @@ async fn d8_exhausted_commit_retries_set_the_lifetime_degraded_flag() {
     assert_eq!(
         result,
         Err(AuditTerminalReason::RetryExhausted),
-        "every attempt failed with a retryable request_state (TransactionRolledBack), so \
+        "every attempt failed with a transient cause behind a proven rollback, so \
          exhausting max_commit_attempts must report RetryExhausted, not the non-retryable \
          StoreFailure fallback"
     );
@@ -529,6 +620,156 @@ async fn d8_non_retryable_store_error_still_reports_store_failure() {
         metrics.degraded,
         "a generation that failed to flush leaves its rows out of the audit trail"
     );
+}
+
+/// The writer task wraps any request operation it rolled back in
+/// `WriterTaskRequestFailed`, whatever the cause, so a permanent cause (an
+/// events table missing a column, and the same refusal as the events daemon
+/// delivers it) must not be replayed: the generation ends as a store failure
+/// after one attempt, not as `RetryExhausted` after all of them.
+#[serial]
+#[tokio::test]
+async fn d8_wrapped_permanent_source_is_terminal_after_one_attempt() {
+    for source in [
+        missing_column_source as fn() -> StorageError,
+        daemon_refusal_source,
+    ] {
+        let store = FakeStore::new();
+        store.fail_next.store(8, Ordering::SeqCst);
+        *store.fail_next_source.lock() = source;
+        let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+        let result = batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.create"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await;
+        assert_eq!(
+            result,
+            Err(AuditTerminalReason::StoreFailure),
+            "a permanent cause behind a proven rollback is not worth replaying"
+        );
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            1,
+            "a permanent cause must be attempted exactly once"
+        );
+        let metrics = batch.metrics_snapshot();
+        assert_eq!(metrics.flush_failures, 1);
+        assert!(metrics.degraded);
+    }
+}
+
+/// The counterpart of the test above: the same wrapper with a transient cause
+/// is replayed for as many attempts as the batch is configured for.
+#[serial]
+#[tokio::test]
+async fn d8_wrapped_transient_source_is_retried_up_to_the_configured_attempts() {
+    let store = FakeStore::new();
+    store.fail_next.store(8, Ordering::SeqCst);
+    let batch = AuditBatch::new(
+        store.clone(),
+        AuditBatchConfig {
+            max_commit_attempts: std::num::NonZeroU8::new(5).unwrap(),
+            ..AuditBatchConfig::default()
+        },
+    );
+    let result = batch
+        .submit(PreparedAuditRow {
+            event: mk_event("kg.create"),
+            producer: AuditProducer::DispatchSucceeded,
+        })
+        .await;
+    assert_eq!(result, Err(AuditTerminalReason::RetryExhausted));
+    assert_eq!(
+        store.calls.load(Ordering::SeqCst),
+        5,
+        "a transient cause must be attempted max_commit_attempts times"
+    );
+}
+
+/// SQLite contention inside a request body reaches the batch as a driver error
+/// behind the rolled-back wrapper. It is the transient case a permanent-cause
+/// rule must not swallow.
+#[serial]
+#[tokio::test]
+async fn d8_wrapped_sqlite_contention_is_retried_not_terminal() {
+    for source in [
+        sqlite_busy_source as fn() -> StorageError,
+        sqlite_locked_source,
+    ] {
+        let store = FakeStore::new();
+        store.fail_next.store(8, Ordering::SeqCst);
+        *store.fail_next_source.lock() = source;
+        let batch = AuditBatch::new(store.clone(), AuditBatchConfig::default());
+        let result = batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.create"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await;
+        assert_eq!(
+            result,
+            Err(AuditTerminalReason::RetryExhausted),
+            "SQLite busy/locked behind a proven rollback is contention, not a permanent fault"
+        );
+        assert_eq!(
+            store.calls.load(Ordering::SeqCst),
+            u64::from(AuditBatchConfig::default().max_commit_attempts.get()),
+        );
+    }
+}
+
+/// A generation that gives up logs the last store error it saw once, with the
+/// attempts it made and the reason it ended with.
+#[serial]
+#[tokio::test]
+async fn d8_failed_generation_logs_the_last_underlying_store_error_once() {
+    const MARKER: &str = "audit generation failed";
+    let submit = |store: Arc<FakeStore>| async move {
+        let batch = AuditBatch::new(store, AuditBatchConfig::default());
+        batch
+            .submit(PreparedAuditRow {
+                event: mk_event("kg.create"),
+                producer: AuditProducer::DispatchSucceeded,
+            })
+            .await
+    };
+
+    // A terminal reason on the first attempt.
+    let store = FakeStore::new();
+    store.fail_terminal_next.store(1, Ordering::SeqCst);
+    let (result, text) = with_logs(submit(store)).await;
+    assert_eq!(result, Err(AuditTerminalReason::StoreFailure));
+    assert_eq!(text.matches(MARKER).count(), 1, "{text}");
+    assert!(
+        text.contains("simulated non-retryable storage fault"),
+        "{text}"
+    );
+    assert!(text.contains("attempts=1"), "{text}");
+    assert!(text.contains("reason=StoreFailure"), "{text}");
+
+    // Every attempt spent on a transient cause.
+    let store = FakeStore::new();
+    store.fail_next.store(8, Ordering::SeqCst);
+    let (result, text) = with_logs(submit(store)).await;
+    assert_eq!(result, Err(AuditTerminalReason::RetryExhausted));
+    assert_eq!(text.matches(MARKER).count(), 1, "{text}");
+    assert!(
+        text.contains("commit refused (simulated transient failure)"),
+        "{text}"
+    );
+    assert!(text.contains("attempts=3"), "{text}");
+    assert!(text.contains("reason=RetryExhausted"), "{text}");
+
+    // The cause behind a permanent wrapper, as the writer task reports it.
+    let store = FakeStore::new();
+    store.fail_next.store(8, Ordering::SeqCst);
+    *store.fail_next_source.lock() = missing_column_source;
+    let (result, text) = with_logs(submit(store)).await;
+    assert!(result.is_err());
+    assert_eq!(text.matches(MARKER).count(), 1, "{text}");
+    assert!(text.contains("has no column named op_index"), "{text}");
 }
 
 #[serial]

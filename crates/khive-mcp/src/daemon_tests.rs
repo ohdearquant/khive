@@ -1,5 +1,12 @@
 use std::sync::Arc;
 
+mod timing {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../test_support/timing.rs"
+    ));
+}
+
 use super::test_harness::{
     clear_daemon_env, connect_when_ready, exchange, HarnessDispatch, InProcessDaemonHandle,
     InProcessDaemonLauncher, RecoveryTestGuard,
@@ -4119,11 +4126,11 @@ async fn try_forward_inner_write_timeout_drops_stream_and_returns_no_socket() {
     // A fixed second covers runner scheduling without scaling down with the
     // timeout. The strict ordinary cap still rejects an extra 1s return
     // delay; coverage keeps its wider cap, below the watchdog.
-    let elapsed_limit = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        request_timeout * 3
-    } else {
-        request_timeout + std::time::Duration::from_secs(1)
-    };
+    let elapsed_limit = timing::duration_bound(
+        request_timeout + std::time::Duration::from_secs(1),
+        Some(request_timeout * 3),
+    )
+    .expect("both ordinary and instrumented forwarding tests have a latency bound");
     let watchdog = request_timeout * 5;
 
     let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
@@ -4249,11 +4256,11 @@ async fn try_forward_inner_read_timeout_after_full_write_returns_parse_failure()
     );
     // Coverage uses wider slack; the ordinary cap allows a fixed second
     // for scheduling but still rejects an extra 1s return delay.
-    let elapsed_limit = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        request_timeout * 3
-    } else {
-        request_timeout + std::time::Duration::from_secs(1)
-    };
+    let elapsed_limit = timing::duration_bound(
+        request_timeout + std::time::Duration::from_secs(1),
+        Some(request_timeout * 3),
+    )
+    .expect("both ordinary and instrumented forwarding tests have a latency bound");
     let watchdog = request_timeout * 5;
 
     let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";

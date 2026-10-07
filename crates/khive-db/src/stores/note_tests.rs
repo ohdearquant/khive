@@ -3792,7 +3792,7 @@ async fn unread_probe_bounded_by_inbound_not_by_recipients_own_outbound_history(
 }
 
 /// `comm.inbox(status="unread")` builds its `to_actor` predicate at
-/// khive-pack-comm/src/handlers.rs ~613-624: `direction` (`Eq`), `read`
+/// khive-pack-comm/src/handlers/inbox.rs::handle_inbox: `direction` (`Eq`), `read`
 /// (`JsonTypeNeMissing`), then `to_actor`. Before this test's fix, that last
 /// filter used `FilterOp::EqOrMissing`, whose SQL
 /// (`(json_extract(...) = ? OR json_extract(...) IS NULL)`) is a different

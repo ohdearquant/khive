@@ -1,6 +1,6 @@
 //! Runtime custody and authorization for opaque memory visibility receipts.
 
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use khive_types::{Details, ErrorKind, KhiveError};
 use uuid::Uuid;
@@ -13,19 +13,6 @@ const MAX_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_FUTURE_MS: i64 = 5 * 60 * 1_000;
 const REPLAY_PHASE: &str = "exact_replay";
 
-static CUSTODY_ABSENT_NOTICE: Once = Once::new();
-
-fn warn_custody_absent(notice: &Once) {
-    notice.call_once(|| {
-        tracing::warn!(
-            target: "khive.boot",
-            "no [visibility_receipts] section is configured: memory.remember stores memories \
-             without a visibility token and session recall refuses until receipt keys are \
-             configured"
-        );
-    });
-}
-
 pub(crate) enum ReceiptCapability {
     Absent,
     Configured(ReceiptSealer),
@@ -34,12 +21,7 @@ pub(crate) enum ReceiptCapability {
 
 impl ReceiptCapability {
     pub(crate) fn from_config(config: &RuntimeConfig) -> Self {
-        Self::from_config_noticing(config, &CUSTODY_ABSENT_NOTICE)
-    }
-
-    fn from_config_noticing(config: &RuntimeConfig, notice: &Once) -> Self {
         let Some(ring) = &config.visibility_receipts else {
-            warn_custody_absent(notice);
             return Self::Absent;
         };
         let Ok(registry) = CredentialRegistry::new(config.credentials.clone()) else {
@@ -162,6 +144,27 @@ fn validate_fields(
 }
 
 impl KhiveRuntime {
+    /// Return a fixed startup notice for absent or unusable receipt custody.
+    ///
+    /// This only projects configuration state: it neither resolves credentials
+    /// nor reads storage. `None` means custody was configured, not that its
+    /// provider is currently available. Memory-pack activation logs this notice;
+    /// hosts serving memory through direct runtime APIs may report it themselves.
+    pub fn visibility_receipt_custody_notice(&self) -> Option<&'static str> {
+        match self.visibility_receipts.as_ref() {
+            ReceiptCapability::Absent => Some(
+                "no [visibility_receipts] section is configured: memory.remember stores memories \
+                 without a visibility token and session recall refuses until receipt keys are \
+                 configured",
+            ),
+            ReceiptCapability::Unavailable => Some(
+                "configured [visibility_receipts] custody is unusable: memory.remember and \
+                 session recall refuse with visibility_key_unavailable; check configuration",
+            ),
+            ReceiptCapability::Configured(_) => None,
+        }
+    }
+
     /// Install host-owned custody before cloning or passing the runtime to packs.
     /// The registry exposes references/providers; resolved material stays private.
     pub fn with_visibility_receipt_credentials(

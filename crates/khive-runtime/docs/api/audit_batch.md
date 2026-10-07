@@ -40,12 +40,26 @@ then joins the retained supervisor `JoinHandle`.
 
 Concurrent `submit()` calls that arrive while a driver iteration is draining the queue share the
 same generation and the same `append_events_idempotent()` call — this is the batching payoff.
-Each generation retries transient storage failures (`WriteQueueFull`, `WriterTaskBusy`,
-`WriterTaskRequestFailed{TransactionRolledBack}` and
+Each generation retries transient storage failures (`WriteQueueFull`, `WriterTaskBusy`, `Pool`,
+`Timeout`, `WriterTaskRequestFailed` whose cause is itself transient, and
 `WriterTaskTerminated{NotStarted | TransactionRolledBack | SideEffectsUnknown}`) up to
 `AuditBatchConfig::max_commit_attempts` with `retry_backoff` between attempts
 (`classify_store_error`). `Unsupported("append_events_idempotent")` and any other storage error
 are terminal for the generation, not retried.
+
+The writer task wraps any request operation that failed and was rolled back in
+`WriterTaskRequestFailed{TransactionRolledBack}`, whatever the cause, so the wrapper is
+classified by the error it carries: a `Pool`, `Timeout`, `WriteQueueFull` or `WriterTaskBusy`
+cause (a failed COMMIT, or a retryable refusal relayed by the events daemon) or a driver error
+carrying SQLite `BUSY`/`LOCKED` is retried like the same error unwrapped. Any other cause, for
+example a missing column or a constraint violation, would fail identically on every attempt: the
+generation ends as `StoreFailure` after one attempt instead of `RetryExhausted` after all of
+them. A `WriterTaskRequestFailed{SideEffectsUnknown}` is retried whatever its cause, since the
+append is idempotent.
+
+When a generation ends in failure, `RetryExhausted` or any terminal reason, the last store error
+it saw is logged once at `warn` with the attempt count and the reason
+(`audit generation failed; its rows were not committed`).
 
 ## Admission: refusal vs. deadline expiry (khive#2117, khive#2208)
 
