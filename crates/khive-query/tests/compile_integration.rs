@@ -170,12 +170,12 @@ fn return_property_projection_compiles() {
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
     assert!(
-        compiled.sql.contains(".name AS a_name"),
+        compiled.sql.contains(r#".name AS "a_name""#),
         "sql: {}",
         compiled.sql
     );
     assert!(
-        compiled.sql.contains(".name AS b_name"),
+        compiled.sql.contains(r#".name AS "b_name""#),
         "sql: {}",
         compiled.sql
     );
@@ -236,12 +236,12 @@ fn return_valid_edge_property_compiles() {
     .unwrap();
     let compiled = compile(&q, &opts()).unwrap();
     assert!(
-        compiled.sql.contains(".relation AS e_relation"),
+        compiled.sql.contains(r#".relation AS "e_relation""#),
         "sql: {}",
         compiled.sql
     );
     assert!(
-        compiled.sql.contains(".weight AS e_weight"),
+        compiled.sql.contains(r#".weight AS "e_weight""#),
         "sql: {}",
         compiled.sql
     );

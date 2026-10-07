@@ -72,6 +72,11 @@ fn observation_target_source(alias: &str) -> String {
     format!("({OBSERVATION_TARGET_SQL}) {alias}")
 }
 
+/// Quotes one SQL identifier while preserving the returned column name.
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 /// Parameterized read-only SQL plus the metadata required to decode its result.
 ///
 /// See `crates/khive-query/docs/api/sql-compilation.md` for lowering rules.
@@ -623,51 +628,58 @@ fn compile_fixed_length(
             match item {
                 ReturnItem::Property(_, prop) => {
                     let col = property_to_column(prop, kind)?;
-                    select_parts.push(format!("{alias}.{col} AS {var}_{prop}"));
+                    let output_alias = quote_identifier(&format!("{var}_{prop}"));
+                    select_parts.push(format!("{alias}.{col} AS {output_alias}"));
                 }
-                ReturnItem::Variable(_) => match kind {
-                    VarKind::Node => {
-                        select_parts.push(format!(
-                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                             {alias}.kind AS {var}_kind, {alias}.entity_type AS {var}_entity_type, \
-                             {alias}.name AS {var}_name, \
-                             {alias}.properties AS {var}_properties, \
-                             {alias}.created_at AS {var}_created_at, \
-                             {alias}.updated_at AS {var}_updated_at"
-                        ));
+                ReturnItem::Variable(_) => {
+                    let columns: &[(&str, &str)] = match kind {
+                        VarKind::Node => &[
+                            ("id", "id"),
+                            ("namespace", "namespace"),
+                            ("kind", "kind"),
+                            ("entity_type", "entity_type"),
+                            ("name", "name"),
+                            ("properties", "properties"),
+                            ("created_at", "created_at"),
+                            ("updated_at", "updated_at"),
+                        ],
+                        VarKind::ObservationTargetNode => &[
+                            ("id", "id"),
+                            ("namespace", "namespace"),
+                            ("kind", "kind"),
+                            ("entity_type", "entity_type"),
+                            ("status", "status"),
+                            ("content", "content"),
+                            ("salience", "salience"),
+                            ("properties", "properties"),
+                            ("created_at", "created_at"),
+                            ("updated_at", "updated_at"),
+                            ("referent_kind", "referent_kind"),
+                        ],
+                        VarKind::EventNode => &[
+                            ("id", "id"),
+                            ("namespace", "namespace"),
+                            ("verb", "verb"),
+                            ("substrate", "substrate"),
+                            ("actor", "actor"),
+                            ("kind", "kind"),
+                            ("outcome", "outcome"),
+                            ("payload", "payload"),
+                            ("created_at", "created_at"),
+                        ],
+                        VarKind::Edge => &[
+                            ("id", "id"),
+                            ("source_id", "source"),
+                            ("target_id", "target"),
+                            ("relation", "relation"),
+                            ("weight", "weight"),
+                        ],
+                    };
+                    for (column, suffix) in columns {
+                        let output_alias = quote_identifier(&format!("{var}_{suffix}"));
+                        select_parts.push(format!("{alias}.{column} AS {output_alias}"));
                     }
-                    VarKind::ObservationTargetNode => {
-                        select_parts.push(format!(
-                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                             {alias}.kind AS {var}_kind, {alias}.entity_type AS {var}_entity_type, \
-                             {alias}.status AS {var}_status, \
-                             {alias}.content AS {var}_content, \
-                             {alias}.salience AS {var}_salience, \
-                             {alias}.properties AS {var}_properties, \
-                             {alias}.created_at AS {var}_created_at, \
-                             {alias}.updated_at AS {var}_updated_at, \
-                             {alias}.referent_kind AS {var}_referent_kind"
-                        ));
-                    }
-                    VarKind::EventNode => {
-                        select_parts.push(format!(
-                            "{alias}.id AS {var}_id, {alias}.namespace AS {var}_namespace, \
-                             {alias}.verb AS {var}_verb, {alias}.substrate AS {var}_substrate, \
-                             {alias}.actor AS {var}_actor, {alias}.kind AS {var}_kind, \
-                             {alias}.outcome AS {var}_outcome, \
-                             {alias}.payload AS {var}_payload, \
-                             {alias}.created_at AS {var}_created_at"
-                        ));
-                    }
-                    VarKind::Edge => {
-                        select_parts.push(format!(
-                            "{alias}.id AS {var}_id, {alias}.source_id AS {var}_source, \
-                             {alias}.target_id AS {var}_target, \
-                             {alias}.relation AS {var}_relation, \
-                             {alias}.weight AS {var}_weight"
-                        ));
-                    }
-                },
+                }
             }
         } else {
             return Err(QueryError::Compile(format!(
@@ -1244,6 +1256,7 @@ fn compile_variable_length(
     }
 
     let mut select_parts: Vec<String> = Vec::new();
+    let mut projection_aliases: Vec<String> = Vec::new();
     let mut has_start = false;
 
     for item in &query.return_items {
@@ -1265,7 +1278,9 @@ fn compile_variable_length(
                             has_start = true;
                         }
                         let col = property_to_column(prop, kind)?;
-                        select_parts.push(format!("{tbl}.{col} AS {var}_{prop}"));
+                        let output_alias = quote_identifier(&format!("{var}_{prop}"));
+                        select_parts.push(format!("{tbl}.{col} AS {output_alias}"));
+                        projection_aliases.push(output_alias);
                     } else {
                         let col = match prop.as_str() {
                             "id" => "via_edge",
@@ -1278,30 +1293,32 @@ fn compile_variable_length(
                                 )));
                             }
                         };
-                        select_parts.push(format!("t.{col} AS {var}_{prop}"));
+                        let output_alias = quote_identifier(&format!("{var}_{prop}"));
+                        select_parts.push(format!("t.{col} AS {output_alias}"));
+                        projection_aliases.push(output_alias);
                     }
                 }
                 ReturnItem::Variable(_) => match kind {
                     VarKind::Node => {
-                        if start.variable.as_deref() == Some(var) {
+                        let tbl = if start.variable.as_deref() == Some(var) {
                             has_start = true;
-                            select_parts.push(format!(
-                                "s.id AS {var}_id, s.namespace AS {var}_namespace, \
-                                 s.kind AS {var}_kind, s.entity_type AS {var}_entity_type, \
-                                 s.name AS {var}_name, \
-                                 s.properties AS {var}_properties, \
-                                 s.created_at AS {var}_created_at, \
-                                 s.updated_at AS {var}_updated_at"
-                            ));
+                            "s"
                         } else {
-                            select_parts.push(format!(
-                                "r.id AS {var}_id, r.namespace AS {var}_namespace, \
-                                 r.kind AS {var}_kind, r.entity_type AS {var}_entity_type, \
-                                 r.name AS {var}_name, \
-                                 r.properties AS {var}_properties, \
-                                 r.created_at AS {var}_created_at, \
-                                 r.updated_at AS {var}_updated_at"
-                            ));
+                            "r"
+                        };
+                        for column in [
+                            "id",
+                            "namespace",
+                            "kind",
+                            "entity_type",
+                            "name",
+                            "properties",
+                            "created_at",
+                            "updated_at",
+                        ] {
+                            let output_alias = quote_identifier(&format!("{var}_{column}"));
+                            select_parts.push(format!("{tbl}.{column} AS {output_alias}"));
+                            projection_aliases.push(output_alias);
                         }
                     }
                     VarKind::EventNode | VarKind::ObservationTargetNode => {
@@ -1312,10 +1329,15 @@ fn compile_variable_length(
                         ));
                     }
                     VarKind::Edge => {
-                        select_parts.push(format!(
-                            "t.via_edge AS {var}_id, t.via_relation AS {var}_relation, \
-                             t.via_weight AS {var}_weight"
-                        ));
+                        for (column, suffix) in [
+                            ("via_edge", "id"),
+                            ("via_relation", "relation"),
+                            ("via_weight", "weight"),
+                        ] {
+                            let output_alias = quote_identifier(&format!("{var}_{suffix}"));
+                            select_parts.push(format!("t.{column} AS {output_alias}"));
+                            projection_aliases.push(output_alias);
+                        }
                     }
                 },
             }
@@ -1326,20 +1348,18 @@ fn compile_variable_length(
         }
     }
 
-    select_parts.push("t.depth AS _depth".to_string());
-    select_parts.push("t.total_weight AS _total_weight".to_string());
+    let depth_alias = quote_identifier("_depth");
+    let total_weight_alias = quote_identifier("_total_weight");
+    select_parts.push(format!("t.depth AS {depth_alias}"));
+    select_parts.push(format!("t.total_weight AS {total_weight_alias}"));
 
     // This path uses SELECT DISTINCT, so ordering by hidden path identities can
     // pick an arbitrary representative for collapsed rows. Ordering by every
     // projected alias instead gives a total order over the rows that survive
     // DISTINCT while retaining depth/weight as the leading traversal order.
-    let projection_order = select_parts
-        .iter()
-        .flat_map(|group| group.split(", "))
-        .filter_map(|projection| projection.rsplit_once(" AS ").map(|(_, alias)| alias))
-        .filter(|alias| !matches!(*alias, "_depth" | "_total_weight"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Keep aliases as data: public AST names may contain SQL delimiters.
+    projection_aliases.retain(|alias| alias != &depth_alias && alias != &total_weight_alias);
+    let projection_order = projection_aliases.join(", ");
     let projection_order_suffix = if projection_order.is_empty() {
         String::new()
     } else {
@@ -1386,7 +1406,7 @@ fn compile_variable_length(
          FROM traverse t \
          {join_start} {join_end} \
          WHERE {end_where} \
-         ORDER BY _depth, _total_weight DESC{projection_order_suffix} \
+         ORDER BY {depth_alias}, {total_weight_alias} DESC{projection_order_suffix} \
          LIMIT ?{limit_param} OFFSET ?{offset_param}",
         primary_nodes = PRIMARY_NODE_SQL,
         seed_next = seed_next,
@@ -1798,8 +1818,7 @@ mod tests {
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
             compiled.sql.contains(
-                "ORDER BY _depth, _total_weight DESC, b_id, b_namespace, b_kind, \
-                 b_entity_type, b_name"
+                r#"ORDER BY "_depth", "_total_weight" DESC, "b_id", "b_namespace", "b_kind", "b_entity_type", "b_name""#
             ),
             "recursive DISTINCT pages need a total projected-row order: {}",
             compiled.sql
@@ -2065,12 +2084,12 @@ mod tests {
                 .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
-            compiled.sql.contains(".name AS a_name"),
+            compiled.sql.contains(r#".name AS "a_name""#),
             "sql: {}",
             compiled.sql
         );
         assert!(
-            compiled.sql.contains(".name AS b_name"),
+            compiled.sql.contains(r#".name AS "b_name""#),
             "sql: {}",
             compiled.sql
         );
@@ -2106,12 +2125,12 @@ mod tests {
             gql::parse("MATCH (a)-[e:extends]->(b) RETURN e.relation, e.weight LIMIT 5").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
-            compiled.sql.contains(".relation AS e_relation"),
+            compiled.sql.contains(r#".relation AS "e_relation""#),
             "sql: {}",
             compiled.sql
         );
         assert!(
-            compiled.sql.contains(".weight AS e_weight"),
+            compiled.sql.contains(r#".weight AS "e_weight""#),
             "sql: {}",
             compiled.sql
         );
@@ -2143,7 +2162,10 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(aliases, ["a_id", "e_id", "e_relation", "b_id"]);
+        assert_eq!(
+            aliases,
+            [r#""a_id""#, r#""e_id""#, r#""e_relation""#, r#""b_id""#]
+        );
     }
 
     #[test]

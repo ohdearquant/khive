@@ -57,7 +57,7 @@ fn distinct_and_case_distinct_bindings_keep_their_projection_sources() {
                     ]
                 );
                 for (alias, variable) in aliases.into_iter().zip([node, edge, "b"]) {
-                    let projection = format!("{alias} AS {variable}_id");
+                    let projection = format!("{alias} AS \"{variable}_id\"");
                     assert_eq!(
                         compiled.sql.matches(&projection).count(),
                         1,
@@ -88,7 +88,7 @@ fn anonymous_bindings_do_not_collide() {
                     compiled.return_vars,
                     vec![ReturnItem::Property(variable.into(), "id".into())]
                 );
-                let projection = format!("{alias} AS {variable}_id");
+                let projection = format!("{alias} AS \"{variable}_id\"");
                 assert_eq!(
                     compiled.sql.matches(&projection).count(),
                     1,
