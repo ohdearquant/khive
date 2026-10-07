@@ -1,0 +1,58 @@
+name: SQLite capacity acceptance
+
+on:
+  pull_request:
+    paths:
+      - "crates/khive-db/tests/capacity_floor_real_fs.rs"
+      - "scripts/test-sqlite-capacity-linux.sh"
+      - ".github/workflows/sqlite-capacity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "crates/khive-db/tests/capacity_floor_real_fs.rs"
+      - "scripts/test-sqlite-capacity-linux.sh"
+      - ".github/workflows/sqlite-capacity.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sqlite-capacity:
+    name: SQLite capacity acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      - name: Build the capacity test outside the namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path crates/Cargo.toml --locked -p khive-db --test capacity_floor_real_fs --no-run --message-format=json-render-diagnostics > "$RUNNER_TEMP/capacity-build.jsonl"
+          jq -er -s '
+            map(select(.reason == "compiler-artifact")
+              | select(.target.name == "capacity_floor_real_fs"
+              and (.target.kind | index("test"))
+              and .profile.test == true
+              and .executable != null))
+            | if length == 1 then .[0].executable
+              else error("expected one capacity test executable") end
+          ' "$RUNNER_TEMP/capacity-build.jsonl" > "$RUNNER_TEMP/capacity-binary"
+      - name: Require constrained-device acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS= read -r capacity_binary < "$RUNNER_TEMP/capacity-binary"
+          scripts/test-sqlite-capacity-linux.sh --privileged "$capacity_binary" 2>&1 | tee "$RUNNER_TEMP/capacity.log"
+          grep -Fxq ADR154_CAPACITY_PASS "$RUNNER_TEMP/capacity.log"
