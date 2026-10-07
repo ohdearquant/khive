@@ -2,11 +2,20 @@
 mod code_map;
 #[path = "pool/identity_registry.rs"]
 mod identity_registry;
+#[path = "pool/write_units.rs"]
+mod write_units;
 #[path = "pool/writer_acquisition.rs"]
 mod writer_acquisition;
 #[cfg(test)]
 use identity_registry::pool_identity_suffix;
 use identity_registry::PoolIdentityRegistration;
+#[cfg(test)]
+use write_units::STARTUP_SPACE_PROBE;
+pub use write_units::{CheckpointGuard, CheckpointResult, WriterAcquisitionSnapshot, WriterGuard};
+pub(crate) use write_units::{
+    PooledAutocommitWriteUnit, PooledTransactionWriteUnit, StandaloneTransactionWriteUnit,
+    WriteAdmission, WriterAcquisitionCounters,
+};
 
 use crossbeam_queue::ArrayQueue;
 use parking_lot::{Condvar, Mutex};
@@ -27,15 +36,21 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 use crate::database_owner_identity::{DatabaseOwnerIdentity, DatabaseOwnerIdentityError};
-use crate::disk_guard_config::{resolve_disk_guard_config, EffectiveDiskGuardConfig};
+use crate::disk_guard::{LeaseRefusal, VolumeIdentity, VolumeLease};
+#[cfg(test)]
+use crate::disk_guard_config::DiskGuardConfigSource;
+use crate::disk_guard_config::{
+    resolve_disk_guard_config, EffectiveDiskGuardConfig, DEFAULT_DISK_GUARD_DEADLINE_MS,
+};
 use crate::error::SqliteError;
 #[cfg(windows)]
 use crate::file_identity::sqlite_opened_file_identity;
 #[cfg(any(unix, windows))]
 use crate::file_identity::{database_file_identity, DatabaseFileIdentity};
-use crate::writer_task::WriterTaskHandle;
+use crate::writer_task::{execute_wrapped_transaction, WriterTaskHandle};
 use khive_storage::error::StorageError;
 use khive_storage::tx_registry::{DbIdentity, TxOrigin};
+use khive_storage::CapacityUnavailablePhase;
 use khive_storage::StorageCapability;
 
 mod claimed_file_identity;
@@ -100,82 +115,6 @@ fn run_identity_open_hook(path: &Path, stage: IdentityOpenStage, conn: Option<&C
             hook(path, stage, conn);
         }
     });
-}
-
-#[cfg(test)]
-type SpaceProbe = dyn Fn(&Path) -> std::io::Result<u64> + Send + Sync;
-
-#[cfg(test)]
-thread_local! {
-    static STARTUP_SPACE_PROBE: std::cell::RefCell<Option<(u64, Arc<SpaceProbe>)>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// The SQLite write reserve is sampled at each operation admission. SQLite
-/// does not expose the size of an arbitrary upcoming transaction, so the
-/// reserve is a warning boundary, not a guarantee that a single very large
-/// transaction cannot consume more than the remaining headroom.
-pub(crate) struct WriteAdmission {
-    volume: Option<PathBuf>,
-    floor_bytes: u64,
-    #[cfg(test)]
-    space_probe: Mutex<Option<Arc<SpaceProbe>>>,
-}
-
-impl WriteAdmission {
-    fn new(volume: Option<PathBuf>, floor_bytes: u64) -> Self {
-        #[cfg(test)]
-        let (floor_bytes, space_probe) = STARTUP_SPACE_PROBE.with(|probe| {
-            probe
-                .borrow()
-                .as_ref()
-                .map(|(floor, probe)| (*floor, Some(Arc::clone(probe))))
-                .unwrap_or((floor_bytes, None))
-        });
-        Self {
-            volume,
-            floor_bytes,
-            #[cfg(test)]
-            space_probe: Mutex::new(space_probe),
-        }
-    }
-
-    fn available_space(&self, volume: &Path) -> std::io::Result<u64> {
-        #[cfg(test)]
-        if let Some(probe) = self.space_probe.lock().as_ref() {
-            return probe(volume);
-        }
-        fs4::available_space(volume)
-    }
-
-    pub(crate) fn check(&self) -> Result<(), SqliteError> {
-        let Some(volume) = self.volume.as_deref() else {
-            return Ok(());
-        };
-        if self.floor_bytes == 0 {
-            return Ok(());
-        }
-        let available = self.available_space(volume)?;
-        // SQL does not tell admission how many bytes the next transaction
-        // will append. At equality, even its first byte would cross the floor.
-        if available <= self.floor_bytes {
-            return Err(SqliteError::CapacityFloor {
-                volume: volume.display().to_string(),
-                available_bytes: available,
-                floor_bytes: self.floor_bytes,
-                required_headroom_bytes: 0,
-            });
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    fn set_test_space_probe(
-        &self,
-        probe: impl Fn(&Path) -> std::io::Result<u64> + Send + Sync + 'static,
-    ) {
-        *self.space_probe.lock() = Some(Arc::new(probe));
-    }
 }
 
 /// Runtime-owned SQL transactions that share the store write-routing policy.
@@ -453,6 +392,14 @@ pub struct PoolConfig {
     /// Overridable via `KHIVE_BUSY_TIMEOUT_SECS`.
     pub busy_timeout: Duration,
     /// Time to wait for a reader connection before returning an error (default: 5s).
+    ///
+    /// For a writer it bounds only the pool-mutex wait. A writable file-backed
+    /// pool takes the volume lease first, bounded by the guard deadline
+    /// (`disk_guard_deadline_ms`, default 2000 ms), so the effective writer
+    /// wait under contention is the guard deadline, then `checkout_timeout`:
+    /// a 50 ms value here can still wait about 2 s, and a wait that ends at
+    /// the lease returns `CapacityUnavailable` with phase `lock` rather than a
+    /// checkout timeout. Diagnostics report both bounds and their sum.
     ///
     /// Overridable via `KHIVE_CHECKOUT_TIMEOUT_SECS`.
     pub checkout_timeout: Duration,
@@ -766,6 +713,8 @@ pub struct SearchMechanismSnapshot {
 /// never alias a read onto the query-only writer slot.
 pub struct ConnectionPool {
     writer: Arc<Mutex<Connection>>,
+    // Prepared before admission so terminal cleanup cannot fail while allocating a replacement.
+    retirement_connection: Mutex<Option<Connection>>,
     #[cfg(any(test, feature = "test-support"))]
     statement_observer: Arc<crate::statement_observer::StatementObserverHub>,
     main_pool_generation: OnceLock<u64>,
@@ -1461,190 +1410,6 @@ impl ReaderAcquisitionCounters {
     }
 }
 
-/// A writer connection checked out from the pool.
-/// The Mutex ensures only one writer at a time.
-pub struct WriterGuard<'pool> {
-    guard: parking_lot::MutexGuard<'pool, Connection>,
-    /// The origin (ADR-091 backend-scoped attribution) of the pool this
-    /// guard was checked out from, carried so `transaction` can register its
-    /// span with the correct origin without holding a `&ConnectionPool`.
-    origin: TxOrigin,
-}
-
-/// A zero-wait checkout that can run only the fixed checkpoint recovery
-/// pragmas. The connection remains private: exposing it would let a caller
-/// execute logical writes without disk-reserve admission (ADR-154 §5).
-///
-/// Ordinary SQL is deliberately unavailable through this capability:
-/// ```compile_fail
-/// use khive_db::{ConnectionPool, PoolConfig};
-/// let pool = ConnectionPool::new(PoolConfig::default()).unwrap();
-/// pool.try_checkpoint_nowait().unwrap().execute_batch("CREATE TABLE bypass (id INTEGER)");
-/// ```
-pub struct CheckpointGuard<'pool> {
-    guard: parking_lot::MutexGuard<'pool, Connection>,
-}
-
-/// SQLite's three-column result from a fixed WAL checkpoint pragma.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointResult {
-    /// Whether SQLite reported a busy checkpoint.
-    pub busy: i64,
-    /// WAL frames observed by SQLite (`-1` when there is no WAL).
-    pub log_frames: i64,
-    /// WAL frames copied back into the database.
-    pub checkpointed_frames: i64,
-}
-
-impl CheckpointGuard<'_> {
-    /// Run a PASSIVE checkpoint without disk-reserve admission.
-    pub fn passive(&self) -> Result<CheckpointResult, SqliteError> {
-        self.guard
-            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                Ok(CheckpointResult {
-                    busy: row.get(0)?,
-                    log_frames: row.get(1)?,
-                    checkpointed_frames: row.get(2)?,
-                })
-            })
-            .map_err(Into::into)
-    }
-
-    /// Run a TRUNCATE checkpoint without disk-reserve admission.
-    pub fn truncate(&self) -> Result<CheckpointResult, SqliteError> {
-        self.guard
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok(CheckpointResult {
-                    busy: row.get(0)?,
-                    log_frames: row.get(1)?,
-                    checkpointed_frames: row.get(2)?,
-                })
-            })
-            .map_err(Into::into)
-    }
-}
-
-/// Process-local monotonic counters for every instrumented writer acquisition
-/// boundary owned by one [`ConnectionPool`].
-///
-/// The aggregate `acquisitions` is the saturating sum of its three explicit
-/// connection classes. Infrastructure-only opens (the diagnostics PASSIVE
-/// probe, the writer task's one-time lifetime connection, and the checkpoint
-/// task's dedicated long-lived connection) are excluded; zero-wait
-/// maintenance probes also remain outside these request-traffic counters.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct WriterAcquisitionSnapshot {
-    /// Successful acquisitions across pooled, standalone, and writer-task
-    /// connection classes.
-    pub acquisitions: u64,
-    /// Successful finite-wait pool-mutex writer checkouts.
-    pub pooled_acquisitions: u64,
-    /// Successful per-operation standalone writer connection opens.
-    pub standalone_acquisitions: u64,
-    /// Successful writer-task ownership acquisitions (one per dequeued
-    /// top-level request or successful `BEGIN IMMEDIATE`).
-    pub writer_task_acquisitions: u64,
-    /// Finite-wait pool writer checkouts that exhausted their deadline.
-    pub timeouts: u64,
-    /// Instrumented direct executions whose final returned error retains SQLite's
-    /// primary DatabaseBusy code, once per operation after its busy handler.
-    /// Excludes LOCKED, checkout/open/admission failures, readers, writer tasks,
-    /// infrastructure probes and uninstrumented raw connection escapes.
-    pub direct_busy_refusals: u64,
-    /// Every writer-task `BEGIN IMMEDIATE` attempt refused busy or locked,
-    /// including refusals a subsequent bounded retry went on to absorb.
-    /// Counted separately from `timeouts` because that counter names the
-    /// pool-mutex checkout stage; folding the two would mislabel the stage.
-    pub writer_task_begin_busy: u64,
-    /// Subset of `writer_task_begin_busy` that a subsequent bounded retry
-    /// absorbed before the request closure ran, so the refusal never
-    /// reached the caller. `writer_task_begin_busy - writer_task_begin_busy_absorbed`
-    /// is the count of refusals a caller actually observed.
-    pub writer_task_begin_busy_absorbed: u64,
-    /// Writer-task `BEGIN IMMEDIATE` attempts that failed for a reason other
-    /// than busy or locked, and so surface as `StorageError::Pool`.
-    pub writer_task_begin_errors: u64,
-    /// Dequeued writer-task requests that reached the writer seam (executed
-    /// or attempted to execute their operation) and terminated in error,
-    /// counted once per request regardless of the specific terminal state.
-    pub writer_task_request_failures: u64,
-    /// Subset of `writer_task_request_failures` whose terminal state was
-    /// `WriterTaskRequestState::SideEffectsUnknown` — the commit or rollback
-    /// outcome could not be established, so the request's side effects on
-    /// the database are unknown.
-    pub writer_task_side_effects_unknown: u64,
-}
-
-/// Atomics backing [`WriterAcquisitionSnapshot`]. The writer task retains an
-/// `Arc` after spawn so its per-request acquisition site can update the same
-/// pool-scoped snapshot without retaining the whole pool.
-#[derive(Debug, Default)]
-pub(crate) struct WriterAcquisitionCounters {
-    pooled_acquisitions: AtomicU64,
-    standalone_acquisitions: AtomicU64,
-    writer_task_acquisitions: AtomicU64,
-    pooled_timeouts: AtomicU64,
-    direct_busy_refusals: AtomicU64,
-    writer_task_begin_busy: AtomicU64,
-    writer_task_begin_busy_absorbed: AtomicU64,
-    writer_task_begin_errors: AtomicU64,
-    writer_task_request_failures: AtomicU64,
-    writer_task_side_effects_unknown: AtomicU64,
-}
-
-impl<'pool> WriterGuard<'pool> {
-    /// Returns a shared reference to the underlying connection.
-    pub fn conn(&self) -> &Connection {
-        &self.guard
-    }
-
-    /// Returns a mutable reference to the underlying connection.
-    pub fn conn_mut(&mut self) -> &mut Connection {
-        &mut self.guard
-    }
-
-    /// Execute a write transaction.
-    /// Wraps the closure in BEGIN IMMEDIATE ... COMMIT.
-    pub fn transaction<F, R>(&self, f: F) -> Result<R, SqliteError>
-    where
-        F: FnOnce(&Connection) -> Result<R, SqliteError>,
-    {
-        self.guard.execute_batch("BEGIN IMMEDIATE")?;
-        let _tx_handle = khive_storage::tx_registry::register_scoped(
-            Some("writer_guard_tx".to_string()),
-            self.origin.clone(),
-        );
-
-        match f(&self.guard) {
-            Ok(result) => {
-                if let Err(err) = self.guard.execute_batch("COMMIT") {
-                    let _ = self.guard.execute_batch("ROLLBACK");
-                    return Err(err.into());
-                }
-                Ok(result)
-            }
-            Err(err) => {
-                let _ = self.guard.execute_batch("ROLLBACK");
-                Err(err)
-            }
-        }
-    }
-}
-
-impl<'pool> Deref for WriterGuard<'pool> {
-    type Target = Connection;
-
-    fn deref(&self) -> &Self::Target {
-        self.conn()
-    }
-}
-
-impl<'pool> DerefMut for WriterGuard<'pool> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.conn_mut()
-    }
-}
-
 impl ConnectionPool {
     /// Create a new connection pool.
     ///
@@ -1665,6 +1430,16 @@ impl ConnectionPool {
             config.read_only,
         )?;
         code_map::validate_pool(&config)?;
+        if config.path.is_some() && !config.read_only {
+            let lock_dir =
+                crate::disk_guard_config::require_volume_lock_dir(config.volume_lock_dir.clone())?;
+            if !lock_dir.is_absolute() {
+                return Err(SqliteError::CapacityUnavailable {
+                    phase: CapacityUnavailablePhase::Lock,
+                    message: "configured volume-lock directory is not absolute".to_string(),
+                });
+            }
+        }
 
         // Resolve "no preference" (`None`) now that `path` is known: on for
         // file-backed pools, off for in-memory ones. An explicit `Some(_)`
@@ -1694,7 +1469,7 @@ impl ConnectionPool {
             None => (TxOrigin::Memory, None),
         };
         let (write_admission, disk_guard_config) = if !config.read_only {
-            if let Some(volume) = identity_path.as_deref().and_then(Path::parent) {
+            if identity_path.as_deref().and_then(Path::parent).is_some() {
                 let disk_guard = match config.disk_guard_config {
                     Some(policy) => policy,
                     None => resolve_disk_guard_config(None, None)?,
@@ -1714,16 +1489,34 @@ impl ConnectionPool {
                 }
                 (
                     Arc::new(WriteAdmission::new(
-                        Some(volume.to_path_buf()),
+                        identity_path.clone(),
                         disk_guard.reserve_bytes,
-                    )),
+                        disk_guard.guard_deadline_ms,
+                        config.volume_lock_dir.clone(),
+                    )?),
                     Some(disk_guard),
                 )
             } else {
-                (Arc::new(WriteAdmission::new(None, 0)), None)
+                (
+                    Arc::new(WriteAdmission::new(
+                        None,
+                        0,
+                        DEFAULT_DISK_GUARD_DEADLINE_MS,
+                        None,
+                    )?),
+                    None,
+                )
             }
         } else {
-            (Arc::new(WriteAdmission::new(None, 0)), None)
+            (
+                Arc::new(WriteAdmission::new(
+                    None,
+                    0,
+                    DEFAULT_DISK_GUARD_DEADLINE_MS,
+                    None,
+                )?),
+                None,
+            )
         };
         let read_only_open_target = read_only_open_target(&config, identity_path.as_deref())?;
         #[cfg(any(unix, windows))]
@@ -1734,6 +1527,10 @@ impl ConnectionPool {
             .flatten();
         #[cfg(any(unix, windows))]
         claimed_file_identity::verify_before_open(&config, identity_before_open)?;
+        let retirement_connection = Connection::open_in_memory()?;
+        retirement_connection.authorizer(Some(deny_retired_writer))?;
+        // Declared first so a failed bootstrap closes SQLite before releasing its lease.
+        let mut initialization_lease = None;
         let mut writer = open_writer_connection(
             &config,
             read_only_open_target.as_deref(),
@@ -1779,19 +1576,33 @@ impl ConnectionPool {
                 ));
             }
         }
-        let opened_database_id =
-            if identity_path.is_some() && !config.read_only && initial_database_id.is_none() {
-                match write_admission.check() {
-                    Ok(()) => Some(initialize_database_id(&mut writer)?),
-                    // Recovery must be able to open this pool and its checkpoint
-                    // connection below the reserve. Physical file pinning still
-                    // applies; a later pool open can install the nonce.
-                    Err(SqliteError::CapacityFloor { .. }) => None,
-                    Err(error) => return Err(error),
+        // A newly-created file must still belong to the volume captured from
+        // its parent before open, and an existing file must retain that volume.
+        write_admission.verify_current_volume()?;
+        let opened_database_id = if identity_path.is_some()
+            && !config.read_only
+            && initial_database_id.is_none()
+        {
+            match write_admission.check() {
+                Ok(()) => {
+                    initialization_lease = write_admission.acquire()?;
+                    match initialize_database_id_with_admission(&mut writer, Some(&write_admission))
+                    {
+                        Ok(id) => Some(id),
+                        Err(SqliteError::CapacityFloor { .. }) => None,
+                        Err(error) => return Err(error),
+                    }
                 }
-            } else {
-                initial_database_id
-            };
+                // Recovery must be able to open this pool and its checkpoint
+                // connection below the reserve. Physical file pinning still
+                // applies; a later pool open can install the nonce.
+                Err(SqliteError::CapacityFloor { .. }) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            initial_database_id
+        };
+        drop(initialization_lease.take());
         #[cfg(test)]
         if let Some(path) = identity_path.as_deref() {
             run_identity_open_hook(
@@ -1823,6 +1634,7 @@ impl ConnectionPool {
 
         let mut pool = Self {
             writer: Arc::new(Mutex::new(writer)),
+            retirement_connection: Mutex::new(Some(retirement_connection)),
             #[cfg(any(test, feature = "test-support"))]
             statement_observer,
             main_pool_generation: OnceLock::new(),
@@ -2112,8 +1924,39 @@ impl ConnectionPool {
     /// Waits up to `checkout_timeout` for the writer Mutex and returns
     /// `Err(SqliteError::WriterPoolCheckoutTimeout)` if the timeout is
     /// exceeded.
+    #[track_caller]
     pub fn writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        self.writer_with_checkout_probe(true, false)
+    }
+
+    /// Callers that own an explicit §4 logical-write boundary probe there,
+    /// so checkout must not refuse ahead of their BEGIN/bootstrap statement.
+    #[track_caller]
+    pub(crate) fn writer_for_admitted_operation(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        self.writer_with_checkout_probe(false, false)
+    }
+
+    /// Checkpoint ownership setup changes only SQLite's checkpoint policy.
+    /// Its bounded checkout must remain available below the write reserve.
+    fn writer_for_checkpoint_operation(&self) -> Result<WriterGuard<'_>, SqliteError> {
+        self.writer_with_checkout_probe(false, true)
+    }
+
+    #[track_caller]
+    fn writer_with_checkout_probe(
+        &self,
+        compatibility_probe: bool,
+        checkpoint_bypass: bool,
+    ) -> Result<WriterGuard<'_>, SqliteError> {
+        if !checkpoint_bypass {
+            self.write_admission.ensure_settled()?;
+        }
         self.ensure_pooled_writer_active()?;
+        let volume_lease = if checkpoint_bypass {
+            None
+        } else {
+            self.write_admission.acquire()?
+        };
         let Some(guard) = self.writer.try_lock_for(self.config.checkout_timeout) else {
             self.writer_acquisition_counters
                 .pooled_timeouts
@@ -2138,13 +1981,26 @@ impl ConnectionPool {
             });
         };
         self.ensure_pooled_writer_active()?;
-        self.write_admission.check()?;
+        #[cfg(any(unix, windows))]
+        if let Some(path) = self.identity_path.as_deref() {
+            self.verify_opened_file_identity(path)?;
+            self.verify_connection_file_identity(&guard, path)?;
+        }
+        // Public raw-Connection/Deref compatibility callers may issue an
+        // autocommit write without another seam. Keep the old coarse sample
+        // until those sites migrate; explicit admitted operations skip it.
+        if compatibility_probe && !checkpoint_bypass {
+            self.write_admission.check()?;
+        }
         self.writer_acquisition_counters
             .pooled_acquisitions
             .fetch_add(1, Ordering::Relaxed);
         Ok(WriterGuard {
             guard,
             origin: self.origin(),
+            pool: self,
+            admission: self.write_admission.as_ref(),
+            _volume_lease: volume_lease,
         })
     }
 
@@ -2152,18 +2008,47 @@ impl ConnectionPool {
     ///
     /// Returns `Err` on timeout instead of panicking. Use this in request
     /// handlers where a 500 is preferable to crashing the process.
+    #[track_caller]
     pub fn try_writer(&self) -> Result<WriterGuard<'_>, SqliteError> {
         self.writer()
     }
 
-    pub(crate) fn writer_until<C>(
+    // Retain the compatibility-probe path only for its focused regression
+    // fixtures; production callers use the execution-boundary admission seam.
+    #[cfg(test)]
+    #[track_caller]
+    fn writer_until<C>(&self, should_stop: C) -> Result<Option<WriterGuard<'_>>, SqliteError>
+    where
+        C: Fn() -> bool,
+    {
+        self.writer_until_with_checkout_probe(should_stop, true)
+    }
+
+    #[track_caller]
+    pub(crate) fn writer_until_for_admitted_operation<C>(
         &self,
         should_stop: C,
     ) -> Result<Option<WriterGuard<'_>>, SqliteError>
     where
         C: Fn() -> bool,
     {
+        self.writer_until_with_checkout_probe(should_stop, false)
+    }
+
+    #[track_caller]
+    fn writer_until_with_checkout_probe<C>(
+        &self,
+        should_stop: C,
+        compatibility_probe: bool,
+    ) -> Result<Option<WriterGuard<'_>>, SqliteError>
+    where
+        C: Fn() -> bool,
+    {
         self.ensure_pooled_writer_active()?;
+        if should_stop() {
+            return Ok(None);
+        }
+        let volume_lease = self.write_admission.acquire()?;
         let started = Instant::now();
         loop {
             if should_stop() {
@@ -2183,13 +2068,23 @@ impl ConnectionPool {
                     return Ok(None);
                 }
                 self.ensure_pooled_writer_active()?;
-                self.write_admission.check()?;
+                #[cfg(any(unix, windows))]
+                if let Some(path) = self.identity_path.as_deref() {
+                    self.verify_opened_file_identity(path)?;
+                    self.verify_connection_file_identity(&guard, path)?;
+                }
+                if compatibility_probe {
+                    self.write_admission.check()?;
+                }
                 self.writer_acquisition_counters
                     .pooled_acquisitions
                     .fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(WriterGuard {
                     guard,
                     origin: self.origin(),
+                    pool: self,
+                    admission: self.write_admission.as_ref(),
+                    _volume_lease: volume_lease,
                 }));
             }
             if started.elapsed() >= self.config.checkout_timeout {
@@ -2256,6 +2151,23 @@ impl ConnectionPool {
         }
     }
 
+    /// Exercise the retired connection's authorizer without exporting a raw
+    /// handle from the pool. This is intentionally unavailable in production.
+    #[cfg(test)]
+    pub(crate) fn probe_retired_pooled_writer_for_test(&self) -> rusqlite::Result<i64> {
+        self.writer
+            .lock()
+            .query_row("SELECT 1", [], |row| row.get(0))
+    }
+
+    /// Leave an inherited transaction on the bare pooled connection to test
+    /// the typed write-unit refusal. A normal WriterGuard rolls it back on
+    /// drop, so it cannot create this poisoned state.
+    #[cfg(test)]
+    pub(crate) fn leave_pooled_writer_transaction_open_for_test(&self) -> rusqlite::Result<()> {
+        self.writer.lock().execute_batch("BEGIN IMMEDIATE")
+    }
+
     fn ensure_pooled_writer_active(&self) -> Result<(), SqliteError> {
         if self.pooled_writer_retired.load(Ordering::Acquire) {
             return Err(SqliteError::InvalidData(
@@ -2268,7 +2180,8 @@ impl ConnectionPool {
     /// Snapshot all instrumented writer acquisition outcomes since this pool
     /// was constructed.
     pub fn writer_acquisition_snapshot(&self) -> WriterAcquisitionSnapshot {
-        self.writer_acquisition_counters.snapshot()
+        self.writer_acquisition_counters
+            .snapshot(self.write_admission.lease_timeouts())
     }
 
     /// Count a coordinator call only after served-kind filtering selects this
@@ -2354,16 +2267,31 @@ impl ConnectionPool {
         floor_bytes: u64,
         probe: impl Fn(&Path) -> std::io::Result<u64> + Send + Sync + 'static,
     ) {
-        let volume = if self.config.read_only {
+        let database_path = if self.config.read_only {
             None
         } else {
-            self.canonical_path()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
+            self.canonical_path().map(Path::to_path_buf)
         };
-        let admission = Arc::new(WriteAdmission::new(volume, floor_bytes));
+        let admission = Arc::new(
+            WriteAdmission::new(
+                database_path,
+                floor_bytes,
+                DEFAULT_DISK_GUARD_DEADLINE_MS,
+                self.config.volume_lock_dir.clone(),
+            )
+            .expect("test admission volume identity"),
+        );
         admission.set_test_space_probe(probe);
         self.write_admission = admission;
+        if self.canonical_path().is_some() && !self.config.read_only {
+            self.disk_guard_config = Some(EffectiveDiskGuardConfig {
+                reserve_bytes: floor_bytes,
+                guard_deadline_ms: DEFAULT_DISK_GUARD_DEADLINE_MS,
+                reserve_source: DiskGuardConfigSource::Backend,
+                deadline_source: DiskGuardConfigSource::Default,
+                legacy_environment_present: false,
+            });
+        }
     }
 
     /// Get the current number of available reader connections.
@@ -2798,14 +2726,6 @@ impl ConnectionPool {
         self.writer_task_join.lock().take()
     }
 
-    /// Compatibility method: returns the writer connection wrapped in `Arc<Mutex>`.
-    ///
-    /// WARNING: This exists only for backward compatibility with code that
-    /// calls `store.conn()`. New code should use `reader()` and `writer()`.
-    pub fn legacy_conn(&self) -> Arc<Mutex<Connection>> {
-        Arc::clone(&self.writer)
-    }
-
     fn open_reader_connection(&self) -> Result<Connection, SqliteError> {
         let path = self.read_connection_path()?;
         #[cfg(any(unix, windows))]
@@ -2846,6 +2766,15 @@ impl ConnectionPool {
     /// increments the standalone acquisition class exactly once.
     pub fn open_standalone_writer(&self) -> Result<Connection, SqliteError> {
         self.write_admission.check()?;
+        self.open_standalone_writer_for_admitted_operation()
+    }
+
+    /// Open for a caller that owns §4 admission at its transaction or
+    /// autocommit execution boundary. Connection open alone cannot authorize
+    /// the later write, especially when a handle is cached across requests.
+    pub(crate) fn open_standalone_writer_for_admitted_operation(
+        &self,
+    ) -> Result<Connection, SqliteError> {
         let conn = self.open_standalone_writer_untracked()?;
         self.writer_acquisition_counters
             .standalone_acquisitions
@@ -3011,7 +2940,7 @@ impl ConnectionPool {
         }
         let result = (|| {
             if !self.config.read_only {
-                let writer = self.writer()?;
+                let writer = self.writer_for_checkpoint_operation()?;
                 writer.conn().pragma_update(None, "wal_autocheckpoint", 0)?;
             }
             Ok(())
@@ -3234,7 +3163,7 @@ fn database_file_identity_if_exists(
 }
 
 #[cfg(any(unix, windows))]
-fn opened_sqlite_file_identity(
+pub(crate) fn opened_sqlite_file_identity(
     conn: &Connection,
     path: &Path,
 ) -> Result<DatabaseFileIdentity, SqliteError> {
@@ -3280,11 +3209,30 @@ fn read_database_id(conn: &Connection) -> Result<Option<uuid::Uuid>, SqliteError
     Ok(Some(id))
 }
 
+#[cfg(test)]
 fn initialize_database_id(conn: &mut Connection) -> Result<uuid::Uuid, SqliteError> {
+    initialize_database_id_with_admission(conn, None)
+}
+
+fn initialize_database_id_with_admission(
+    conn: &mut Connection,
+    admission: Option<&WriteAdmission>,
+) -> Result<uuid::Uuid, SqliteError> {
     if let Some(id) = read_database_id(conn)? {
         return Ok(id);
     }
     let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(admission) = admission {
+        if let Err(error) = admission.check() {
+            let rollback = transaction.rollback();
+            return Err(crate::migrations::capacity_refusal_after_rollback(
+                conn,
+                rollback,
+                error,
+                "database identity bootstrap",
+            ));
+        }
+    }
     transaction.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS main.{DATABASE_ID_TABLE} (\
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1), \
@@ -4008,3 +3956,7 @@ mod database_owner_identity_pool_tests;
 #[cfg(test)]
 #[path = "pool_tests.rs"]
 mod tests;
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "pool_identity_admission_tests.rs"]
+mod identity_admission_tests;

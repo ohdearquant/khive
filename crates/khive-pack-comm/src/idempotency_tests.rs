@@ -71,10 +71,7 @@ fn file_parties() -> (tempfile::TempDir, VerbRegistry, VerbRegistry, KhiveRuntim
     let dir = tempfile::tempdir().unwrap();
     let backend =
         khive_db::StorageBackend::sqlite_for_test(dir.path().join("messages.db")).unwrap();
-    {
-        let mut writer = backend.pool().try_writer().unwrap();
-        khive_db::run_migrations(writer.conn_mut()).unwrap();
-    }
+    backend.pool().run_migrations().unwrap();
     assert!(backend.pool().writer_task_handle().unwrap().is_some());
     let backend = Arc::new(backend);
     let (sender, runtime) = actor_registry(Arc::clone(&backend), "actor:sender", "local");

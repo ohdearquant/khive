@@ -3,6 +3,22 @@ use khive_db::{ConnectionPool, PoolConfig, StorageBackend, WalCeilingPolicy, Wal
 use khive_runtime::{BackendId, KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
 use std::{path::Path, sync::Arc};
 
+// A private lock directory under the fixture root keeps these writable opens
+// out of the user's real volume-lock namespace.
+fn file_backend_with_policy(
+    root: &Path,
+    path: &Path,
+    policy: WalCeilingPolicy,
+) -> Result<StorageBackend, khive_db::SqliteError> {
+    StorageBackend::sqlite_with_max_readers_and_policies(
+        path,
+        Some(1),
+        policy,
+        khive_db::DiskGuardEnvironment::default().resolve(Some(0), None)?,
+        root.join("volume-locks"),
+    )
+}
+
 fn file_backend(
     root: &Path,
     name: &str,
@@ -11,12 +27,8 @@ fn file_backend(
 ) -> Arc<StorageBackend> {
     let path = root.join(name);
     if read_only {
-        let seed = StorageBackend::sqlite_with_max_readers_and_wal_ceiling(
-            &path,
-            Some(1),
-            WalCeilingPolicy::default(),
-        )
-        .expect("create main fixture database");
+        let seed = file_backend_with_policy(root, &path, WalCeilingPolicy::default())
+            .expect("create main fixture database");
         seed.prepare_core_schema()
             .expect("initialize fixture schema");
         drop(seed);
@@ -30,7 +42,7 @@ fn file_backend(
         )
     } else {
         Arc::new(
-            StorageBackend::sqlite_with_max_readers_and_wal_ceiling(&path, Some(1), policy)
+            file_backend_with_policy(root, &path, policy)
                 .expect("open fixture backend with explicit policy"),
         )
     }

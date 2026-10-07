@@ -15928,6 +15928,9 @@ async fn db_diagnostics_runtime_audit_fields_are_additive() {
     for field in [
         "writer_task_begin_busy",
         "direct_writer_busy_refusals",
+        "writer_lease_timeouts",
+        "configured_checkout_timeout_ms",
+        "effective_writer_wait_bound_ms",
         "writer_task_begin_busy_absorbed",
         "writer_task_request_failures",
         "writer_task_side_effects_unknown",

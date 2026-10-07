@@ -2338,7 +2338,7 @@ mod tests {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let pool = khive_db::ConnectionPool::new(khive_db::PoolConfig {
             path: Some(dir.path().join("already_taken.db")),
-            ..khive_db::PoolConfig::default()
+            ..khive_db::PoolConfig::for_test()
         })
         .expect("file-backed pool should open");
         assert!(

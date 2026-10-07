@@ -22,15 +22,15 @@ optional `sqlite-vec` vector storage over a WAL-mode connection pool.
 ## Usage
 
 ```rust
-use khive_db::{run_migrations, StorageBackend};
+use khive_db::StorageBackend;
 
 // File-backed (WAL mode, 1 writer + N readers) or StorageBackend::memory() for tests.
 let backend = StorageBackend::sqlite("/path/to/khive.db")?;
 
-{
-    let mut writer = backend.pool().try_writer()?;
-    run_migrations(writer.conn_mut())?;
-}
+// Core migrations through the pool's own write admission. The raw
+// `run_migrations(conn)` takes the volume lease itself, so it is not called on a
+// connection borrowed from a pool writer that is still held.
+backend.pool().run_migrations()?;
 
 let entities = backend.entities()?; // Arc<dyn khive_storage::EntityStore>
 let attachments = backend.attachments()?; // Arc<dyn khive_storage::AttachmentStore>

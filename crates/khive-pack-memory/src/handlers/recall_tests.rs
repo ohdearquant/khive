@@ -1912,10 +1912,7 @@ async fn recall_event_store_acquisition_failure_warns_without_failing_response()
     let tmp = tempfile::tempdir().expect("temp dir");
     let db_path = tmp.path().join("khive.db");
     let backend = Arc::new(khive_db::StorageBackend::sqlite_for_test(&db_path).expect("backend"));
-    {
-        let mut writer = backend.pool().writer().expect("migration writer");
-        khive_db::run_migrations(writer.conn_mut()).expect("migrations");
-    }
+    backend.pool().run_migrations().expect("migrations");
     let config = khive_runtime::RuntimeConfig {
         db_path: Some(db_path),
         embedding_model: None,

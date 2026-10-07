@@ -8,7 +8,6 @@ use khive_storage::error::StorageError;
 use khive_storage::{AgentState, AgentStore, StorageCapability, TerminalReason};
 use khive_types::AgentRecord;
 
-use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
 use crate::writer_task::WriterTaskHandle;
 
@@ -52,8 +51,18 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Sql, op, e)
 }
 
-fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
-    e.into_storage_error(StorageCapability::Sql, op)
+// The transaction wrapper reports a successful rollback, but the agent-store
+// API has always exposed a rejected INSERT as its underlying driver error.
+// Keep that distinction while retaining the wrapper's terminal error when
+// rollback or autocommit cannot be proved.
+fn preserve_driver_refusal(error: StorageError) -> StorageError {
+    match error {
+        StorageError::WriterTaskRequestFailed {
+            request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+            source,
+        } if matches!(source.as_ref(), StorageError::Driver { .. }) => *source,
+        other => other,
+    }
 }
 
 const AGENT_COLUMNS: &str = "agent_id, state, terminal_reason, provider, provider_session_id, \
@@ -185,27 +194,16 @@ fn insert_agent_dml(
 /// description of the table as a single runtime-owned process ledger.
 pub struct SqlAgentStore {
     pool: Arc<ConnectionPool>,
-    is_file_backed: bool,
     writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlAgentStore {
-    pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+    pub fn new(pool: Arc<ConnectionPool>, _is_file_backed: bool) -> Self {
         // Construction may happen before Tokio is entered. A missing handle
         // is therefore only a cache hint; every write re-resolves it and
         // applies strict/compatibility policy at the actual write seam.
         let writer_task = pool.writer_task_handle().ok().flatten();
-        Self {
-            pool,
-            is_file_backed,
-            writer_task,
-        }
-    }
-
-    fn open_standalone_writer(&self) -> Result<rusqlite::Connection, StorageError> {
-        self.pool
-            .open_standalone_writer()
-            .map_err(|e| map_sqlite_err(e, "open_agent_writer"))
+        Self { pool, writer_task }
     }
 
     fn current_writer_task(
@@ -224,32 +222,21 @@ impl SqlAgentStore {
         if let Some(writer_task) = self.current_writer_task(op)? {
             return writer_task
                 .send_bounded(move |conn| f(conn).map_err(|e| map_err(e, op)))
-                .await;
+                .await
+                .map_err(preserve_driver_refusal);
         }
 
         self.pool
             .record_direct_route(crate::timeout_sink::Site::DirectRouteAgentGeneralWrite);
-        if self.is_file_backed {
-            let conn = self.open_standalone_writer()?;
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                f(&conn)
-                    .map_err(|e| map_err(e, op))
-                    .inspect_err(|error| pool.record_direct_writer_error(error))
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || {
+            pool.execute_direct_transaction(StorageCapability::Sql, op, move |conn| {
+                f(conn).map_err(|error| map_err(error, op))
             })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Sql, op, e))?
-        } else {
-            let pool = Arc::clone(&self.pool);
-            tokio::task::spawn_blocking(move || {
-                let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
-                f(guard.conn())
-                    .map_err(|e| map_err(e, op))
-                    .inspect_err(|error| pool.record_direct_writer_error(error))
-            })
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Sql, op, e))?
-        }
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, op, e))?
+        .map_err(preserve_driver_refusal)
     }
 
     async fn with_reader<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
@@ -274,26 +261,19 @@ impl AgentStore for SqlAgentStore {
 
         // The provider-session pre-check and INSERT must share one write
         // transaction. The WriterTask already supplies that transaction, so
-        // submit only the DML body on the queue path; the compatibility path
-        // below retains its explicit BEGIN/COMMIT wrapper.
+        // submit only the DML body on the queue path. The direct typed unit
+        // supplies the same transaction around this body.
         if let Some(writer_task) = self.current_writer_task("agent_insert")? {
             return writer_task
                 .send_bounded(move |conn| {
                     insert_agent_dml(conn, &record).map_err(|error| map_err(error, "agent_insert"))
                 })
-                .await;
+                .await
+                .map_err(preserve_driver_refusal);
         }
 
-        self.with_writer("agent_insert", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-            if let Err(e) = insert_agent_dml(conn, &record) {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            conn.execute_batch("COMMIT")?;
-            Ok(())
-        })
-        .await
+        self.with_writer("agent_insert", move |conn| insert_agent_dml(conn, &record))
+            .await
     }
 
     async fn get(&self, agent_id: &str) -> Result<Option<AgentRecord>, StorageError> {

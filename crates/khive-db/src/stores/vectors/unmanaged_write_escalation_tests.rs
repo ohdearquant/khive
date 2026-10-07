@@ -42,8 +42,13 @@ async fn vector_unmanaged_writer_escalates_sqlite_full() {
             ))
         })
         .await
-        .expect_err("legacy vector write must preserve the SQLite failure");
-    assert!(matches!(error, StorageError::Driver { .. }));
+        .expect_err("direct vector write must preserve the SQLite failure");
+    assert!(matches!(error,
+        StorageError::WriterTaskRequestFailed {
+            request_state: khive_storage::WriterTaskRequestState::TransactionRolledBack,
+            source,
+        } if matches!(*source, StorageError::Driver { .. })
+    ));
     assert!(
         receiver.try_iter().any(|db| db == expected_db),
         "the unmanaged vector route must emit sqlite_full for its database"

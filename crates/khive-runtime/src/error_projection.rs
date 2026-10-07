@@ -494,6 +494,17 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_writer_refusal_converts_to_not_started() {
+        let value = runtime_error_value(
+            RuntimeError::from(khive_db::SqliteError::WriterPoisoned),
+            DomainDisposition::Unknown,
+        );
+        assert_eq!(value["request_state"], "not_started");
+        assert_eq!(value["task_terminated"], true);
+        assert_eq!(value["retryable"], false);
+    }
+
+    #[test]
     fn missing_subject_projection_is_typed_without_matching_error_text() {
         for disposition in [DomainDisposition::Unknown, DomainDisposition::NotCommitted] {
             let error = RuntimeError::NotFound("subject missing".into());

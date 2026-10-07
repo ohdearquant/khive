@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use khive_storage::attachment::{Attachment, AttachmentSubstrate};
 use khive_storage::entity::{Entity, EntityFilter, EntityTypeCounts};
-use khive_storage::error::{StorageError, WriterTaskRequestState};
+use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, Page, PageRequest, SeekCursor, SeekPage, SqlStatement, SqlValue,
 };
@@ -322,7 +322,9 @@ impl SqlEntityStore {
             .record_direct_route(crate::timeout_sink::Site::DirectRouteEntity);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
+            let guard = pool
+                .autocommit_write_unit()
+                .map_err(|e| map_sqlite_err(e, op))?;
             f(guard.conn())
                 .map_err(|e| map_err(e, op))
                 .inspect_err(|error| pool.record_direct_writer_error(error))
@@ -350,26 +352,10 @@ impl SqlEntityStore {
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool
-                .try_writer()
-                .map_err(|error| map_sqlite_err(error, op))?;
+                .transaction_write_unit()
+                .map_err(|error| map_sqlite_err(error, op))
+                .inspect_err(|error| pool.record_direct_writer_error(error))?;
             let conn = guard.conn();
-            if !conn.is_autocommit() {
-                pool.retire_pooled_writer(conn);
-                return Err(StorageError::WriterTaskTerminated {
-                    request_state: WriterTaskRequestState::SideEffectsUnknown,
-                });
-            }
-            if let Err(begin_error) = conn.execute_batch("BEGIN IMMEDIATE") {
-                if !conn.is_autocommit() {
-                    pool.retire_pooled_writer(conn);
-                    return Err(StorageError::WriterTaskTerminated {
-                        request_state: WriterTaskRequestState::SideEffectsUnknown,
-                    });
-                }
-                return Err(map_err(begin_error, op))
-                    .inspect_err(|error| pool.record_direct_writer_error(error));
-            }
-
             let (result, terminal_state) = execute_wrapped_transaction(conn, op, move |conn| {
                 f(conn).map_err(|error| map_err(error, op))
             });

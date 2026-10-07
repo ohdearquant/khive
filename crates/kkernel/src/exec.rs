@@ -1670,6 +1670,9 @@ fn disclose_resolved_database(cfg: &RuntimeConfig, khive_cfg: &KhiveConfig, forc
     let line =
         khive_mcp::serve::resolved_database_disclosure(cfg.db_path.as_deref(), &khive_cfg.backends);
     let _ = writeln!(std::io::stderr(), "{line}");
+    let lock_line =
+        khive_mcp::serve::resolved_volume_lock_disclosure(cfg.volume_lock_dir.as_deref());
+    let _ = writeln!(std::io::stderr(), "{lock_line}");
     let wal_line =
         khive_mcp::serve::resolved_wal_ceiling_disclosure(cfg, &khive_cfg.backends, force_memory);
     let _ = writeln!(std::io::stderr(), "{wal_line}");

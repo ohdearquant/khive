@@ -6404,7 +6404,7 @@ mod tests {
             let pool = Arc::new(
                 ConnectionPool::new(khive_db::PoolConfig {
                     path: Some(directory.join("same.db")),
-                    ..khive_db::PoolConfig::default()
+                    ..khive_db::PoolConfig::for_test()
                 })
                 .unwrap(),
             );

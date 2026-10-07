@@ -17,8 +17,12 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("direct_busy.db");
         let pool = Arc::new(
+            // Each fixture busy-waits on an external SQLite lock while it holds
+            // the volume lease; a lock directory of its own keeps that hold off
+            // the lease the other tests in this process share.
             ConnectionPool::new(PoolConfig {
                 path: Some(path.clone()),
+                volume_lock_dir: Some(dir.path().join("volume-locks")),
                 wal_mode,
                 busy_timeout: Duration::from_millis(50),
                 checkout_timeout: Duration::from_secs(2),

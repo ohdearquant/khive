@@ -118,12 +118,19 @@ fn sink_never_adds_measurable_latency_when_its_directory_is_unwritable() {
     // must still resolve in close to `checkout_timeout`, not measurably more,
     // even though `emit_timeout`'s underlying sink can never successfully
     // write anywhere in this test.
-    let held = pool.writer().expect("first checkout should succeed");
+    // The checkpoint capability holds only the writer mutex, not the volume
+    // lease, so the second checkout waits at the pool writer and times out there.
+    let held = pool
+        .try_checkpoint_nowait()
+        .expect("checkpoint capability holds only the writer mutex");
     let pool_for_thread = Arc::clone(&pool);
     let (timed_out_tx, timed_out_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let started = Instant::now();
-        let timed_out = pool_for_thread.writer().is_err();
+        let timed_out = matches!(
+            pool_for_thread.writer(),
+            Err(khive_db::SqliteError::WriterPoolCheckoutTimeout { .. })
+        );
         let _ = timed_out_tx.send((timed_out, started.elapsed()));
     });
     let (timed_out, elapsed) = timed_out_rx

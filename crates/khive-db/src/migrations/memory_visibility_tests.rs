@@ -8,8 +8,10 @@ use rusqlite::{params, Connection};
 use super::{migrate_through, table_exists};
 use crate::migrations::memory_visibility::test_state::{self, Stop};
 use crate::migrations::{
-    finalize_attachment_cutover, migrate_outbound_due_key, read_schema_version, run_migrations,
-    stage_attachment_cutover, validate_memory_visibility_cutover, MIGRATIONS,
+    finalize_attachment_cutover_for_test as finalize_attachment_cutover, migrate_outbound_due_key,
+    read_schema_version, run_migrations_for_test as run_migrations,
+    stage_attachment_cutover_for_test as stage_attachment_cutover,
+    validate_memory_visibility_cutover, MIGRATIONS,
 };
 
 struct StopGuard;

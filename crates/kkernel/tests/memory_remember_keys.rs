@@ -391,7 +391,7 @@ impl Fixture {
         assert!(self.memories("keys:index-check").is_empty());
         let pool = ConnectionPool::new(PoolConfig {
             path: Some(self.database.clone()),
-            ..PoolConfig::default()
+            ..PoolConfig::for_test()
         })
         .expect("observer pool for keyed-memory schema");
         let reader = pool.reader().expect("schema reader");

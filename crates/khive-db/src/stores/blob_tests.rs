@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "blob_tests/volume_floor_tests.rs"]
+mod volume_floor_tests;
+
 fn store(floor_bytes: u64) -> (tempfile::TempDir, FsBlobStore) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("blobs");
@@ -165,8 +168,17 @@ fn prepare_v20_gc_fixture(conn: &mut rusqlite::Connection) {
 /// gate then rejects. The assert below is what catches a drift here.
 fn prepare_completed_v21_gc_fixture(conn: &mut rusqlite::Connection) {
     prepare_v20_gc_fixture(conn);
-    crate::migrations::stage_attachment_cutover(conn).expect("stage canonical completed V21");
-    crate::migrations::finalize_attachment_cutover(conn).expect("finalize canonical completed V21");
+    let admission = crate::pool::WriteAdmission::for_migration_policy(
+        conn.path()
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from),
+        &crate::migrations::migration_test_policy(),
+    )
+    .expect("fixture admission policy");
+    crate::migrations::stage_attachment_cutover_with_admission(conn, &admission)
+        .expect("stage canonical completed V21");
+    crate::migrations::finalize_attachment_cutover_with_admission(conn, &admission)
+        .expect("finalize canonical completed V21");
     let version =
         crate::migrations::read_schema_version(conn).expect("read canonical completed V21 ledger");
     assert_eq!(
@@ -1140,37 +1152,6 @@ async fn capacity_floor_error_names_the_floor_and_volume() {
         "must name the floor: {msg}"
     );
     assert!(msg.contains("Blob"), "must name the capability: {msg}");
-}
-
-#[test]
-fn crosses_floor_is_write_size_aware_at_the_exact_boundary() {
-    // Exact-boundary case, verbatim from the report: `available ==
-    // floor_bytes + 1` must still refuse a 2-byte write. A floor-only
-    // check (`available < floor_bytes`) would NOT catch this — 101 is
-    // not below 100 — but the write's own size must be subtracted first.
-    assert!(crosses_floor(101, 2, 100));
-    assert!(!crosses_floor(101, 1, 100));
-}
-
-#[test]
-fn crosses_floor_accepts_a_write_that_lands_exactly_on_the_floor() {
-    assert!(!crosses_floor(100, 0, 100));
-}
-
-#[test]
-fn crosses_floor_rejects_a_write_that_lands_one_byte_under_the_floor() {
-    assert!(crosses_floor(100, 1, 100));
-}
-
-#[test]
-fn crosses_floor_saturates_instead_of_underflowing_when_write_exceeds_available() {
-    assert!(crosses_floor(10, 100, 50));
-    // floor_bytes == 0 means "no floor enforced" (the convention every
-    // other test in this file uses via `store(0)`) — even a write far
-    // exceeding available space is not refused by the floor check itself
-    // in that case; `saturating_sub` floors the subtraction at 0, and
-    // `0 < 0` is false.
-    assert!(!crosses_floor(10, 100, 0));
 }
 
 #[test]
@@ -2953,9 +2934,9 @@ async fn abandoned_claim_recovery_deletes_at_most_one_batch_per_writer_hold() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("khive.db");
     let backend = crate::StorageBackend::sqlite_for_test(&db_path).unwrap();
+    backend.pool().run_migrations().unwrap();
     {
         let mut writer = backend.pool().writer().unwrap();
-        crate::run_migrations(writer.conn_mut()).unwrap();
         let tx = writer.conn_mut().transaction().unwrap();
         for index in 0..(BLOB_GC_CLAIM_BATCH_SIZE + 1) {
             tx.execute(

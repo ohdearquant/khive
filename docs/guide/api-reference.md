@@ -1173,6 +1173,15 @@ standalone writer opens, and the third counts dequeued writer-task requests that
 dedicated connection (or successfully completed `BEGIN IMMEDIATE`).
 `writer_acquisition_timeouts` remains specific to the finite-wait main-pool mutex before SQLite
 executes; SQLite `BEGIN`/statement failures are separate stages.
+`writer_lease_timeouts` counts writes refused because another writer held the volume lease past
+the guard deadline; the caller receives `CapacityUnavailable` with phase `lock`, and the
+writer-timeout sink records a `timeout` row with `site` `volume_lease` and `phase` `lock`. Every
+writer class takes the lease before its connection, so same-volume writer contention lands in this
+counter rather than in `writer_acquisition_timeouts`. The effective writer wait bound under
+contention is the guard deadline for the lease, then `checkout_timeout` for the pool mutex:
+`configured_guard_deadline_ms` (null when the pool takes no lease), `configured_checkout_timeout_ms`
+and their sum `effective_writer_wait_bound_ms` report it, so a 50 ms `checkout_timeout` that waits
+about 2 s is the documented shape.
 `direct_writer_busy_refusals` counts instrumented direct typed-store and SQL executions
 whose final returned error retains SQLite's primary `SQLITE_BUSY` code, once per operation
 after the busy handler. It includes legacy pool-mutex writes, standalone writes, and direct

@@ -47,6 +47,8 @@ mod khive_root_tests {
 
     // MUST-FAIL: building the lock directory on `khive_dir()` resolves the
     // relative last-resort root in the child instead of returning the error.
+    // The child drops the test marker too, since under it the default is the
+    // shared test namespace rather than the per-user one.
     #[test]
     fn volume_lock_dir_without_a_home_is_an_error_not_the_relative_socket_root() {
         let in_parent = khive_storage::test_support::run_exact_test_in_child(
@@ -56,7 +58,8 @@ mod khive_root_tests {
                 command
                     .env_remove("HOME")
                     .env_remove("USERPROFILE")
-                    .env_remove("KHIVE_VOLUME_LOCK_DIR");
+                    .env_remove("KHIVE_VOLUME_LOCK_DIR")
+                    .env_remove("KHIVE_TEST_HARNESS");
             },
         );
         if in_parent {

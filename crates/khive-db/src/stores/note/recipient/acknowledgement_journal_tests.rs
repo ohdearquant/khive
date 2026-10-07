@@ -313,7 +313,7 @@ async fn acknowledgement_retry_bookkeeping_survives_file_backed_restart() {
     let pending_before;
     {
         let backend = StorageBackend::sqlite_for_test(&path).unwrap();
-        crate::run_migrations(backend.pool().writer().unwrap().conn_mut()).unwrap();
+        backend.pool().run_migrations().unwrap();
         let store = RecipientTransportStore::new(backend.pool_arc());
         store.commit(input.clone()).await.unwrap();
         store
@@ -323,7 +323,7 @@ async fn acknowledgement_retry_bookkeeping_survives_file_backed_restart() {
         pending_before = acknowledgement_row(&backend, input.delivery_attempt_id);
     }
     let reopened = StorageBackend::sqlite_for_test(&path).unwrap();
-    crate::run_migrations(reopened.pool().writer().unwrap().conn_mut()).unwrap();
+    reopened.pool().run_migrations().unwrap();
     let store = RecipientTransportStore::new(reopened.pool_arc());
     assert_eq!(
         acknowledgement_row(&reopened, input.delivery_attempt_id),

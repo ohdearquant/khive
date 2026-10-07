@@ -396,7 +396,7 @@ pub fn reachable_constraints(census: &NamespaceCensus) -> Vec<&NamespaceConstrai
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations::run_migrations;
+    use crate::migrations::run_migrations_for_test as run_migrations;
 
     fn migrated() -> Connection {
         let mut conn = Connection::open_in_memory().expect("in-memory connection");

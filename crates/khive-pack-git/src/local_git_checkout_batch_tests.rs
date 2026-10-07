@@ -131,6 +131,9 @@ impl Fixture {
         std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut config = RuntimeConfig::no_embeddings();
         config.db_path = Some(directory.path().join("runtime.db"));
+        // Own lock namespace, so runtime construction does not queue behind
+        // other tests' writers on this volume.
+        config.volume_lock_dir = Some(directory.path().join("volume-locks"));
         config.git_write.program = Some(wrapper);
         let runtime = Arc::new(KhiveRuntime::new(config).unwrap());
         let store = Arc::new(ObservedStore {

@@ -2203,11 +2203,11 @@ async fn failed_checkpoint_claim_keeps_existing_writer_task_on_fallback() {
         crate::pool::FALLBACK_WAL_AUTOCHECKPOINT_PAGES
     );
 
-    let legacy_conn = pool.legacy_conn();
     let (held_tx, held_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder_pool = Arc::clone(&pool);
     let holder = tokio::task::spawn_blocking(move || {
-        let _held_writer = legacy_conn.lock();
+        let _held_writer = holder_pool.try_checkpoint_nowait().expect("claim writer");
         held_tx.send(()).expect("signal held pooled writer");
         release_rx.recv().expect("release held pooled writer");
     });

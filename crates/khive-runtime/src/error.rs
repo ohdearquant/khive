@@ -890,6 +890,11 @@ impl From<khive_db::SqliteError> for RuntimeError {
                     request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
                 })
             }
+            khive_db::SqliteError::WriterPoisoned => {
+                Self::Storage(khive_storage::StorageError::WriterTaskTerminated {
+                    request_state: khive_storage::WriterTaskRequestState::NotStarted,
+                })
+            }
             error => Self::Sqlite(error),
         }
     }

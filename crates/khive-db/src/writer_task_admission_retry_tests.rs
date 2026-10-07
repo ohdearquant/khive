@@ -10,8 +10,11 @@ async fn transient_begin_refusal_retries_once_and_restores_timeout() {
     let path = dir.path().join("writer_task_begin_transient_contention.db");
     let busy_timeout = Duration::from_secs(5);
     let configured_timeout_ms = i64::try_from(busy_timeout.as_millis()).unwrap();
+    // A lock directory of its own keeps this deliberate writer hold off the
+    // volume lease the other tests in this process share.
     let pool = ConnectionPool::new(PoolConfig {
-        path: Some(path),
+        path: Some(path.clone()),
+        volume_lock_dir: Some(dir.path().join("volume-locks")),
         busy_timeout,
         ..PoolConfig::for_test()
     })
@@ -37,8 +40,8 @@ async fn transient_begin_refusal_retries_once_and_restores_timeout() {
         })
         .await
         .expect("install connection-local contention observers");
-    let lock_holder = pool.try_writer().unwrap();
-    lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+    let lock_holder = Connection::open(&path).unwrap();
+    lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let op_runs = Arc::new(AtomicUsize::new(0));
     let op_runs_in_request = Arc::clone(&op_runs);
@@ -61,7 +64,7 @@ async fn transient_begin_refusal_retries_once_and_restores_timeout() {
         .await;
         // Release even when the handshake times out, so a failing test
         // cannot strand the writer behind its own fixture lock.
-        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+        lock_holder.execute_batch("ROLLBACK").unwrap();
         observed.expect("first BEGIN refusal must be observed before releasing the lock");
     };
     let (result, ()) = tokio::join!(send_future, release_future);
@@ -224,8 +227,11 @@ async fn contended_begin_exhaustion_separates_absorbed_and_surfaced_refusals() {
     // which this integration test cannot reproduce deterministically.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("writer_task_begin_busy_counter.db");
+    // A lock directory of its own keeps this deliberate writer hold off the
+    // volume lease the other tests in this process share.
     let cfg = PoolConfig {
         path: Some(path.clone()),
+        volume_lock_dir: Some(dir.path().join("volume-locks")),
         busy_timeout: Duration::from_millis(150),
         ..PoolConfig::for_test()
     };
@@ -247,8 +253,8 @@ async fn contended_begin_exhaustion_separates_absorbed_and_surfaced_refusals() {
     );
     assert_eq!(before.writer_task_begin_busy_absorbed, 0);
 
-    let lock_holder = pool.try_writer().unwrap();
-    lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+    let lock_holder = Connection::open(&path).unwrap();
+    lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let result = handle
         .send(|conn| {
@@ -287,7 +293,7 @@ async fn contended_begin_exhaustion_separates_absorbed_and_surfaced_refusals() {
     // Discriminating arm: a SUCCEEDING request must not move the failure
     // counter. Without this the assertion above would also pass against a
     // counter that simply counted every request.
-    lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+    lock_holder.execute_batch("ROLLBACK").unwrap();
     drop(lock_holder);
     handle
         .send(|conn| {
@@ -330,8 +336,11 @@ async fn begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("writer_task_begin_retry_budget.db");
     let busy_timeout = Duration::from_millis(150);
+    // A lock directory of its own keeps this deliberate writer hold off the
+    // volume lease the other tests in this process share.
     let cfg = PoolConfig {
-        path: Some(path),
+        path: Some(path.clone()),
+        volume_lock_dir: Some(dir.path().join("volume-locks")),
         busy_timeout,
         ..PoolConfig::for_test()
     };
@@ -345,8 +354,8 @@ async fn begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention
     }
 
     let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
-    let lock_holder = pool.try_writer().unwrap();
-    lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+    let lock_holder = Connection::open(&path).unwrap();
+    lock_holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let result = handle
         .send(|conn| {
@@ -380,7 +389,7 @@ async fn begin_retry_budget_makes_exactly_one_attempt_under_sustained_contention
         "a refusal that already consumed the whole budget must not be retried"
     );
 
-    lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+    lock_holder.execute_batch("ROLLBACK").unwrap();
 }
 
 #[tokio::test]
@@ -428,4 +437,143 @@ async fn writer_task_resamples_capacity_for_each_request() {
     ));
     assert_eq!(samples.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(operations.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[serial(tx_registry)]
+async fn queued_request_probes_after_begin_rolls_back_and_task_recovers() {
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queued_capacity_refusal.db");
+    let mut pool = file_pool(&path);
+    pool.writer()
+        .unwrap()
+        .conn()
+        .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    let available = Arc::new(AtomicU64::new(102));
+    let sampled = Arc::clone(&available);
+    pool.set_test_write_admission(100, move |_| Ok(sampled.load(Ordering::SeqCst)));
+    let handle = spawn(&pool, 8).unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let first_handle = handle.clone();
+    let first = tokio::spawn(async move {
+        first_handle
+            .send(move |conn| {
+                conn.execute("INSERT INTO t (id) VALUES (1)", [])
+                    .map_err(|error| StorageError::Pool {
+                        operation: "first_capacity_insert".into(),
+                        message: error.to_string(),
+                    })?;
+                let _ = started_tx.send(());
+                release_rx.recv().expect("first request must be released");
+                Ok::<_, StorageError>(())
+            })
+            .await
+    });
+    started_rx.await.expect("first request must reach its body");
+
+    let second_ran = Arc::new(AtomicBool::new(false));
+    let second_ran_in_body = Arc::clone(&second_ran);
+    let second = handle
+        .enqueue_inner(
+            move |conn| {
+                second_ran_in_body.store(true, Ordering::SeqCst);
+                conn.execute("INSERT INTO t (id) VALUES (2)", [])
+                    .map_err(|error| StorageError::Pool {
+                        operation: "second_capacity_insert".into(),
+                        message: error.to_string(),
+                    })
+            },
+            false,
+            false,
+            false,
+        )
+        .await
+        .expect("second request must be queued while first holds the lease");
+    available.store(100, Ordering::SeqCst);
+    release_tx.send(()).unwrap();
+    first.await.unwrap().unwrap();
+
+    assert!(matches!(
+        second.await.unwrap(),
+        Err(StorageError::CapacityFloor {
+            capability: khive_storage::StorageCapability::Sql,
+            available_bytes: 100,
+            required_headroom_bytes: 0,
+            ..
+        })
+    ));
+    assert!(!second_ran.load(Ordering::SeqCst));
+
+    available.store(102, Ordering::SeqCst);
+    handle
+        .send(|conn| {
+            conn.execute("INSERT INTO t (id) VALUES (3)", [])
+                .map_err(|error| StorageError::Pool {
+                    operation: "recovered_capacity_insert".into(),
+                    message: error.to_string(),
+                })
+        })
+        .await
+        .expect("a successful rollback must leave the writer task usable");
+    let count: i64 = pool
+        .reader()
+        .unwrap()
+        .conn()
+        .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 2, "the refused request did not write a row");
+}
+
+#[tokio::test]
+#[serial(tx_registry)]
+async fn probe_failure_after_begin_is_typed_and_nonterminal_after_rollback() {
+    use khive_storage::CapacityUnavailablePhase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("probe_failure_after_begin.db");
+    let mut pool = file_pool(&path);
+    let fail_probe = Arc::new(AtomicBool::new(true));
+    let fail_in_probe = Arc::clone(&fail_probe);
+    pool.set_test_write_admission(100, move |_| {
+        if fail_in_probe.load(Ordering::SeqCst) {
+            Err(std::io::Error::other("injected capacity probe failure"))
+        } else {
+            Ok(102)
+        }
+    });
+    let handle = spawn(&pool, 8).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_in_body = Arc::clone(&ran);
+    let first = handle
+        .send(move |_| {
+            ran_in_body.store(true, Ordering::SeqCst);
+            Ok::<_, StorageError>(())
+        })
+        .await;
+    assert!(matches!(
+        first,
+        Err(StorageError::CapacityUnavailable {
+            capability: khive_storage::StorageCapability::Sql,
+            phase: CapacityUnavailablePhase::Probe,
+            ..
+        })
+    ));
+    assert!(!ran.load(Ordering::SeqCst));
+
+    fail_probe.store(false, Ordering::SeqCst);
+    handle
+        .send(|conn| {
+            assert!(
+                !conn.is_autocommit(),
+                "the recovered request has its own BEGIN"
+            );
+            Ok::<_, StorageError>(())
+        })
+        .await
+        .expect("the refusal rolled back and left the writer task usable");
 }

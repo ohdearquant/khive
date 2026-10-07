@@ -12,7 +12,8 @@
 //! integration-test binary (its own process, per Cargo's `tests/`
 //! convention) containing only sink-wiring tests that all point the sink at
 //! one shared, process-lifetime directory (via [`ensure_sink_dir`]), so they
-//! can run concurrently without racing each other for it.
+//! cannot race to claim different sink directories. Writer tests serialize
+//! on one key because their databases also share a physical-volume lease.
 //!
 //! The sink hands events to a background writer thread through a bounded
 //! channel, so a caller-path emission never blocks on file I/O and a line
@@ -170,6 +171,7 @@ fn ndjson_wait_does_not_hide_other_read_errors() {
 /// spawned copy of this integration-test binary because other tests in the
 /// parent process intentionally initialize that global sink.
 #[test]
+#[serial_test::serial(writer_timeout_sink_volume)]
 fn read_only_pool_does_not_claim_sink_and_later_writable_pool_can() {
     const CHILD_MARKER: &str = "KHIVE_READ_ONLY_SINK_FRESH_PROCESS";
 
@@ -283,6 +285,7 @@ fn read_only_pool_does_not_claim_sink_and_later_writable_pool_can() {
 /// a tiny `checkout_timeout`) must produce a `"kind":"timeout"` /
 /// `"site":"pool_admission"` row naming this pool's own database path.
 #[test]
+#[serial_test::serial(writer_timeout_sink_volume)]
 fn writer_admission_timeout_emits_ndjson_row() {
     ensure_sink_dir();
 
@@ -295,11 +298,18 @@ fn writer_admission_timeout_emits_ndjson_row() {
     };
     let pool = Arc::new(ConnectionPool::new(cfg).expect("file-backed pool should open"));
 
-    let held = pool.writer().expect("first checkout should succeed");
+    let held = pool
+        .try_checkpoint_nowait()
+        .expect("checkpoint capability holds only the writer mutex");
     let pool_for_thread = Arc::clone(&pool);
-    let timed_out = std::thread::spawn(move || pool_for_thread.writer().is_err())
-        .join()
-        .unwrap();
+    let timed_out = std::thread::spawn(move || {
+        matches!(
+            pool_for_thread.writer(),
+            Err(khive_db::SqliteError::WriterPoolCheckoutTimeout { .. })
+        )
+    })
+    .join()
+    .unwrap();
     assert!(
         timed_out,
         "a second writer checkout while the first is held must time out"
@@ -327,12 +337,94 @@ fn writer_admission_timeout_emits_ndjson_row() {
     );
 }
 
+/// Same-volume writer contention ends at the volume lease, which a writer
+/// takes before the pool mutex, so it never reaches `checkout_timeout`. The
+/// refused writer must still be counted and sunk: `lease_timeouts` rises,
+/// `timeouts` (the mutex stage) does not, and a `"kind":"timeout"` row with
+/// `"site":"volume_lease"` and `"phase":"lock"` names this pool's database.
+#[test]
+#[serial_test::serial(writer_timeout_sink_volume)]
+fn writer_lease_timeout_counts_and_emits_lock_phase_row() {
+    ensure_sink_dir();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("writer_lease_timeout_sink_test.db");
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(db_path.clone()),
+            checkout_timeout: Duration::from_millis(50),
+            // The holder keeps the lease through the waiter's whole deadline,
+            // and every pool on this volume in this process waits behind it,
+            // so the deadline stays short.
+            disk_guard_config: Some(khive_db::EffectiveDiskGuardConfig {
+                guard_deadline_ms: 100,
+                ..Default::default()
+            }),
+            ..PoolConfig::for_test()
+        })
+        .expect("file-backed pool should open"),
+    );
+    let before = pool.writer_acquisition_snapshot();
+
+    let held = pool
+        .writer()
+        .expect("the first writer takes the volume lease and the pool mutex");
+    let pool_for_thread = Arc::clone(&pool);
+    let (refused_at_lease, refusal) = std::thread::spawn(move || {
+        let result = pool_for_thread.writer().map(drop);
+        (
+            matches!(
+                result,
+                Err(khive_db::SqliteError::CapacityUnavailable {
+                    phase: khive_storage::CapacityUnavailablePhase::Lock,
+                    ..
+                })
+            ),
+            format!("{result:?}"),
+        )
+    })
+    .join()
+    .unwrap();
+    drop(held);
+    assert!(
+        refused_at_lease,
+        "a second writer on the same volume must be refused at the lease: {refusal}"
+    );
+
+    let after = pool.writer_acquisition_snapshot();
+    assert_eq!(
+        after.lease_timeouts,
+        before.lease_timeouts + 1,
+        "the lease refusal must be counted"
+    );
+    assert_eq!(
+        after.timeouts, before.timeouts,
+        "the refused writer never reached the pool mutex"
+    );
+
+    let canonical_db: PathBuf = db_path.canonicalize().unwrap_or(db_path);
+    let db_marker = canonical_db.display().to_string();
+    let is_lease_row = |line: &str| {
+        line.contains("\"kind\":\"timeout\"")
+            && line.contains("\"site\":\"volume_lease\"")
+            && line.contains("\"phase\":\"lock\"")
+            && line.contains("\"timeout_ms\":100")
+            && line.contains(&db_marker)
+    };
+    let contents = wait_for_ndjson_line(is_lease_row, Duration::from_secs(5));
+    assert!(
+        contents.lines().any(is_lease_row),
+        "expected a volume_lease timeout row with phase lock naming {db_marker}, got: {contents}"
+    );
+}
+
 /// Writer-timeout NDJSON sink coverage contract: a standalone-writer
 /// `SQLITE_BUSY`/`SQLITE_LOCKED` error surfaced through `SqlBridge` (the
 /// `sql_bridge.rs` emission site) must produce a `"kind":"timeout"` /
 /// `"site":"standalone:sql_bridge"` row naming this pool's own database
 /// path.
 #[tokio::test]
+#[serial_test::serial(writer_timeout_sink_volume)]
 async fn sql_bridge_busy_standalone_writer_emits_ndjson_row() {
     ensure_sink_dir();
 
@@ -356,10 +448,9 @@ async fn sql_bridge_busy_standalone_writer_emits_ndjson_row() {
             .unwrap();
     }
 
-    // Hold the write lock on an independent standalone connection so the
-    // bridge's own standalone writer (opened by `SqlBridge::writer()`) is
-    // the one that starves and surfaces SQLITE_BUSY.
-    let holder = pool.open_standalone_writer().unwrap();
+    // A raw SQLite holder does not claim khive's cooperative volume lease.
+    // The bridge must reach the intended SQLite busy site after admission.
+    let holder = rusqlite::Connection::open(&db_path).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let bridge = SqlBridge::new(Arc::clone(&pool), true);
@@ -405,6 +496,7 @@ async fn sql_bridge_busy_standalone_writer_emits_ndjson_row() {
 /// `"site":"standalone:graph"` row when a real held write lock forces
 /// `upsert_edge` to see `SQLITE_BUSY`.
 #[tokio::test]
+#[serial_test::serial(writer_timeout_sink_volume)]
 async fn graph_busy_standalone_writer_emits_ndjson_row() {
     ensure_sink_dir();
 
@@ -425,7 +517,7 @@ async fn graph_busy_standalone_writer_emits_ndjson_row() {
         writer.conn().execute_batch(GRAPH_DDL).unwrap();
     }
 
-    let holder = pool.open_standalone_writer().unwrap();
+    let holder = rusqlite::Connection::open(&db_path).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let store = SqlGraphStore::new_scoped(Arc::clone(&pool), true, "default");
@@ -477,6 +569,7 @@ async fn graph_busy_standalone_writer_emits_ndjson_row() {
 /// `"site":"standalone:event"` row when a real held write lock forces
 /// `append_event` to see `SQLITE_BUSY`.
 #[tokio::test]
+#[serial_test::serial(writer_timeout_sink_volume)]
 async fn event_busy_standalone_writer_emits_ndjson_row() {
     ensure_sink_dir();
 
@@ -497,7 +590,7 @@ async fn event_busy_standalone_writer_emits_ndjson_row() {
         writer.conn().execute_batch(EVENTS_DDL).unwrap();
     }
 
-    let holder = pool.open_standalone_writer().unwrap();
+    let holder = rusqlite::Connection::open(&db_path).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let store = SqlEventStore::new_scoped(Arc::clone(&pool), true, "default");
@@ -563,7 +656,7 @@ async fn event_busy_standalone_writer_emits_ndjson_row() {
 /// is lazy: the resolved `Some(false)` config is already baked in by the time
 /// the variables are restored below.
 #[tokio::test]
-#[serial_test::serial(writer_timeout_sink_busy_env)]
+#[serial_test::serial(writer_timeout_sink_volume)]
 async fn text_busy_standalone_writer_emits_ndjson_row() {
     ensure_sink_dir();
 
@@ -574,7 +667,7 @@ async fn text_busy_standalone_writer_emits_ndjson_row() {
     let previous_write_queue = std::env::var_os("KHIVE_WRITE_QUEUE");
     std::env::set_var("KHIVE_BUSY_TIMEOUT_SECS", "1");
     std::env::set_var("KHIVE_WRITE_QUEUE", "0");
-    let backend = khive_db::StorageBackend::sqlite(&db_path).expect("file-backed backend");
+    let backend = khive_db::StorageBackend::sqlite_for_test(&db_path).expect("file-backed backend");
     match previous_busy_timeout {
         Some(v) => std::env::set_var("KHIVE_BUSY_TIMEOUT_SECS", v),
         None => std::env::remove_var("KHIVE_BUSY_TIMEOUT_SECS"),
@@ -591,7 +684,7 @@ async fn text_busy_standalone_writer_emits_ndjson_row() {
 
     let store = backend.text("wts_busy_test").expect("text search");
 
-    let holder = backend.pool().open_standalone_writer().unwrap();
+    let holder = rusqlite::Connection::open(&db_path).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
 
     let doc = TextDocument {
@@ -642,6 +735,7 @@ async fn text_busy_standalone_writer_emits_ndjson_row() {
 /// sleeps 50ms, so the span is guaranteed over-threshold without depending
 /// on scheduler timing.
 #[tokio::test]
+#[serial_test::serial(writer_timeout_sink_volume)]
 async fn slow_queued_write_emits_slow_write_row() {
     ensure_sink_dir();
 
@@ -693,6 +787,7 @@ async fn slow_queued_write_emits_slow_write_row() {
 /// and db path so the assertion ("no slow_write row for THIS db") cannot
 /// collide with the positive test's rows in the shared sink file.
 #[tokio::test]
+#[serial_test::serial(writer_timeout_sink_volume)]
 async fn slow_write_disabled_by_zero_threshold_emits_nothing() {
     ensure_sink_dir();
 

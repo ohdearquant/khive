@@ -67,6 +67,9 @@ mod timing {
     ));
 }
 
+#[path = "pool_admission_tests.rs"]
+mod admission;
+
 #[test]
 fn constructor_writer_cancels_after_entering_the_wait_without_pool_timeout() {
     let pool = ConnectionPool::new(PoolConfig {
@@ -1266,7 +1269,7 @@ fn windows_read_only_legacy_reader_rejects_different_opened_file_identity() {
     let replacement = dir.path().join("replacement.db");
     for target in [&path, &replacement] {
         let conn = Connection::open(target).unwrap();
-        conn.execute_batch("CREATE TABLE marker (value INTEGER)")
+        conn.execute_batch(include_str!("../tests/fixtures/disk-admission.sql"))
             .unwrap();
     }
     let pool = ConnectionPool::new(PoolConfig {
@@ -1778,8 +1781,7 @@ fn standalone_writer_waits_for_checkpoint_claim_resolution() {
         .expect("pool open"),
     );
 
-    let legacy_conn = pool.legacy_conn();
-    let held_writer = legacy_conn.lock();
+    let held_writer = pool.try_checkpoint_nowait().expect("hold pooled writer");
     let claim_start = Arc::new(std::sync::Barrier::new(2));
     let claim_pool = Arc::clone(&pool);
     let claim_thread_start = Arc::clone(&claim_start);
@@ -1893,8 +1895,7 @@ fn failed_checkpoint_ownership_claim_keeps_fallback_and_can_be_retried() {
     })
     .expect("pool open");
 
-    let legacy_conn = pool.legacy_conn();
-    let held_writer = legacy_conn.lock();
+    let held_writer = pool.try_checkpoint_nowait().expect("hold pooled writer");
     let error = pool
         .claim_checkpoint_ownership()
         .expect_err("the held pooled writer must make the claim time out");
@@ -2039,12 +2040,14 @@ fn standalone_writer_open_counts_its_connection_class_once() {
             standalone_acquisitions: 1,
             writer_task_acquisitions: 0,
             timeouts: 0,
+            lease_timeouts: 0,
             direct_busy_refusals: 0,
             writer_task_begin_busy: 0,
             writer_task_begin_busy_absorbed: 0,
             writer_task_begin_errors: 0,
             writer_task_request_failures: 0,
             writer_task_side_effects_unknown: 0,
+            writer_guard_drop_rollbacks: 0,
         },
         "the public standalone boundary must contribute to the aggregate exactly once"
     );
@@ -2357,37 +2360,6 @@ fn writer_checkout_and_release_works() {
 }
 
 #[test]
-fn db_capacity_floor_refuses_pooled_writer_before_sqlite_work() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut pool = ConnectionPool::new(PoolConfig {
-        path: Some(dir.path().join("capacity.db")),
-        write_queue_enabled: Some(false),
-        ..PoolConfig::for_test()
-    })
-    .unwrap();
-    pool.set_test_write_admission(100, |_| Ok(100));
-
-    let error = match pool.writer() {
-        Ok(_) => panic!("the reserve must refuse this checkout"),
-        Err(error) => error,
-    };
-    let mapped = error.into_storage_error(StorageCapability::Sql, "test_write");
-    assert!(
-        matches!(
-            mapped,
-            StorageError::CapacityFloor {
-                capability: StorageCapability::Sql,
-                available_bytes: 100,
-                floor_bytes: 100,
-                ..
-            }
-        ),
-        "the refusal must keep its typed capacity classification"
-    );
-    assert_eq!(pool.writer_acquisition_snapshot().pooled_acquisitions, 0);
-}
-
-#[test]
 fn db_capacity_floor_keeps_legacy_pool_and_checkpoint_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy-capacity.db");
@@ -2442,9 +2414,7 @@ fn read_only_legacy_pool_accepts_later_nonce_installation() {
     .expect("open legacy database read-only");
     assert_eq!(read_only.opened_database_id, None);
 
-    let _probe = install_startup_space_probe(0, |_| {
-        panic!("the disabled floor must not sample disk space")
-    });
+    let _probe = install_startup_space_probe(0, |_| Ok(1));
     let writable = ConnectionPool::new(PoolConfig {
         path: Some(path),
         wal_mode: false,
@@ -2457,65 +2427,6 @@ fn read_only_legacy_pool_accepts_later_nonce_installation() {
     read_only
         .open_reader_connection()
         .expect("the preexisting read-only pool must keep replacing readers");
-}
-
-#[test]
-fn db_capacity_floor_samples_each_pooled_writer_admission() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut pool = ConnectionPool::new(PoolConfig {
-        path: Some(dir.path().join("fresh-capacity.db")),
-        write_queue_enabled: Some(false),
-        ..PoolConfig::for_test()
-    })
-    .unwrap();
-    let samples = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let observed = Arc::clone(&samples);
-    pool.set_test_write_admission(100, move |_| {
-        match observed.fetch_add(1, Ordering::SeqCst) {
-            0 => Ok(102),
-            1 => Ok(100),
-            extra => panic!("unexpected capacity sample {extra}"),
-        }
-    });
-
-    drop(pool.writer().expect("first admission clears the reserve"));
-    let second = pool.writer();
-    assert!(
-        matches!(
-            second,
-            Err(SqliteError::CapacityFloor {
-                available_bytes: 100,
-                ..
-            })
-        ),
-        "the second admission must see the lower free-space sample"
-    );
-    assert_eq!(samples.load(Ordering::SeqCst), 2);
-    assert_eq!(pool.writer_acquisition_snapshot().pooled_acquisitions, 1);
-}
-
-#[test]
-fn db_capacity_floor_covers_standalone_and_cancellable_writer_admission() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut pool = ConnectionPool::new(PoolConfig {
-        path: Some(dir.path().join("other-capacity.db")),
-        write_queue_enabled: Some(false),
-        ..PoolConfig::for_test()
-    })
-    .unwrap();
-    pool.set_test_write_admission(100, |_| Ok(99));
-
-    assert!(matches!(
-        pool.open_standalone_writer(),
-        Err(SqliteError::CapacityFloor { .. })
-    ));
-    assert!(matches!(
-        pool.writer_until(|| false),
-        Err(SqliteError::CapacityFloor { .. })
-    ));
-    let counters = pool.writer_acquisition_snapshot();
-    assert_eq!(counters.standalone_acquisitions, 0);
-    assert_eq!(counters.pooled_acquisitions, 0);
 }
 
 #[test]
@@ -2562,6 +2473,7 @@ fn writer_checkout_snapshot_counts_successes_and_timeouts_at_the_pool_boundary()
             standalone_acquisitions: 0,
             writer_task_acquisitions: 0,
             timeouts: 1,
+            lease_timeouts: 0,
             direct_busy_refusals: 0,
             // A pool-mutex checkout timeout must NOT bleed into the
             // writer-task BEGIN counters: separate stages, separate
@@ -2571,6 +2483,7 @@ fn writer_checkout_snapshot_counts_successes_and_timeouts_at_the_pool_boundary()
             writer_task_begin_errors: 0,
             writer_task_request_failures: 0,
             writer_task_side_effects_unknown: 0,
+            writer_guard_drop_rollbacks: 0,
         }
     );
 
@@ -2584,12 +2497,14 @@ fn writer_checkout_snapshot_counts_successes_and_timeouts_at_the_pool_boundary()
             standalone_acquisitions: 0,
             writer_task_acquisitions: 0,
             timeouts: 1,
+            lease_timeouts: 0,
             direct_busy_refusals: 0,
             writer_task_begin_busy: 0,
             writer_task_begin_busy_absorbed: 0,
             writer_task_begin_errors: 0,
             writer_task_request_failures: 0,
             writer_task_side_effects_unknown: 0,
+            writer_guard_drop_rollbacks: 0,
         }
     );
 }

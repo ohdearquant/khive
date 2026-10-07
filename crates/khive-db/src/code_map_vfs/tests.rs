@@ -52,6 +52,24 @@ fn fixture() -> tempfile::TempDir {
         .expect("private VFS fixture")
 }
 
+fn open_code_map(
+    path: impl AsRef<Path>,
+    protected_main: &[PathBuf],
+    protected_events: &[PathBuf],
+) -> Result<StorageBackend, SqliteError> {
+    StorageBackend::sqlite_code_map_with_policies(
+        path,
+        protected_main,
+        protected_events,
+        crate::DiskGuardEnvironment::default()
+            .resolve(Some(0), Some(100))
+            .unwrap(),
+        crate::PoolConfig::for_test()
+            .volume_lock_dir
+            .expect("private fixture lock directory"),
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn configured_production_parent_alias_is_sampled() {
@@ -70,17 +88,15 @@ fn configured_production_parent_alias_is_sampled() {
     let configured_production = configured_root.join("production.db");
 
     let target = dir.path().join("dedicated-map.db");
-    let backend =
-        StorageBackend::sqlite_code_map(&target, std::slice::from_ref(&configured_production), &[])
-            .expect("configured parent alias resolves before protected leaf sampling");
+    let backend = open_code_map(&target, std::slice::from_ref(&configured_production), &[])
+        .expect("configured parent alias resolves before protected leaf sampling");
     drop(backend);
 
     let alias = dir.path().join("production-hardlink.db");
     std::fs::hard_link(&production, &alias).unwrap();
-    let error =
-        StorageBackend::sqlite_code_map(&alias, std::slice::from_ref(&configured_production), &[])
-            .err()
-            .expect("physical production identity remains protected");
+    let error = open_code_map(&alias, std::slice::from_ref(&configured_production), &[])
+        .err()
+        .expect("physical production identity remains protected");
     assert!(
         error.to_string().contains("protected production identity"),
         "{error}"
@@ -99,7 +115,7 @@ fn planted_target_parent_symlink_below_fixture_root_refuses() {
     std::fs::create_dir(&physical_root).unwrap();
     std::os::unix::fs::symlink(&physical_root, &planted).unwrap();
     let target = planted.join("code-map.db");
-    let error = StorageBackend::sqlite_code_map(&target, &[], &[])
+    let error = open_code_map(&target, &[], &[])
         .err()
         .expect("target parent symlink must refuse before opening a database");
     assert!(
@@ -118,7 +134,7 @@ fn missing_target_parent_is_refused_and_not_created() {
     }
     let dir = fixture();
     let parent = dir.path().join("missing-parent");
-    let error = StorageBackend::sqlite_code_map(parent.join("code-map.db"), &[], &[])
+    let error = open_code_map(parent.join("code-map.db"), &[], &[])
         .err()
         .expect("a missing parent directory must refuse the open");
     assert!(
@@ -161,7 +177,7 @@ fn fresh_first_open_stays_in_delete_and_never_uses_shm() {
     let target = dir.path().join("code-map.db");
     let registrations_before = vfs::registration_count();
     let shm_before = callbacks::shm_violation_count();
-    let backend = StorageBackend::sqlite_code_map(&target, &[], &[]).expect("first guarded open");
+    let backend = open_code_map(&target, &[], &[]).expect("first guarded open");
     {
         let writer = backend.pool().writer().expect("guarded writer");
         let mode: String = writer
@@ -183,7 +199,7 @@ fn fresh_first_open_stays_in_delete_and_never_uses_shm() {
     assert_eq!(vfs::registration_count(), registrations_before + 1);
     drop(backend);
 
-    let reopened = StorageBackend::sqlite_code_map(&target, &[], &[]).expect("reuse guarded VFS");
+    let reopened = open_code_map(&target, &[], &[]).expect("reuse guarded VFS");
     assert_eq!(vfs::registration_count(), registrations_before + 1);
     let count: i64 = reopened
         .pool()
@@ -202,7 +218,7 @@ fn live_rollback_pool_reopens_without_quiescent_wal_transition() {
     }
     let dir = fixture();
     let target = dir.path().join("live-rollback-code-map.db");
-    let first = StorageBackend::sqlite_code_map(&target, &[], &[]).expect("first guarded pool");
+    let first = open_code_map(&target, &[], &[]).expect("first guarded pool");
     first
         .pool()
         .writer()
@@ -211,7 +227,7 @@ fn live_rollback_pool_reopens_without_quiescent_wal_transition() {
         .execute_batch("CREATE TABLE witness(value INTEGER); INSERT INTO witness VALUES(7)")
         .expect("seed a committed DELETE-mode row");
 
-    let second = StorageBackend::sqlite_code_map(&target, &[], &[])
+    let second = open_code_map(&target, &[], &[])
         .expect("a live rollback pool must not trigger a WAL transition");
     let writer = second.pool().writer().expect("second guarded writer");
     let mode: String = writer
@@ -247,8 +263,7 @@ fn prior_wal_is_converted_to_delete_without_losing_rows_or_using_shm() {
     drop(seed);
 
     let shm_before = callbacks::shm_violation_count();
-    let backend = StorageBackend::sqlite_code_map(&target, &[], &[])
-        .expect("guarded quiescent WAL transition");
+    let backend = open_code_map(&target, &[], &[]).expect("guarded quiescent WAL transition");
     let writer = backend.pool().writer().expect("post-transition writer");
     let mode: String = writer
         .conn()
@@ -364,7 +379,7 @@ fn byte_copy_of_production_is_not_an_identity_alias() {
     let target = dir.path().join("code-map.db");
     seed_rollback(&production);
     std::fs::copy(&production, &target).expect("copy equal bytes to a different inode");
-    let backend = StorageBackend::sqlite_code_map(&target, std::slice::from_ref(&production), &[])
+    let backend = open_code_map(&target, std::slice::from_ref(&production), &[])
         .expect("independent byte copy must be admissible");
     backend
         .pool()
@@ -405,7 +420,7 @@ fn opened_main_reports_when_its_path_names_another_file() {
     }
     let dir = fixture();
     let target = dir.path().join("code-map.db");
-    let backend = StorageBackend::sqlite_code_map(&target, &[], &[]).expect("first guarded open");
+    let backend = open_code_map(&target, &[], &[]).expect("first guarded open");
     let writer = backend.pool().writer().expect("guarded writer");
     assert_eq!(has_moved(writer.conn()), (rusqlite::ffi::SQLITE_OK, 0));
 

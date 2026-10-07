@@ -262,7 +262,9 @@ impl SqliteSparseStore {
             .record_direct_route(crate::timeout_sink::Site::DirectRouteSparseGeneralWrite);
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
-            let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
+            let guard = pool
+                .autocommit_write_unit()
+                .map_err(|e| map_sqlite_err(e, op))?;
             f(guard.conn())
                 .map_err(|e| map_err(e, op))
                 .inspect_err(|error| pool.record_direct_writer_error(error))

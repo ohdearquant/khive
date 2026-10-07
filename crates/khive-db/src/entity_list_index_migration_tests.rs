@@ -1,3 +1,4 @@
+use super::run_migrations_for_test as run_migrations;
 use super::*;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use std::sync::{Arc, Mutex};

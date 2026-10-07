@@ -7,6 +7,11 @@ impl WriterContentionDiagnostics {
         runtime_audit_batch_metrics: Option<RuntimeAuditBatchMetrics>,
     ) -> Self {
         let writer = pool.writer_acquisition_snapshot();
+        let configured_guard_deadline_ms = pool
+            .effective_disk_guard_config()
+            .map(|policy| policy.guard_deadline_ms);
+        let configured_checkout_timeout_ms =
+            u64::try_from(pool.config().checkout_timeout.as_millis()).unwrap_or(u64::MAX);
         let unavailable_reason =
             || Some("no audit-batch control is registered with this runtime instance".to_string());
         Self {
@@ -15,6 +20,12 @@ impl WriterContentionDiagnostics {
             standalone_writer_acquisitions: writer.standalone_acquisitions,
             writer_task_acquisitions: writer.writer_task_acquisitions,
             writer_acquisition_timeouts: writer.timeouts,
+            writer_lease_timeouts: writer.lease_timeouts,
+            configured_guard_deadline_ms,
+            configured_checkout_timeout_ms,
+            effective_writer_wait_bound_ms: configured_guard_deadline_ms
+                .unwrap_or(0)
+                .saturating_add(configured_checkout_timeout_ms),
             direct_writer_busy_refusals: writer.direct_busy_refusals,
             writer_task_begin_busy: writer.writer_task_begin_busy,
             writer_task_begin_busy_absorbed: writer.writer_task_begin_busy_absorbed,
@@ -103,4 +114,55 @@ async fn direct_busy_diagnostics_serializes_each_pool_counter() {
     assert_eq!(other_wire["direct_writer_busy_refusals"], 0);
     assert!(!holder.is_autocommit());
     holder.execute_batch("ROLLBACK").unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn writer_contention_reports_lease_timeouts_and_the_wait_bound() {
+    use crate::pool::PoolConfig;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Arc::new(
+        ConnectionPool::new(PoolConfig {
+            path: Some(dir.path().join("writer-wait-bound.db")),
+            checkout_timeout: Duration::from_millis(50),
+            // Same-volume pools in this process wait behind the held lease.
+            disk_guard_config: Some(crate::EffectiveDiskGuardConfig {
+                guard_deadline_ms: 100,
+                ..Default::default()
+            }),
+            ..PoolConfig::for_test()
+        })
+        .unwrap(),
+    );
+    let held = pool.writer().unwrap();
+    let waiter = Arc::clone(&pool);
+    let refused = std::thread::spawn(move || waiter.writer().is_err())
+        .join()
+        .unwrap();
+    drop(held);
+    assert!(refused, "a contended writer must be refused at the lease");
+    let wire =
+        serde_json::to_value(WriterContentionDiagnostics::snapshot(&pool, None, None)).unwrap();
+    assert_eq!(wire["writer_lease_timeouts"], 1);
+    assert_eq!(wire["writer_acquisition_timeouts"], 0);
+    assert_eq!(wire["configured_guard_deadline_ms"], 100);
+    assert_eq!(wire["configured_checkout_timeout_ms"], 50);
+    assert_eq!(wire["effective_writer_wait_bound_ms"], 150);
+
+    let memory = ConnectionPool::new(PoolConfig {
+        path: None,
+        checkout_timeout: Duration::from_millis(50),
+        ..PoolConfig::for_test()
+    })
+    .unwrap();
+    let memory_wire =
+        serde_json::to_value(WriterContentionDiagnostics::snapshot(&memory, None, None)).unwrap();
+    assert!(
+        memory_wire["configured_guard_deadline_ms"].is_null(),
+        "an in-memory pool takes no lease: {memory_wire}"
+    );
+    assert_eq!(memory_wire["effective_writer_wait_bound_ms"], 50);
 }

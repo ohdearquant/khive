@@ -4475,11 +4475,22 @@ mod tests {
         db_path: &Path,
         mode: TestJournalMode,
     ) -> (KhiveRuntime, NamespaceToken) {
+        // Lock files beside the database: the fixture's own lease slot, so a
+        // test pausing an ingest inside the lease stalls only its own store.
+        runtime_on_with_mode_in(db_path, mode, db_path.with_extension("volume-locks"))
+    }
+
+    pub(super) fn runtime_on_with_mode_in(
+        db_path: &Path,
+        mode: TestJournalMode,
+        volume_lock_dir: std::path::PathBuf,
+    ) -> (KhiveRuntime, NamespaceToken) {
         let backend = Arc::new(
-            StorageBackend::sqlite_for_test_with_journal_mode(
+            StorageBackend::sqlite_for_test_with_journal_mode_in(
                 db_path,
                 mode.wal_mode(),
                 std::time::Duration::from_secs(5),
+                volume_lock_dir,
             )
             .expect("target backend opens"),
         );
@@ -5248,8 +5259,15 @@ mod tests {
     async fn rollback_journal_busy_begin_retries_after_other_runtime_releases_lock() {
         let root = TempDir::new().expect("temporary database directory");
         let db_path = root.path().join("busy-delete.db");
+        // The runtimes take different lock directories, so the second one stands
+        // in for a writer outside this process's lease and meets the first
+        // one's reserved lock at BEGIN, as SQLITE_BUSY.
         let (runtime_a, _) = runtime_on_with_mode(&db_path, TestJournalMode::Delete);
-        let (runtime_b, token_b) = runtime_on_with_mode(&db_path, TestJournalMode::Delete);
+        let (runtime_b, token_b) = runtime_on_with_mode_in(
+            &db_path,
+            TestJournalMode::Delete,
+            root.path().join("other-writer-locks"),
+        );
         let pool_b = runtime_b.backend().pool();
         let writer_task = pool_b
             .writer_task_handle()

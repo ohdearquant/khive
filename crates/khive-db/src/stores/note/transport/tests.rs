@@ -4,7 +4,7 @@ use khive_storage::{DeleteMode, Note, NoteStore};
 
 fn fixture() -> (StorageBackend, SenderEnvelope) {
     let backend = StorageBackend::memory().unwrap();
-    crate::run_migrations(backend.pool().writer().unwrap().conn_mut()).unwrap();
+    backend.pool().run_migrations().unwrap();
     let envelope = SenderEnvelope {
         namespace: "local".into(),
         logical_message_id: Uuid::new_v4(),
@@ -126,7 +126,7 @@ async fn admission_time_survives_reopening_the_store() {
     let deadline = admitted_at + 600_000_000;
     let envelope = {
         let backend = crate::StorageBackend::sqlite(&path).unwrap();
-        crate::run_migrations(backend.pool().writer().unwrap().conn_mut()).unwrap();
+        backend.pool().run_migrations().unwrap();
         let store = SenderTransportStore::new(backend.pool_arc());
         let envelope = fixture().1;
         store.create(envelope.clone(), false).await.unwrap();
@@ -140,7 +140,7 @@ async fn admission_time_survives_reopening_the_store() {
     };
 
     let reopened = crate::StorageBackend::sqlite(&path).unwrap();
-    crate::run_migrations(reopened.pool().writer().unwrap().conn_mut()).unwrap();
+    reopened.pool().run_migrations().unwrap();
     let store = SenderTransportStore::new(reopened.pool_arc());
     let record = store.get(envelope.key()).await.unwrap().unwrap();
     assert_eq!(record.admitted_at, Some(admitted_at));

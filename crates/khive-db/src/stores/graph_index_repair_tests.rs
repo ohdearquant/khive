@@ -162,7 +162,18 @@ impl HeldRepairFixture {
 async fn held_repair_fixture(direction: Direction) -> HeldRepairFixture {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("held-traversal-repair.db");
-    let backend = StorageBackend::sqlite_for_test(&path).unwrap();
+    // Own lock namespace: the 100 ms traversal budgets below start before the
+    // held writer is checked out, so its lease must not queue behind other
+    // tests' writers on this volume.
+    let backend = StorageBackend::sqlite_with_pool_config(
+        &path,
+        crate::pool::PoolConfig {
+            volume_lock_dir: Some(dir.path().join("volume-locks")),
+            ..crate::pool::PoolConfig::for_test()
+        },
+        None,
+    )
+    .unwrap();
     assert!(backend.pool().config().wal_mode);
     assert!(backend.pool().max_readers() > 0);
     assert!(
