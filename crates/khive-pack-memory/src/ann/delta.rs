@@ -640,9 +640,16 @@ mod tests {
         let publication = publish(dir, &mut bridge);
         assert_eq!(bridge.delta_chunks, 1, "pending batches are not chunks");
 
+        // Pin the persisted format independently of writer and reader constants.
+        let head_bytes = fs::read(dir.join("memory_delta.head")).expect("read literal HEAD path");
+        assert_eq!(&head_bytes[..8], b"KHMDEH01", "persisted HEAD magic");
+        let chunk_file = format!("memory_delta-{}.bin", publication.last_nonce);
+        let chunk_bytes = fs::read(dir.join(&chunk_file)).expect("read literal chunk path");
+        assert_eq!(&chunk_bytes[..8], b"KHMDEC01", "persisted chunk magic");
+
         assert_eq!(
             delta_names(dir),
-            vec![chunk_name(publication.last_nonce)],
+            vec![chunk_file],
             "three pending batches publish exactly one chunk"
         );
         let base_digest = segment_commit_digest(dir).unwrap().expect("base commit");
