@@ -13,7 +13,7 @@ use khive_runtime::{
 };
 use khive_storage::blob::ContentRef;
 use khive_storage::event::{Event, EventFilter};
-use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
+use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::{AttachmentSubstrate, BlobStore, Entity, NewAttachment};
 use khive_types::{EdgeRelation, EventKind, EventOutcome, SubstrateKind};
 
@@ -1204,11 +1204,9 @@ async fn load_judgment_snapshot(
 }
 
 /// Collect up to `max_rows` events for `base_filter` by walking a strict
-/// descending `before` cursor at `offset: 0`, requesting at most `page_size`
-/// (clamped to the events-daemon transport cap) rows per query — the same
-/// technique `khive-pack-brain`'s `collect_events_cursor_walk` uses for its
-/// split-store reads (duplicated here rather than shared: that helper is
-/// crate-private to `khive-pack-brain`).
+/// descending `before` cursor at `offset: 0` through the shared runtime visitor,
+/// requesting pages initially sized by `page_size` and widened only up to the
+/// events-daemon transport cap.
 ///
 /// `before` is a strict `created_at <` bound, so stepping the cursor to the
 /// last row's timestamp would drop rows sharing that microsecond beyond the
@@ -1225,93 +1223,24 @@ async fn collect_judgment_events_cursor_walk(
     page_size: u32,
     max_rows: u64,
 ) -> Result<Vec<Event>, RuntimeError> {
-    let cap = khive_runtime::events_split::MAX_QUERY_EVENTS_PAGE_ROWS;
-    let mut items: Vec<Event> = Vec::new();
-    let mut cursor: Option<i64> = base_filter.before;
-    let mut boundary_at: Option<i64> = None;
-    let mut boundary_ids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-    let mut fetch_limit = page_size.clamp(1, cap);
-    while (items.len() as u64) < max_rows {
-        let mut filter = base_filter.clone();
-        filter.before = cursor;
-        let page = store
-            .query_events(
-                filter,
-                PageRequest {
-                    offset: 0,
-                    limit: fetch_limit,
-                },
-            )
-            .await?;
-        let fetched = page.items.len() as u64;
-        let fresh: Vec<Event> = page
-            .items
-            .into_iter()
-            .filter(|event| !boundary_ids.contains(&event.id))
-            .collect();
-        if fresh.is_empty() {
-            if fetched < u64::from(fetch_limit) {
-                // The store returned everything under the cursor and all of
-                // it was already collected: the window is exhausted.
-                break;
-            }
-            // A full page of already-collected boundary rows: the tie run at
-            // this microsecond fills the page. Widen and re-read — but only
-            // up to the transport cap, past which the daemon refuses the
-            // request.
-            if fetch_limit >= cap {
-                let boundary = boundary_at.ok_or_else(|| {
-                    RuntimeError::Internal(
-                        "moodboard judgment cursor walk saw duplicate rows before any boundary"
-                            .to_string(),
-                    )
-                })?;
-                let mut ge_boundary = base_filter.clone();
-                ge_boundary.after = boundary.checked_sub(1).or(base_filter.after);
-                let ge_total = store.count_events(ge_boundary).await?;
-                if ge_total == items.len() as u64 {
-                    cursor = Some(boundary);
-                    continue;
-                }
-                return Err(RuntimeError::InvalidInput(format!(
-                    "moodboard.train_preference cannot page this actor's judgment snapshot: \
-                     more than {fetch_limit} judgments share one created_at microsecond, which \
-                     exceeds the event transport's page cap"
-                )));
-            }
-            fetch_limit = fetch_limit.saturating_mul(2).min(cap);
-            continue;
-        }
-        // Pages come back created_at DESC, so the last fresh row carries the
-        // new boundary microsecond.
-        let boundary = fresh
-            .last()
-            .map(|event| event.created_at)
-            .expect("fresh is non-empty");
-        if boundary_at != Some(boundary) {
-            boundary_ids.clear();
-            boundary_at = Some(boundary);
-        }
-        boundary_ids.extend(
-            fresh
-                .iter()
-                .filter(|event| event.created_at == boundary)
-                .map(|event| event.id),
-        );
-        items.extend(fresh);
-        cursor = if boundary == i64::MAX {
-            cursor
-        } else {
-            Some(boundary + 1)
-        };
-        if fetched < u64::from(fetch_limit) {
-            break;
-        }
-    }
-    // A page may carry the collection past `max_rows`; the bound is a row
-    // budget, so surplus rows from the final page are dropped rather than
-    // returned over-budget.
-    items.truncate(usize::try_from(max_rows).unwrap_or(usize::MAX));
+    let mut items = Vec::new();
+    khive_runtime::visit_events_cursor_walk(store, base_filter, page_size, max_rows, |event| {
+        items.push(event)
+    })
+    .await
+    .map_err(|cause| match cause {
+        khive_runtime::EventCursorWalkError::Storage(error) => RuntimeError::from(error),
+        khive_runtime::EventCursorWalkError::MissingBoundary => RuntimeError::Internal(
+            "moodboard judgment cursor walk saw duplicate rows before any boundary".to_string(),
+        ),
+        khive_runtime::EventCursorWalkError::DenseTimestampTie {
+            page_limit: fetch_limit,
+        } => RuntimeError::InvalidInput(format!(
+            "moodboard.train_preference cannot page this actor's judgment snapshot: \
+                 more than {fetch_limit} judgments share one created_at microsecond, which \
+                 exceeds the event transport's page cap"
+        )),
+    })?;
     Ok(items)
 }
 

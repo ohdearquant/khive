@@ -3071,115 +3071,26 @@ pub(crate) async fn visit_events_cursor_walk<F: FnMut(Event)>(
     base_filter: &EventFilter,
     page_size: u32,
     max_rows: u64,
-    mut visit: F,
+    visit: F,
 ) -> Result<u64, RuntimeError> {
-    let mut admitted = 0;
-    let mut cursor: Option<i64> = base_filter.before;
-    let mut boundary_at: Option<i64> = None;
-    let mut boundary_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-    let mut fetch_limit = page_size.clamp(1, TRANSPORT_PAGE_ROWS);
-    while admitted < max_rows {
-        let mut filter = base_filter.clone();
-        filter.before = cursor;
-        let page = store
-            .query_events(
-                filter,
-                PageRequest {
-                    offset: 0,
-                    limit: fetch_limit,
-                },
-            )
-            .await
-            .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-        let fetched = page.items.len() as u64;
-        let fresh: Vec<Event> = page
-            .items
-            .into_iter()
-            .filter(|event| !boundary_ids.contains(&event.id))
-            .collect();
-        if fresh.is_empty() {
-            if fetched < u64::from(fetch_limit) {
-                // The store returned everything under the cursor and all of
-                // it was already collected: the window is exhausted.
-                break;
+    khive_runtime::visit_events_cursor_walk(store, base_filter, page_size, max_rows, visit)
+        .await
+        .map_err(|cause| match cause {
+            khive_runtime::EventCursorWalkError::Storage(error) => {
+                RuntimeError::InvalidInput(error.to_string())
             }
-            // A full page of already-collected boundary rows: the tie run at
-            // this microsecond fills the page. Widen and re-read — but only
-            // up to the transport cap, past which the daemon refuses the
-            // request.
-            if fetch_limit >= TRANSPORT_PAGE_ROWS {
-                // At the cap, distinguish a tie run that exactly fills the
-                // page (fully collected, pageable by stepping the strict
-                // bound to the boundary itself) from one wider than the cap
-                // (genuinely unpageable with a timestamp cursor). Every
-                // collected row is >= the boundary microsecond, so equality
-                // of the at-or-above count with the collected count proves
-                // the run is complete.
-                let boundary = boundary_at.ok_or_else(|| {
-                    RuntimeError::Internal(
-                        "event cursor walk saw duplicate rows before any boundary".to_string(),
-                    )
-                })?;
-                let mut ge_boundary = base_filter.clone();
-                // `after` is a strict `created_at >` bound, so at-or-above
-                // the boundary is `> boundary - 1`. At `i64::MIN` every row
-                // already satisfies at-or-above; keep the base bound.
-                ge_boundary.after = boundary.checked_sub(1).or(base_filter.after);
-                let ge_total = store
-                    .count_events(ge_boundary)
-                    .await
-                    .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
-                if ge_total == admitted {
-                    cursor = Some(boundary);
-                    continue;
-                }
-                return Err(RuntimeError::InvalidInput(format!(
-                    "brain.event_counts cannot page this window: more than {fetch_limit} \
+            khive_runtime::EventCursorWalkError::MissingBoundary => RuntimeError::Internal(
+                "event cursor walk saw duplicate rows before any boundary".to_string(),
+            ),
+            khive_runtime::EventCursorWalkError::DenseTimestampTie {
+                page_limit: fetch_limit,
+            } => RuntimeError::InvalidInput(format!(
+                "brain.event_counts cannot page this window: more than {fetch_limit} \
                      events share one created_at microsecond, which exceeds the event \
                      transport's page cap; narrow `since`/`until` or add filters (`actor` \
                      or `kind`)"
-                )));
-            }
-            fetch_limit = fetch_limit.saturating_mul(2).min(TRANSPORT_PAGE_ROWS);
-            continue;
-        }
-        // Pages come back created_at DESC, so the last fresh row carries the
-        // new boundary microsecond.
-        let boundary = fresh
-            .last()
-            .map(|event| event.created_at)
-            .expect("fresh is non-empty");
-        if boundary_at != Some(boundary) {
-            boundary_ids.clear();
-            boundary_at = Some(boundary);
-        }
-        boundary_ids.extend(
-            fresh
-                .iter()
-                .filter(|event| event.created_at == boundary)
-                .map(|event| event.id),
-        );
-        // Preserve the old final truncate: only the remaining prefix is
-        // admitted, so surplus payloads never reach the aggregate callback.
-        let remaining = usize::try_from(max_rows - admitted).unwrap_or(usize::MAX);
-        for event in fresh.into_iter().take(remaining) {
-            visit(event);
-            admitted += 1;
-        }
-        // `i64::MAX` admits no exclusive bound above it: keep the cursor as
-        // is and re-read — dedup drops the re-admitted rows, and the
-        // at-the-cap completeness check above advances past the boundary (or
-        // reports the dense tie) once a page comes back all-duplicates.
-        cursor = if boundary == i64::MAX {
-            cursor
-        } else {
-            Some(boundary + 1)
-        };
-        if fetched < u64::from(fetch_limit) {
-            break;
-        }
-    }
-    Ok(admitted)
+            )),
+        })
 }
 
 #[cfg(test)]
