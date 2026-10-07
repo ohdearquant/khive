@@ -992,6 +992,8 @@ impl MemoryPack {
             t_stage = Some(Instant::now());
         }
 
+        // MMR can lower a composite after the admission gate above.
+        ranked.retain(|sn| sn.rank_score >= effective_min_score);
         ranked.sort_by(|a, b| {
             compare_rank_scores_desc(a.rank_score, b.rank_score).then(a.id.cmp(&b.id))
         });
