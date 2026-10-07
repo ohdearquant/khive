@@ -114,7 +114,7 @@ def manifest(*, control_classification: str = "WRITER") -> dict:
                         "kind": "sqlite",
                         "symbol": "mark_read_target -> try_patch_note_property",
                         "evidence": {
-                            "path": "crates/khive-pack-comm/src/handlers.rs",
+                            "path": "crates/khive-pack-comm/src/handlers/read_marking.rs",
                             "required_patterns": [
                                 "async fn mark_read_target(",
                                 ".try_patch_note_property(",
