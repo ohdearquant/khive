@@ -591,11 +591,15 @@ pub(crate) async fn ingest(
                     name: name.clone(),
                     kind: "tool".into(),
                     description: opt_str(&tool, "description")?,
-                    schema: tool
-                        .get("inputSchema")
-                        .or_else(|| tool.get("schema"))
-                        .filter(|v| v.is_object())
-                        .cloned(),
+                    schema: match tool.get("inputSchema").or_else(|| tool.get("schema")) {
+                        None | Some(Value::Null) => None,
+                        Some(v @ Value::Object(_)) => Some(v.clone()),
+                        Some(_) => {
+                            return Err(RuntimeError::InvalidInput(format!(
+                                "schema must be an object for tool {name:?}"
+                            )))
+                        }
+                    },
                     source: Some(format!("mcp:{server}")),
                     side_effect: opt_str(&tool, "side_effect")?.unwrap_or_else(|| "write".into()),
                     trust: trust.clone().unwrap_or_else(|| "external".into()),
