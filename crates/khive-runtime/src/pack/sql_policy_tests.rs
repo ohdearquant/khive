@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use syn::parse::Parser;
+use syn::spanned::Spanned;
 use syn::visit::Visit;
 
 const CONVERTED: &[&str] = &[
@@ -868,45 +869,42 @@ const INLINE_KEEPS: &[Keep] = &[
 ];
 
 fn strip_test_modules(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut cursor = 0usize;
-    while let Some(found) = text[cursor..].find("#[cfg(test)]") {
-        let start = cursor + found;
-        // Only a `mod` item is stripped, not a test-only `use` or `fn`.
-        let after = &text[start..];
-        // The item ends at its first `{` or `;`. A `mod name;` declaration keeps its body in
-        // another file, so the code after it stays.
-        let Some(end_rel) = after.find(['{', ';']) else {
-            out.push_str(&text[cursor..]);
-            return out;
-        };
-        if after.as_bytes()[end_rel] == b';' || !after[..end_rel].contains("mod ") {
-            out.push_str(&text[cursor..start + end_rel]);
-            cursor = start + end_rel;
-            continue;
-        }
-        out.push_str(&text[cursor..start]);
-        let mut depth = 0usize;
-        let mut i = start + end_rel;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        i += 1;
-                        break;
-                    }
-                }
-                _ => {}
+    struct TestModules(Vec<std::ops::Range<usize>>);
+
+    impl<'ast> Visit<'ast> for TestModules {
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            let test_only = module.attrs.iter().any(|attr| {
+                attr.path().is_ident("cfg")
+                    && attr
+                        .parse_args::<syn::Path>()
+                        .is_ok_and(|path| path.is_ident("test"))
+            });
+            if module.content.is_some() && test_only {
+                self.0.push(module.span().byte_range());
+                return;
             }
-            i += 1;
+            syn::visit::visit_item_mod(self, module);
         }
-        cursor = i;
     }
-    out.push_str(&text[cursor..]);
-    out
+
+    let file = syn::parse_file(text).expect("parse Rust source for inline SQL policy");
+    // syn strips these prefixes before parsing; its spans start after them.
+    let offset = if text.starts_with('\u{feff}') { 3 } else { 0 }
+        + file.shebang.as_ref().map_or(0, String::len);
+    let mut modules = TestModules(Vec::new());
+    modules.visit_file(&file);
+
+    // Keep every byte outside an excluded item and every source line boundary.
+    // Blanking complete items also excludes their test-only outer attributes.
+    let mut out = text.as_bytes().to_vec();
+    for range in modules.0 {
+        for byte in &mut out[offset + range.start..offset + range.end] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(out).expect("masked Rust source remains UTF-8")
 }
 
 /// Find a literal's closing quote, skipping rather than decoding escapes.
