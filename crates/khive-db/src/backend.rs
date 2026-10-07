@@ -21,6 +21,7 @@ mod code_map;
 #[path = "backend/schema_readiness.rs"]
 mod memory_visibility;
 mod pack_schema;
+mod policy_open;
 
 #[cfg(test)]
 #[path = "backend/memory_visibility_tests.rs"]
@@ -304,6 +305,10 @@ impl StorageBackend {
     /// No service schema is applied — call `apply_schema()` for each service.
     /// The pool may create its internal `_khive_database_identity` singleton
     /// table on a writable open before service migrations run.
+    ///
+    /// The volume-lock directory is the per-user default of
+    /// [`crate::default_volume_lock_dir`], shared by every process of the user;
+    /// [`Self::sqlite_with_volume_lock_dir`] names one explicitly.
     pub fn sqlite(path: impl AsRef<Path>) -> Result<Self, SqliteError> {
         Self::sqlite_with_pool_config(path, PoolConfig::default(), None)
     }
@@ -335,6 +340,7 @@ impl StorageBackend {
 
     /// Open SQLite with a reader count selected before any connections are opened.
     /// `None` preserves the default pool size and filesystem read-only detection.
+    /// The volume-lock directory defaults as in [`Self::sqlite`].
     pub fn sqlite_with_max_readers(
         path: impl AsRef<Path>,
         max_readers: Option<usize>,
@@ -344,6 +350,7 @@ impl StorageBackend {
 
     /// Open a file-backed SQLite backend with its already-resolved WAL ceiling.
     /// A nonzero policy fails closed until the WAL I/O limiter is installed.
+    /// The volume-lock directory defaults as in [`Self::sqlite`].
     pub fn sqlite_with_max_readers_and_wal_ceiling(
         path: impl AsRef<Path>,
         max_readers: Option<usize>,
@@ -1531,34 +1538,7 @@ mod tests {
         assert_eq!(got, dir.path());
     }
 
-    #[test]
-    fn ann_root_is_database_scoped_sibling_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("data.db");
-        let backend = StorageBackend::sqlite_for_test(&path).expect("file backend");
-        let got = backend.ann_root().expect("file backend must return Some");
-        assert_eq!(got, dir.path().join("data.db.ann"));
-        assert!(StorageBackend::memory().unwrap().ann_root().is_none());
-    }
-
-    /// Two distinct non-UTF-8 database filenames must never share an ANN
-    /// root: a lossy UTF-8 conversion collapses both to the replacement
-    /// character, letting one database adopt the other's segments. Exercised
-    /// on the path derivation directly — APFS (macOS CI) refuses to create
-    /// files with non-UTF-8 names, so a real backend cannot be opened there.
-    #[cfg(unix)]
-    #[test]
-    fn ann_root_distinct_for_non_utf8_filenames() {
-        use std::os::unix::ffi::OsStrExt;
-        let path_a = std::path::Path::new("/data").join(std::ffi::OsStr::from_bytes(b"\xff.db"));
-        let path_b = std::path::Path::new("/data").join(std::ffi::OsStr::from_bytes(b"\xfe.db"));
-        let root_a = ann_root_for(&path_a).expect("Some for a file path");
-        let root_b = ann_root_for(&path_b).expect("Some for a file path");
-        assert_ne!(
-            root_a, root_b,
-            "distinct database files must map to distinct ANN roots"
-        );
-    }
+    include!("backend/ann_root_tests.rs");
 
     #[tokio::test]
     async fn sql_access_memory_roundtrip() {

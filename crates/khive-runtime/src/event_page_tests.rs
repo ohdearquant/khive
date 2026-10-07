@@ -500,7 +500,17 @@ async fn cross_namespace_plane_duplicate_refuses_before_global_page_truncation()
     .unwrap();
     let token = token(&["team"]);
     seed(&runtime, &token, "local", vec![event("local", 1, 10)]).await;
-    let lane = crate::events_split::direct_backend_for(&lane_path).unwrap();
+    // One process opens the lane with one set of policies: the test runtime's
+    // pool carries the test lock directory, so the lane uses it.
+    let lane = crate::events_split::direct_backend_with_policies(
+        &lane_path,
+        false,
+        None,
+        runtime.backend().pool().config().wal_ceiling,
+        Some(runtime.events_disk_guard_policy().unwrap()),
+        runtime.events_volume_lock_dir(),
+    )
+    .unwrap();
     let team = lane.events_for_namespace("team").unwrap();
     team.append_event(event("team", 2, 10)).await.unwrap();
     let mut req = request();
@@ -547,7 +557,17 @@ async fn aggregate_budget_refuses_when_two_planes_fill_sixteen_namespaces() {
         .collect::<Vec<_>>();
     let visible = names.iter().map(String::as_str).collect::<Vec<_>>();
     let token = token(&visible);
-    let lane = crate::events_split::direct_backend_for(&lane_path).unwrap();
+    // One process opens the lane with one set of policies: the test runtime's
+    // pool carries the test lock directory, so the lane uses it.
+    let lane = crate::events_split::direct_backend_with_policies(
+        &lane_path,
+        false,
+        None,
+        runtime.backend().pool().config().wal_ceiling,
+        Some(runtime.events_disk_guard_policy().unwrap()),
+        runtime.events_volume_lock_dir(),
+    )
+    .unwrap();
     for (index, name) in names.iter().enumerate() {
         let plane_rows = |plane: usize| {
             (0..ROWS_PER_PLANE)

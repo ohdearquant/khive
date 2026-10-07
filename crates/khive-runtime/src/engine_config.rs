@@ -16,6 +16,9 @@ use crate::{
     presentation::OutputFormat,
 };
 
+#[path = "engine_config_backend_disk_guard.rs"]
+mod backend_disk_guard;
+
 // ---- Error type ----
 
 /// Errors produced while loading or validating a `KhiveConfig`.
@@ -76,6 +79,18 @@ pub enum ConfigError {
 
     #[error("backend {name:?}: `served_kinds` must not be empty when declared")]
     EmptyBackendServedKinds { name: String },
+
+    #[error("backend {name:?}: invalid disk guard configuration: {reason}")]
+    InvalidBackendDiskGuard { name: String, reason: String },
+
+    #[error(
+        "backends {first_backend:?} and {second_backend:?} name the same database but resolve \
+         different disk reserve/deadline policies"
+    )]
+    DiskGuardAliasConflict {
+        first_backend: String,
+        second_backend: String,
+    },
 
     #[error("KHIVE_SQLITE_WAL_CEILING_BYTES must be an unsigned decimal byte count")]
     InvalidWalCeilingEnvironment { value: String },
@@ -475,6 +490,12 @@ pub struct BackendConfig {
     /// zero disables the ceiling. Read-only backends retain the configured
     /// value for reporting but enforce no writer policy.
     pub wal_ceiling_bytes: Option<u64>,
+    /// SQLite disk reserve, in bytes. Zero explicitly disables the floor.
+    #[serde(default)]
+    pub disk_reserve_bytes: Option<u64>,
+    /// Volume-guard acquisition deadline, in milliseconds (100..=10000).
+    #[serde(default)]
+    pub disk_guard_deadline_ms: Option<u64>,
 }
 
 /// Per-pack backend assignment.
@@ -1859,6 +1880,8 @@ impl KhiveConfig {
                     )?;
                 }
 
+                backend.resolve_disk_guard(&khive_db::DiskGuardEnvironment::default())?;
+
                 // Reject fields that are parsed but not yet implemented: silently
                 // accepting them would let misconfiguration slip past startup.
                 if backend.cache_mb.is_some() {
@@ -2104,6 +2127,7 @@ mod tests {
 
     include!("engine_config_timeout_tests.rs");
     include!("engine_config_deadline_tests.rs");
+    include!("engine_config_disk_guard_tests.rs");
 
     fn write_toml(dir: &tempfile::TempDir, content: &str) -> PathBuf {
         let path = dir.path().join("config.toml");
@@ -2170,44 +2194,7 @@ mod tests {
         }
     }
 
-    // khive#1221: with no primary set, the additional list must ADD to the
-    // built-in default primary, never replace it.
-    #[test]
-    fn env_additional_only_keeps_builtin_primary() {
-        let cfg = super::config_from_env_parts(
-            None,
-            vec!["paraphrase-multilingual-minilm-l12-v2".to_string()],
-        );
-        assert_eq!(cfg.engines.len(), 2);
-        let default_engine = cfg.default_engine().expect("a default engine");
-        assert_eq!(default_engine.model, "all-minilm-l6-v2");
-        assert!(
-            cfg.engines
-                .iter()
-                .any(|e| !e.default && e.model == "paraphrase-multilingual-minilm-l12-v2"),
-            "additional model must be a non-default secondary engine"
-        );
-    }
-
-    #[test]
-    fn env_explicit_primary_stays_primary() {
-        let cfg = super::config_from_env_parts(
-            Some("paraphrase-multilingual-minilm-l12-v2".to_string()),
-            vec![],
-        );
-        assert_eq!(cfg.engines.len(), 1);
-        assert_eq!(
-            cfg.default_engine().expect("default").model,
-            "paraphrase-multilingual-minilm-l12-v2"
-        );
-    }
-
-    #[test]
-    fn env_additional_restating_primary_is_deduped() {
-        let cfg = super::config_from_env_parts(None, vec!["all-minilm-l6-v2".to_string()]);
-        assert_eq!(cfg.engines.len(), 1);
-        assert!(cfg.engines[0].default);
-    }
+    include!("engine_config_env_additional_tests.rs");
 
     #[test]
     fn test_load_minimal_config() {

@@ -1,4 +1,4 @@
-struct ConfigIdFields<'a> {
+pub(super) struct ConfigIdFields<'a> {
     packs: &'a str,
     db: &'a str,
     embed: &'a str,
@@ -11,13 +11,19 @@ struct ConfigIdFields<'a> {
     git_write: &'a str,
     brain: &'a str,
     telemetry: &'a str,
-    display_timezone: &'a str,
+    pub(super) display_timezone: &'a str,
     visibility_receipts: &'a str,
     backends: Option<&'a str>,
-    pack_backends: Option<&'a str>,
+    pub(super) pack_backends: Option<&'a str>,
+    /// Trailing writable-SQLite disk policy; absent from ids that carry none.
+    pub(super) sqlite_disk_guard: Option<&'a str>,
 }
 
-fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
+pub(super) fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
+    let (config_id, sqlite_disk_guard) = match config_id.rsplit_once(";sqlite_disk_guard=") {
+        Some((before, policy)) => (before, Some(policy)),
+        None => (config_id, None),
+    };
     let (base, backends, pack_backends) =
         if let Some((before_routing, routing)) = config_id.rsplit_once("];pack_backends=[") {
             let pack_backends = routing.strip_suffix(']')?;
@@ -73,6 +79,7 @@ fn parse_config_id(config_id: &str) -> Option<ConfigIdFields<'_>> {
         visibility_receipts,
         backends,
         pack_backends,
+        sqlite_disk_guard,
     })
 }
 
@@ -140,6 +147,7 @@ pub fn config_ids_compatible(client_id: &str, daemon_id: &str) -> bool {
         && client.visibility_receipts == daemon.visibility_receipts
         && client.backends == daemon.backends
         && client.pack_backends == daemon.pack_backends
+        && client.sqlite_disk_guard == daemon.sqlite_disk_guard
 }
 
 /// Name the first differing configuration component for diagnostics.
@@ -187,6 +195,8 @@ pub fn first_config_mismatch_field(client_id: &str, daemon_id: Option<&str>) -> 
         "backends"
     } else if client.pack_backends != daemon.pack_backends {
         "pack_backends"
+    } else if client.sqlite_disk_guard != daemon.sqlite_disk_guard {
+        "sqlite_disk_guard"
     } else if client.extra != daemon.extra {
         // A pre-v8 daemon compared exact ids and could refuse a safe superset.
         "extra"

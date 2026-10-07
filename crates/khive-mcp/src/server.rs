@@ -64,7 +64,10 @@ pub(crate) fn bridge_instance_id() -> uuid::Uuid {
     *BRIDGE_INSTANCE_ID.get_or_init(uuid::Uuid::new_v4)
 }
 
+mod disk_policy;
 mod search_diagnostics;
+
+use disk_policy::disk_guard_policy_fingerprint;
 
 use search_diagnostics::{
     backend_errors_value, op_success_from_registry_result, search_arm_participation_value,
@@ -10503,6 +10506,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -10526,71 +10531,7 @@ mod tests {
         );
     }
 
-    /// A backend path is caller-controlled data, so the legacy `:read_only`
-    /// suffix must never be confusable with literal path text. Before this
-    /// regression, these two distinct archive backends produced the same
-    /// topology string and could therefore share the wrong warm daemon:
-    ///
-    /// - read-only `/.../archive.db`
-    /// - writable `/.../archive.db:read_only`
-    #[test]
-    #[serial_test::serial(config_ledger)]
-    fn config_id_does_not_confuse_read_only_mode_with_a_path_suffix() {
-        use khive_runtime::{BackendConfig, BackendId, BackendKind, KhiveConfig, PackConfig};
-
-        let dir = tempfile::tempdir().expect("topology collision tempdir");
-        let main_path = dir.path().join("main.db");
-        let archive_path = dir.path().join("archive.db");
-        let literal_suffix_path = dir.path().join("archive.db:read_only");
-        let runtime = RuntimeConfig {
-            db_path: Some(main_path.clone()),
-            packs: vec!["kg".to_string(), "knowledge".to_string()],
-            backend_id: BackendId::main(),
-            ..RuntimeConfig::no_embeddings()
-        };
-
-        let topology = |path, read_only| KhiveConfig {
-            backends: vec![
-                BackendConfig {
-                    name: "main".to_string(),
-                    kind: BackendKind::Sqlite,
-                    path: Some(main_path.clone()),
-                    cache_mb: None,
-                    journal_mode: None,
-                    wal_ceiling_bytes: None,
-                    served_kinds: None,
-                    read_only: false,
-                },
-                BackendConfig {
-                    name: "archive".to_string(),
-                    kind: BackendKind::Sqlite,
-                    path: Some(path),
-                    cache_mb: None,
-                    journal_mode: None,
-                    wal_ceiling_bytes: None,
-                    served_kinds: None,
-                    read_only,
-                },
-            ],
-            packs: std::collections::HashMap::from([(
-                "knowledge".to_string(),
-                PackConfig {
-                    backend: "archive".to_string(),
-                    no_embed: false,
-                },
-            )]),
-            ..KhiveConfig::default()
-        };
-
-        let read_only_archive = topology(archive_path, true);
-        let writable_literal_suffix = topology(literal_suffix_path, false);
-
-        assert_ne!(
-            compute_config_id(&runtime, Some(&read_only_archive)),
-            compute_config_id(&runtime, Some(&writable_literal_suffix)),
-            "backend mode must be encoded as a field, not an ambiguous path suffix"
-        );
-    }
+    include!("server/config_id_read_only_tests.rs");
 
     /// The collision fix is deliberately conditional: ordinary topology
     /// components that contain no reserved syntax keep the legacy spelling
@@ -10616,6 +10557,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -10634,8 +10577,9 @@ mod tests {
             canonical_fingerprint_path(&main_path)
         );
         let config_id = compute_config_id(&runtime, Some(&topology));
+        // The disk-guard segment follows the topology segments for a writable SQLite backend.
         assert!(
-            config_id.ends_with(&expected_suffix),
+            config_id.contains(&format!("{expected_suffix};sqlite_disk_guard=")),
             "delimiter-free topologies must retain the legacy field encoding; got {config_id}"
         );
     }
@@ -10697,6 +10641,8 @@ mod tests {
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: false,
         };
@@ -10807,6 +10753,8 @@ mod tests {
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: None,
             read_only: false,
         };
@@ -10828,9 +10776,9 @@ mod tests {
         let legacy_id = compute_config_id(&runtime, Some(&legacy));
         assert!(legacy_id.contains(&main_backend), "{legacy_id}");
         assert!(
-            legacy_id.ends_with(&format!(
+            legacy_id.contains(&format!(
                 ";backends=[archive:Sqlite:{}:wal_ceiling_bytes=0,\
-                 main:Sqlite:{}:wal_ceiling_bytes=0];pack_backends=[kg=main]",
+                 main:Sqlite:{}:wal_ceiling_bytes=0];pack_backends=[kg=main];sqlite_disk_guard=",
                 canonical_fingerprint_path(&archive_path),
                 canonical_fingerprint_path(&main_path),
             )),
@@ -10920,6 +10868,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -10978,6 +10928,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds,
                 read_only: false,
             }],
@@ -11016,6 +10968,8 @@ mod tests {
             cache_mb: None,
             journal_mode: None,
             wal_ceiling_bytes: None,
+            disk_reserve_bytes: None,
+            disk_guard_deadline_ms: None,
             served_kinds: served_kinds.clone(),
             read_only: false,
         };
@@ -11078,6 +11032,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],
@@ -11143,6 +11099,8 @@ mod tests {
                 cache_mb: None,
                 journal_mode: None,
                 wal_ceiling_bytes: None,
+                disk_reserve_bytes: None,
+                disk_guard_deadline_ms: None,
                 served_kinds: None,
                 read_only: false,
             }],

@@ -12,7 +12,7 @@ impl KhiveRuntime {
     /// parent directory must already exist. A code-map database runs in
     /// rollback-journal mode, so a configured WAL ceiling does not apply to it.
     pub fn new_code_map(
-        config: RuntimeConfig,
+        mut config: RuntimeConfig,
         protected_main: Vec<std::path::PathBuf>,
         protected_events: Vec<std::path::PathBuf>,
     ) -> RuntimeResult<Self> {
@@ -21,8 +21,18 @@ impl KhiveRuntime {
                 "code-map runtime requires a guarded file-backed database".into(),
             ));
         }
+        let disk_guard = config
+            .resolve_disk_guard_policy(false)?
+            .expect("code-map has a file-backed disk policy");
+        let volume_lock_dir = config.volume_lock_dir.clone();
         Self::new_with_file_backend(config, false, move |path| {
-            StorageBackend::sqlite_code_map(path, &protected_main, &protected_events)
+            StorageBackend::sqlite_code_map_with_policies(
+                path,
+                &protected_main,
+                &protected_events,
+                disk_guard,
+                khive_db::require_volume_lock_dir(volume_lock_dir)?,
+            )
         })
     }
 }

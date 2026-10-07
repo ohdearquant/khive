@@ -28,11 +28,24 @@ configured busy timeout.
 
 ## SQLite write reserve
 
-Writable file-backed pools use `KHIVE_DB_FREE_SPACE_FLOOR_BYTES` as their
-free-space reserve. The default is 1 GiB; `0` disables the check. The value is
-read once when the pool opens. An invalid byte count fails pool construction
-with `SqliteError::InvalidConfig`. In-memory and read-only pools do not sample
-disk space.
+Writable file-backed pools take their free-space reserve from the resolved
+disk-guard policy. A backend's own reserve setting wins, then
+`KHIVE_SQLITE_DISK_RESERVE_BYTES`, then the deprecated
+`KHIVE_DB_FREE_SPACE_FLOOR_BYTES` (still read, with a warning), then the 1 GiB
+default; `0` disables the check. Setting both variables to different values is
+a configuration error, even when a backend overrides them. The policy is
+resolved once when the pool opens, and an invalid byte count fails pool
+construction with `SqliteError::InvalidConfig`. In-memory and read-only pools
+do not sample disk space.
+
+Writable file-backed hosts also need a volume-lock directory shared by every
+khive process of the user. It is `KHIVE_VOLUME_LOCK_DIR` when that is set and
+not blank, otherwise `.khive/sqlite-volume-locks` under the first non-blank of
+`HOME` and `USERPROFILE`. It must be absolute and there is no working-directory
+fallback: with no usable home, or with a relative path, the resolver returns
+`SqliteError::InvalidConfig` naming `KHIVE_VOLUME_LOCK_DIR`. A writable pool
+configured without a directory fails when it takes its volume lease. Read-only
+pools never need it.
 
 Each pooled writer checkout, cancellable writer checkout, standalone writer
 open, standalone writer-handle operation, and writer-task request samples

@@ -8,10 +8,56 @@
 
 use khive_storage::blob::ContentRef;
 use rusqlite::{Connection, OptionalExtension};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::error::SqliteError;
 use crate::stores::blob::{try_acquire_database_gc_owner_for_path, DatabaseGcOwnerGuard};
+
+/// Captured disk-guard settings and shared volume-lock directory for a SQLite
+/// writer.
+///
+/// Construction validates configuration without reading or writing a database.
+/// Cooperating callers must choose the same absolute volume-lock directory.
+#[derive(Clone, Debug)]
+pub struct MigrationWritePolicy {
+    disk_guard: crate::EffectiveDiskGuardConfig,
+    volume_lock_dir: PathBuf,
+}
+
+impl MigrationWritePolicy {
+    pub fn new(
+        disk_guard: crate::EffectiveDiskGuardConfig,
+        volume_lock_dir: impl Into<PathBuf>,
+    ) -> Result<Self, SqliteError> {
+        disk_guard.validate()?;
+        let volume_lock_dir = volume_lock_dir.into();
+        if !volume_lock_dir.is_absolute() {
+            return Err(SqliteError::InvalidConfig(
+                "migration volume-lock directory must be absolute".to_string(),
+            ));
+        }
+        Ok(Self {
+            disk_guard,
+            volume_lock_dir,
+        })
+    }
+
+    /// Resolve both settings from the process environment. The lock directory
+    /// follows [`crate::default_volume_lock_dir`], the same per-user default the
+    /// public SQLite constructors use.
+    pub fn from_environment() -> Result<Self, SqliteError> {
+        let disk_guard = crate::DiskGuardEnvironment::capture().resolve(None, None)?;
+        Self::new(disk_guard, crate::default_volume_lock_dir()?)
+    }
+
+    pub fn disk_guard_config(&self) -> crate::EffectiveDiskGuardConfig {
+        self.disk_guard
+    }
+
+    pub fn volume_lock_dir(&self) -> &Path {
+        &self.volume_lock_dir
+    }
+}
 
 #[path = "session_identity_migration.rs"]
 mod session_identity_migration;

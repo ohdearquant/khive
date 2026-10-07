@@ -44,4 +44,40 @@ mod khive_root_tests {
         // local attacker could pre-claim to intercept the daemon socket.
         assert_eq!(khive_root_from(None, None), PathBuf::from("./.khive"));
     }
+
+    // MUST-FAIL: building the lock directory on `khive_dir()` resolves the
+    // relative last-resort root in the child instead of returning the error.
+    #[test]
+    fn volume_lock_dir_without_a_home_is_an_error_not_the_relative_socket_root() {
+        let in_parent = khive_storage::test_support::run_exact_test_in_child(
+            "KHIVE_NO_HOME_LOCK_DIR_CHILD",
+            false,
+            |command| {
+                command
+                    .env_remove("HOME")
+                    .env_remove("USERPROFILE")
+                    .env_remove("KHIVE_VOLUME_LOCK_DIR");
+            },
+        );
+        if in_parent {
+            return;
+        }
+        let error =
+            super::volume_lock_dir().expect_err("no home must not resolve a lock directory");
+        assert!(
+            error.to_string().contains("KHIVE_VOLUME_LOCK_DIR"),
+            "{error}"
+        );
+        // The socket root keeps its historical relative last resort.
+        #[cfg(unix)]
+        assert_eq!(super::khive_dir(), PathBuf::from("./.khive"));
+    }
+
+    #[test]
+    fn volume_lock_dir_is_the_storage_layer_rule() {
+        assert_eq!(
+            super::volume_lock_dir().map_err(|error| error.to_string()),
+            khive_db::default_volume_lock_dir().map_err(|error| error.to_string())
+        );
+    }
 }

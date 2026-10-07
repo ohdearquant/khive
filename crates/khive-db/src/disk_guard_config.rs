@@ -1,10 +1,12 @@
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 
 use crate::SqliteError;
 
 const RESERVE_ENV: &str = "KHIVE_SQLITE_DISK_RESERVE_BYTES";
 const LEGACY_RESERVE_ENV: &str = "KHIVE_DB_FREE_SPACE_FLOOR_BYTES";
 const DEADLINE_ENV: &str = "KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS";
+const VOLUME_LOCK_DIR_ENV: &str = "KHIVE_VOLUME_LOCK_DIR";
 pub(crate) const DEFAULT_DISK_RESERVE_BYTES: u64 = 1_073_741_824;
 pub(crate) const DEFAULT_DISK_GUARD_DEADLINE_MS: u64 = 2_000;
 
@@ -156,6 +158,68 @@ pub fn resolve_disk_guard_config(
     DiskGuardEnvironment::capture().resolve(reserve_override, deadline_override)
 }
 
+/// The directory that holds the volume advisory lock files shared by every
+/// khive process of one user.
+///
+/// `KHIVE_VOLUME_LOCK_DIR` wins when it is set and not blank. Otherwise the
+/// per-user runtime namespace `<home>/.khive/sqlite-volume-locks` is used, where
+/// `<home>` is the first non-blank of `HOME` and `USERPROFILE`. Every process of
+/// that user therefore resolves the same directory, whatever its working
+/// directory. With none of these set, or when the resolved directory is not
+/// absolute, the result is a configuration error rather than a relative path,
+/// because a working-directory-relative lock directory would give two processes
+/// two different lock files.
+pub fn default_volume_lock_dir() -> Result<PathBuf, SqliteError> {
+    volume_lock_dir_from(
+        std::env::var_os(VOLUME_LOCK_DIR_ENV),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    )
+}
+
+/// A caller's optional lock directory, or the configuration error that
+/// [`default_volume_lock_dir`] reports when no directory can be resolved.
+pub fn require_volume_lock_dir(configured: Option<PathBuf>) -> Result<PathBuf, SqliteError> {
+    configured.ok_or_else(unresolved_volume_lock_dir)
+}
+
+/// Env-free core of [`default_volume_lock_dir`], so the order is testable
+/// without mutating process-global environment variables.
+fn volume_lock_dir_from(
+    override_dir: Option<OsString>,
+    home: Option<OsString>,
+    userprofile: Option<OsString>,
+) -> Result<PathBuf, SqliteError> {
+    let is_set = |value: &OsString| !value.to_str().is_some_and(|text| text.trim().is_empty());
+    let directory = match override_dir.filter(is_set) {
+        Some(directory) => PathBuf::from(directory),
+        None => {
+            let home = home
+                .filter(is_set)
+                .or_else(|| userprofile.filter(is_set))
+                .ok_or_else(unresolved_volume_lock_dir)?;
+            PathBuf::from(home)
+                .join(".khive")
+                .join("sqlite-volume-locks")
+        }
+    };
+    if !directory.is_absolute() {
+        return Err(SqliteError::InvalidConfig(format!(
+            "SQLite volume-lock directory {directory:?} is not absolute: {VOLUME_LOCK_DIR_ENV} \
+             must be absolute, and so must HOME or USERPROFILE when it is unset"
+        )));
+    }
+    Ok(directory)
+}
+
+fn unresolved_volume_lock_dir() -> SqliteError {
+    SqliteError::InvalidConfig(format!(
+        "no SQLite volume-lock directory: {VOLUME_LOCK_DIR_ENV} is unset and neither HOME nor \
+         USERPROFILE names a home directory; set {VOLUME_LOCK_DIR_ENV} to an absolute directory \
+         shared by every khive process of this user"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +361,116 @@ mod tests {
         assert!(matches!(
             environment.resolve(None, None),
             Err(SqliteError::InvalidConfig(_))
+        ));
+    }
+
+    fn lock_dir(
+        override_dir: Option<&str>,
+        home: Option<&str>,
+        userprofile: Option<&str>,
+    ) -> Result<PathBuf, SqliteError> {
+        volume_lock_dir_from(
+            override_dir.map(OsString::from),
+            home.map(OsString::from),
+            userprofile.map(OsString::from),
+        )
+    }
+
+    fn per_user_lock_dir(home: &str) -> PathBuf {
+        PathBuf::from(home)
+            .join(".khive")
+            .join("sqlite-volume-locks")
+    }
+
+    #[test]
+    fn volume_lock_dir_follows_override_then_home_then_userprofile() {
+        assert_eq!(
+            lock_dir(Some("/locks"), Some("/home/a"), Some("/profile/a")).unwrap(),
+            PathBuf::from("/locks")
+        );
+        assert_eq!(
+            lock_dir(None, Some("/home/a"), Some("/profile/a")).unwrap(),
+            per_user_lock_dir("/home/a")
+        );
+        assert_eq!(
+            lock_dir(None, None, Some("/profile/a")).unwrap(),
+            per_user_lock_dir("/profile/a")
+        );
+    }
+
+    #[test]
+    fn volume_lock_dir_skips_empty_and_blank_values() {
+        assert_eq!(
+            lock_dir(Some(""), Some("/home/a"), None).unwrap(),
+            per_user_lock_dir("/home/a")
+        );
+        assert_eq!(
+            lock_dir(None, Some(""), Some("/profile/a")).unwrap(),
+            per_user_lock_dir("/profile/a")
+        );
+        assert_eq!(
+            lock_dir(None, Some("  "), Some("/profile/a")).unwrap(),
+            per_user_lock_dir("/profile/a")
+        );
+        for blank in ["   ", "\t", " \n "] {
+            assert_eq!(
+                lock_dir(Some(blank), Some("/home/a"), Some("/profile/a")).unwrap(),
+                per_user_lock_dir("/home/a")
+            );
+        }
+        assert_eq!(
+            lock_dir(Some("   "), None, Some("/profile/a")).unwrap(),
+            per_user_lock_dir("/profile/a")
+        );
+    }
+
+    #[test]
+    fn volume_lock_dir_refuses_a_relative_directory() {
+        for (override_dir, home, userprofile) in [
+            (Some("locks"), Some("/home/a"), None),
+            (Some("./locks"), None, Some("/profile/a")),
+            (None, Some("home/a"), Some("/profile/a")),
+            (None, None, Some("profile/a")),
+            (None, Some("."), None),
+        ] {
+            match lock_dir(override_dir, home, userprofile) {
+                Err(SqliteError::InvalidConfig(message)) => {
+                    assert!(message.contains("KHIVE_VOLUME_LOCK_DIR"), "{message}");
+                    assert!(message.contains("must be absolute"), "{message}");
+                }
+                other => panic!(
+                    "expected a configuration error for {override_dir:?} {home:?} \
+                     {userprofile:?}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn volume_lock_dir_without_a_home_is_an_error_naming_the_override_variable() {
+        for (override_dir, home, userprofile) in [
+            (None, None, None),
+            (Some(""), Some(""), Some("")),
+            (None, Some("  "), Some("\t")),
+        ] {
+            match lock_dir(override_dir, home, userprofile) {
+                Err(SqliteError::InvalidConfig(message)) => {
+                    assert!(message.contains("KHIVE_VOLUME_LOCK_DIR"), "{message}");
+                }
+                other => panic!("expected a configuration error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn required_volume_lock_dir_names_the_override_variable_when_none_resolved() {
+        assert_eq!(
+            require_volume_lock_dir(Some(PathBuf::from("/locks"))).unwrap(),
+            PathBuf::from("/locks")
+        );
+        assert!(matches!(
+            require_volume_lock_dir(None),
+            Err(SqliteError::InvalidConfig(message)) if message.contains("KHIVE_VOLUME_LOCK_DIR")
         ));
     }
 }

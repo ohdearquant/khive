@@ -18,6 +18,7 @@ fn child_receives_a_private_home_and_the_documented_variables() {
         ("KHIVE_RECOVERER_LOCK", "recoverer.lock"),
         ("KHIVE_SOCKET", "s"),
         ("KHIVE_PID", "p"),
+        ("KHIVE_VOLUME_LOCK_DIR", "volume-locks"),
     ];
     for (variable, file) in private_paths {
         let value = std::env::var_os(variable).expect("private path");
@@ -37,6 +38,7 @@ fn child_receives_a_private_home_and_the_documented_variables() {
         "KHIVE_RUNTIME_ISOLATED_TEST",
         "KHIVE_SOCKET",
         "KHIVE_TEST_HARNESS",
+        "KHIVE_VOLUME_LOCK_DIR",
     ];
     assert_eq!(khive_names, expected);
 }

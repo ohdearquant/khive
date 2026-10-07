@@ -22,6 +22,7 @@ pub(crate) fn run_in_child() -> bool {
             // Native model initialization must not escape the checked child HOME.
             .env_remove("LATTICE_MODEL_CACHE")
             .env("KHIVE_TEST_HARNESS", "1")
+            .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
             .env("KHIVE_LOCK", root.path().join("khived.recovery.lock"));
         // The fixture must outlive the child that runs inside the call.
         fixture = Some(root);

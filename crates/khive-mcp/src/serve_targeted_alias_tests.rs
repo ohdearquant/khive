@@ -13,6 +13,8 @@ fn sqlite_config(name: &str, path: &Path) -> BackendConfig {
         cache_mb: None,
         journal_mode: None,
         wal_ceiling_bytes: None,
+        disk_reserve_bytes: None,
+        disk_guard_deadline_ms: None,
         served_kinds: None,
         read_only: false,
     }

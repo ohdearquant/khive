@@ -122,7 +122,11 @@ struct FtsFixture {
 fn build_fts_fixture() -> FtsFixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bench_fts.db");
-    let backend = StorageBackend::sqlite(&path).expect("backend");
+    let backend = StorageBackend::sqlite_with_volume_lock_dir(
+        &path,
+        path.parent().unwrap().join("volume-locks"),
+    )
+    .expect("backend");
     let store = backend.text("bench_notes").expect("text store");
 
     let rt = tokio::runtime::Runtime::new().expect("rt");
@@ -144,7 +148,11 @@ fn build_vec_fixture() -> VecFixture {
     ensure_extensions_loaded();
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("bench_vec.db");
-    let backend = StorageBackend::sqlite(&path).expect("backend");
+    let backend = StorageBackend::sqlite_with_volume_lock_dir(
+        &path,
+        path.parent().unwrap().join("volume-locks"),
+    )
+    .expect("backend");
     let store = backend
         .vectors_for_namespace(MODEL_KEY, "all-minilm-l6-v2", VECTOR_DIMS, NAMESPACE)
         .expect("vec store");
@@ -462,7 +470,11 @@ fn bench_fts_upsert_batch(c: &mut Criterion) {
                             .collect();
                         let dir = tempfile::tempdir().expect("tempdir");
                         let path = dir.path().join("bench_upsert.db");
-                        let backend = StorageBackend::sqlite(&path).expect("backend");
+                        let backend = StorageBackend::sqlite_with_volume_lock_dir(
+                            &path,
+                            path.parent().unwrap().join("volume-locks"),
+                        )
+                        .expect("backend");
                         let store = backend.text("upsert_bench").expect("text store");
                         (store, docs, dir)
                     },
@@ -554,7 +566,11 @@ fn bench_vec_insert_batch(c: &mut Criterion) {
                             .collect();
                         let dir = tempfile::tempdir().expect("tempdir");
                         let path = dir.path().join("bench_vec_insert.db");
-                        let backend = StorageBackend::sqlite(&path).expect("backend");
+                        let backend = StorageBackend::sqlite_with_volume_lock_dir(
+                            &path,
+                            path.parent().unwrap().join("volume-locks"),
+                        )
+                        .expect("backend");
                         let store = backend
                             .vectors_for_namespace(
                                 MODEL_KEY,
@@ -602,7 +618,11 @@ fn bench_backend_creation(c: &mut Criterion) {
             || tempfile::tempdir().expect("tempdir"),
             |dir| {
                 let path = dir.path().join("bench_creation.db");
-                let backend = StorageBackend::sqlite(&path).expect("sqlite backend");
+                let backend = StorageBackend::sqlite_with_volume_lock_dir(
+                    &path,
+                    path.parent().unwrap().join("volume-locks"),
+                )
+                .expect("sqlite backend");
                 black_box((backend, dir))
             },
             BatchSize::SmallInput,

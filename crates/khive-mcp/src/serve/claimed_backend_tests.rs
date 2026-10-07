@@ -21,6 +21,8 @@ fn declared(path: &std::path::Path, read_only: bool) -> BackendConfig {
         served_kinds: None,
         read_only,
         wal_ceiling_bytes: Some(0),
+        disk_reserve_bytes: None,
+        disk_guard_deadline_ms: None,
     }
 }
 
@@ -31,6 +33,7 @@ fn daemon_claim_blocks_foreign_pool_before_identity_or_wal_initialization() {
     }
     for implicit in [false, true] {
         let (_dir, path) = fixture();
+        let locks = path.with_file_name("volume-locks");
         let held_path = path.with_file_name("held.db");
         let mut guards = acquire_daemon_store_guards(vec![path.clone()]).unwrap();
         bind_daemon_store_files(&mut guards, &[]).unwrap();
@@ -54,6 +57,8 @@ fn daemon_claim_blocks_foreign_pool_before_identity_or_wal_initialization() {
                 Some(1),
                 khive_db::WalCeilingPolicy::default(),
                 Some(&guards),
+                Some(khive_db::EffectiveDiskGuardConfig::default()),
+                Some(&locks),
             )
         }
         .err()
@@ -70,6 +75,8 @@ fn daemon_claim_blocks_foreign_pool_before_identity_or_wal_initialization() {
             Some(1),
             khive_db::WalCeilingPolicy::default(),
             None,
+            Some(khive_db::EffectiveDiskGuardConfig::default()),
+            Some(&locks),
         )
         .unwrap();
         assert!(!control.is_read_only());
@@ -99,6 +106,8 @@ fn matching_daemon_claim_opens_read_only_snapshots_in_both_boot_routes() {
                 Some(1),
                 khive_db::WalCeilingPolicy::default(),
                 Some(&guards),
+                None,
+                None,
             )
         }
         .unwrap();
@@ -127,6 +136,7 @@ fn sqlite_open_errors_preserve_backend_resolved_path_and_typed_cause() {
         let home = PathBuf::from(std::env::var_os("HOME").expect("isolated child HOME"));
         let dir = tempfile::tempdir_in(&home).unwrap();
         let path = dir.path().join("invalid.db");
+        let locks = dir.path().join("volume-locks");
         std::fs::write(&path, [b'X'; 1024]).unwrap();
         let declared_path = PathBuf::from("~")
             .join(dir.path().strip_prefix(&home).unwrap())
@@ -134,6 +144,7 @@ fn sqlite_open_errors_preserve_backend_resolved_path_and_typed_cause() {
         let error = if implicit {
             let mut config = RuntimeConfig {
                 db_path: Some(path.clone()),
+                volume_lock_dir: Some(locks.clone()),
                 ..RuntimeConfig::no_embeddings()
             };
             open_single_backend(&mut config, Some(1), None)
@@ -143,6 +154,8 @@ fn sqlite_open_errors_preserve_backend_resolved_path_and_typed_cause() {
                 Some(1),
                 khive_db::WalCeilingPolicy::default(),
                 None,
+                Some(khive_db::EffectiveDiskGuardConfig::default()),
+                Some(&locks),
             )
         }
         .err()
@@ -173,6 +186,143 @@ fn sqlite_open_errors_preserve_backend_resolved_path_and_typed_cause() {
             "error must disclose the opened path rather than the tilde spelling: {message}"
         );
     }
+}
+
+// MUST-FAIL: a claimed writable open that builds its pool without the host's
+// captured policies leaves the default reserve and lock directory on the pool.
+#[test]
+fn matching_daemon_claim_opens_writable_backends_with_the_captured_policies() {
+    if initialize_in_isolated_child() {
+        return;
+    }
+    let policy = khive_db::EffectiveDiskGuardConfig {
+        reserve_bytes: 123,
+        guard_deadline_ms: 250,
+        ..khive_db::EffectiveDiskGuardConfig::default()
+    };
+    for implicit in [false, true] {
+        let (dir, path) = fixture();
+        let locks = dir.path().join("volume-locks");
+        let mut guards = acquire_daemon_store_guards(vec![path.clone()]).unwrap();
+        bind_daemon_store_files(&mut guards, &[]).unwrap();
+        let backend = if implicit {
+            let mut config = RuntimeConfig {
+                db_path: Some(path.clone()),
+                disk_guard_config: Some(policy),
+                volume_lock_dir: Some(locks.clone()),
+                ..RuntimeConfig::default()
+            };
+            open_single_backend(&mut config, Some(1), Some(&guards))
+        } else {
+            open_backend(
+                &declared(&path, false),
+                Some(1),
+                khive_db::WalCeilingPolicy::default(),
+                Some(&guards),
+                Some(policy),
+                Some(&locks),
+            )
+        }
+        .unwrap();
+        assert_eq!(backend.pool().effective_disk_guard_config(), Some(policy));
+        assert_eq!(
+            backend.pool().config().volume_lock_dir.as_deref(),
+            Some(locks.as_path())
+        );
+    }
+}
+
+// MUST-FAIL: dropping the lock-directory requirement opens the database
+// (and creates its journal files) before any refusal.
+#[test]
+fn writable_open_without_a_lock_directory_refuses_before_touching_the_database() {
+    for implicit in [false, true] {
+        let (_dir, path) = fixture();
+        let before = std::fs::read(&path).unwrap();
+        let error = if implicit {
+            let mut config = RuntimeConfig {
+                db_path: Some(path.clone()),
+                volume_lock_dir: None,
+                ..RuntimeConfig::default()
+            };
+            open_single_backend(&mut config, Some(1), None)
+        } else {
+            open_backend(
+                &declared(&path, false),
+                Some(1),
+                khive_db::WalCeilingPolicy::default(),
+                None,
+                Some(khive_db::EffectiveDiskGuardConfig::default()),
+                None,
+            )
+        }
+        .err()
+        .expect("a writable open needs a lock directory");
+        assert!(
+            error.to_string().contains("KHIVE_VOLUME_LOCK_DIR"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("db-wal").exists());
+        assert!(!path.with_extension("db-shm").exists());
+    }
+}
+
+// MUST-FAIL: creating the database's parent directory before the writer policy
+// is resolved leaves that directory behind when the open is refused.
+#[test]
+fn writable_open_without_a_lock_directory_creates_no_parent_directory() {
+    for implicit in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path().join("missing");
+        let path = top.join("nested").join("main.db");
+        let error = if implicit {
+            let mut config = RuntimeConfig {
+                db_path: Some(path.clone()),
+                volume_lock_dir: None,
+                ..RuntimeConfig::default()
+            };
+            open_single_backend(&mut config, Some(1), None)
+        } else {
+            open_backend(
+                &declared(&path, false),
+                Some(1),
+                khive_db::WalCeilingPolicy::default(),
+                None,
+                Some(khive_db::EffectiveDiskGuardConfig::default()),
+                None,
+            )
+        }
+        .err()
+        .expect("a writable open needs a lock directory");
+        assert!(
+            error.to_string().contains("KHIVE_VOLUME_LOCK_DIR"),
+            "{error:#}"
+        );
+        assert!(!top.exists());
+    }
+}
+
+// MUST-FAIL: same ordering as above for a declared backend that has a lock
+// directory but no resolved disk policy.
+#[test]
+fn writable_open_without_a_disk_policy_creates_no_parent_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let top = dir.path().join("missing");
+    let path = top.join("nested").join("main.db");
+    let locks = dir.path().join("volume-locks");
+    let error = open_backend(
+        &declared(&path, false),
+        Some(1),
+        khive_db::WalCeilingPolicy::default(),
+        None,
+        None,
+        Some(&locks),
+    )
+    .err()
+    .expect("a writable open needs a disk policy");
+    assert!(error.to_string().contains("disk policy"), "{error:#}");
+    assert!(!top.exists());
 }
 
 fn initialize_in_isolated_child() -> bool {
