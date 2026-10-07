@@ -277,6 +277,9 @@ impl SparqlParser {
                 let n: f64 = s
                     .parse()
                     .map_err(|_| self.err(format!("invalid number: {s}")))?;
+                if !n.is_finite() {
+                    return Err(self.err(format!("float literal '{s}' is not finite")));
+                }
                 Ok(Object::NumberLiteral(ConditionValue::Number(n)))
             }
             _ => Err(self.err("expected variable (?x), kind (:concept), string, or number")),
