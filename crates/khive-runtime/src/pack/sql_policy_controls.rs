@@ -54,6 +54,121 @@ mod inline {
         );
     }
 
+    #[test]
+    fn test_fixture_braces_do_not_hide_production_sql() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/lib.rs");
+        for fixture in [
+            r#"const BRACE: &str = "{";"#,
+            r##"const BRACE: &str = r#"{"#;"##,
+            r#"const BRACE: &[u8] = b"{";"#,
+            "const BRACE: char = '{';",
+            "// {",
+            "/* { /* nested } */ { */",
+            r#"const BRACE: &str = "}";"#,
+        ] {
+            let source = format!(
+                "#[cfg(test)]\nmod tests {{\n{fixture}\n\
+                 const Q: &str = \"SELECT fixture FROM notes\";\n}}\n\
+                 const Q: &str = \"SELECT production FROM notes\";\n"
+            );
+            let sources = BTreeMap::from([(path.clone(), source.clone())]);
+            assert_eq!(
+                inline_errors(&sources, &root, &["demo"], &[]),
+                vec!["inline SQL: demo/src/lib.rs: SELECT production FROM notes"],
+                "{source}"
+            );
+            assert!(still_inline_seen(&sources, &root.join("demo")));
+        }
+    }
+
+    #[test]
+    fn test_module_mask_preserves_prefix_suffix_and_line_boundaries() {
+        let root = PathBuf::from("/crates");
+        let path = root.join("demo/src/lib.rs");
+        for prefix in [
+            "",
+            "\u{feff}",
+            "#!/usr/bin/env rust-script\n",
+            "\u{feff}#!/usr/bin/env rust-script\r\n",
+            "#![allow(dead_code)]\n",
+            "\u{feff}#! /* prelude */ [allow(dead_code)]\r\n",
+        ] {
+            let before = format!("{prefix}const LABEL: &str = \"雪\"; ");
+            let after = " const Q: &str = \"SELECT production FROM notes\";\r\n";
+            for attributes in [
+                "#[cfg(test)]\r\n#[doc = \"SELECT fixture_doc FROM notes\"]",
+                "#[doc = \"SELECT fixture_doc FROM notes\"]\r\n#[cfg(test)]",
+            ] {
+                let source = format!(
+                    "{before}{attributes}\r\nmod tests {{\r\n\
+                     const Q: &str = \"SELECT fixture FROM notes\";\r\n}}{after}"
+                );
+                let masked = strip_test_modules(&source);
+                assert_eq!(masked.len(), source.len());
+                assert!(masked.starts_with(&before));
+                assert!(masked.ends_with(after));
+                for (index, byte) in source.bytes().enumerate() {
+                    if matches!(byte, b'\r' | b'\n') {
+                        assert_eq!(masked.as_bytes()[index], byte);
+                    }
+                }
+                let sources = BTreeMap::from([(path.clone(), source)]);
+                assert_eq!(
+                    inline_errors(&sources, &root, &["demo"], &[]),
+                    vec!["inline SQL: demo/src/lib.rs: SELECT production FROM notes"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn only_actual_direct_cfg_test_inline_modules_are_excluded() {
+        let source = r##"
+const MARKER: &str = r#"#[cfg(test)] mod decoy {"#;
+// #[cfg(test)] mod comment_decoy {
+mod outer {
+    #[cfg(test)]
+    mod fixture {
+        const Q: &str = "SELECT fixture FROM notes";
+        #[cfg(test)]
+        mod nested { const Q: &str = "SELECT nested_fixture FROM notes"; }
+    }
+    const Q: &str = "SELECT nested_production FROM notes";
+}
+#[cfg(feature = "demo")]
+mod conditional { const Q: &str = "SELECT conditional FROM notes"; }
+#[cfg(all(test, feature = "demo"))]
+mod compound { const Q: &str = "SELECT compound FROM notes"; }
+const Q: &str = "SELECT production FROM notes";
+"##;
+        let root = PathBuf::from("/crates");
+        let sources = BTreeMap::from([(root.join("demo/src/lib.rs"), source.into())]);
+        assert_eq!(
+            inline_errors(&sources, &root, &["demo"], &[]),
+            vec![
+                "inline SQL: demo/src/lib.rs: SELECT nested_production FROM notes",
+                "inline SQL: demo/src/lib.rs: SELECT conditional FROM notes",
+                "inline SQL: demo/src/lib.rs: SELECT compound FROM notes",
+                "inline SQL: demo/src/lib.rs: SELECT production FROM notes",
+            ]
+        );
+        let masked = strip_test_modules(source);
+        assert!(masked.contains(r##"const MARKER: &str = r#"#[cfg(test)] mod decoy {"#;"##));
+        assert!(masked.contains("// #[cfg(test)] mod comment_decoy {"));
+    }
+
+    #[test]
+    #[should_panic(expected = "parse Rust source for inline SQL policy")]
+    fn malformed_inline_source_fails_closed() {
+        let root = PathBuf::from("/crates");
+        let sources = BTreeMap::from([(
+            root.join("demo/src/lib.rs"),
+            "#[cfg(test)] mod broken {".into(),
+        )]);
+        inline_errors(&sources, &root, &["demo"], &[]);
+    }
+
     fn fixture(source: &str) -> (BTreeMap<PathBuf, String>, BTreeSet<PathBuf>, PathBuf) {
         let root = PathBuf::from("/crates");
         let sources = BTreeMap::from([
