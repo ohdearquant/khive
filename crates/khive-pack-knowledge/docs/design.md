@@ -229,6 +229,9 @@
 
 ## Module Boundaries
 
+`knowledge/search/ann_search.rs` holds private ANN candidate acquisition, score provenance,
+RRF fusion, and post-hydration filters. The handlers remain in `knowledge/search.rs`.
+
 | Module                  | Responsibility                                                                           |
 | ----------------------- | ---------------------------------------------------------------------------------------- |
 | `lib.rs`                | Public exports and the operator-facing `reindex_knowledge` library entry                 |
