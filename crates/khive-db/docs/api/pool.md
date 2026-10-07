@@ -32,42 +32,86 @@ Writable file-backed pools take their free-space reserve from the resolved
 disk-guard policy. A backend's own reserve setting wins, then
 `KHIVE_SQLITE_DISK_RESERVE_BYTES`, then the deprecated
 `KHIVE_DB_FREE_SPACE_FLOOR_BYTES` (still read, with a warning), then the 1 GiB
-default; `0` disables the check. Setting both variables to different values is
-a configuration error, even when a backend overrides them. The policy is
-resolved once when the pool opens, and an invalid byte count fails pool
-construction with `SqliteError::InvalidConfig`. In-memory and read-only pools
-do not sample disk space.
+default. Setting both variables to different values is a configuration error,
+even when a backend overrides them. The policy is resolved once when the pool
+opens, and invalid numeric settings fail construction with
+`SqliteError::InvalidConfig`. A reserve of `0` removes the floor comparison,
+but still requires volume identity, the cooperative lease and a successful
+probe; operation-specific headroom, including VACUUM's estimate, still applies.
+In-memory and read-only pools do not take the disk lease or sample disk space.
 
-Writable file-backed hosts also need a volume-lock directory shared by every
-khive process of the user. It is `KHIVE_VOLUME_LOCK_DIR` when that is set and
-not blank, otherwise `.khive/sqlite-volume-locks` under the first non-blank of
-`HOME` and `USERPROFILE`. It must be absolute and there is no working-directory
-fallback: with no usable home, or with a relative path, the resolver returns
-`SqliteError::InvalidConfig` naming `KHIVE_VOLUME_LOCK_DIR`. A writable pool
-configured without a directory fails when it takes its volume lease. Read-only
-pools never need it.
+`disk_guard_deadline_ms` resolves from the backend setting, then
+`KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS`, then 2,000 ms. Its valid range is
+100–10,000 ms without clamping. It bounds volume-lease acquisition independently
+of the pool's `checkout_timeout` and the queue-only
+`write_admission_deadline_ms`.
 
-Each pooled writer checkout, cancellable writer checkout, standalone writer
-open, standalone writer-handle operation, and writer-task request samples
-available space on the canonical database parent directory. At or below the
-reserve, admission returns a typed capacity-floor error before running the
-operation. Both a standalone writer handle and the writer task keep their
-SQLite connections open across operations, so each operation gets a fresh
-check after the handle was opened. The sampled value is not cached across
-admissions.
+Writable file-backed hosts also need an absolute volume-lock directory shared
+by cooperating khive processes of the user. The default resolver uses a
+non-blank `KHIVE_VOLUME_LOCK_DIR`, otherwise `.khive/sqlite-volume-locks` under
+the first non-blank of `HOME` and `USERPROFILE`. There is no working-directory
+fallback; an unresolved or relative default is `SqliteError::InvalidConfig`.
+`ConnectionPool::new` requires a supplied, absolute directory before any SQLite
+open: a missing directory is a configuration error, and an explicitly supplied
+relative directory is a `CapacityUnavailable` lock-phase error. Read-only and
+in-memory pools do not require it. Test fixtures may supply their own directory;
+the test-harness default uses a separate temporary lock namespace.
 
-Checkpoint and diagnostics infrastructure connections, including the
-zero-wait `try_checkpoint_nowait` capability, remain available below the floor
-so recovery can reclaim WAL space. Pool startup also remains available; opening and
-configuring SQLite connections may perform setup I/O before any operation is
-admitted. A caller's `execute_script_top_level` is still a request-path
-operation, including `khive-vcs` sync's `WalCheckpointTruncate`; it is refused
-at or below the floor on both writer-task and standalone-handle routes. That
-request path does not use the infrastructure checkpoint connection and is not
-exempt. The check cannot predict the size of an arbitrary SQL transaction or
-writes by other processes, so a very large already-admitted transaction can
-still reach `SQLITE_FULL`. The reserve protects subsequent admissions and
-provides headroom for recovery; it is not a transaction-size quota.
+Admission identifies the volume through the nearest existing canonical ancestor
+of the database path. On Unix, an existing database file is itself the probe target, not its parent;
+a missing file resolves through an existing ancestor.
+On Windows the capacity probe uses the resolved volume root. The stable volume
+key selects the cooperative lease, while the path is diagnostic/probe metadata.
+
+An admitted pooled checkout takes the volume lease before the writer mutex and
+leaves capacity sampling to the logical-write boundary: a transaction samples
+after successful `BEGIN IMMEDIATE`, before its body; an autocommit unit samples
+immediately before its write. The public compatibility `writer()` path also
+samples at checkout, which alone cannot authorize arbitrary later raw SQL.
+Writer-task requests sample after `BEGIN`, and admitted standalone transactions
+follow the same order. Standalone autocommit statements/scripts sample before
+their first write call. Each admission takes a fresh sample; the result is not
+cached across operations. The lease stays held through commit, rollback or
+owned-connection settlement.
+
+Admission compares available space with the reserve plus required headroom. If
+that sum is nonzero, space at or below it returns `CapacityFloor` before the
+logical write runs; addition overflow also refuses. `CapacityUnavailable` distinguishes
+`identity`, `lock` and `probe` failures; neither capacity outcome requests an
+automatic retry. A thread that already holds the same volume lease is refused
+immediately with `VolumeLeaseReentry`, naming the holder and requester sites.
+Cross-thread contention instead waits within the guard deadline.
+
+A capacity refusal whose rollback restores autocommit leaves the writer reusable.
+A pooled `WriterGuard` rollback that does not prove autocommit retires that writer
+and returns `WriterSettlementUnknown`. This result is distinct from subsequent
+owned cleanup, which runs while the lease is held and may still restore autocommit
+or close the connection successfully. Only if that cleanup proves neither
+autocommit nor successful close is shared admission poisoned, so later writes
+fail with `WriterPoisoned` before starting. Storage
+projection distinguishes the unknown earlier outcome (`SideEffectsUnknown`) from
+a later refused write (`NotStarted`). The writer task additionally retires its
+queue on a terminal request outcome.
+
+Checkpoint and read-only diagnostics bypass disk-lease and capacity admission,
+including `try_checkpoint_nowait` and caller-issued
+`TopLevelMaintenance::WalCheckpointTruncate` on both writer-task and standalone
+SQL routes. The queued route uses `send_checkpoint_bounded`; the standalone
+route takes a lease only for `Vacuum`. VACUUM is not a recovery bypass: it needs
+the lease and a copy-sized estimate from database/WAL metadata, and an unavailable
+estimate, arithmetic overflow or insufficient headroom refuses it. A checkpoint
+bypass does not suppress SQLite errors or bypass the route's other availability
+checks. Startup connection setup can perform I/O; bootstrap DDL has its own
+admitted boundary.
+
+An already-admitted large transaction or another filesystem consumer can still
+exhaust space. The sampled floor is neither reserved capacity nor guaranteed
+recovery headroom, and it is not a transaction-size quota. See
+[SQLite disk admission](disk-admission.md) for the boundary inventory and remaining
+raw-connection work. Full ADR-154 conformance remains tracked by
+[#3551](https://github.com/ohdearquant/khive/issues/3551); native `SQLITE_FULL`
+code propagation after automatic rollback remains separate work in
+[#4405](https://github.com/ohdearquant/khive/issues/4405).
 
 `try_checkpoint_nowait` returns a restricted `CheckpointGuard`. It has fixed
 PASSIVE and TRUNCATE operations and exposes no raw SQLite connection or

@@ -42,42 +42,65 @@ writer-task acquisition class once per dequeued top-level request or successful
 `PoolConfig::write_queue_capacity` resolves the default from
 `KHIVE_WRITE_QUEUE_CAPACITY`).
 
-## Proposed disk-reserve admission (#1844; not implemented)
+## Disk-reserve admission
 
-[ADR-154](../../../../docs/adr/ADR-154-sqlite-disk-reserve-admission.md) proposes
-the disk-reserve contract. This section is an implementation map, not a claim
-about current behavior.
+[ADR-154](../../../../docs/adr/ADR-154-sqlite-disk-reserve-admission.md) defines
+the accepted contract. The drain-loop behavior below is implemented; the
+[SQLite disk admission](disk-admission.md) inventory records the remaining
+raw-connection boundaries, so this is not a claim of complete ADR conformance.
 
 The writer task does not sample free space when a caller enters the bounded
 channel. At execution time it acquires the shared volume lease, successfully
 executes `BEGIN IMMEDIATE`, and then probes the volume before invoking the
 request closure. A refusal or probe failure runs `ROLLBACK` and replies with
-the typed capacity error; a successful rollback does not retire the task. The
-lease remains held through the ordinary `COMMIT` or `ROLLBACK`.
+the typed capacity error if autocommit is restored; that refusal does not retire
+the task. The lease remains held through ordinary `COMMIT` or `ROLLBACK`.
 
-Every path follows the same lock order: volume lease, SQLite writer
-acquisition, capacity probe, first logical write. Top-level requests acquire
-the same lease and probe immediately before their first SQLite call because
-they deliberately have no explicit `BEGIN`. Pooled/standalone writers and
-startup migrations receive equivalent admission outside this drain loop.
-Volume-lease acquisition has its own configured deadline; it does not reuse
-the queue-only `write_admission_deadline_ms` governed by ADR-131.
+The lock order is volume lease, SQLite writer acquisition, capacity probe, first
+logical write. Non-checkpoint top-level requests have no explicit `BEGIN`, so
+they take the lease and probe immediately before execution. Typed VACUUM dispatch
+also requires a copy-sized database/WAL headroom estimate and refuses if that
+estimate is unavailable or overflows. Typed checkpoint requests, including
+`TopLevelMaintenance::WalCheckpointTruncate` sent through
+`send_checkpoint_bounded`, skip both the lease and capacity probe while remaining
+serialized by the writer task. The standalone SQL route makes the same
+checkpoint/VACUUM distinction.
 
-The two current migration bootstrap writes happen before a migration
-transaction exists: `apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and
-`run_migrations_locked` executes `MIGRATION_TRACKING_TABLE`. Each acquires the
-volume lease and probes immediately before its autocommit `execute_batch`,
-skips that call on refusal, and holds the lease until the connection returns
-to autocommit. Subsequent migration transactions use the ordinary
-post-`BEGIN` probe.
+Volume-lease acquisition uses `disk_guard_deadline_ms` (backend override, then
+`KHIVE_SQLITE_DISK_GUARD_DEADLINE_MS`, then 2,000 ms; valid range 100–10,000 ms).
+It does not reuse the queue-only `write_admission_deadline_ms` governed by
+ADR-131. `CapacityUnavailable` identifies `identity`, `lock` and `probe` failures;
+like `CapacityFloor`, it is not automatically retryable. Same-thread nesting
+returns `VolumeLeaseReentry` immediately with both call sites instead of waiting
+as ordinary contention.
 
-Transaction terminators, checkpointing, diagnostics, reader release, and
-recovery are explicit refusal bypasses. The guard therefore belongs at the
-logical-request boundary, never inside generic statement execution. Native
-`SQLITE_FULL` remains a separate higher-severity stage and is not rendered as
-a successful capacity refusal. Checkpoint bypass includes PASSIVE,
-ADR-091's scheduled threshold-armed `maybe_truncate`, and operator-authorized
-stronger checkpoints.
+If admission's rollback cannot prove autocommit, the request receives
+`WriterTaskTerminated` with `SideEffectsUnknown` and the task retires. Terminal
+return and unwind retain the volume lease through owned-connection cleanup.
+Cleanup attempts to establish autocommit or close the connection; if neither
+succeeds, it returns `WriterSettlementUnknown` internally and poisons shared
+admission, so later writes are refused before starting (`WriterPoisoned`,
+projected as `NotStarted`). The task preserves its terminal reply and closes and
+fails the queued requests without restarting. A cleanup failure does not turn an
+unknown outcome into an ordinary capacity refusal.
+
+The two migration bootstrap writes happen before a migration transaction exists:
+`apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and
+`bootstrap_migration_ledger` executes `MIGRATION_TRACKING_TABLE`. Their admitted
+wrappers hold the volume lease; each probes immediately before its autocommit
+`execute_batch`, skips that call on refusal, and retains the lease through
+settlement. Subsequent migration transactions use the ordinary post-`BEGIN`
+probe.
+
+Transaction terminators, checkpointing, read-only diagnostics, reader release and
+recovery bypass disk-floor refusal. The guard belongs at the logical-write
+boundary, never inside generic statement execution. A bypass does not suppress
+SQLite errors, and a sample does not reserve capacity or guarantee recovery
+headroom. Native `SQLITE_FULL` is distinct from preflight capacity refusal; its
+caller-visible code propagation after automatic rollback is still tracked by
+[#4405](https://github.com/ohdearquant/khive/issues/4405). Checkpoint bypass includes
+PASSIVE, ADR-091's scheduled threshold-armed `maybe_truncate`, and
+operator-authorized stronger checkpoints.
 
 ## Writer-stage telemetry (#1849)
 

@@ -194,7 +194,7 @@ writer-task seam. Pool, SQL-bridge, migration, and explicitly top-level/standalo
 the central enforcement boundary.
 
 The bootstrap row names two current writes which occur before any migration transaction:
-`apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and `run_migrations_locked` executes
+`apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and `bootstrap_migration_ledger` executes
 `MIGRATION_TRACKING_TABLE`. Each call must acquire the volume lease, probe before its
 `execute_batch`, skip the call on refusal/probe failure, and retain the lease until the connection
 is demonstrably back in autocommit. The later per-migration transaction then performs the normal
