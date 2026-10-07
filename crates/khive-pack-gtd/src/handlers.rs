@@ -455,9 +455,9 @@ pub(crate) async fn resolve_context_entity_id(
 /// `CASE` semantics for absent, JSON-null, and non-text legacy values.
 const DEFAULT_STATUS: &str = "inbox";
 
-/// Priority a task is treated as when the `priority` property is missing/empty.
-/// An explicit default-priority filter uses `FilterOp::EqOrMissing` so legacy
-/// rows without the property remain visible.
+/// Priority projected when the `priority` property is missing or non-text.
+/// An explicit default-priority filter uses `FilterOp::TextEqOrNonText` to
+/// match that fallback; empty and unknown strings retain their stored values.
 const DEFAULT_PRIORITY: &str = "p2";
 
 /// Status used internally on a task. Defaults to "inbox" when missing or non-string.
@@ -1809,18 +1809,15 @@ impl GtdPack {
             });
         }
         if let Some(want) = p.priority.as_deref() {
-            // Priorities are always stored lowercase (`task_create`/
-            // `prepare_transition` normalize via `to_ascii_lowercase`), so an
-            // exact-match SQL predicate on the lowercased input reproduces
-            // the prior `eq_ignore_ascii_case` behavior. A legacy task with no
-            // stored `priority` renders as `p2` (`priority_rank`,
-            // `render_task`), so `priority="p2"` must also match the missing
-            // case via `EqOrMissing` — plain `Eq` never matches SQL NULL.
+            // Canonical priorities are stored lowercase, so normalize the input.
+            // `render_task` defaults missing and non-text priorities to `p2`;
+            // match that fallback in SQL before pagination. Other stored strings
+            // retain exact matching rather than being treated as `p2`.
             let want = want.to_ascii_lowercase();
             property_filters.push(PropertyFilter {
                 json_path: "$.priority".to_string(),
                 op: if want == DEFAULT_PRIORITY {
-                    FilterOp::EqOrMissing
+                    FilterOp::TextEqOrNonText
                 } else {
                     FilterOp::Eq
                 },
