@@ -428,6 +428,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 resolution_mode: IdResolutionMode::NotApplicable,
             },
             ParamDef {
+                name: "min_effective_salience",
+                param_type: "number",
+                required: false,
+                description: "Soft-delete memories whose decay-adjusted salience is strictly below this value, using the active recall decay configuration. Omit to disable this selector; criteria are combined with OR.",
+                resolution_mode: IdResolutionMode::NotApplicable,
+            },
+            ParamDef {
                 name: "before",
                 param_type: "integer",
                 required: false,
@@ -1087,6 +1094,86 @@ mod note_mutation_hook_tests {
     use serde_json::json;
     use serial_test::serial;
     use uuid::Uuid;
+
+    #[test]
+    #[serial_test::serial(config_ledger)]
+    fn prune_description_publishes_optional_effective_salience_schema() {
+        use khive_runtime::{RuntimeConfig, WalCeilingSource};
+
+        let runtime = KhiveRuntime::new(RuntimeConfig {
+            db_path: None,
+            embedding_model: None,
+            additional_embedding_models: Vec::new(),
+            wal_ceiling_bytes: 0,
+            wal_ceiling_configured_bytes: 0,
+            wal_ceiling_source: WalCeilingSource::Default,
+            wal_ceiling_env_raw: None,
+            disk_guard_environment: Default::default(),
+            disk_guard_config: None,
+            volume_lock_dir: None,
+            credentials: Vec::new(),
+            visibility_receipts: None,
+            mounts: Vec::new(),
+            events_split: None,
+            actor_id: None,
+            brain_profile: None,
+            brain: Default::default(),
+            packs: vec!["kg".into(), "memory".into()],
+            ..RuntimeConfig::default()
+        })
+        .expect("isolated memory runtime");
+        assert!(runtime.config().db_path.is_none());
+        assert!(runtime.backend().pool().config().path.is_none());
+        assert!(runtime.backend_data_dir().is_none());
+        assert!(runtime.backend_ann_root().is_none());
+        assert!(runtime.registered_embedding_model_names().is_empty());
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(runtime.clone()));
+        builder.register(MemoryPack::new(runtime));
+        // This uses the production description renderer without activating packs.
+        let registry = builder.build_metadata().expect("metadata registry");
+        assert!(registry.has_verb("memory.prune"));
+        let description = registry
+            .describe_verb("memory.prune")
+            .expect("prune description");
+        assert_eq!(description["verb"], "memory.prune");
+        assert_eq!(description["pack"], "memory");
+        assert_eq!(description["category"], "Commissive");
+
+        let params = description["params"].as_array().expect("parameter list");
+        assert_eq!(params.len(), 5);
+        let schema = &description["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], true);
+        assert!(schema["required"]
+            .as_array()
+            .expect("required list")
+            .is_empty());
+        let properties = schema["properties"].as_object().expect("schema properties");
+        assert_eq!(properties.len(), 6);
+        assert_eq!(properties["help"]["type"], "boolean");
+
+        for (name, param_type) in [
+            ("min_salience", "number"),
+            ("min_effective_salience", "number"),
+            ("before", "integer"),
+            ("namespace", "string"),
+            ("dry_run", "boolean"),
+        ] {
+            let matching: Vec<_> = params
+                .iter()
+                .filter(|param| param["name"].as_str() == Some(name))
+                .collect();
+            assert_eq!(matching.len(), 1, "exactly one declaration for {name}");
+            assert_eq!(matching[0]["type"], param_type, "help type for {name}");
+            assert_eq!(matching[0]["required"], false, "optional help field {name}");
+            assert_eq!(
+                properties[name]["type"], param_type,
+                "schema type for {name}"
+            );
+        }
+    }
 
     const FR1_MODEL: &str = "fr1-mutation-hook-model";
 
