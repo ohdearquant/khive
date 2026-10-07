@@ -299,6 +299,8 @@ fn same_diagnostic_database(a: &OpenedDiagnosticBackend, b: &OpenedDiagnosticBac
 #[derive(Clone)]
 pub struct KhiveRuntime {
     pub(crate) visibility_receipts: Arc<crate::visibility_receipts::ReceiptCapability>,
+    pub(crate) visibility_cutover: Arc<crate::visibility_receipts::ReceiptCutover>,
+    core_visibility_cutover: Arc<crate::visibility_receipts::ReceiptCutover>,
     backend: Arc<StorageBackend>,
     /// Successful named-vector bindings and their namespace-scoped stores.
     /// Shared by runtime clones so repeated reads do not enter the writer or
@@ -512,7 +514,11 @@ impl KhiveRuntime {
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;
         }
-        Ok(Self::assemble_from_backend(Arc::new(backend), config))
+        Ok(Self::assemble_from_backend(
+            Arc::new(backend),
+            config,
+            false,
+        ))
     }
 
     /// Open a runtime for read-only inspection (no model registration, no DB creation).
@@ -564,14 +570,20 @@ impl KhiveRuntime {
             }
         };
         backend.prepare_core_schema()?;
-        Ok(Self::assemble_from_backend(Arc::new(backend), config))
+        Ok(Self::assemble_from_backend(
+            Arc::new(backend),
+            config,
+            false,
+        ))
     }
 
     /// Construct a runtime from an already-opened backend.
     ///
     /// This is a low-level, infallible assembly seam for already-prepared
-    /// multi-backend deployments. It does not inspect or migrate the V21
-    /// attachment-cutover state. Production hosts must first run the async
+    /// multi-backend deployments. It does not migrate or require completion of
+    /// the V21 attachment cutover. Receipt admission is primed best-effort; a
+    /// failed check is retried by later receipt operations. Production hosts
+    /// must first run the async
     /// kkernel/khive-mcp coordinator and must not expose a server over a
     /// pending or incomplete backend. Prefer [`Self::from_prepared_backend`]
     /// when constructing one fallible host runtime.
@@ -585,7 +597,7 @@ impl KhiveRuntime {
                 tracing::warn!(error = %err, "failed to register configured embedding models");
             }
         }
-        Self::assemble_from_backend(backend, config)
+        Self::assemble_from_backend(backend, config, false)
     }
 
     /// Construct a single-backend runtime after a host boot coordinator has
@@ -610,10 +622,14 @@ impl KhiveRuntime {
         if !backend.is_read_only() {
             register_configured_embedding_models(&backend, &config)?;
         }
-        Ok(Self::assemble_from_backend(backend, config))
+        Ok(Self::assemble_from_backend(backend, config, true))
     }
 
-    fn assemble_from_backend(backend: Arc<StorageBackend>, config: RuntimeConfig) -> Self {
+    fn assemble_from_backend(
+        backend: Arc<StorageBackend>,
+        config: RuntimeConfig,
+        cutover_validated: bool,
+    ) -> Self {
         if config.backend_id.as_str() == BackendId::MAIN {
             backend.pool().main_pool_generation();
         }
@@ -622,8 +638,14 @@ impl KhiveRuntime {
         let visibility_receipts = Arc::new(
             crate::visibility_receipts::ReceiptCapability::from_config(&config),
         );
+        let visibility_cutover = Arc::new(crate::visibility_receipts::ReceiptCutover::primed(
+            backend.clone(),
+            cutover_validated,
+        ));
         Self {
             visibility_receipts,
+            core_visibility_cutover: visibility_cutover.clone(),
+            visibility_cutover,
             backend,
             named_vector_stores: Arc::new(RwLock::new(HashMap::new())),
             core_named_vector_stores: None,
@@ -669,6 +691,13 @@ impl KhiveRuntime {
             "with_core_backend must not be called on the main runtime"
         );
         core.pool().main_pool_generation();
+        if self.visibility_cutover.is_bound_to(&core) {
+            self.core_visibility_cutover = self.visibility_cutover.clone();
+        } else if !self.core_visibility_cutover.is_bound_to(&core) {
+            self.core_visibility_cutover = Arc::new(
+                crate::visibility_receipts::ReceiptCutover::primed(core.clone(), false),
+            );
+        }
         if self
             .core_backend
             .as_ref()
@@ -771,6 +800,8 @@ impl KhiveRuntime {
                 };
                 KhiveRuntime {
                     visibility_receipts: self.visibility_receipts.clone(),
+                    visibility_cutover: self.core_visibility_cutover.clone(),
+                    core_visibility_cutover: self.core_visibility_cutover.clone(),
                     backend: main_arc.clone(),
                     named_vector_stores: self
                         .core_named_vector_stores

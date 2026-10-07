@@ -538,3 +538,253 @@ fn runtime_construction_and_custody_notice_projection_are_quiet() {
         "construction and projection stay quiet: {notices:?}"
     );
 }
+
+fn cutover_config(backend_id: &str) -> RuntimeConfig {
+    RuntimeConfig {
+        db_path: None,
+        backend_id: BackendId::parse(backend_id).unwrap(),
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: crate::WalCeilingSource::Default,
+        wal_ceiling_env_raw: None,
+        packs: vec!["kg".into()],
+        brain_profile: None,
+        actor_id: None,
+        ..RuntimeConfig::no_embeddings()
+    }
+}
+
+fn cutover_runtime(backend: Arc<khive_db::StorageBackend>, backend_id: &str) -> KhiveRuntime {
+    let runtime = KhiveRuntime::from_backend(backend, cutover_config(backend_id));
+    assert!(!runtime.backend().is_file_backed());
+    assert!(runtime.backend_data_dir().is_none());
+    assert!(runtime.backend_ann_root().is_none());
+    assert!(runtime.registered_embedding_model_names().is_empty());
+    configure(runtime).0
+}
+
+#[test]
+fn receipt_cutover_recovers_after_preparation_without_reconstruction() {
+    let backend = Arc::new(khive_db::StorageBackend::memory().unwrap());
+    let runtime = cutover_runtime(backend.clone(), BackendId::MAIN);
+    for _ in 0..2 {
+        let error = projected(runtime.ensure_visibility_receipt_key().unwrap_err());
+        assert_eq!(error["details"]["reason"], "receipt_store_unavailable");
+        assert_eq!(error["retryable"], true);
+    }
+    backend.prepare_core_schema().unwrap();
+    runtime.ensure_visibility_receipt_key().unwrap();
+    let before = backend.pool().reader_acquisition_snapshot();
+    for handle in [runtime.clone(), runtime.core()] {
+        handle.ensure_visibility_receipt_key().unwrap();
+        assert!(handle
+            .ensure_visibility_receipt_key_if_configured()
+            .unwrap());
+        let token = handle.seal_visibility_receipt("visible", &[]).unwrap();
+        let opened = handle
+            .open_visibility_receipt(&token, &["visible"], &[])
+            .unwrap();
+        assert_eq!(opened.namespace(), "visible");
+    }
+    let after = backend.pool().reader_acquisition_snapshot();
+    assert_eq!(after.acquisitions, before.acquisitions);
+    assert_eq!(after.pooled_checkouts, before.pooled_checkouts);
+}
+
+#[test]
+fn receipt_cutover_retries_a_failed_prime_and_then_skips_the_validator() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::atomic::AtomicUsize;
+
+    let backend = Arc::new(khive_db::StorageBackend::memory().unwrap());
+    backend.prepare_core_schema().unwrap();
+    let deny = Arc::new(AtomicBool::new(true));
+    let reads = Arc::new(AtomicUsize::new(0));
+    {
+        let deny = deny.clone();
+        let reads = reads.clone();
+        let writer = backend.pool().writer().unwrap();
+        writer
+            .conn()
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(
+                    context.action,
+                    AuthAction::Read {
+                        table_name: "memory_visibility_epochs",
+                        ..
+                    }
+                ) {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    if deny.load(Ordering::SeqCst) {
+                        return Authorization::Deny;
+                    }
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+    }
+    let runtime = cutover_runtime(backend.clone(), BackendId::MAIN);
+    assert!(
+        reads.load(Ordering::SeqCst) > 0,
+        "construction must try the real validator"
+    );
+    let before_retry = reads.load(Ordering::SeqCst);
+    let error = projected(runtime.ensure_visibility_receipt_key().unwrap_err());
+    assert_eq!(error["details"]["reason"], "receipt_store_unavailable");
+    assert!(reads.load(Ordering::SeqCst) > before_retry);
+    deny.store(false, Ordering::SeqCst);
+    runtime.ensure_visibility_receipt_key().unwrap();
+
+    deny.store(true, Ordering::SeqCst);
+    let before = backend.pool().reader_acquisition_snapshot();
+    let before_reads = reads.load(Ordering::SeqCst);
+    runtime.ensure_visibility_receipt_key().unwrap();
+    assert!(runtime
+        .ensure_visibility_receipt_key_if_configured()
+        .unwrap());
+    let token = runtime.seal_visibility_receipt("visible", &[]).unwrap();
+    runtime
+        .open_visibility_receipt(&token, &["visible"], &[])
+        .unwrap();
+    let after = backend.pool().reader_acquisition_snapshot();
+    assert_eq!(after.acquisitions, before.acquisitions);
+    assert_eq!(after.pooled_checkouts, before.pooled_checkouts);
+    assert_eq!(reads.load(Ordering::SeqCst), before_reads);
+    assert!(
+        backend.validate_memory_visibility_cutover().is_err(),
+        "the direct DB validator remains fresh"
+    );
+    backend
+        .pool()
+        .writer()
+        .unwrap()
+        .conn()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+}
+
+#[test]
+fn receipt_cutover_binds_clones_and_core_to_their_actual_backends() {
+    for prepare_secondary in [false, true] {
+        for prepare_main in [false, true] {
+            let secondary_backend = Arc::new(khive_db::StorageBackend::memory().unwrap());
+            let main = Arc::new(khive_db::StorageBackend::memory().unwrap());
+            if prepare_secondary {
+                secondary_backend.prepare_core_schema().unwrap();
+            }
+            if prepare_main {
+                main.prepare_core_schema().unwrap();
+            }
+            let secondary = cutover_runtime(secondary_backend.clone(), "receipt-secondary")
+                .with_core_backend(main.clone());
+            let local_before = secondary_backend.pool().reader_acquisition_snapshot();
+            let main_before = main.pool().reader_acquisition_snapshot();
+            let clone = secondary.clone();
+            let core = secondary.core();
+            let same_core = clone.core();
+            assert_eq!(
+                secondary_backend.pool().reader_acquisition_snapshot(),
+                local_before
+            );
+            assert_eq!(main.pool().reader_acquisition_snapshot(), main_before);
+            assert!(Arc::ptr_eq(
+                &core.visibility_cutover,
+                &same_core.visibility_cutover
+            ));
+            assert!(!Arc::ptr_eq(
+                &secondary.visibility_cutover,
+                &core.visibility_cutover
+            ));
+            for (handle, prepared) in [(&secondary, prepare_secondary), (&core, prepare_main)] {
+                match handle.ensure_visibility_receipt_key() {
+                    Ok(()) => assert!(prepared),
+                    Err(error) => {
+                        assert!(!prepared);
+                        assert_eq!(
+                            projected(error)["details"]["reason"],
+                            "receipt_store_unavailable"
+                        );
+                    }
+                }
+            }
+            secondary_backend.prepare_core_schema().unwrap();
+            main.prepare_core_schema().unwrap();
+            secondary.ensure_visibility_receipt_key().unwrap();
+            core.ensure_visibility_receipt_key().unwrap();
+            let local_before = secondary_backend.pool().reader_acquisition_snapshot();
+            let main_before = main.pool().reader_acquisition_snapshot();
+            let rebound_same = secondary.clone().with_core_backend(main.clone());
+            for handle in [clone, same_core, rebound_same.core()] {
+                let token = handle.seal_visibility_receipt("visible", &[]).unwrap();
+                handle
+                    .open_visibility_receipt(&token, &["visible"], &[])
+                    .unwrap();
+            }
+            assert_eq!(
+                secondary_backend.pool().reader_acquisition_snapshot(),
+                local_before
+            );
+            assert_eq!(main.pool().reader_acquisition_snapshot(), main_before);
+
+            let other = Arc::new(khive_db::StorageBackend::memory().unwrap());
+            let rebound = secondary.with_core_backend(other.clone());
+            let other_before = other.pool().reader_acquisition_snapshot();
+            let new_core = rebound.core();
+            assert_eq!(other.pool().reader_acquisition_snapshot(), other_before);
+            assert!(!Arc::ptr_eq(
+                &core.visibility_cutover,
+                &new_core.visibility_cutover
+            ));
+            assert_eq!(
+                projected(new_core.ensure_visibility_receipt_key().unwrap_err())["details"]
+                    ["reason"],
+                "receipt_store_unavailable"
+            );
+            core.ensure_visibility_receipt_key().unwrap();
+            other.prepare_core_schema().unwrap();
+            new_core.ensure_visibility_receipt_key().unwrap();
+            let other_before = other.pool().reader_acquisition_snapshot();
+            rebound.core().ensure_visibility_receipt_key().unwrap();
+            assert_eq!(other.pool().reader_acquisition_snapshot(), other_before);
+        }
+    }
+}
+
+#[test]
+fn separately_assembled_runtimes_prime_their_own_cutover_latch() {
+    let backend = Arc::new(khive_db::StorageBackend::memory().unwrap());
+    backend.prepare_core_schema().unwrap();
+    let before = backend.pool().reader_acquisition_snapshot();
+    let first = cutover_runtime(backend.clone(), BackendId::MAIN);
+    let after_first = backend.pool().reader_acquisition_snapshot();
+    assert_eq!(after_first.pooled_checkouts, before.pooled_checkouts + 1);
+    let second = cutover_runtime(backend.clone(), BackendId::MAIN);
+    let after_second = backend.pool().reader_acquisition_snapshot();
+    assert_eq!(
+        after_second.pooled_checkouts,
+        after_first.pooled_checkouts + 1
+    );
+    assert!(!Arc::ptr_eq(
+        &first.visibility_cutover,
+        &second.visibility_cutover
+    ));
+    first.ensure_visibility_receipt_key().unwrap();
+    second.ensure_visibility_receipt_key().unwrap();
+    assert_eq!(backend.pool().reader_acquisition_snapshot(), after_second);
+}
+
+#[test]
+fn prepared_constructor_reuses_its_successful_cutover_validation() {
+    let backend = Arc::new(khive_db::StorageBackend::memory().unwrap());
+    backend.prepare_core_schema().unwrap();
+    let before = backend.pool().reader_acquisition_snapshot();
+    let runtime =
+        KhiveRuntime::from_prepared_backend(backend.clone(), cutover_config(BackendId::MAIN))
+            .unwrap();
+    let after = backend.pool().reader_acquisition_snapshot();
+    // One attachment-status read and one complete receipt-cutover validation.
+    assert_eq!(after.pooled_checkouts, before.pooled_checkouts + 2);
+    let (runtime, _) = configure(runtime);
+    runtime.ensure_visibility_receipt_key().unwrap();
+    assert_eq!(backend.pool().reader_acquisition_snapshot(), after);
+}

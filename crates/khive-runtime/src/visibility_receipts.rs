@@ -1,5 +1,6 @@
 //! Runtime custody and authorization for opaque memory visibility receipts.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use khive_types::{Details, ErrorKind, KhiveError};
@@ -12,6 +13,45 @@ use crate::{KhiveRuntime, RuntimeConfig, RuntimeError, RuntimeResult};
 const MAX_AGE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_FUTURE_MS: i64 = 5 * 60 * 1_000;
 const REPLAY_PHASE: &str = "exact_replay";
+
+/// Positive receipt admission shared by clones bound to one runtime backend.
+/// A failed prime stays retryable; unlatched calls retain synchronous validation.
+pub(crate) struct ReceiptCutover {
+    backend: Arc<khive_db::StorageBackend>,
+    ready: AtomicBool,
+    check: parking_lot::Mutex<()>,
+}
+
+impl ReceiptCutover {
+    pub(crate) fn primed(backend: Arc<khive_db::StorageBackend>, validated: bool) -> Self {
+        let cutover = Self {
+            backend,
+            ready: AtomicBool::new(validated),
+            check: parking_lot::Mutex::new(()),
+        };
+        let _ = cutover.ensure();
+        cutover
+    }
+
+    pub(crate) fn is_bound_to(&self, backend: &Arc<khive_db::StorageBackend>) -> bool {
+        Arc::ptr_eq(&self.backend, backend)
+    }
+
+    fn ensure(&self) -> RuntimeResult<()> {
+        if self.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let _check = self.check.lock();
+        if self.ready.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.backend
+            .validate_memory_visibility_cutover()
+            .map_err(|_| receipt_failure("receipt_store_unavailable", None, false))?;
+        self.ready.store(true, Ordering::Release);
+        Ok(())
+    }
+}
 
 pub(crate) enum ReceiptCapability {
     Absent,
@@ -183,9 +223,7 @@ impl KhiveRuntime {
     }
 
     pub(crate) fn require_visibility_cutover(&self) -> RuntimeResult<()> {
-        self.backend()
-            .validate_memory_visibility_cutover()
-            .map_err(|_| receipt_failure("receipt_store_unavailable", None, false))
+        self.visibility_cutover.ensure()
     }
 
     /// Verify current key availability without issuing a receipt or reserving a nonce.
