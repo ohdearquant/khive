@@ -300,6 +300,7 @@ pub(crate) async fn handle_thread(
                     .get_note(cursor_uuid)
                     .await
                     .map_err(|e| RuntimeError::Internal(format!("thread: get_note (after): {e}")))?
+                    .filter(|note| note.kind == "message")
                     .ok_or_else(|| {
                         RuntimeError::InvalidInput(format!(
                             "thread: `after` cursor {raw:?} does not resolve to a message"
