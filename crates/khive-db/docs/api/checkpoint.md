@@ -225,7 +225,7 @@ See `crates/khive-db/src/checkpoint.rs` — the module-scoped `AtomicU64`
 compatibility counters (`LAST_WAL_PAGES`, `TRUNCATE_ATTEMPTS`, etc.) plus the
 backend-keyed `RoutineWalObservation` registry.
 
-Mirrors the fallback-counter pattern in `khive-mcp/src/daemon.rs`
+Mirrors the fallback-counter pattern in `khive-mcp/src/daemon/fallback.rs`
 (`FALLBACK_*` statics + their `pub(crate)` accessors): the checkpoint task is
 a single fire-and-forget `tokio::spawn` with no handle retained anywhere the
 daemon's connection-accept loop can reach, so these are plain module-scoped
