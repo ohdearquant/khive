@@ -12,38 +12,38 @@ categories.workspace = true
 description = "khive kernel — stdio MCP server binary and admin CLI (sync, pack introspection, db ops)"
 
 [dependencies]
-khive-mounts = { version = "0.9.0", path = "../khive-mounts" }
-khive-pack-agent = { version = "0.9.0", path = "../khive-pack-agent", optional = true }
-khive-runtime = { version = "0.9.0", path = "../khive-runtime" }
-khive-retrieval = { version = "0.9.0", path = "../khive-retrieval", default-features = false }
-khive-mcp = { version = "0.9.0", path = "../khive-mcp", default-features = false }
-khive-score = { version = "0.9.0", path = "../khive-score" }
-khive-db = { version = "0.9.0", path = "../khive-db" }
-khive-storage = { version = "0.9.0", path = "../khive-storage" }
-khive-types = { version = "0.9.0", path = "../khive-types" }
-khive-vcs = { version = "0.9.0", path = "../khive-vcs" }
-khive-vcs-adapters = { version = "0.9.0", path = "../khive-vcs-adapters" }
-khive-pack-kg = { version = "0.9.0", path = "../khive-pack-kg" }
-khive-pack-gtd = { version = "0.9.0", path = "../khive-pack-gtd" }
-khive-pack-memory = { version = "0.9.0", path = "../khive-pack-memory" }
-khive-pack-brain = { version = "0.9.0", path = "../khive-pack-brain" }
-khive-pack-comm = { version = "0.9.0", path = "../khive-pack-comm" }
-khive-pack-schedule = { version = "0.9.0", path = "../khive-pack-schedule" }
-khive-pack-formal = { version = "0.9.0", path = "../khive-pack-formal", optional = true }
-khive-pack-code = { version = "0.9.0", path = "../khive-pack-code" }
-khive-pack-web = { version = "0.9.0", path = "../khive-pack-web", optional = true }
-khive-pack-telemetry = { version = "0.9.0", path = "../khive-pack-telemetry", optional = true }
-khive-pack-knowledge = { version = "0.9.0", path = "../khive-pack-knowledge" }
-khive-pack-session = { version = "0.9.0", path = "../khive-pack-session" }
-khive-pack-tool = { version = "0.9.0", path = "../khive-pack-tool" }
-khive-pack-exec = { version = "0.9.0", path = "../khive-pack-exec" }
-khive-pack-git = { version = "0.9.0", path = "../khive-pack-git" }
-khive-pack-blob = { version = "0.9.0", path = "../khive-pack-blob" }
-khive-pack-moodboard = { version = "0.9.0", path = "../khive-pack-moodboard", optional = true }
-khive-pack-workspace = { version = "0.9.0", path = "../khive-pack-workspace" }
-khive-request = { version = "0.9.0", path = "../khive-request" }
-khive-changeset = { version = "0.9.0", path = "../khive-changeset" }
-khive-repo-showcase = { version = "0.9.0", path = "../khive-repo-showcase" }
+khive-mounts = { version = "0.10.0", path = "../khive-mounts" }
+khive-pack-agent = { version = "0.10.0", path = "../khive-pack-agent", optional = true }
+khive-runtime = { version = "0.10.0", path = "../khive-runtime" }
+khive-retrieval = { version = "0.10.0", path = "../khive-retrieval", default-features = false }
+khive-mcp = { version = "0.10.0", path = "../khive-mcp", default-features = false }
+khive-score = { version = "0.10.0", path = "../khive-score" }
+khive-db = { version = "0.10.0", path = "../khive-db" }
+khive-storage = { version = "0.10.0", path = "../khive-storage" }
+khive-types = { version = "0.10.0", path = "../khive-types" }
+khive-vcs = { version = "0.10.0", path = "../khive-vcs" }
+khive-vcs-adapters = { version = "0.10.0", path = "../khive-vcs-adapters" }
+khive-pack-kg = { version = "0.10.0", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.10.0", path = "../khive-pack-gtd" }
+khive-pack-memory = { version = "0.10.0", path = "../khive-pack-memory" }
+khive-pack-brain = { version = "0.10.0", path = "../khive-pack-brain" }
+khive-pack-comm = { version = "0.10.0", path = "../khive-pack-comm" }
+khive-pack-schedule = { version = "0.10.0", path = "../khive-pack-schedule" }
+khive-pack-formal = { version = "0.10.0", path = "../khive-pack-formal", optional = true }
+khive-pack-code = { version = "0.10.0", path = "../khive-pack-code" }
+khive-pack-web = { version = "0.10.0", path = "../khive-pack-web", optional = true }
+khive-pack-telemetry = { version = "0.10.0", path = "../khive-pack-telemetry", optional = true }
+khive-pack-knowledge = { version = "0.10.0", path = "../khive-pack-knowledge" }
+khive-pack-session = { version = "0.10.0", path = "../khive-pack-session" }
+khive-pack-tool = { version = "0.10.0", path = "../khive-pack-tool" }
+khive-pack-exec = { version = "0.10.0", path = "../khive-pack-exec" }
+khive-pack-git = { version = "0.10.0", path = "../khive-pack-git" }
+khive-pack-blob = { version = "0.10.0", path = "../khive-pack-blob" }
+khive-pack-moodboard = { version = "0.10.0", path = "../khive-pack-moodboard", optional = true }
+khive-pack-workspace = { version = "0.10.0", path = "../khive-pack-workspace" }
+khive-request = { version = "0.10.0", path = "../khive-request" }
+khive-changeset = { version = "0.10.0", path = "../khive-changeset" }
+khive-repo-showcase = { version = "0.10.0", path = "../khive-repo-showcase" }
 lru = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -64,8 +64,8 @@ sha2 = { workspace = true }
 lattice-embed = { workspace = true }
 
 [dev-dependencies]
-khive-db = { version = "0.9.0", path = "../khive-db", features = ["test-support"] }
-khive-pack-template = { version = "0.9.0", path = "../khive-pack-template" }
+khive-db = { version = "0.10.0", path = "../khive-db", features = ["test-support"] }
+khive-pack-template = { version = "0.10.0", path = "../khive-pack-template" }
 libc = { workspace = true }
 rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
@@ -76,10 +76,10 @@ rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 # armed-capture hook while the release dependency above stays untouched.
 # Default features stay off here too: a test build that left them on would link
 # the optional packs into a kkernel built without them.
-khive-mcp = { version = "0.9.0", path = "../khive-mcp", default-features = false, features = ["test-forward-seam"] }
-khive-gate-rego = { version = "0.9.0", path = "../khive-gate-rego" }
-khive-storage = { version = "0.9.0", path = "../khive-storage", features = ["test-support"] }
-khive-runtime = { version = "0.9.0", path = "../khive-runtime", features = ["test-internals"] }
+khive-mcp = { version = "0.10.0", path = "../khive-mcp", default-features = false, features = ["test-forward-seam"] }
+khive-gate-rego = { version = "0.10.0", path = "../khive-gate-rego" }
+khive-storage = { version = "0.10.0", path = "../khive-storage", features = ["test-support"] }
+khive-runtime = { version = "0.10.0", path = "../khive-runtime", features = ["test-internals"] }
 blake3 = { workspace = true }
 
 [features]
