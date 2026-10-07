@@ -143,6 +143,15 @@ pub(super) fn tags_to_json(tags: Option<&Vec<String>>) -> String {
     }
 }
 
+/// Classify valid stored tag arrays by exact element, retaining the historical
+/// guard for malformed or non-array legacy tag text.
+pub(super) fn has_domain_mirror_tag(tags: &str) -> bool {
+    match serde_json::from_str::<Vec<String>>(tags) {
+        Ok(tags) => tags.iter().any(|tag| tag == "type:domain"),
+        Err(_) => tags.contains("type:domain"),
+    }
+}
+
 pub(super) fn row_str(row: &khive_storage::types::SqlRow, col: &str) -> Option<String> {
     match row.get(col) {
         Some(SqlValue::Text(s)) => Some(s.clone()),
@@ -513,6 +522,37 @@ mod tests {
                 khive_brain_core::SectionType::normalize_name(input),
                 "{input:?}"
             );
+        }
+    }
+
+    #[test]
+    fn domain_marker_uses_exact_decoded_tag_and_retains_legacy_fallback() {
+        for tags in [
+            r#"["type:domain"]"#,
+            r#"["ordinary","type:domain"]"#,
+            r#"["type\u003adomain"]"#,
+            "broken type:domain",
+            r#""type:domain""#,
+            r#"{"tag":"type:domain"}"#,
+            r#"["type:domain-extra",7]"#,
+        ] {
+            assert!(has_domain_mirror_tag(tags), "{tags}");
+        }
+        for tags in [
+            "[]",
+            r#"["ordinary"]"#,
+            r#"["prefix:type:domain"]"#,
+            r#"["type:domain-extra"]"#,
+            r#"["TYPE:DOMAIN"]"#,
+            r#"[" type:domain "]"#,
+            "broken",
+            r#""ordinary""#,
+            "{}",
+            r#"["ordinary",7]"#,
+            "null",
+            "",
+        ] {
+            assert!(!has_domain_mirror_tag(tags), "{tags}");
         }
     }
 }
