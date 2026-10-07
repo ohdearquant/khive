@@ -1212,6 +1212,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/daemon/executable.rs",
     ),
     (
+        "khive-mcp/src/daemon.rs",
+        "dispatch",
+        "khive-mcp/src/daemon/dispatch.rs",
+    ),
+    (
         "khive-runtime/src/daemon.rs",
         "load_limits",
         "khive-runtime/src/daemon/load_limits.rs",
