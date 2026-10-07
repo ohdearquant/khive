@@ -352,11 +352,10 @@ fn memory_runtime_config() -> RuntimeConfig {
 
 #[test]
 fn missing_pid_parent_is_treated_as_no_incumbent() {
-    let workspace = std::env::current_dir().expect("workspace directory");
     let dir = tempfile::Builder::new()
         .prefix("khive-missing-pid-parent-")
-        .tempdir_in(workspace)
-        .expect("workspace-local tempdir");
+        .tempdir()
+        .expect("tempdir");
     let pid_file = dir.path().join("not-created").join("khived.pid");
 
     assert!(!pid_file_directory_is_trusted_if_present(&pid_file)
