@@ -5353,7 +5353,7 @@ async fn concurrent_drains_fire_each_row_exactly_once() {
 // `run_pending_events`'s wrapper seam must not misread a default
 // namespace as an explicit actor override. These tests exercise the real
 // config-discovery path (process cwd / `HOME`); the helpers below mirror
-// `serve.rs`'s own equivalents, kept local since they are test-only.
+// `serve_tests.rs`'s own equivalents, kept local since they are test-only.
 
 /// RAII guard: redirects process cwd and `HOME` to isolated locations so
 /// the real machine's global `~/.khive/config.toml` never leaks into a
