@@ -2815,7 +2815,11 @@ async fn hydrate_atoms_statement_still_scopes_by_namespace() {
 // needle itself in test source.
 #[test]
 fn knowledge_ann_query_paths_use_query_intent_embed() {
-    let src = include_str!("search.rs");
+    let src = [
+        include_str!("search.rs"),
+        include_str!("search/compose_packing.rs"),
+    ]
+    .join("\n");
     // Build needle at runtime to avoid self-match in include_str.
     let generic_needle: String = [".embed(", "raw_query)"].concat();
     let generic_borrowed_needle: String = [".embed(", "&raw_query)"].concat();
