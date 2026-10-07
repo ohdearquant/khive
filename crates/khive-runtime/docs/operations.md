@@ -2,16 +2,19 @@
 
 `operations.rs` composes storage capabilities into the runtime's user-facing verbs (create, get,
 list, search, link, traverse, query, recall, etc.). This document collects design rationale that
-doesn't belong as inline comments: why the file isn't split into submodules, and the fault-injection
-testing infrastructure it hosts. The in-source comments carry only short pointers here.
+doesn't belong as inline comments: the module boundaries and fault-injection testing infrastructure.
+The in-source comments carry only short pointers here.
 
-## Why this file is not split into submodules
+## Module layout
 
-All verbs share internal helpers (namespace checks, edge validation, canonical-endpoint logic)
-that require `pub(crate)` access — splitting into submodules would require `pub(crate)`
-re-exports across every helper or circular dependencies, and inline tests exercise those private
-helpers directly. Split plan: once the verb surface stabilises post-retrieval-refactor, group by
-substrate (entity, note, edge, search) into submodules under an `operations/` directory.
+`operations.rs` retains the production verb bodies and their public paths. Fault-injection state,
+scoped guards and arming helpers live in `src/operations/fault_injection.rs`; the parent re-exports
+the existing public and crate-visible APIs and imports only the private state its operations use.
+The child exposes those internal items to its parent with `pub(super)` access.
+
+Unit tests remain in `src/operations_tests.rs` under the same `operations::tests` module and retain
+access to the parent helpers. Further extraction groups the remaining verb bodies by concern
+(entity, note, edge, search) while preserving their public paths.
 
 ## Fault-injection arm migration
 
@@ -99,7 +102,7 @@ own single-writer transaction.
 
 ## Fault-injection static state
 
-Several `thread_local!`/`static` items in this file back the test-only fault-injection surface
+The `thread_local!`/`static` items in `src/operations/fault_injection.rs` back the test-only fault-injection surface
 (`cfg(any(test, feature = "fault-injection"))`), gated out of production/published binaries.
 External integration test crates enable it via `khive-runtime = { ..., features =
 ["fault-injection"] }`.
