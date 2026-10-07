@@ -23,7 +23,7 @@
     {
       "verb": "comm.read",
       "classification": "WRITER",
-      "source_file": "crates/khive-pack-comm/src/handlers.rs",
+      "source_file": "crates/khive-pack-comm/src/handlers/read_marking.rs",
       "evidence_marker": "try_patch_note_property",
       "note": "handle_read -> mark_read_target -> NoteStore::try_patch_note_property, a real UPDATE. Known-positive control per ADR-133: a scanner that misses this is void."
     },

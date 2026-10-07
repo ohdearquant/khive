@@ -301,7 +301,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.heartbeat",
-        site: "khive-pack-comm/src/handlers.rs::handle_heartbeat",
+        site: "khive-pack-comm/src/handlers/quarantine_heartbeat.rs::handle_heartbeat",
         expected_writes: 2,
         target: Substrate::Note,
         write_class: WriteClass::WholeObject,
@@ -418,7 +418,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.ingest.quarantine_repair",
-        site: "khive-pack-comm/src/handlers.rs::repair_duplicate_quarantine",
+        site: "khive-pack-comm/src/handlers/ingest.rs::repair_duplicate_quarantine",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::FixedKeySet { key_paths: &["$.channel_slug", "$.quarantine_content_ref"] },
@@ -431,7 +431,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.reply.read",
-        site: "khive-pack-comm/src/handlers.rs::handle_reply",
+        site: "khive-pack-comm/src/handlers/reply.rs::handle_reply",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
@@ -444,7 +444,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.read.one",
-        site: "khive-pack-comm/src/handlers.rs::mark_read_target",
+        site: "khive-pack-comm/src/handlers/read_marking.rs::mark_read_target",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
@@ -457,7 +457,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
     },
     RouteInventoryEntry {
         id: "comm.read.atomic",
-        site: "khive-pack-comm/src/handlers.rs::mark_read_targets_atomic",
+        site: "khive-pack-comm/src/handlers/read_marking.rs::mark_read_targets_atomic",
         expected_writes: 1,
         target: Substrate::Note,
         write_class: WriteClass::SingleKey { key_path: "$.read" },
@@ -596,7 +596,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::RunAtomicUnit,
         stamp: StampCapability::ReservationOnly,
         family: Some("note.create"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::create_note_rejects_reserved_secret_gate_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations_tests.rs::create_note_rejects_reserved_secret_gate_key" },
     },
     RouteInventoryEntry {
         id: "runtime.note_store.insert_note_if_absent",
@@ -726,7 +726,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: Some("note.create"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::try_create_note_rejects_reserved_secret_gate_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations/tests/try_create_note.rs::try_create_note_rejects_reserved_secret_gate_key" },
     },
     RouteInventoryEntry {
         id: "runtime.claim_entity",
@@ -752,7 +752,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: Some("entity.create"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::create_entity_rejects_reserved_secret_gate_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations_tests.rs::create_entity_rejects_reserved_secret_gate_key" },
     },
     RouteInventoryEntry {
         id: "runtime.create_note_inner",
@@ -765,7 +765,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: Some("note.create"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::create_note_rejects_reserved_secret_gate_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations_tests.rs::create_note_rejects_reserved_secret_gate_key" },
     },
     RouteInventoryEntry {
         id: "runtime.import.entity",

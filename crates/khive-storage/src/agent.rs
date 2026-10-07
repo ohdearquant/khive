@@ -17,6 +17,18 @@ pub trait AgentStore: Send + Sync {
         terminal_reason: Option<TerminalReason>,
         state_changed_at: i64,
     ) -> Result<(), StorageError>;
+    /// Atomically update lifecycle fields only when the stored state is `expected`.
+    /// Returns `false` without changing the record when the ID is absent or its
+    /// state no longer matches. The low-level `update_state` setter is unchanged.
+    async fn transition_state(
+        &self,
+        agent_id: &str,
+        expected: AgentState,
+        state: AgentState,
+        terminal_reason: Option<TerminalReason>,
+        state_changed_at: i64,
+    ) -> Result<bool, StorageError>;
+
     async fn set_checkpoint(
         &self,
         agent_id: &str,

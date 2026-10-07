@@ -194,7 +194,7 @@ writer-task seam. Pool, SQL-bridge, migration, and explicitly top-level/standalo
 the central enforcement boundary.
 
 The bootstrap row names two current writes which occur before any migration transaction:
-`apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and `run_migrations_locked` executes
+`apply_schema_plan` executes `SCHEMA_VERSION_TABLE`, and `bootstrap_migration_ledger` executes
 `MIGRATION_TRACKING_TABLE`. Each call must acquire the volume lease, probe before its
 `execute_batch`, skip the call on refusal/probe failure, and retain the lease until the connection
 is demonstrably back in autocommit. The later per-migration transaction then performs the normal
@@ -307,6 +307,10 @@ workspace volume:
    pins a real WAL snapshot while writes grow it; the next write must return
    `sqlite_capacity_refused` before any raw `SQLITE_FULL`. After the reader exits, a bypassed
    checkpoint reclaims space and an ordinary write succeeds.
+   Acceptance 7 is gated when it runs by the initially non-required
+   `SQLite capacity acceptance` job in `.github/workflows/sqlite-capacity.yml`
+   (exit 0 and `ADR154_CAPACITY_PASS` required), with a dedicated-host run quoted
+   in the PR body as the fallback if the hosted runner refuses the namespace or mount.
 8. A separate raw-`SQLITE_FULL` classification test, using SQLite's bounded page limit or the
    isolated device with the guard explicitly disabled, proves the native code is preserved and
    reported as `sqlite_disk_full`, never as a guard refusal.

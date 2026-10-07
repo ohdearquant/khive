@@ -96,20 +96,29 @@ fn wal_ceiling_aliases_reject_unequal_effective_limits_before_open() {
 #[cfg(unix)]
 #[test]
 fn wal_ceiling_missing_paths_share_identity_through_symlink_parent() {
-    let cwd = std::env::current_dir().unwrap();
+    let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
     let dir = tempfile::Builder::new()
         .prefix("wal-alias-")
-        .tempdir_in(&cwd)
+        .tempdir()
         .unwrap();
-    let real = dir.path().join("real");
-    let link = dir.path().join("link");
+    // macOS temporary roots can be symlink aliases; keep the physical parent explicit.
+    let root = dir.path().canonicalize().unwrap();
+    let real = root.join("real");
+    let link = root.join("link");
     std::fs::create_dir(&real).unwrap();
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let database = real.join("not-created/deeper/database.db");
-    let relative = link
-        .strip_prefix(&cwd)
-        .unwrap()
-        .join("not-created/deeper/database.db");
+    // Reach the Unix root from the physical cwd without changing process-global cwd.
+    let mut relative = std::path::PathBuf::new();
+    for _ in cwd.components().skip(1) {
+        relative.push("..");
+    }
+    relative.push(link.strip_prefix("/").unwrap());
+    let relative = relative.join("not-created/deeper/database.db");
+    assert!(
+        relative.is_relative(),
+        "the second trial must remain relative"
+    );
     for alias in [link.join("not-created/deeper/database.db"), relative] {
         let mut topology = duplicate_sqlite_path_config(&database);
         topology.backends[1].path = Some(alias);

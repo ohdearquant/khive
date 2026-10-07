@@ -325,7 +325,9 @@ async fn refuses_before_sqlite_full_with_old_reader_and_recoverable_reserve() {
         })
         .unwrap();
     assert_eq!(generation, writes + 1);
-    println!("ADR154_CAPACITY_PASS");
+    // libtest prints the test name on the line this output starts, so begin
+    // with a newline to keep the marker on a line of its own.
+    println!("\nADR154_CAPACITY_PASS");
 }
 
 #[test]

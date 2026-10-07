@@ -367,3 +367,145 @@ fn agent_write_strict_routing_fails_closed_without_writer_task() {
     );
     assert!(error.to_string().contains("strict"), "got: {error}");
 }
+
+fn cas_pool(path: &std::path::Path, queued: bool) -> Arc<ConnectionPool> {
+    let config = PoolConfig {
+        path: Some(path.to_path_buf()),
+        volume_lock_dir: Some(path.parent().unwrap().join("volume-locks")),
+        wal_ceiling: Default::default(),
+        disk_guard_config: Some(crate::EffectiveDiskGuardConfig {
+            reserve_bytes: 0,
+            ..Default::default()
+        }),
+        busy_timeout: std::time::Duration::from_secs(5),
+        checkout_timeout: std::time::Duration::from_secs(5),
+        write_queue_enabled: Some(queued),
+        write_queue_capacity: 16,
+        write_routing_strict: queued,
+        write_admission_deadline_ms: 2_000,
+        ..PoolConfig::for_test()
+    };
+    assert_eq!(config.path.as_deref(), Some(path));
+    Arc::new(ConnectionPool::new(config).unwrap())
+}
+
+#[tokio::test]
+async fn state_cas_matches_id_and_expected_state_without_changing_other_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = cas_pool(&dir.path().join("agent-cas.db"), false);
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(AGENTS_DDL).unwrap();
+    }
+    let store = SqlAgentStore::new(pool, true);
+    let mut record = make_record("agent-cas", "actor-a");
+    record.checkpoint_session_id = Some("checkpoint".into());
+    store.insert(&record).await.unwrap();
+    store
+        .insert(&make_record("other-agent", "actor-b"))
+        .await
+        .unwrap();
+    assert!(!store
+        .transition_state(
+            "missing",
+            AgentState::Spawned,
+            AgentState::Running,
+            None,
+            2_000
+        )
+        .await
+        .unwrap());
+    assert!(!store
+        .transition_state(
+            "agent-cas",
+            AgentState::Running,
+            AgentState::Suspended,
+            None,
+            2_000
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        serde_json::to_value(store.get("agent-cas").await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(&record).unwrap()
+    );
+    assert!(store
+        .transition_state(
+            "agent-cas",
+            AgentState::Spawned,
+            AgentState::Running,
+            None,
+            2_000
+        )
+        .await
+        .unwrap());
+    record.state = AgentState::Running;
+    record.state_changed_at = 2_000;
+    assert_eq!(
+        serde_json::to_value(store.get("agent-cas").await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(record).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(store.get("other-agent").await.unwrap().unwrap()).unwrap(),
+        serde_json::to_value(make_record("other-agent", "actor-b")).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn independent_pools_reject_stale_suspend_and_resume_after_terminal_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    for (index, initial, requested) in [
+        (0, AgentState::Running, AgentState::Suspended),
+        (1, AgentState::Suspended, AgentState::Running),
+    ] {
+        let path = dir.path().join(format!("agent-race-{index}.db"));
+        let stale_pool = cas_pool(&path, true);
+        {
+            let writer = stale_pool.writer().unwrap();
+            writer.conn().execute_batch(AGENTS_DDL).unwrap();
+        }
+        let terminal_pool = cas_pool(&path, true);
+        assert!(!Arc::ptr_eq(&stale_pool, &terminal_pool));
+        let stale_store = SqlAgentStore::new(stale_pool, true);
+        let terminal_store = SqlAgentStore::new(terminal_pool, true);
+        let mut record = make_record("racing-agent", "actor-a");
+        record.state = initial;
+        stale_store.insert(&record).await.unwrap();
+        let read_done = tokio::sync::Barrier::new(2);
+        let terminal_done = tokio::sync::Barrier::new(2);
+        let stale = async {
+            let observed = stale_store.get("racing-agent").await.unwrap().unwrap();
+            assert_eq!(observed.state, initial);
+            read_done.wait().await;
+            terminal_done.wait().await;
+            assert!(!stale_store
+                .transition_state("racing-agent", observed.state, requested, None, 4_000)
+                .await
+                .unwrap());
+        };
+        let terminal = async {
+            read_done.wait().await;
+            assert!(terminal_store
+                .transition_state(
+                    "racing-agent",
+                    initial,
+                    AgentState::Terminal,
+                    Some(TerminalReason::Killed),
+                    3_000
+                )
+                .await
+                .unwrap());
+            terminal_done.wait().await;
+        };
+        tokio::join!(stale, terminal);
+        record.state = AgentState::Terminal;
+        record.terminal_reason = Some(TerminalReason::Killed);
+        record.state_changed_at = 3_000;
+        for store in [&stale_store, &terminal_store] {
+            assert_eq!(
+                serde_json::to_value(store.get("racing-agent").await.unwrap().unwrap()).unwrap(),
+                serde_json::to_value(&record).unwrap()
+            );
+        }
+    }
+}

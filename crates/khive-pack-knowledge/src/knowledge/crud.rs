@@ -957,11 +957,28 @@ impl KnowledgeHandlers {
             .transpose()?
             .flatten();
 
+        if matches!(kind, KnowledgeListKind::Atom) {
+            if let Some(status) = p.status.as_ref() {
+                let valid = match status {
+                    Value::String(_) => true,
+                    Value::Array(items) => items.iter().all(Value::is_string),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(RuntimeError::InvalidInput(
+                        "status must be a string or an array of strings".into(),
+                    ));
+                }
+            }
+        }
+
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
         let limit_usize = p.limit.unwrap_or(20).clamp(1, 500);
         let limit = limit_usize as i64;
-        let offset = p.offset.unwrap_or(0) as i64;
+        let offset = i64::try_from(p.offset.unwrap_or(0)).map_err(|_| {
+            RuntimeError::InvalidInput("knowledge.list offset exceeds the supported range".into())
+        })?;
         let select_columns = list_select_columns(p.fields.as_deref());
 
         let mut reader = sql.reader().await.map_err(|e| sql_err("list reader", e))?;

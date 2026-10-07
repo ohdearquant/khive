@@ -3262,6 +3262,18 @@ impl KnowledgeHandlers {
             .count();
 
         let ns = token.namespace().as_str().to_owned();
+        if let Some(status) = p.status.as_ref() {
+            let valid_shape = match status {
+                Value::String(_) => true,
+                Value::Array(items) => items.iter().all(Value::is_string),
+                _ => false,
+            };
+            if !valid_shape {
+                return Err(RuntimeError::InvalidInput(
+                    "status must be a string or an array of strings".into(),
+                ));
+            }
+        }
         let requested_statuses = status_values(p.status.as_ref());
 
         // Normalize exclude_status once: trim whitespace, treat blank as absent.

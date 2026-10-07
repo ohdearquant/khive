@@ -18,7 +18,7 @@ const LEGACY_SQL_WRITERS: &[&str] = &[
 const APPLICATION_SQL_WRITERS: &[(&str, &str, &str)] = &[
     (
         "khive-pack-comm/sql/quarantine_duplicate_retention_repair.sql",
-        COMM,
+        COMM_INGEST,
         "repair_duplicate_quarantine",
     ),
     (
@@ -45,7 +45,8 @@ const CREATE: &str = "khive-runtime/src/note_create.rs";
 const OPERATIONS: &str = "khive-runtime/src/operations.rs";
 const MESSAGE: &str = "khive-runtime/src/keyed_message.rs";
 const FAULT: &str = "khive-runtime/src/atomic_message.rs";
-const COMM: &str = "khive-pack-comm/src/handlers.rs";
+const COMM_HEARTBEAT: &str = "khive-pack-comm/src/handlers/quarantine_heartbeat.rs";
+const COMM_INGEST: &str = "khive-pack-comm/src/handlers/ingest.rs";
 const ID: &str = "00000000-0000-4000-8000-000000000001";
 
 fn words(sql: &str) -> Vec<String> {
@@ -762,7 +763,7 @@ const MARKERLESS_CALLERS: &[(&str, &str, &str, MarkerDisposition)] = &[
         MarkerDisposition::UnkeyedNote,
     ),
     (
-        COMM,
+        COMM_HEARTBEAT,
         "handle_heartbeat",
         "insert_note_if_absent",
         MarkerDisposition::FixedNonMemoryKind,
@@ -1006,7 +1007,7 @@ fn census() -> BTreeMap<(String, String), String> {
         (MESSAGE, "create_keyed_message_pair_with_attachments"),
         // A matching quarantine replay repairs legacy retention metadata in
         // one UPDATE. The note version trigger, not this writer, advances it.
-        (COMM, "repair_duplicate_quarantine"),
+        (COMM_INGEST, "repair_duplicate_quarantine"),
         // This feature can compile outside tests; keep its zero-row writer visible.
         (FAULT, "injected_failure_statement"),
     ]
@@ -1149,7 +1150,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
             "{}",
         ),
         (
-            COMM,
+            COMM_INGEST,
             "repair_duplicate_quarantine",
             "message",
             r#"{"quarantined":true,"quarantine_content_ref":"census-ref","channel_kind":"email"}"#,
@@ -1236,7 +1237,7 @@ fn note_version_one_real_writer_per_file_advances_exactly_once() {
                 params!["active", 200_i64, ID, "local", "memory"],
             ),
             MESSAGE => conn.execute(sql, params!["census/key", ID, "local"]),
-            COMM => conn.execute(
+            COMM_INGEST => conn.execute(
                 sql,
                 params![
                     ID,

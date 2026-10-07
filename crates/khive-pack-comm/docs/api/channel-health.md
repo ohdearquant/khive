@@ -2,8 +2,8 @@
 
 Technical reference for the `comm` pack's channel-heartbeat write path
 (`comm.ingest`'s companion operational surface) and the read-only `comm.health`
-verb — how poll-loop outcomes are persisted and reported, spanning `lib.rs` and
-`handlers.rs` and `handlers/health.rs`.
+verb — how poll-loop outcomes are persisted and reported, spanning `lib.rs`,
+`handlers.rs`, `handlers/health.rs` and `handlers/quarantine_heartbeat.rs`.
 
 ## `lib.rs::CHANNEL_HEALTH_NAMESPACE` — rationale
 
@@ -27,7 +27,9 @@ but a call with an explicit non-local `namespace=` reads that namespace
 instead, observing the heartbeat rows an authorized per-tenant writer (khive
 #917) produced there, and must not fall back to this constant.
 
-## `handlers.rs::heartbeat_note_id`
+<a id="handlersrsheartbeat_note_id"></a>
+
+## `handlers/quarantine_heartbeat.rs::heartbeat_note_id`
 
 Deterministic UUID identifying the `channel_health` row for one `(namespace,
 channel_kind, channel_slug)` triple (khive #606). Deterministic (not
@@ -48,7 +50,9 @@ identical string `"khive:channel_health:a:b:c:d"` under the old scheme.
 quoted and internal quotes/backslashes are escaped — so distinct triples
 always serialize to distinct byte sequences.
 
-## `handlers.rs::handle_heartbeat`
+<a id="handlersrshandle_heartbeat"></a>
+
+## `handlers/quarantine_heartbeat.rs::handle_heartbeat`
 
 Persists one poll attempt's outcome into the channel's heartbeat row (khive
 #606). Internal subhandler with no MCP wire path: its production local caller

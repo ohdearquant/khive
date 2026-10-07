@@ -269,14 +269,14 @@ written as strings at their producing site and returned to the caller unchanged.
 `micros_to_iso`. Each field below was located at source rather than inferred from the pack it
 conceptually belongs to, because the two do not always agree:
 
-| Field          | Written at                                                                                                               |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `due`          | `crates/khive-pack-gtd/src/task_create.rs:383` (via `parse_due`, defined in `crates/khive-pack-gtd/src/handlers.rs:499`) |
-| `completed_at` | `crates/khive-pack-gtd/src/handlers.rs:845,946`                                                                          |
-| `sent_at`      | `crates/khive-pack-comm/src/handlers.rs:337,1413`                                                                        |
-| `delivered_at` | `crates/khive-mcp/src/serve.rs:1562,1872`                                                                                |
-| `cancelled_at` | `crates/khive-pack-schedule/src/handlers.rs:1060`                                                                        |
-| `last_seen_at` | `crates/khive-pack-code/src/source_ingest.rs` (many sites; see the enumeration note)                                     |
+| Field          | Written at                                                                                                                                                                              |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `due`          | `crates/khive-pack-gtd/src/task_create.rs:383` (via `parse_due`, defined in `crates/khive-pack-gtd/src/handlers.rs:499`)                                                                |
+| `completed_at` | `crates/khive-pack-gtd/src/handlers.rs:845,946`                                                                                                                                         |
+| `sent_at`      | `crates/khive-pack-comm/src/handlers.rs::handle_send` / `crates/khive-pack-comm/src/handlers/reply.rs::handle_reply` and `crates/khive-pack-comm/src/handlers/ingest.rs::handle_ingest` |
+| `delivered_at` | `crates/khive-mcp/src/serve.rs:1562,1872`                                                                                                                                               |
+| `cancelled_at` | `crates/khive-pack-schedule/src/handlers.rs:1060`                                                                                                                                       |
+| `last_seen_at` | `crates/khive-pack-code/src/source_ingest.rs` (many sites; see the enumeration note)                                                                                                    |
 
 **This table names fields and files, not a closed set of lines, and it is a starting point rather
 than the inventory itself.** An earlier draft cited `last_seen_at` as two specific lines in

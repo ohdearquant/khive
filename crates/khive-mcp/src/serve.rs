@@ -7,12 +7,19 @@
 mod claimed_backend;
 #[path = "serve/disk_policy.rs"]
 mod disk_policy;
+#[cfg(unix)]
+#[path = "serve/events_socket_preflight.rs"]
+mod events_socket_preflight;
 #[path = "serve/gate_boot_disclosure.rs"]
 mod gate_boot_disclosure;
 
 use disk_policy::{disk_guard_numbers, open_backend_with_policies, validate_disk_guard_topology};
 #[cfg(test)]
 use disk_policy::{open_backend, open_backend_with_wal_ceiling};
+#[cfg(unix)]
+pub use events_socket_preflight::{
+    preflight_events_socket_for_boot, prepare_preflighted_daemon_store_plan,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -179,6 +186,17 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         resolve_cli_namespace(&args).map_err(|error| anyhow::anyhow!("{error}"))?;
     let mut prepared = prepare_server_boot(&args, cli_ns, cli_ns_explicit, cli_ns_explicit)?;
     #[cfg(unix)]
+    let store_plan = if args.daemon {
+        Some(prepare_preflighted_daemon_store_plan(
+            &mut prepared.config,
+            &mut prepared.db_anchor,
+            &mut prepared.khive_cfg.backends,
+            args.db.as_deref() == Some(":memory:"),
+        )?)
+    } else {
+        None
+    };
+    #[cfg(unix)]
     let boot_guard = if args.daemon {
         Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
     } else {
@@ -189,13 +207,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
         crate::daemon::refuse_serving_socket_before_store_claim().await?;
     }
     #[cfg(unix)]
-    let store_guards = if args.daemon {
-        let plan = prepare_daemon_store_plan(
-            &mut prepared.config.db_path,
-            &mut prepared.db_anchor,
-            &mut prepared.khive_cfg.backends,
-            args.db.as_deref() == Some(":memory:"),
-        )?;
+    let store_guards = if let Some(plan) = store_plan {
         let mut guards = khive_runtime::daemon::claim_stores(&plan.paths, &plan.read_only_paths)?;
         plan.assert_aliases_unchanged()?;
         khive_runtime::daemon::bind_daemon_store_files(&mut guards, &plan.read_only_paths)?;
@@ -3602,6 +3614,9 @@ async fn prepare_configured_storage_topology(
     // preparation is deferred until after main is identified: every distinct
     // secondary must be inventoried before main can atomically enable
     // attachment-only GC at V21.
+    #[cfg(unix)]
+    preflight_events_socket_for_boot(&base_config, &effective_backends, force_memory)?;
+
     let backends = open_effective_backends_with(
         &base_config,
         &effective_backends,
@@ -4892,6 +4907,8 @@ async fn build_single_backend_runtime_with_max_readers(
     max_readers: Option<usize>,
     daemon_claims: Option<&[khive_runtime::daemon::DaemonStoreGuard]>,
 ) -> anyhow::Result<KhiveRuntime> {
+    #[cfg(unix)]
+    preflight_events_socket_for_boot(&config, &[], false)?;
     let email_policy = OutboundEmailPolicy::from_env().map_err(anyhow::Error::msg)?;
     let backend = Arc::new(claimed_backend::open_single_backend(
         &mut config,

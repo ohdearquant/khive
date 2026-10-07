@@ -178,3 +178,160 @@ impl std::error::Error for PoisonedBatchError {
         Some(&self.original)
     }
 }
+
+pub(super) fn run_standalone_statement(
+    handle: StandaloneHandle,
+    pool: Arc<ConnectionPool>,
+    unit_holds_lease: bool,
+    statement: SqlStatement,
+    event_rows: Option<Arc<AtomicEventRows>>,
+) -> (
+    StandaloneHandle,
+    Result<usize, StandaloneWriteError<rusqlite::Error>>,
+) {
+    let lease = match admit_standalone_operation(&pool, unit_holds_lease, "execute", false) {
+        Ok(lease) => lease,
+        Err(error) => return (handle, Err(StandaloneWriteError::Refused(error))),
+    };
+    let res = (|| -> Result<usize, rusqlite::Error> {
+        let mut stmt = prepare_cached_sql_statement(&handle.conn, &statement.sql)?;
+        bind_params(&mut stmt, &statement.params)?;
+        let affected = stmt.raw_execute()?;
+        if let Some(event_rows) = event_rows.as_deref() {
+            event_rows.observe(&statement, affected as u64);
+        }
+        Ok(affected)
+    })();
+    drop(lease);
+    (handle, res.map_err(StandaloneWriteError::Sql))
+}
+
+pub(super) fn run_standalone_batch(
+    handle: StandaloneHandle,
+    pool: Arc<ConnectionPool>,
+    unit_holds_lease: bool,
+    statements: Vec<SqlStatement>,
+    origin: khive_storage::tx_registry::TxOrigin,
+    event_rows: Option<Arc<AtomicEventRows>>,
+) -> (
+    Option<StandaloneHandle>,
+    Result<u64, StandaloneWriteError<BatchFailure>>,
+) {
+    let lease = match acquire_standalone_lease(&pool, unit_holds_lease, "execute_batch") {
+        Ok(lease) => lease,
+        Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
+    };
+    let admit = || {
+        pool.write_admission()
+            .check()
+            .map_err(|error| error.into_storage_error(StorageCapability::Sql, "execute_batch"))
+    };
+    let (disposition, result) = execute_standalone_batch(
+        &handle.conn,
+        &statements,
+        origin,
+        event_rows.as_deref(),
+        admit,
+    );
+    let retained = match disposition {
+        BatchHandleDisposition::Retain => Some(handle),
+        // The connection closes while the lease is still held.
+        BatchHandleDisposition::Poison => {
+            drop(handle);
+            None
+        }
+    };
+    drop(lease);
+    (retained, result)
+}
+
+pub(super) fn run_standalone_script(
+    handle: StandaloneHandle,
+    pool: Arc<ConnectionPool>,
+    unit_holds_lease: bool,
+    script: String,
+) -> (
+    Option<StandaloneHandle>,
+    Result<(), StandaloneWriteError<rusqlite::Error>>,
+) {
+    let lease = match admit_standalone_operation(&pool, unit_holds_lease, "execute_script", false) {
+        Ok(lease) => lease,
+        Err(error) => return (Some(handle), Err(StandaloneWriteError::Refused(error))),
+    };
+    let res = handle
+        .conn
+        .execute_batch(&script)
+        .map_err(StandaloneWriteError::Sql);
+    // ADR-154: without a unit lease the volume lease covers this call
+    // only, so a transaction the script left open is settled here,
+    // while the lease is still held, instead of continuing outside it.
+    if unit_holds_lease || handle.conn.is_autocommit() {
+        drop(lease);
+        return (Some(handle), res);
+    }
+    let (handle, settled) =
+        if handle.conn.execute_batch("ROLLBACK").is_ok() && handle.conn.is_autocommit() {
+            (Some(handle), Ok(()))
+        } else {
+            // The connection closes while the lease is still held; the
+            // handle's slots are released after it.
+            let StandaloneHandle {
+                conn,
+                _retained_slot,
+                read_transaction_slot,
+            } = handle;
+            let settled = pool.write_admission().close_retired_connection(conn);
+            drop((_retained_slot, read_transaction_slot));
+            (None, settled)
+        };
+    drop(lease);
+    let result = match (res, settled) {
+        (res, Err(settlement)) => {
+            if let Err(StandaloneWriteError::Sql(error)) = &res {
+                tracing::warn!(
+                    target: "khive_db::sql_bridge",
+                    %error,
+                    "execute_script failed inside a transaction it opened, and the \
+                     transaction could not be settled; reporting the settlement failure"
+                );
+            }
+            Err(StandaloneWriteError::Refused(
+                settlement.into_storage_error(StorageCapability::Sql, "execute_script"),
+            ))
+        }
+        (Err(failure), Ok(())) => Err(failure),
+        (Ok(()), Ok(())) => Err(StandaloneWriteError::Refused(StorageError::InvalidInput {
+            capability: StorageCapability::Sql,
+            operation: "execute_script".into(),
+            message: "the script left a transaction open; a standalone script holds \
+                      the volume lease only for the call, so the transaction was \
+                      rolled back before the lease was released — use atomic_unit \
+                      to run statements as one transaction"
+                .into(),
+        })),
+    };
+    (handle, result)
+}
+
+pub(super) fn run_standalone_top_level(
+    handle: StandaloneHandle,
+    pool: Arc<ConnectionPool>,
+    unit_holds_lease: bool,
+    maintenance: TopLevelMaintenance,
+) -> (
+    StandaloneHandle,
+    Result<(), StandaloneWriteError<rusqlite::Error>>,
+) {
+    let lease = if maintenance == TopLevelMaintenance::Vacuum {
+        match admit_standalone_operation(&pool, unit_holds_lease, "execute_script_top_level", true)
+        {
+            Ok(lease) => lease,
+            Err(error) => return (handle, Err(StandaloneWriteError::Refused(error))),
+        }
+    } else {
+        None
+    };
+    let res = execute_top_level_maintenance(&pool, &handle.conn, maintenance);
+    drop(lease);
+    (handle, res.map_err(StandaloneWriteError::Sql))
+}

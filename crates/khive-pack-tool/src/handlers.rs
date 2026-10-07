@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{
-    micros_to_iso, operations::EntityClaimSpec, KhiveRuntime, NamespaceToken, RuntimeError,
-    VerbRegistry,
+    micros_to_iso, operations::EntityClaimSpec, KhiveRuntime, NamespaceToken, RequestIdentity,
+    RuntimeError, VerbRegistry,
 };
 use khive_storage::types::Direction;
 use khive_storage::{
@@ -953,14 +953,16 @@ pub(crate) async fn request(
                 &row.id[..8],
             );
             notified = registry
-                .dispatch(
+                .dispatch_with_identity(
                     "comm.send",
                     json!({
+                        "namespace": token.namespace().as_str(),
                         "to": to,
                         "subject": format!("tool.request: {actor} asks for {name}"),
                         "content": content,
                         "tags": ["tool-request", format!("tool:{name}")],
                     }),
+                    Some(RequestIdentity::from_token(token)),
                 )
                 .await
                 .is_ok();

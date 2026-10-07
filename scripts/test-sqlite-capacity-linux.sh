@@ -3,12 +3,17 @@ set -eu
 
 # Pass Cargo's exact compiled capacity_floor_real_fs test executable. Building
 # stays outside the mount namespace and cannot consume the constrained device.
+capacity_privileged=false
+if [ "${1-}" = --privileged ]; then
+    capacity_privileged=true
+    shift
+fi
 if [ "$(uname -s)" != Linux ]; then
     echo "SKIP ADR154_CAPACITY: requires Linux user and mount namespaces" >&2
     exit 77
 fi
 if [ "$#" -ne 1 ] || [ ! -x "$1" ]; then
-    echo "usage: $0 /absolute/path/to/capacity_floor_real_fs-test-binary" >&2
+    echo "usage: $0 [--privileged] /absolute/path/to/capacity_floor_real_fs-test-binary" >&2
     exit 2
 fi
 case "$1" in
@@ -31,8 +36,17 @@ trap cleanup_receipts EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+set -- unshare --user --map-root-user --mount --propagation private
+if [ "$capacity_privileged" = true ]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+        echo "SKIP ADR154_CAPACITY: missing sudo for privileged mount namespace" >&2
+        exit 77
+    fi
+    set -- sudo -n unshare --mount --propagation private
+fi
+
 set +e
-unshare --user --map-root-user --mount --propagation private /bin/sh -eu -c '
+"$@" /bin/sh -eu -c '
     capacity_receipts=$1
     capacity_binary=$2
     : > "$capacity_receipts/entered"
