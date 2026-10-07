@@ -1546,9 +1546,42 @@ impl EventStore for SqlEventStore {
 // =============================================================================
 
 const EVENTS_DDL: &str = include_str!("../../sql/events-ddl.sql");
+const OPERATION_ATTRIBUTION_COLUMNS: &str =
+    include_str!("../../sql/036-events-operation-attribution.sql");
 
 pub(crate) fn ensure_events_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(EVENTS_DDL)
+    conn.execute_batch(EVENTS_DDL)?;
+    ensure_operation_attribution_columns(conn)
+}
+
+/// Add `op_index` and `ref_resolution` to an `events` table created before
+/// they existed. `CREATE TABLE IF NOT EXISTS` leaves such a table unchanged,
+/// and a standalone events database has no migration chain to run V36, so
+/// every insert naming the two columns would fail. V36 calls this too, which
+/// keeps it valid on a table the store DDL has already upgraded. Both columns
+/// are added in one transaction (the caller's, if one is open).
+pub(crate) fn ensure_operation_attribution_columns(
+    conn: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    match (
+        has_column(conn, "events", "op_index")?,
+        has_column(conn, "events", "ref_resolution")?,
+    ) {
+        (true, true) => Ok(()),
+        (false, false) if conn.is_autocommit() => {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(OPERATION_ATTRIBUTION_COLUMNS)?;
+            tx.commit()
+        }
+        (false, false) => conn.execute_batch(OPERATION_ATTRIBUTION_COLUMNS),
+        (op_index, ref_resolution) => Err(rusqlite::Error::ToSqlConversionFailure(
+            format!(
+                "events table has only one operation attribution column \
+                 (op_index={op_index}, ref_resolution={ref_resolution}); refusing to guess"
+            )
+            .into(),
+        )),
+    }
 }
 
 #[cfg(test)]

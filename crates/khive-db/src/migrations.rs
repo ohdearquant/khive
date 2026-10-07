@@ -1714,6 +1714,14 @@ fn run_migrations_locked(conn: &mut Connection) -> Result<u32, SqliteError> {
                     error: e.to_string(),
                 }
             })?;
+        } else if migration.version == 36 {
+            // The events store DDL may already have added these columns.
+            crate::stores::event::ensure_operation_attribution_columns(&tx).map_err(|error| {
+                SqliteError::Migration {
+                    version: migration.version,
+                    error: error.to_string(),
+                }
+            })?;
         } else if migration.version == 44 {
             migrate_outbound_due_key(&tx).map_err(|error| SqliteError::Migration {
                 version: migration.version,
