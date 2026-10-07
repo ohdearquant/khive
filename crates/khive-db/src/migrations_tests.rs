@@ -5178,6 +5178,14 @@ fn event_operation_attribution_upgrade_keeps_legacy_rows_unknown() {
 }
 
 #[test]
+fn event_operation_attribution_upgrade_follows_the_event_store_schema() {
+    let mut conn = open_memory();
+    migrate_through(&mut conn, 35);
+    crate::stores::event::ensure_events_schema(&conn).unwrap();
+    assert_eq!(run_migrations(&mut conn).unwrap(), latest_schema_version());
+}
+
+#[test]
 fn issue2673_v37_initializes_and_guards_entity_versions() {
     let upgraded = rusqlite::Connection::open_in_memory().unwrap();
     upgraded.execute_batch("CREATE TABLE entities(id TEXT PRIMARY KEY, name TEXT NOT NULL); INSERT INTO entities(id,name) VALUES('old','kept');").unwrap();
