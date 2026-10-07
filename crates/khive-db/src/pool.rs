@@ -2,6 +2,9 @@
 mod code_map;
 #[path = "pool/identity_registry.rs"]
 mod identity_registry;
+#[cfg(any(test, feature = "test-support"))]
+#[path = "pool/test_volume_lock_dir.rs"]
+mod test_volume_lock_dir;
 #[path = "pool/write_units.rs"]
 mod write_units;
 #[path = "pool/writer_acquisition.rs"]
@@ -9,6 +12,8 @@ mod writer_acquisition;
 #[cfg(test)]
 use identity_registry::pool_identity_suffix;
 use identity_registry::PoolIdentityRegistration;
+#[cfg(any(test, feature = "test-support"))]
+use test_volume_lock_dir::test_volume_lock_dir;
 #[cfg(test)]
 use write_units::STARTUP_SPACE_PROBE;
 pub use write_units::{CheckpointGuard, CheckpointResult, WriterAcquisitionSnapshot, WriterGuard};
@@ -73,22 +78,6 @@ const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
 const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 const DATABASE_ID_TABLE: &str = "_khive_database_identity";
 static NEXT_MAIN_POOL_GENERATION: AtomicU64 = AtomicU64::new(1);
-
-/// Explicit test-only lock namespace, shared by every fixture pool in this
-/// process. `PoolConfig::default()` in an ordinary build never calls this.
-#[cfg(any(test, feature = "test-support"))]
-fn test_volume_lock_dir() -> PathBuf {
-    static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
-    DIRECTORY
-        .get_or_init(|| {
-            tempfile::Builder::new()
-                .prefix("khive-db-volume-lock-test-")
-                .tempdir()
-                .expect("private test volume-lock directory")
-                .keep()
-        })
-        .clone()
-}
 
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]

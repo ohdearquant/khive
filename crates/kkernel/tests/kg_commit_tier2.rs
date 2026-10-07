@@ -174,6 +174,7 @@ fn kg_commit_lands_a_clean_changeset_with_provenance_trailers() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", stage.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", stage.path().join("volume-locks"))
         .args([
             "kg",
             "commit",
@@ -247,6 +248,7 @@ fn kg_commit_refuses_repo_with_configured_remote() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", stage.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", stage.path().join("volume-locks"))
         .args([
             "kg",
             "commit",
@@ -300,6 +302,7 @@ fn kg_commit_refuses_changeset_with_error_severity_finding() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", stage.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", stage.path().join("volume-locks"))
         .args([
             "kg",
             "commit",
@@ -353,6 +356,7 @@ fn kg_commit_fails_loud_on_malformed_changeset() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", stage.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", stage.path().join("volume-locks"))
         .args([
             "kg",
             "commit",
@@ -420,6 +424,7 @@ fn kg_commit_lands_formal_typed_endpoint_with_edge_endpoint_types_enabled() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", stage.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", stage.path().join("volume-locks"))
         .args([
             "kg",
             "commit",
@@ -473,6 +478,7 @@ fn kg_commit_lands_changeset_with_description_satisfying_require_field_rule() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", stage.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", stage.path().join("volume-locks"))
         .args([
             "kg",
             "commit",
@@ -529,6 +535,7 @@ fn kg_commit_refuses_malformed_dangling_refs_severity() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", stage.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", stage.path().join("volume-locks"))
         .args([
             "kg",
             "commit",
@@ -595,6 +602,7 @@ fn kg_commit_refuses_generic_rule_named_dangling_refs() {
 
     let output = Command::new(kkernel_bin())
         .env("HOME", stage.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", stage.path().join("volume-locks"))
         .args([
             "kg",
             "commit",

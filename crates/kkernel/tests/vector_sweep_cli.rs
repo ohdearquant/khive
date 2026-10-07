@@ -47,6 +47,7 @@ fn isolated_command(root: &Path) -> Command {
     command
         .current_dir(root)
         .env("HOME", root)
+        .env("KHIVE_VOLUME_LOCK_DIR", root.join("volume-locks"))
         .env("KHIVE_NO_DAEMON", "1")
         .env("KHIVE_NO_EMBED", "true")
         .env("KHIVE_EVENTS_SPLIT", "0");

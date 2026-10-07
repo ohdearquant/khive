@@ -80,6 +80,7 @@ fn isolated_command(home: &Path) -> Command {
     let mut command = Command::new(kkernel_bin());
     command
         .env("HOME", home)
+        .env("KHIVE_VOLUME_LOCK_DIR", home.join("volume-locks"))
         .env("KHIVE_NO_DAEMON", "1")
         .env("GH_CONFIG_DIR", home.join("gh"))
         .env_remove("KHIVE_CONFIG")

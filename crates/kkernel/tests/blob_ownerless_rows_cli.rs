@@ -26,6 +26,7 @@ fn current_quiescent_member_prints_a_complete_json_report() {
         ])
         .env_remove("KHIVE_DB")
         .env_remove("KHIVE_CONFIG")
+        .env("KHIVE_VOLUME_LOCK_DIR", dir.path().join("volume-locks"))
         .output()
         .expect("run ownerless report binary");
     assert!(
@@ -75,6 +76,7 @@ fn live_member_refuses_without_printing_a_partial_report() {
         ])
         .env_remove("KHIVE_DB")
         .env_remove("KHIVE_CONFIG")
+        .env("KHIVE_VOLUME_LOCK_DIR", dir.path().join("volume-locks"))
         .output()
         .expect("run ownerless report binary");
     assert!(!output.status.success(), "live member must refuse");
