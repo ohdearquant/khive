@@ -318,6 +318,31 @@ impl AgentStore for SqlAgentStore {
         .await
     }
 
+    async fn transition_state(
+        &self,
+        agent_id: &str,
+        expected: AgentState,
+        state: AgentState,
+        terminal_reason: Option<TerminalReason>,
+        state_changed_at: i64,
+    ) -> Result<bool, StorageError> {
+        let agent_id = agent_id.to_string();
+        self.with_writer("agent_transition_state", move |conn| {
+            let affected = conn.execute(
+                include_str!("../../sql/agent-transition-state.sql"),
+                rusqlite::params![
+                    state.as_str(),
+                    terminal_reason.map(TerminalReason::as_str),
+                    state_changed_at,
+                    agent_id,
+                    expected.as_str(),
+                ],
+            )?;
+            Ok(affected == 1)
+        })
+        .await
+    }
+
     async fn set_checkpoint(
         &self,
         agent_id: &str,

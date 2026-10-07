@@ -7,7 +7,7 @@
 //! implementation — the pack only ever sees the trait object, and this
 //! test double proves that boundary holds.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -16,9 +16,17 @@ use khive_runtime::{VerbRegistry, VerbRegistryBuilder};
 use khive_storage::{AgentStore, StorageError};
 use khive_types::{AgentRecord, AgentState, Pack, TerminalReason};
 
+enum CasMiss {
+    Unchanged,
+    State(AgentState, Option<TerminalReason>),
+    Gone,
+}
+
 #[derive(Default)]
 struct MockAgentStore {
     records: Mutex<HashMap<String, AgentRecord>>,
+    cas_misses: Mutex<VecDeque<CasMiss>>,
+    cas_expected: Mutex<Vec<AgentState>>,
 }
 
 #[async_trait]
@@ -48,6 +56,46 @@ impl AgentStore for MockAgentStore {
         record.terminal_reason = terminal_reason;
         record.state_changed_at = state_changed_at;
         Ok(())
+    }
+
+    async fn transition_state(
+        &self,
+        agent_id: &str,
+        expected: AgentState,
+        state: AgentState,
+        terminal_reason: Option<TerminalReason>,
+        state_changed_at: i64,
+    ) -> Result<bool, StorageError> {
+        let mut records = self.records.lock().unwrap();
+        self.cas_expected.lock().unwrap().push(expected);
+        if let Some(miss) = self.cas_misses.lock().unwrap().pop_front() {
+            match miss {
+                // Models a competing state change followed by a return to the
+                // previous state before the handler's reread (an ABA race).
+                CasMiss::Unchanged => {}
+                CasMiss::State(state, reason) => {
+                    let record = records.get_mut(agent_id).unwrap();
+                    record.state = state;
+                    record.terminal_reason = reason;
+                    record.state_changed_at = 777;
+                    record.checkpoint_session_id = Some("raced-checkpoint".into());
+                }
+                CasMiss::Gone => {
+                    records.remove(agent_id);
+                }
+            }
+            return Ok(false);
+        }
+        let Some(record) = records.get_mut(agent_id) else {
+            return Ok(false);
+        };
+        if record.state != expected {
+            return Ok(false);
+        }
+        record.state = state;
+        record.terminal_reason = terminal_reason;
+        record.state_changed_at = state_changed_at;
+        Ok(true)
     }
 
     async fn set_checkpoint(
@@ -292,4 +340,187 @@ async fn unavailable_providers_never_write_and_do_not_poison_observe() {
             .unwrap()["agent_id"],
         id
     );
+}
+
+async fn cas_fixture(initial: AgentState) -> (VerbRegistry, Arc<MockAgentStore>, String) {
+    let (registry, store) = build_registry();
+    let id = seed(&store).await;
+    store.update_state(&id, initial, None, 1).await.unwrap();
+    (registry, store, id)
+}
+
+#[tokio::test]
+async fn lifecycle_cas_miss_rereads_into_normal_noop() {
+    for (verb, initial, current, reason) in [
+        (
+            "agent.suspend",
+            AgentState::Running,
+            AgentState::Suspended,
+            None,
+        ),
+        (
+            "agent.resume",
+            AgentState::Suspended,
+            AgentState::Running,
+            None,
+        ),
+        (
+            "agent.kill",
+            AgentState::Running,
+            AgentState::Terminal,
+            Some(TerminalReason::Completed),
+        ),
+    ] {
+        let (registry, store, id) = cas_fixture(initial).await;
+        store
+            .cas_misses
+            .lock()
+            .unwrap()
+            .push_back(CasMiss::State(current, reason));
+        let response = registry
+            .dispatch(verb, serde_json::json!({"id": id}))
+            .await
+            .unwrap();
+        let expected = match verb {
+            "agent.suspend" => {
+                serde_json::json!({"agent_id": id, "state": "suspended", "checkpoint_session_id": "raced-checkpoint"})
+            }
+            "agent.resume" => serde_json::json!({"agent_id": id, "state": "running"}),
+            _ => {
+                serde_json::json!({"agent_id": id, "state": "terminal", "terminal_reason": "completed"})
+            }
+        };
+        assert_eq!(response, expected);
+        assert_eq!(*store.cas_expected.lock().unwrap(), vec![initial]);
+        let record = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(record.state, current);
+        assert_eq!(record.terminal_reason, reason);
+        assert_eq!(record.state_changed_at, 777);
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_cas_miss_retries_a_still_legal_change() {
+    for (verb, initial, target) in [
+        ("agent.suspend", AgentState::Running, AgentState::Suspended),
+        ("agent.resume", AgentState::Suspended, AgentState::Running),
+        ("agent.kill", AgentState::Running, AgentState::Terminal),
+    ] {
+        let (registry, store, id) = cas_fixture(initial).await;
+        let retry_from = if verb == "agent.kill" {
+            AgentState::Suspended
+        } else {
+            initial
+        };
+        let miss = if verb == "agent.kill" {
+            CasMiss::State(retry_from, None)
+        } else {
+            CasMiss::Unchanged
+        };
+        store.cas_misses.lock().unwrap().push_back(miss);
+        let response = registry
+            .dispatch(verb, serde_json::json!({"id": id}))
+            .await
+            .unwrap();
+        assert_eq!(response["agent_id"], id);
+        assert_eq!(response["state"], target.as_str());
+        assert_eq!(
+            *store.cas_expected.lock().unwrap(),
+            vec![initial, retry_from]
+        );
+        let record = store.get(&id).await.unwrap().unwrap();
+        assert_eq!(record.state, target);
+        assert_eq!(
+            record.terminal_reason,
+            if target == AgentState::Terminal {
+                Some(TerminalReason::Killed)
+            } else {
+                None
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_cas_misses_preserve_refusals_and_cap_attempts() {
+    for (verb, initial) in [
+        ("agent.suspend", AgentState::Running),
+        ("agent.resume", AgentState::Suspended),
+        ("agent.kill", AgentState::Running),
+    ] {
+        let (registry, store, id) = cas_fixture(initial).await;
+        let before = serde_json::to_value(store.get(&id).await.unwrap().unwrap()).unwrap();
+        store.cas_misses.lock().unwrap().extend([
+            CasMiss::Unchanged,
+            CasMiss::Unchanged,
+            CasMiss::Unchanged,
+        ]);
+        let error = registry
+            .dispatch(verb, serde_json::json!({"id": id}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, khive_runtime::RuntimeError::InvalidInput(message) if message == format!("{verb}: state changed concurrently; retry"))
+        );
+        assert_eq!(*store.cas_expected.lock().unwrap(), vec![initial; 3]);
+        assert_eq!(
+            serde_json::to_value(store.get(&id).await.unwrap().unwrap()).unwrap(),
+            before
+        );
+
+        let (registry, store, id) = cas_fixture(initial).await;
+        store.cas_misses.lock().unwrap().push_back(CasMiss::Gone);
+        let error = registry
+            .dispatch(verb, serde_json::json!({"id": id}))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, khive_runtime::RuntimeError::NotFound(message) if message == format!("{verb}: unknown agent_id {id:?}"))
+        );
+        assert_eq!(*store.cas_expected.lock().unwrap(), vec![initial]);
+        assert!(store.get(&id).await.unwrap().is_none());
+
+        if verb != "agent.kill" {
+            let (registry, store, id) = cas_fixture(initial).await;
+            store.cas_misses.lock().unwrap().push_back(CasMiss::State(
+                AgentState::Terminal,
+                Some(TerminalReason::Killed),
+            ));
+            let error = registry
+                .dispatch(verb, serde_json::json!({"id": id}))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, khive_runtime::RuntimeError::InvalidInput(message) if message == format!("{verb}: illegal transition from terminal for agent_id {id:?}"))
+            );
+            assert_eq!(*store.cas_expected.lock().unwrap(), vec![initial]);
+            let record = store.get(&id).await.unwrap().unwrap();
+            assert_eq!(record.state, AgentState::Terminal);
+            assert_eq!(record.terminal_reason, Some(TerminalReason::Killed));
+            assert_eq!(record.state_changed_at, 777);
+        }
+    }
+}
+
+#[tokio::test]
+async fn lifecycle_last_cas_miss_still_rereads_before_retry_refusal() {
+    let (registry, store, id) = cas_fixture(AgentState::Running).await;
+    store.cas_misses.lock().unwrap().extend([
+        CasMiss::Unchanged,
+        CasMiss::Unchanged,
+        CasMiss::State(AgentState::Suspended, None),
+    ]);
+    let response = registry
+        .dispatch("agent.suspend", serde_json::json!({"id": id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        response,
+        serde_json::json!({"agent_id": id, "state": "suspended", "checkpoint_session_id": "raced-checkpoint"})
+    );
+    assert_eq!(
+        *store.cas_expected.lock().unwrap(),
+        vec![AgentState::Running; 3]
+    );
+    assert_eq!(store.get(&id).await.unwrap().unwrap().state_changed_at, 777);
 }
