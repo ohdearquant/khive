@@ -596,7 +596,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::RunAtomicUnit,
         stamp: StampCapability::ReservationOnly,
         family: Some("note.create"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::create_note_rejects_reserved_secret_gate_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations_tests.rs::create_note_rejects_reserved_secret_gate_key" },
     },
     RouteInventoryEntry {
         id: "runtime.note_store.insert_note_if_absent",
@@ -726,7 +726,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: Some("note.create"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::try_create_note_rejects_reserved_secret_gate_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations/tests/try_create_note.rs::try_create_note_rejects_reserved_secret_gate_key" },
     },
     RouteInventoryEntry {
         id: "runtime.claim_entity",
@@ -752,7 +752,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: Some("entity.create"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::create_entity_rejects_reserved_secret_gate_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations_tests.rs::create_entity_rejects_reserved_secret_gate_key" },
     },
     RouteInventoryEntry {
         id: "runtime.create_note_inner",
@@ -765,7 +765,7 @@ pub(crate) const ROUTE_INVENTORY: &[RouteInventoryEntry] = &[
         transaction: TransactionOwner::WriterTask,
         stamp: StampCapability::ReservationOnly,
         family: Some("note.create"),
-        acceptance: Acceptance::Test { path: "khive-runtime/src/operations.rs::tests::create_note_rejects_reserved_secret_gate_key" },
+        acceptance: Acceptance::Test { path: "khive-runtime/src/operations_tests.rs::create_note_rejects_reserved_secret_gate_key" },
     },
     RouteInventoryEntry {
         id: "runtime.import.entity",
