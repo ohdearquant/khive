@@ -1,6 +1,6 @@
 use super::*;
 use khive_db::StorageBackend;
-use khive_runtime::{PackRuntime, RuntimeConfig};
+use khive_runtime::{PackRuntime, RuntimeConfig, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::types::SqlRow;
 use khive_types::Namespace;
 use std::sync::Arc;
@@ -553,6 +553,197 @@ async fn number_lookup_preserves_namespace_project_kind_type_and_cast_contracts(
                 .await
                 .unwrap(),
             Some(cast_id)
+        );
+    }
+}
+
+fn project_update_fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
+    let runtime = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        embedding_model: None,
+        additional_embedding_models: Vec::new(),
+        wal_ceiling_bytes: 0,
+        wal_ceiling_configured_bytes: 0,
+        wal_ceiling_source: khive_db::WalCeilingSource::Default,
+        wal_ceiling_env_raw: None,
+        disk_guard_config: None,
+        volume_lock_dir: None,
+        actor_id: None,
+        brain_profile: None,
+        credentials: Vec::new(),
+        visibility_receipts: None,
+        events_split: None,
+        mounts: Vec::new(),
+        packs: vec!["kg".into(), "git".into()],
+        ..RuntimeConfig::no_embeddings()
+    })
+    .expect("isolated memory runtime");
+    assert!(!runtime.backend().is_file_backed());
+    assert!(runtime.backend_data_dir().is_none());
+    assert!(runtime.backend_ann_root().is_none());
+    let token = runtime.authorize(Namespace::local()).expect("local token");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(crate::GitPack::new(runtime.clone()));
+    builder
+        .with_runtime_event_store(&runtime)
+        .expect("runtime audit store");
+    let registry = builder.build().expect("registry");
+    runtime.install_edge_rules(registry.all_edge_rules());
+    registry.apply_schema_plans(runtime.backend());
+    (runtime, token, registry)
+}
+
+#[tokio::test]
+async fn dispatched_project_id_spellings_remain_findable_by_ingest() {
+    let (runtime, token, registry) = project_update_fixture();
+    let project = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+    let other = Uuid::parse_str("bbbbbbbb-cccc-4ddd-8eee-ffffffffffff").unwrap();
+    let canonical = project.to_string();
+    for kind in ["issue", "pull_request"] {
+        for (index, spelling) in [
+            canonical.clone(),
+            canonical.to_ascii_uppercase(),
+            project.simple().to_string(),
+            format!("{{{project}}}"),
+            format!("urn:uuid:{project}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let number = index as u64 + 1;
+            let created = registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": kind, "content": "project spelling fixture",
+                        "properties": {"number": number, "project_id": canonical, "kept": true},
+                    }),
+                )
+                .await
+                .expect("create a canonical note");
+            let id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                find_by_number(&runtime, &token, kind, project, number)
+                    .await
+                    .unwrap(),
+                Some(id),
+                "the canonical note must be visible before the update"
+            );
+            let updated = registry
+                .dispatch(
+                    "update",
+                    json!({"id": id, "kind": kind, "properties": {"project_id": spelling}}),
+                )
+                .await
+                .expect("a complete spelling of the same project is accepted");
+            let stored = registry.dispatch("get", json!({"id": id})).await.unwrap();
+            assert_eq!(
+                find_by_number(&runtime, &token, kind, project, number)
+                    .await
+                    .unwrap(),
+                Some(id),
+                "the actual ingest lookup must retain the dispatched note for {kind} {spelling}"
+            );
+            assert_eq!(updated["properties"]["project_id"], json!(canonical));
+            assert_eq!(stored["properties"]["project_id"], json!(canonical));
+            assert_eq!(stored["properties"]["kept"], json!(true));
+
+            registry
+                .dispatch(
+                    "update",
+                    json!({"id": id, "kind": kind, "properties": {"project_id": other}}),
+                )
+                .await
+                .expect("a different canonical project remains a legal update");
+            assert_eq!(
+                find_by_number(&runtime, &token, kind, project, number)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                find_by_number(&runtime, &token, kind, other, number)
+                    .await
+                    .unwrap(),
+                Some(id)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn dispatched_project_id_normalization_preserves_validation_and_omission() {
+    let (runtime, token, registry) = project_update_fixture();
+    let project = Uuid::parse_str("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee").unwrap();
+    for kind in ["issue", "pull_request"] {
+        let created = registry
+            .dispatch(
+                "create",
+                json!({
+                    "kind": kind, "content": "project validation fixture",
+                    "properties": {"number": 9, "project_id": project},
+                }),
+            )
+            .await
+            .unwrap();
+        let id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+        registry
+            .dispatch(
+                "update",
+                json!({"id": id, "properties": {"unrelated": "retained"}}),
+            )
+            .await
+            .expect("omitting project_id must preserve it");
+        let before = registry.dispatch("get", json!({"id": id})).await.unwrap();
+        assert_eq!(before["properties"]["project_id"], json!(project));
+        assert_eq!(before["properties"]["unrelated"], json!("retained"));
+        for invalid in [
+            Value::Null,
+            json!(false),
+            json!(7),
+            json!([]),
+            json!({}),
+            json!("aaaaaaaa"),
+            json!("not-a-uuid"),
+        ] {
+            let error = registry
+                .dispatch(
+                    "update",
+                    json!({"id": id, "kind": kind, "properties": {"project_id": invalid}}),
+                )
+                .await
+                .expect_err("the existing project_id validator must still refuse");
+            assert!(
+                matches!(error, RuntimeError::InvalidInput(ref text) if text.contains("project_id"))
+            );
+            assert_eq!(
+                registry.dispatch("get", json!({"id": id})).await.unwrap(),
+                before
+            );
+            assert_eq!(
+                find_by_number(&runtime, &token, kind, project, 9)
+                    .await
+                    .unwrap(),
+                Some(id)
+            );
+        }
+        let error = registry
+            .dispatch(
+                "update",
+                json!({
+                    "id": id, "kind": kind,
+                    "properties": {"project_id": format!("{{{project}}}"), "number": "nine"},
+                }),
+            )
+            .await
+            .expect_err("normalization must not skip the remaining kind validation");
+        assert!(
+            matches!(error, RuntimeError::InvalidInput(ref text) if text.contains("number must be an integer"))
+        );
+        assert_eq!(
+            registry.dispatch("get", json!({"id": id})).await.unwrap(),
+            before
         );
     }
 }
