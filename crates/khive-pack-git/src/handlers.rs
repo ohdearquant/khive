@@ -216,6 +216,16 @@ impl GitPack {
             Some(v) => parse_include(v)?,
         };
 
+        let project = match params.get("project") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(raw)) => Some(raw.as_str()),
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(
+                    "project must be a string when provided".into(),
+                ))
+            }
+        };
+
         // Commits need a repository to walk. Issues and pull requests are
         // source-bound `gh` API reads, so a remote API-only request uses a
         // neutral working directory and never clones unused git history.
@@ -259,7 +269,7 @@ impl GitPack {
         };
 
         // Resolve or auto-create the repo-anchor `project` entity.
-        let resolution = match params.get("project").and_then(Value::as_str) {
+        let resolution = match project {
             Some(raw) => {
                 let id = resolve_project_id(self.runtime(), raw)
                     .await
