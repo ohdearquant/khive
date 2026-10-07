@@ -957,6 +957,21 @@ impl KnowledgeHandlers {
             .transpose()?
             .flatten();
 
+        if matches!(kind, KnowledgeListKind::Atom) {
+            if let Some(status) = p.status.as_ref() {
+                let valid = match status {
+                    Value::String(_) => true,
+                    Value::Array(items) => items.iter().all(Value::is_string),
+                    _ => false,
+                };
+                if !valid {
+                    return Err(RuntimeError::InvalidInput(
+                        "status must be a string or an array of strings".into(),
+                    ));
+                }
+            }
+        }
+
         let ns = token.namespace().as_str().to_owned();
         let sql = runtime.sql();
         let limit_usize = p.limit.unwrap_or(20).clamp(1, 500);
