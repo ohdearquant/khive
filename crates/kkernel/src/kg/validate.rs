@@ -116,6 +116,17 @@ fn build_pack_edge_rules() -> Result<Vec<EdgeEndpointRule>> {
     Ok(registry.all_edge_rules())
 }
 
+// ADR-034 reserves exit 2 for TOML parse failures and unsupported rules formats.
+// Preserve each diagnostic while distinguishing it from other loader failures.
+#[derive(Debug)]
+struct RulesSyntaxOrFormatError(String);
+
+impl std::fmt::Display for RulesSyntaxOrFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
     let kg_dir = args.repo.join(".khive/kg");
     if !kg_dir.exists() {
@@ -141,7 +152,14 @@ pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
 
     if !args.no_rules && rules_path.exists() {
         let configurable =
-            configurable_rule_checks(&entities_path, &edges_path, &notes_path, &rules_path)?;
+            match configurable_rule_checks(&entities_path, &edges_path, &notes_path, &rules_path) {
+                Ok(results) => results,
+                Err(error) if error.is::<RulesSyntaxOrFormatError>() => {
+                    eprintln!("Error: {error:?}");
+                    std::process::exit(2);
+                }
+                Err(error) => return Err(error),
+            };
         rule_results.extend(configurable);
     }
 
@@ -1095,7 +1113,7 @@ fn configurable_rule_checks_impl(
         .and_then(|e| e.to_str())
         .unwrap_or("");
     if matches!(ext, "yaml" | "yml") {
-        bail!(
+        return Err(anyhow::Error::msg(RulesSyntaxOrFormatError(format!(
             "rules file {:?} uses YAML format which is not supported in this build. \
              Rename it to {}.toml and use TOML format instead.",
             rules_path,
@@ -1103,14 +1121,15 @@ fn configurable_rule_checks_impl(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("rules")
-        );
+        ))));
     }
 
     let content = std::fs::read_to_string(rules_path)
         .with_context(|| format!("read rules file {}", rules_path.display()))?;
 
-    let rules_file: RulesFile = toml::from_str(&content)
-        .with_context(|| format!("parse rules TOML {}", rules_path.display()))?;
+    let rules_file: RulesFile = toml::from_str(&content).with_context(|| {
+        RulesSyntaxOrFormatError(format!("parse rules TOML {}", rules_path.display()))
+    })?;
 
     if let Some(cfg) = &rules_file.edge_direction_conventions {
         validate_direction_rule_entries(&cfg.relations)
