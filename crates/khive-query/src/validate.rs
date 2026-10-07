@@ -78,6 +78,11 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
         match element {
             PatternElement::Node(node) => {
                 if let Some(var) = node.variable.as_deref() {
+                    if seen_edge_vars.contains(var) {
+                        return Err(QueryError::Validation(format!(
+                            "variable '{var}' cannot bind both a node and an edge"
+                        )));
+                    }
                     if !seen_node_vars.insert(var) {
                         return Err(QueryError::Unsupported(format!(
                             "repeated node variable '{var}' (cycle / self-reachability \
@@ -88,6 +93,11 @@ pub fn validate_with_warnings(query: &mut GqlQuery) -> Result<Vec<String>, Query
             }
             PatternElement::Edge(edge) => {
                 if let Some(var) = edge.variable.as_deref() {
+                    if seen_node_vars.contains(var) {
+                        return Err(QueryError::Validation(format!(
+                            "variable '{var}' cannot bind both a node and an edge"
+                        )));
+                    }
                     if !seen_edge_vars.insert(var) {
                         return Err(QueryError::Unsupported(format!(
                             "repeated edge variable '{var}' not supported"
