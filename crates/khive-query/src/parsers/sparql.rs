@@ -55,7 +55,7 @@ enum Object {
     Variable(String),
     Kind(String),
     StringLiteral(String),
-    NumberLiteral(f64),
+    NumberLiteral(ConditionValue),
 }
 
 struct SparqlParser {
@@ -268,10 +268,16 @@ impl SparqlParser {
                     }
                 }
                 let s: String = self.input[start..self.pos].iter().collect();
+                // Keep representable integer spellings exact without changing the float fallback.
+                if !s.contains('.') {
+                    if let Ok(n) = s.parse::<i64>() {
+                        return Ok(Object::NumberLiteral(ConditionValue::Integer(n)));
+                    }
+                }
                 let n: f64 = s
                     .parse()
                     .map_err(|_| self.err(format!("invalid number: {s}")))?;
-                Ok(Object::NumberLiteral(n))
+                Ok(Object::NumberLiteral(ConditionValue::Number(n)))
             }
             _ => Err(self.err("expected variable (?x), kind (:concept), string, or number")),
         }
@@ -406,7 +412,7 @@ fn triples_to_ast(
                         variable: triple.subject,
                         property: PropertyRef::JsonPath(vec![name]),
                         op: CompareOp::Eq,
-                        value: ConditionValue::Number(val),
+                        value: val,
                     });
                 }
                 Object::Kind(val) => {
@@ -806,14 +812,14 @@ mod tests {
             2,
             "neither numeric triple may be discarded"
         );
-        for (condition, value) in conditions.into_iter().zip([1.0, 2.0]) {
+        for (condition, value) in conditions.into_iter().zip([1, 2]) {
             assert_eq!(condition.variable, "a");
             assert_eq!(
                 condition.property,
                 PropertyRef::JsonPath(vec!["score".into()])
             );
             assert_eq!(condition.op, CompareOp::Eq);
-            assert_eq!(condition.value, ConditionValue::Number(value));
+            assert_eq!(condition.value, ConditionValue::Integer(value));
         }
         let compiled = crate::compile(&query, &crate::CompileOptions::default())
             .expect("both conjuncts compile");
