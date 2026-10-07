@@ -2340,3 +2340,92 @@ fn find_prev_failure_none_when_resolve_all_succeeds() {
     assert!(arg.resolve_all(&prev).is_some());
     assert!(arg.find_prev_failure(&prev).is_none());
 }
+
+#[test]
+fn find_prev_failure_wrong_type_prefix_uses_valid_dsl_path() {
+    for (path, previous, prefix) in [
+        ("$prev[0].id", json!([7]), "$prev[0]"),
+        ("$prev.items[0].id", json!({"items": [7]}), "$prev.items[0]"),
+        ("$prev.id", json!(7), "$prev"),
+    ] {
+        let parsed = parse_request_unplanned(&format!("source() | use(value={path})"))
+            .expect("valid reference path");
+        let arg = &parsed.ops[1].args["value"];
+        assert_eq!(arg.resolve_all(&previous), None);
+        let failure = arg.find_prev_failure(&previous).expect("wrong type");
+        assert_eq!(
+            failure,
+            PrevFailure::WrongType {
+                arg_path: String::new(),
+                prev_path: path.to_string(),
+                resolved_prefix: prefix.to_string(),
+                segment: "id".to_string(),
+                expected: "object",
+                found: "number",
+            }
+        );
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "{path}: {prefix} is a number, not an object, so \
+                 \"id\" cannot be applied to it"
+            )
+        );
+    }
+}
+
+#[test]
+fn find_prev_failure_not_found_prefix_uses_valid_dsl_path() {
+    for (path, previous, prefix, missing, available) in [
+        (
+            "$prev[0].missing",
+            json!([{"id": "x"}]),
+            "$prev[0]",
+            "missing",
+            "id",
+        ),
+        (
+            "$prev[0][1]",
+            json!([[0]]),
+            "$prev[0]",
+            "[1]",
+            "array has 1 element(s)",
+        ),
+        (
+            "$prev.items[0].missing",
+            json!({"items": [{"id": "x"}]}),
+            "$prev.items[0]",
+            "missing",
+            "id",
+        ),
+        (
+            "$prev[2]",
+            json!([]),
+            "$prev",
+            "[2]",
+            "array has 0 element(s)",
+        ),
+    ] {
+        let parsed = parse_request_unplanned(&format!("source() | use(value={path})"))
+            .expect("valid reference path");
+        let arg = &parsed.ops[1].args["value"];
+        assert_eq!(arg.resolve_all(&previous), None);
+        let failure = arg.find_prev_failure(&previous).expect("missing path");
+        assert_eq!(
+            failure,
+            PrevFailure::NotFound {
+                arg_path: String::new(),
+                prev_path: path.to_string(),
+                resolved_prefix: prefix.to_string(),
+                missing: missing.to_string(),
+                available: vec![available.to_string()],
+            }
+        );
+        assert_eq!(
+            failure.to_string(),
+            format!(
+                "{path}: {prefix} has no {missing:?}. Available top-level fields: [{available}]"
+            )
+        );
+    }
+}

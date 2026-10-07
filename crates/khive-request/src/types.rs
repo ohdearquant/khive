@@ -254,7 +254,7 @@ fn prev_path_prefix(resolved_prefix: &str) -> String {
     if resolved_prefix.is_empty() {
         "$prev".to_string()
     } else {
-        format!("$prev.{resolved_prefix}")
+        render_prev_path(resolved_prefix)
     }
 }
 
