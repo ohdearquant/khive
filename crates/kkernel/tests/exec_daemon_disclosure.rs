@@ -36,6 +36,7 @@ fn exec_command(root: &TempDir, ops: &str) -> Command {
         .arg(root.path().join("fixture.db"))
         .current_dir(root.path())
         .env("HOME", root.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", root.path().join("volume-locks"))
         .env("KHIVE_PACKS", "kg")
         .env("KHIVE_EVENTS_SPLIT", "0")
         .env("KHIVE_SOCKET", root.path().join("s"))

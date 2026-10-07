@@ -95,6 +95,7 @@ fn events_daemon_keeps_shared_locks_on_its_database_while_idle() {
 
     let child = Command::new(env!("CARGO_BIN_EXE_kkernel"))
         .env("HOME", dir.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", dir.path().join("volume-locks"))
         .arg("events-daemon")
         .arg("--db")
         .arg(&db)

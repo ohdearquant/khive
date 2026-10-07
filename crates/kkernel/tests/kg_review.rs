@@ -92,6 +92,7 @@ fn run_review(changeset: &Path, rules: &Path, reviewer_model_family: Option<&str
     let home = TempDir::new().expect("private child HOME");
     let mut command = Command::new(kkernel_bin());
     command.env("HOME", home.path());
+    command.env("KHIVE_VOLUME_LOCK_DIR", home.path().join("volume-locks"));
     command.args([
         "kg",
         "review",

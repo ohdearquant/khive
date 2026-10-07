@@ -24,6 +24,7 @@ fn exec_pending_events_discloses_resolved_actor_before_drain() {
         ])
         .current_dir(home.path())
         .env("HOME", home.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", home.path().join("volume-locks"))
         .env("KHIVE_NO_DAEMON", "1")
         .env("KHIVE_ACTOR", "lambda:pending-events-test")
         .env("RUST_LOG", "error")

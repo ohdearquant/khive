@@ -15,6 +15,7 @@ fn command(home: &TempDir) -> Command {
     command
         .current_dir(home.path())
         .env("HOME", home.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", home.path().join("volume-locks"))
         .env("KHIVE_NO_DAEMON", "1")
         .env("KHIVE_PACKS", "kg")
         .env("RUST_LOG", "error");

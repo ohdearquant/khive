@@ -5,7 +5,11 @@ use khive_runtime::{KhiveConfig, RuntimeConfig};
 
 fn cli(home: &std::path::Path, raw: Option<&str>) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_kkernel"));
-    command.env_clear().env("HOME", home).current_dir(home);
+    command
+        .env_clear()
+        .env("HOME", home)
+        .env("KHIVE_VOLUME_LOCK_DIR", home.join("volume-locks"))
+        .current_dir(home);
     if let Some(raw) = raw {
         command.env("KHIVE_SQLITE_WAL_CEILING_BYTES", raw);
     }

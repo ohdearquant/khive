@@ -240,6 +240,7 @@ fn code_ingest(args: &[&str]) -> std::process::Output {
         .args(args)
         .current_dir(seat.path())
         .env("HOME", seat.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", seat.path().join("volume-locks"))
         .env("KHIVE_NO_DAEMON", "1")
         .env_remove("KHIVE_CONFIG")
         .output()

@@ -16,6 +16,7 @@ fn configured_exec(home: &TempDir, packs: &str) -> Command {
         .arg("exec")
         .current_dir(home.path())
         .env("HOME", home.path())
+        .env("KHIVE_VOLUME_LOCK_DIR", home.path().join("volume-locks"))
         .env("KHIVE_NO_DAEMON", "1")
         .env("KHIVE_PACKS", packs)
         .env("RUST_LOG", "error")

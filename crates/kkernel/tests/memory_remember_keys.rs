@@ -201,6 +201,10 @@ impl Fixture {
             .env("KHIVE_PID", self.pid_file(index))
             .env("KHIVE_LOCK", self.root.path().join("boot.lock"))
             .env(
+                "KHIVE_VOLUME_LOCK_DIR",
+                self.root.path().join("volume-locks"),
+            )
+            .env(
                 "KHIVE_RECOVERER_LOCK",
                 self.root.path().join(format!("recover-{index}.lock")),
             )

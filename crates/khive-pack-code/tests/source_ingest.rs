@@ -7,7 +7,9 @@
 //! never the shared production runtime).
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use chrono::Utc;
 use khive_pack_code::source_ingest::{run_code_ingest, CodeSourceIngestOptions};
@@ -21,10 +23,27 @@ fn all_languages() -> BTreeSet<&'static str> {
     ["rust", "python", "typescript"].into_iter().collect()
 }
 
+// Each runtime takes its own volume-lock namespace, kept outside the walked
+// tree: a long ingest in one test then cannot hold the lease that an
+// unrelated test in the same binary is waiting on.
+fn private_volume_lock_dir() -> PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    ROOT.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("khive-code-test-volume-locks-")
+            .tempdir()
+            .expect("private volume-lock root")
+            .keep()
+    })
+    .join(NEXT.fetch_add(1, Ordering::Relaxed).to_string())
+}
+
 fn rt_at(db_path: &Path) -> KhiveRuntime {
     let config = RuntimeConfig {
         db_path: Some(db_path.to_path_buf()),
         packs: vec![],
+        volume_lock_dir: Some(private_volume_lock_dir()),
         ..RuntimeConfig::no_embeddings()
     };
     KhiveRuntime::new(config).expect("target runtime opens")
