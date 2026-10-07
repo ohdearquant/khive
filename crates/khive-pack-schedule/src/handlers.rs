@@ -294,6 +294,23 @@ mod create_refusal_tests;
 #[path = "resource_alias_drift_tests.rs"]
 mod resource_alias_drift_tests;
 
+/// Mirror KG create's raw singleton alias-shape check before kind reconciliation.
+fn optional_create_kind_alias_for_replay<'a>(
+    args: &'a std::collections::BTreeMap<String, khive_request::ArgValue>,
+    field: &str,
+) -> Result<Option<&'a str>, RuntimeError> {
+    match args.get(field).and_then(khive_request::ArgValue::as_value) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Err(RuntimeError::InvalidInput(
+            format!("create: `{field}` must not be empty"),
+        )),
+        Some(Value::String(value)) => Ok(Some(value.as_str())),
+        Some(value) => Err(RuntimeError::InvalidInput(format!(
+            "create: `{field}` must be a string or null; got {value}"
+        ))),
+    }
+}
+
 /// Rejects scheduled actions known to fail a handler's *conditional*
 /// required param even though `describe_verb` marks none of the
 /// alternatives `required:true` (issue #461) — hard-codes the `create`
@@ -336,15 +353,8 @@ fn validate_conditional_requirements(
         .and_then(khive_request::ArgValue::as_value)
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let entity_kind_arg = args
-        .get("entity_kind")
-        .and_then(khive_request::ArgValue::as_value)
-        .and_then(Value::as_str);
-    let note_kind_arg = args
-        .get("note_kind")
-        .and_then(khive_request::ArgValue::as_value)
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty());
+    let entity_kind_arg = optional_create_kind_alias_for_replay(args, "entity_kind")?;
+    let note_kind_arg = optional_create_kind_alias_for_replay(args, "note_kind")?;
 
     match classify_create_kind(kind_str, registry)? {
         CreateKindClass::Entity { specific } => {
