@@ -121,6 +121,20 @@ impl KgPack {
             ));
         }
 
+        let expiry = p
+            .expiry
+            .map(|micros| {
+                u64::try_from(micros)
+                    .map(khive_types::Timestamp::from_micros)
+                    .map_err(|_| {
+                        RuntimeError::InvalidInput(
+                            "expiry must be a non-negative integer in microseconds since epoch"
+                                .into(),
+                        )
+                    })
+            })
+            .transpose()?;
+
         // Secret gate: scan all caller-supplied text before constructing/appending events.
         khive_runtime::secret_gate::check_at(&p.title, "proposal", "title")?;
         khive_runtime::secret_gate::check_at(&p.description, "proposal", "description")?;
@@ -213,9 +227,7 @@ impl KgPack {
             description: p.description.clone(),
             changeset,
             reviewers: p.reviewers.clone(),
-            expiry: p
-                .expiry
-                .map(|v| khive_types::Timestamp::from_micros(v as u64)),
+            expiry,
             parent_id: validated_parent_id,
         };
 
