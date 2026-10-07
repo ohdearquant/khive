@@ -434,7 +434,7 @@ impl KgPack {
                             // The row is already absent, so this retry only
                             // reports the attachment cleanup it performed.
                             return Ok(serde_json::json!({
-                                "deleted": false, "id": p.id, "kind": "entity",
+                                "deleted": false, "id": id.to_string(), "kind": "entity",
                                 "attachment_cleanup": true,
                             }));
                         }
@@ -471,7 +471,7 @@ impl KgPack {
                                 .await?
                             {
                                 return Ok(serde_json::json!({
-                                    "deleted": false, "id": p.id, "kind": "entity",
+                                    "deleted": false, "id": id.to_string(), "kind": "entity",
                                     "attachment_cleanup": true,
                                 }));
                             }
@@ -510,7 +510,7 @@ impl KgPack {
                         .await?;
                 }
                 let mut response = to_json(
-                    &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
+                    &serde_json::json!({ "deleted": deleted, "id": id.to_string(), "kind": resolved_kind }),
                 )?;
                 if !degradations.is_empty() {
                     response["post_commit_degradations"] = serde_json::json!(degradations);
@@ -554,7 +554,7 @@ impl KgPack {
                     return Err(RuntimeError::NotFound(format!("note {}", p.id)));
                 }
                 let mut response = to_json(
-                    &serde_json::json!({ "deleted": deleted, "id": p.id, "kind": resolved_kind }),
+                    &serde_json::json!({ "deleted": deleted, "id": id.to_string(), "kind": resolved_kind }),
                 )?;
                 if !degradations.is_empty() {
                     response["post_commit_degradations"] = serde_json::json!(degradations);
@@ -563,7 +563,9 @@ impl KgPack {
             }
             KindSpec::Edge => {
                 let deleted = target.runtime.delete_edge(token, id, hard).await?;
-                to_json(&serde_json::json!({ "deleted": deleted, "id": p.id, "kind": "edge" }))
+                to_json(
+                    &serde_json::json!({ "deleted": deleted, "id": id.to_string(), "kind": "edge" }),
+                )
             }
             KindSpec::Event => Err(immutable_event_error()),
             KindSpec::Proposal => Err(RuntimeError::InvalidInput(

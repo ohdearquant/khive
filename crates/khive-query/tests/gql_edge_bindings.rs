@@ -58,7 +58,7 @@ fn valid_edge_binding_spelling_and_projection_are_preserved() {
                 );
                 let compiled = compile(&query, &CompileOptions::default()).unwrap();
                 assert_eq!(compiled.sql.contains("WITH RECURSIVE"), !hops.is_empty());
-                let projection = format!("{source} AS {variable}_id");
+                let projection = format!("{source} AS \"{variable}_id\"");
                 assert_eq!(
                     compiled.sql.matches(&projection).count(),
                     1,
