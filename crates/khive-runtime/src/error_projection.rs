@@ -17,6 +17,15 @@ use crate::{DomainDisposition, RuntimeError};
 pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) -> Value {
     // These named outcomes carry their own domain proof. Do not infer general
     // write disposition from a conflict or unavailable variant.
+    let sqlite_write_failure = match error.refusal_source() {
+        RuntimeError::Storage(error) => error.sqlite_write_failure(),
+        RuntimeError::Sqlite(error) => error.write_failure(),
+        _ => None,
+    };
+    let outcome_has_precedence = error.writer_task_failure_context().is_some_and(|context| {
+        context.task_terminated
+            || context.request_state == khive_storage::WriterTaskRequestState::SideEffectsUnknown
+    });
     let receipt_projection = crate::visibility_receipts::receipt_error_projection(&error);
     let named_disposition = match &error {
         _ if receipt_projection.is_some_and(|(_, replay)| replay) => Some("not_committed"),
@@ -234,6 +243,22 @@ pub fn runtime_error_value(error: RuntimeError, disposition: DomainDisposition) 
         }
     };
     let mut value = payload;
+    if let Some(failure) = sqlite_write_failure {
+        // Capacity refusal retains its existing caller-visible precedence.
+        if !outcome_has_precedence
+            && !failure.settlement_unknown
+            && failure.primary_code != rusqlite::ffi::SQLITE_FULL
+        {
+            value["code"] = json!(failure.stage.as_str());
+            value["stage"] = json!(failure.stage.as_str());
+            if value["kind"] == "runtime_error" {
+                value["kind"] = json!("storage");
+            }
+        }
+        value["sqlite_write_stage"] = json!(failure.stage.as_str());
+        value["sqlite_primary_code"] = json!(failure.primary_code);
+        value["sqlite_extended_code"] = json!(failure.extended_code);
+    }
     if let Some((retryable, _)) = receipt_projection {
         value["retryable"] = json!(retryable);
     }
@@ -345,9 +370,16 @@ fn sqlite_capacity_failure_from_storage(error: &StorageError) -> Option<SqliteCa
                 extended_code: *extended_code,
             })
         }
-        StorageError::WriterTaskRequestFailed { source, .. } => {
-            sqlite_capacity_failure_from_storage(source)
+        StorageError::SqliteWrite { failure, .. }
+            if failure.primary_code == rusqlite::ffi::SQLITE_FULL =>
+        {
+            Some(SqliteCapacityFailure::NativeFull {
+                primary_code: failure.primary_code,
+                extended_code: failure.extended_code,
+            })
         }
+        StorageError::WriterTaskRequestFailed { source, .. }
+        | StorageError::SqliteWrite { source, .. } => sqlite_capacity_failure_from_storage(source),
         StorageError::Driver { source, .. } => {
             if let Some(sqlite) = source.downcast_ref::<khive_db::SqliteError>() {
                 sqlite_capacity_failure_from_sqlite(sqlite)
@@ -377,7 +409,8 @@ fn sqlite_capacity_failure_from_sqlite(
         khive_db::SqliteError::CapacityUnavailable { phase, .. } => {
             Some(SqliteCapacityFailure::Unavailable { phase: *phase })
         }
-        khive_db::SqliteError::Rusqlite(sqlite) => native_sqlite_full(sqlite),
+        khive_db::SqliteError::Rusqlite(sqlite)
+        | khive_db::SqliteError::Write { source: sqlite, .. } => native_sqlite_full(sqlite),
         _ => None,
     }
 }

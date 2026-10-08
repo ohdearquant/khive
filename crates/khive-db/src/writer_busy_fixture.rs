@@ -194,7 +194,10 @@ async fn reader_busy_and_queued_write_refusals_do_not_count_as_direct() {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, StorageError::WriterTaskBusy { .. }),
+        matches!(
+            error.without_sqlite_write_stage(),
+            StorageError::WriterTaskBusy { .. }
+        ),
         "{error:?}"
     );
     let snapshot = queued.pool.writer_acquisition_snapshot();
