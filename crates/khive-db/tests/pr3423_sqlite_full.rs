@@ -183,7 +183,8 @@ async fn auto_rollback_full_keeps_cause_specific_escalation() {
         matches!(
             failed,
             Err(StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::SideEffectsUnknown
+                request_state: WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "this scoped telemetry test preserves the inspected retirement policy"

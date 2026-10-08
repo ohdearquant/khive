@@ -616,7 +616,7 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
 }
 
 fn writer_task_terminated(request_state: WriterTaskRequestState) -> StorageError {
-    StorageError::WriterTaskTerminated { request_state }
+    StorageError::writer_task_terminated(request_state)
 }
 
 fn writer_task_begin_error(error: rusqlite::Error, busy_timeout: Duration) -> StorageError {
@@ -1425,7 +1425,7 @@ mod tests {
         expected: WriterTaskRequestState,
     ) {
         match result {
-            Err(StorageError::WriterTaskTerminated { request_state }) => {
+            Err(StorageError::WriterTaskTerminated { request_state, .. }) => {
                 assert_eq!(request_state, expected)
             }
             other => panic!("expected WriterTaskTerminated({expected:?}), got {other:?}"),
