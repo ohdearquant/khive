@@ -184,8 +184,8 @@ async fn auto_rollback_full_keeps_cause_specific_escalation() {
             failed,
             Err(StorageError::WriterTaskTerminated {
                 request_state: WriterTaskRequestState::SideEffectsUnknown,
-                ..
-            })
+                sqlite_full_codes: Some((rusqlite::ffi::SQLITE_FULL, extended)),
+            }) if extended & 0xff == rusqlite::ffi::SQLITE_FULL
         ),
         "this scoped telemetry test preserves the inspected retirement policy"
     );
