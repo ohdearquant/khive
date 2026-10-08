@@ -3,7 +3,7 @@
 **Status**: accepted\
 **Date**: 2026-05-23\
 **Authors**: khive maintainers\
-**Amended by**: proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which atomically binds a
+**Amended by**: Amendment 5 below (ordered peer engines and explicit retrieval strategies, proposed); proposed [ADR-160](ADR-160-shared-pack-infrastructure.md), which atomically binds a
 provider factory to a complete immutable embedding-space identity and replaces sanitized
 model-derived physical selection on acceptance.\
 **Consolidates** (retired v0-series drafts predating the 2026-05-23 ADR renumbering; these
@@ -1216,3 +1216,159 @@ shape or a verb reply.
   examples; this amendment supersedes those examples for document embedding.
 - [ADR-099](ADR-099-bulk-apply-atomic-units.md) governs cross-operation atomic writes; the
   report-aware note export does not alter its transaction semantics.
+
+## Amendment 5 (2026-10-08): ordered peer engines and explicit retrieval strategies
+
+**Status**: proposed.
+
+### Context and scope
+
+The implemented configuration splits embedding models into one default and additional models. The registry is unordered, configured fusion weights are refused, and only memory recall currently fans out over registered engines. Other retrieval paths select one model. The `Weighted` fusion variant performs normalized linear score blending; it does not implement weighted reciprocal rank fusion.
+
+This amendment establishes one ordered list of peer engines and a mandatory per-query strategy. It covers memory retrieval and its retrieval subhandlers, entity/note search, knowledge retrieval, and runtime hybrid retrieval, including composite retrieval entry points. It does not add a sparse leg, change write transaction guarantees, introduce remote-provider services, or alter pack-specific scoring objectives.
+
+### Changes to earlier decisions
+
+1. D2/D3 and the TOML addendum change from a primary/additional configuration to ordered peers. Accepted Amendment 2's provider and registry placement in `khive-runtime` stands.
+2. D4 changes to permit runtime adapters to invoke registered providers and delegate candidate execution to `khive-retrieval`. Model-aware physical routing remains required. The unused metadata-only runtime sketch is not the target API for this work.
+3. D5 replaces its mistaken use of `Weighted` for weighted RRF with `WeightedRrf`. It retains two fusion stages, but moves their reusable execution into `khive-retrieval`; pack scoring remains outside. D5's pack-only orchestration rationale, Alternative E, and Open Question 1 are superseded to this extent.
+4. D4's optional strategy and D6's optional per-call strategy wording become the mandatory contract below. Existing `Weighted`, `Rrf`, `Union`, `VectorOnly`, `KeywordOnly`, and runtime-dispatched `Custom` meanings are not renamed or repurposed.
+5. Amendment 1's knowledge write/read symmetry remains a migration gate. Its assertion that every entity/note read already fans out is corrected to describe the intended contract, not the current implementation. The corresponding knowledge ADR must be updated with the activation change.
+6. Amendment 3's refusal is lifted only when the configured weights can reach the checked engine-fusion path for every activated retrieval surface. Intermediate releases must continue to refuse unused settings.
+7. Proposed Amendment 4's existing truncation reports and provider-attestation distinctions are preserved by this implementation; this amendment does not ratify or enlarge that proposal.
+
+### Decision A — Engine identity, order, and configuration
+
+`[[engines]]` declares an ordered list of peers. Each entry has a stable `name`, `weight` defaulting to `1.0`, optional `dims` as a checked assertion, and optional calibration fields. There is no canonical `default` flag or `[retrieval].default_engine` setting. A configured name resolves to an existing `EmbedderProvider`; built-in names select lattice adapters and other names require a registered host/pack implementation.
+
+```toml
+[[engines]]
+name = "bge-small-en-v1.5"
+weight = 1.0
+dims = 384
+
+[[engines]]
+name = "team-multilingual-v1" # supplied by a registered provider
+weight = 0.8
+dims = 768
+```
+
+The registry preserves declaration order independently of its lookup map. Provider enumeration, named subsets, results, and resolved weights use that same order. Request order does not rebind weights. No model-count cap is derived from the lattice enum; concurrency, memory, and request budgets remain finite and explicit. Provider registration makes an implementation available; an explicit configured list determines participation. Programmatic registration-only hosts must finalize an ordered participating list before serving. Mutation may not replace a provider underneath an in-flight query.
+
+Names must be unique after built-in alias canonicalization. Duplicate names, alias collisions, unresolved providers, nonpositive dimensions, and dimension mismatches are errors. Duplicate provider registration must not silently replace a serving embedding space. Multiple instances using identical model weights may have distinct provider names, but must have distinct verified storage bindings if their preprocessing or vector spaces differ.
+
+Weights are finite and strictly positive. Zero is not an engine-disable switch; use explicit selection. The first peer is the compatibility choice only for a documented single-engine API and `DefaultModel` note policy. Multi-engine retrieval selects all applicable configured peers unless the request names a subset. An explicitly empty list disables vector participation; a vector-requiring request then errors. A missing configuration follows the existing deployment fallback, converted into a one-entry peer list; this amendment does not silently change the fallback model.
+
+Logical labels, provider identity, and existing physical index keys must not be conflated. Legacy conversion preserves the actual canonical model-to-index binding even when the old configuration used a decorative `name`. Changing order or weight never renames, rewrites, or re-embeds stored vectors. Different dimensions or preprocessing require a new verified embedding-space binding and reindex; matching dimensions alone do not establish compatibility. Until an accepted replacement identity design is available, collisions under the current sanitizer must be refused, not merged.
+
+Calibration is applied within each engine before rank fusion. For cosine-producing adapters, absent values mean `noise_floor=-1`, `max_similarity=1`, `threshold=0`. Require finite `-1 <= noise_floor < max_similarity <= 1` and `0 <= threshold <= 1`. Discard raw similarity below the floor; calculate `u=clamp((s-noise_floor)/(max_similarity-noise_floor),0,1)`; retain `u >= threshold`. Preserve the engine's descending raw-similarity order with stable ID ties, then compact the ranks of retained distinct IDs. Thus a normalization cap does not create an accidental ID ordering among originally unequal high scores. An adapter must expose the agreed cosine/similarity contract before using these settings; it must not label an arbitrary vendor score as cosine. No historical calibration numbers are installed without a provider/corpus-specific basis.
+
+### Decision B — Complete the existing provider seam
+
+Keep `EmbedderProvider`, `EmbedderRegistry`, and the lattice adapter in `khive-runtime`. Configuration binding is finalized after host/pack provider registration and before the first request. Parsing configuration can check syntax first; it cannot reject a custom name merely because lattice's enum cannot parse it.
+
+Named query and document invocation must dispatch the correct retrieval role through the registered provider. Extend the existing provider contract with role-aware methods as needed, using the registry's cached service; do not create a second provider abstraction or rebuild the service for every request. Built-in implementations retain their current prefix conventions. A custom implementation owns its role preparation and must not receive accidental lattice prefixes from a placeholder enum. Legacy generic services may remain callable by their old API, but cannot be declared conforming to the new role-aware retrieval contract without the adapter capability and its tests.
+
+Validate batch cardinality, ordering, finite coordinates, and exact declared dimensions before indexing/search. Preserve runtime input-bounding reports; do not claim visibility into preprocessing or truncation inside custom providers. Query caches and index handles must be keyed by the resolved engine identity and relevant role/preparation identity, not by “default”.
+
+### Decision C — Required request contract and response evidence
+
+Each retrieval request supplies a `strategy` value containing **both** `engine_fusion` and `hybrid_fusion`. This is a composition of existing `FusionStrategy` values, not another competing strategy hierarchy. Engine weights resolve by name from configuration, with optional explicit name-keyed request overrides; positional arrays are produced internally only after name validation.
+
+Example wire contract:
+
+```json
+{
+  "query": "multilingual research",
+  "engines": ["bge-small-en-v1.5", "team-multilingual-v1"],
+  "strategy": {
+    "engine_fusion": { "weighted_rrf": { "k": 60 } },
+    "hybrid_fusion": { "weighted": { "weights": [0.7, 0.3] } }
+  }
+}
+```
+
+`engine_fusion` supports `weighted_rrf` and explicitly unweighted `rrf` in this lane. Both require `k >= 1`. For `rrf`, the response states that effective engine weights are all one; configured weights are deliberately not applied under that explicit choice. Name-keyed weight overrides are rejected for an unweighted selection. Other engine-stage variants are rejected until their multi-engine semantics are specified. `engine_fusion: null` is required with `hybrid_fusion: "keyword_only"`; it is invalid for a vector-using request. One-engine requests still select a strategy. A vector-only request skips text but still applies its selected engine fusion.
+
+The hybrid stage accepts the existing strategies, including the new rank-weighted variant over exactly `[combined_vector, text]`. Weighted hybrid strategies require exactly two finite positive weights. Rank strategies require an explicit `k`; there is no hidden per-pack value. Custom hybrid fusion resolves through the existing runtime `FusionExecutor` registry; unsupported or unregistered custom strategies return an error, never RRF fallback. `Union` retains its existing max-score meaning and carries that score kind; it must not be described as scale-independent.
+
+Missing/null/incomplete `strategy`, unknown engines, duplicate selections, unknown weight-map keys, nonfinite/nonpositive weights, unsupported stage combinations, and ambiguous legacy/new fields fail before embedding or ANN work. Omitting `engines` means the configured applicable peer set, not the first entry. Explicit selection outside the applicable configured set fails.
+
+The successful retrieval outcome is an envelope containing `results` and `retrieval`. `retrieval` contains the resolved two-stage strategy and its version, requested/selected/used engines in canonical order, effective weights, per-engine requested and returned candidate counts, per-arm status/reason, text participation, and degraded status. It distinguishes an arm that ran with zero hits from one that was skipped, unavailable, or failed. Scores identify the fusion stage/score kind; they are not relabelled as raw cosine or probability. Zero-result responses carry the same evidence. Diagnostic envelopes carry no raw query vectors.
+
+`memory.recall`, KG `search` for entities and notes, `knowledge.search`, and runtime hybrid retrieval obey this contract directly. Retrieval subhandlers (`recall_embed`, `recall_candidates`, `recall_fuse`, `recall_rerank`, `recall_score`) consume the explicit strategy or a validated upstream envelope that already carries it; no subhandler can recreate a default. Pure vector generation is not fusion, but the retrieval pipeline's embed stage must preserve the selected plan.
+
+Composite retrieval APIs such as query-driven `context`, natural-language `resolve`, knowledge composition/suggestion, and tool suggestion propagate the caller's strategy. Deterministic by-ID access, SQL/structured listing, graph traversal without search, and writes are not retrieval-strategy requests. A write performing advisory similarity search supplies its own explicit internal policy at the call site and discloses that policy with the advisory result. Pure by-ID resolution does not require irrelevant strategy, but a request that may use similarity fallback must provide it before that fallback executes. The release census must classify all such entry points; four updated flagship verbs alone do not establish coverage.
+
+### Decision D — Fusion semantics
+
+Add `FusionStrategy::WeightedRrf { k, weights }` to `khive-fusion`. For ordered engine lists `L_i`, each containing distinct IDs with one-based ranks:
+
+```text
+vector_score(d) = sum_i [d in L_i] * w_i / (k_engine + rank_i(d))
+```
+
+Weights are not normalized in this primitive. Equal weights of one reproduce ordinary RRF; multiplying all engine weights by the same positive scalar scales the aggregate score. Duplicate occurrences in a source count once at their best rank. Ties use stable ascending IDs. Validate weight/source cardinality and numeric validity even for empty results. Preserve an empty positional slot for failed or empty selected engines so weights cannot shift. Unknown/missing weights must not be padded, zeroed, clamped, or replaced with uniform weights. Arithmetic outside the representable deterministic-score range is an explicit error, not silent saturation; tests cover boundary rounding and accumulation.
+
+Engine candidate depth is distinct from `k_engine`: `k` smooths rank contribution; it is not top-k, a pool size, or an engine-count correction. Use the same requested pool depth for peers by default. Unequal realized depths due to filtering, smaller corpora, or failures leave missing contributions at zero. Do not renormalize by returned pool size or number of successful engines. Any explicit per-engine pool override is part of the resolved evidence and evaluation configuration.
+
+Fuse engine rankings, then fuse exactly two modality slots `[combined_vector, text]` under `hybrid_fusion`, retaining empty slots. Engine-stage and hybrid-stage `k` values are separate. Retain the complete bounded candidate union through both fusion stages and the pack's eligibility/scoring steps; apply the final result limit afterward. An additional intermediate cap must be explicit and tested for recall loss, not accidentally inherited from the final limit.
+
+For example, with engine lists `[a,b]` and `[b,a]`, weights `[1,3]`, and `k_engine=10`, scores are `a=1/11+3/12` and `b=1/12+3/11`; `b` wins. Swapping the named weights makes `a` win. A second hybrid RRF uses the rank of this vector aggregate, not those magnitudes. With identical singleton vector lists containing `x` and a text-only singleton `y`, linear hybrid weights `[0.7,0.3]` give `y` a positive text contribution of `0.3` before pack scoring regardless of the number of vector arms.
+
+All new runtime/pack paths use checked fusion. The existing unvalidated retrieval helper's silent fallback is not permitted on these paths. Existing two-slot linear blending remains available; N-engine weighted RRF does not pass through its two-slot weight conversion.
+
+### Decision E — Shared execution and failure boundaries
+
+`khive-retrieval` owns one reusable executor for ordered engine work, bounded concurrency, candidate aggregation, and the two fusion stages. Runtime supplies adapters carrying named provider invocation and store/search access; retrieval must not depend on runtime or a pack. Extend the existing `HybridSearcher` surface for named per-engine inputs and detailed outcomes. Its single-vector operation remains single-space: an unlabelled precomputed vector cannot be broadcast across peers. A multi-engine request with precomputed vectors must bind every supplied vector to its selected engine and validate dimensions.
+
+Packs determine retrieval scope, eligibility, candidate budgets, model-specific ANN/fresh-tail adapters, and post-fusion scoring. Memory decay/salience, knowledge section aggregation, reranking, and session/freshness requirements remain owned by their existing layers. The executor returns per-engine evidence so those policies are not reduced to one anonymous score. Common scheduling/fusion logic is not copied into each pack.
+
+Snapshot the ordered selected engines, identities, parameters, and weights once per request. Preserve existing request cancellation, deadline, Gate, and query-filter semantics. Ordinary provider/index failures can degrade individual arms and must be disclosed; they cannot rebind names or weights. If at least one selected vector engine completes successfully, including a valid empty result, vector execution has succeeded. If all selected vector engines fail, return an error for a vector-only request. A hybrid request may return successful text results with an explicit all-vector-arms-failed degradation, extending D2's previous all-engines-failed rule for that case. A lexical failure in a hybrid request remains an error, matching the restored runtime's explicit text-leg error contract. Cancellation, exhausted request deadlines, invalid configuration, and unmet requested consistency guarantees are fatal, not ordinary arm degradation.
+
+Concurrent fan-out does not promise O(1) cost: total embedding/index work scales with N, and shared accelerator contention can increase latency. Enforce existing request/embedding admission and bound outstanding engine work. Never create unbounded tasks because configuration permits arbitrary engine counts.
+
+### Decision F — Wiring, symmetry, and deferred policy
+
+`hybrid_search_with_strategy` and `FusionStrategy` are required integration points. Evolve the restored runtime entry point into the explicit composite-strategy route and connect production callers; an unused wrapper does not satisfy this amendment. `hybrid_search` must take/forward an explicit strategy in the new API. Default-only raw-vector/rerank operations remain explicitly single-engine and require a named space in their replacement API. No vector can be inferred to belong to the first configured engine solely from its dimension.
+
+`DualIndexRouter` remains an optional per-engine index-generation migration mechanism. Its primary/legacy pair is not the peer-engine list; its independent weight ordering remains unchanged. The restored `query_ir`, metrics, and persistence surfaces remain available. This lane does not require speculative rewrites of those modules. Existing relevant filters, diagnostics, and persisted engine/index identity must survive adapter integration; versioned query caches include the resolved strategy and engine selection. No restored surface is deleted as cleanup.
+
+Knowledge activation is paired: model-aware reads, ANN warming, fresh-tail handling, exact rerank where used, and per-engine index identity must be ready before enabling multi-engine knowledge writes. Existing default-model vectors remain valid for that engine. Backfill other engines with readiness/coverage evidence; do not report them as complete because their indexes exist. Search must distinguish partial coverage from a healthy complete corpus. Before activation, knowledge retains its current single-engine write/read policy. Update its governing ADR with the same cutover contract.
+
+Retain `AllModels` and `DefaultModel` note policies. The latter selects the first configured peer for new writes and reindex, with the migration consequence documented. Do not delete historical vectors merely because a current write policy excludes their engine. Defer arbitrary named subsets; `[note_kinds.<kind>].engines` is unsupported and rejected until a later amendment specifies the full lifecycle.
+
+### Migration and compatibility
+
+1. Land this amendment and the matching knowledge contract before dependent implementation merges. Amend the existing document; do not duplicate an accepted amendment number.
+2. Prepare additive checked primitives and adapter APIs before switching public handlers. Keep intermediate support internal or explicitly incomplete; do not accept config weights that deployed readers ignore.
+3. Provide a deterministic legacy-config conversion: canonicalize each legacy `model`; place the single old `default=true` model first; preserve remaining distinct model order; preserve actual index keys; map `fusion_weight` to `weight`; default absent weights to one. Duplicate model aliases that previously collapsed require an explicit migration diagnostic. Conflicting old/new keys are errors. The canonical emitted form has no `default` or primary/additional fields. A bounded legacy-input adapter may warn and perform this conversion for the migration release; it does not become a second runtime authority.
+4. Preserve the existing no-file/environment fallback through the same conversion. Do not switch existing MiniLM deployments to BGE because an older ADR example named BGE. Custom-only deployments are valid once their providers and explicit ordered list are resolved.
+5. Audit the `vec_default` shim before activation. Its implementation was not established by the implementation census. Never reinterpret `vec_default` as whichever engine is first today. Only migrate a legacy table when its original embedding identity is established and compatible with the destination. Unknown provenance or both old/new tables present requires a diagnostic and an explicit reindex/migration decision; never silently merge, overwrite, drop, or relabel it. Preserve data until that decision is applied. This narrows the unconditional rename sketch in D3.
+6. Clients migrate to an explicit strategy and the result envelope before strict activation. The old `fusion_strategy` string does not identify both stages and cannot silently stand in for the new object. Old implicit-default calls fail with a migration example in the new contract. If staging needs the old interface, serve it only under its explicitly old version; do not describe it as compliant.
+7. Adding a variant to the currently exhaustive published `FusionStrategy` enum is a Rust source break for downstream exhaustive matches, despite being syntactically additive. Runtime signatures and result envelopes are also breaking changes. Release affected published crates with a compatible coordinated minor bump from the 0.10 line and document all source/wire/config changes. Version numbers must be checked at release time. Changelog and dependency updates precede publication; this decision is not publication approval.
+8. Reindex only for added/changed embedding spaces or uncovered corpora. Weight, strategy, and declaration-order changes alone do not invalidate stored vectors. Rollback retains old indexes and pins an explicit old client/config version; mixed clients cannot rely on server inference.
+
+### Verification required for acceptance
+
+- **Config/order:** zero/one/two/five engines; more than ten distinct fake providers; non-first legacy default; ordered subsets; alias/name/sanitizer collisions; mixed legacy/canonical keys; provider-not-registered; wrong dimensions; custom-only startup; ignored reserved key refused. No paid network dependency.
+- **Provider contract:** fake provider outside the lattice enum, distinct query/document prefixes observed exactly once, correct batch order/cardinality, invalid/NaN vectors rejected, cached construction single-flight, no default lattice loading, truncation reports preserved.
+- **Fusion math:** the two-engine weight-reversal example; all-one equivalence with RRF; common scalar scaling; deterministic ties; duplicates; empty/failed middle arm; invalid source/weight arity; invalid k/weights; representability boundaries. A fixture with genuinely different vector spaces/dimensions proves vectors are never broadcast.
+- **Text regression:** text-only ID absent from every vector arm; two and five agreeing engines; empty vector or text slot; positive two-arm linear and rank weights. Assert text contribution and selected score, not merely that a jointly retrievable note appears. Also assert that explicit vector-only skips text and keyword-only makes no embedding calls.
+- **Request contract:** every classified retrieval entry point rejects omitted strategy before provider calls; complete strategy appears on populated, empty, degraded, and composed responses; unknown custom fusion fails rather than falling back. Dotted stages carry the same validated plan. Name-bound weights survive completion-order permutations and a failed middle engine.
+- **Executor/packs:** one provider/index outage; all vectors failed with successful text; all vectors failed in vector-only; text failure; cancellation/deadline; readiness/freshness failure. Preserve filters, Gate context, evidence, pack scoring, and final-limit ordering. Custom-only runtime hybrid retrieval must run vectors even though legacy `embedding_model` is absent.
+- **Knowledge/lifecycle:** pre-cutover writes remain single-engine; post-cutover read/write/backfill/restart/warming/fresh-tail paths see each ready engine. Existing vectors remain queryable after config conversion. Reindex respects each kind's policy and provider identity. Test known and unknown `vec_default` provenance without destroying either table.
+- **Quality:** freeze a small judged English/CJK/exact-keyword corpus and compare the measured baseline against both two-stage choices with fixed pools. Report candidate recall and ranking separately, by slice; establish acceptance tolerances before inspecting results. Math conformance alone is not evidence of a retrieval-quality improvement.
+- **Release:** direct Rust caller compilation for affected APIs, schema/help snapshots, updated client examples, workspace format/check/clippy/tests required by repository policy, and an end-to-end wire matrix. Uncovered indirect retrieval entry points block the compliance claim.
+
+### Risks and explicit unknowns
+
+Two-stage fusion intentionally limits cross-engine consensus to its effect on the vector aggregate; relevance evaluation must assess the cost. Config order affects compatibility-only selection and therefore requires migration disclosure. Remote-provider latency/rate limits remain implementation-specific. Exact storage identity integration with proposed ADR-160 and existing `vec_default` provenance must be resolved before their dependent activation; this amendment provides no evidence that either is already solved. The existing compensated write behavior is not upgraded to cross-engine transaction atomicity by this work.
+
+### Implementation fences
+
+**MAY:** extend the existing provider/registry/strategy/searcher types; add ordinary request/outcome data records and one concrete executor; stage additive APIs; preserve existing indexes and scoring; use registered custom adapters with explicit budgets.
+
+**MAY NOT:** infer an omitted strategy; substitute linear blending for weighted RRF; reinterpret `Weighted`; drop or shift arm weights; broadcast unlabelled vectors; use HashMap iteration as weight order; silently replace providers or accept unused config; move pack policy into the executor; create a new embedder crate; remove restored surfaces; claim knowledge fan-out before paired indexing/readiness; silently change physical space identity.
+
+**VERIFY BY:** the acceptance matrix above plus source/wire migration examples and a production call path through the restored strategy runtime entry point. Proposed status persists until architectural sign-off; implementation passing tests is not substitute ratification.
