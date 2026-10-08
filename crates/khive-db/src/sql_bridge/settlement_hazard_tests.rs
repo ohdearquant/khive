@@ -280,6 +280,7 @@ async fn pool_backed_failed_call_whose_rollback_fails_reports_side_effects_unkno
             &script,
             Err(khive_storage::StorageError::WriterTaskTerminated {
                 request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                ..
             })
         ),
         "a failed rollback must not be masked by the statement error: {script:?}"

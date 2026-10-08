@@ -176,13 +176,11 @@ impl SqliteError {
                 message,
             },
             Self::InheritedWriterTransaction | Self::WriterSettlementUnknown => {
-                StorageError::WriterTaskTerminated {
-                    request_state: WriterTaskRequestState::SideEffectsUnknown,
-                }
+                StorageError::writer_task_terminated(WriterTaskRequestState::SideEffectsUnknown)
             }
-            Self::WriterPoisoned => StorageError::WriterTaskTerminated {
-                request_state: WriterTaskRequestState::NotStarted,
-            },
+            Self::WriterPoisoned => {
+                StorageError::writer_task_terminated(WriterTaskRequestState::NotStarted)
+            }
             other => StorageError::driver(capability, operation, other),
         }
     }
@@ -244,6 +242,7 @@ mod tests {
                         mapped,
                         StorageError::WriterTaskTerminated {
                             request_state: WriterTaskRequestState::SideEffectsUnknown,
+                            ..
                         }
                     ),
                     "{capability:?}: {mapped:?}"
@@ -256,6 +255,7 @@ mod tests {
                     refused,
                     StorageError::WriterTaskTerminated {
                         request_state: WriterTaskRequestState::NotStarted,
+                        ..
                     }
                 ),
                 "{capability:?}: {refused:?}"

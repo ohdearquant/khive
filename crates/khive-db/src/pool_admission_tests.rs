@@ -382,6 +382,7 @@ fn native_sqlite_full_survives_guarded_transaction_classification() {
             error,
             StorageError::WriterTaskTerminated {
                 request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                ..
             }
         ),
         "native FULL classification: {error:?}"
