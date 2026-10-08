@@ -1,5 +1,6 @@
 //! SPARQL-inspired syntax parser producing the same AST as the GQL parser.
 
+use super::lexer::Cursor;
 use crate::ast::*;
 use crate::error::QueryError;
 use crate::language::{read_only_error, DEFAULT_HOP_CAP, SPARQL_WRITE_KEYWORDS};
@@ -60,139 +61,34 @@ enum Object {
 }
 
 struct SparqlParser {
-    input: Vec<char>,
-    pos: usize,
+    cursor: Cursor,
+}
+
+impl std::ops::Deref for SparqlParser {
+    type Target = Cursor;
+
+    fn deref(&self) -> &Self::Target {
+        &self.cursor
+    }
+}
+
+impl std::ops::DerefMut for SparqlParser {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.cursor
+    }
 }
 
 impl SparqlParser {
     fn new(input: &str) -> Self {
         Self {
-            input: input.chars().collect(),
-            pos: 0,
+            cursor: Cursor::new(input),
         }
-    }
-
-    fn err(&self, msg: impl Into<String>) -> QueryError {
-        QueryError::Parse {
-            position: self.pos,
-            message: msg.into(),
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.input.get(self.pos).copied()
-    }
-
-    fn advance(&mut self) -> Option<char> {
-        let c = self.input.get(self.pos).copied();
-        if c.is_some() {
-            self.pos += 1;
-        }
-        c
-    }
-
-    fn skip_whitespace(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn expect_char(&mut self, expected: char) -> Result<(), QueryError> {
-        self.skip_whitespace();
-        match self.advance() {
-            Some(c) if c == expected => Ok(()),
-            Some(c) => Err(self.err(format!("expected '{expected}', got '{c}'"))),
-            None => Err(self.err(format!("expected '{expected}', got end of input"))),
-        }
-    }
-
-    fn try_keyword(&mut self, kw: &str) -> bool {
-        self.skip_whitespace();
-        let start = self.pos;
-        let kw_upper = kw.to_uppercase();
-        for expected_char in kw_upper.chars() {
-            match self.advance() {
-                Some(c) if c.to_uppercase().next() == Some(expected_char) => {}
-                _ => {
-                    self.pos = start;
-                    return false;
-                }
-            }
-        }
-        if let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
-                self.pos = start;
-                return false;
-            }
-        }
-        true
-    }
-
-    fn expect_keyword(&mut self, kw: &str) -> Result<(), QueryError> {
-        if !self.try_keyword(kw) {
-            Err(self.err(format!("expected keyword '{kw}'")))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn parse_ident(&mut self) -> Result<String, QueryError> {
-        self.skip_whitespace();
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_alphanumeric() || c == '_' {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(self.err("expected identifier"));
-        }
-        Ok(self.input[start..self.pos].iter().collect())
     }
 
     fn parse_var(&mut self) -> Result<String, QueryError> {
         self.skip_whitespace();
         self.expect_char('?')?;
         self.parse_ident()
-    }
-
-    fn parse_number(&mut self) -> Result<usize, QueryError> {
-        self.skip_whitespace();
-        let start = self.pos;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(self.err("expected number"));
-        }
-        let s: String = self.input[start..self.pos].iter().collect();
-        s.parse()
-            .map_err(|_| self.err(format!("invalid number: {s}")))
-    }
-
-    fn parse_string_literal(&mut self) -> Result<String, QueryError> {
-        self.skip_whitespace();
-        let quote = match self.advance() {
-            Some(c @ ('\'' | '"')) => c,
-            _ => return Err(self.err("expected string literal")),
-        };
-        let start = self.pos;
-        while let Some(c) = self.advance() {
-            if c == quote {
-                return Ok(self.input[start..self.pos - 1].iter().collect());
-            }
-        }
-        Err(self.err("unterminated string literal"))
     }
 
     fn parse_predicate(&mut self) -> Result<Predicate, QueryError> {
@@ -338,19 +234,9 @@ impl SparqlParser {
             triples.push(self.parse_triple()?);
         }
 
-        let limit = if self.try_keyword("LIMIT") {
-            Some(self.parse_number()?)
-        } else {
-            None
-        };
+        let limit = self.parse_limit()?;
 
-        self.skip_whitespace();
-        if self.pos < self.input.len() {
-            return Err(self.err(format!(
-                "unexpected trailing input: '{}'",
-                self.input[self.pos..].iter().collect::<String>()
-            )));
-        }
+        self.expect_end()?;
 
         triples_to_ast(triples, return_items, limit)
     }
