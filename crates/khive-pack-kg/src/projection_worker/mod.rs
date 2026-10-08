@@ -340,27 +340,9 @@ impl ProposalsProjectionWorker {
 
         Ok(row.map(|r| {
             let get_text = |name: &str| -> String {
-                r.get(name)
-                    .and_then(|v| {
-                        if let SqlValue::Text(s) = v {
-                            Some(s.clone())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_default()
+                r.text_or_none(name).map(str::to_owned).unwrap_or_default()
             };
-            let get_int = |name: &str| -> i64 {
-                r.get(name)
-                    .and_then(|v| {
-                        if let SqlValue::Integer(i) = v {
-                            Some(*i)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(0)
-            };
+            let get_int = |name: &str| -> i64 { r.i64_or_none(name).unwrap_or(0) };
             ProposalRow {
                 proposal_id: get_text("proposal_id"),
                 proposer: get_text("proposer"),
