@@ -327,6 +327,7 @@ impl SqlEntityStore {
                 .map_err(|e| map_sqlite_err(e, op))?;
             f(guard.conn())
                 .map_err(|e| map_err(e, op))
+                .map_err(crate::error::statement_failure)
                 .inspect_err(|error| pool.record_direct_writer_error(error))
         })
         .await
