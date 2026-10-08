@@ -11,7 +11,7 @@
 use std::any::Any;
 
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_storage::{AtomicUnitOp, SqlAccess, StorageError, StorageResult};
+use khive_storage::{AtomicUnitOp, SqlAccess, SqlReader, StorageError, StorageResult};
 
 /// Closed watermark for a registered consumer which has not yet published its
 /// first durable checkpoint.  It sorts below every active watermark and below
@@ -311,6 +311,73 @@ pub fn read_watermark_statement(
     .labelled(format!("{label_prefix}ann_read_own_watermark"))
 }
 
+/// SQL SELECT for a wildcard-inclusive minimum using caller-selected bind positions.
+/// Callers supply trusted, positive numbered positions and bind namespace/model values.
+#[doc(hidden)]
+pub fn min_watermark_subquery(namespace_param: usize, model_param: usize) -> String {
+    format!(
+        "SELECT MIN(watermark) FROM ann_consumer_watermark \
+         WHERE (namespace = ?{namespace_param} OR namespace = '*') \
+           AND embedding_model = ?{model_param}"
+    )
+}
+
+/// Statement reading the exact namespace/model minimum, including wildcard consumers.
+pub fn min_watermark_statement(label_prefix: &str, namespace: &str, model: &str) -> SqlStatement {
+    let minimum = min_watermark_subquery(1, 2);
+    SqlStatement::new(
+        format!("SELECT ({minimum}) AS m"),
+        vec![
+            SqlValue::Text(namespace.to_owned()),
+            SqlValue::Text(model.to_owned()),
+        ],
+    )
+    .labelled(format!("{label_prefix}ann_registry_min"))
+}
+
+async fn read_integer_on(
+    reader: &mut dyn SqlReader,
+    statement: SqlStatement,
+    column: &str,
+) -> StorageResult<Option<i64>> {
+    let rows = reader.query_all(statement).await?;
+    Ok(rows
+        .into_iter()
+        .next()
+        .and_then(|row| row.i64_or_none(column)))
+}
+
+/// Read one consumer using the caller's existing reader and complete statement label.
+/// No connection is acquired. Only an Integer in the first row is returned; negative
+/// watermarks are preserved and absent, NULL or other-shaped values return `None`.
+pub async fn read_watermark_on(
+    reader: &mut dyn SqlReader,
+    label: &str,
+    consumer: &str,
+    namespace: &str,
+    model: &str,
+) -> StorageResult<Option<i64>> {
+    let statement = read_watermark_statement("", consumer, namespace, model).labelled(label);
+    read_integer_on(reader, statement, "watermark").await
+}
+
+/// Read the wildcard-inclusive minimum using the caller's existing reader.
+/// The label prefix is followed by `ann_registry_min`. Decoding is as permissive
+/// as [`read_watermark_on`], including retention of negative closed watermarks.
+pub async fn min_watermark_on(
+    reader: &mut dyn SqlReader,
+    label_prefix: &str,
+    namespace: &str,
+    model: &str,
+) -> StorageResult<Option<i64>> {
+    read_integer_on(
+        reader,
+        min_watermark_statement(label_prefix, namespace, model),
+        "m",
+    )
+    .await
+}
+
 /// Read one consumer's registered watermark.  `None` means the registry holds
 /// no row for that consumer, namespace and model.
 pub async fn read_watermark(
@@ -322,14 +389,7 @@ pub async fn read_watermark(
 ) -> StorageResult<Option<i64>> {
     let statement = read_watermark_statement(label_prefix, consumer, namespace, model);
     let mut reader = sql.reader().await?;
-    let rows = reader.query_all(statement).await?;
-    Ok(rows
-        .into_iter()
-        .next()
-        .and_then(|row| match row.get("watermark") {
-            Some(SqlValue::Integer(n)) => Some(*n),
-            _ => None,
-        }))
+    read_integer_on(reader.as_mut(), statement, "watermark").await
 }
 
 /// Register a consumer in the pending state without changing an existing
