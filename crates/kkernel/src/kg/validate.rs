@@ -206,7 +206,12 @@ pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
         OutputFormat::Text => print_text_format(&report, args.verbose, args.quiet),
     }
 
-    if args.fix {
+    if args.fix
+        && report
+            .rules
+            .iter()
+            .any(|rule| !rule.passed && rule.violations.iter().any(|violation| violation.fixable))
+    {
         apply_fixes(&args.repo)?;
     }
 
