@@ -2720,11 +2720,10 @@ fn squash_merge_pr_number(subject: &str) -> Option<u64> {
 /// `"<short_sha> <subject>"`).
 const NAME_MAX_CHARS: usize = 120;
 
-/// Cap for the text a commit note sends to the vector embedder (issue #764).
-/// Matches the repository's existing `MAX_EMBED_BYTES` precedent
-/// (`khive-pack-knowledge`, `kkernel::reindex`, ADR-048) — bytes, not chars,
-/// UTF-8-boundary-safe. The full, untruncated commit content is always
-/// stored and FTS-indexed; only the candidate vector input is capped.
+/// Byte cap for a commit note's candidate `embedding_content` (issue #764).
+/// This UTF-8-safe pre-cut drives the truncation summary; the runtime bounds
+/// each model's provider input to its own budget. Full commit content stays
+/// untruncated in storage and FTS.
 const MAX_COMMIT_EMBED_BYTES: usize = 32_768;
 
 /// Sentinel reason seeded into the commit source slot when a walk begins.
@@ -4526,49 +4525,8 @@ mod recovery_classifier_tests {
 }
 
 #[cfg(test)]
-mod truncation_tests {
-    use super::*;
-
-    #[test]
-    fn under_cap_content_is_not_truncated() {
-        let content = "a".repeat(MAX_COMMIT_EMBED_BYTES - 1);
-        assert_eq!(truncated_embedding_head(&content), None);
-    }
-
-    #[test]
-    fn exactly_at_cap_content_is_not_truncated() {
-        let content = "a".repeat(MAX_COMMIT_EMBED_BYTES);
-        assert_eq!(truncated_embedding_head(&content), None);
-    }
-
-    #[test]
-    fn over_cap_content_is_truncated_to_exactly_the_cap() {
-        let content = "a".repeat(MAX_COMMIT_EMBED_BYTES + 1);
-        let head = truncated_embedding_head(&content).expect("over cap must truncate");
-        assert_eq!(head.len(), MAX_COMMIT_EMBED_BYTES);
-        assert!(content.starts_with(head));
-    }
-
-    /// Multibyte scalar straddling the byte cap must roll back to a char boundary.
-    #[test]
-    fn multibyte_scalar_straddling_cap_rolls_back_to_char_boundary() {
-        // Fill up to one byte short of the cap with ASCII, then place a
-        // 3-byte character exactly across the boundary.
-        let mut content = "a".repeat(MAX_COMMIT_EMBED_BYTES - 1);
-        content.push('€'); // 3 bytes: straddles byte 32_768..32_771
-        content.push_str("tail-sentinel");
-
-        let head = truncated_embedding_head(&content).expect("over cap must truncate");
-        assert!(head.len() <= MAX_COMMIT_EMBED_BYTES);
-        assert!(content.is_char_boundary(head.len()));
-        assert!(std::str::from_utf8(head.as_bytes()).is_ok());
-        assert!(content.starts_with(head));
-        assert!(
-            !head.contains("tail-sentinel"),
-            "head must not include text past the cap"
-        );
-    }
-}
+#[path = "ingest/truncation_tests.rs"]
+mod truncation_tests;
 
 /// PR #816: `resolve_id`/`resolve_project_id` LIKE-wildcard-injection
 /// regression tests. See crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
