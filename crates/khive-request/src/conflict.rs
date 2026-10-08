@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 
+use khive_types::EdgeRelation;
 use serde_json::Value;
 
 use crate::types::{ArgValue, ParsedOp};
@@ -165,41 +166,13 @@ pub fn write_keys_for_op_pub(op: &ParsedOp) -> Vec<String> {
 
 /// Adds a natural edge key, ordering endpoints for known symmetric relations.
 fn push_link_key(keys: &mut Vec<String>, source: &str, target: &str, relation: &str) {
-    let relation_key = canonical_relation_key(relation);
-    let (source_key, target_key) = if is_static_symmetric_relation(&relation_key) && target < source
-    {
-        (target, source)
-    } else {
-        (source, target)
-    };
+    let parsed = relation.parse::<EdgeRelation>().ok();
+    let relation_key = parsed.as_ref().map_or(relation, EdgeRelation::as_str);
+    let (source_key, target_key) =
+        parsed.map_or((source, target), |r| r.canonical_endpoints(source, target));
     keys.push(format!(
         "edge-natural:{source_key}:{target_key}:{relation_key}"
     ));
-}
-
-/// Normalizes relation spelling without adding a `khive-types` dependency.
-fn canonical_relation_key(relation: &str) -> String {
-    let normalized: String = relation
-        .chars()
-        .map(|c| {
-            if c == '-' {
-                '_'
-            } else {
-                c.to_ascii_lowercase()
-            }
-        })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    match normalized.as_str() {
-        "competeswith" => "competes_with".to_string(),
-        "composedwith" => "composed_with".to_string(),
-        _ => normalized,
-    }
-}
-
-/// Returns whether the deliberately conservative local relation set is symmetric.
-fn is_static_symmetric_relation(relation: &str) -> bool {
-    matches!(relation, "competes_with" | "composed_with")
 }
 
 /// Scans a parsed batch for duplicate write keys; ordered chains are exempt.
@@ -455,11 +428,20 @@ mod tests {
 
     #[test]
     fn reversed_non_symmetric_links_do_not_conflict() {
-        let r = parse_request(
-            r#"[link(source_id="b", target_id="a", relation="extends"), link(source_id="a", target_id="b", relation="extends")]"#,
-        )
-        .unwrap();
-        check_write_key_conflicts(&r).unwrap();
+        for (relation, key) in [
+            ("extends", "extends"),
+            ("derivedfrom", "derived_from"),
+            ("Custom-Relation", "Custom-Relation"),
+        ] {
+            let r = parse_request(&format!(
+                r#"[link(source_id="b", target_id="a", relation="{relation}"), link(source_id="a", target_id="b", relation="{relation}")]"#,
+            )).unwrap();
+            check_write_key_conflicts(&r).unwrap();
+            assert_eq!(
+                write_keys_for_op_pub(&r.ops[0]),
+                [format!("edge-natural:b:a:{key}")]
+            );
+        }
     }
 
     #[test]
