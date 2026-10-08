@@ -1,9 +1,10 @@
 // Environment fixtures share the parent tests module through include!.
 // Cases that open pools configure the child before any reader or writer starts.
 
-const POOL_ENV_VARS: [&str; 7] = [
+const POOL_ENV_VARS: [&str; 8] = [
     "KHIVE_BUSY_TIMEOUT_SECS",
     "KHIVE_CHECKOUT_TIMEOUT_SECS",
+    "KHIVE_READER_CHECKOUT_WARN_SECS",
     "KHIVE_WAL_AUTOCHECKPOINT_PAGES",
     "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
     "KHIVE_WRITE_QUEUE",
@@ -61,6 +62,28 @@ fn pool_config_default_values_match_constants() {
     );
     assert_eq!(cfg.busy_timeout, Duration::from_secs(30));
     assert_eq!(cfg.checkout_timeout, Duration::from_secs(5));
+    assert_eq!(cfg.reader_checkout_warn_after, Duration::from_secs(10));
+}
+
+#[test]
+fn pool_config_reader_checkout_warning_threshold() {
+    if crate::test_process::run_in_child(|command| {
+        command.env_remove("KHIVE_READER_CHECKOUT_WARN_SECS");
+    }) {
+        return;
+    }
+    let key = "KHIVE_READER_CHECKOUT_WARN_SECS";
+    assert_eq!(
+        PoolConfig::default().reader_checkout_warn_after,
+        Duration::from_secs(10)
+    );
+    for (value, seconds) in [("1", 1), ("0", 0), ("invalid", 10), ("-1", 10)] {
+        crate::test_process::set_var(key, value);
+        assert_eq!(
+            PoolConfig::default().reader_checkout_warn_after,
+            Duration::from_secs(seconds)
+        );
+    }
 }
 
 #[test]

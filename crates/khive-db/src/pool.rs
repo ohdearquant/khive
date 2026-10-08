@@ -213,6 +213,10 @@ pub struct PoolConfig {
     ///
     /// Overridable via `KHIVE_CHECKOUT_TIMEOUT_SECS`.
     pub checkout_timeout: Duration,
+    /// Warn once per observed episode while an outstanding pooled checkout
+    /// exceeds this age. Captured from `KHIVE_READER_CHECKOUT_WARN_SECS`
+    /// (default: 10 seconds); this never cancels or closes a reader.
+    pub reader_checkout_warn_after: Duration,
     /// Maximum WAL journal size in bytes before SQLite resets the WAL.
     ///
     /// Maps to `PRAGMA journal_size_limit`. Default: 64 MiB.
@@ -330,6 +334,10 @@ impl Default for PoolConfig {
             checkout_timeout: Duration::from_secs(crate::env::env_parse_or(
                 "KHIVE_CHECKOUT_TIMEOUT_SECS",
                 5,
+            )),
+            reader_checkout_warn_after: Duration::from_secs(crate::env::env_parse_or(
+                "KHIVE_READER_CHECKOUT_WARN_SECS",
+                10,
             )),
             journal_size_limit_bytes: crate::env::env_parse_or(
                 "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
@@ -554,6 +562,7 @@ pub struct ConnectionPool {
     /// store and raw-SQL caller inherits it without per-verb bookkeeping
     /// (ADR-165 Slice 2 / ADR-166 G2).
     reader_acquisition_counters: ReaderAcquisitionCounters,
+    reader_checkouts: Mutex<BTreeMap<Instant, usize>>,
     /// ADR-166 G4/G5 process-lifetime mechanism counters for this physical
     /// backend. Backend IDs remain separate even when aliases share a pool.
     search_dispatches: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
@@ -877,6 +886,7 @@ impl<'pool> Drop for ReaderGuard<'pool> {
         self.pool
             .reader_acquisition_counters
             .record_checkout_completed(self.checked_out_at.elapsed(), self.operation);
+        self.pool.finish_reader_checkout(self.checked_out_at);
     }
 }
 
@@ -945,6 +955,7 @@ impl Drop for SharedReaderTransactionGuard {
                 self.checked_out_at.elapsed(),
                 Some("explicit_sql_read_transaction"),
             );
+        self.pool.finish_reader_checkout(self.checked_out_at);
     }
 }
 
@@ -1018,7 +1029,7 @@ impl ConnectionPool {
                     conn,
                     admission_slot: Some(admission_slot),
                     pool: Arc::clone(self),
-                    checked_out_at: Instant::now(),
+                    checked_out_at: self.begin_reader_checkout(),
                     poison: Cell::new(false),
                 }));
             }
@@ -1450,6 +1461,7 @@ impl ConnectionPool {
             write_admission,
             disk_guard_config,
             reader_acquisition_counters: ReaderAcquisitionCounters::default(),
+            reader_checkouts: Mutex::new(BTreeMap::new()),
             search_dispatches: Mutex::new(BTreeMap::new()),
             note_candidate_hydration_rows: AtomicU64::new(0),
             readers,
@@ -1667,7 +1679,7 @@ impl ConnectionPool {
                         pool: self,
                         reusable: Cell::new(true),
                         query_in_progress: Cell::new(false),
-                        checked_out_at: Instant::now(),
+                        checked_out_at: self.begin_reader_checkout(),
                         dirty: Cell::new(false),
                         operation: None,
                     }));
@@ -1689,7 +1701,7 @@ impl ConnectionPool {
                     pool: self,
                     reusable: Cell::new(true),
                     query_in_progress: Cell::new(false),
-                    checked_out_at: Instant::now(),
+                    checked_out_at: self.begin_reader_checkout(),
                     dirty: Cell::new(false),
                     operation: None,
                 }));
@@ -2108,6 +2120,38 @@ impl ConnectionPool {
     /// Get the total number of reader connections in the pool.
     pub fn max_readers(&self) -> usize {
         self.max_readers
+    }
+
+    /// Age of the oldest outstanding pooled reader checkout, including
+    /// degraded shared-reader leases and their reset/replacement work.
+    /// Returns `None` when no checkout remains; standalone readers are
+    /// separately tracked by the transaction registry.
+    pub fn oldest_checkout_age(&self) -> Option<Duration> {
+        self.oldest_checkout_age_at(Instant::now())
+    }
+
+    pub(crate) fn oldest_checkout_age_at(&self, now: Instant) -> Option<Duration> {
+        self.reader_checkouts
+            .lock()
+            .first_key_value()
+            .map(|(started, _)| now.saturating_duration_since(*started))
+    }
+
+    fn begin_reader_checkout(&self) -> Instant {
+        let started = Instant::now();
+        // Instant resolution can give simultaneous leases the same key.
+        *self.reader_checkouts.lock().entry(started).or_default() += 1;
+        started
+    }
+
+    fn finish_reader_checkout(&self, started: Instant) {
+        let mut checkouts = self.reader_checkouts.lock();
+        if let Some(count) = checkouts.get_mut(&started) {
+            *count -= 1;
+            if *count == 0 {
+                checkouts.remove(&started);
+            }
+        }
     }
 
     /// Return the pool configuration.

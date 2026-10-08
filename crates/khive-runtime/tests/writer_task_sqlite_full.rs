@@ -51,6 +51,7 @@ fn automatic_rollback_full_reaches_runtime_projection() {
                 wal_mode: true,
                 busy_timeout: Duration::from_secs(1),
                 checkout_timeout: Duration::from_secs(1),
+                reader_checkout_warn_after: Duration::from_secs(10),
                 journal_size_limit_bytes: 64 * 1024 * 1024,
                 read_only: false,
                 wal_ceiling: WalCeilingPolicy {
