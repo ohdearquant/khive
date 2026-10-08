@@ -1028,7 +1028,7 @@ impl KhiveRuntime {
                 // Drop non-matching candidates here, before the alive set is built,
                 // so they're excluded ahead of truncation.
                 if let Some(pf) = properties_filter {
-                    if !entity_props_match(e.properties.as_ref(), pf) {
+                    if !properties_match(e.properties.as_ref(), pf) {
                         continue;
                     }
                 }
@@ -1576,19 +1576,19 @@ impl KhiveRuntime {
     }
 }
 
-/// Returns `true` when `entity_props` is a superset of all key-value pairs in `filter`.
+/// Returns `true` when `properties` is a superset of all key-value pairs in `filter`.
 ///
 /// Mirrors the semantics of `khive_pack_kg::handlers::common::props_match` so that the
 /// storage-leg predicate is identical to the handler-side post-filter.
-fn entity_props_match(
-    entity_props: Option<&serde_json::Value>,
+pub(crate) fn properties_match(
+    properties: Option<&serde_json::Value>,
     filter: &serde_json::Value,
 ) -> bool {
     let required = match filter.as_object() {
         Some(obj) if !obj.is_empty() => obj,
         _ => return true,
     };
-    let actual = match entity_props.and_then(serde_json::Value::as_object) {
+    let actual = match properties.and_then(serde_json::Value::as_object) {
         Some(obj) => obj,
         None => return false,
     };

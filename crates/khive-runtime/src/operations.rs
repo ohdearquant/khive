@@ -1249,24 +1249,6 @@ pub(crate) fn validate_edge_metadata(
     Ok(())
 }
 
-/// Returns `true` when `note_props` is a superset of all key-value pairs in `filter`.
-///
-/// Mirrors the semantics of `khive_pack_kg::handlers::common::props_match` so that the
-/// storage-leg predicate in `search_notes` is identical to the handler-side post-filter.
-fn note_props_match(note_props: Option<&serde_json::Value>, filter: &serde_json::Value) -> bool {
-    let required = match filter.as_object() {
-        Some(obj) if !obj.is_empty() => obj,
-        _ => return true,
-    };
-    let actual = match note_props.and_then(serde_json::Value::as_object) {
-        Some(obj) => obj,
-        None => return false,
-    };
-    required
-        .iter()
-        .all(|(k, v)| actual.get(k).is_some_and(|av| av == v))
-}
-
 fn note_graph_name(note: &Note) -> String {
     note.name
         .as_deref()
@@ -5695,7 +5677,7 @@ impl KhiveRuntime {
             }
             // Apply properties predicate before truncation, same reasoning as tags above.
             if let Some(pf) = properties_filter {
-                if !note_props_match(note.properties.as_ref(), pf) {
+                if !crate::retrieval::properties_match(note.properties.as_ref(), pf) {
                     continue;
                 }
             }
