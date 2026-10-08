@@ -2918,22 +2918,9 @@ pub(crate) async fn session_exact_candidates(
             }
         };
         let id = Uuid::parse_str(id).map_err(|error| format!("session exact id: {error}"))?;
-        // Mirror khive-db's sqlite_cosine_score boundary tolerance, then use
-        // the shared deterministic distance conversion (vectors.rs:170-196).
-        const BOUNDARY_EPSILON: f64 = 8.0 * f32::EPSILON as f64;
-        if !distance.is_finite()
-            || !(-BOUNDARY_EPSILON..=2.0 + BOUNDARY_EPSILON).contains(&distance)
-        {
-            return Err(format!(
-                "session exact cosine distance out of range: {distance}"
-            ));
-        }
-        let score = khive_score::try_score_from_distance(
-            distance.clamp(0.0, 2.0) as f32,
-            khive_types::DistanceMetric::Cosine,
-        )
-        .map_err(|error| error.to_string())?
-        .to_f64() as f32;
+        let score = khive_score::try_cosine_score_with_f32_tolerance(distance)
+            .map_err(|_| format!("session exact cosine distance out of range: {distance}"))?
+            .to_f64() as f32;
         candidates.push((id, score));
     }
     Ok(Some(candidates))
