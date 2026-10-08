@@ -8,6 +8,16 @@
 use core::fmt;
 use core::str::FromStr;
 
+/// Return whether every byte is an ASCII digit or a lowercase hexadecimal letter.
+///
+/// The empty string returns `true`; callers retain their own length requirements.
+#[inline]
+pub fn is_lowercase_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// A 128-bit opaque identifier stored as 16 bytes, formatted as a hyphenated UUID string.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id128([u8; 16]);
