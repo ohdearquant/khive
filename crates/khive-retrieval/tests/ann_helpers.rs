@@ -388,3 +388,295 @@ async fn loop_stops_when_the_tick_breaks() {
     assert!(finished.is_ok(), "loop ran past a break");
     assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
+
+mod registry_reader_tests {
+    use async_trait::async_trait;
+    use khive_db::StorageBackend;
+    use khive_retrieval::ann::corpus::{CorpusScope, TailFloor, WatermarkCapture};
+    use khive_retrieval::ann::registry::{min_watermark_on, read_watermark_on};
+    use khive_storage::types::{SqlColumn, SqlRow, SqlStatement, SqlValue};
+    use khive_storage::{SqlAccess, SqlReader, StorageError, StorageResult};
+
+    struct ReaderSpy {
+        result: Option<StorageResult<Vec<SqlRow>>>,
+        statements: Vec<SqlStatement>,
+    }
+
+    #[async_trait]
+    impl SqlReader for ReaderSpy {
+        async fn query_all(&mut self, statement: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            self.statements.push(statement);
+            self.result.take().expect("exactly one read")
+        }
+        async fn query_row(&mut self, _: SqlStatement) -> StorageResult<Option<SqlRow>> {
+            panic!("must retain query_all routing")
+        }
+        async fn query_scalar(&mut self, _: SqlStatement) -> StorageResult<Option<SqlValue>> {
+            panic!("must retain query_all routing")
+        }
+        async fn explain(&mut self, _: SqlStatement) -> StorageResult<Vec<SqlRow>> {
+            panic!("must not explain")
+        }
+    }
+
+    fn row(column: &str, value: SqlValue) -> SqlRow {
+        SqlRow {
+            columns: vec![SqlColumn {
+                name: column.into(),
+                value,
+            }],
+        }
+    }
+
+    async fn read(spy: &mut ReaderSpy, minimum: bool) -> StorageResult<Option<i64>> {
+        if minimum {
+            min_watermark_on(spy, "memory_", "local'quoted", "model").await
+        } else {
+            read_watermark_on(
+                spy,
+                "note_search_ann_consumer_snapshot",
+                "consumer",
+                "local'quoted",
+                "model",
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_reader_decoding_labels_and_errors_are_preserved() {
+        for minimum in [false, true] {
+            let column = if minimum { "m" } else { "watermark" };
+            let mut cases = vec![
+                (vec![], None),
+                (vec![row("wrong", SqlValue::Integer(8))], None),
+            ];
+            for value in [0, 17, i64::MAX, -1, -2] {
+                cases.push((vec![row(column, SqlValue::Integer(value))], Some(value)));
+            }
+            for value in [
+                SqlValue::Null,
+                SqlValue::Bool(true),
+                SqlValue::Float(7.0),
+                SqlValue::Text("7".into()),
+                SqlValue::Blob(vec![7]),
+                SqlValue::Json(serde_json::json!(7)),
+                SqlValue::Uuid(uuid::Uuid::nil()),
+                SqlValue::Timestamp(chrono::DateTime::UNIX_EPOCH),
+            ] {
+                cases.push((vec![row(column, value)], None));
+            }
+            cases.push((
+                vec![
+                    row(column, SqlValue::Integer(7)),
+                    row(column, SqlValue::Integer(9)),
+                ],
+                Some(7),
+            ));
+            let mut duplicate = row(column, SqlValue::Null);
+            duplicate.columns.push(SqlColumn {
+                name: column.into(),
+                value: SqlValue::Integer(9),
+            });
+            cases.push((vec![duplicate], None));
+            for (rows, expected) in cases {
+                let mut spy = ReaderSpy {
+                    result: Some(Ok(rows)),
+                    statements: vec![],
+                };
+                assert_eq!(read(&mut spy, minimum).await.expect("read"), expected);
+                assert_eq!(spy.statements.len(), 1);
+                let statement = &spy.statements[0];
+                let (label, params) = if minimum {
+                    (
+                        "memory_ann_registry_min",
+                        vec![
+                            SqlValue::Text("local'quoted".into()),
+                            SqlValue::Text("model".into()),
+                        ],
+                    )
+                } else {
+                    (
+                        "note_search_ann_consumer_snapshot",
+                        vec![
+                            SqlValue::Text("consumer".into()),
+                            SqlValue::Text("local'quoted".into()),
+                            SqlValue::Text("model".into()),
+                        ],
+                    )
+                };
+                assert_eq!(statement.label.as_deref(), Some(label));
+                assert_eq!(
+                    serde_json::to_value(&statement.params).unwrap(),
+                    serde_json::to_value(params).unwrap()
+                );
+            }
+            let mut spy = ReaderSpy {
+                result: Some(Err(StorageError::Internal("registry-reader-marker".into()))),
+                statements: vec![],
+            };
+            match read(&mut spy, minimum).await {
+                Err(StorageError::Internal(message)) => {
+                    assert_eq!(message, "registry-reader-marker")
+                }
+                other => panic!("backend error must propagate unchanged: {other:?}"),
+            }
+            assert_eq!(spy.statements.len(), 1);
+        }
+    }
+
+    fn memory_backend() -> StorageBackend {
+        let backend = StorageBackend::memory().expect("private memory backend");
+        backend.prepare_core_schema().expect("core schema");
+        backend
+    }
+
+    async fn execute(sql: &dyn SqlAccess, text: &str, params: Vec<SqlValue>) {
+        sql.writer()
+            .await
+            .expect("writer")
+            .execute(SqlStatement::new(text, params).labelled("registry_reader_fixture"))
+            .await
+            .expect("seed");
+    }
+
+    async fn watermark(
+        sql: &dyn SqlAccess,
+        consumer: &str,
+        namespace: &str,
+        model: &str,
+        value: i64,
+    ) {
+        execute(sql, "INSERT INTO ann_consumer_watermark (consumer, namespace, embedding_model, watermark) VALUES (?1, ?2, ?3, ?4)",
+            vec![SqlValue::Text(consumer.into()), SqlValue::Text(namespace.into()), SqlValue::Text(model.into()), SqlValue::Integer(value)]).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_readers_keep_exact_scope_wildcards_and_closed_watermarks() {
+        let backend = memory_backend();
+        let sql = backend.sql();
+        watermark(sql.as_ref(), "own", "local'quoted", "model", 11).await;
+        watermark(sql.as_ref(), "peer", "local'quoted", "model", 8).await;
+        watermark(sql.as_ref(), "global", "*", "model", 3).await;
+        watermark(sql.as_ref(), "foreign", "other", "model", -2).await;
+        watermark(sql.as_ref(), "case", "LOCAL'QUOTED", "model", -1).await;
+        watermark(
+            sql.as_ref(),
+            "wrong-model",
+            "local'quoted",
+            "other-model",
+            -2,
+        )
+        .await;
+        watermark(sql.as_ref(), "pending", "local'quoted", "pending-model", -2).await;
+        watermark(sql.as_ref(), "recovering", "*", "recovering-model", -1).await;
+        // No writer is acquired while this existing reader is held.
+        let mut reader = sql.reader().await.expect("reader");
+        assert_eq!(
+            read_watermark_on(reader.as_mut(), "own", "own", "local'quoted", "model")
+                .await
+                .unwrap(),
+            Some(11)
+        );
+        assert_eq!(
+            read_watermark_on(reader.as_mut(), "missing", "own", "other", "model")
+                .await
+                .unwrap(),
+            None
+        );
+        for (namespace, model, expected) in [
+            ("local'quoted", "model", Some(3)),
+            ("*", "model", Some(3)),
+            ("local'quoted", "pending-model", Some(-2)),
+            ("local'quoted", "recovering-model", Some(-1)),
+            ("local'quoted", "missing-model", None),
+        ] {
+            assert_eq!(
+                min_watermark_on(reader.as_mut(), "fixture_", namespace, model)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn final_tail_reads_registry_minimum_in_each_parameter_layout() {
+        let backend = memory_backend();
+        let sql = backend.sql();
+        watermark(sql.as_ref(), "owner", "registry", "model", 7).await;
+        watermark(sql.as_ref(), "peer", "registry", "model", 5).await;
+        watermark(sql.as_ref(), "global", "*", "model", 3).await;
+        watermark(sql.as_ref(), "foreign", "other", "model", -2).await;
+        watermark(sql.as_ref(), "other-model", "registry", "wrong-model", -2).await;
+        execute(sql.as_ref(), "CREATE TABLE fixture_vectors (subject_id TEXT PRIMARY KEY, namespace TEXT, embedding_model TEXT, kind TEXT, field TEXT, embedding BLOB)", vec![]).await;
+        for (seq, namespace, model, field) in [
+            (2, "registry", "model", "note.content"),
+            (4, "registry", "model", "note.content"),
+            (5, "corpus", "model", "note.content"),
+            (6, "other", "model", "note.content"),
+            (7, "registry", "wrong-model", "note.content"),
+            (8, "registry", "model", "other.field"),
+        ] {
+            let id = format!("subject-{seq}");
+            execute(sql.as_ref(), "INSERT INTO ann_write_log (seq, namespace, embedding_model, kind, field, subject_id, op) VALUES (?1, ?2, ?3, 'note', ?4, ?5, 'upsert')",
+                vec![SqlValue::Integer(seq), SqlValue::Text(namespace.into()), SqlValue::Text(model.into()), SqlValue::Text(field.into()), SqlValue::Text(id.clone())]).await;
+            execute(sql.as_ref(), "INSERT INTO fixture_vectors (subject_id, namespace, embedding_model, kind, field, embedding) VALUES (?1, ?2, ?3, 'note', ?4, ?5)",
+                vec![SqlValue::Text(id), SqlValue::Text(namespace.into()), SqlValue::Text(model.into()), SqlValue::Text(field.into()), SqlValue::Blob(vec![0, 0, 0, 0])]).await;
+        }
+        let mut reader = sql.reader().await.expect("reader");
+        for (namespace, expected) in [
+            (Some("registry"), vec!["subject-4"]),
+            (Some("corpus"), vec!["subject-5"]),
+            (None, vec!["subject-4", "subject-5", "subject-6"]),
+        ] {
+            let scope = CorpusScope {
+                namespace,
+                record_kind: Some("note"),
+                field: "note.content",
+                live_join: None,
+                watermark_capture: WatermarkCapture::LogHighWater,
+            };
+            let floor = TailFloor::RegistryMinimum {
+                registry_namespace: "registry",
+                consumer: "owner",
+            };
+            let rows = reader
+                .query_all(scope.final_tail(
+                    "fixture_vectors",
+                    "model",
+                    1,
+                    None,
+                    floor,
+                    "tail_layout",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.text_or_none("subject_id").unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            for row in &rows {
+                assert_eq!(row.i64_or_none("registry_min"), Some(3));
+                assert_eq!(row.i64_or_none("own_watermark"), Some(7));
+            }
+            let empty = reader
+                .query_all(scope.final_tail(
+                    "fixture_vectors",
+                    "model",
+                    100,
+                    None,
+                    floor,
+                    "empty_tail_layout",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(empty.len(), 1);
+            assert!(matches!(empty[0].get("subject_id"), Some(SqlValue::Null)));
+            assert_eq!(empty[0].i64_or_none("registry_min"), Some(3));
+            assert_eq!(empty[0].i64_or_none("own_watermark"), Some(7));
+        }
+    }
+}

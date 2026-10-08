@@ -4,7 +4,7 @@
 
 use khive_storage::types::{SqlStatement, SqlValue};
 
-use super::registry::CompactionScope;
+use super::registry::{min_watermark_subquery, CompactionScope};
 
 /// Live-row join applied to corpus reads and counts, never to the write-log tail.
 #[derive(Clone, Copy, Debug)]
@@ -216,13 +216,10 @@ impl CorpusScope<'_> {
                     params.push(SqlValue::Text(registry_namespace.to_owned()));
                     params.len()
                 };
+                let minimum = min_watermark_subquery(namespace_param, model_param);
                 (
                     format!(
-                        "registry AS (\
-                           SELECT MIN(watermark) AS registry_min FROM ann_consumer_watermark \
-                           WHERE (namespace = ?{namespace_param} OR namespace = '*') \
-                             AND embedding_model = ?{model_param}\
-                         ), own AS (\
+                        "registry AS (SELECT ({minimum}) AS registry_min), own AS (\
                            SELECT (SELECT watermark FROM ann_consumer_watermark \
                                    WHERE consumer = ?{consumer_param} \
                                      AND namespace = ?{namespace_param} \
