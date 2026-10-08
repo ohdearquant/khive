@@ -113,7 +113,7 @@ impl VamanaIndex {
 
     /// Encode this index into the ADR-110 portable container.
     pub fn to_bytes(&self, external_ids: &[(u32, String)]) -> Result<Vec<u8>> {
-        let vectors = cast_slice(self.vectors()?).to_vec();
+        let vectors = khive_types::vector::encode_f32_le(self.vectors()?);
         let graph = encode_graph_lossless(&self.graph)?;
         let lifecycle = encode_lifecycle(
             &self.tombstones,
@@ -220,12 +220,8 @@ impl VamanaIndex {
                 vector_bytes.len()
             )));
         }
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let vectors: Vec<f32> = vector_bytes
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
-            .collect();
+        let vectors = khive_types::vector::decode_f32_le(vector_bytes)
+            .map_err(|error| VamanaError::invalid_format(error.to_string()))?;
         require_finite(&vectors, "portable vectors")?;
 
         let mut graph = parse_graph(graph_bytes, config.max_degree, num_vectors)?;
@@ -1165,5 +1161,28 @@ impl VamanaIndex {
             gs_codes: CodeStore::Owned(gs_codes),
             last_applied_seq: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    #[test]
+    fn portable_vector_segment_is_fixed_little_endian() {
+        let vectors = [1.0, -2.5, 0.25, 2.0];
+        let config = VamanaConfig::with_dimensions(2)
+            .with_max_degree(1)
+            .with_search_list_size(2);
+        let index = VamanaIndex::build(&vectors, config).unwrap();
+        let bytes = index.to_bytes(&[]).unwrap();
+        let segments = parse_portable_container(&bytes).unwrap();
+        assert_eq!(
+            required_segment(&segments, "vectors.bin").unwrap(),
+            [0, 0, 0x80, 0x3f, 0, 0, 0x20, 0xc0, 0, 0, 0x80, 0x3e, 0, 0, 0, 0x40,]
+        );
+        let (restored, ids) = VamanaIndex::from_bytes(&bytes).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(restored.vectors().unwrap(), vectors);
     }
 }

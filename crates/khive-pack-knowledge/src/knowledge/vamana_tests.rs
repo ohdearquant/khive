@@ -1581,7 +1581,7 @@ fn memory_rt_with_embedder() -> KhiveRuntime {
 /// Seed `n` distinct rows into the vec0 table for `WARM_TEST_MODEL`.
 ///
 /// Calls `rt.vectors_for_model` first so the virtual table is created, then
-/// inserts raw f32 LE blobs directly via SQL.
+/// inserts raw native f32 blobs directly via SQL.
 async fn seed_warm_corpus(rt: &KhiveRuntime, token: &NamespaceToken, n: usize) {
     seed_warm_corpus_opts(rt, token, n, true).await;
 }
@@ -1602,7 +1602,7 @@ async fn seed_warm_corpus_opts(rt: &KhiveRuntime, token: &NamespaceToken, n: usi
         let id = Uuid::new_v4();
         let mut v = [0.0_f32; WARM_DIMS];
         v[i % WARM_DIMS] = 1.0;
-        let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let bytes = khive_storage::encode_f32_native(&v);
         w.execute(SqlStatement {
             sql: format!(
                 "INSERT INTO {table} \
@@ -1656,10 +1656,7 @@ async fn append_warm_vector(
     let table = format!("vec_{}", sanitize_model_key(WARM_TEST_MODEL));
     let namespace = token.namespace().as_str().to_owned();
     let subject = Uuid::new_v4();
-    let bytes: Vec<u8> = embedding
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
+    let bytes = khive_storage::encode_f32_native(&embedding);
     let sql = rt.sql();
     let mut writer = sql.writer().await.expect("writer");
     writer
