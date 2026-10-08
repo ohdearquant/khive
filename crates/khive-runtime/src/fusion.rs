@@ -1,9 +1,10 @@
 //! Fusion strategies for combining ranked result lists.
 
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
+use khive_retrieval::hit::{merge_hit_metadata, SignalMerge};
 use khive_score::DeterministicScore;
 use khive_storage::types::{
     PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
@@ -51,18 +52,6 @@ pub trait FusionExecutor: Send + Sync + 'static {
 
 const CANDIDATE_MULTIPLIER: u32 = 4;
 
-/// RRF convenience wrapper used by operations.rs (k=60 note search path).
-pub(crate) async fn rrf_fuse_k(
-    rt: &KhiveRuntime,
-    text_hits: Vec<TextSearchHit>,
-    vector_hits: Vec<VectorSearchHit>,
-    k: usize,
-    limit: usize,
-) -> RuntimeResult<Vec<SearchHit>> {
-    rt.fuse_with_strategy(text_hits, vector_hits, &FusionStrategy::Rrf { k }, limit)
-        .await
-}
-
 impl KhiveRuntime {
     /// Fuse text and vector hits using the given strategy, returning at most
     /// `limit` results. Positional weighted strategies use `[vector, keyword]`
@@ -109,10 +98,14 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<SearchHit>> {
         let mut metadata: HashMap<Uuid, SearchHit> =
             HashMap::with_capacity(text_hits.len() + vector_hits.len());
-        let prefer_maximum_signal = matches!(
+        let signal_merge = if matches!(
             strategy,
             FusionStrategy::Weighted { .. } | FusionStrategy::Union
-        );
+        ) {
+            SignalMerge::Maximum
+        } else {
+            SignalMerge::FirstPresent
+        };
 
         let text_source: Vec<(Uuid, DeterministicScore)> = text_hits
             .into_iter()
@@ -131,7 +124,7 @@ impl KhiveRuntime {
                 };
                 let id = hit.entity_id;
                 let score = hit.score;
-                merge_metadata(&mut metadata, hit, prefer_maximum_signal);
+                merge_hit_metadata(&mut metadata, hit, signal_merge);
                 (id, score)
             })
             .collect();
@@ -153,7 +146,7 @@ impl KhiveRuntime {
                 };
                 let id = hit.entity_id;
                 let score = hit.score;
-                merge_metadata(&mut metadata, hit, prefer_maximum_signal);
+                merge_hit_metadata(&mut metadata, hit, signal_merge);
                 (id, score)
             })
             .collect();
@@ -189,13 +182,9 @@ impl KhiveRuntime {
         strategy: &FusionStrategy,
         limit: usize,
     ) -> RuntimeResult<(RankScoreKind, Vec<RankedHit>)> {
-        let rank_score_kind = match strategy {
-            FusionStrategy::Rrf { .. } => RankScoreKind::Rrf,
-            FusionStrategy::VectorOnly => RankScoreKind::Vector,
-            FusionStrategy::KeywordOnly => RankScoreKind::Keyword,
-            FusionStrategy::Weighted { .. } => RankScoreKind::Weighted,
-            FusionStrategy::Union => RankScoreKind::Union,
-            FusionStrategy::Custom { name, params } => {
+        let rank_score_kind = match RankScoreKind::of(strategy) {
+            Ok(kind) => kind,
+            Err((name, params)) => {
                 let executor = self.fusion_executor(name)?;
                 let rank_score_kind = executor.rank_score_kind();
                 if limit == 0 || sources.iter().all(Vec::is_empty) {
@@ -211,60 +200,6 @@ impl KhiveRuntime {
             rank_score_kind,
             khive_fusion::fuse(sources, strategy, limit)?,
         ))
-    }
-}
-
-fn merge_metadata(
-    metadata: &mut HashMap<Uuid, SearchHit>,
-    hit: SearchHit,
-    prefer_maximum_signal: bool,
-) {
-    match metadata.entry(hit.entity_id) {
-        Entry::Occupied(mut entry) => {
-            let existing = entry.get_mut();
-            existing.source = merge_sources(existing.source, hit.source);
-            // RRF and pass-through retain the first occurrence; weighted and
-            // union use the maximum contribution from each retrieval leg.
-            existing.signals.vector_similarity = if prefer_maximum_signal {
-                existing
-                    .signals
-                    .vector_similarity
-                    .max(hit.signals.vector_similarity)
-            } else {
-                existing
-                    .signals
-                    .vector_similarity
-                    .or(hit.signals.vector_similarity)
-            };
-            existing.signals.keyword_score = if prefer_maximum_signal {
-                existing
-                    .signals
-                    .keyword_score
-                    .max(hit.signals.keyword_score)
-            } else {
-                existing.signals.keyword_score.or(hit.signals.keyword_score)
-            };
-            if existing.title.is_none() {
-                existing.title = hit.title;
-            }
-            if existing.snippet.is_none() {
-                existing.snippet = hit.snippet;
-            }
-        }
-        Entry::Vacant(entry) => {
-            entry.insert(hit);
-        }
-    }
-}
-
-fn merge_sources(left: SearchSource, right: SearchSource) -> SearchSource {
-    match (left, right) {
-        (SearchSource::Both, _) | (_, SearchSource::Both) => SearchSource::Both,
-        (SearchSource::Text, SearchSource::Vector) | (SearchSource::Vector, SearchSource::Text) => {
-            SearchSource::Both
-        }
-        (SearchSource::Text, SearchSource::Text) => SearchSource::Text,
-        (SearchSource::Vector, SearchSource::Vector) => SearchSource::Vector,
     }
 }
 

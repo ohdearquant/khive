@@ -1692,7 +1692,9 @@ fn rrf_fuse(
         });
     }
 
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then(a.entity_id.cmp(&b.entity_id)));
+    hits.sort_by(|a, b| {
+        khive_score::cmp_desc_then_id(a.score, &a.entity_id, b.score, &b.entity_id)
+    });
     hits.truncate(limit);
     hits
 }
