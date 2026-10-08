@@ -151,7 +151,8 @@ test that would pass regardless of which call shape were in use).
 ## Test coverage map
 
 - Unit: `src/hash.rs` (hash correctness, edge cases), `src/types.rs`
-  (`SnapshotId` validation, serde rejection), `src/sync.rs` (sync helpers,
-  remote fetch, atomicity, FTS population).
+  (`SnapshotId` validation, serde rejection), `src/sync_tests.rs` (sync helpers,
+  remote fetch, atomicity, FTS population), and retained tests in `src/sync.rs`
+  (WAL checkpoint and entity-upsert guards).
 - Integration: `tests/integration.rs` (cross-module composition, adapter
   pipeline, `VcsState` roundtrip).
