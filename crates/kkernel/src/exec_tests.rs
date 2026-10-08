@@ -7450,3 +7450,4 @@ async fn atomic_update_and_gtd_transition_accept_8_hex_prefix_ids() {
 }
 
 include!("exec_atomic_result_shape_tests.rs");
+include!("exec_atomic_kind_tests.rs");

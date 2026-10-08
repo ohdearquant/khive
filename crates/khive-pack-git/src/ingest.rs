@@ -1866,7 +1866,7 @@ async fn write_commit_checkpoint(
             SqlValue::Text(project_id.to_string()),
             SqlValue::Text(progress),
             SqlValue::Text(checkpoint.last_completed_sha.clone()),
-            SqlValue::Integer(Utc::now().timestamp_micros()),
+            SqlValue::Integer(khive_storage::now_micros()),
         ],
         label: Some("git_ingest_write_commit_checkpoint".into()),
     })
@@ -2002,7 +2002,7 @@ async fn write_page_checkpoint(
         SqlValue::Text(project_id.to_string()),
         SqlValue::Text(format!("{kind}_checkpoint")),
         SqlValue::Text(serde_json::to_string(checkpoint)?),
-        SqlValue::Integer(Utc::now().timestamp_micros()),
+        SqlValue::Integer(khive_storage::now_micros()),
     ];
     let statement_sql = if let Some(floor) = &checkpoint.floor {
         params.extend([SqlValue::Text(kind.into()), SqlValue::Text(floor.clone())]);

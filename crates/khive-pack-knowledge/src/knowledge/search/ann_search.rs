@@ -177,7 +177,7 @@ pub(super) async fn search_ann_with_warm_wait(
 
 // ─── ANN fusion (symmetric RRF) ─────────────────────────────────────────────
 
-pub(super) const RRF_K: usize = 60;
+pub(super) use khive_fusion::DEFAULT_RRF_K as RRF_K;
 
 pub(super) fn normalize_rrf_score(raw: f32, source_count: usize, k: usize) -> f32 {
     if source_count == 0 {

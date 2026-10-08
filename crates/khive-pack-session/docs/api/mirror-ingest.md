@@ -266,7 +266,7 @@ drift apart.
 `mirror_file` used to allocate and read the entire file delta in one shot via
 `read_from_offset` (`Vec::with_capacity(file_len - offset)` + `read_to_end`),
 which could OOM or stall the daemon on a very large accumulated delta. The
-regression suite in `ingest.rs`'s `tests` module covers, with a tiny
+regression suite in `ingest_tests.rs` (the `mirror::ingest::tests` module) covers, with a tiny
 test-only byte cap forcing multi-pass behavior instead of giant fixtures:
 
 - **multi-pass bounded reads**: a multi-line file is consumed across multiple

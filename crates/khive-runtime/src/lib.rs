@@ -30,6 +30,7 @@ pub mod curation;
 pub mod daemon;
 pub mod email_message_id;
 pub mod embedder_registry;
+pub mod embedding_warning;
 pub mod engine_config;
 pub mod entity_write;
 pub mod error;

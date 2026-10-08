@@ -367,11 +367,9 @@ impl KgPack {
         event.aggregate_kind = Some("proposal".to_string());
         event.aggregate_id = Some(proposal_id);
 
-        let new_status = match decision {
-            ProposalDecision::Approve => "approved",
-            ProposalDecision::Reject => "rejected",
-            ProposalDecision::Comment => current_status,
-            ProposalDecision::RequestChanges => "changes_requested",
+        let new_status = match crate::projection_worker::review_decision_effect(decision).0 {
+            Some(status) => status,
+            None => current_status,
         };
 
         let decision_changes_state = decision != ProposalDecision::Comment;
