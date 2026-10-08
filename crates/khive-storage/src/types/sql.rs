@@ -54,6 +54,23 @@ pub struct SqlStatement {
     pub label: Option<String>,
 }
 
+impl SqlStatement {
+    /// Create a statement without a diagnostic label.
+    pub fn new(sql: impl Into<String>, params: Vec<SqlValue>) -> Self {
+        Self {
+            sql: sql.into(),
+            params,
+            label: None,
+        }
+    }
+
+    /// Set or replace the diagnostic label for this statement.
+    pub fn labelled(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+}
+
 /// A single named column in a SQL result row.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SqlColumn {
