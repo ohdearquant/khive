@@ -55,7 +55,7 @@ pub use event::{
 pub use event::{
     EntityDraft, NoteDraft, ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch,
 };
-pub use hash::Hash32;
+pub use hash::{fnv1a_64, Hash32};
 pub use header::Header;
 pub use id::{is_lowercase_hex, Id128, ParseIdError};
 #[cfg(feature = "serde")]
