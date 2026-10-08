@@ -18,6 +18,7 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 | `src/hit.rs`             | Search result types: `SearchHit`, `SearchSource`, `HybridSearchOutcome`       |
 | `src/hybrid/`            | `HybridSearcher`, `HybridConfig`, `Query`                                     |
 | `src/materialization.rs` | Bounded policy-free ranked-prefix materialization and typed drop diagnostics  |
+| `src/metrics/`           | `MetricEvent`, `MetricsSink`, `RecordingSink`, `NoopSink`                     |
 | `src/policy/`            | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
 | `src/query_ir.rs`        | `QueryNode` IR tree; composable, serialisable query plans                     |
 | `src/search_config.rs`   | Per-call `SearchConfig` for recall/compose search phase                       |

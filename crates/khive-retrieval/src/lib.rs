@@ -23,6 +23,7 @@ pub mod eval;
 pub mod hit;
 pub mod hybrid;
 pub mod materialization;
+pub mod metrics;
 pub mod policy;
 pub mod query_ir;
 pub mod search_config;
@@ -66,6 +67,7 @@ pub use materialization::{
     MAX_MATERIALIZATION_DIAGNOSTICS, MAX_MATERIALIZATION_DROP_REASONS,
     MAX_MATERIALIZATION_LOADER_BATCH, MAX_MATERIALIZATION_OUTPUTS,
 };
+pub use metrics::{MetricEvent, MetricValue, MetricsSink, NoopSink, RecordingSink};
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
 pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
 pub use search_config::SearchConfig;
