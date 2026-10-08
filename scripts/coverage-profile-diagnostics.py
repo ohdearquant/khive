@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Observe llvm-profdata without changing coverage admission or profile inputs."""
+"""Observe llvm-profdata, and keep a merge alive past profiles it cannot read.
+
+A profile file left truncated by a process that died mid-write makes
+`llvm-profdata merge` refuse the whole set ("no profile can be merged"), which
+turns one lost process into no coverage measurement at all. The merge forwarder
+checks every input with `llvm-profdata show` first, excludes the unreadable
+ones, and says so: each dropped file is a workflow warning with the tool's own
+reason, and more than `COVERAGE_PROFILE_DROP_FLOOR` dropped files (default 1)
+fails the merge before it starts, so a real loss of coverage data cannot pass
+as a measurement.
+"""
 
 import hashlib
 import json
@@ -34,10 +44,118 @@ def persist(output, name, record):
         return False
 
 
+def annotate(level, title, message):
+    # The runner reads workflow commands from stderr as well as stdout.
+    try:
+        print(f"::{level} title={title}::{message}", file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
+def drop_floor():
+    raw = os.environ.get("COVERAGE_PROFILE_DROP_FLOOR", "1")
+    try:
+        floor = int(raw)
+    except ValueError:
+        floor = -1
+    if floor < 0:
+        warning(f"COVERAGE_PROFILE_DROP_FLOOR {raw!r} is not a non-negative integer; using 1")
+        floor = 1
+    return floor
+
+
+def exclude_unreadable(real, output, arguments):
+    """Rewrite the merge input list without profiles `show` rejects.
+
+    Returns the arguments to run, or None when more profiles were dropped than
+    the floor allows (the caller then fails the merge without running it). A
+    list that cannot be read or checked is forwarded unchanged: the merge
+    itself then reports whatever is wrong, as before.
+    """
+    if "-f" not in arguments[1:]:
+        return arguments
+    position = arguments.index("-f", 1) + 1
+    if position >= len(arguments):
+        return arguments
+    list_path = Path(arguments[position])
+    try:
+        entries = [line for line in list_path.read_text().splitlines() if line.strip()]
+    except OSError as error:
+        warning(f"cannot read merge input list {list_path}: {error}")
+        return arguments
+    deadline = time.monotonic() + 240
+    kept, dropped, unchecked = [], [], []
+    for entry in entries:
+        if time.monotonic() >= deadline:
+            unchecked.append(entry)
+            kept.append(entry)
+            continue
+        try:
+            result = subprocess.run(
+                [real, "show", entry],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=min(10, max(1, deadline - time.monotonic())),
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            unchecked.append(entry)
+            kept.append(entry)
+            warning(f"could not check {entry}: {error}; keeping it")
+            continue
+        if result.returncode == 0:
+            kept.append(entry)
+            continue
+        if result.returncode < 0:
+            # A signal says nothing about the file; keep it for the real merge.
+            unchecked.append(entry)
+            kept.append(entry)
+            continue
+        reason = result.stderr.decode("utf-8", errors="replace").strip().splitlines()
+        dropped.append({"path": entry, "show_exit": result.returncode,
+                        "reason": reason[-1] if reason else ""})
+    floor = drop_floor()
+    persist(output, "dropped.json", {
+        "total": len(entries), "kept": len(kept), "dropped": dropped,
+        "unchecked": unchecked, "floor": floor,
+    })
+    for item in dropped:
+        annotate("warning", "Unreadable coverage profile excluded",
+                 f"{Path(item['path']).name}: {item['reason'] or 'llvm-profdata show failed'}"
+                 f" (exit {item['show_exit']})")
+    if unchecked:
+        warning(f"{len(unchecked)} of {len(entries)} profiles were not checked and are forwarded as they are")
+    if len(dropped) > floor:
+        annotate("error", "Too many unreadable coverage profiles",
+                 f"{len(dropped)} of {len(entries)} profile files are unreadable; the floor is {floor},"
+                 " so no coverage measurement is produced")
+        return None
+    if dropped:
+        warning(f"excluded {len(dropped)} of {len(entries)} profiles from the merge (floor {floor})")
+    if not kept:
+        annotate("error", "No readable coverage profile",
+                 f"all {len(entries)} profile files are unreadable; no coverage measurement is produced")
+        return None
+    filtered = output / "merge-inputs.filtered"
+    try:
+        filtered.write_text("".join(f"{path}\n" for path in kept))
+    except OSError as error:
+        warning(f"cannot write the filtered input list: {error}; forwarding the original list")
+        return arguments
+    rewritten = list(arguments)
+    rewritten[position] = str(filtered)
+    return rewritten
+
+
 def forward(real, output):
     arguments = [real, *sys.argv[1:]]
     if sys.argv[1:2] != ["merge"]:
         os.execvpe(real, arguments, os.environ)
+    arguments = exclude_unreadable(real, output, arguments)
+    if arguments is None:
+        persist(output, "merge-end.json", {"state": "refused", "exit": 1})
+        return 1
     started = persist(output, "merge-start.json", {"state": "observed"})
     capture = None
     errors = []
