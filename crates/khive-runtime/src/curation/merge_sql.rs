@@ -214,19 +214,7 @@ pub(super) fn merge_entity_sql(
         )?;
         let mut rows = stmt.query(rusqlite::params![&from_str])?;
         while let Some(row) = rows.next()? {
-            let edge = EdgeRow {
-                id: parse_id(row.get(0)?)?,
-                namespace: row.get(1)?,
-                source_id: parse_id(row.get(2)?)?,
-                target_id: parse_id(row.get(3)?)?,
-                relation: row.get(4)?,
-                weight: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-                deleted_at: row.get(8)?,
-                target_backend: row.get(9)?,
-                metadata: row.get(10)?,
-            };
+            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
             budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
             outbound.push(edge);
         }
@@ -241,19 +229,7 @@ pub(super) fn merge_entity_sql(
         )?;
         let mut rows = stmt.query(rusqlite::params![&from_str])?;
         while let Some(row) = rows.next()? {
-            let edge = EdgeRow {
-                id: parse_id(row.get(0)?)?,
-                namespace: row.get(1)?,
-                source_id: parse_id(row.get(2)?)?,
-                target_id: parse_id(row.get(3)?)?,
-                relation: row.get(4)?,
-                weight: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-                deleted_at: row.get(8)?,
-                target_backend: row.get(9)?,
-                metadata: row.get(10)?,
-            };
+            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
             budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
             inbound.push(edge);
         }
@@ -902,19 +878,7 @@ pub(super) fn merge_note_sql(
         )?;
         let mut rows = stmt.query(rusqlite::params![&from_str])?;
         while let Some(row) = rows.next()? {
-            let edge = EdgeRow {
-                id: parse_id(row.get(0)?)?,
-                namespace: row.get(1)?,
-                source_id: parse_id(row.get(2)?)?,
-                target_id: parse_id(row.get(3)?)?,
-                relation: row.get(4)?,
-                weight: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-                deleted_at: row.get(8)?,
-                target_backend: row.get(9)?,
-                metadata: row.get(10)?,
-            };
+            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
             budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
             outbound.push(edge);
         }
@@ -927,19 +891,7 @@ pub(super) fn merge_note_sql(
         )?;
         let mut rows = stmt.query(rusqlite::params![&from_str])?;
         while let Some(row) = rows.next()? {
-            let edge = EdgeRow {
-                id: parse_id(row.get(0)?)?,
-                namespace: row.get(1)?,
-                source_id: parse_id(row.get(2)?)?,
-                target_id: parse_id(row.get(3)?)?,
-                relation: row.get(4)?,
-                weight: row.get(5)?,
-                created_at: row.get(6)?,
-                updated_at: row.get(7)?,
-                deleted_at: row.get(8)?,
-                target_backend: row.get(9)?,
-                metadata: row.get(10)?,
-            };
+            let edge = EdgeRow::from_row_with_id(row, parse_id(row.get(0)?)?)?;
             budget.charge(1, edge_row_budget_bytes(&edge), "collecting incident edges")?;
             inbound.push(edge);
         }
