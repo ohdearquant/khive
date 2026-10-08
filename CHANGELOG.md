@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Breaking Rust API change: `khive_types::RerankExecutedPayload::model_id` is now
+  optional, and the payload adds `reranker`, `query_id`, `tiers`, `ignored_weights`
+  and `unidentified_candidates`. Direct constructors and exhaustive destructurings
+  must account for those fields. Stored events without a discriminator still decode
+  as native reranks; weighted memory reranking does not invent a model identity.
 - Entity updates now distinguish an omitted `description` from an explicit `null`: omission
   keeps the stored value, `null` clears it, and an empty string stays a concrete value. Before,
   `description: null` was a no-op. Canonical and atomic updates also refuse a present `salience`

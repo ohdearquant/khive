@@ -82,6 +82,42 @@ The default weight is `0.3`, making both clamp endpoints reachable at posterior 
 
 The score is `sum(weight * feature) / sum(positive weights)`. Unknown names are ignored for forward compatibility. Zero weights do not contribute. Empty, unrecognized-only, or non-positive-only maps return zero. Because of normalization, scaling every positive weight by the same factor does not change the result; a single positive feature weight returns that feature's value. Finite feature magnitudes are also scaled during accumulation so intermediate sums stay bounded.
 
+### Weighted rerank provenance
+
+`memory.recall_rerank` records a typed `RerankExecuted` event with
+`reranker: "weighted"` in the caller's namespace. It preserves the response's
+input order and `f64` scores. This instruments the explicit subhandler; it does
+not add a native model stage or an event to the separate `memory.recall` pipeline.
+
+The event omits `model_id`, reports no served profile, and sets both hook flags to
+`false`. Optional `query_id` is an opaque caller-supplied string, preserved exactly;
+omission or `null` leaves it absent. It is never generated or required to be a UUID.
+Its `tiers` list includes only positive recognized weights, in the fixed
+order `relevance`, `salience`, `temporal`, `text_match`, `vector_match`.
+`ignored_weights` separately lists every unknown configured key in lexical order,
+including unknown keys with zero weight. The existing response's
+`active_rerankers` continues to include all positive keys, including ignored ones.
+
+`reranked` records raw feature values, not the response's weight-multiplied
+`rerank_scores`; `final_scores` records the weighted result. Event score tuples
+use `f32`, while response scores keep `f64`. Candidate UUIDs are canonicalized
+for the event but echoed unchanged in the response. Missing, non-string, or
+unparseable candidate IDs are counted in `unidentified_candidates` and omitted
+from all three event ID arrays without removing their response entries.
+
+If the final score or any raw feature does not narrow to a finite `f32`, the
+identified candidate remains in `candidates`, but both its `reranked` and
+`final_scores` tuples are omitted. No score is clamped or saturated. The score
+array lengths can therefore differ from the candidate array length. Do not zip
+them by position: score tuples carry their own IDs and retain their relative order.
+The response keeps its existing values.
+The event is still attempted for empty input and calls with no active tiers.
+An append failure is logged and leaves the computed response unchanged.
+
+Legacy events without a `reranker` discriminator decode as `native`. The existing
+DB projection accepts the absent model and derives `Candidate` and `Selected`
+observations from the ordered candidate and final-score arrays.
+
 ## DoS caps and MMR
 
 `ScoringConfig::apply_dos_caps` clamps candidates to 500, token budget to 16,000, and result limit to 200. Defaults are 200 candidates, 4,000 tokens, and 10 results. `default_token_budget` and `chars_per_token` must both be positive; recall rejects a configuration whose effective character-budget product cannot be represented instead of wrapping it or treating it as an empty-result budget. MMR applies a default `0.1` penalty when the first 100 characters duplicate a higher-ranked result in pre-penalty composite-score order (ID breaks equal-score ties). Both the MMR and final sorts use a total order that puts NaN after numeric scores, with ID as the tie-breaker.
