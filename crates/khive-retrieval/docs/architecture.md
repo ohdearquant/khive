@@ -19,6 +19,7 @@ single retrieval layer with deterministic scoring throughout. Designed to compos
 | `src/hybrid/`            | `HybridSearcher`, `HybridConfig`, `Query`                                     |
 | `src/materialization.rs` | Bounded policy-free ranked-prefix materialization and typed drop diagnostics  |
 | `src/policy/`            | `SearchPolicy`, `ClearanceLevel`, `filter_by_policy`                          |
+| `src/query_ir.rs`        | `QueryNode` IR tree; composable, serialisable query plans                     |
 | `src/search_config.rs`   | Per-call `SearchConfig` for recall/compose search phase                       |
 | `src/timeout.rs`         | `search_with_timeout`, `search_with_cancellation`, `search_with_deadline`     |
 

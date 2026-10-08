@@ -24,6 +24,7 @@ pub mod hit;
 pub mod hybrid;
 pub mod materialization;
 pub mod policy;
+pub mod query_ir;
 pub mod search_config;
 pub mod timeout;
 
@@ -66,6 +67,7 @@ pub use materialization::{
     MAX_MATERIALIZATION_LOADER_BATCH, MAX_MATERIALIZATION_OUTPUTS,
 };
 pub use policy::{filter_by_policy, filter_by_predicate, ClearanceLevel, SearchPolicy};
+pub use query_ir::{FilterPredicate, FuseStrategy, QueryNode, RerankMethod};
 pub use search_config::SearchConfig;
 pub use timeout::{
     search_with_cancellation, search_with_deadline, search_with_optional_timeout,
