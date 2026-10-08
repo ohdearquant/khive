@@ -60,6 +60,7 @@ async fn multi_backend_isolates_pack_data_to_separate_files() {
                 "comm".to_string(),
                 PackConfig {
                     backend: "second".to_string(),
+                    verbs_disabled: Vec::new(),
                     no_embed: false,
                 },
             );
