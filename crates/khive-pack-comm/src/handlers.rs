@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::retrieval::add_embedding_truncation_warning;
 use khive_runtime::{
     is_valid_mailbox_actor_label, EmailMessageIdDomains, KhiveRuntime, MailboxView, NamespaceToken,
     RuntimeError,
@@ -94,21 +95,6 @@ use validation::{
     require_existing_thread_root, send_response_thread_id, thread_id_query_spellings,
     validate_actor_label, validate_inbox_substring,
 };
-
-fn add_embedding_truncation_warning(
-    response: &mut Value,
-    report: &khive_runtime::retrieval::EmbeddingTruncationReport,
-) {
-    if !report.any_truncated() {
-        return;
-    }
-    if let Some(object) = response.as_object_mut() {
-        object.insert(
-            "warnings".to_string(),
-            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
-        );
-    }
-}
 
 /// `send` — create a message note in the caller's namespace (outbound) AND
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).

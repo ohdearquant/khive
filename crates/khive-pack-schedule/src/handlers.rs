@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_runtime::retrieval::add_embedding_truncation_warning;
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::note::{
     FilterOp, Note, NoteFilter, NoteInstantSeekAfter, PropertyFilter, SortDir,
@@ -40,21 +41,6 @@ mod activation_seam {
 
 fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
-}
-
-fn add_embedding_truncation_warning(
-    response: &mut Value,
-    report: &khive_runtime::retrieval::EmbeddingTruncationReport,
-) {
-    if !report.any_truncated() {
-        return;
-    }
-    if let Some(object) = response.as_object_mut() {
-        object.insert(
-            "warnings".to_string(),
-            json!([khive_runtime::retrieval::EMBEDDING_INPUT_TRUNCATED_WARNING]),
-        );
-    }
 }
 
 /// Resolve a raw id string to a full UUID.

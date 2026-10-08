@@ -99,6 +99,25 @@ impl EmbeddingTruncationReport {
     }
 }
 
+/// Add the embedding-input advisory when the report records truncation.
+///
+/// An object response receives the existing one-element warnings array, replacing
+/// any previous warnings. Other response values and untruncated reports are unchanged.
+pub fn add_embedding_truncation_warning(
+    response: &mut serde_json::Value,
+    report: &EmbeddingTruncationReport,
+) {
+    if !report.any_truncated() {
+        return;
+    }
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "warnings".to_string(),
+            serde_json::json!([EMBEDDING_INPUT_TRUNCATED_WARNING]),
+        );
+    }
+}
+
 /// Maximum document bytes accepted before the embedding service adds its model prefix.
 pub fn document_embedding_budget(model_name: &str) -> usize {
     parse_embedding_model_alias(model_name)
