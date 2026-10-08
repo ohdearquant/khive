@@ -333,6 +333,18 @@ fn sqlite_capacity_failure_from_storage(error: &StorageError) -> Option<SqliteCa
             phase,
             ..
         } => Some(SqliteCapacityFailure::Unavailable { phase: *phase }),
+        StorageError::WriterTaskTerminated {
+            sqlite_full_codes: Some((primary_code, extended_code)),
+            ..
+        } if *primary_code == rusqlite::ffi::SQLITE_FULL
+            && *extended_code >= 0
+            && (*extended_code & 0xff) == *primary_code =>
+        {
+            Some(SqliteCapacityFailure::NativeFull {
+                primary_code: *primary_code,
+                extended_code: *extended_code,
+            })
+        }
         StorageError::WriterTaskRequestFailed { source, .. } => {
             sqlite_capacity_failure_from_storage(source)
         }
@@ -746,6 +758,46 @@ mod tests {
             value.get("receipt_id").is_none(),
             "an error with no durable receipt must not name one: {value}"
         );
+        assert_eq!(value["domain_disposition"], "unknown");
+    }
+
+    #[test]
+    fn terminal_full_projection_requires_consistent_native_codes() {
+        for codes in [
+            None,
+            Some((5, 5)),
+            Some((13, 5)),
+            Some((5, 13)),
+            Some((13, -243)),
+        ] {
+            let error = StorageError::WriterTaskTerminated {
+                request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+                sqlite_full_codes: codes,
+            };
+            let value = runtime_error_value(
+                crate::RuntimeError::Storage(error),
+                crate::DomainDisposition::Unknown,
+            );
+            assert_eq!(value["stage"], "writer_task_terminated");
+            assert!(value.get("sqlite_primary_code").is_none());
+            assert_eq!(value["retryable"], false);
+        }
+        let extended = rusqlite::ffi::SQLITE_FULL | (3 << 8);
+        let error = StorageError::WriterTaskTerminated {
+            request_state: khive_storage::WriterTaskRequestState::SideEffectsUnknown,
+            sqlite_full_codes: Some((rusqlite::ffi::SQLITE_FULL, extended)),
+        };
+        let value = runtime_error_value(
+            crate::RuntimeError::Storage(error),
+            crate::DomainDisposition::Unknown,
+        );
+        assert_eq!(value["stage"], "sqlite_disk_full");
+        assert_eq!(value["code"], "sqlite_disk_full");
+        assert_eq!(value["sqlite_primary_code"], rusqlite::ffi::SQLITE_FULL);
+        assert_eq!(value["sqlite_extended_code"], extended);
+        assert_eq!(value["request_state"], "side_effects_unknown");
+        assert_eq!(value["task_terminated"], true);
+        assert_eq!(value["retryable"], false);
         assert_eq!(value["domain_disposition"], "unknown");
     }
 

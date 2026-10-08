@@ -264,6 +264,9 @@ pub enum StorageError {
     #[error("writer task terminated (request_state={request_state})")]
     WriterTaskTerminated {
         request_state: WriterTaskRequestState,
+        /// Original SQLITE_FULL primary/extended codes, when the terminal cause supplied them.
+        /// Evidence only: it does not change finality, retryability or the error source chain.
+        sqlite_full_codes: Option<(i32, i32)>,
     },
 
     /// An internal storage failure not attributable to a specific storage
@@ -310,7 +313,10 @@ impl StorageError {
     ///
     /// The request state and existing retry policy are unchanged.
     pub fn writer_task_terminated(request_state: WriterTaskRequestState) -> Self {
-        Self::WriterTaskTerminated { request_state }
+        Self::WriterTaskTerminated {
+            request_state,
+            sqlite_full_codes: None,
+        }
     }
 
     /// Construct a `Driver` error wrapping a backend-specific error source.
