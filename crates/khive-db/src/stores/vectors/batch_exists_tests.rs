@@ -315,7 +315,7 @@ async fn sqlite_vector_paths_tolerate_real_f32_endpoint_roundoff_above_two() {
             model_key
         );
         let mut stmt = writer.conn().prepare(&sql).unwrap();
-        stmt.raw_bind_parameter(1, f32_slice_as_bytes(&query_vector))
+        stmt.raw_bind_parameter(1, encode_f32_native(&query_vector))
             .unwrap();
         stmt.raw_bind_parameter(2, stored_id.to_string().as_str())
             .unwrap();

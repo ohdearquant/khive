@@ -182,7 +182,7 @@ async fn bypass_vector_replacement_makes_stale_sidecar_unknown() {
                 "INSERT INTO vec_provenance_test \
                      (subject_id, namespace, kind, field, embedding_model, embedding) \
                      VALUES (?1, 'ns:test', 'entity', 'entity.body', 'model/a', ?2)",
-                rusqlite::params![subject_id.to_string(), f32_slice_as_bytes(&[0.7_f32, 0.8])],
+                rusqlite::params![subject_id.to_string(), encode_f32_native(&[0.7_f32, 0.8])],
             )
             .unwrap();
     }
@@ -532,7 +532,7 @@ async fn legacy_and_deleted_vectors_have_no_current_provenance() {
                 "INSERT INTO vec_provenance_test \
                      (subject_id, namespace, kind, field, embedding_model, embedding) \
                      VALUES (?1, 'ns:test', 'entity', 'entity.body', 'model/a', ?2)",
-                rusqlite::params![subject_id.to_string(), f32_slice_as_bytes(&[0.1_f32, 0.2])],
+                rusqlite::params![subject_id.to_string(), encode_f32_native(&[0.1_f32, 0.2])],
             )
             .expect("write legacy vector without provenance");
         writer
