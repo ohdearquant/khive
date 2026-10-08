@@ -18,6 +18,19 @@ pub struct ProposalsProjectionWorker {
     runtime: KhiveRuntime,
 }
 
+/// Status change and approval/rejection counter deltas for one review decision.
+/// A comment retains the current status and changes neither counter.
+pub(crate) fn review_decision_effect(
+    decision: ProposalDecision,
+) -> (Option<&'static str>, i64, i64) {
+    match decision {
+        ProposalDecision::Approve => (Some("approved"), 1, 0),
+        ProposalDecision::Reject => (Some("rejected"), 0, 1),
+        ProposalDecision::Comment => (None, 0, 0),
+        ProposalDecision::RequestChanges => (Some("changes_requested"), 0, 0),
+    }
+}
+
 impl ProposalsProjectionWorker {
     /// Create a new projection worker backed by the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
@@ -68,13 +81,8 @@ impl ProposalsProjectionWorker {
         let ns = token.namespace().as_str().to_owned();
         let proposal_id = Uuid::from_u128(payload.proposal_id.to_u128());
 
-        let (new_status_opt, approve_delta, reject_delta): (Option<&str>, i64, i64) =
-            match payload.decision {
-                ProposalDecision::Approve => (Some("approved"), 1, 0),
-                ProposalDecision::Reject => (Some("rejected"), 0, 1),
-                ProposalDecision::Comment => (None, 0, 0),
-                ProposalDecision::RequestChanges => (Some("changes_requested"), 0, 0),
-            };
+        let (new_status_opt, approve_delta, reject_delta) =
+            review_decision_effect(payload.decision);
 
         let last_decision_str = payload.decision.as_str();
 
@@ -227,13 +235,8 @@ impl ProposalsProjectionWorker {
         let proposal_id = Uuid::from_u128(payload.proposal_id.to_u128());
         let event = EventAttribution::from_token(token).stamp(event);
 
-        let (new_status_opt, approve_delta, reject_delta): (Option<&str>, i64, i64) =
-            match payload.decision {
-                ProposalDecision::Approve => (Some("approved"), 1, 0),
-                ProposalDecision::Reject => (Some("rejected"), 0, 1),
-                ProposalDecision::Comment => (None, 0, 0),
-                ProposalDecision::RequestChanges => (Some("changes_requested"), 0, 0),
-            };
+        let (new_status_opt, approve_delta, reject_delta) =
+            review_decision_effect(payload.decision);
         let last_decision_str = payload.decision.as_str();
 
         let projection_stmt = if let Some(new_status) = new_status_opt {
