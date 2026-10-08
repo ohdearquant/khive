@@ -15,12 +15,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `decay_factor`, `null` included, on an entity or edge target, where it used to be ignored;
   the record is left unchanged and the refusal comes before any sibling field is applied.
 
-### Removed
+### Restored
 
-- `KhiveRuntime::rerank` is removed. No workspace code called it; its implementation
-  filtered a namespace-wide top-N instead of scoring every requested candidate.
-  This is a source-breaking change for an out-of-tree Rust consumer. There is no
-  replacement runtime method with the same candidate-set contract.
+- The retrieval surfaces removed in 0.10.0 are back, unchanged from 0.9.x, as the base for
+  their integration work: `KhiveRuntime::hybrid_search_with_strategy` and `KhiveRuntime::rerank`;
+  `khive_retrieval::hybrid::dual_index` (`DualIndexRouter`, `DualIndexConfig`,
+  `DualIndexStrategy`); `khive_retrieval::query_ir` (`QueryNode`, `FuseStrategy`,
+  `FilterPredicate`, `RerankMethod`); `khive_retrieval::metrics` (`MetricEvent`,
+  `MetricValue`, `MetricsSink`, `NoopSink`, `RecordingSink`); and the `persist` feature with
+  the `persist`, `replay` and `weights` modules (`RetrievalPersistence`, `PersistenceStats`,
+  `PersistError`, `ShadowValidationConfig`, `ShadowValidationResult`, `ShadowMetrics`). A
+  0.10.0 consumer that migrated away from any of these keeps working; the removal entries
+  below describe 0.10.0 only.
 
 ## [0.10.0] - 2026-10-07
 
@@ -35,31 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `update_note_with_embedding_report`. The `create_notes_atomic` re-export is dropped from the
   crate root; migrate to `create_notes_atomic_with_report`, which keeps the same all-or-none note
   write and adds the aggregate report.
-- `KhiveRuntime::hybrid_search_with_strategy` is removed. Nothing in the workspace called it
-  outside its own tests, and `KhiveRuntime::hybrid_search` remains the one entity search entry
-  point. This is a source-breaking change for an out-of-tree Rust consumer. `hybrid_search` takes
-  no fusion strategy, and its text leg covers every namespace visible to the caller, where the
-  removed method searched the caller's primary namespace only.
-- `khive_retrieval::DualIndexRouter`, `DualIndexConfig` and `DualIndexStrategy` are removed, with
-  the `hybrid::dual_index` module. Nothing in the workspace constructed the router outside its own
-  tests. This is a source-breaking change for an out-of-tree Rust consumer; a caller that merged a
-  primary and a legacy index through it now fuses the two result lists with
-  `fuse_search_results_checked` and its own source order.
-- The unused `khive_retrieval::metrics` module and the `MetricEvent`, `MetricValue`,
-  `MetricsSink`, `NoopSink` and `RecordingSink` crate-root re-exports are removed. Nothing in
-  the workspace used this surface outside its own tests. This is a source-breaking change
-  for an out-of-tree Rust consumer, including users of `metrics::emit` or `metrics::names`.
-  The separate metrics APIs in `khive-bm25` and `khive-hnsw` remain unchanged.
-- The unused `khive_retrieval::query_ir` module and the `QueryNode`, `FuseStrategy`,
-  `FilterPredicate` and `RerankMethod` crate-root re-exports are removed. Nothing in the
-  workspace used this surface outside its own tests. This is a source-breaking change
-  for an out-of-tree Rust consumer; no replacement query-plan API is provided.
-- The `khive-retrieval` `persist` feature is removed, with the `persist`, `replay` and `weights`
-  modules and the `PersistError`, `PersistenceStats`, `RetrievalPersistence`, `ShadowMetrics`,
-  `ShadowValidationConfig` and `ShadowValidationResult` re-exports. Nothing in the workspace
-  enabled the feature. This is a source-breaking change for an out-of-tree Rust consumer that
-  enabled `persist`. HNSW checkpoints remain available through the `checkpoint` feature, and
-  existing `retrieval_snapshots` rows are left in place.
 
 ### Changed
 
@@ -105,8 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `khive-retrieval` no longer compiles `khive-hnsw`, `khive-bm25` or `khive-db` by default. The
   `khive-hnsw` and `khive-bm25` types it re-exports at the crate root (`HnswIndex`, `HnswConfig`,
   `Bm25Index`, `Bm25Config` and the rest) are now behind the new `hnsw` and `bm25` features, so a
-  Rust consumer that uses them must enable the matching feature. `checkpoint` implies `hnsw`, so
-  its consumers need no change. `khive-db` is now a dev-dependency only.
+  Rust consumer that uses them must enable the matching feature. `persist` implies both and
+  `checkpoint` implies `hnsw`, so those consumers need no change. `khive-db` is now a
+  dev-dependency only.
 
 ## [0.9.0] - 2026-09-27
 

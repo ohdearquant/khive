@@ -52,7 +52,7 @@ pub fn arm_backfill_reader_fail() {
 const RRF_K: usize = 10;
 
 /// Candidates pulled per path before fusion. Higher = better recall, more work.
-pub(crate) const CANDIDATE_MULTIPLIER: u32 = 4;
+const CANDIDATE_MULTIPLIER: u32 = 4;
 
 /// Advisory emitted by write verbs when only the embedding input was bounded.
 pub const EMBEDDING_INPUT_TRUNCATED_WARNING: &str =
@@ -1109,6 +1109,41 @@ impl KhiveRuntime {
                 backend_hints: None,
             })
             .await?)
+    }
+
+    /// Exact KNN restricted to a candidate set.
+    ///
+    /// Useful for reranking the top-N results from `hybrid_search` (or any other
+    /// retrieval path) with exact cosine similarity against a query vector.
+    /// Returns hits sorted by similarity (highest first), truncated to `top_k`.
+    pub async fn rerank(
+        &self,
+        token: &NamespaceToken,
+        query_vector: &[f32],
+        candidate_ids: &[Uuid],
+        top_k: u32,
+    ) -> RuntimeResult<Vec<VectorSearchHit>> {
+        let candidate_set: HashSet<Uuid> = candidate_ids.iter().copied().collect();
+        let ns = token.namespace().as_str().to_owned();
+        let all_hits = self
+            .vectors(token)?
+            .search(VectorSearchRequest {
+                query_vectors: vec![query_vector.to_vec()],
+                top_k: candidate_ids.len() as u32,
+                namespace: Some(ns),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await?;
+        let mut hits: Vec<VectorSearchHit> = all_hits
+            .into_iter()
+            .filter(|h| candidate_set.contains(&h.subject_id))
+            .collect();
+        hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
+        hits.truncate(top_k as usize);
+        Ok(hits)
     }
 
     async fn embed_backfill_page(

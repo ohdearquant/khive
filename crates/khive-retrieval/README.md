@@ -15,6 +15,9 @@ scoring throughout.
   are re-exported, and `khive-hnsw` and `khive-bm25` types are re-exported
   behind the `hnsw` and `bm25` features, so a caller depends on this one crate
   for the full hybrid path
+- **`DualIndexRouter`** — routes queries between a primary and legacy vector
+  index during a migration, with positional `[primary, legacy]` fusion and a
+  configurable auto-switch threshold
 - **Timeout/cancellation wrappers** — `search_with_timeout`,
   `search_with_deadline`, `search_with_cancellation` around any search future
 - **Feature-gated extensions** — see Configuration below
@@ -55,6 +58,7 @@ given exactly the two vector/text source slots;
 | `bm25`             | `khive-bm25` index type re-exports (`Bm25Index`, `Bm25Config`, ...)                                 |
 | `policy`           | `khive-gate`-backed `ClearanceLevel`/`SearchPolicy` result filtering                                |
 | `checkpoint`       | `HnswCheckpoint`/`HnswCheckpointStore` re-exports (implies `hnsw`; snapshots via `khive-fold`)      |
+| `persist`          | SQLite-based persistence for HNSW and BM25 indexes (implies `hnsw`, `bm25`; `rusqlite`)             |
 | `storage-adapters` | `StorageVectorSearch`/`StorageKeywordSearch` bridging sqlite-vec/FTS5 backends to the search traits |
 | `embed`            | Native `lattice-embed` embedding service re-exports                                                 |
 | `native-rerank`    | Cross-encoder reranking — deferred pending `khive-inference` port                                   |
@@ -62,7 +66,7 @@ given exactly the two vector/text source slots;
 None of these features are enabled by default. The base crate is not
 dependency-free, though: it depends on `lattice-embed` for native embedding. The
 features above gate additional surface — HNSW/BM25 re-exports, policy filtering,
-HNSW checkpointing, storage-backed search adapters, and
+HNSW/BM25 checkpoint and persistence, storage-backed search adapters, and
 cross-encoder reranking — and the `khive-hnsw`, `khive-bm25` and `khive-storage`
 dependencies are only compiled when a feature that needs them is enabled.
 
