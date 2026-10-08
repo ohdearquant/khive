@@ -28,6 +28,7 @@ use super::{PackFactory, PackRegistry};
 /// immutable and cheaply cloneable.
 pub struct VerbRegistryBuilder {
     packs: Vec<Box<dyn PackRuntime>>,
+    pub(super) pack_versions: HashMap<String, &'static str>,
     /// Parallel to `packs`: whether the composition root vouches for the
     /// pack at the same index, recorded by the registration method the
     /// *caller* chose rather than anything the pack reports about itself.
@@ -83,6 +84,7 @@ impl VerbRegistryBuilder {
     pub fn new() -> Self {
         Self {
             packs: Vec::new(),
+            pack_versions: HashMap::new(),
             pack_trusted: Vec::new(),
             resolvers: Vec::new(),
             kg_read_resolver: None,
@@ -553,6 +555,7 @@ impl VerbRegistryBuilder {
 
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
+            pack_versions: Arc::new(self.pack_versions),
             resolvers: Arc::new(self.resolvers),
             kg_read_resolver: self.kg_read_resolver,
             gate: self.gate,
@@ -791,6 +794,11 @@ impl PackMetadataRegistry {
 
     pub fn pack_names(&self) -> Vec<&str> {
         self.registry.pack_names()
+    }
+
+    /// Factory-reported version, if this pack was registered through a factory.
+    pub fn pack_version(&self, name: &str) -> Option<&'static str> {
+        self.registry.pack_version(name)
     }
 
     pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {

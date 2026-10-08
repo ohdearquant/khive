@@ -356,6 +356,14 @@ impl VerbRegistry {
             .ok()
     }
 
+    /// Factory-reported version for a registered pack.
+    ///
+    /// Returns `None` for unknown packs and packs registered directly without
+    /// a factory; their package version is not available to the registry.
+    pub fn pack_version(&self, name: &str) -> Option<&'static str> {
+        self.pack_versions.get(name).copied()
+    }
+
     /// Declared dependencies for a registered pack.
     pub fn pack_requires(&self, name: &str) -> Option<&'static [&'static str]> {
         self.packs

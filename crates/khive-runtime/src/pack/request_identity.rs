@@ -19,6 +19,7 @@ use super::{
 #[derive(Clone)]
 pub struct VerbRegistry {
     pub(super) packs: std::sync::Arc<Vec<Box<dyn PackRuntime>>>,
+    pub(super) pack_versions: Arc<HashMap<String, &'static str>>,
     /// Pack-level by-ID resolvers, in registration order.
     pub(super) resolvers: std::sync::Arc<Vec<(String, Box<dyn PackByIdResolver>)>>,
     /// Read-only KG lookup topology; never used to redirect a pack write.
