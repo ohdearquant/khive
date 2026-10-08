@@ -21,9 +21,10 @@ An adapter reports its short format `name`, exposes separate `entities` and `edg
 and accumulates non-fatal issues in `warnings`. Implementations write no database state. IDs are accepted when supplied and validated as UUIDs; when an entity omits `id` or an edge omits `edge_id`/`id`, the adapter mints a fresh `Uuid::new_v4()` for that record, so ID-free input is not deterministic across parses. Record-level fatal errors remain in the iterator as `AdapterError` values.
 
 The current modules divide responsibilities as follows: `adapter` defines the trait,
-`json_adapter` implements JSON-array parsing, `record` defines the intermediate wire shapes, and
+`json_adapter` implements JSON-array parsing and shared record validation; `csv_adapter`
+implements header-based CSV/TSV parsing. `record` defines the intermediate wire shapes, and
 `error` defines the failure taxonomy. Integration coverage lives in
-`tests/json_adapter_tests.rs`.
+`tests/json_adapter_tests.rs` and `tests/csv_adapter_tests.rs`.
 
 ## Taxonomy invariants
 
@@ -50,6 +51,13 @@ Parsing is eager through `serde_json::from_str`, so the complete source is loade
 iteration. ADR-036 section 7 calls for a streaming implementation; that remains P1 work because it
 requires `impl Read` pipeline wiring.
 
+## CSV and TSV
+
+[`CsvFormatAdapter`](csv-tsv-adapter.md) selects entity or edge records from the header row.
+It reuses JSON record validation after converting tabular cells to the intermediate field types.
+`kkernel kg import` accepts explicit `--format csv|tsv`, infers `.csv`/`.tsv`, and accepts
+`--default-kind` for rows with no kind.
+
 ## Error boundary
 
 Missing or blank required fields, invalid values, structural parse failures, malformed present
@@ -65,4 +73,4 @@ Callers inspect `warnings()` after draining the streams.
 | P1       | BibTeX, Turtle/N-Triples, JSON-LD; streaming JSON parse |
 | P2       | GraphML, GEXF, Markdown                                 |
 
-The protocol and its JSON implementation were last reviewed on 2026-06-06.
+The JSON and delimited adapters are eager; neither performs database I/O.
