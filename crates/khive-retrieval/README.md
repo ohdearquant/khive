@@ -55,6 +55,7 @@ given exactly the two vector/text source slots;
 | `bm25`             | `khive-bm25` index type re-exports (`Bm25Index`, `Bm25Config`, ...)                                 |
 | `policy`           | `khive-gate`-backed `ClearanceLevel`/`SearchPolicy` result filtering                                |
 | `checkpoint`       | `HnswCheckpoint`/`HnswCheckpointStore` re-exports (implies `hnsw`; snapshots via `khive-fold`)      |
+| `persist`          | SQLite-based persistence for HNSW and BM25 indexes (implies `hnsw`, `bm25`; `rusqlite`)             |
 | `storage-adapters` | `StorageVectorSearch`/`StorageKeywordSearch` bridging sqlite-vec/FTS5 backends to the search traits |
 | `embed`            | Native `lattice-embed` embedding service re-exports                                                 |
 | `native-rerank`    | Cross-encoder reranking — deferred pending `khive-inference` port                                   |
@@ -62,7 +63,7 @@ given exactly the two vector/text source slots;
 None of these features are enabled by default. The base crate is not
 dependency-free, though: it depends on `lattice-embed` for native embedding. The
 features above gate additional surface — HNSW/BM25 re-exports, policy filtering,
-HNSW checkpointing, storage-backed search adapters, and
+HNSW/BM25 checkpoint and persistence, storage-backed search adapters, and
 cross-encoder reranking — and the `khive-hnsw`, `khive-bm25` and `khive-storage`
 dependencies are only compiled when a feature that needs them is enabled.
 

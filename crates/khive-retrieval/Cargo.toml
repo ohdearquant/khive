@@ -34,10 +34,15 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 [features]
-# No optional features are enabled by default, as specified by ADR-030.
+# ADR-030 originally marked checkpoint/persist/embed/storage-adapters as default-on.
+# The current default = [] reflects a deliberate decision to keep the base crate lightweight
+# and avoid pulling in rusqlite/lattice-embed/khive-storage unless explicitly requested.
+# This deviation is tracked as a known gap pending an ADR-030 amendment.
 default = []
 # Re-exports the khive-hnsw index types (HnswIndex, HnswConfig, ...) at the crate root
 hnsw = ["dep:khive-hnsw"]
@@ -48,6 +53,8 @@ policy = ["khive-gate"]
 # HNSW checkpoint integration with khive-fold (ADR-030 F167)
 # Enables HnswCheckpoint/HnswCheckpointStore re-exports and khive-hnsw checkpoint support.
 checkpoint = ["hnsw", "khive-fold", "khive-hnsw/checkpoint"]
+# SQLite-based persistence for HNSW and BM25 indexes
+persist = ["hnsw", "bm25", "rusqlite", "tracing", "rand"]
 # Adapters bridging khive-storage backends (sqlite-vec, FTS5) to retrieval search traits.
 # The adapter tests get sqlite-vec from the khive-db dev-dependency's vectors feature.
 storage-adapters = ["khive-storage"]

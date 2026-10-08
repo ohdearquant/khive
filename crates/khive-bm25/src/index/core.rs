@@ -515,7 +515,7 @@ impl Bm25Index {
     }
 
     /// Rebuild `doc_lengths_vec` and `doc_lengths_f32` from `doc_lengths` HashMap.
-    /// Called after deserialization to populate the fast-path Vecs.
+    /// Called after deserialization to populate the fast-path Vecs (see `persist::bm25`).
     pub fn ensure_doc_lengths_vec(&mut self) {
         if !self.doc_lengths_vec.is_empty() || self.doc_lengths.is_empty() {
             return;
