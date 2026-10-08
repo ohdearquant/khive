@@ -1464,68 +1464,53 @@ async fn fetch_final_states(
 /// O(batch × dimensions) regardless of tail size.
 const REPLAY_BATCH: usize = 500;
 
-/// Stream the coalesced final states onto `bridge`. Each final upsert's
-/// embedding is point-read by single-key equality — the only constraint
-/// shape sqlite-vec plans as a primary-key point lookup rather than a full
-/// table scan — and the consumer scope predicate is checked in process on
-/// the returned row. Batches apply as they are read, so peak memory is one
-/// batch of embeddings, never the whole tail. A final upsert whose source
-/// row is missing or out of scope is a contradiction → `Err` (caller
-/// escalates to Cold).
+/// Stream the coalesced final states onto `bridge`. Each batch hydrates only
+/// its upserts through the scoped vector store before applying the original
+/// final-op order. A missing or out-of-scope source is a contradiction -> Cold.
 async fn replay_final_states(
     rt: &KhiveRuntime,
+    token: &NamespaceToken,
     bridge: &mut AnnBridge,
     ns: &str,
     model: &str,
     finals: &[(Uuid, bool)],
 ) -> Result<(), String> {
-    let table_name = format!("vec_{}", sanitize_model_key(model));
-    let point_read_sql = format!(
-        "SELECT namespace, embedding_model, field, embedding \
-         FROM {table_name} WHERE subject_id = ?1"
-    );
-    let sql = rt.sql();
-    let mut reader = sql.reader().await.map_err(|e| e.to_string())?;
+    let mut store: Option<Arc<dyn khive_storage::VectorStore>> = None;
     let mut reverse = bridge.reverse_map_for(finals.iter().map(|(uuid, _)| *uuid));
 
     for batch in finals.chunks(REPLAY_BATCH) {
-        let mut embeddings: HashMap<Uuid, Vec<f32>> = HashMap::new();
-        for (uuid, is_delete) in batch {
-            if *is_delete {
-                continue;
+        let ids: Vec<Uuid> = batch
+            .iter()
+            .filter_map(|(id, delete)| (!*delete).then_some(*id))
+            .collect();
+        if store.is_none() && !ids.is_empty() {
+            // A persisted literal-model scope must not read a canonical alias's rows.
+            if rt
+                .resolve_embedding_model(Some(model))
+                .is_ok_and(|resolved| resolved.to_string() != model)
+            {
+                return Err(format!(
+                    "replay model {model} is not canonical (contradiction -> Cold)"
+                ));
             }
-            let rows = reader
-                .query_all(SqlStatement {
-                    sql: point_read_sql.clone(),
-                    params: vec![SqlValue::Text(uuid.to_string())],
-                    label: Some("ann_replay_point_read".into()),
-                })
+            store = Some(
+                rt.vectors_for_model(token, model)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let mut embeddings = match &store {
+            Some(store) if !ids.is_empty() => store
+                .get_vectors(&ids, ns, "knowledge.atom")
                 .await
-                .map_err(|e| e.to_string())?;
-            let Some(row) = rows.first() else {
+                .map_err(|e| e.to_string())?,
+            _ => HashMap::new(),
+        };
+        for uuid in &ids {
+            if !embeddings.contains_key(uuid) {
                 return Err(format!(
                     "final upsert for {uuid} has no source row (contradiction → Cold)"
                 ));
-            };
-            let in_scope = matches!(row.get("namespace"), Some(SqlValue::Text(t)) if t == ns)
-                && matches!(row.get("embedding_model"), Some(SqlValue::Text(t)) if t == model)
-                && matches!(row.get("field"), Some(SqlValue::Text(t)) if t == "knowledge.atom");
-            if !in_scope {
-                return Err(format!(
-                    "final upsert for {uuid}: source row left the consumer scope \
-                     (contradiction → Cold)"
-                ));
             }
-            let Some(SqlValue::Blob(bytes)) = row.get("embedding") else {
-                return Err(format!("final upsert for {uuid}: embedding missing on row"));
-            };
-            // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-            #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-            let vec: Vec<f32> = bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect();
-            embeddings.insert(*uuid, vec);
         }
         for (uuid, is_delete) in batch {
             let op =
@@ -2942,6 +2927,7 @@ enum SegmentOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn classify_and_adopt_segment(
     rt: &KhiveRuntime,
+    token: &NamespaceToken,
     ann: &SharedAnn,
     key: &AnnKey,
     ns: &str,
@@ -3105,7 +3091,7 @@ async fn classify_and_adopt_segment(
                 return SegmentOutcome::Cold;
             }
         };
-        if let Err(e) = replay_final_states(rt, &mut bridge, ns, model, &finals).await {
+        if let Err(e) = replay_final_states(rt, token, &mut bridge, ns, model, &finals).await {
             tracing::warn!(error = %e, "tail replay failed; Cold rebuild");
             return SegmentOutcome::Cold;
         }
@@ -3266,8 +3252,17 @@ pub(crate) async fn ensure_ann_for_model(
     // consumer's registry row, and one same-snapshot (live, tail) read.
     if !force_rebuild {
         if let Some(seg_dir) = ann_segment_dir(rt, &ns, model) {
-            match classify_and_adopt_segment(rt, ann, &key, &ns, model, &seg_dir, target_generation)
-                .await
+            match classify_and_adopt_segment(
+                rt,
+                token,
+                ann,
+                &key,
+                &ns,
+                model,
+                &seg_dir,
+                target_generation,
+            )
+            .await
             {
                 SegmentOutcome::Installed => return AnnWarmOutcome::Ready,
                 SegmentOutcome::Empty => {

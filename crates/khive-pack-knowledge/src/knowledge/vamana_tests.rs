@@ -3493,3 +3493,221 @@ async fn ensure_ann_for_model_store_open_failure_does_not_mark_unavailable() {
              the retry's install, not short-circuit false"
     );
 }
+
+struct ReplayNamedProvider(&'static str);
+
+#[async_trait]
+impl EmbedderProvider for ReplayNamedProvider {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn dimensions(&self) -> usize {
+        WARM_DIMS
+    }
+    async fn build(&self) -> khive_runtime::RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(Arc::new(ConstVecService))
+    }
+}
+
+#[tokio::test]
+async fn replay_vectors_keep_final_order_across_batches_and_exact_model_names() {
+    for model in [WARM_TEST_MODEL, "replay-custom-model"] {
+        let dir = TempDir::new().expect("private root");
+        let rt = file_rt_with_embedder(dir.path().join("replay.db"));
+        rt.register_embedder(ReplayNamedProvider("replay-custom-model"));
+        let token = rt.authorize(Namespace::local()).expect("token");
+        let store = rt.vectors_for_model(&token, model).expect("store");
+        // The index refuses to tombstone its last live node, so the bridge
+        // starts with a second vector that no final state touches.
+        let deleted = Uuid::new_v4();
+        let kept = Uuid::new_v4();
+        let mut kept_vector = vec![0.0_f32; WARM_DIMS];
+        kept_vector[2] = 1.0;
+        let mut built = vec![1.0; WARM_DIMS];
+        built.extend(kept_vector.iter().copied());
+        let mut bridge = AnnBridge::build(built, WARM_DIMS, vec![deleted, kept]).expect("bridge");
+        let mut finals = vec![(deleted, true)];
+        finals.extend((0..REPLAY_BATCH - 4).map(|_| (Uuid::new_v4(), true)));
+        let mut ids = Vec::new();
+        let mut expected = Vec::new();
+        for (x, y) in [(0.6, 0.8), (-0.6, 0.8), (0.8, -0.6), (-0.8, -0.6)] {
+            let id = Uuid::new_v4();
+            let mut vector = vec![0.0_f32; WARM_DIMS];
+            vector[0] = x;
+            vector[1] = y;
+            store
+                .insert(
+                    id,
+                    khive_types::SubstrateKind::Entity,
+                    "local",
+                    "knowledge.atom",
+                    vec![vector.clone()],
+                )
+                .await
+                .expect("stored vector");
+            ids.push(id);
+            expected.extend(vector);
+            finals.push((id, false));
+        }
+        assert_eq!(finals.len(), REPLAY_BATCH + 1);
+        replay_final_states(&rt, &token, &mut bridge, "local", model, &finals)
+            .await
+            .expect("replay");
+        // The first upsert recycles the deleted slot 0; `kept` stays at 1;
+        // the remaining upserts append in final-state order.
+        let expected_ids = vec![ids[0], kept, ids[1], ids[2], ids[3]];
+        let mut expected_vectors = expected[..WARM_DIMS].to_vec();
+        expected_vectors.extend(kept_vector.iter().copied());
+        expected_vectors.extend(expected[WARM_DIMS..].iter().copied());
+        assert_eq!(
+            bridge.id_map, expected_ids,
+            "HashMap order must not become mutation order"
+        );
+        assert_eq!(bridge.index.live_count(), 5);
+        assert_eq!(bridge.index.vectors().expect("vectors"), expected_vectors);
+        assert!(!bridge.id_map.contains(&deleted));
+    }
+}
+
+#[tokio::test]
+async fn replay_missing_or_out_of_scope_vectors_refuse_before_batch_mutation() {
+    let dir = TempDir::new().expect("private root");
+    let rt = file_rt_with_embedder(dir.path().join("replay.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    for (namespace, field, model) in [
+        ("local", "knowledge.atom", None),
+        ("other", "knowledge.atom", Some(WARM_TEST_MODEL)),
+        ("local", "entity.body", Some(WARM_TEST_MODEL)),
+        ("local", "knowledge.atom", Some("foreign-model")),
+    ] {
+        let missing = Uuid::new_v4();
+        if let Some(model) = model {
+            let store = rt
+                .backend()
+                .vectors_for_namespace(
+                    &sanitize_model_key(WARM_TEST_MODEL),
+                    model,
+                    WARM_DIMS,
+                    namespace,
+                )
+                .expect("fixture store");
+            store
+                .insert(
+                    missing,
+                    khive_types::SubstrateKind::Entity,
+                    namespace,
+                    field,
+                    vec![vec![1.0; WARM_DIMS]],
+                )
+                .await
+                .expect("out-of-scope row");
+        }
+        let deleted = Uuid::new_v4();
+        let mut bridge =
+            AnnBridge::build(vec![1.0; WARM_DIMS], WARM_DIMS, vec![deleted]).expect("bridge");
+        let before = bridge.index.to_bytes(&[]).expect("before");
+        let error = replay_final_states(
+            &rt,
+            &token,
+            &mut bridge,
+            "local",
+            WARM_TEST_MODEL,
+            &[(deleted, true), (missing, false)],
+        )
+        .await
+        .expect_err("refuse absent scoped vector");
+        assert_eq!(
+            error,
+            format!("final upsert for {missing} has no source row (contradiction → Cold)")
+        );
+        assert_eq!(bridge.id_map, vec![deleted]);
+        assert_eq!(
+            bridge.index.to_bytes(&[]).expect("after"),
+            before,
+            "the earlier delete must not run"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_alias_does_not_hydrate_a_different_literal_model_scope() {
+    let dir = TempDir::new().expect("private root");
+    let rt = file_rt_with_embedder(dir.path().join("replay.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    let alias = "all_minilm_l6_v2";
+    assert_eq!(
+        rt.resolve_embedding_model(Some(alias))
+            .expect("registered alias")
+            .to_string(),
+        WARM_TEST_MODEL
+    );
+    let source = Uuid::new_v4();
+    rt.vectors_for_model(&token, WARM_TEST_MODEL)
+        .expect("canonical store")
+        .insert(
+            source,
+            khive_types::SubstrateKind::Entity,
+            "local",
+            "knowledge.atom",
+            vec![vec![1.0; WARM_DIMS]],
+        )
+        .await
+        .expect("canonical row");
+    let kept = Uuid::new_v4();
+    let mut bridge = AnnBridge::build(vec![1.0; WARM_DIMS], WARM_DIMS, vec![kept]).expect("bridge");
+    let before = bridge.index.to_bytes(&[]).expect("before");
+    let error = replay_final_states(
+        &rt,
+        &token,
+        &mut bridge,
+        "local",
+        alias,
+        &[(kept, true), (source, false)],
+    )
+    .await
+    .expect_err("literal alias refuses");
+    assert!(error.contains("not canonical"));
+    assert_eq!(bridge.id_map, vec![kept]);
+    assert_eq!(bridge.index.to_bytes(&[]).expect("after"), before);
+}
+
+#[tokio::test]
+async fn replay_empty_and_delete_only_do_not_resolve_a_vector_store() {
+    let dir = TempDir::new().expect("private root");
+    let rt = file_rt_with_embedder(dir.path().join("replay.db"));
+    let token = rt.authorize(Namespace::local()).expect("token");
+    // The index refuses to tombstone its last live node, so a second
+    // vector that no final state touches keeps the delete legal.
+    let id = Uuid::new_v4();
+    let kept = Uuid::new_v4();
+    let mut built = vec![1.0; WARM_DIMS];
+    let mut kept_vector = vec![0.0_f32; WARM_DIMS];
+    kept_vector[0] = 1.0;
+    built.extend(kept_vector);
+    let mut bridge = AnnBridge::build(built, WARM_DIMS, vec![id, kept]).expect("bridge");
+    let before = bridge.index.to_bytes(&[]).expect("before");
+    replay_final_states(
+        &rt,
+        &token,
+        &mut bridge,
+        "local",
+        "unregistered-replay-model",
+        &[],
+    )
+    .await
+    .expect("empty replay");
+    assert_eq!(bridge.index.to_bytes(&[]).expect("after empty"), before);
+    replay_final_states(
+        &rt,
+        &token,
+        &mut bridge,
+        "local",
+        "unregistered-replay-model",
+        &[(id, true)],
+    )
+    .await
+    .expect("delete-only replay");
+    assert_eq!(bridge.index.live_count(), 1);
+    assert!(bridge.index.is_tombstoned(0));
+    assert!(!bridge.index.is_tombstoned(1));
+}
