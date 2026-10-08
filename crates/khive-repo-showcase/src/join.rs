@@ -151,11 +151,7 @@ pub(crate) fn release_tags(
                 "tag {name:?} targets a {target_type} object rather than a commit"
             )));
         }
-        if sha.len() != 40
-            || !sha
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if sha.len() != 40 || !khive_types::is_lowercase_hex(sha) {
             return Err(ExportError::InvalidData(format!(
                 "tag {name:?} has invalid commit target {sha:?}"
             )));
