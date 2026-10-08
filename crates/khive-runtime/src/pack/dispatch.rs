@@ -37,9 +37,12 @@ impl VerbRegistry {
     /// instead of restating it per param across every `HandlerDef` in every
     /// pack. Parameters whose mode is [`IdResolutionMode::NotApplicable`]
     /// (every non-identifier parameter) are left unchanged.
-    /// Unknown verbs return `RuntimeError::InvalidInput`. Full shape documented
+    /// Unknown or disabled verbs return `RuntimeError::UnknownVerb`. Full shape documented
     /// in `docs/protocol.md` §Request Schema.
     pub fn describe_verb(&self, verb: &str) -> Result<Value, RuntimeError> {
+        if self.is_verb_disabled(verb) {
+            return Err(self.unknown_verb_error(verb));
+        }
         for pack in self.packs.iter() {
             for handler in pack.handlers().iter() {
                 if handler.name == verb {
@@ -119,10 +122,7 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(RuntimeError::UnknownVerb(format!(
-            "unknown verb {verb:?}; available: {}",
-            self.available_verbs.join(", ")
-        )))
+        Err(self.unknown_verb_error(verb))
     }
 
     /// Check whether the gate permits writes into `ns`.
@@ -275,6 +275,15 @@ impl VerbRegistry {
         F: FnOnce(NamespaceToken) -> Fut,
         Fut: std::future::Future<Output = Result<InterceptedDispatchResult<M>, RuntimeError>>,
     {
+        if self.is_verb_disabled(verb) {
+            // Use the ordinary unknown-verb path, including attribution and audit,
+            // without invoking an interceptor that could perform the mutation.
+            self.dispatch_with_disposition(verb, params.clone(), identity.cloned())
+                .await?;
+            return Err(DispatchError::before_dispatch(
+                self.unknown_verb_error(verb),
+            ));
+        }
         let request_id = identity.and_then(|id| id.request_id);
         let gate_req = self
             .gate_request_with_identity(verb, params, identity)
@@ -904,7 +913,7 @@ impl VerbRegistry {
             None => crate::config::process_ref_from_env(),
         });
 
-        for pack in self.packs.iter() {
+        for pack in self.packs.iter().filter(|_| !self.is_verb_disabled(verb)) {
             let handler_def = pack.handlers().iter().find(|v| v.name == verb);
             let mounted_name = pack.mounted_namespace().and_then(|prefix| {
                 verb.strip_prefix(prefix)
@@ -1292,12 +1301,9 @@ impl VerbRegistry {
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error).
-        Err(DispatchError::before_dispatch(RuntimeError::UnknownVerb(
-            format!(
-                "unknown verb {verb:?}; available: {}",
-                self.available_verbs.join(", ")
-            ),
-        )))
+        Err(DispatchError::before_dispatch(
+            self.unknown_verb_error(verb),
+        ))
     }
 
     /// Dispatch a verb under an out-of-band verified actor identity.

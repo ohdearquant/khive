@@ -192,7 +192,19 @@ impl VerbRegistry {
     /// guaranteed-failed `dispatch` (and its audit write) when an optional
     /// pack is absent can probe first and skip the call entirely.
     pub fn has_verb(&self, verb: &str) -> bool {
-        self.handler_by_name.contains_key(verb)
+        self.handler_by_name.contains_key(verb) && !self.is_verb_disabled(verb)
+    }
+
+    /// Whether operator policy disables this registered public handler.
+    pub fn is_verb_disabled(&self, verb: &str) -> bool {
+        self.disabled_verbs.contains(verb)
+    }
+
+    pub(crate) fn unknown_verb_error(&self, verb: &str) -> RuntimeError {
+        RuntimeError::UnknownVerb(format!(
+            "unknown verb {verb:?}; available: {}",
+            self.available_verbs.join(", ")
+        ))
     }
 
     /// Advisory metadata for synchronous planning and MCP initialization.
@@ -243,14 +255,14 @@ impl VerbRegistry {
 
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
     ///
-    /// Subhandlers (`Visibility::Subhandler`) are excluded — they are internal
+    /// Disabled verbs and subhandlers (`Visibility::Subhandler`) are excluded — subhandlers are internal
     /// pipeline steps not surfaced on the MCP wire. Returned with `'static`
     /// lifetime since pack handlers are `&'static [HandlerDef]` constants.
     pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
         self.packs
             .iter()
             .flat_map(|p| p.handlers().iter())
-            .filter(|h| matches!(h.visibility, Visibility::Verb))
+            .filter(|h| matches!(h.visibility, Visibility::Verb) && !self.is_verb_disabled(h.name))
             .collect()
     }
 
@@ -264,11 +276,13 @@ impl VerbRegistry {
         self.packs
             .iter()
             .flat_map(|p| p.handlers().iter().map(move |v| (p.name(), v)))
-            .filter(|(_, h)| matches!(h.visibility, Visibility::Verb))
+            .filter(|(_, h)| {
+                matches!(h.visibility, Visibility::Verb) && !self.is_verb_disabled(h.name)
+            })
             .collect()
     }
 
-    /// All handler definitions across all registered packs, including subhandlers.
+    /// All handler definitions across all registered packs, including disabled verbs and subhandlers.
     ///
     /// Unlike `all_verbs`, this includes `Visibility::Subhandler` entries. Useful
     /// for runtime introspection (e.g. `list_handlers`) and tooling that needs
