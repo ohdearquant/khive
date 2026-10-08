@@ -1109,25 +1109,16 @@ const ANN_CONSUMER: &str = "knowledge:knowledge.atom";
 #[cfg(test)]
 async fn register_consumer(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), String> {
     let sql = rt.sql();
-    if ann_segment_dir(rt, ns, model).is_none() {
-        // In-memory SqlBridge atomic units cannot pin their manual transaction
-        // across PoolBackedWriter calls. Pathless consumers have no durable
-        // pending lifecycle to retire, so one closed-fence statement is enough.
-        let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
-        writer
-            .execute(ann_registry::pathless_register_pending(
-                "knowledge_",
-                ANN_CONSUMER,
-                ns,
-                model,
-            ))
-            .await
-            .map_err(|error| error.to_string())?;
-        return Ok(());
-    }
-    ann_registry::register_pending(sql.as_ref(), ANN_CONSUMER, ns, model)
-        .await
-        .map_err(|e| e.to_string())
+    ann_registry::register_pending_dispatch(
+        sql.as_ref(),
+        "knowledge_",
+        ANN_CONSUMER,
+        ns,
+        model,
+        ann_segment_dir(rt, ns, model).is_none(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Durable sentinel for registry-loss recovery.  `-1` is below every legal
@@ -1255,27 +1246,23 @@ async fn raise_watermark(
         CheckpointAuthority::FullRegistered => WatermarkAuthority::PendingOrActive,
     };
     let sql = rt.sql();
-    let raised = if ann_segment_dir(rt, ns, model).is_none() {
-        let watermark = i64::try_from(s)
+    let pathless = ann_segment_dir(rt, ns, model).is_none();
+    if pathless {
+        i64::try_from(s)
             .map_err(|_| format!("knowledge ANN watermark {s} exceeds SQLite INTEGER range"))?;
-        let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
-        writer
-            .execute(ann_registry::pathless_raise_watermark(
-                "knowledge_",
-                ANN_CONSUMER,
-                ns,
-                model,
-                watermark,
-                shared_authority,
-            ))
-            .await
-            .map_err(|error| error.to_string())?
-            == 1
-    } else {
-        ann_registry::raise_watermark(sql.as_ref(), ANN_CONSUMER, ns, model, s, shared_authority)
-            .await
-            .map_err(|e| e.to_string())?
-    };
+    }
+    let raised = ann_registry::raise_watermark_dispatch(
+        sql.as_ref(),
+        "knowledge_",
+        ANN_CONSUMER,
+        ns,
+        model,
+        s,
+        shared_authority,
+        pathless,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if !raised {
         return Err(format!(
             "ANN watermark publication fence rejected {authority:?}: affected 0 rows"
@@ -1302,23 +1289,15 @@ fn knowledge_corpus(ns: &str) -> CorpusScope<'_> {
 /// matches nothing — an unregistered pair never compacts.
 async fn compact_log(rt: &KhiveRuntime, ns: &str, model: &str) -> Result<(), String> {
     let sql = rt.sql();
-    if ann_segment_dir(rt, ns, model).is_none() {
-        let mut writer = sql.writer().await.map_err(|error| error.to_string())?;
-        writer
-            .execute(ann_registry::pathless_compact_log(
-                "knowledge_",
-                knowledge_corpus(ns).compaction_scope(),
-                model,
-            ))
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())?;
-        return Ok(());
-    }
-    ann_registry::compact_write_log(sql.as_ref(), knowledge_corpus(ns).compaction_scope(), model)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    ann_registry::compact_dispatch(
+        sql.as_ref(),
+        "knowledge_",
+        knowledge_corpus(ns).compaction_scope(),
+        model,
+        ann_segment_dir(rt, ns, model).is_none(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Whether any tail row exists above `s` for this consumer's scope. A pure

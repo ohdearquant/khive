@@ -2147,25 +2147,16 @@ async fn register_consumer_identity(
     consumer: &str,
 ) -> Result<(), String> {
     let sql = rt.sql();
-    if ann_segment_dir(rt, model).is_none() {
-        // Pooled in-memory writers can't hold a manual transaction across
-        // calls, so this stays a single statement; pathless runtimes have no
-        // durable consumer to age-retire, so that's sufficient here.
-        let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
-        writer
-            .execute(ann_registry::pathless_register_pending(
-                "memory_",
-                consumer,
-                ANN_WILDCARD_NS,
-                model,
-            ))
-            .await
-            .map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    ann_registry::register_pending(sql.as_ref(), consumer, ANN_WILDCARD_NS, model)
-        .await
-        .map_err(|e| e.to_string())
+    ann_registry::register_pending_dispatch(
+        sql.as_ref(),
+        "memory_",
+        consumer,
+        ANN_WILDCARD_NS,
+        model,
+        ann_segment_dir(rt, model).is_none(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Read this consumer's own wildcard registry watermark. `None` = no row
@@ -2260,27 +2251,23 @@ async fn raise_consumer_watermark_with_authority(
     authority: WatermarkAuthority,
 ) -> Result<(), String> {
     let sql = rt.sql();
-    let raised = if ann_segment_dir(rt, model).is_none() {
-        let watermark = i64::try_from(s)
+    let pathless = ann_segment_dir(rt, model).is_none();
+    if pathless {
+        i64::try_from(s)
             .map_err(|_| format!("memory ANN watermark {s} exceeds SQLite INTEGER range"))?;
-        let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
-        writer
-            .execute(ann_registry::pathless_raise_watermark(
-                "memory_",
-                consumer,
-                ANN_WILDCARD_NS,
-                model,
-                watermark,
-                authority,
-            ))
-            .await
-            .map_err(|e| e.to_string())?
-            == 1
-    } else {
-        ann_registry::raise_watermark(sql.as_ref(), consumer, ANN_WILDCARD_NS, model, s, authority)
-            .await
-            .map_err(|e| e.to_string())?
-    };
+    }
+    let raised = ann_registry::raise_watermark_dispatch(
+        sql.as_ref(),
+        "memory_",
+        consumer,
+        ANN_WILDCARD_NS,
+        model,
+        s,
+        authority,
+        pathless,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if !raised {
         return Err(format!(
             "{consumer} ANN watermark publication fence rejected {authority:?}"
@@ -2313,27 +2300,15 @@ fn memory_corpus() -> CorpusScope<'static> {
 /// matches nothing.
 async fn compact_log(rt: &KhiveRuntime, model: &str) -> Result<(), String> {
     let sql = rt.sql();
-    if ann_segment_dir(rt, model).is_none() {
-        // The ephemeral, single-process backend has no durable dormant
-        // registrations to retire. Keep its historical single-statement
-        // compaction shape so a background checkpoint cannot expose a manual
-        // multi-statement transaction between pooled writer operations.
-        let mut writer = sql.writer().await.map_err(|e| e.to_string())?;
-        writer
-            .execute(ann_registry::pathless_compact_log(
-                "memory_",
-                memory_corpus().compaction_scope(),
-                model,
-            ))
-            .await
-            .map(|_| ())
-            .map_err(|e| e.to_string())?;
-        return Ok(());
-    }
-    ann_registry::compact_write_log(sql.as_ref(), memory_corpus().compaction_scope(), model)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    ann_registry::compact_dispatch(
+        sql.as_ref(),
+        "memory_",
+        memory_corpus().compaction_scope(),
+        model,
+        ann_segment_dir(rt, model).is_none(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
