@@ -19,7 +19,7 @@ use khive_runtime::{entity_fts_document, KhiveRuntime, RuntimeConfig};
 use khive_storage::types::Edge;
 use khive_storage::LinkId;
 use khive_types::{EdgeRelation, Pack};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::VcsError;
@@ -1354,18 +1354,18 @@ fn read_entities(path: &Path) -> Result<Vec<NdjsonEntity>> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(path)?;
-    parse_entities(&text)
+    read_ndjson(&text, "entity")
 }
 
-fn parse_entities(text: &str) -> Result<Vec<NdjsonEntity>> {
+fn read_ndjson<T: DeserializeOwned>(text: &str, label: &str) -> Result<Vec<T>> {
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let e: NdjsonEntity = serde_json::from_str(trimmed)
-            .with_context(|| format!("parsing entity at line {}", i + 1))?;
+        let e: T = serde_json::from_str(trimmed)
+            .with_context(|| format!("parsing {label} at line {}", i + 1))?;
         out.push(e);
     }
     Ok(out)
@@ -1376,21 +1376,7 @@ fn read_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
         return Ok(Vec::new());
     }
     let text = std::fs::read_to_string(path)?;
-    parse_edges(&text)
-}
-
-fn parse_edges(text: &str) -> Result<Vec<NdjsonEdge>> {
-    let mut out = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let e: NdjsonEdge = serde_json::from_str(trimmed)
-            .with_context(|| format!("parsing edge at line {}", i + 1))?;
-        out.push(e);
-    }
-    Ok(out)
+    read_ndjson(&text, "edge")
 }
 
 /// A checked-out remote member is untrusted. Keep the read bound to an opened
@@ -1548,14 +1534,14 @@ fn open_remote_member(path: &Path) -> Result<Option<std::fs::File>> {
 
 fn read_remote_entities(path: &Path) -> Result<Vec<NdjsonEntity>> {
     match read_remote_regular_file(path)? {
-        Some(text) => parse_entities(&text),
+        Some(text) => read_ndjson(&text, "entity"),
         None => Ok(Vec::new()),
     }
 }
 
 fn read_remote_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
     match read_remote_regular_file(path)? {
-        Some(text) => parse_edges(&text),
+        Some(text) => read_ndjson(&text, "edge"),
         None => Ok(Vec::new()),
     }
 }
@@ -1609,21 +1595,18 @@ async fn upsert_entities(
             let updated_at = parse_ts_micros(r.updated_at.as_deref(), fallback)
                 .with_context(|| format!("entity {} invalid updated_at", r.id))?;
             let entity = khive_storage::entity::Entity {
-                id: r.id,
-                namespace: namespace.to_string(),
-                kind: r.kind.clone(),
                 entity_type: r.entity_type.clone(),
-                name: r.name.clone(),
                 description: r.description.clone(),
                 properties: r.properties.clone(),
                 tags: r.tags.clone(),
-                created_at,
-                updated_at,
-                deleted_at: None,
-                merge_event_id: None,
-                merged_into: None,
-                version: 1,
-                content_ref: None,
+                ..khive_storage::entity::Entity::minimal(
+                    r.id,
+                    namespace,
+                    r.kind.clone(),
+                    r.name.clone(),
+                    created_at,
+                    updated_at,
+                )
             };
             khive_runtime::secret_gate::reject_reserved_secret_gate_property(
                 entity.properties.as_ref(),

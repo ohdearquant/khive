@@ -1145,6 +1145,17 @@ fn build_event_filter_sql(
         filter.actors.iter().cloned(),
     );
 
+    if let Some(outcome) = filter.outcome {
+        params.push(Box::new(outcome.name().to_string()));
+        conditions.push(format!("outcome = ?{}", params.len()));
+    }
+    super::append_json_equalities(
+        &mut conditions,
+        &mut params,
+        "payload",
+        &filter.payload_equalities,
+    );
+
     if let Some(after) = filter.after {
         params.push(Box::new(after));
         conditions.push(format!("created_at > ?{}", params.len()));
@@ -1374,6 +1385,11 @@ impl EventStore for SqlEventStore {
         filter: EventFilter,
         page: PageRequest,
     ) -> Result<Page<Event>, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.payload_equalities,
+            StorageCapability::Events,
+            "query_events",
+        )?;
         let namespace = self.namespace.clone();
         let limit_i64 = i64::from(page.limit);
         let offset_i64 = i64::try_from(page.offset).map_err(|_| StorageError::InvalidInput {
@@ -1435,6 +1451,11 @@ impl EventStore for SqlEventStore {
     }
 
     async fn count_events(&self, filter: EventFilter) -> Result<u64, StorageError> {
+        super::validate_json_equality_paths(
+            &filter.payload_equalities,
+            StorageCapability::Events,
+            "count_events",
+        )?;
         let namespace = self.namespace.clone();
 
         self.with_reader("count_events", move |conn| {

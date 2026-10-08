@@ -26,6 +26,58 @@ pub mod vectors;
 
 use khive_storage::{BatchWriteErrorClass, BatchWriteRetryability};
 
+fn validate_json_equality_paths(
+    predicates: &[(String, khive_storage::SqlValue)],
+    capability: StorageCapability,
+    operation: &'static str,
+) -> Result<(), StorageError> {
+    for (path, _) in predicates {
+        if !path.starts_with("$.")
+            || !path[2..].split('.').all(|part| {
+                !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
+        {
+            return Err(StorageError::InvalidInput {
+                capability,
+                operation: operation.into(),
+                message: format!("invalid JSON equality path: {path:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn append_json_equalities(
+    conditions: &mut Vec<String>,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    column: &'static str,
+    predicates: &[(String, khive_storage::SqlValue)],
+) {
+    use khive_storage::SqlValue;
+    use rusqlite::types::Value;
+
+    for (path, value) in predicates {
+        params.push(Box::new(path.clone()));
+        let path_index = params.len();
+        let value = match value {
+            SqlValue::Null => Value::Null,
+            SqlValue::Bool(value) => Value::Integer(i64::from(*value)),
+            SqlValue::Integer(value) => Value::Integer(*value),
+            SqlValue::Float(value) => Value::Real(*value),
+            SqlValue::Text(value) => Value::Text(value.clone()),
+            SqlValue::Blob(value) => Value::Blob(value.clone()),
+            SqlValue::Json(value) => Value::Text(value.to_string()),
+            SqlValue::Uuid(value) => Value::Text(value.to_string()),
+            SqlValue::Timestamp(value) => Value::Integer(value.timestamp_micros()),
+        };
+        params.push(Box::new(value));
+        conditions.push(format!(
+            "json_extract({column}, ?{path_index}) = ?{}",
+            params.len()
+        ));
+    }
+}
+
 /// Stable refusal classification for SQLite errors captured inside a
 /// best-effort per-item batch loop.
 fn classify_batch_sqlite_error(

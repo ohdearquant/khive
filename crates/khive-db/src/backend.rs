@@ -24,6 +24,13 @@ mod pack_schema;
 mod policy_open;
 
 #[cfg(test)]
+#[path = "backend/filter_builder_tests.rs"]
+mod filter_builder_tests;
+
+mod namespace_listing;
+pub use namespace_listing::NamespaceLiveness;
+
+#[cfg(test)]
 #[path = "backend/memory_visibility_tests.rs"]
 mod memory_visibility_tests;
 

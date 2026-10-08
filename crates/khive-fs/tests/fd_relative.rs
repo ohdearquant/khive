@@ -240,3 +240,101 @@ fn writable_open_applies_mode_with_the_process_umask() {
         );
     }
 }
+
+mod mutations {
+    use super::*;
+    use khive_fs::fd_relative::{rename_at, unlink_at};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn rename_uses_independent_held_parents_and_replaces_the_destination() {
+        let scratch = Scratch::new("rename-held-parents");
+        let root = scratch.path();
+        // APFS refuses non-UTF-8 names (EILSEQ), so the byte-name arm is Linux-only;
+        // every other platform exercises the same paths with a UTF-8 name.
+        #[cfg(target_os = "linux")]
+        let source_name = OsStr::from_bytes(b"source-\xff");
+        #[cfg(not(target_os = "linux"))]
+        let source_name = OsStr::from_bytes("source-\u{e9}".as_bytes());
+        std::fs::create_dir(root.join("from")).unwrap();
+        std::fs::create_dir(root.join("to")).unwrap();
+        std::fs::write(root.join("from").join(source_name), b"original").unwrap();
+        std::fs::write(root.join("to/destination"), b"replaced").unwrap();
+        let from = File::open(root.join("from")).unwrap();
+        let to = File::open(root.join("to")).unwrap();
+        std::fs::rename(root.join("from"), root.join("held")).unwrap();
+        std::fs::create_dir(root.join("from")).unwrap();
+        std::fs::write(root.join("from").join(source_name), b"decoy").unwrap();
+
+        rename_at(&from, source_name, &to, OsStr::new("destination")).unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("to/destination")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read(root.join("from").join(source_name)).unwrap(),
+            b"decoy"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(root.join("held").join(source_name))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn unlink_removes_entries_without_following_links_and_preserves_errors() {
+        let scratch = Scratch::new("unlink-entries");
+        let dir = scratch.open();
+        std::fs::write(scratch.path().join("target"), b"kept").unwrap();
+        symlink("target", scratch.path().join("link")).unwrap();
+        unlink_at(&dir, OsStr::new("link")).unwrap();
+        assert_eq!(
+            std::fs::read(scratch.path().join("target")).unwrap(),
+            b"kept"
+        );
+        let missing = unlink_at(&dir, OsStr::new("link")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(missing.raw_os_error(), Some(libc::ENOENT));
+        std::fs::create_dir(scratch.path().join("directory")).unwrap();
+        assert!(unlink_at(&dir, OsStr::new("directory"))
+            .unwrap_err()
+            .raw_os_error()
+            .is_some());
+        assert!(scratch.path().join("directory").is_dir());
+        unlink_at(&dir, OsStr::new("target")).unwrap();
+        assert!(!scratch.path().join("target").exists());
+    }
+
+    #[test]
+    fn mutations_validate_every_name_before_changing_entries() {
+        let scratch = Scratch::new("mutation-names");
+        let root = scratch.path();
+        let dir = scratch.open();
+        std::fs::create_dir(root.join("sub")).unwrap();
+        for name in ["source", "destination", "sub/source", "sub/destination"] {
+            std::fs::write(root.join(name), name.as_bytes()).unwrap();
+        }
+        for name in [
+            OsStr::new(""),
+            OsStr::new("sub/source"),
+            OsStr::new("/absolute"),
+            OsStr::from_bytes(b"source\0suffix"),
+        ] {
+            for result in [
+                unlink_at(&dir, name),
+                rename_at(&dir, name, &dir, OsStr::new("destination")),
+                rename_at(&dir, OsStr::new("source"), &dir, name),
+            ] {
+                let error = result.unwrap_err();
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{name:?}");
+                assert_eq!(error.raw_os_error(), None, "{name:?}");
+            }
+            for name in ["source", "destination", "sub/source", "sub/destination"] {
+                assert_eq!(std::fs::read(root.join(name)).unwrap(), name.as_bytes());
+            }
+        }
+    }
+}

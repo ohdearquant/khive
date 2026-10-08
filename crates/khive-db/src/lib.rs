@@ -27,6 +27,8 @@ pub mod diagnostics;
 /// Physical-volume identity and bounded cooperative SQLite admission lease.
 mod disk_guard;
 mod disk_guard_config;
+/// Environment readers with explicit parse/default and boolean policies.
+pub mod env;
 /// Error types for the SQLite layer.
 pub mod error;
 /// SQLite extension registration (sqlite-vec auto-extension).

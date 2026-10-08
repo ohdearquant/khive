@@ -323,22 +323,18 @@ impl Default for PoolConfig {
                 .unwrap_or(1)
                 .clamp(1, DEFAULT_READER_CAP),
             wal_mode: true,
-            busy_timeout: Duration::from_secs(
-                std::env::var("KHIVE_BUSY_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(30),
+            busy_timeout: Duration::from_secs(crate::env::env_parse_or(
+                "KHIVE_BUSY_TIMEOUT_SECS",
+                30,
+            )),
+            checkout_timeout: Duration::from_secs(crate::env::env_parse_or(
+                "KHIVE_CHECKOUT_TIMEOUT_SECS",
+                5,
+            )),
+            journal_size_limit_bytes: crate::env::env_parse_or(
+                "KHIVE_JOURNAL_SIZE_LIMIT_BYTES",
+                DEFAULT_JOURNAL_SIZE_LIMIT_BYTES,
             ),
-            checkout_timeout: Duration::from_secs(
-                std::env::var("KHIVE_CHECKOUT_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(5),
-            ),
-            journal_size_limit_bytes: std::env::var("KHIVE_JOURNAL_SIZE_LIMIT_BYTES")
-                .ok()
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
             read_only: false,
             wal_ceiling: WalCeilingPolicy::default(),
             // `var_os`, not `var`: the documented contract is "any SET value
@@ -357,10 +353,10 @@ impl Default for PoolConfig {
             write_routing_strict: std::env::var("KHIVE_WRITE_ROUTING")
                 .map(|v| v.eq_ignore_ascii_case("strict"))
                 .unwrap_or(false),
-            write_admission_deadline_ms: std::env::var("KHIVE_WRITE_ADMISSION_DEADLINE_MS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_WRITE_ADMISSION_DEADLINE_MS),
+            write_admission_deadline_ms: crate::env::env_parse_or(
+                "KHIVE_WRITE_ADMISSION_DEADLINE_MS",
+                DEFAULT_WRITE_ADMISSION_DEADLINE_MS,
+            ),
             disk_guard_config: None,
             #[cfg(test)]
             volume_lock_dir: Some(test_volume_lock_dir()),

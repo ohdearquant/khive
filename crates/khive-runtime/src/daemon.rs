@@ -3665,10 +3665,7 @@ async fn finish_connection_tasks(tasks: Vec<tokio::task::JoinHandle<()>>, draine
 /// longer than the drain bound could never complete its abort/state
 /// transition before the daemon returns.
 pub fn drain_timeout() -> std::time::Duration {
-    let secs = std::env::var("KHIVE_DRAIN_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_DRAIN_TIMEOUT_SECS);
+    let secs = khive_db::env::env_parse_or("KHIVE_DRAIN_TIMEOUT_SECS", DEFAULT_DRAIN_TIMEOUT_SECS);
     std::time::Duration::from_secs(secs)
 }
 
