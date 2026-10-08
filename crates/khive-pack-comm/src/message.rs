@@ -143,6 +143,7 @@ fn attach_outbound_id_to_ambiguous_write(outbound_id: Uuid, error: RuntimeError)
     match error {
         RuntimeError::Storage(StorageError::WriterTaskTerminated {
             request_state: WriterTaskRequestState::SideEffectsUnknown,
+            ..
         }) => RuntimeError::Khive(
             KhiveError::conflict(format!(
                 "dual_write delivery outcome is uncertain (side_effects_unknown); \
@@ -952,9 +953,9 @@ mod tests {
     #[test]
     fn side_effects_unknown_surfaces_outbound_confirmation_id() {
         let outbound_id = Uuid::new_v4();
-        let error = RuntimeError::Storage(StorageError::WriterTaskTerminated {
-            request_state: WriterTaskRequestState::SideEffectsUnknown,
-        });
+        let error = RuntimeError::Storage(StorageError::writer_task_terminated(
+            WriterTaskRequestState::SideEffectsUnknown,
+        ));
 
         let annotated = attach_outbound_id_to_ambiguous_write(outbound_id, error);
         let RuntimeError::Khive(khive_error) = &annotated else {

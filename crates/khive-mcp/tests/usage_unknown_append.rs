@@ -156,6 +156,7 @@ impl Lane {
                         Outcome::Unknown | Outcome::UnknownAfterFreeze,
                         StorageError::WriterTaskTerminated {
                             request_state: WriterTaskRequestState::SideEffectsUnknown,
+                            ..
                         },
                     ) => WriterTaskRequestState::SideEffectsUnknown,
                     other => panic!("unexpected real append outcome: {other:?}"),
