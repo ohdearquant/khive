@@ -113,20 +113,6 @@ pub(crate) struct PreparedAtomicNotes {
     pub embedding_truncation: crate::retrieval::EmbeddingTruncationReport,
 }
 
-/// Bit-identical to `khive-db`'s private `f32_slice_as_bytes` (native-endian
-/// reinterpretation of the float buffer) but built from safe `to_ne_bytes`
-/// calls instead of an unsafe pointer cast — this crate has no visibility
-/// into that helper, and correctness here only requires this process's
-/// writes and reads agree on layout, which native-endian byte-for-byte
-/// concatenation guarantees identically to the raw cast.
-fn f32_vec_to_bytes(data: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for f in data {
-        bytes.extend_from_slice(&f.to_ne_bytes());
-    }
-    bytes
-}
-
 /// Mirrors `khive-db`'s private `non_finite_index` — this crate has no
 /// visibility into that helper, so the check is reproduced here to keep the
 /// atomic path's embedding validation observably identical to the canonical
@@ -217,7 +203,7 @@ pub(crate) fn vector_insert_statements(
         .strip_prefix("vec_")
         .expect("runtime vector tables use the vec_ prefix");
     let kind_str = SubstrateKind::Note.to_string();
-    let blob = f32_vec_to_bytes(embedding);
+    let blob = khive_storage::encode_f32_native(embedding);
     vec![
         // Delta-log any pre-existing row this REPLACE is about to evict —
         // mirrors `log_vector_deletes`'s "replace" predicate exactly.
