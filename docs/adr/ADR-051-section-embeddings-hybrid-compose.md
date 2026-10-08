@@ -385,3 +385,99 @@ At this revision `knowledge.compose` (`crates/khive-pack-knowledge/src/knowledge
 ### Refs
 
 - #3232, #3233, #3234, #3235; implemented by #3349.
+
+## Amendment 3 (2026-10-08): knowledge retrieval under ordered peer engines
+
+**Status**: proposed. This is the knowledge companion that ADR-031 Amendment 5 requires under
+its Migration item 1; it binds when both are accepted, and dependent implementation merges only
+after both. Numbered 3 because this file carries two sections headed Amendment 1 and one headed
+Amendment 2.
+
+### Context
+
+Amendment 1 (2026-08-01) made knowledge single-model: `knowledge.index` embeds and writes only the
+default model because `knowledge.search`, ANN warming, fresh-tail fusion and compose embed and
+probe only that model. That remains the implementation at this revision: the search path embeds
+the query once through the runtime's default query embedder
+(`crates/khive-pack-knowledge/src/knowledge/search.rs`), there is no `strategy` parameter, and the
+response carries no account of which engine answered.
+
+ADR-031 Amendment 5 replaces the default/additional model split with an ordered list of peer
+engines and a per-query retrieval strategy that is always resolved and always disclosed. It names
+`knowledge.search` as a direct entry point of that contract, knowledge composition and suggestion
+as composite entry points, and requires this record to carry the same activation and cutover
+contract for knowledge writes. Everything below is scoped to knowledge atoms and sections; entity,
+note and memory retrieval are governed by ADR-031 directly.
+
+### Decision
+
+1. **Request contract.** `knowledge.search` accepts an optional `strategy` object as defined by
+   ADR-031 Amendment 5 Decision C. A supplied strategy is validated as written before any
+   embedding or ANN work. An omitted strategy resolves to `[retrieval].default_strategy`. Every
+   successful response, including an empty one, carries a `retrieval` field with the resolved
+   two-stage strategy, its source (`request` or `config`), the requested, selected and used
+   engines in canonical order, effective weights, per-engine candidate counts, per-arm status and
+   reason, text participation, and degraded status. No knowledge read path resolves a default of
+   its own.
+2. **Composite entry points.** `knowledge.compose` and `knowledge.suggest` propagate a supplied
+   strategy to the searches they run and otherwise resolve the configured default once, at their
+   own entry, and disclose it in their envelope. Section aggregation, the hybrid compose formula,
+   rerank and the budget of Amendment 2 remain knowledge-owned scoring applied after fusion to the
+   per-engine evidence the executor returns; they are not folded into the fusion stage.
+3. **Before activation.** The applicable engine set for knowledge is exactly the engines whose
+   atom vectors are indexed. Until the activation switch below is on, that set is one engine: the
+   first configured peer, which the legacy conversion of ADR-031 Amendment 5 maps from the former
+   default model. Writes and reindex use that engine only. A supplied strategy that selects an
+   engine outside the applicable set is refused with the engine named; it is never narrowed to the
+   indexed engine silently. The envelope discloses the one-engine applicable set, so clients see
+   the same response shape before and after activation.
+4. **Activation is paired and single.** Multi-engine knowledge writes are enabled by one switch,
+   and that switch is accepted only when every read-side requirement is ready together:
+   model-aware reads (the query embedded once per selected engine with that engine's query role),
+   ANN warming per engine index, fresh-tail handling per engine, exact rerank where it is used,
+   and per-engine index identity for atom and section vectors. There is no per-surface activation;
+   a write path that fans out while any read path is still single-engine is the dead-embedding
+   state Amendment 1 refused.
+5. **Backfill and coverage.** Existing default-model vectors remain valid for that engine and are
+   never deleted because a later write policy excludes their engine. Other engines are backfilled,
+   and an engine is reported ready only on coverage evidence (indexed rows against live atoms and
+   sections), never because its index exists. A search over an engine with partial coverage runs
+   it as a degraded arm and says so in the envelope; it does not report a healthy complete corpus.
+6. **Reindex.** The section embedding pass of `kkernel reindex` follows the knowledge write policy
+   and the provider identity recorded for each vector. Weight, strategy and declaration-order
+   changes alone do not invalidate stored vectors; only an added or changed embedding space or an
+   uncovered corpus triggers re-embedding.
+
+### Alternatives considered
+
+- **Enable multi-engine writes first and add the read path later.** Rejected for the reason
+  Amendment 1 gave: vectors no read path can consume are embedding and storage cost with no
+  retrieval benefit.
+- **Keep knowledge single-engine permanently.** Rejected: ADR-031 Amendment 5 requires the
+  resolved strategy on every multi-engine retrieval path, and knowledge is the corpus where exact
+  keyword and multilingual slices differ most between engines.
+- **Activate per surface (search, warming, compose) with separate flags.** Rejected: the flags
+  drift, and a reader on one engine beside a writer on several is the state item 4 forbids.
+- **Treat the first configured peer as "the" knowledge engine without disclosure.** Rejected: a
+  client cannot tell a one-engine answer from a fused one unless the envelope says which engines
+  ran.
+
+### Consequences
+
+- `knowledge.search` responses grow a `retrieval` field before activation; clients that ignore
+  unknown fields are unaffected. The former implicit default is now a disclosed configured
+  default.
+- Activation becomes a configuration and backfill event with coverage evidence, not a code
+  release. Operators can read readiness per engine from the same evidence the envelope reports.
+- Total embedding and index work for knowledge scales with the number of activated engines, under
+  the admission bounds ADR-031 Amendment 5 Decision E sets.
+- The verification items ADR-031 Amendment 5 lists under Knowledge/lifecycle apply to this record:
+  pre-cutover writes single-engine; post-cutover read, write, backfill, restart, warming and
+  fresh-tail paths see each ready engine; existing vectors remain queryable after configuration
+  conversion.
+
+### Refs
+
+- ADR-031 Amendment 5 (Decisions C, E and F, Migration item 1); Amendment 1 of this record.
+- #4657 (search envelope), #4658 (multi-engine knowledge indexing and activation), #4659
+  (composite strategy propagation).
