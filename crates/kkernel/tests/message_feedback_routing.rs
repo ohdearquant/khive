@@ -48,6 +48,7 @@ async fn fixture_with_gate(gate: khive_runtime::GateRef) -> Fixture {
             "comm".into(),
             PackConfig {
                 backend: "comm".into(),
+                verbs_disabled: Vec::new(),
                 no_embed: true,
             },
         )]),
