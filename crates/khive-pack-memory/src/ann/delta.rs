@@ -342,9 +342,7 @@ fn encode_chunk(
             Some(vector) => {
                 payload.push(1);
                 payload.extend_from_slice(&(vector.len() as u64).to_le_bytes());
-                for value in vector {
-                    payload.extend_from_slice(&value.to_le_bytes());
-                }
+                payload.extend_from_slice(&khive_storage::encode_f32_le(vector));
             }
         }
     }

@@ -2,6 +2,11 @@
 
 use alloc::{vec, vec::Vec};
 
+mod codec;
+pub use codec::{
+    decode_f32_le, decode_f32_native, encode_f32_le, encode_f32_native, VectorCodecError,
+};
+
 /// Distance metric for vector similarity search.
 ///
 /// # Variants

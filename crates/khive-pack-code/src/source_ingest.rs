@@ -2544,9 +2544,10 @@ pub async fn run_code_ingest(
 
 /// The `source_project` for a file with no governing manifest anywhere above
 /// it: the basename of the ingested folder (ADR-085 Amendment 2 B4).
-fn basename_project_name(ingest_root: &Path) -> String {
+fn basename_project_name(ingest_root: &Path, canonical_ingest_root: &Path) -> String {
     ingest_root
         .file_name()
+        .or_else(|| canonical_ingest_root.file_name())
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| ingest_root.display().to_string())
 }
@@ -2623,7 +2624,7 @@ async fn run_import_scan(
         let (proj_root, proj_name) = governing.unwrap_or_else(|| {
             (
                 canonical_ingest_root.clone(),
-                basename_project_name(ingest_root),
+                basename_project_name(ingest_root, &canonical_ingest_root),
             )
         });
         let Some(module_path) = imports::module_path_for_file(&file, &proj_root, language) else {
@@ -4010,7 +4011,7 @@ async fn run_l2_sweep(
             let (proj_root, proj_name) = governing.unwrap_or_else(|| {
                 (
                     canonical_ingest_root.clone(),
-                    basename_project_name(ingest_root),
+                    basename_project_name(ingest_root, &canonical_ingest_root),
                 )
             });
             let owner = L2OwnerKey {
@@ -4421,6 +4422,9 @@ mod l2_batch_tests;
 
 #[cfg(test)]
 mod l2_recovery_tests;
+
+#[cfg(test)]
+mod basename_project_tests;
 
 #[cfg(test)]
 mod tests {

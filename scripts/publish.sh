@@ -96,7 +96,7 @@ CRATES=(
     khive-mounts         # needs khive-db/runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-pack-web       # needs khive-db/runtime/storage/types (all above); dep of khive-mcp/kkernel
     khive-mcp
-    khive-repo-showcase    # no khive-* dependencies; normal dep of kkernel, so publish first
+    khive-repo-showcase    # needs khive-types (above); normal dep of kkernel, so publish first
     kkernel
 )
 

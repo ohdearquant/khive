@@ -427,36 +427,32 @@ impl<'ast> Visit<'ast> for TypeRefCollector {
     }
 }
 
+fn collect_type_refs(visit: impl FnOnce(&mut TypeRefCollector)) -> Vec<Vec<String>> {
+    let mut collector = TypeRefCollector {
+        type_refs: Vec::new(),
+    };
+    visit(&mut collector);
+    collector.type_refs
+}
+
 /// Type references in a function/method signature: parameter types, the
 /// return type, and generic bounds (`Signature::generics` carries both the
 /// `<T: Bound>` params and the trailing `where` clause) -- D3 rules 2, 3,
 /// 5, 6, 7 depending on what the source/target declarations turn out to be,
 /// which only the ingest pipeline's project-wide symbol index can resolve.
 fn collect_type_refs_from_signature(sig: &syn::Signature) -> Vec<Vec<String>> {
-    let mut collector = TypeRefCollector {
-        type_refs: Vec::new(),
-    };
-    collector.visit_signature(sig);
-    collector.type_refs
+    collect_type_refs(|collector| collector.visit_signature(sig))
 }
 
 /// Type references in a struct/enum-variant's fields (D3 rule 4/5:
 /// `datatype depends_on datatype`/`interface`, "field / composition").
 fn collect_type_refs_from_fields(fields: &syn::Fields) -> Vec<Vec<String>> {
-    let mut collector = TypeRefCollector {
-        type_refs: Vec::new(),
-    };
-    collector.visit_fields(fields);
-    collector.type_refs
+    collect_type_refs(|collector| collector.visit_fields(fields))
 }
 
 /// Type references in a single `Type` node (a type alias's own target).
 fn collect_type_refs_from_type(ty: &Type) -> Vec<Vec<String>> {
-    let mut collector = TypeRefCollector {
-        type_refs: Vec::new(),
-    };
-    collector.visit_type(ty);
-    collector.type_refs
+    collect_type_refs(|collector| collector.visit_type(ty))
 }
 
 /// Type references in a trait's supertrait bound list (D3 rule 6:
@@ -465,13 +461,11 @@ fn collect_type_refs_from_type(ty: &Type) -> Vec<Vec<String>> {
 fn collect_type_refs_from_bounds(
     bounds: &syn::punctuated::Punctuated<syn::TypeParamBound, syn::Token![+]>,
 ) -> Vec<Vec<String>> {
-    let mut collector = TypeRefCollector {
-        type_refs: Vec::new(),
-    };
-    for bound in bounds {
-        collector.visit_type_param_bound(bound);
-    }
-    collector.type_refs
+    collect_type_refs(|collector| {
+        for bound in bounds {
+            collector.visit_type_param_bound(bound);
+        }
+    })
 }
 
 #[cfg(test)]

@@ -3646,32 +3646,26 @@ const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updated
 const ISSUE_FIELDS: &str =
     "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
 
+#[path = "ingest/gh_page.rs"]
+mod gh_page;
+use gh_page::fetch_page;
+
 async fn fetch_pr_page(
     repo: &Path,
     gh_repo: &str,
     floor: Option<&str>,
     limit: usize,
 ) -> Result<Vec<GhPr>> {
-    let search = search_query(floor);
-    let limit = limit.to_string();
-    let raw = gh_json(
+    fetch_page::<GhPr>(
         repo,
         gh_repo,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "all",
-            "--search",
-            search.as_str(),
-            "--limit",
-            &limit,
-            "--json",
-            PR_FIELDS,
-        ],
+        floor,
+        limit,
+        "pr",
+        PR_FIELDS,
+        "parsing gh pr list --json",
     )
-    .await?;
-    serde_json::from_str(&raw).context("parsing gh pr list --json")
+    .await
 }
 
 async fn fetch_issue_page(
@@ -3680,26 +3674,16 @@ async fn fetch_issue_page(
     floor: Option<&str>,
     limit: usize,
 ) -> Result<Vec<GhIssue>> {
-    let search = search_query(floor);
-    let limit = limit.to_string();
-    let raw = gh_json(
+    fetch_page::<GhIssue>(
         repo,
         gh_repo,
-        &[
-            "issue",
-            "list",
-            "--state",
-            "all",
-            "--search",
-            search.as_str(),
-            "--limit",
-            &limit,
-            "--json",
-            ISSUE_FIELDS,
-        ],
+        floor,
+        limit,
+        "issue",
+        ISSUE_FIELDS,
+        "parsing gh issue list --json",
     )
-    .await?;
-    serde_json::from_str(&raw).context("parsing gh issue list --json")
+    .await
 }
 
 /// Every `GhPr` field funnels through this constructor before it can reach

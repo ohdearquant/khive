@@ -57,8 +57,15 @@ Each node record: `degree: u32` followed by `degree` neighbor IDs as `u32`.
 
 ### `vectors.bin`
 
-Raw `f32` values in little-endian IEEE 754 format, row-major:
-`num_vectors × dimensions × 4` bytes. Loaded via `memmap2` as a read-only mapping.
+Raw `f32` values in the host's native byte order, row-major:
+`num_vectors × dimensions × 4` bytes. Directory checkpoints are loaded via
+`memmap2` as a read-only native-float mapping; their payload and corpus hashes
+are not a cross-endian format. This applies to both v1 and v2 directories.
+
+The portable `to_bytes` / `from_bytes` container instead encodes its vector
+segment as little-endian IEEE 754 values. Reframing a directory without decoding
+its native payload does not convert its byte order. Existing directory payloads,
+mmap readers and fingerprints are unchanged.
 
 ---
 

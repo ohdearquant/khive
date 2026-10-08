@@ -42,6 +42,9 @@ pub use event::{
     Event, EventFilter, EventObservation, EventStore, EventView, ObservationRole, ReferentKind,
 };
 pub use graph::GraphStore;
+pub use khive_types::vector::{
+    decode_f32_le, decode_f32_native, encode_f32_le, encode_f32_native, VectorCodecError,
+};
 pub use note::{FilterOp, Note, NoteFilter, NoteStore, NoteVisibility, SortDir};
 pub use request_context::{
     await_request_read_phase, capture_request_read_context, effective_request_read_deadline,

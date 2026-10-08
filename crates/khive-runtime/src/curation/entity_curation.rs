@@ -717,10 +717,7 @@ impl KhiveRuntime {
             .expect("runtime vector tables use the vec_ prefix");
         let kind = SubstrateKind::Entity.to_string();
         let field = "entity.body";
-        let blob = vector
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect();
+        let blob = khive_storage::encode_f32_native(vector);
         vec![
             SqlStatement {
                 sql: format!(

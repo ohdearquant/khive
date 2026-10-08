@@ -1006,7 +1006,8 @@ impl AnnBridge {
     /// is. See crates/khive-pack-knowledge/docs/api/vamana.md#save_atomic.
     #[allow(dead_code)]
     pub fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
-        let _publication_lock = acquire_bridge_checkpoint_lock(dir)?;
+        let _publication_lock =
+            khive_retrieval::ann::acquire_checkpoint_lock(dir, BRIDGE_LOCK_MESSAGE_PREFIX)?;
         self.save_atomic_locked(dir)
     }
 
@@ -1041,28 +1042,13 @@ impl AnnBridge {
 
 const BRIDGE_LOCK_MESSAGE_PREFIX: &str = "ANN bridge";
 
-fn acquire_bridge_checkpoint_lock(dir: &std::path::Path) -> Result<std::fs::File, String> {
-    khive_retrieval::ann::acquire_checkpoint_lock(dir, BRIDGE_LOCK_MESSAGE_PREFIX)
-}
-
-async fn acquire_bridge_checkpoint_lock_async(
-    dir: std::path::PathBuf,
-) -> Result<std::fs::File, String> {
-    khive_retrieval::ann::acquire_checkpoint_lock_async(dir, BRIDGE_LOCK_MESSAGE_PREFIX).await
-}
-
 // ── persistence helpers ───────────────────────────────────────────────────────
 
 mod segment_key;
 pub(crate) use segment_key::snapshot_key;
 use segment_key::{ann_segment_dir, ann_segment_dir_from_root, decode_ann_dir_name};
 
-/// Model-key sanitization — must match `khive_runtime::sanitize_key`.
-pub(crate) fn sanitize_model_key(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
+pub(crate) use khive_runtime::config::sanitize_key as sanitize_model_key;
 
 /// Persist `bridge` as v2 Vamana segments under `<db-file>.ann/<hex>/`.
 ///
@@ -1153,7 +1139,10 @@ async fn write_force_rebuild_sentinel(rt: &KhiveRuntime, key: &AnnKey) -> Result
     // therefore either finishes before `-1` is published or observes `-1`
     // under this same lock and aborts without publishing.
     let _publication_lock = match ann_segment_dir(rt, &key.namespace, &key.model) {
-        Some(dir) => Some(acquire_bridge_checkpoint_lock_async(dir).await?),
+        Some(dir) => Some(
+            khive_retrieval::ann::acquire_checkpoint_lock_async(dir, BRIDGE_LOCK_MESSAGE_PREFIX)
+                .await?,
+        ),
         None => None,
     };
     // The detector may have waited behind a successful authoritative
@@ -1549,82 +1538,17 @@ fn fresh_tail_snapshot_statement(
     live_threshold: Option<f64>,
 ) -> SqlStatement {
     let table_name = format!("vec_{}", sanitize_model_key(model));
-    let (live_cte, selected_order, live_join, live_column) = match live_threshold {
-        Some(_) => (
-            format!(
-                "live AS (\
-                   SELECT COUNT(*) AS live_count FROM {table_name} \
-                   WHERE namespace = ?1 AND embedding_model = ?2 \
-                     AND field = 'knowledge.atom'\
-                 ),"
-            ),
-            "ORDER BY seq DESC \
-             LIMIT (SELECT CAST(live_count * ?5 AS INTEGER) + \
-                       CASE WHEN CAST(live_count * ?5 AS INTEGER) < live_count * ?5 \
-                            THEN 1 ELSE 0 END FROM live)",
-            "CROSS JOIN live",
-            "live.live_count",
-        ),
-        None => (String::new(), "ORDER BY seq", "", "NULL"),
-    };
-    let mut params = vec![
-        SqlValue::Text(ns.to_owned()),
-        SqlValue::Text(model.to_owned()),
-        SqlValue::Integer(watermark),
-        SqlValue::Text(ANN_CONSUMER.into()),
-    ];
-    if let Some(threshold) = live_threshold {
-        params.push(SqlValue::Float(threshold));
-    }
-    SqlStatement {
-        sql: format!(
-            "WITH \
-             registry AS (\
-               SELECT MIN(watermark) AS registry_min \
-               FROM ann_consumer_watermark \
-               WHERE (namespace = ?1 OR namespace = '*') \
-                 AND embedding_model = ?2\
-             ), \
-             own AS (\
-               SELECT (SELECT watermark FROM ann_consumer_watermark \
-                       WHERE consumer = ?4 AND namespace = ?1 \
-                         AND embedding_model = ?2) AS own_watermark\
-             ), \
-             {live_cte} \
-             selected AS (\
-               SELECT seq, subject_id, op FROM ann_write_log \
-               WHERE namespace = ?1 AND embedding_model = ?2 \
-                 AND field = 'knowledge.atom' \
-                 AND seq > MAX(\
-                   ?3, COALESCE((SELECT registry_min FROM registry), ?3)\
-                 ) \
-               {selected_order}\
-             ), \
-             finals AS (\
-               SELECT first_seq AS seq, subject_id, op FROM (\
-                 SELECT MIN(seq) OVER (PARTITION BY subject_id) AS first_seq, \
-                        subject_id, op, \
-                        ROW_NUMBER() OVER (\
-                          PARTITION BY subject_id ORDER BY seq DESC\
-                        ) AS final_rank \
-                 FROM selected\
-               ) WHERE final_rank = 1\
-             ) \
-             SELECT finals.seq, finals.subject_id, finals.op, \
-                    vectors.namespace AS vector_namespace, \
-                    vectors.embedding_model AS vector_model, \
-                    vectors.field AS vector_field, \
-                    vectors.embedding, registry.registry_min, \
-                    own.own_watermark, {live_column} AS live_count \
-             FROM registry CROSS JOIN own {live_join} \
-             LEFT JOIN finals ON 1 = 1 \
-             LEFT JOIN {table_name} AS vectors \
-               ON vectors.subject_id = finals.subject_id \
-             ORDER BY finals.seq"
-        ),
-        params,
-        label: Some("knowledge_ann_fresh_tail_snapshot".into()),
-    }
+    knowledge_corpus(ns).final_tail(
+        &table_name,
+        model,
+        watermark,
+        live_threshold,
+        khive_retrieval::ann::corpus::TailFloor::RegistryMinimum {
+            registry_namespace: ns,
+            consumer: ANN_CONSUMER,
+        },
+        "knowledge_ann_fresh_tail_snapshot",
+    )
 }
 
 /// Read the registry guard, optional live-count cap, selected log suffix, and
@@ -1736,18 +1660,12 @@ async fn fetch_fresh_tail_snapshot(
                 "fresh-tail upsert {subject}: embedding is not a blob"
             ));
         };
-        if bytes.len() % std::mem::size_of::<f32>() != 0 {
-            return Err(format!(
+        let embedding = khive_storage::decode_f32_native(&bytes).map_err(|_| {
+            format!(
                 "fresh-tail upsert {subject}: malformed embedding byte length {}",
                 bytes.len()
-            ));
-        }
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let embedding = bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect();
+            )
+        })?;
         ops.push((subject, Some(embedding)));
     }
     Ok(FreshTailSnapshot {
@@ -1779,34 +1697,10 @@ pub(crate) fn merge_fresh_tail(
     query: &[f32],
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
 ) -> Vec<(Uuid, f32)> {
-    if ops.is_empty() {
-        return candidates;
-    }
-    let mut deletes = HashSet::new();
-    let mut upserts = HashMap::new();
-    for (subject, op) in ops {
-        match op {
-            Some(embedding) => {
-                upserts.insert(subject, exact_cosine(query, &embedding));
-            }
-            None => {
-                deletes.insert(subject);
-            }
-        }
-    }
-    let mut merged: Vec<(Uuid, f32)> = candidates
-        .into_iter()
-        .filter(|(subject, _)| !deletes.contains(subject) && !upserts.contains_key(subject))
-        .collect();
-    merged.extend(upserts);
-    merged.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    merged
+    khive_retrieval::ann::merge_fresh_tail(candidates, ops, |embedding| {
+        Ok::<_, std::convert::Infallible>(exact_cosine(query, embedding))
+    })
+    .unwrap_or_else(|never| match never {})
 }
 
 pub(crate) async fn merge_fresh_tail_off_thread(
@@ -2228,7 +2122,12 @@ pub(crate) async fn checkpoint_raise_compact_readopt(
     // transition.  The sentinel writer takes the same lock, so an ordinary
     // replay checkpoint that predates registry loss cannot publish after -1.
     let publication_lock = match ann_segment_dir(rt, ns, model) {
-        Some(dir) => match acquire_bridge_checkpoint_lock_async(dir).await {
+        Some(dir) => match khive_retrieval::ann::acquire_checkpoint_lock_async(
+            dir,
+            BRIDGE_LOCK_MESSAGE_PREFIX,
+        )
+        .await
+        {
             Ok(lock) => Some(lock),
             Err(error) => {
                 tracing::warn!(error = %error, "failed to acquire ANN checkpoint lock");
@@ -2485,12 +2384,9 @@ async fn scan_corpus_raw(
         if bytes.len() != dims * 4 {
             continue;
         }
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let vec: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let Ok(vec) = khive_storage::decode_f32_native(bytes) else {
+            continue;
+        };
         id_map.push(uuid);
         flat.extend_from_slice(&vec);
     }
@@ -2797,7 +2693,12 @@ async fn refresh_rotated_segment(
         return;
     }
 
-    let _publication_guard = match acquire_bridge_checkpoint_lock_async(dir.clone()).await {
+    let _publication_guard = match khive_retrieval::ann::acquire_checkpoint_lock_async(
+        dir.clone(),
+        BRIDGE_LOCK_MESSAGE_PREFIX,
+    )
+    .await
+    {
         Ok(lock) => lock,
         Err(error) => {
             tracing::warn!(

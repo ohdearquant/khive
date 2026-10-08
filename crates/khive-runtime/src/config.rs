@@ -876,7 +876,10 @@ pub(crate) fn vec_model_key(model: EmbeddingModel) -> String {
     sanitize_key(&model.to_string())
 }
 
-pub(crate) fn sanitize_key(s: &str) -> String {
+/// Preserve ASCII letters and digits; replace every other Unicode character with `_`.
+/// Used for model-name table suffixes; this mapping does not preserve uniqueness.
+#[doc(hidden)]
+pub fn sanitize_key(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect()

@@ -20,8 +20,8 @@ use khive_storage::types::{
     VectorProvenance, VectorRecord, VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities,
     VectorStoreInfo,
 };
-use khive_storage::StorageResult;
 use khive_storage::VectorStore;
+use khive_storage::{encode_f32_native, StorageResult};
 use khive_storage::{ContentRef, StorageCapability};
 use khive_types::SubstrateKind;
 
@@ -124,20 +124,6 @@ mod failpoint {
             disarm();
         }
     }
-}
-
-/// Cast a `&[f32]` slice to `&[u8]` for sqlite-vec blob binding.
-///
-/// # Safety
-///
-/// Safe: f32 has no alignment requirements beyond what &[u8] needs, the byte
-/// length is exactly the input slice size, and the lifetime is tied to input.
-fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
-    // SAFETY: `data` is a valid &[f32] so the pointer is non-null, well-aligned, and
-    // live for the call duration. u8 alignment is 1 (satisfied by any allocation).
-    // size_of_val gives the exact byte count. The returned slice borrows `data`
-    // so its lifetime cannot outlive the input reference.
-    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
 /// Snapshot the current thread's failpoint flag (test builds only; always
@@ -493,7 +479,7 @@ impl SqliteVecStore {
 
         self.with_reader("score_candidates", move |conn| {
             let mut all_hits: Vec<VectorSearchHit> = Vec::new();
-            let query_blob = f32_slice_as_bytes(&query_vec);
+            let query_blob = encode_f32_native(&query_vec);
             let sql = format!(
                 "SELECT e.subject_id, vec_distance_cosine(e.embedding, ?1) as distance \
                  FROM {table} e \

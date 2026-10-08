@@ -1200,27 +1200,10 @@ impl KhiveMcpServer {
     /// Production code should use [`Self::new`] or [`Self::with_packs`].
     #[doc(hidden)]
     pub fn from_registry(registry: VerbRegistry) -> Self {
-        Self {
-            registry,
-            default_namespace: "local".to_string(),
-            // A registry injected directly has no resolved RuntimeConfig; use a
-            // sentinel that matches no real daemon so such servers always
-            // dispatch locally rather than forward.
-            config_id: "registry-only".to_string(),
-            coordinator: None,
-            pool: None,
-            secondary_pools: Vec::new(),
-            default_output_format: OutputFormat::Json,
-            schedule_ticker_last_tick_micros: Arc::new(AtomicI64::new(0)),
-            #[cfg(unix)]
-            bridge_executable: None,
-            stdio_bridge: false,
-            runtime: None,
-            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-            channel_outbox_runtime: None,
-            #[cfg(any(feature = "channel-email", feature = "channel-telegram"))]
-            channel_loop_admission: ChannelLoopAdmission::default(),
-        }
+        // A registry injected directly has no resolved RuntimeConfig; use a
+        // sentinel that matches no real daemon so such servers always
+        // dispatch locally rather than forward.
+        Self::from_registry_with_meta(registry, "local", "registry-only")
     }
 
     /// Build a server from a pre-built registry with explicit namespace and config_id.
@@ -4613,15 +4596,28 @@ fn attach_audit_persistence_advisories(response: &mut Value, registry: &VerbRegi
     }
 }
 
-fn invalid_request_error(message: String) -> McpError {
-    McpError::invalid_params(
+fn request_error(
+    message: String,
+    code: rmcp::model::ErrorCode,
+    kind: &str,
+    disposition: DomainDisposition,
+) -> McpError {
+    McpError::new(
+        code,
         message.clone(),
         Some(error_with_disposition(
-            json!({
-                "kind":"invalid_input", "message":message,
-            }),
-            DomainDisposition::NotCommitted,
+            json!({"kind": kind, "message": message}),
+            disposition,
         )),
+    )
+}
+
+fn invalid_request_error(message: String) -> McpError {
+    request_error(
+        message,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "invalid_input",
+        DomainDisposition::NotCommitted,
     )
 }
 
@@ -4644,14 +4640,11 @@ fn cancelled_forward_error(request_id: Option<u64>) -> McpError {
 
 fn request_internal_error(message: String) -> McpError {
     // Rendering/saving can follow a mixture of per-op outcomes.
-    McpError::internal_error(
-        message.clone(),
-        Some(error_with_disposition(
-            json!({
-                "kind":"internal", "message":message,
-            }),
-            DomainDisposition::Unknown,
-        )),
+    request_error(
+        message,
+        rmcp::model::ErrorCode::INTERNAL_ERROR,
+        "internal",
+        DomainDisposition::Unknown,
     )
 }
 

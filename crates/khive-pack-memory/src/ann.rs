@@ -1011,12 +1011,7 @@ impl AnnBridge {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-/// Replace non-alphanumeric chars with `_` to produce a valid table-name suffix.
-pub(crate) fn sanitize_model_key(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
+pub(crate) use khive_runtime::config::sanitize_key as sanitize_model_key;
 
 /// Identity key for the global memory Vamana index for a model; hex-encoded to
 /// name its v2 segment directory. Distinct from knowledge's
@@ -1440,7 +1435,12 @@ async fn refresh_rotated_segment(
         return;
     }
 
-    let _publication_guard = match acquire_bridge_checkpoint_lock_async(dir.clone()).await {
+    let _publication_guard = match khive_retrieval::ann::acquire_checkpoint_lock_async(
+        dir.clone(),
+        "memory ANN",
+    )
+    .await
+    {
         Ok(lock) => lock,
         Err(error) => {
             tracing::warn!(
@@ -2031,12 +2031,9 @@ async fn load_and_build_from_vector_store(
         if bytes.len() != dims * 4 {
             continue;
         }
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let vec: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let Ok(vec) = khive_storage::decode_f32_native(bytes) else {
+            continue;
+        };
         if let Some(SqlValue::Text(ns)) = row.get("namespace") {
             namespace_set.insert(ns.clone());
         }
@@ -2077,12 +2074,6 @@ fn ann_segment_dir_from_root(ann_root: &std::path::Path, model: &str) -> std::pa
     let key = snapshot_key("global", model);
     let hex: String = key.bytes().map(|b| format!("{b:02x}")).collect();
     ann_root.join(hex)
-}
-
-async fn acquire_bridge_checkpoint_lock_async(
-    dir: std::path::PathBuf,
-) -> Result<std::fs::File, String> {
-    khive_retrieval::ann::acquire_checkpoint_lock_async(dir, "memory ANN").await
 }
 
 /// Install `candidate`, replacing an equal-or-newer-generation incumbent but
@@ -2545,12 +2536,9 @@ fn parse_final_tail_rows(
         let Some(bytes) = embedding else {
             return Err(format!("tail upsert {subject}: embedding is not a blob"));
         };
-        // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-        #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-        let vector: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        // Preserve this adapter's existing complete-chunk policy.
+        let vector =
+            khive_storage::decode_f32_native(&bytes[..bytes.len() / 4 * 4]).unwrap_or_default();
         if is_live {
             ops.push((subject, Some(vector)));
         } else {
@@ -2687,32 +2675,9 @@ pub(crate) fn merge_fresh_tail_for_route(
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
     route: AnnScoreRoute,
 ) -> Result<Vec<(Uuid, f64)>, RuntimeError> {
-    if ops.is_empty() {
-        return Ok(best_raw);
-    }
-    let mut deletes: HashSet<Uuid> = HashSet::new();
-    let mut upserts: HashMap<Uuid, f64> = HashMap::new();
-    for (uuid, op) in ops {
-        match op {
-            None => {
-                deletes.insert(uuid);
-            }
-            Some(embedding) => {
-                upserts.insert(uuid, route.tail_score(query, &embedding)?);
-            }
-        }
-    }
-    let mut merged: Vec<(Uuid, f64)> = best_raw
-        .into_iter()
-        .filter(|(uuid, _)| !deletes.contains(uuid) && !upserts.contains_key(uuid))
-        .collect();
-    merged.extend(upserts);
-    merged.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    Ok(merged)
+    khive_retrieval::ann::merge_fresh_tail(best_raw, ops, |embedding| {
+        route.tail_score(query, embedding)
+    })
 }
 
 /// Keep the cheap wait probe and candidate-producing snapshot on the same
@@ -2815,7 +2780,7 @@ pub(crate) async fn session_exact_candidates(
     }
 
     let table_name = format!("vec_{}", sanitize_model_key(model));
-    let query_blob = query.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let query_blob = khive_storage::encode_f32_native(query);
     let mut params = vec![
         SqlValue::Blob(query_blob),
         SqlValue::Integer(i64::try_from(k).unwrap_or(i64::MAX)),
@@ -2926,32 +2891,10 @@ pub(crate) fn merge_fresh_tail(
     query: &[f32],
     ops: Vec<(Uuid, Option<Vec<f32>>)>,
 ) -> Vec<(Uuid, f32)> {
-    if ops.is_empty() {
-        return best_raw;
-    }
-    let mut deletes: HashSet<Uuid> = HashSet::new();
-    let mut upserts: HashMap<Uuid, f32> = HashMap::new();
-    for (uuid, op) in ops {
-        match op {
-            None => {
-                deletes.insert(uuid);
-            }
-            Some(embedding) => {
-                upserts.insert(uuid, exact_cosine(query, &embedding));
-            }
-        }
-    }
-    let mut merged: Vec<(Uuid, f32)> = best_raw
-        .into_iter()
-        .filter(|(u, _)| !deletes.contains(u) && !upserts.contains_key(u))
-        .collect();
-    merged.extend(upserts);
-    merged.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    merged
+    khive_retrieval::ann::merge_fresh_tail(best_raw, ops, |embedding| {
+        Ok::<_, std::convert::Infallible>(exact_cosine(query, embedding))
+    })
+    .unwrap_or_else(|never| match never {})
 }
 
 /// Fold a [`FreshTailOutcome`] into the candidates a recall handler serves
@@ -3761,13 +3704,16 @@ async fn persist_file_checkpoint(
     // lock. Revalidate the durable row only after acquiring it: otherwise a
     // stale publisher could overwrite a newer segment, lose its conditional
     // raise, and leave the registry ahead of the files that restart adopts.
-    let _publication_lock = match acquire_bridge_checkpoint_lock_async(dir.to_path_buf()).await {
-        Ok(lock) => lock,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to acquire memory ANN checkpoint lock");
-            return Err(false);
-        }
-    };
+    let _publication_lock =
+        match khive_retrieval::ann::acquire_checkpoint_lock_async(dir.to_path_buf(), "memory ANN")
+            .await
+        {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to acquire memory ANN checkpoint lock");
+                return Err(false);
+            }
+        };
     let current_watermark = match read_own_watermark(rt, model).await {
         Ok(value) => value,
         Err(e) => {

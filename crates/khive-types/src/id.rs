@@ -8,6 +8,16 @@
 use core::fmt;
 use core::str::FromStr;
 
+/// Return whether every byte is an ASCII digit or a lowercase hexadecimal letter.
+///
+/// The empty string returns `true`; callers retain their own length requirements.
+#[inline]
+pub fn is_lowercase_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// A 128-bit opaque identifier stored as 16 bytes, formatted as a hyphenated UUID string.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id128([u8; 16]);
@@ -275,6 +285,17 @@ mod tests {
         let a = Id128::from_u128(1);
         let b = Id128::from_u128(2);
         assert!(a < b);
+    }
+
+    #[test]
+    fn lowercase_hex_accepts_digits_and_a_through_f_only() {
+        assert!(is_lowercase_hex("0123456789abcdef"));
+        assert!(is_lowercase_hex(""));
+        assert!(!is_lowercase_hex("abcdeF"));
+        assert!(!is_lowercase_hex("abcdeg"));
+        assert!(!is_lowercase_hex("ab cd"));
+        assert!(!is_lowercase_hex("0x12"));
+        assert!(!is_lowercase_hex("ab\u{e9}"));
     }
 
     /// C1 regression: Id128 must deserialize from an owned serde_json::Value string,

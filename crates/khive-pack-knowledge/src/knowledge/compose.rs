@@ -354,14 +354,7 @@ pub(super) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 
 pub(super) fn decode_embedding(blob: &[u8]) -> Vec<f32> {
-    if !blob.len().is_multiple_of(4) {
-        return Vec::new();
-    }
-    // `as_chunks` is unstable on stable; keep `chunks_exact` until it lands.
-    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
-    blob.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    khive_storage::decode_f32_le(blob).unwrap_or_default()
 }
 
 fn tokenize_checked(text: &str) -> Result<Vec<String>, RuntimeError> {

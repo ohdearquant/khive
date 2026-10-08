@@ -317,6 +317,7 @@ pub(crate) fn legacy_post_commit_result_with_embedding<T>(
 
 #[cfg(any(test, feature = "fault-injection"))]
 mod fault_injection;
+mod resolve_uuid_or_prefix;
 
 #[cfg(any(test, feature = "fault-injection"))]
 pub use fault_injection::{
