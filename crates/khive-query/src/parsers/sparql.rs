@@ -2,6 +2,7 @@
 
 use crate::ast::*;
 use crate::error::QueryError;
+use crate::language::{read_only_error, DEFAULT_HOP_CAP, SPARQL_WRITE_KEYWORDS};
 use std::collections::{BTreeMap, HashMap};
 
 struct Triple {
@@ -219,7 +220,7 @@ impl SparqlParser {
         let (min_hops, max_hops) = match self.peek() {
             Some('+') => {
                 self.advance();
-                (1, 5)
+                (1, DEFAULT_HOP_CAP)
             }
             Some('*') => {
                 // The CTE cannot emit depth zero; treating `*` as `+` would lose matches.
@@ -625,14 +626,10 @@ pub fn parse(input: &str) -> Result<GqlQuery, QueryError> {
 /// Rejects SPARQL Update after skipping comments and an optional prologue.
 fn reject_sparql_write(input: &str) -> Result<(), QueryError> {
     let keyword = leading_keyword(input);
-    match keyword.as_str() {
-        "INSERT" | "DELETE" | "WITH" | "LOAD" | "CLEAR" | "CREATE" | "DROP" | "COPY" | "MOVE"
-        | "ADD" => Err(QueryError::Unsupported(
-            "the query verb is read-only; \
-             to mutate the graph use: create, update, link, merge, delete"
-                .into(),
-        )),
-        _ => Ok(()),
+    if SPARQL_WRITE_KEYWORDS.contains(&keyword.as_str()) {
+        Err(read_only_error(QueryError::Unsupported))
+    } else {
+        Ok(())
     }
 }
 
