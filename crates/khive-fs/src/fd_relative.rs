@@ -94,6 +94,47 @@ pub fn open_at(parent: &File, name: &OsStr, directory: bool) -> io::Result<File>
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+/// Remove a file or symlink entry relative to `parent`; directories are refused.
+///
+/// The name follows [`c_name`]'s single-component policy. A symlink target is
+/// never removed. This does not sync the directory after the removal.
+pub fn unlink_at(parent: &File, name: &OsStr) -> io::Result<()> {
+    let name = c_name(name)?;
+    // SAFETY: parent is live and the validated name is NUL-terminated for the call.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Rename an entry between independently held directory handles.
+///
+/// Both names pass [`c_name`] before any mutation. The kernel's ordinary rename
+/// replacement and error semantics apply; this neither follows a final symlink
+/// nor syncs either directory after the rename.
+pub fn rename_at(
+    from_parent: &File,
+    from_name: &OsStr,
+    to_parent: &File,
+    to_name: &OsStr,
+) -> io::Result<()> {
+    let from_name = c_name(from_name)?;
+    let to_name = c_name(to_name)?;
+    // SAFETY: both parents are live and both validated names remain NUL-terminated.
+    let rc = unsafe {
+        libc::renameat(
+            from_parent.as_raw_fd(),
+            from_name.as_ptr(),
+            to_parent.as_raw_fd(),
+            to_name.as_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Creation policy for a descriptor-relative writable open.
 #[derive(Debug, Clone, Copy)]
 pub enum Create {
