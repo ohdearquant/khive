@@ -1191,7 +1191,7 @@ const VALID_DEPENDENCY_KINDS: &[&str] = &[
 /// Used by `link` and `import_kg` to enforce the weight invariant consistently
 /// across all edge creation paths.
 pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
-    if !weight.is_finite() || !(0.0..=1.0).contains(&weight) {
+    if !khive_types::validate_edge_weight(weight) {
         return Err(RuntimeError::InvalidInput(format!(
             "edge weight must be finite and in [0.0, 1.0], got {weight}"
         )));
@@ -7844,7 +7844,7 @@ impl KhiveRuntime {
         if let Some(w) = patch.weight {
             // Reject non-finite or out-of-range weight explicitly; do not silently
             // clamp invalid caller input (coding-standards §608-622).
-            if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+            if !khive_types::validate_edge_weight(w) {
                 return Err(RuntimeError::InvalidInput(format!(
                     "edge weight must be a finite value in [0.0, 1.0]; got {w}"
                 )));
