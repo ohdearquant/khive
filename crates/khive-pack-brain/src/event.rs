@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use khive_storage::event::Event;
-use khive_types::EventOutcome;
+use khive_types::{EventKind, EventOutcome};
 
 pub use khive_brain_core::BrainSignal;
 use khive_brain_core::{FeedbackEventKind, FeedbackSignal, SectionType, ServeAttribution};
@@ -21,6 +21,11 @@ use khive_brain_core::{FeedbackEventKind, FeedbackSignal, SectionType, ServeAttr
 ///
 /// To add a new signal source: add one match arm to this function.
 pub fn interpret(event: &Event) -> BrainSignal {
+    // Kind is authoritative even if telemetry carries judgment-looking fields.
+    if event.kind == EventKind::FeedbackUnjudged {
+        return BrainSignal::Irrelevant;
+    }
+
     match event.verb.as_str() {
         "memory.recall" | "recall" => match event.outcome {
             EventOutcome::Success => match event.target_id {
@@ -146,6 +151,20 @@ mod tests {
         e.outcome = outcome;
         e.target_id = target;
         e
+    }
+
+    #[test]
+    fn unjudged_kind_precedes_signal_and_verb_interpretation() {
+        for verb in ["brain.feedback", "recall", "search", "get"] {
+            let mut event = make_event(verb, EventOutcome::Success, Some(Uuid::new_v4()));
+            event.kind = EventKind::FeedbackUnjudged;
+            event.payload = serde_json::json!({
+                "signal": "useful",
+                "section_signals": {"overview": "useful"},
+                "served_by_profile_id": "telemetry-only-profile"
+            });
+            assert!(matches!(interpret(&event), BrainSignal::Irrelevant));
+        }
     }
 
     #[test]

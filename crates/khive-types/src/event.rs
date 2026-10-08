@@ -62,7 +62,7 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 41 typed event variants produced by the verb dispatch path
+/// Discriminant for the 42 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -105,6 +105,8 @@ pub enum EventKind {
     TaskTransitioned,
     /// An explicit user feedback signal was recorded.
     FeedbackExplicit,
+    /// Telemetry recording a serve without a judgment (ADR-104 Amendment 3).
+    FeedbackUnjudged,
     /// The brain recommended a profile resolution update.
     ProfileResolutionRecommended,
     /// Two brain profiles were merged.
@@ -154,8 +156,8 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// All 41 event kind variants in declaration order.
-    pub const ALL: [Self; 41] = [
+    /// All 42 event kind variants in declaration order.
+    pub const ALL: [Self; 42] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
@@ -174,6 +176,7 @@ impl EventKind {
         Self::EdgeDeleted,
         Self::TaskTransitioned,
         Self::FeedbackExplicit,
+        Self::FeedbackUnjudged,
         Self::ProfileResolutionRecommended,
         Self::ProfileMerged,
         Self::EmbeddingModelChanged,
@@ -220,6 +223,7 @@ impl EventKind {
             Self::EdgeDeleted => "edge_deleted",
             Self::TaskTransitioned => "task_transitioned",
             Self::FeedbackExplicit => "feedback_explicit",
+            Self::FeedbackUnjudged => "feedback_unjudged",
             Self::ProfileResolutionRecommended => "profile_resolution_recommended",
             Self::ProfileMerged => "profile_merged",
             Self::EmbeddingModelChanged => "embedding_model_changed",
@@ -272,6 +276,7 @@ const EVENT_KIND_VALID: &[&str] = &[
     "edge_deleted",
     "task_transitioned",
     "feedback_explicit",
+    "feedback_unjudged",
     "profile_resolution_recommended",
     "profile_merged",
     "embedding_model_changed",
@@ -320,6 +325,7 @@ impl core::str::FromStr for EventKind {
             "edge_deleted" => Ok(Self::EdgeDeleted),
             "task_transitioned" => Ok(Self::TaskTransitioned),
             "feedback_explicit" => Ok(Self::FeedbackExplicit),
+            "feedback_unjudged" => Ok(Self::FeedbackUnjudged),
             "profile_resolution_recommended" => Ok(Self::ProfileResolutionRecommended),
             "profile_merged" => Ok(Self::ProfileMerged),
             "embedding_model_changed" => Ok(Self::EmbeddingModelChanged),
@@ -947,6 +953,29 @@ mod tests {
                 .expect("EventKind::name must parse back");
             assert_eq!(parsed, kind);
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn feedback_unjudged_kind_has_canonical_string_and_serde_roundtrip() {
+        let kind = EventKind::FeedbackUnjudged;
+        assert!(EventKind::ALL.contains(&kind));
+        assert_eq!(kind.name(), "feedback_unjudged");
+        assert_eq!(kind.to_string(), "feedback_unjudged");
+        assert_eq!("feedback_unjudged".parse::<EventKind>().unwrap(), kind);
+        assert!("unknown"
+            .parse::<EventKind>()
+            .unwrap_err()
+            .valid
+            .contains(&"feedback_unjudged"));
+        assert_eq!(
+            serde_json::to_string(&kind).unwrap(),
+            "\"feedback_unjudged\""
+        );
+        assert_eq!(
+            serde_json::from_str::<EventKind>("\"feedback_unjudged\"").unwrap(),
+            kind
+        );
     }
 
     #[cfg(feature = "serde")]
