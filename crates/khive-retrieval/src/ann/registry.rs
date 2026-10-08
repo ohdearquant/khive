@@ -72,14 +72,6 @@ pub struct CompactionOutcome {
     pub retired_consumers: Vec<RetiredConsumer>,
 }
 
-fn stmt(sql: impl Into<String>, params: Vec<SqlValue>, label: &str) -> SqlStatement {
-    SqlStatement {
-        sql: sql.into(),
-        params,
-        label: Some(label.to_owned()),
-    }
-}
-
 fn consumer_stmt(
     sql: impl Into<String>,
     label: &str,
@@ -88,7 +80,7 @@ fn consumer_stmt(
     model: &str,
     watermark: i64,
 ) -> SqlStatement {
-    stmt(
+    SqlStatement::new(
         sql,
         vec![
             SqlValue::Text(consumer.to_owned()),
@@ -96,8 +88,8 @@ fn consumer_stmt(
             SqlValue::Text(model.to_owned()),
             SqlValue::Integer(watermark),
         ],
-        label,
     )
+    .labelled(label)
 }
 
 fn integer_range_error(value: u64) -> StorageError {
@@ -206,16 +198,16 @@ pub fn pathless_compact_log(
     let label = format!("{label_prefix}ann_compact_pathless_log");
     let model = model.to_owned();
     match scope {
-        CompactionScope::Namespace(namespace) => stmt(
+        CompactionScope::Namespace(namespace) => SqlStatement::new(
             include_str!("../../sql/ann_write_log_compact_namespace_pathless.sql"),
             vec![SqlValue::Text(namespace), SqlValue::Text(model)],
-            &label,
-        ),
-        CompactionScope::Model => stmt(
+        )
+        .labelled(label),
+        CompactionScope::Model => SqlStatement::new(
             include_str!("../../sql/ann_write_log_compact_model.sql"),
             vec![SqlValue::Text(model)],
-            &label,
-        ),
+        )
+        .labelled(label),
     }
 }
 
@@ -308,15 +300,15 @@ pub fn read_watermark_statement(
     namespace: &str,
     model: &str,
 ) -> SqlStatement {
-    stmt(
+    SqlStatement::new(
         include_str!("../../sql/ann_consumer_watermark_select.sql"),
         vec![
             SqlValue::Text(consumer.to_owned()),
             SqlValue::Text(namespace.to_owned()),
             SqlValue::Text(model.to_owned()),
         ],
-        &format!("{label_prefix}ann_read_own_watermark"),
     )
+    .labelled(format!("{label_prefix}ann_read_own_watermark"))
 }
 
 /// Read one consumer's registered watermark.  `None` means the registry holds
@@ -400,11 +392,10 @@ async fn register_pending_at(
                 pending_params.push(SqlValue::Integer(PENDING_WATERMARK));
             }
             writer
-                .execute(stmt(
-                    pending_insert,
-                    pending_params,
-                    "ann_registry_stamp_pending",
-                ))
+                .execute(
+                    SqlStatement::new(pending_insert, pending_params)
+                        .labelled("ann_registry_stamp_pending"),
+                )
                 .await?;
             Ok(Box::new(()) as Box<dyn Any + Send>)
         })
@@ -440,15 +431,17 @@ pub async fn mark_recovering(
                 ))
                 .await?;
             writer
-                .execute(stmt(
-                    include_str!("../../sql/ann_consumer_pending_delete.sql"),
-                    vec![
-                        SqlValue::Text(consumer),
-                        SqlValue::Text(namespace),
-                        SqlValue::Text(model),
-                    ],
-                    "ann_registry_clear_pending_for_recovery",
-                ))
+                .execute(
+                    SqlStatement::new(
+                        include_str!("../../sql/ann_consumer_pending_delete.sql"),
+                        vec![
+                            SqlValue::Text(consumer),
+                            SqlValue::Text(namespace),
+                            SqlValue::Text(model),
+                        ],
+                    )
+                    .labelled("ann_registry_clear_pending_for_recovery"),
+                )
                 .await?;
             Ok(Box::new(()) as Box<dyn Any + Send>)
         })
@@ -496,15 +489,17 @@ pub async fn raise_watermark(
                 .await?;
             if affected == 1 {
                 writer
-                    .execute(stmt(
-                        include_str!("../../sql/ann_consumer_pending_delete.sql"),
-                        vec![
-                            SqlValue::Text(consumer),
-                            SqlValue::Text(namespace),
-                            SqlValue::Text(model),
-                        ],
-                        "ann_registry_activate_consumer",
-                    ))
+                    .execute(
+                        SqlStatement::new(
+                            include_str!("../../sql/ann_consumer_pending_delete.sql"),
+                            vec![
+                                SqlValue::Text(consumer),
+                                SqlValue::Text(namespace),
+                                SqlValue::Text(model),
+                            ],
+                        )
+                        .labelled("ann_registry_activate_consumer"),
+                    )
                     .await?;
             }
             Ok(Box::new(affected == 1) as Box<dyn Any + Send>)
@@ -566,17 +561,17 @@ async fn compact_write_log_at(
             let mut backfill_params = scope_params.clone();
             backfill_params[0] = SqlValue::Integer(now_us);
             writer
-                .execute(stmt(
-                    backfill_sql,
-                    backfill_params,
-                    "ann_registry_backfill_pending_timestamp",
-                ))
+                .execute(
+                    SqlStatement::new(backfill_sql, backfill_params)
+                        .labelled("ann_registry_backfill_pending_timestamp"),
+                )
                 .await?;
 
             let retired_rows = writer
-                .query_all(stmt(
-                    format!(
-                        "SELECT watermark.consumer, watermark.namespace, \
+                .query_all(
+                    SqlStatement::new(
+                        format!(
+                            "SELECT watermark.consumer, watermark.namespace, \
                                 watermark.embedding_model, pending.registered_at_us \
                          FROM ann_consumer_watermark watermark \
                          JOIN ann_consumer_pending pending \
@@ -587,16 +582,18 @@ async fn compact_write_log_at(
                            AND watermark.watermark = -2 \
                            AND watermark.embedding_model = ?2{scope_filter} \
                          ORDER BY watermark.consumer, watermark.namespace"
-                    ),
-                    scope_params.clone(),
-                    "ann_registry_find_expired_pending",
-                ))
+                        ),
+                        scope_params.clone(),
+                    )
+                    .labelled("ann_registry_find_expired_pending"),
+                )
                 .await?;
 
             writer
-                .execute(stmt(
-                    format!(
-                        "DELETE FROM ann_consumer_watermark AS watermark \
+                .execute(
+                    SqlStatement::new(
+                        format!(
+                            "DELETE FROM ann_consumer_watermark AS watermark \
                          WHERE watermark.watermark = -2 \
                            AND watermark.embedding_model = ?2{scope_filter} \
                            AND EXISTS (SELECT 1 FROM ann_consumer_pending pending \
@@ -604,10 +601,11 @@ async fn compact_write_log_at(
                                          AND pending.namespace = watermark.namespace \
                                          AND pending.embedding_model = watermark.embedding_model \
                                          AND pending.registered_at_us <= ?1)"
-                    ),
-                    scope_params.clone(),
-                    "ann_registry_retire_expired_pending",
-                ))
+                        ),
+                        scope_params.clone(),
+                    )
+                    .labelled("ann_registry_retire_expired_pending"),
+                )
                 .await?;
 
             // Drop metadata for retired rows and for consumers activated by a
@@ -615,7 +613,7 @@ async fn compact_write_log_at(
             // authoritative state.
             let pending_scope_filter = scope_filter.replace("watermark.", "pending.");
             writer
-                .execute(stmt(
+                .execute(SqlStatement::new(
                     format!(
                         "DELETE FROM ann_consumer_pending AS pending \
                          WHERE pending.embedding_model = ?2{pending_scope_filter} \
@@ -626,30 +624,33 @@ async fn compact_write_log_at(
                                              AND watermark.watermark = -2)"
                     ),
                     scope_params,
-                    "ann_registry_prune_pending_metadata",
-                ))
+                ).labelled("ann_registry_prune_pending_metadata"))
                 .await?;
 
             let deleted_log_rows = match &scope {
                 CompactionScope::Namespace(namespace) => {
                     writer
-                        .execute(stmt(
-                            include_str!("../../sql/ann_write_log_compact_namespace.sql"),
-                            vec![
-                                SqlValue::Text(namespace.clone()),
-                                SqlValue::Text(model.clone()),
-                            ],
-                            "ann_registry_compact_namespace",
-                        ))
+                        .execute(
+                            SqlStatement::new(
+                                include_str!("../../sql/ann_write_log_compact_namespace.sql"),
+                                vec![
+                                    SqlValue::Text(namespace.clone()),
+                                    SqlValue::Text(model.clone()),
+                                ],
+                            )
+                            .labelled("ann_registry_compact_namespace"),
+                        )
                         .await?
                 }
                 CompactionScope::Model => {
                     writer
-                        .execute(stmt(
-                            include_str!("../../sql/ann_write_log_compact_model.sql"),
-                            vec![SqlValue::Text(model.clone())],
-                            "ann_registry_compact_model",
-                        ))
+                        .execute(
+                            SqlStatement::new(
+                                include_str!("../../sql/ann_write_log_compact_model.sql"),
+                                vec![SqlValue::Text(model.clone())],
+                            )
+                            .labelled("ann_registry_compact_model"),
+                        )
                         .await?
                 }
             };
@@ -717,7 +718,7 @@ mod tests {
         sql.writer()
             .await
             .expect("writer")
-            .execute(stmt(sql_text, params, "ann_registry_test"))
+            .execute(SqlStatement::new(sql_text, params).labelled("ann_registry_test"))
             .await
             .expect("execute");
     }
@@ -727,7 +728,7 @@ mod tests {
             .reader()
             .await
             .expect("reader")
-            .query_scalar(stmt(sql_text, params, "ann_registry_test_scalar"))
+            .query_scalar(SqlStatement::new(sql_text, params).labelled("ann_registry_test_scalar"))
             .await
             .expect("query scalar")
         {
