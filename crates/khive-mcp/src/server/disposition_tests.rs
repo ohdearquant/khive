@@ -1146,9 +1146,15 @@ impl ErrorConstructorCensus {
             // carrier. An arbitrary object named error_detail is no proof.
             syn::Expr::Field(field) => {
                 matches!(&field.member, syn::Member::Named(name) if name == "error_detail")
-                    && (self.root_function("khive-mcp/src/daemon.rs", "daemon_mcp_error")
-                        || self.root_function("khive-mcp/src/daemon.rs", "protocol_mismatch_error")
-                        || self.root_function("khive-mcp/src/daemon.rs", "request_too_large_error")
+                    && (self.root_function("khive-mcp/src/daemon/forward.rs", "daemon_mcp_error")
+                        || self.root_function(
+                            "khive-mcp/src/daemon/forward.rs",
+                            "protocol_mismatch_error",
+                        )
+                        || self.root_function(
+                            "khive-mcp/src/daemon/forward.rs",
+                            "request_too_large_error",
+                        )
                         || self.root_function(
                             "khive-runtime/src/daemon.rs",
                             "handle_conn_with_lifecycle",
@@ -1225,6 +1231,11 @@ const EXTERNAL_ERROR_MODULES: &[(&str, &str, &str)] = &[
         "khive-mcp/src/daemon.rs",
         "fallback",
         "khive-mcp/src/daemon/fallback.rs",
+    ),
+    (
+        "khive-mcp/src/daemon.rs",
+        "forward",
+        "khive-mcp/src/daemon/forward.rs",
     ),
     (
         "khive-runtime/src/daemon.rs",
