@@ -5747,6 +5747,35 @@ impl KhiveRuntime {
         Ok((hits, vector_error))
     }
 
+    /// Parse a full UUID or resolve a compact hexadecimal prefix in the caller's
+    /// primary namespace, using the same lookup policy as [`Self::resolve_prefix`].
+    ///
+    /// A parseable full UUID is returned without a lookup or an existence,
+    /// liveness or authorization check. Otherwise input must contain at least
+    /// eight ASCII hexadecimal characters with no separators or whitespace.
+    /// Missing prefixes and invalid shapes return distinct `InvalidInput` errors;
+    /// lookup storage and ambiguity errors propagate unchanged.
+    pub async fn resolve_uuid_or_prefix(
+        &self,
+        token: &NamespaceToken,
+        s: &str,
+    ) -> RuntimeResult<Uuid> {
+        if let Ok(uuid) = s.parse::<Uuid>() {
+            return Ok(uuid);
+        }
+        if s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return match self.resolve_prefix(token, s).await? {
+                Some(uuid) => Ok(uuid),
+                None => Err(RuntimeError::InvalidInput(format!(
+                    "no record matches prefix: {s:?}"
+                ))),
+            };
+        }
+        Err(RuntimeError::InvalidInput(format!(
+            "invalid UUID (expected full UUID or 8+ hex prefix): {s:?}"
+        )))
+    }
+
     /// Resolve a short UUID prefix (8+ hex chars) to a full UUID.
     ///
     /// Searches entities, notes, and edges tables for a UUID starting with the
