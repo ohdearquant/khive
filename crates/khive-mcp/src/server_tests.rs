@@ -2918,6 +2918,8 @@ async fn typed_serial_dispatch_retains_full_batch_write_conflict_preflight() {
         assert_eq!(serial_row["ok"], false);
         assert_eq!(serial_row["tool"], parallel_row["tool"]);
         assert_eq!(serial_row["error"], parallel_row["error"]);
+        assert_eq!(serial_row["conflict_ops"], json!([0, 1]));
+        assert_eq!(parallel_row["conflict_ops"], json!([0, 1]));
         assert!(serial_row["error"]["message"]
             .as_str()
             .expect("conflict error")
@@ -7254,4 +7256,74 @@ fn issue2757_note_scope_handles_persisted_kinds_without_payload_markers() {
         note_content_scope(true, "get", &entity, &server.registry),
         NoteContentScope::None
     );
+}
+
+#[test]
+fn request_conflict_details_survive_mcp_error_conversion() {
+    let error = dsl_err_to_mcp(khive_request::DslError::WriteKeyConflict {
+        id: "entity:x".into(),
+        first_op: "update".into(),
+        second_op: "delete".into(),
+        conflict_ops: vec![0, 2, 4],
+    });
+    let data = error.data.expect("structured request error");
+    assert_eq!(data["conflict_ops"], json!([0, 2, 4]));
+    assert_eq!(data["domain_disposition"], "not_committed");
+    assert_eq!(data["kind"], "parse_error");
+    let ordinary = dsl_err_to_mcp(khive_request::DslError::EmptyBatch);
+    assert!(ordinary.data.unwrap().get("conflict_ops").is_none());
+}
+
+#[tokio::test]
+#[serial_test::serial(config_ledger)]
+async fn conflict_participants_distinguish_unit_causes_from_collateral_aborts() {
+    let server = large_result_test_server();
+    let response = server
+        .dispatch_request_local(RequestParams {
+            ops: concat!(
+                "[record_write(marker=\"must-not-run\") | update(id=\"a\") | delete(id=\"a\"), ",
+                "update(id=\"a\"), delete(id=\"a\"), record_write(marker=\"independent\")]"
+            )
+            .into(),
+            format: Some("json".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("parallel chains");
+    let envelope: Value = serde_json::from_str(&response).unwrap();
+    let rows = envelope["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0]["ok"], false);
+    assert_eq!(rows[0].get("conflict_ops"), Some(&json!([])));
+    for index in 1..5 {
+        assert_eq!(rows[index]["conflict_ops"], json!([1, 2, 3, 4]));
+    }
+    for row in &rows[..5] {
+        assert_eq!(row["domain_disposition"], "not_committed");
+    }
+    assert_eq!(rows[1]["aborted"], true);
+    assert_eq!(rows[2]["aborted"], true);
+    assert_eq!(rows[3]["ok"], false);
+    assert_eq!(rows[4]["ok"], false);
+    assert_eq!(rows[5]["result"]["marker"], "independent");
+    assert!(rows[5].get("conflict_ops").is_none());
+    assert_eq!(
+        envelope["summary"],
+        json!({"total":6,"succeeded":1,"failed":3,"aborted":2})
+    );
+
+    // An ordinary failed chain and its aborted tail are not write conflicts.
+    let response = server
+        .dispatch_request_local(RequestParams {
+            ops: "update(id=\"a\") | delete(id=\"a\")".into(),
+            format: Some("json".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("ordered chain");
+    let envelope: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(envelope["results"][1]["aborted"], true);
+    for row in envelope["results"].as_array().unwrap() {
+        assert!(row.get("conflict_ops").is_none());
+    }
 }
