@@ -23,7 +23,7 @@ impl VamanaIndex {
         if !self.validate_search(query, k)? {
             return Ok(Vec::new());
         }
-        let mut visited = VisitedSet::new(self.num_vectors);
+        let mut visited = crate::graph::new_visited_set(self.num_vectors);
         self.search_with_visited(query, k, &mut visited)
     }
 
